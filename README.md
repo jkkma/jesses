@@ -112,7 +112,7 @@ Build a native executable with embedded frontend assets:
 pnpm tauri build --debug --no-bundle
 ```
 
-Native CI is configured for Windows x64, Linux x64, and macOS arm64/x64. Installer,
+Native CI targets Windows x64 and Linux x64. macOS support is deferred. Installer,
 signing, clean-machine, and cross-platform runtime qualification remain pending.
 
 ## Development layout
