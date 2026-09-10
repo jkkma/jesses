@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 mod jobs;
-pub use jobs::{JobSnapshot, JobState, RemuxRequest};
+pub use jobs::{EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +76,8 @@ pub fn typescript_contracts() -> String {
         MediaFile::decl(&config),
         AppError::decl(&config),
         RemuxRequest::decl(&config),
+        EncodeSettings::decl(&config),
+        EncodeRequest::decl(&config),
         JobState::decl(&config),
         JobSnapshot::decl(&config),
     ];

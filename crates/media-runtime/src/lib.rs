@@ -12,5 +12,5 @@ pub mod supervisor;
 pub use discovery::get_capabilities;
 pub use jobs::JobManager;
 pub use media_core::{AppError, MediaFile, MediaStream, ToolInfo};
-pub use media_core::{JobSnapshot, JobState, RemuxRequest};
+pub use media_core::{EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
 pub use probe::probe_media;

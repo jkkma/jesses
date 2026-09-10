@@ -1,7 +1,7 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import type { JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from './generated';
+import type { EncodeRequest, JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from './generated';
 
 export function isDesktop(): boolean {
   return isTauri();
@@ -79,6 +79,30 @@ export async function chooseRemuxDestination(defaultPath: string): Promise<strin
 export async function startRemux(request: RemuxRequest): Promise<JobSnapshot> {
   requireDesktop();
   return invoke<JobSnapshot>('start_remux', { request });
+}
+
+export async function chooseEncodeDestination(defaultPath: string): Promise<string | null> {
+  requireDesktop();
+  return save({
+    title: 'Save AV1 encode',
+    defaultPath,
+    filters: [{ name: 'Matroska', extensions: ['mkv'] }],
+  });
+}
+
+export async function startEncode(request: EncodeRequest): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('start_encode', { request });
+}
+
+export async function enqueueEncode(request: EncodeRequest): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('enqueue_encode', { request });
+}
+
+export async function cancelAllJobs(): Promise<JobSnapshot[]> {
+  requireDesktop();
+  return invoke<JobSnapshot[]>('cancel_all_jobs');
 }
 
 export async function cancelJob(id: string): Promise<JobSnapshot> {

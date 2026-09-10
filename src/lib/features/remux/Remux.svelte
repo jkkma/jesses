@@ -1,16 +1,8 @@
 <script lang="ts">
-  import {
-    ArrowDown,
-    ArrowUp,
-    ArrowRight,
-    FolderOutput,
-    Play,
-    Square,
-    CircleAlert,
-  } from '@lucide/svelte';
+  import { ArrowDown, ArrowUp, ArrowRight, FolderOutput, Play, CircleAlert } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { chooseRemuxDestination, isDesktop } from '$lib/ipc/client';
-  import { errorMessage, formatDuration } from '$lib/components/shared/format';
+  import { errorMessage } from '$lib/components/shared/format';
   import type { JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from '$lib/ipc/generated';
   let {
     file,
@@ -19,7 +11,6 @@
     connected,
     onfiles,
     onstart,
-    oncancel,
   }: {
     file: MediaFile | undefined;
     tools: ToolInfo[];
@@ -27,7 +18,6 @@
     connected: boolean;
     onfiles: () => void;
     onstart: (request: RemuxRequest) => Promise<void>;
-    oncancel: (id: string) => Promise<void>;
   } = $props();
   let destination = $state('');
   let order = $state<number[]>([]);
@@ -35,9 +25,9 @@
   let error = $state<string | null>(null);
   let submitting = $state(false);
   const desktop = isDesktop();
-  const terminal = (state: string) => ['succeeded', 'failed', 'canceled'].includes(state);
+  const terminal = (state: string) =>
+    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
   const active = $derived(jobs.find((job) => !terminal(job.state)));
-  const current = $derived(active ?? jobs[0]);
   const toolsReady = $derived(
     ['ffmpeg', 'ffprobe'].every((id) => tools.some((tool) => tool.id === id && tool.available)),
   );
@@ -95,14 +85,6 @@
       error = errorMessage(cause);
     } finally {
       submitting = false;
-    }
-  }
-  async function cancel(id: string) {
-    error = null;
-    try {
-      await oncancel(id);
-    } catch (cause) {
-      error = errorMessage(cause);
     }
   }
 </script>
@@ -213,43 +195,6 @@
       </div>
     </aside>
   </div>
-  {#if current}<section class="panel remux-job" aria-label="Current remux job">
-      <div class="section-heading">
-        <span class="eyebrow">Job status</span><strong role="status"
-          >{current.state.charAt(0).toUpperCase() + current.state.slice(1)}</strong
-        >
-      </div>
-      <div class="remux-job-body">
-        <p class="job-destination">{current.request.outputPath}</p>
-        {#if current.state === 'running'}<progress
-            aria-label="Remux progress"
-            max={current.durationSeconds ?? 1}
-            value={current.progressSeconds ?? undefined}
-          ></progress>
-          <p class="small-muted">
-            {formatDuration(current.progressSeconds)} / {formatDuration(current.durationSeconds)}
-          </p>{/if}
-        {#if current.state === 'finalizing'}<p>Checking the output before saving it.</p>{/if}
-        {#if current.state === 'succeeded'}<p>Output verified and saved.</p>{/if}
-        {#if current.error}<p class="job-error" role="alert">{current.error.message}</p>{/if}
-        {#if !terminal(current.state)}<Button
-            variant="outline"
-            disabled={current.state === 'canceling'}
-            onclick={() => cancel(current.id)}><Square size={12} />Cancel job</Button
-          >
-          <p class="small-muted">
-            Closing jesses cancels the active job. Jobs cannot be resumed after restart yet.
-          </p>{/if}
-        <details>
-          <summary>Job log</summary>
-          <pre aria-label="Remux job log">{current.logs.join('\n') ||
-              'Waiting for tool output…'}</pre>
-          {#if current.logPath}<p class="small-muted job-destination">
-              Saved log: {current.logPath}
-            </p>{/if}
-        </details>
-      </div>
-    </section>{/if}
 </section>
 
 <style>
@@ -262,8 +207,7 @@
     gap: 20px;
   }
   .remux-streams,
-  .remux-output,
-  .remux-job {
+  .remux-output {
     min-width: 0;
   }
   .section-heading {
@@ -322,39 +266,11 @@
     display: flex;
     flex: 0 0 auto;
   }
-  .remux-output-content,
-  .remux-job-body {
+  .remux-output-content {
     padding: 20px;
     display: flex;
     flex-direction: column;
     gap: 14px;
-  }
-  .remux-job {
-    margin-top: 20px;
-  }
-  .job-destination,
-  .job-error {
-    overflow-wrap: anywhere;
-  }
-  .job-error {
-    color: #8c2c22;
-  }
-  progress {
-    width: 100%;
-    height: 8px;
-    accent-color: #ad5326;
-  }
-  summary {
-    cursor: pointer;
-    font-size: 12px;
-  }
-  pre {
-    max-height: 240px;
-    overflow: auto;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    font-size: 11px;
-    margin-top: 10px;
   }
   @media (max-width: 850px) {
     .remux-grid {

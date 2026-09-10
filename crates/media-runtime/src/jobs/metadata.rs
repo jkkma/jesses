@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use media_core::AppError;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct Document {
     #[serde(default)]
     pub streams: Vec<Stream>,
@@ -12,14 +12,15 @@ pub(super) struct Document {
     pub format: Option<Format>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct Format {
     pub duration: Option<String>,
+    pub start_time: Option<String>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct Stream {
     pub index: u32,
     pub codec_type: Option<String>,
@@ -31,13 +32,27 @@ pub(super) struct Stream {
     pub duration: Option<String>,
     pub nb_read_packets: Option<String>,
     pub extradata_hash: Option<String>,
+    pub pix_fmt: Option<String>,
+    pub field_order: Option<String>,
+    pub sample_aspect_ratio: Option<String>,
+    pub avg_frame_rate: Option<String>,
+    pub r_frame_rate: Option<String>,
+    pub time_base: Option<String>,
+    pub start_time: Option<String>,
+    pub color_space: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_primaries: Option<String>,
+    pub color_range: Option<String>,
+    pub chroma_location: Option<String>,
+    #[serde(default)]
+    pub side_data_list: Vec<serde_json::Value>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
     pub disposition: BTreeMap<String, u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct Chapter {
     pub start_time: String,
     pub end_time: String,
@@ -172,6 +187,24 @@ pub(super) fn verify(
     selected: &[&Stream],
     output: &Document,
 ) -> Result<(), AppError> {
+    verify_inner(source, selected, output, None)
+}
+
+pub(super) fn verify_encoded(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    video_index: u32,
+) -> Result<(), AppError> {
+    verify_inner(source, selected, output, Some(video_index))
+}
+
+fn verify_inner(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    encoded_video: Option<u32>,
+) -> Result<(), AppError> {
     let fail = |message: &str| AppError::new("OUTPUT_VALIDATION_FAILED", message, None);
     if selected.len() != output.streams.len() {
         return Err(fail(
@@ -179,8 +212,30 @@ pub(super) fn verify(
         ));
     }
     for (expected, actual) in selected.iter().zip(&output.streams) {
+        let encoded = encoded_video == Some(expected.index);
+        if let Some(source_start) = expected
+            .start_time
+            .as_deref()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            let output_start = actual
+                .start_time
+                .as_deref()
+                .and_then(|v| v.parse::<f64>().ok());
+            if !output_start
+                .is_some_and(|start| start.is_finite() && (start - source_start).abs() <= 0.002)
+            {
+                return Err(fail(
+                    "The output track start time changed, which could affect synchronization.",
+                ));
+            }
+        }
         if expected.codec_type != actual.codec_type
-            || expected.codec_name != actual.codec_name
+            || if encoded {
+                actual.codec_name.as_deref() != Some("av1")
+            } else {
+                expected.codec_name != actual.codec_name
+            }
             || expected.width != actual.width
             || expected.height != actual.height
             || expected.sample_rate != actual.sample_rate
@@ -199,8 +254,9 @@ pub(super) fn verify(
             .nb_read_packets
             .as_deref()
             .and_then(|v| v.parse::<u64>().ok());
-        if (media_track && !expected_packets.is_some_and(|count| count > 0))
-            || expected_packets != actual_packets
+        if !encoded
+            && ((media_track && !expected_packets.is_some_and(|count| count > 0))
+                || expected_packets != actual_packets)
         {
             return Err(fail(
                 "The output packet count differs from the selected source track.",

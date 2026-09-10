@@ -1,7 +1,10 @@
-//! One active, in-memory copy/remux job with immutable selection and no-clobber
-//! output publication. This is not a durable queue or encoding pipeline.
+//! Sequential media jobs with immutable requests and optional durable history.
+//! Interrupted jobs are reported after restart and never automatically resumed.
 
+mod encode;
+mod encode_plan;
 mod files;
+mod history;
 mod metadata;
 #[cfg(test)]
 mod real_tests;
@@ -16,8 +19,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use media_core::{AppError, JobSnapshot, JobState, RemuxRequest};
-use tokio::sync::{Mutex, mpsc, watch};
+use media_core::{AppError, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use crate::{
     discovery::find_executable,
@@ -40,12 +43,16 @@ struct Entry {
 struct State {
     entries: Vec<Entry>,
     shutting_down: bool,
+    storage_error: Option<AppError>,
 }
 
 #[derive(Clone)]
 pub struct JobManager {
     state: Arc<Mutex<State>>,
     log_dir: Arc<PathBuf>,
+    history: Option<history::History>,
+    execution: Arc<Mutex<()>>,
+    queue_changed: Arc<Notify>,
 }
 
 fn canceled() -> AppError {
@@ -79,12 +86,104 @@ impl JobManager {
         Self {
             state: Arc::new(Mutex::new(State::default())),
             log_dir: Arc::new(log_dir),
+            history: None,
+            execution: Arc::new(Mutex::new(())),
+            queue_changed: Arc::new(Notify::new()),
         }
     }
 
+    pub async fn open(log_dir: PathBuf, history_dir: PathBuf) -> Self {
+        let mut manager = Self::new(log_dir);
+        match history::History::open(history_dir).await {
+            Ok((history, snapshots)) => {
+                manager.history = Some(history);
+                let mut state = manager.state.lock().await;
+                for mut snapshot in snapshots {
+                    if !snapshot.state.is_terminal() {
+                        snapshot.state = JobState::Interrupted;
+                        snapshot.error = Some(AppError::new(
+                            "JOB_INTERRUPTED",
+                            "The previous session ended before completion was recorded. Review the output and logs before submitting a new job; no processes were restarted or old temporary files deleted.",
+                            Some(snapshot.request.output_path.clone()),
+                        ));
+                        append_log(
+                            &mut snapshot,
+                            "Interrupted job restored for review. Automatic resume is unavailable."
+                                .into(),
+                        );
+                    }
+                    let (cancel, _) = watch::channel(true);
+                    state.entries.push(Entry {
+                        snapshot,
+                        cancel,
+                        task: None,
+                    });
+                }
+                let _ = manager.persist(&mut state).await;
+            }
+            Err(error) => manager.state.lock().await.storage_error = Some(error),
+        }
+        manager
+    }
+
+    pub async fn ready(&self) -> Result<(), AppError> {
+        self.state
+            .lock()
+            .await
+            .storage_error
+            .clone()
+            .map_or(Ok(()), Err)
+    }
+
+    async fn persist(&self, state: &mut State) -> Result<(), AppError> {
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if let Some(history) = &self.history
+            && let Err(error) = history
+                .save(state.entries.iter().map(|e| e.snapshot.clone()).collect())
+                .await
+        {
+            for entry in &mut state.entries {
+                if !entry.snapshot.state.is_terminal() {
+                    entry.cancel.send_replace(true);
+                }
+                append_log(&mut entry.snapshot, error.message.clone());
+                entry.snapshot.error = Some(error.clone());
+            }
+            state.storage_error = Some(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn start_remux(&self, request: RemuxRequest) -> Result<JobSnapshot, AppError> {
+        self.start_job(request, None, false).await
+    }
+
+    pub async fn start_encode(&self, request: EncodeRequest) -> Result<JobSnapshot, AppError> {
+        encode::validate_settings(&request.settings)?;
+        self.start_job(request.source, Some(request.settings), false)
+            .await
+    }
+
+    pub async fn enqueue_encode(&self, request: EncodeRequest) -> Result<JobSnapshot, AppError> {
+        encode::validate_settings(&request.settings)?;
+        self.start_job(request.source, Some(request.settings), true)
+            .await
+    }
+
+    async fn start_job(
+        &self,
+        request: RemuxRequest,
+        encode_settings: Option<EncodeSettings>,
+        allow_queue: bool,
+    ) -> Result<JobSnapshot, AppError> {
         files::validate_request(&request)?;
         let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
         if state.shutting_down {
             return Err(AppError::new(
                 "APP_CLOSING",
@@ -92,10 +191,11 @@ impl JobManager {
                 None,
             ));
         }
-        if state
-            .entries
-            .iter()
-            .any(|e| !e.snapshot.state.is_terminal())
+        if !allow_queue
+            && state
+                .entries
+                .iter()
+                .any(|e| !e.snapshot.state.is_terminal())
         {
             return Err(AppError::new(
                 "JOB_BUSY",
@@ -103,8 +203,39 @@ impl JobManager {
                 None,
             ));
         }
+        if state.entries.iter().any(|e| {
+            !e.snapshot.state.is_terminal()
+                && if cfg!(windows) {
+                    e.snapshot
+                        .request
+                        .output_path
+                        .eq_ignore_ascii_case(&request.output_path)
+                } else {
+                    e.snapshot.request.output_path == request.output_path
+                }
+        }) {
+            return Err(AppError::new(
+                "OUTPUT_QUEUED",
+                "This destination is already assigned to an unfinished job.",
+                Some(request.output_path),
+            ));
+        }
         while state.entries.len() >= MAX_HISTORY {
-            state.entries.remove(0);
+            let index = state
+                .entries
+                .iter()
+                .position(|e| {
+                    e.snapshot.state.is_terminal()
+                        && e.task.as_ref().is_none_or(|task| task.is_finished())
+                })
+                .ok_or_else(|| {
+                    AppError::new(
+                        "QUEUE_FULL",
+                        "The queue is full. Wait for jobs to finish before adding more.",
+                        None,
+                    )
+                })?;
+            state.entries.remove(index);
         }
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -120,24 +251,74 @@ impl JobManager {
             id: id.clone(),
             state: JobState::Queued,
             request,
+            encode_settings,
             progress_seconds: None,
             duration_seconds: None,
-            logs: vec!["Copy/remux job queued.".into()],
+            logs: vec!["Media job queued.".into()],
             error: None,
-            log_path: None,
+            log_path: Some(log_path.to_string_lossy().into_owned()),
         };
         let (cancel, receiver) = watch::channel(false);
         let worker = self.clone();
         let task_id = id.clone();
-        let task = tokio::spawn(async move {
-            worker.execute(task_id, receiver, log_path).await;
-        });
         state.entries.push(Entry {
             snapshot: snapshot.clone(),
             cancel,
-            task: Some(task),
+            task: None,
         });
+        if let Err(error) = self.persist(&mut state).await {
+            state.entries.pop();
+            return Err(error);
+        }
+        let task = tokio::spawn(async move {
+            worker.run_queued(task_id, receiver, log_path).await;
+        });
+        state.entries.last_mut().expect("registered job").task = Some(task);
+        self.queue_changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    async fn run_queued(&self, id: String, cancel: watch::Receiver<bool>, log_path: PathBuf) {
+        let turn = async {
+            loop {
+                let changed = self.queue_changed.notified();
+                let first = self
+                    .state
+                    .lock()
+                    .await
+                    .entries
+                    .iter()
+                    .find(|e| !e.snapshot.state.is_terminal())
+                    .map(|e| e.snapshot.id.clone());
+                if first.as_deref() == Some(&id) {
+                    return self.execution.lock().await;
+                }
+                changed.await;
+            }
+        };
+        let slot = tokio::select! {
+            biased;
+            _ = wait_cancel(cancel.clone()) => None,
+            guard = turn => Some(guard),
+        };
+        if slot.is_some() {
+            self.execute(id, cancel, log_path).await;
+        } else {
+            let storage_error = self.state.lock().await.storage_error.clone();
+            self.change(&id, |snapshot| {
+                if let Some(error) = storage_error {
+                    snapshot.state = JobState::Failed;
+                    append_log(snapshot, error.message.clone());
+                    snapshot.error = Some(error);
+                } else {
+                    snapshot.state = JobState::Canceled;
+                    append_log(snapshot, "Queued job canceled before starting.".into());
+                }
+            })
+            .await;
+        }
+        drop(slot);
+        self.queue_changed.notify_waiters();
     }
 
     pub async fn list_jobs(&self) -> Vec<JobSnapshot> {
@@ -173,7 +354,32 @@ impl JobManager {
                     .into(),
             );
         }
-        Ok(entry.snapshot.clone())
+        let snapshot = entry.snapshot.clone();
+        self.persist(&mut state).await?;
+        self.queue_changed.notify_waiters();
+        Ok(snapshot)
+    }
+
+    pub async fn cancel_all_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {
+        let mut state = self.state.lock().await;
+        for entry in &mut state.entries {
+            if !entry.snapshot.state.is_terminal() {
+                entry.cancel.send_replace(true);
+                entry.snapshot.state = JobState::Canceling;
+                append_log(
+                    &mut entry.snapshot,
+                    "Queue stopped; cancellation applies to this job and all waiting jobs.".into(),
+                );
+            }
+        }
+        self.queue_changed.notify_waiters();
+        self.persist(&mut state).await?;
+        Ok(state
+            .entries
+            .iter()
+            .rev()
+            .map(|e| e.snapshot.clone())
+            .collect())
     }
 
     /// Prevents new jobs and waits for process-tree and owned-output cleanup.
@@ -181,7 +387,7 @@ impl JobManager {
         let tasks = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            state
+            let tasks = state
                 .entries
                 .iter_mut()
                 .filter_map(|e| {
@@ -191,7 +397,10 @@ impl JobManager {
                     }
                     e.task.take()
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let _ = self.persist(&mut state).await;
+            self.queue_changed.notify_waiters();
+            tasks
         };
         for task in tasks {
             let _ = task.await;
@@ -199,15 +408,14 @@ impl JobManager {
     }
 
     async fn change(&self, id: &str, update: impl FnOnce(&mut JobSnapshot)) {
-        if let Some(entry) = self
-            .state
-            .lock()
-            .await
-            .entries
-            .iter_mut()
-            .find(|e| e.snapshot.id == id)
-        {
+        let mut state = self.state.lock().await;
+        if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
+            let before = entry.snapshot.state;
             update(&mut entry.snapshot);
+            if entry.snapshot.state != before || entry.snapshot.state.is_terminal() {
+                let _ = self.persist(&mut state).await;
+                self.queue_changed.notify_waiters();
+            }
         }
     }
 
@@ -222,7 +430,7 @@ impl JobManager {
     }
 
     async fn execute(&self, id: String, cancel: watch::Receiver<bool>, log_path: PathBuf) {
-        let request = {
+        let snapshot = {
             let state = self.state.lock().await;
             state
                 .entries
@@ -230,15 +438,44 @@ impl JobManager {
                 .find(|e| e.snapshot.id == id)
                 .expect("registered job")
                 .snapshot
-                .request
                 .clone()
         };
+        let request = snapshot.request;
         let mut temporary = None;
-        let result = self
-            .remux(&id, &request, &cancel, &log_path, &mut temporary)
-            .await;
-        let cleanup_error = temporary.as_mut().and_then(|temp| temp.cleanup().err());
+        let mut scratch = Vec::new();
+        let result = if let Some(settings) = snapshot.encode_settings {
+            self.encode(
+                &id,
+                &request,
+                &settings,
+                &cancel,
+                &log_path,
+                &mut temporary,
+                &mut scratch,
+            )
+            .await
+        } else {
+            self.remux(&id, &request, &cancel, &log_path, &mut temporary)
+                .await
+        };
+        let cleanup_errors: Vec<_> = temporary
+            .iter_mut()
+            .chain(scratch.iter_mut())
+            .filter_map(|temp| temp.cleanup().err())
+            .collect();
         let saved_log = tokio::fs::metadata(&log_path).await.is_ok();
+        // Storage-triggered cancellation is a failure, not a successful user
+        // stop. Keep its diagnostic visible even when token cancellation wins.
+        let result = match result {
+            Err(error) if error.code == "JOB_CANCELED" => Err(self
+                .state
+                .lock()
+                .await
+                .storage_error
+                .clone()
+                .unwrap_or(error)),
+            other => other,
+        };
         self.change(&id, |snapshot| {
             if saved_log {
                 snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
@@ -257,7 +494,7 @@ impl JobManager {
                     Some(error)
                 };
             }
-            if let Some(error) = cleanup_error {
+            for error in cleanup_errors {
                 append_log(snapshot, error.message.clone());
                 snapshot.error = Some(error);
                 if snapshot.state != JobState::Succeeded {
@@ -400,7 +637,21 @@ impl JobManager {
                 "Verified Matroska output published. The source was preserved.".into(),
             );
         }
+        // Publication is already committed; a history-write error is reported
+        // on the successful job and must not relabel or delete its output.
+        let _ = self.persist(&mut state).await;
         Ok(())
+    }
+}
+
+async fn wait_cancel(mut cancel: watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -616,5 +867,184 @@ mod tests {
         drop(source);
         assert_eq!(std::fs::read(input).unwrap(), b"source");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_queue_cancels_waiters_without_starting_and_preserves_settings() {
+        let dir = std::env::temp_dir();
+        let manager = JobManager::new(dir.join("jesses-queue-test-logs"));
+        let slot = manager.execution.lock().await;
+        for index in 0..3 {
+            manager
+                .enqueue_encode(EncodeRequest {
+                    source: RemuxRequest {
+                        input_path: dir
+                            .join("missing-queue-source.mkv")
+                            .to_string_lossy()
+                            .into(),
+                        output_path: dir
+                            .join(format!("missing-queue-output-{index}.mkv"))
+                            .to_string_lossy()
+                            .into(),
+                        stream_indices: vec![0],
+                    },
+                    settings: EncodeSettings {
+                        preset: index + 4,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            manager
+                .list_jobs()
+                .await
+                .iter()
+                .all(|job| job.state == JobState::Queued)
+        );
+        manager.cancel_all_jobs().await.unwrap();
+        // Workers waiting for the execution slot must respond to cancellation
+        // even while the current operation still owns the slot.
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
+        let jobs = manager.list_jobs().await;
+        assert!(jobs.iter().all(|job| job.state == JobState::Canceled));
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.encode_settings.as_ref().unwrap().preset)
+                .collect::<Vec<_>>(),
+            vec![6, 5, 4]
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| !job.logs.iter().any(|line| line.contains("Checking")))
+        );
+        drop(slot);
+    }
+
+    #[tokio::test]
+    async fn unfinished_history_reopens_as_interrupted_without_touching_files() {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-recovery-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let input = path.join("source.mkv");
+        let output = path.join("existing.mkv");
+        std::fs::write(&input, b"original source").unwrap();
+        std::fs::write(&output, b"existing output").unwrap();
+        let (history, _) = history::History::open(path.join("history")).await.unwrap();
+        history
+            .save(vec![JobSnapshot {
+                id: "previous-session-job".into(),
+                state: JobState::Running,
+                request: RemuxRequest {
+                    input_path: input.to_string_lossy().into(),
+                    output_path: output.to_string_lossy().into(),
+                    stream_indices: vec![0],
+                },
+                encode_settings: Some(EncodeSettings::default()),
+                progress_seconds: Some(1.0),
+                duration_seconds: Some(5.0),
+                logs: vec!["Started with saved settings".into()],
+                error: None,
+                log_path: None,
+            }])
+            .await
+            .unwrap();
+        drop(history);
+        let manager = JobManager::open(path.join("logs"), path.join("history")).await;
+        manager.ready().await.unwrap();
+        let jobs = manager.list_jobs().await;
+        assert_eq!(jobs[0].state, JobState::Interrupted);
+        assert_eq!(jobs[0].error.as_ref().unwrap().code, "JOB_INTERRUPTED");
+        assert_eq!(jobs[0].encode_settings, Some(EncodeSettings::default()));
+        manager.shutdown().await;
+        drop(manager);
+        assert_eq!(std::fs::read(input).unwrap(), b"original source");
+        assert_eq!(std::fs::read(output).unwrap(), b"existing output");
+        assert!(!path.join("logs").exists());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_history_blocks_job_admission_without_erasing_it() {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-invalid-history-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("jobs.json"), b"corrupt history retained").unwrap();
+        let manager = JobManager::open(path.join("logs"), path.clone()).await;
+        assert_eq!(
+            manager.ready().await.unwrap_err().code,
+            "JOB_HISTORY_FAILED"
+        );
+        let error = manager
+            .start_remux(RemuxRequest {
+                input_path: path.join("source.mkv").to_string_lossy().into(),
+                output_path: path.join("output.mkv").to_string_lossy().into(),
+                stream_indices: vec![0],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "JOB_HISTORY_FAILED");
+        assert_eq!(
+            std::fs::read(path.join("jobs.json")).unwrap(),
+            b"corrupt history retained"
+        );
+        drop(manager);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_failure_is_not_reported_as_user_cancellation() {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-history-failure-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manager = JobManager::open(path.join("logs"), path.join("history")).await;
+        manager.ready().await.unwrap();
+        let slot = manager.execution.lock().await;
+        let job = manager
+            .enqueue_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: path.join("source.mkv").to_string_lossy().into(),
+                    output_path: path.join("output.mkv").to_string_lossy().into(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            job.log_path
+                .as_ref()
+                .unwrap()
+                .ends_with(&format!("{}.log", job.id))
+        );
+        let record = path.join("history/jobs.json");
+        let saved = path.join("history/previous.json");
+        std::fs::rename(&record, &saved).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        manager
+            .phase(&job.id, JobState::Preparing, "Preparing a job.")
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
+        let jobs = manager.list_jobs().await;
+        assert_eq!(jobs[0].state, JobState::Failed);
+        assert_eq!(jobs[0].error.as_ref().unwrap().code, "JOB_HISTORY_FAILED");
+        assert!(std::fs::read_to_string(saved).unwrap().contains(&job.id));
+        assert!(!path.join("output.mkv").exists());
+        drop(slot);
+        drop(manager);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

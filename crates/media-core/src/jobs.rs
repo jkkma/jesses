@@ -12,6 +12,31 @@ pub struct RemuxRequest {
     pub stream_indices: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeSettings {
+    pub video_stream_index: u32,
+    pub crf: u8,
+    pub preset: u8,
+}
+
+impl Default for EncodeSettings {
+    fn default() -> Self {
+        Self {
+            video_stream_index: 0,
+            crf: 30,
+            preset: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeRequest {
+    pub source: RemuxRequest,
+    pub settings: EncodeSettings,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum JobState {
@@ -23,11 +48,15 @@ pub enum JobState {
     Canceling,
     Canceled,
     Failed,
+    Interrupted,
 }
 
 impl JobState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Canceled | Self::Failed)
+        matches!(
+            self,
+            Self::Succeeded | Self::Canceled | Self::Failed | Self::Interrupted
+        )
     }
 }
 
@@ -37,6 +66,8 @@ pub struct JobSnapshot {
     pub id: String,
     pub state: JobState,
     pub request: RemuxRequest,
+    #[serde(default)]
+    pub encode_settings: Option<EncodeSettings>,
     pub progress_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub logs: Vec<String>,

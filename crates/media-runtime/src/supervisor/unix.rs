@@ -18,14 +18,25 @@ pub(super) struct OwnedChild {
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false)
+        Self::spawn_with_input(spec, false, None)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true)
+        Self::spawn_with_input(spec, true, None)
     }
 
-    fn spawn_with_input(spec: &CommandSpec, pipe_stdin: bool) -> io::Result<Self> {
+    pub(super) fn spawn_with_stdin_to_file(
+        spec: &CommandSpec,
+        output: std::fs::File,
+    ) -> io::Result<Self> {
+        Self::spawn_with_input(spec, true, Some(output))
+    }
+
+    fn spawn_with_input(
+        spec: &CommandSpec,
+        pipe_stdin: bool,
+        output: Option<std::fs::File>,
+    ) -> io::Result<Self> {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.args)
@@ -34,7 +45,7 @@ impl OwnedChild {
             } else {
                 Stdio::null()
             })
-            .stdout(Stdio::piped())
+            .stdout(output.map_or_else(Stdio::piped, Stdio::from))
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(cwd) = &spec.cwd {
@@ -60,6 +71,13 @@ impl OwnedChild {
 
     pub(super) fn take_stdin(&mut self) -> ChildStdin {
         self.child.stdin.take().expect("piped stdin")
+    }
+
+    pub(super) fn take_output_pipes(&mut self) -> (Option<ChildStdout>, ChildStderr) {
+        (
+            self.child.stdout.take(),
+            self.child.stderr.take().expect("piped stderr"),
+        )
     }
 
     fn terminate_tree(&mut self) -> io::Result<()> {

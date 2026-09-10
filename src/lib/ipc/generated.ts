@@ -26,6 +26,10 @@ export type AppError = { code: string, message: string, path: string | null, };
 
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
 
-export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "canceled" | "failed";
+export type EncodeSettings = { videoStreamIndex: number, crf: number, preset: number, };
 
-export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+export type EncodeRequest = { source: RemuxRequest, settings: EncodeSettings, };
+
+export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "canceled" | "failed" | "interrupted";
+
+export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, encodeSettings: EncodeSettings | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };

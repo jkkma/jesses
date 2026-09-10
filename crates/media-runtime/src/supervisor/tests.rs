@@ -149,6 +149,38 @@ fn fake_tool() {
             stderr.join().unwrap();
             std::process::exit(0);
         }
+        "binary-relay" => {
+            std::io::stderr()
+                .write_all(b"binary relay diagnostic\n")
+                .unwrap();
+            let mut stdout = std::io::stdout().lock();
+            std::io::copy(&mut std::io::stdin().lock(), &mut stdout).unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(0);
+        }
+        "seekable-consumer" => {
+            use std::io::{Seek, SeekFrom};
+            #[cfg(unix)]
+            use std::os::fd::AsFd;
+            #[cfg(windows)]
+            use std::os::windows::io::AsHandle;
+            let stdout = std::io::stdout();
+            stdout.lock().flush().unwrap();
+            #[cfg(unix)]
+            let owned = stdout.as_fd().try_clone_to_owned().unwrap();
+            #[cfg(windows)]
+            let owned = stdout.as_handle().try_clone_to_owned().unwrap();
+            let mut file = std::fs::File::from(owned);
+            // IVF encoders write a provisional header, then seek back to record
+            // their final frame count. A pipe relay cannot support this contract.
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"HEAD0000").unwrap();
+            std::io::copy(&mut std::io::stdin().lock(), &mut file).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"HEADdone").unwrap();
+            file.flush().unwrap();
+            std::process::exit(0);
+        }
         "binary-fail" => {
             wait_peer(&path);
             std::io::stdout().write_all(b"partial binary data").unwrap();

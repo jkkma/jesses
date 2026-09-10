@@ -215,10 +215,18 @@ pub(super) struct Temporary {
 
 impl Temporary {
     pub fn create(output: &Path, id: &str) -> Result<Self, AppError> {
+        Self::create_extension(output, id, "mkv")
+    }
+
+    pub fn create_ivf(output: &Path, id: &str) -> Result<Self, AppError> {
+        Self::create_extension(output, id, "ivf")
+    }
+
+    fn create_extension(output: &Path, id: &str, extension: &str) -> Result<Self, AppError> {
         let path = output
             .parent()
             .expect("validated output parent")
-            .join(format!(".jesses-{id}.partial.mkv"));
+            .join(format!(".jesses-{id}.partial.{extension}"));
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(windows)]
@@ -309,6 +317,15 @@ impl Temporary {
         })
         .await
         .map_err(|e| error("OUTPUT_FLUSH_FAILED", e.to_string(), &self.path))?
+    }
+
+    pub fn clone_file(&self) -> Result<File, AppError> {
+        self.verify_identity()?;
+        self.file
+            .as_ref()
+            .expect("owned temporary handle")
+            .try_clone()
+            .map_err(|e| error("OUTPUT_UNREADABLE", e.to_string(), &self.path))
     }
 
     fn verify_identity(&self) -> Result<(), AppError> {

@@ -1,4 +1,4 @@
-use media_core::{AppError, JobSnapshot, MediaFile, RemuxRequest, ToolInfo};
+use media_core::{AppError, EncodeRequest, JobSnapshot, MediaFile, RemuxRequest, ToolInfo};
 use media_runtime::jobs::JobManager;
 use std::sync::{
     Arc,
@@ -21,12 +21,34 @@ async fn start_remux(
 }
 
 #[tauri::command]
+async fn start_encode(
+    request: EncodeRequest,
+    jobs: State<'_, Jobs>,
+) -> Result<JobSnapshot, AppError> {
+    jobs.manager.start_encode(request).await
+}
+
+#[tauri::command]
+async fn enqueue_encode(
+    request: EncodeRequest,
+    jobs: State<'_, Jobs>,
+) -> Result<JobSnapshot, AppError> {
+    jobs.manager.enqueue_encode(request).await
+}
+
+#[tauri::command]
+async fn cancel_all_jobs(jobs: State<'_, Jobs>) -> Result<Vec<JobSnapshot>, AppError> {
+    jobs.manager.cancel_all_jobs().await
+}
+
+#[tauri::command]
 async fn cancel_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
     jobs.manager.cancel_job(id).await
 }
 
 #[tauri::command]
 async fn list_jobs(jobs: State<'_, Jobs>) -> Result<Vec<JobSnapshot>, AppError> {
+    jobs.manager.ready().await?;
     Ok(jobs.manager.list_jobs().await)
 }
 
@@ -35,6 +57,7 @@ async fn subscribe_jobs(
     channel: Channel<Vec<JobSnapshot>>,
     jobs: State<'_, Jobs>,
 ) -> Result<(), AppError> {
+    jobs.manager.ready().await?;
     let manager = Arc::clone(&jobs.manager);
     let generation = Arc::clone(&jobs.subscription);
     let current = generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -70,8 +93,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let log_dir = app.path().app_log_dir()?.join("jobs");
+            let history_dir = app.path().app_data_dir()?.join("jobs");
             app.manage(Jobs {
-                manager: Arc::new(JobManager::new(log_dir)),
+                manager: Arc::new(tauri::async_runtime::block_on(JobManager::open(
+                    log_dir,
+                    history_dir,
+                ))),
                 subscription: Arc::new(AtomicU64::new(0)),
             });
             Ok(())
@@ -80,6 +107,9 @@ pub fn run() {
             probe_media,
             get_capabilities,
             start_remux,
+            start_encode,
+            enqueue_encode,
+            cancel_all_jobs,
             cancel_job,
             list_jobs,
             subscribe_jobs

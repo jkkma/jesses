@@ -15,7 +15,10 @@ use std::{
     time::Duration,
 };
 use windows_sys::Win32::{
-    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     Security::SECURITY_ATTRIBUTES,
     System::{
         JobObjects::{
@@ -27,10 +30,10 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         Threading::{
             CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList,
-            EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-            STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -45,14 +48,25 @@ pub(super) struct OwnedChild {
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false)
+        Self::spawn_with_input(spec, false, None)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true)
+        Self::spawn_with_input(spec, true, None)
     }
 
-    fn spawn_with_input(spec: &CommandSpec, pipe_stdin: bool) -> io::Result<Self> {
+    pub(super) fn spawn_with_stdin_to_file(
+        spec: &CommandSpec,
+        output: std::fs::File,
+    ) -> io::Result<Self> {
+        Self::spawn_with_input(spec, true, Some(output))
+    }
+
+    fn spawn_with_input(
+        spec: &CommandSpec,
+        pipe_stdin: bool,
+        output: Option<std::fs::File>,
+    ) -> io::Result<Self> {
         if spec
             .executable
             .extension()
@@ -76,7 +90,26 @@ impl OwnedChild {
             .as_ref()
             .map(|path| wide(path.as_os_str()))
             .transpose()?;
-        let (stdout_read, stdout_write) = pipe()?;
+        let (stdout_read, stdout_write) = if let Some(file) = output {
+            // A seekable duplicate preserves the original ownership/share mode;
+            // never reopen the pathname or make the parent's handle inheritable.
+            let mut duplicate = null_mut();
+            check(unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    file.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            })?;
+            (None, owned(duplicate)?)
+        } else {
+            let (read, write) = pipe()?;
+            (Some(read), write)
+        };
         let (stderr_read, stderr_write) = pipe()?;
         let (stdin_read, stdin_write) = pipe()?;
         // The parent writer must never be inherited: an inherited writer would
@@ -183,7 +216,7 @@ impl OwnedChild {
             job,
             process,
             stdin: stdin_write.map(|file| tokio::fs::File::from_std(std::fs::File::from(file))),
-            stdout: Some(tokio::fs::File::from_std(std::fs::File::from(stdout_read))),
+            stdout: stdout_read.map(|file| tokio::fs::File::from_std(std::fs::File::from(file))),
             stderr: Some(tokio::fs::File::from_std(std::fs::File::from(stderr_read))),
         })
     }
@@ -197,6 +230,13 @@ impl OwnedChild {
 
     pub(super) fn take_stdin(&mut self) -> tokio::fs::File {
         self.stdin.take().expect("piped stdin")
+    }
+
+    pub(super) fn take_output_pipes(&mut self) -> (Option<tokio::fs::File>, tokio::fs::File) {
+        (
+            self.stdout.take(),
+            self.stderr.take().expect("piped stderr"),
+        )
     }
 
     fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
@@ -230,7 +270,10 @@ impl OwnedChild {
                     null_mut(),
                 )
             })?;
-            if info.ActiveProcesses == 0 {
+            // Job accounting may reach zero before the leader's asynchronous
+            // termination finishes releasing its kernel/file handles. Waiting
+            // for its signaled process object also waits for that teardown.
+            if info.ActiveProcesses == 0 && self.try_wait()?.is_some() {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {

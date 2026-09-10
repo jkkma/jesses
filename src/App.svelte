@@ -26,6 +26,7 @@
   import FileInspector from '$lib/features/files/FileInspector.svelte';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
   import Remux from '$lib/features/remux/Remux.svelte';
+  import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import {
     chooseMediaFiles,
@@ -35,9 +36,18 @@
     subscribeDrop,
     subscribeJobs,
     startRemux,
+    startEncode,
+    enqueueEncode,
+    cancelAllJobs,
     cancelJob,
   } from '$lib/ipc/client';
-  import type { JobSnapshot, RemuxRequest, MediaFile, ToolInfo } from '$lib/ipc/generated';
+  import type {
+    EncodeRequest,
+    JobSnapshot,
+    RemuxRequest,
+    MediaFile,
+    ToolInfo,
+  } from '$lib/ipc/generated';
   import {
     displayCodec,
     errorMessage,
@@ -66,6 +76,39 @@
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
   let jobsConnected = $state(false);
+  let jobsError = $state<string | null>(null);
+  let jobsConnecting = $state(false);
+  let stopJobSubscription: (() => void) | undefined;
+  let jobsDisposed = false;
+  const terminalJob = (state: string) =>
+    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
+  const currentJob = $derived(
+    jobs.find((job) => !terminalJob(job.state) && job.state !== 'queued') ??
+      jobs.filter((job) => job.state === 'queued').at(-1) ??
+      jobs[0],
+  );
+
+  async function connectJobs() {
+    if (!desktop || jobsConnecting) return;
+    jobsConnecting = true;
+    jobsError = null;
+    jobsConnected = false;
+    stopJobSubscription?.();
+    try {
+      const stop = await subscribeJobs((snapshot) => {
+        if (jobsDisposed) return;
+        jobs = snapshot;
+        jobsConnected = true;
+      });
+      if (jobsDisposed) stop();
+      else stopJobSubscription = stop;
+    } catch (error) {
+      jobsError = errorMessage(error);
+      addLog(`Job connection failed: ${jobsError}`, 'error');
+    } finally {
+      jobsConnecting = false;
+    }
+  }
 
   async function submitRemux(request: RemuxRequest) {
     const job = await startRemux(request);
@@ -76,8 +119,22 @@
 
   async function stopJob(id: string) {
     const job = await cancelJob(id);
+    jobs = jobs.map((entry) => (entry.id === id && !terminalJob(entry.state) ? job : entry));
+  }
+  async function submitEncode(request: EncodeRequest) {
+    const job = await startEncode(request);
+    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
+    addLog('AV1 encode job submitted.');
+  }
+  async function queueEncode(request: EncodeRequest) {
+    const job = await enqueueEncode(request);
+    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
+    addLog('AV1 encode added to the queue.');
+  }
+  async function stopQueue() {
+    const snapshots = await cancelAllJobs();
     jobs = jobs.map((entry) =>
-      entry.id === id && !['succeeded', 'failed', 'canceled'].includes(entry.state) ? job : entry,
+      terminalJob(entry.state) ? entry : (snapshots.find((job) => job.id === entry.id) ?? entry),
     );
   }
   const selectedFile = $derived(files.find((file) => file.id === selectedId));
@@ -252,20 +309,9 @@
     }
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    let stopJobs: (() => void) | undefined;
     if (desktop) {
       void refreshTools();
-      void subscribeJobs((snapshot) => {
-        jobs = snapshot;
-        jobsConnected = true;
-      })
-        .then((stop) => {
-          if (disposed) stop();
-          else stopJobs = stop;
-        })
-        .catch((error) => {
-          addLog(`Job connection failed: ${errorMessage(error)}`, 'error');
-        });
+      void connectJobs();
       void subscribeDrop((paths) => {
         void importPaths(paths);
       })
@@ -280,7 +326,8 @@
     return () => {
       disposed = true;
       unlisten?.();
-      stopJobs?.();
+      jobsDisposed = true;
+      stopJobSubscription?.();
     };
   });
 
@@ -555,8 +602,6 @@
           >
         </div>
       </section>
-    {:else if view === 'convert'}
-      <QuickConvert file={selectedFile} onfiles={() => (view = 'files')} />
     {:else if view === 'tools'}
       <ToolsPanel
         {tools}
@@ -566,6 +611,32 @@
         onrefresh={refreshTools}
       />
     {/if}
+    {#if (view === 'convert' || view === 'remux') && jobsError}
+      <div class="notice error-notice" role="alert">
+        <CircleAlert size={16} aria-hidden="true" />
+        <div>
+          <p><strong>Job controls are unavailable.</strong> {jobsError}</p>
+          <p>
+            Files remains available. For a storage problem, correct it and restart jesses. Reconnect
+            retries the job connection.
+          </p>
+        </div>
+        <Button variant="outline" onclick={connectJobs} disabled={jobsConnecting}
+          >Reconnect jobs</Button
+        >
+      </div>
+    {/if}
+    <div hidden={view !== 'convert'}>
+      <QuickConvert
+        file={selectedFile}
+        {tools}
+        {jobs}
+        connected={jobsConnected}
+        onfiles={() => (view = 'files')}
+        onstart={submitEncode}
+        onqueue={queueEncode}
+      />
+    </div>
     <div hidden={view !== 'remux'}>
       <Remux
         file={selectedFile}
@@ -574,9 +645,14 @@
         connected={jobsConnected}
         onfiles={() => (view = 'files')}
         onstart={submitRemux}
-        oncancel={stopJob}
       />
     </div>
+    {#if view === 'convert' || view === 'remux'}<JobStatus
+        job={currentJob}
+        {jobs}
+        oncancel={stopJob}
+        onstop={stopQueue}
+      />{/if}
   </main>
 
   <section class="log-panel" class:expanded={logOpen} aria-label="Activity log">

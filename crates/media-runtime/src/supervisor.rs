@@ -206,13 +206,65 @@ pub async fn run_pipeline(
     log_path: &Path,
     time_limit: Duration,
 ) -> Result<PipelineResult, SupervisorError> {
+    run_pipeline_inner(
+        producer_spec,
+        consumer_spec,
+        cancel,
+        events,
+        log_path,
+        time_limit,
+        None,
+    )
+    .await
+}
+
+/// As `run_pipeline`, with consumer stdout inheriting an already-owned seekable
+/// file. Encoders can rewrite container headers through stdout. Neither raw
+/// stream is logged. The child trees close their file handles before normal
+/// completion/cancellation returns; the caller must flush and validate the file.
+/// A `Cleanup` error means process termination could not be confirmed; callers
+/// must preserve the temporary artifact rather than assume all handles closed.
+pub async fn run_pipeline_to_file(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    output: std::fs::File,
+) -> Result<PipelineResult, SupervisorError> {
+    run_pipeline_inner(
+        producer_spec,
+        consumer_spec,
+        cancel,
+        events,
+        log_path,
+        time_limit,
+        Some(output),
+    )
+    .await
+}
+
+async fn run_pipeline_inner(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    output: Option<std::fs::File>,
+) -> Result<PipelineResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
     // Start the reader first. Each stage has its own owned tree; failure to
     // launch either stage tears down everything already started.
-    let mut consumer = platform::OwnedChild::spawn_with_stdin(consumer_spec)?;
+    let mut consumer = if let Some(file) = output {
+        platform::OwnedChild::spawn_with_stdin_to_file(consumer_spec, file)?
+    } else {
+        platform::OwnedChild::spawn_with_stdin(consumer_spec)?
+    };
     let mut producer = match platform::OwnedChild::spawn(producer_spec) {
         Ok(child) => child,
         Err(error) => {
@@ -225,8 +277,19 @@ pub async fn run_pipeline(
     };
     let (producer_stdout, producer_stderr) = producer.take_pipes();
     let consumer_stdin = consumer.take_stdin();
-    let (consumer_stdout, consumer_stderr) = consumer.take_pipes();
+    let (consumer_stdout, consumer_stderr) = consumer.take_output_pipes();
     let delivered = AtomicBool::new(false);
+    // File-output mode has no stdout pipe: the child owns a seekable duplicate,
+    // and process-tree cleanup closes every inherited copy before returning.
+    let consumer_output = async {
+        if let Some(consumer_stdout) = consumer_stdout {
+            drain_stage(consumer_stdout, false, Some("consumer"), &events, &log).await
+        } else {
+            Ok::<_, SupervisorError>(())
+        }
+    };
+    tokio::pin!(consumer_output);
+    let mut consumer_output_done = false;
     let execution = async {
         let producer_wait = producer.wait_and_terminate_descendants();
         let consumer_wait = consumer.wait_and_terminate_descendants();
@@ -234,7 +297,6 @@ pub async fn run_pipeline(
         let diagnostics = async {
             tokio::try_join!(
                 drain_stage(producer_stderr, true, Some("producer"), &events, &log),
-                drain_stage(consumer_stdout, false, Some("consumer"), &events, &log),
                 drain_stage(consumer_stderr, true, Some("consumer"), &events, &log),
             )?;
             Ok::<_, SupervisorError>(())
@@ -267,12 +329,23 @@ pub async fn run_pipeline(
                     result?;
                     diagnostics_done = true;
                 }
+                result = &mut consumer_output, if !consumer_output_done => {
+                    consumer_output_done = true;
+                    result?;
+                }
             }
-            if let (Some(producer_status), Some(consumer_status), Some(bytes_transferred), true) = (
+            if let (
+                Some(producer_status),
+                Some(consumer_status),
+                Some(bytes_transferred),
+                true,
+                true,
+            ) = (
                 producer_status,
                 consumer_status,
                 bytes_transferred,
                 diagnostics_done,
+                consumer_output_done,
             ) {
                 return Ok(PipelineResult {
                     producer_status,
@@ -294,6 +367,12 @@ pub async fn run_pipeline(
         tokio::join!(producer.terminate_and_wait(), consumer.terminate_and_wait(),);
     producer_cleanup.map_err(SupervisorError::Cleanup)?;
     consumer_cleanup.map_err(SupervisorError::Cleanup)?;
+    let output_result = if consumer_output_done {
+        Ok(())
+    } else {
+        consumer_output.await
+    };
+    output_result?;
     log.lock().await.flush().await?;
     result
 }
@@ -303,7 +382,9 @@ async fn transfer_binary(
     mut consumer: impl AsyncWrite + Unpin,
     delivered: &AtomicBool,
 ) -> io::Result<u64> {
-    let mut buffer = [0_u8; PIPE_BYTES];
+    // Keep large buffers off the async state-machine stack. Nested job/pipeline
+    // futures otherwise overflow Windows' default thread stack when moved.
+    let mut buffer = vec![0_u8; PIPE_BYTES];
     let mut total = 0_u64;
     loop {
         let count = read_pipe(&mut producer, &mut buffer).await?;

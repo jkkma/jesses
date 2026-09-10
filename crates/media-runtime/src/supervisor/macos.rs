@@ -86,8 +86,10 @@ mod tests {
     #[tokio::test]
     async fn exited_unreaped_leader_is_confirmed_zombie_only_before_cleanup() {
         let spec = crate::supervisor::CommandSpec {
-            executable: "/bin/true".into(),
-            args: Vec::new(),
+            // An empty test selection exits normally with tiny output and does
+            // not depend on platform-specific locations of external utilities.
+            executable: std::env::current_exe().unwrap(),
+            args: vec!["--exact".into(), "__supervisor_empty_selection__".into()],
             cwd: None,
         };
         let mut child = super::super::OwnedChild::spawn(&spec).unwrap();

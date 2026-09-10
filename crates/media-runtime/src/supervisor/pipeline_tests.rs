@@ -69,6 +69,159 @@ async fn binary_pipeline_preserves_all_bytes_and_keeps_them_out_of_logs() {
 }
 
 #[tokio::test]
+async fn pipeline_file_sink_is_binary_exact_without_stdout_events() {
+    let (producer, consumer) = fixtures("binary-producer", "binary-relay");
+    let output_path = consumer.0.join("encoded.bin");
+    let output = std::fs::File::create(&output_path).unwrap();
+    let (_cancel, receiver) = watch::channel(false);
+    let (events, mut receiver_events) = mpsc::channel(512);
+    let log = producer.0.join("pipeline.log");
+    let result = run_pipeline_to_file(
+        &producer.spec(),
+        &consumer.spec(),
+        receiver,
+        events,
+        &log,
+        Duration::from_secs(15),
+        output,
+    )
+    .await
+    .unwrap();
+    assert!(result.producer_status.success() && result.consumer_status.success());
+    let output = std::fs::read(output_path).unwrap();
+    let marker = output
+        .windows(RAW_MARKER.len())
+        .position(|value| value == RAW_MARKER)
+        .unwrap();
+    let binary = &output[marker + RAW_MARKER.len()..];
+    assert_eq!(binary.len(), BINARY_CHUNKS * RECORD_BYTES);
+    assert!(
+        binary
+            .as_chunks::<RECORD_BYTES>()
+            .0
+            .iter()
+            .all(|block| *block == binary_block())
+    );
+    while let Ok(event) = receiver_events.try_recv() {
+        assert!(
+            matches!(event, ProcessEvent::Stderr(_)),
+            "raw stdout leaked to diagnostics"
+        );
+    }
+    let log = std::fs::read_to_string(log).unwrap();
+    assert!(!log.contains("RAW_BYTES_MUST_NEVER_ENTER_TEXT_LOGS"));
+    assert!(log.contains("binary relay diagnostic"));
+}
+
+#[tokio::test]
+async fn file_sink_stdout_is_seekable_for_encoder_header_rewrites() {
+    let (producer, consumer) = fixtures("binary-producer", "seekable-consumer");
+    let output_path = consumer.0.join("seekable.bin");
+    let output = std::fs::File::create(&output_path).unwrap();
+    let (_cancel, receiver) = watch::channel(false);
+    let (events, mut receiver_events) = mpsc::channel(512);
+    let result = run_pipeline_to_file(
+        &producer.spec(),
+        &consumer.spec(),
+        receiver,
+        events,
+        &producer.0.join("pipeline.log"),
+        Duration::from_secs(15),
+        output,
+    )
+    .await
+    .unwrap();
+    let output = std::fs::read(output_path).unwrap();
+    assert!(result.producer_status.success() && result.consumer_status.success());
+    assert_eq!(&output[..8], b"HEADdone");
+    assert_eq!(output.len() as u64, result.bytes_transferred + 8);
+    assert_eq!(&output[output.len() - RECORD_BYTES..], &binary_block());
+    while let Ok(event) = receiver_events.try_recv() {
+        assert!(matches!(event, ProcessEvent::Stderr(_)));
+    }
+}
+
+#[tokio::test]
+async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file() {
+    let (producer, consumer) = fixtures("binary-producer-tree", "binary-relay");
+    let output_path = consumer.0.join("readonly.bin");
+    std::fs::write(&output_path, b"preserve").unwrap();
+    let output = std::fs::File::open(&output_path).unwrap();
+    let (_cancel, receiver) = watch::channel(false);
+    let (events, _unread) = mpsc::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_pipeline_to_file(
+            &producer.spec(),
+            &consumer.spec(),
+            receiver,
+            events,
+            &producer.0.join("pipeline.log"),
+            Duration::from_secs(30),
+            output,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&output_path).unwrap(), b"preserve");
+    // A sink error can occur before the tool helper itself starts. Every known
+    // PID must be terminated; native job ownership also covers unobserved ones.
+    for fixture in [&producer, &consumer] {
+        if let Ok(pid) = std::fs::read_to_string(fixture.0.join("pid")) {
+            assert_dead(&[pid.parse().unwrap()]).await;
+        }
+    }
+
+    let (producer, consumer) = fixtures("binary-producer-tree", "blocked-consumer-tree");
+    let output_path = consumer.0.join("cancelled.bin");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1 | 2); // A surviving writer would prevent removal.
+    }
+    let output = options.open(&output_path).unwrap();
+    let (cancel, receiver) = watch::channel(false);
+    let (events, _unread) = mpsc::channel(1);
+    let producer_spec = producer.spec();
+    let consumer_spec = consumer.spec();
+    let log = producer.0.join("pipeline.log");
+    let task = tokio::spawn(async move {
+        run_pipeline_to_file(
+            &producer_spec,
+            &consumer_spec,
+            receiver,
+            events,
+            &log,
+            Duration::from_secs(30),
+            output,
+        )
+        .await
+    });
+    let pids = [
+        producer.pid(0).await,
+        producer.pid(1).await,
+        producer.pid(2).await,
+        consumer.pid(0).await,
+        consumer.pid(1).await,
+        consumer.pid(2).await,
+    ];
+    cancel.send(true).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(SupervisorError::Cancelled)
+    ));
+    assert_dead(&pids).await;
+    std::fs::remove_file(output_path)
+        .expect("sink handle must be closed before cancellation returns");
+}
+
+#[tokio::test]
 async fn upstream_failure_cannot_be_masked_by_consumer_or_hang_at_eof() {
     let (producer, consumer) = fixtures("binary-fail", "read-then-hang");
     let (_cancel, receiver) = watch::channel(false);
