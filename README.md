@@ -6,14 +6,36 @@ A desktop app for video encoding, muxing, and media analysis, created by **jkkma
 
 Rust, Tauri, Svelte, and shadcn-svelte.
 
-The first development build provides a desktop media workspace with native file
+The development build provides a desktop media workspace with native file
 selection and drag/drop, FFprobe metadata and stream inspection, and detection of
 FFmpeg, FFprobe, standalone SVT-AV1, and av1an on PATH. The interface uses a fixed
-parchment-and-rust light theme.
+parchment-and-rust light theme. The Remux tab copies selected streams from one
+source into a new Matroska file, with progress, cancellation, and output validation.
 
-Quick Convert currently shows a disabled configuration preview. Encoding, muxing,
-folder import, thumbnails, saved jobs, and bundled media tools are not implemented
-yet. This is a development foundation, not a release.
+Quick Convert currently shows a disabled encoding configuration preview. Encoding,
+multi-source muxing, folder import, thumbnails, batch processing, saved jobs,
+pause/resume, and bundled media tools are not implemented yet. This is a development
+build, not a release.
+
+## Remux a file
+
+Add a local file in Files, open Remux, choose the streams and their order, and
+select a new `.mkv` destination. Keep attachments after video/audio/subtitle tracks.
+At least one video or audio track is required. FFmpeg and FFprobe must be on PATH.
+Streams are copied without encoding; unsupported Matroska streams fail explicitly.
+
+Existing destinations are never replaced. The app writes a temporary sibling,
+checks packet counts, selected stream properties, dispositions, metadata, chapters,
+attachment hashes, and duration, then publishes the output without overwriting.
+Publication requires a filesystem with hard-link support (for example NTFS);
+unsupported filesystems fail and leave existing files unchanged. Verification scans
+the source and output, so preparing/finalizing can take time for large files.
+
+One job runs at a time. Cancel stops its owned process tree and removes its
+temporary output. Closing the app also cancels the job. Progress survives a
+webview reload, but job history is in memory and cannot resume after app restart.
+Job logs are stored under the platform app log directory; each tool log retains
+the newest two 4 MiB segments. Cleanup failures are reported with their paths.
 
 ## Run locally
 
@@ -46,6 +68,7 @@ Run the real-tool integration tests separately with FFmpeg/FFprobe on PATH:
 cargo test -p media-runtime --locked -- --include-ignored
 cargo run -p media-runtime --example inspect
 cargo run -p media-runtime --example inspect -- /path/to/video.mkv
+cargo run -p media-runtime --example remux -- /path/to/video.mkv /path/to/new-output.mkv
 ```
 
 Build a native executable with embedded frontend assets:
@@ -67,9 +90,10 @@ signing, clean-machine, and cross-platform runtime qualification remain pending.
 
 Rust owns media contracts. Run `pnpm contracts` after changing the DTOs and review
 the generated TypeScript; CI rejects drift. Native commands launch known tools
-directly with argument arrays, bounded output, and timeouts. The inspection
-adapter is not an encoding process supervisor; process-tree ownership, output
-transactions, durable jobs, and recovery must precede encoding support.
+directly with argument arrays, bounded output, and timeouts. Job supervision uses
+atomic Job Object assignment on Windows 10+ and process groups on Unix. Unix tools
+must not deliberately detach from their process group. Binary encoder pipelines,
+durable recovery, and cross-platform runtime qualification remain future gates.
 
 The activity panel retains at most 200 entries in memory. Only its open/closed
 state persists; source lists and media metadata are session-only.

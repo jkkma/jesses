@@ -25,6 +25,7 @@
   import { Button } from '$lib/components/ui/button';
   import FileInspector from '$lib/features/files/FileInspector.svelte';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
+  import Remux from '$lib/features/remux/Remux.svelte';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import {
     chooseMediaFiles,
@@ -32,8 +33,11 @@
     isDesktop,
     probeMedia,
     subscribeDrop,
+    subscribeJobs,
+    startRemux,
+    cancelJob,
   } from '$lib/ipc/client';
-  import type { MediaFile, ToolInfo } from '$lib/ipc/generated';
+  import type { JobSnapshot, RemuxRequest, MediaFile, ToolInfo } from '$lib/ipc/generated';
   import {
     displayCodec,
     errorMessage,
@@ -42,7 +46,7 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'convert' | 'tools';
+  type View = 'files' | 'convert' | 'remux' | 'tools';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
@@ -60,6 +64,22 @@
   let logs = $state<LogEntry[]>([]);
   let logOpen = $state(false);
   let nextLogId = 0;
+  let jobs = $state<JobSnapshot[]>([]);
+  let jobsConnected = $state(false);
+
+  async function submitRemux(request: RemuxRequest) {
+    const job = await startRemux(request);
+    // A channel snapshot may arrive before the command reply. Never regress it.
+    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
+    addLog('Remux job submitted.');
+  }
+
+  async function stopJob(id: string) {
+    const job = await cancelJob(id);
+    jobs = jobs.map((entry) =>
+      entry.id === id && !['succeeded', 'failed', 'canceled'].includes(entry.state) ? job : entry,
+    );
+  }
   const selectedFile = $derived(files.find((file) => file.id === selectedId));
   const totalSize = $derived(files.reduce((total, file) => total + Number(file.sizeBytes), 0));
   const hasSample = $derived(files.some((file) => file.id === sampleId));
@@ -232,8 +252,20 @@
     }
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    let stopJobs: (() => void) | undefined;
     if (desktop) {
       void refreshTools();
+      void subscribeJobs((snapshot) => {
+        jobs = snapshot;
+        jobsConnected = true;
+      })
+        .then((stop) => {
+          if (disposed) stop();
+          else stopJobs = stop;
+        })
+        .catch((error) => {
+          addLog(`Job connection failed: ${errorMessage(error)}`, 'error');
+        });
       void subscribeDrop((paths) => {
         void importPaths(paths);
       })
@@ -248,6 +280,7 @@
     return () => {
       disposed = true;
       unlisten?.();
+      stopJobs?.();
     };
   });
 
@@ -314,6 +347,12 @@
         aria-current={view === 'convert' ? 'page' : undefined}
         onclick={() => (view = 'convert')}
         ><SlidersHorizontal size={16} aria-hidden="true" />Quick Convert</button
+      >
+      <button
+        type="button"
+        class:active={view === 'remux'}
+        aria-current={view === 'remux' ? 'page' : undefined}
+        onclick={() => (view = 'remux')}>Remux</button
       >
       <button
         type="button"
@@ -518,7 +557,7 @@
       </section>
     {:else if view === 'convert'}
       <QuickConvert file={selectedFile} onfiles={() => (view = 'files')} />
-    {:else}
+    {:else if view === 'tools'}
       <ToolsPanel
         {tools}
         {desktop}
@@ -527,6 +566,17 @@
         onrefresh={refreshTools}
       />
     {/if}
+    <div hidden={view !== 'remux'}>
+      <Remux
+        file={selectedFile}
+        {tools}
+        {jobs}
+        connected={jobsConnected}
+        onfiles={() => (view = 'files')}
+        onstart={submitRemux}
+        oncancel={stopJob}
+      />
+    </div>
   </main>
 
   <section class="log-panel" class:expanded={logOpen} aria-label="Activity log">

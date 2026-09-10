@@ -23,3 +23,9 @@ id: string, path: string, name: string,
 sizeBytes: string, durationSeconds: number | null, format: string | null, streams: Array<MediaStream>, };
 
 export type AppError = { code: string, message: string, path: string | null, };
+
+export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
+
+export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "canceled" | "failed";
+
+export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };

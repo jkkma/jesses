@@ -1,7 +1,7 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
+import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { open } from '@tauri-apps/plugin-dialog';
-import type { MediaFile, ToolInfo } from './generated';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import type { JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from './generated';
 
 export function isDesktop(): boolean {
   return isTauri();
@@ -65,6 +65,38 @@ export async function probeMedia(path: string): Promise<MediaFile> {
 export async function getCapabilities(): Promise<ToolInfo[]> {
   requireDesktop();
   return invoke<ToolInfo[]>('get_capabilities');
+}
+
+export async function chooseRemuxDestination(defaultPath: string): Promise<string | null> {
+  requireDesktop();
+  return save({
+    title: 'Save remuxed media',
+    defaultPath,
+    filters: [{ name: 'Matroska', extensions: ['mkv'] }],
+  });
+}
+
+export async function startRemux(request: RemuxRequest): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('start_remux', { request });
+}
+
+export async function cancelJob(id: string): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('cancel_job', { id });
+}
+
+export async function subscribeJobs(handler: (jobs: JobSnapshot[]) => void): Promise<() => void> {
+  requireDesktop();
+  let disposed = false;
+  const channel = new Channel<JobSnapshot[]>();
+  channel.onmessage = (jobs) => {
+    if (!disposed) handler(jobs);
+  };
+  await invoke('subscribe_jobs', { channel });
+  return () => {
+    disposed = true;
+  };
 }
 
 export async function subscribeDrop(handler: (paths: string[]) => void): Promise<() => void> {

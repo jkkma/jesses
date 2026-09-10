@@ -62,7 +62,14 @@ async function desktopMock(page: Page, paths: string[]) {
       state.__TAURI_INTERNALS__ = {
         metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
         transformCallback: () => 1,
-        invoke: async (command: string, payload: { path?: string }) => {
+        invoke: async (
+          command: string,
+          payload: { path?: string; channel?: { onmessage: (value: unknown[]) => void } },
+        ) => {
+          if (command === 'subscribe_jobs') {
+            payload.channel?.onmessage([]);
+            return;
+          }
           if (command === 'get_capabilities') return tools;
           if (command === 'plugin:dialog|open') return pickedPaths;
           if (command.startsWith('plugin:event|')) return 1;

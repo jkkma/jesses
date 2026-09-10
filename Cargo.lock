@@ -1807,11 +1807,13 @@ dependencies = [
 name = "media-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "media-core",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
