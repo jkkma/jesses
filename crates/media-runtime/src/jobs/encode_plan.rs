@@ -3,13 +3,14 @@ use serde::Deserialize;
 
 use super::metadata::{Document, Stream};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Plan {
     pub video_index: u32,
     pub width: u32,
     pub height: u32,
     pub fps_num: u32,
     pub fps_den: u32,
+    pub cadence_reconciled: bool,
     pub tolerance: f64,
     pub primaries: u8,
     pub transfer: u8,
@@ -175,6 +176,7 @@ impl Plan {
             height,
             fps_num,
             fps_den,
+            cadence_reconciled: false,
             tolerance,
             primaries: sdr_color(video.color_primaries.as_deref())?,
             transfer: sdr_color(video.color_transfer.as_deref())?,
@@ -203,6 +205,35 @@ impl Plan {
 
     pub fn frame_seconds(&self) -> f64 {
         f64::from(self.fps_den) / f64::from(self.fps_num)
+    }
+
+    pub fn validate_source_frames(
+        &mut self,
+        frames: &Frames,
+        stream: &Stream,
+    ) -> Result<usize, AppError> {
+        let declared_error = match self.validate_frames(frames, stream, false) {
+            Ok(count) => return Ok(count),
+            Err(error) => error,
+        };
+        // Some sources declare NTSC 24000/1001 but author their timestamps at
+        // decimal 23.976. This fixed alternative differs by one part per million.
+        // Never estimate an arbitrary cadence or widen the per-frame tolerance:
+        // every timestamp AND every frame's metadata must validate at one rate.
+        if u64::from(self.fps_num) * 1001 != u64::from(self.fps_den) * 24000 {
+            return Err(declared_error);
+        }
+        let mut candidate = self.clone();
+        candidate.fps_num = 2997;
+        candidate.fps_den = 125;
+        candidate.cadence_reconciled = true;
+        match candidate.validate_frames(frames, stream, false) {
+            Ok(count) => {
+                *self = candidate;
+                Ok(count)
+            }
+            Err(_) => Err(declared_error),
+        }
     }
 
     pub fn validate_frames(
@@ -322,7 +353,7 @@ pub(super) struct Frames {
     pub frames: Vec<Frame>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(super) struct Frame {
     best_effort_timestamp_time: Option<String>,
     interlaced_frame: Option<u8>,
@@ -366,6 +397,123 @@ mod tests {
             plan.validate_frames(&frames(&["0", "0.042", "0.100"]), &source.streams[0], false)
                 .is_err()
         );
+    }
+
+    fn long_cfr_frames(num: u64, den: u64) -> Frames {
+        let template = frames(&["0"]).frames.pop().unwrap();
+        Frames {
+            frames: (0..40_000)
+                .map(|index| {
+                    let mut frame = template.clone();
+                    let millis = (index * den * 1000 + num / 2) / num;
+                    frame.best_effort_timestamp_time =
+                        Some(format!("{}.{:03}", millis / 1000, millis % 1000));
+                    frame
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn long_ntsc_and_decimal_cadences_validate_without_widening_tolerance() {
+        let source = source();
+        for (num, den) in [(24000, 1001), (2997, 125)] {
+            let mut plan = Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings::default(),
+            )
+            .unwrap();
+            let frames = long_cfr_frames(num, den);
+            let tolerance = plan.tolerance;
+            if num == 2997 {
+                assert!(
+                    plan.validate_frames(&frames, &source.streams[0], false)
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                plan.validate_source_frames(&frames, &source.streams[0])
+                    .unwrap(),
+                40_000
+            );
+            assert_eq!((plan.fps_num, plan.fps_den), (num as u32, den as u32));
+            assert_eq!(plan.tolerance, tolerance);
+            let mut output = frames;
+            for frame in &mut output.frames {
+                frame.pix_fmt = Some("yuv420p10le".into());
+            }
+            assert!(
+                plan.validate_frames(&output, &source.streams[0], true)
+                    .is_ok()
+            );
+            if num == 2997 {
+                // Output must preserve the selected cadence, not revert to the
+                // declared rate after reconciliation.
+                let mut wrong_rate = long_cfr_frames(24000, 1001);
+                for frame in &mut wrong_rate.frames {
+                    frame.pix_fmt = Some("yuv420p10le".into());
+                }
+                assert!(
+                    plan.validate_frames(&wrong_rate, &source.streams[0], true)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_rejects_gaps_duplicates_nonlinear_drift_and_changed_frames() {
+        let source = source();
+        for defect in [
+            "gap",
+            "duplicate",
+            "nonlinear",
+            "offset",
+            "geometry",
+            "color",
+            "hdr",
+        ] {
+            let mut plan = Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings::default(),
+            )
+            .unwrap();
+            let mut frames = long_cfr_frames(2997, 125);
+            match defect {
+                "gap" => {
+                    for frame in &mut frames.frames[20_000..] {
+                        let time = seconds(frame.best_effort_timestamp_time.as_deref()).unwrap();
+                        frame.best_effort_timestamp_time = Some(format!("{:.6}", time + 0.042));
+                    }
+                }
+                "duplicate" => {
+                    frames.frames[20_000].best_effort_timestamp_time =
+                        frames.frames[19_999].best_effort_timestamp_time.clone()
+                }
+                "nonlinear" => {
+                    for (index, frame) in frames.frames.iter_mut().enumerate() {
+                        let time = seconds(frame.best_effort_timestamp_time.as_deref()).unwrap();
+                        let drift = 0.005 * (index as f64 / 40_000.0).powi(2);
+                        frame.best_effort_timestamp_time = Some(format!("{:.6}", time + drift));
+                    }
+                }
+                "offset" => frames.frames[0].best_effort_timestamp_time = Some("0.010".into()),
+                "geometry" => frames.frames[20_000].sample_aspect_ratio = Some("4:3".into()),
+                "color" => frames.frames[20_000].color_primaries = Some("bt2020".into()),
+                "hdr" => frames.frames[20_000]
+                    .side_data_list
+                    .push(serde_json::json!({"side_data_type": "Mastering display metadata"})),
+                _ => unreachable!(),
+            }
+            assert!(
+                plan.validate_source_frames(&frames, &source.streams[0])
+                    .is_err(),
+                "{defect}"
+            );
+            assert_eq!((plan.fps_num, plan.fps_den), (24000, 1001));
+        }
     }
 
     #[test]

@@ -13,25 +13,34 @@ parchment-and-rust light theme. The Remux tab copies selected streams from one
 source into a new Matroska file, with progress, cancellation, and output validation.
 
 Quick Convert encodes one selected video with standalone SVT-AV1 and copies the
-selected audio, subtitles, and attachments. Jobs can be queued sequentially and
-their settings and history survive restart. Multi-source muxing, folder import,
-thumbnails, audio conversion, pause/resume, and bundled media tools remain pending.
+selected audio, subtitles, and attachments. Folder import and Batch encode prepare
+multiple files with individual track selections and common quality settings.
+Jobs run sequentially, and their settings and history survive restart. Multi-source
+muxing, thumbnails, audio conversion, pause/resume, and bundled media tools remain pending.
 This is a development build, not a release.
 
 ## Encode a file
 
 Add a local file in Files, open Quick Convert, choose the video and copied tracks,
 and select a new `.mkv` destination. CRF 30 and preset 4 are the initial settings;
-the output video is 10-bit AV1. FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
+CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
+FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
 must be on PATH. The selected tool and its version appear in the job log.
 
 The first encoder supports progressive, constant-frame-rate SDR video with
 explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. It rejects
 HDR, variable frame rates, rotation, unsupported chroma placement, and nonzero
-video/container start times. Source and encoded frames are decoded for timing,
+video/container start times. Dimensions must be even, from 64 through 8192 pixels,
+and frame rates must be between 1 and 120 fps. Source and encoded frames are decoded for timing,
 frame count, geometry, and color validation before the output is published. Each
 frame scan has a 10-minute and 64 MiB metadata limit; sources beyond those limits
 fail explicitly. Selected non-video tracks keep their original codecs.
+
+A source declaring `24000/1001` fps may use timestamps authored at decimal
+`23.976` (`2997/125`) fps. The encoder accepts that one alternative only when every
+decoded frame fits the existing timestamp tolerance and all frame metadata checks
+pass. The accepted cadence is used for decoding, encoding, and output validation;
+the tolerance is not widened to accept gaps or variable frame rates.
 
 Use **Start encode** for an idle workspace or **Add to queue** to submit an
 immutable settings snapshot. Change the source or destination to add another job.
@@ -39,6 +48,37 @@ One job runs at a time, in submission order. **Cancel job** stops one job;
 **Stop queue** cancels the active job and every waiting job. A failed job does not
 prevent later queued jobs from running. Every input and destination is rechecked
 when its job starts.
+
+## Import a folder and prepare a batch
+
+In Files, choose **Add folder** and optionally include subfolders. Discovery reads
+regular files with supported media extensions, sorts the discovered paths, and
+skips symbolic links and Windows reparse points. Errors and skipped entries remain
+visible. A scan returns at most 500 media files after examining at most 10,000
+entries; discovery times out after 30 seconds. A truncated scan should be retried
+with a smaller folder. **Stop import** keeps completed imports and discards late
+results; the current read-only scan or probe may finish in the background.
+
+Open **Batch encode**, select up to 100 files, and review the video and copied
+tracks for each file. Choose common CRF/preset settings and an existing writable
+output folder, then select **Preview batch**. The app proposes names such as
+`episode_av1.mkv` and `episode_av1_2.mkv`, avoiding existing files and destinations
+already reserved in the queue. Unicode names and spaces are retained where valid.
+The preview creates no output files or folders.
+
+The preview reports per-file selection and header compatibility errors. Each
+FFprobe header inspection is limited to 30 seconds and 2 MiB of metadata. A ready
+row still requires the full decoded-frame and output validation when its job runs.
+Changing files, tracks, quality settings, or the output folder requires a new
+preview.
+
+**Queue ready files** submits only the ready rows, with immutable per-file
+settings, in the reviewed order. The entire submitted batch must pass admission
+and fit the 100-record queue/history capacity before any new job is added. A
+collision, invalid input, or history-write failure rejects the submission without
+partially adding it. **Stop queue** also invalidates a batch submission whose
+source checks are still in progress. Preview again before retrying a rejected
+batch.
 
 ## Remux a file
 
@@ -121,7 +161,7 @@ signing, clean-machine, and cross-platform runtime qualification remain pending.
 - `src-tauri/`: desktop entry point and window command permissions.
 - `crates/media-core/`: platform-independent metadata and error contracts.
 - `crates/media-runtime/`: tool discovery, probing, process pipelines, validated
-  output transactions, and job history/queue.
+  output transactions, folder/batch preparation, and job history/queue.
 - `tests/`: browser workflows and synthetic fixture recipes.
 
 Rust owns media contracts. Run `pnpm contracts` after changing the DTOs and review

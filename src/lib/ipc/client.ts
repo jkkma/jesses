@@ -1,7 +1,17 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import type { EncodeRequest, JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from './generated';
+import type {
+  BatchEncodePreview,
+  BatchEncodeRequest,
+  EncodeRequest,
+  FolderScanRequest,
+  FolderScanResult,
+  JobSnapshot,
+  MediaFile,
+  RemuxRequest,
+  ToolInfo,
+} from './generated';
 
 export function isDesktop(): boolean {
   return isTauri();
@@ -60,6 +70,31 @@ export async function chooseMediaFiles(): Promise<string[]> {
 export async function probeMedia(path: string): Promise<MediaFile> {
   requireDesktop();
   return invoke<MediaFile>('probe_media', { path });
+}
+
+export async function chooseMediaFolder(): Promise<string | null> {
+  requireDesktop();
+  return open({ directory: true, multiple: false, title: 'Add media folder to jesses' });
+}
+
+export async function chooseOutputFolder(): Promise<string | null> {
+  requireDesktop();
+  return open({ directory: true, multiple: false, title: 'Choose batch output folder' });
+}
+
+export async function scanMediaFolder(request: FolderScanRequest): Promise<FolderScanResult> {
+  requireDesktop();
+  return invoke<FolderScanResult>('scan_media_folder', { request });
+}
+
+export async function previewEncodeBatch(request: BatchEncodeRequest): Promise<BatchEncodePreview> {
+  requireDesktop();
+  return invoke<BatchEncodePreview>('preview_encode_batch', { request });
+}
+
+export async function enqueueEncodeBatch(requests: EncodeRequest[]): Promise<JobSnapshot[]> {
+  requireDesktop();
+  return invoke<JobSnapshot[]>('enqueue_encode_batch', { requests });
 }
 
 export async function getCapabilities(): Promise<ToolInfo[]> {

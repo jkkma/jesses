@@ -1,6 +1,8 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
+#[cfg(test)]
+mod batch_tests;
 mod encode;
 mod encode_plan;
 mod files;
@@ -10,6 +12,7 @@ mod metadata;
 mod real_tests;
 
 use std::{
+    collections::HashSet,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -19,7 +22,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use media_core::{AppError, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
+use media_core::{
+    AppError, BatchEncodeInput, BatchEncodePreview, BatchEncodeRequest, EncodeRequest,
+    EncodeSettings, JobSnapshot, JobState, RemuxRequest,
+};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use crate::{
@@ -39,11 +45,18 @@ struct Entry {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+struct Preflight {
+    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Default)]
 struct State {
     entries: Vec<Entry>,
+    preflights: Vec<Preflight>,
     shutting_down: bool,
     storage_error: Option<AppError>,
+    submission_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -59,6 +72,14 @@ fn canceled() -> AppError {
     AppError::new(
         "JOB_CANCELED",
         "The job was canceled. No output was published.",
+        None,
+    )
+}
+
+fn batch_canceled() -> AppError {
+    AppError::new(
+        "BATCH_CANCELED",
+        "Stop Queue canceled this batch while its sources were being checked. No jobs were added.",
         None,
     )
 }
@@ -173,6 +194,278 @@ impl JobManager {
             .await
     }
 
+    pub async fn preview_encode_batch(
+        &self,
+        request: BatchEncodeRequest,
+    ) -> Result<BatchEncodePreview, AppError> {
+        encode::validate_settings(&EncodeSettings {
+            video_stream_index: 0,
+            crf: request.crf,
+            preset: request.preset,
+        })?;
+        let (queued, epoch) = {
+            let state = self.state.lock().await;
+            let queued: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|entry| !entry.snapshot.state.is_terminal())
+                .map(|entry| entry.snapshot.request.output_path.clone())
+                .collect();
+            (queued, state.submission_epoch)
+        };
+        let reserved = queued
+            .iter()
+            .map(|path| {
+                crate::batch::destination_key(Path::new(path))
+                    .unwrap_or_else(|_| crate::batch::path_key(Path::new(path)))
+            })
+            .collect();
+        crate::batch::preview(self, request, reserved, epoch).await
+    }
+
+    pub(crate) async fn inspect_encode_source(
+        &self,
+        input: &BatchEncodeInput,
+        epoch: u64,
+    ) -> Result<media_core::MediaFile, AppError> {
+        let input = input.clone();
+        self.run_preflight(epoch, move |cancel| async move {
+            inspect_encode_source(&input, &cancel).await
+        })
+        .await
+    }
+
+    async fn run_preflight<T, F, Fut>(&self, epoch: u64, action: F) -> Result<T, AppError>
+    where
+        T: Send + 'static,
+        F: FnOnce(watch::Receiver<bool>) -> Fut,
+        Fut: Future<Output = Result<T, AppError>> + Send + 'static,
+    {
+        let mut state = self.state.lock().await;
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; source inspection cannot start.",
+                None,
+            ));
+        }
+        if epoch != state.submission_epoch {
+            return Err(batch_canceled());
+        }
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        state.preflights.retain(|entry| !entry.task.is_finished());
+        let (cancel, receiver) = watch::channel(false);
+        let (sender, result) = tokio::sync::oneshot::channel();
+        let work = action(receiver);
+        let task = tokio::spawn(async move {
+            let result = work.await.map_err(|error| {
+                if error.code == "JOB_CANCELED" {
+                    batch_canceled()
+                } else {
+                    error
+                }
+            });
+            let _ = sender.send(result);
+        });
+        state.preflights.push(Preflight { cancel, task });
+        drop(state);
+        result
+            .await
+            .map_err(|e| AppError::new("PREFLIGHT_FAILED", e.to_string(), None))?
+    }
+
+    /// Admit one immutable batch with a single durable write. Expensive probes
+    /// happen before the lock; admission rechecks destinations/capacity while
+    /// Stop Queue and other submissions are excluded by the same state lock.
+    pub async fn enqueue_encode_batch(
+        &self,
+        requests: Vec<EncodeRequest>,
+    ) -> Result<Vec<JobSnapshot>, AppError> {
+        let epoch = self.state.lock().await.submission_epoch;
+        crate::batch::validate_batch_len(requests.len())?;
+        let mut prepared = Vec::with_capacity(requests.len());
+        for mut request in requests {
+            if epoch != self.state.lock().await.submission_epoch {
+                return Err(batch_canceled());
+            }
+            encode::validate_settings(&request.settings)?;
+            files::validate_request(&request.source)?;
+            let media = crate::batch::inspect_selection(
+                self,
+                &BatchEncodeInput {
+                    input_path: request.source.input_path.clone(),
+                    stream_indices: request.source.stream_indices.clone(),
+                    video_stream_index: request.settings.video_stream_index,
+                },
+                epoch,
+            )
+            .await?;
+            request.source.input_path = media.path;
+            prepared.push(request);
+        }
+        self.admit_encode_batch_at_epoch(prepared, epoch).await
+    }
+
+    #[cfg(test)]
+    async fn admit_encode_batch(
+        &self,
+        requests: Vec<EncodeRequest>,
+    ) -> Result<Vec<JobSnapshot>, AppError> {
+        let epoch = self.state.lock().await.submission_epoch;
+        self.admit_encode_batch_at_epoch(requests, epoch).await
+    }
+
+    async fn admit_encode_batch_at_epoch(
+        &self,
+        requests: Vec<EncodeRequest>,
+        epoch: u64,
+    ) -> Result<Vec<JobSnapshot>, AppError> {
+        crate::batch::validate_batch_len(requests.len())?;
+        let mut state = self.state.lock().await;
+        if epoch != state.submission_epoch {
+            return Err(batch_canceled());
+        }
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; new jobs cannot start.",
+                None,
+            ));
+        }
+        let mut reserved: HashSet<_> = state
+            .entries
+            .iter()
+            .filter(|entry| !entry.snapshot.state.is_terminal())
+            .map(|entry| {
+                crate::batch::destination_key(Path::new(&entry.snapshot.request.output_path))
+                    .unwrap_or_else(|_| {
+                        crate::batch::path_key(Path::new(&entry.snapshot.request.output_path))
+                    })
+            })
+            .collect();
+        let mut normalized = Vec::with_capacity(requests.len());
+        for mut request in requests {
+            files::validate_request(&request.source)?;
+            encode::validate_settings(&request.settings)?;
+            let source = Source::open(Path::new(&request.source.input_path))?;
+            let output = files::output_path(&request.source, &source)?;
+            crate::batch::writable_directory(output.parent().expect("validated output parent"))?;
+            if !reserved.insert(crate::batch::path_key(&output)) {
+                return Err(files::error(
+                    "OUTPUT_QUEUED",
+                    "The batch or existing queue already reserves this output filename.",
+                    &output,
+                ));
+            }
+            request.source.input_path = source.path.to_string_lossy().into_owned();
+            request.source.output_path = output.to_string_lossy().into_owned();
+            normalized.push(request);
+        }
+        let remove_count = (state.entries.len() + normalized.len()).saturating_sub(MAX_HISTORY);
+        let prune: HashSet<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.snapshot.state.is_terminal()
+                    && entry.task.as_ref().is_none_or(|task| task.is_finished())
+            })
+            .take(remove_count)
+            .map(|(index, _)| index)
+            .collect();
+        if prune.len() != remove_count {
+            return Err(AppError::new(
+                "QUEUE_FULL",
+                "The whole batch does not fit in the queue. Wait for jobs to finish or submit fewer files.",
+                None,
+            ));
+        }
+        let mut staged = Vec::with_capacity(normalized.len());
+        for request in normalized {
+            let nonce = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let id = format!(
+                "{}-{nonce}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let log_path = self.log_dir.join(format!("{id}.log"));
+            let snapshot = JobSnapshot {
+                id,
+                state: JobState::Queued,
+                request: request.source,
+                encode_settings: Some(request.settings),
+                progress_seconds: None,
+                duration_seconds: None,
+                logs: vec!["Media job admitted with an atomic batch.".into()],
+                error: None,
+                log_path: Some(log_path.to_string_lossy().into_owned()),
+            };
+            let (cancel, receiver) = watch::channel(false);
+            staged.push((
+                Entry {
+                    snapshot,
+                    cancel,
+                    task: None,
+                },
+                receiver,
+                log_path,
+            ));
+        }
+        let mut persisted: Vec<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !prune.contains(index))
+            .map(|(_, entry)| entry.snapshot.clone())
+            .collect();
+        persisted.extend(staged.iter().map(|(entry, _, _)| entry.snapshot.clone()));
+        if let Some(history) = &self.history
+            && let Err(error) = history.save(persisted).await
+        {
+            // No staged entry has entered memory and no task has been spawned.
+            // Existing jobs receive the same durability failure behavior as a
+            // failed normal state transition.
+            for entry in &mut state.entries {
+                if !entry.snapshot.state.is_terminal() {
+                    entry.cancel.send_replace(true);
+                }
+                append_log(&mut entry.snapshot, error.message.clone());
+                entry.snapshot.error = Some(error.clone());
+            }
+            state.storage_error = Some(error.clone());
+            self.queue_changed.notify_waiters();
+            return Err(error);
+        }
+        let mut index = 0;
+        state.entries.retain(|_| {
+            let retain = !prune.contains(&index);
+            index += 1;
+            retain
+        });
+        let snapshots = staged
+            .iter()
+            .map(|(entry, _, _)| entry.snapshot.clone())
+            .collect();
+        for (mut entry, receiver, log_path) in staged {
+            let worker = self.clone();
+            let id = entry.snapshot.id.clone();
+            entry.task = Some(tokio::spawn(async move {
+                worker.run_queued(id, receiver, log_path).await;
+            }));
+            state.entries.push(entry);
+        }
+        self.queue_changed.notify_waiters();
+        Ok(snapshots)
+    }
+
     async fn start_job(
         &self,
         request: RemuxRequest,
@@ -203,16 +496,15 @@ impl JobManager {
                 None,
             ));
         }
+        let destination = crate::batch::destination_key(Path::new(&request.output_path))
+            .unwrap_or_else(|_| crate::batch::path_key(Path::new(&request.output_path)));
         if state.entries.iter().any(|e| {
             !e.snapshot.state.is_terminal()
-                && if cfg!(windows) {
-                    e.snapshot
-                        .request
-                        .output_path
-                        .eq_ignore_ascii_case(&request.output_path)
-                } else {
-                    e.snapshot.request.output_path == request.output_path
-                }
+                && crate::batch::destination_key(Path::new(&e.snapshot.request.output_path))
+                    .unwrap_or_else(|_| {
+                        crate::batch::path_key(Path::new(&e.snapshot.request.output_path))
+                    })
+                    == destination
         }) {
             return Err(AppError::new(
                 "OUTPUT_QUEUED",
@@ -362,6 +654,10 @@ impl JobManager {
 
     pub async fn cancel_all_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {
         let mut state = self.state.lock().await;
+        state.submission_epoch = state.submission_epoch.wrapping_add(1);
+        for preflight in &state.preflights {
+            preflight.cancel.send_replace(true);
+        }
         for entry in &mut state.entries {
             if !entry.snapshot.state.is_terminal() {
                 entry.cancel.send_replace(true);
@@ -387,7 +683,7 @@ impl JobManager {
         let tasks = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            let tasks = state
+            let mut tasks = state
                 .entries
                 .iter_mut()
                 .filter_map(|e| {
@@ -398,6 +694,10 @@ impl JobManager {
                     e.task.take()
                 })
                 .collect::<Vec<_>>();
+            for preflight in state.preflights.drain(..) {
+                preflight.cancel.send_replace(true);
+                tasks.push(preflight.task);
+            }
             let _ = self.persist(&mut state).await;
             self.queue_changed.notify_waiters();
             tasks
@@ -680,6 +980,134 @@ async fn discover(name: &str, cancel: &watch::Receiver<bool>) -> Result<PathBuf,
             None,
         )
     })
+}
+
+/// Inspect container headers only. Packet counts and decoded-frame validation
+/// remain part of execution, where they are cancelable and visibly Preparing.
+async fn inspect_encode_source(
+    input: &BatchEncodeInput,
+    cancel: &watch::Receiver<bool>,
+) -> Result<media_core::MediaFile, AppError> {
+    check_cancel(cancel)?;
+    let path = PathBuf::from(&input.input_path);
+    let canonical = tokio::fs::canonicalize(&path).await.map_err(|error| {
+        files::error(
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "FILE_NOT_FOUND"
+            } else {
+                "FILE_UNREADABLE"
+            },
+            error.to_string(),
+            &path,
+        )
+    })?;
+    let source = tokio::task::spawn_blocking(move || Source::open(&canonical))
+        .await
+        .map_err(|e| files::error("FILE_UNREADABLE", e.to_string(), &path))??;
+    let executable = discover("ffprobe", cancel).await?;
+    let args = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(source.path.as_os_str().to_owned()))
+    .collect();
+    let output = supervisor::run_capture(
+        &CommandSpec {
+            executable,
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        2 * 1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|e| process_error(e, &source.path))?;
+    check_cancel(cancel)?;
+    if !output.status.success() {
+        return Err(files::error(
+            "PROBE_FAILED",
+            format!(
+                "FFprobe could not inspect this source: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(600)
+                    .collect::<String>()
+            ),
+            &source.path,
+        ));
+    }
+    validate_encode_preview(&output.stdout, input).map_err(|mut error| {
+        error.path = Some(source.path.to_string_lossy().into_owned());
+        error
+    })?;
+    source.verify()?;
+    let size = tokio::fs::metadata(&source.path)
+        .await
+        .map_err(|e| files::error("FILE_UNREADABLE", e.to_string(), &source.path))?
+        .len();
+    let canonical = source
+        .path
+        .to_str()
+        .ok_or_else(|| {
+            files::error(
+                "INVALID_INPUT",
+                "The source path cannot be represented as Unicode.",
+                &source.path,
+            )
+        })?
+        .to_owned();
+    crate::probe::parse_probe(
+        &output.stdout,
+        canonical,
+        source
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        size,
+    )
+}
+
+fn validate_encode_preview(bytes: &[u8], input: &BatchEncodeInput) -> Result<(), AppError> {
+    let document: Document = serde_json::from_slice(bytes).map_err(|_| {
+        AppError::new(
+            "PROBE_INVALID_RESPONSE",
+            "FFprobe returned unreadable media metadata.",
+            None,
+        )
+    })?;
+    let selected = document.selected(&input.stream_indices)?;
+    let videos: Vec<_> = selected
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+        .collect();
+    if videos.len() != 1 || videos[0].index != input.video_stream_index {
+        return Err(AppError::new(
+            "STREAM_SELECTION_INVALID",
+            "Select exactly one video stream matching the video chosen for encoding.",
+            None,
+        ));
+    }
+    encode_plan::Plan::build(
+        &document,
+        &selected,
+        &EncodeSettings {
+            video_stream_index: input.video_stream_index,
+            ..EncodeSettings::default()
+        },
+    )?;
+    Ok(())
 }
 
 async fn probe(

@@ -84,14 +84,24 @@ impl JobManager {
         }
         let document = probe(&ffprobe, &source.path, cancel).await?;
         let selected = document.selected(&request.stream_indices)?;
-        let plan = Plan::build(&document, &selected, settings)?;
+        let mut plan = Plan::build(&document, &selected, settings)?;
         let video = selected
             .iter()
             .find(|stream| stream.index == plan.video_index)
             .expect("validated video selection");
         self.phase(id,JobState::Preparing,"Decoding the source once to verify every frame timestamp, progressive scan, and SDR format (bounded to 10 minutes and 64 MiB of metadata).").await;
         let source_frames = frame_scan(&ffprobe, &source.path, plan.video_index, cancel).await?;
-        let frame_count = plan.validate_frames(&source_frames, video, false)?;
+        let declared_rate = (plan.fps_num, plan.fps_den);
+        let frame_count = plan.validate_source_frames(&source_frames, video)?;
+        if declared_rate != (plan.fps_num, plan.fps_den) {
+            self.change(id, |snapshot| {
+                append_log(snapshot, format!(
+                    "Source timestamps follow {}/{} fps; reconciled declared {}/{} fps after checking all {frame_count} frames within {:.3} ms.",
+                    plan.fps_num, plan.fps_den, declared_rate.0, declared_rate.1,
+                    plan.tolerance * 1000.0,
+                ));
+            }).await;
+        }
         drop(source_frames);
         source.verify()?;
         check_cancel(cancel)?;
@@ -332,13 +342,26 @@ fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     .collect();
     args.push(input.as_os_str().to_owned());
     args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
+    // All source frames already match this cadence within one timestamp tick.
+    // Use it for the Y4M header as well as SVT/IVF, so a reconciled decimal rate
+    // cannot be overwritten by the input's declared nominal rate.
+    if plan.cadence_reconciled {
+        args.extend([
+            "-r".into(),
+            format!("{}/{}", plan.fps_num, plan.fps_den).into(),
+        ]);
+    }
     args.extend(
         [
             "-an",
             "-sn",
             "-dn",
             "-fps_mode",
-            "passthrough",
+            if plan.cadence_reconciled {
+                "cfr"
+            } else {
+                "passthrough"
+            },
             "-pix_fmt",
             "yuv420p10le",
             "-strict",

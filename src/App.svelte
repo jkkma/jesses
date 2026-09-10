@@ -25,11 +25,14 @@
   import { Button } from '$lib/components/ui/button';
   import FileInspector from '$lib/features/files/FileInspector.svelte';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
+  import BatchEncode from '$lib/features/batch/BatchEncode.svelte';
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import {
     chooseMediaFiles,
+    chooseMediaFolder,
+    scanMediaFolder,
     getCapabilities,
     isDesktop,
     probeMedia,
@@ -38,6 +41,7 @@
     startRemux,
     startEncode,
     enqueueEncode,
+    enqueueEncodeBatch,
     cancelAllJobs,
     cancelJob,
   } from '$lib/ipc/client';
@@ -56,7 +60,7 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'convert' | 'remux' | 'tools';
+  type View = 'files' | 'convert' | 'batch' | 'remux' | 'tools';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
@@ -68,6 +72,9 @@
   let toolsError = $state<string | null>(null);
   let importing = $state(false);
   let importingName = $state('');
+  let recursiveImport = $state(false);
+  let importNotice = $state<string | null>(null);
+  let importGeneration = 0;
   let importQueue: string[] = [];
   let activePath: string | null = null;
   let importErrors = $state<{ name: string; message: string }[]>([]);
@@ -131,6 +138,13 @@
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
     addLog('AV1 encode added to the queue.');
   }
+  async function queueBatch(requests: EncodeRequest[]) {
+    const submitted = await enqueueEncodeBatch(requests);
+    // Keep authoritative channel updates that beat the command response.
+    const missing = submitted.filter((job) => !jobs.some((entry) => entry.id === job.id));
+    jobs = [...missing.reverse(), ...jobs];
+    addLog(`${submitted.length} AV1 encodes added to the queue.`);
+  }
   async function stopQueue() {
     const snapshots = await cancelAllJobs();
     jobs = jobs.map((entry) =>
@@ -171,7 +185,7 @@
     }
   }
 
-  async function importPaths(paths: string[]) {
+  function queueImportPaths(paths: string[]) {
     const candidates = paths.filter(
       (path) =>
         path !== activePath &&
@@ -179,42 +193,118 @@
         !files.some((file) => file.path === path),
     );
     importQueue.push(...new Set(candidates));
-    if (importing || !importQueue.length) return;
+  }
+
+  function beginImport() {
+    const generation = ++importGeneration;
+    importQueue = [];
+    activePath = null;
     importing = true;
+    importNotice = null;
+    importErrors = [];
     view = 'files';
+    return generation;
+  }
+
+  function finishImport(generation: number) {
+    if (generation !== importGeneration) return;
+    activePath = null;
+    importing = false;
+    importingName = '';
+  }
+
+  function stopImport() {
+    ++importGeneration;
+    importQueue = [];
+    activePath = null;
+    importing = false;
+    importingName = '';
+    importNotice =
+      'Stopped importing. Completed files are kept. The current scan or probe may finish in the background.';
+    addLog('Stopped importing; pending files and late results are discarded.');
+  }
+
+  async function drainImport(generation: number) {
     try {
-      while (importQueue.length) {
+      while (generation === importGeneration && importQueue.length) {
         const path = importQueue.shift()!;
         activePath = path;
         importingName = fileName(path);
         try {
           const media = await probeMedia(path);
+          if (generation !== importGeneration) return;
           if (!files.some((file) => file.id === media.id)) {
             files = [...files, media];
             selectedId = media.id;
             addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
           }
         } catch (error) {
+          if (generation !== importGeneration) return;
           const message = errorMessage(error);
           importErrors = [...importErrors, { name: importingName, message }];
           addLog(`Could not import ${importingName}: ${message}`, 'error');
         }
       }
     } finally {
-      activePath = null;
-      importing = false;
-      importingName = '';
+      finishImport(generation);
     }
+  }
+
+  async function importPaths(paths: string[]) {
+    if (!desktop || !paths.length) return;
+    if (importing) {
+      queueImportPaths(paths);
+      return;
+    }
+    const generation = beginImport();
+    queueImportPaths(paths);
+    await drainImport(generation);
   }
 
   async function addFiles() {
     if (!desktop || importing) return;
+    const generation = beginImport();
+    importingName = 'Choosing files';
     try {
-      await importPaths(await chooseMediaFiles());
+      const paths = await chooseMediaFiles();
+      if (generation !== importGeneration) return;
+      queueImportPaths(paths);
+      await drainImport(generation);
     } catch (error) {
+      if (generation !== importGeneration) return;
       const message = errorMessage(error);
       importErrors = [...importErrors, { name: 'File picker', message }];
       addLog(`Could not open file picker: ${message}`, 'error');
+    } finally {
+      finishImport(generation);
+    }
+  }
+
+  async function addFolder() {
+    if (!desktop || importing) return;
+    const generation = beginImport();
+    const recursive = recursiveImport;
+    importingName = 'Choosing folder';
+    try {
+      const path = await chooseMediaFolder();
+      if (generation !== importGeneration || !path) return;
+      importingName = `Scanning ${fileName(path)}`;
+      const scan = await scanMediaFolder({ path, recursive });
+      if (generation !== importGeneration) return;
+      importErrors = scan.errors.map((error) => ({
+        name: error.path ?? 'Folder scan',
+        message: error.message,
+      }));
+      importNotice = `${scan.paths.length} media files found. ${scan.skippedCount} entries skipped.${scan.truncated ? ' Scan truncated: the 500-file or 10,000-entry limit was reached. Add a smaller folder to find the remaining files.' : ''}`;
+      queueImportPaths(scan.paths);
+      await drainImport(generation);
+    } catch (error) {
+      if (generation !== importGeneration) return;
+      const message = errorMessage(error);
+      importErrors = [...importErrors, { name: 'Folder import', message }];
+      addLog(`Could not import folder: ${message}`, 'error');
+    } finally {
+      finishImport(generation);
     }
   }
 
@@ -325,6 +415,7 @@
     }
     return () => {
       disposed = true;
+      ++importGeneration;
       unlisten?.();
       jobsDisposed = true;
       stopJobSubscription?.();
@@ -397,6 +488,12 @@
       >
       <button
         type="button"
+        class:active={view === 'batch'}
+        aria-current={view === 'batch' ? 'page' : undefined}
+        onclick={() => (view = 'batch')}>Batch encode</button
+      >
+      <button
+        type="button"
         class:active={view === 'remux'}
         aria-current={view === 'remux' ? 'page' : undefined}
         onclick={() => (view = 'remux')}>Remux</button
@@ -439,6 +536,9 @@
             <p>Inspect your media. Start with a source.</p>
           </div>
           <div class="toolbar-actions">
+            <Button variant="outline" onclick={addFolder} disabled={!desktop || importing}
+              ><FolderOpen size={15} aria-hidden="true" />Add folder</Button
+            >
             <Button variant="ghost" onclick={clearFiles} disabled={!files.length || importing}
               ><Trash2 size={14} aria-hidden="true" />Clear list</Button
             ><Button
@@ -452,6 +552,18 @@
             >
           </div>
         </div>
+        <div class="folder-import-options">
+          <label
+            ><input
+              type="checkbox"
+              bind:checked={recursiveImport}
+              disabled={!desktop || importing}
+            /> Include subfolders</label
+          >
+          <span class="small-muted">Folder scans stop at 500 media files or 10,000 entries.</span>
+          {#if importing}<Button variant="outline" onclick={stopImport}>Stop import</Button>{/if}
+        </div>
+        {#if importNotice}<div class="notice" role="status"><p>{importNotice}</p></div>{/if}
         {#if importErrors.length}
           <div class="notice error-notice import-errors" role="alert">
             <CircleAlert size={17} aria-hidden="true" />
@@ -611,7 +723,7 @@
         onrefresh={refreshTools}
       />
     {/if}
-    {#if (view === 'convert' || view === 'remux') && jobsError}
+    {#if (view === 'convert' || view === 'batch' || view === 'remux') && jobsError}
       <div class="notice error-notice" role="alert">
         <CircleAlert size={16} aria-hidden="true" />
         <div>
@@ -637,6 +749,15 @@
         onqueue={queueEncode}
       />
     </div>
+    <div hidden={view !== 'batch'}>
+      <BatchEncode
+        {files}
+        {tools}
+        connected={jobsConnected}
+        onfiles={() => (view = 'files')}
+        onqueue={queueBatch}
+      />
+    </div>
     <div hidden={view !== 'remux'}>
       <Remux
         file={selectedFile}
@@ -647,7 +768,7 @@
         onstart={submitRemux}
       />
     </div>
-    {#if view === 'convert' || view === 'remux'}<JobStatus
+    {#if view === 'convert' || view === 'batch' || view === 'remux'}<JobStatus
         job={currentJob}
         {jobs}
         oncancel={stopJob}
@@ -705,3 +826,38 @@
     ><span>Desktop media encoding, muxing, and analysis.</span>
   </footer>
 </div>
+
+<style>
+  .folder-import-options {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin: 0 0 16px;
+  }
+  .folder-import-options label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .folder-import-options input {
+    accent-color: #ad5326;
+  }
+  :global(.workspace-nav nav) {
+    flex-wrap: wrap;
+  }
+  :global(.workspace-nav) {
+    min-height: 49px;
+    height: auto;
+  }
+  :global(.toolbar-actions) {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  @media (max-width: 1000px) {
+    :global(.workspace-label) {
+      display: none;
+    }
+  }
+</style>

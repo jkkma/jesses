@@ -1,4 +1,7 @@
-use media_core::{AppError, EncodeRequest, JobSnapshot, MediaFile, RemuxRequest, ToolInfo};
+use media_core::{
+    AppError, BatchEncodePreview, BatchEncodeRequest, EncodeRequest, FolderScanRequest,
+    FolderScanResult, JobSnapshot, MediaFile, RemuxRequest, ToolInfo,
+};
 use media_runtime::jobs::JobManager;
 use std::sync::{
     Arc,
@@ -34,6 +37,27 @@ async fn enqueue_encode(
     jobs: State<'_, Jobs>,
 ) -> Result<JobSnapshot, AppError> {
     jobs.manager.enqueue_encode(request).await
+}
+
+#[tauri::command]
+async fn scan_media_folder(request: FolderScanRequest) -> Result<FolderScanResult, AppError> {
+    media_runtime::scan_media_folder(request).await
+}
+
+#[tauri::command]
+async fn preview_encode_batch(
+    request: BatchEncodeRequest,
+    jobs: State<'_, Jobs>,
+) -> Result<BatchEncodePreview, AppError> {
+    jobs.manager.preview_encode_batch(request).await
+}
+
+#[tauri::command]
+async fn enqueue_encode_batch(
+    requests: Vec<EncodeRequest>,
+    jobs: State<'_, Jobs>,
+) -> Result<Vec<JobSnapshot>, AppError> {
+    jobs.manager.enqueue_encode_batch(requests).await
 }
 
 #[tauri::command]
@@ -109,6 +133,9 @@ pub fn run() {
             start_remux,
             start_encode,
             enqueue_encode,
+            scan_media_folder,
+            preview_encode_batch,
+            enqueue_encode_batch,
             cancel_all_jobs,
             cancel_job,
             list_jobs,

@@ -33,3 +33,15 @@ export type EncodeRequest = { source: RemuxRequest, settings: EncodeSettings, };
 export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "canceled" | "failed" | "interrupted";
 
 export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, encodeSettings: EncodeSettings | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+
+export type FolderScanRequest = { path: string, recursive: boolean, };
+
+export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, skippedCount: number, truncated: boolean, };
+
+export type BatchEncodeInput = { inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+
+export type BatchEncodeRequest = { inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, };
+
+export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
+
+export type BatchEncodePreview = { items: Array<BatchEncodeItem>, };

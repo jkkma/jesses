@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-media-folder"
+description = "Enables the scan_media_folder command without any pre-configured scope."
+commands.allow = ["scan_media_folder"]
+
+[[permission]]
+identifier = "deny-scan-media-folder"
+description = "Denies the scan_media_folder command without any pre-configured scope."
+commands.deny = ["scan_media_folder"]
