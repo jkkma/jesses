@@ -7,6 +7,9 @@ use std::{
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
+#[path = "pipeline_tests.rs"]
+mod pipeline;
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(mode: &str) -> Self {
@@ -105,6 +108,73 @@ fn fake_tool() {
     let mode = std::fs::read_to_string(path.join("mode")).unwrap();
     std::fs::write(path.join("pid"), std::process::id().to_string()).unwrap();
     match mode.as_str() {
+        "binary-producer" => {
+            let diagnostics = std::thread::spawn(|| {
+                let mut stderr = std::io::stderr().lock();
+                for _ in 0..32 {
+                    stderr.write_all(&[b'p'; RECORD_BYTES]).unwrap();
+                }
+                stderr.write_all(b"\nproducer diagnostic\n").unwrap();
+            });
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(pipeline::RAW_MARKER).unwrap();
+            let block = pipeline::binary_block();
+            for _ in 0..pipeline::BINARY_CHUNKS {
+                stdout.write_all(&block).unwrap();
+            }
+            stdout.flush().unwrap();
+            drop(stdout);
+            diagnostics.join().unwrap();
+            std::process::exit(0);
+        }
+        "binary-consumer" => {
+            let stdout = std::thread::spawn(|| {
+                let mut stdout = std::io::stdout().lock();
+                for _ in 0..32 {
+                    stdout.write_all(&[b'c'; RECORD_BYTES]).unwrap();
+                }
+                stdout.write_all(b"\nconsumer complete\n").unwrap();
+            });
+            let stderr = std::thread::spawn(|| {
+                let mut stderr = std::io::stderr().lock();
+                for _ in 0..32 {
+                    stderr.write_all(&[b'e'; RECORD_BYTES]).unwrap();
+                }
+                stderr.write_all(b"\nconsumer diagnostic\n").unwrap();
+            });
+            let mut file = std::fs::File::create(path.join("received.bin")).unwrap();
+            std::io::copy(&mut std::io::stdin().lock(), &mut file).unwrap();
+            file.flush().unwrap();
+            stdout.join().unwrap();
+            stderr.join().unwrap();
+            std::process::exit(0);
+        }
+        "binary-fail" => {
+            wait_peer(&path);
+            std::io::stdout().write_all(b"partial binary data").unwrap();
+            std::process::exit(7);
+        }
+        "read-then-hang" => {
+            std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+        }
+        "early-consumer" | "failed-consumer" => {
+            wait_peer(&path);
+            std::process::exit(if mode == "early-consumer" { 0 } else { 9 });
+        }
+        "binary-producer-tree" => {
+            spawn_fixture_child(&path, "branch");
+            // The child harness writes its header to inherited stdout before
+            // fake_tool starts. Let both descendants start before flooding that
+            // pipe, otherwise backpressure correctly blocks their startup too.
+            while !path.join("child/child/pid").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut stdout = std::io::stdout().lock();
+            loop {
+                stdout.write_all(&pipeline::binary_block()).unwrap();
+            }
+        }
+        "blocked-consumer-tree" => spawn_fixture_child(&path, "branch"),
         #[cfg(windows)]
         "supervisor-host" => {
             let child_path = path.join("child");
@@ -167,6 +237,13 @@ fn fake_tool() {
     }
     loop {
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn wait_peer(path: &Path) {
+    let peer = std::fs::read_to_string(path.join("peer")).unwrap();
+    while !Path::new(&peer).join("pid").exists() {
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

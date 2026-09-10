@@ -9,10 +9,11 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::ExitStatus,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex, mpsc, watch},
 };
 
@@ -25,6 +26,7 @@ mod platform;
 
 const RECORD_BYTES: usize = 8192;
 const LOG_BYTES: u64 = 4 * 1024 * 1024;
+const PIPE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -51,6 +53,28 @@ pub struct CapturedOutput {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub struct PipelineResult {
+    pub producer_status: ExitStatus,
+    pub consumer_status: ExitStatus,
+    pub bytes_transferred: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineStage {
+    Producer,
+    Consumer,
+}
+
+impl std::fmt::Display for PipelineStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Producer => "producer",
+            Self::Consumer => "consumer",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
     #[error("The job was cancelled.")]
@@ -59,6 +83,13 @@ pub enum SupervisorError {
     Timeout,
     #[error("The tool produced more output than the capture limit allows.")]
     OutputLimit,
+    #[error("The {stage} stage failed ({status}).")]
+    StageFailed {
+        stage: PipelineStage,
+        status: ExitStatus,
+    },
+    #[error("The consumer exited before all producer bytes were delivered.")]
+    EarlyConsumerExit,
     #[error("The process tree could not be confirmed stopped: {0}")]
     Cleanup(io::Error),
     #[error("The tool could not be started, monitored, or logged: {0}")]
@@ -164,6 +195,131 @@ pub async fn run_capture(
     result
 }
 
+/// Streams producer stdout directly into consumer stdin through a fixed-size
+/// buffer. Raw bytes never enter diagnostic logs or UI events. Both complete
+/// stage statuses are mandatory; output validation remains the caller's job.
+pub async fn run_pipeline(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+) -> Result<PipelineResult, SupervisorError> {
+    if *cancel.borrow() {
+        return Err(SupervisorError::Cancelled);
+    }
+    let log = Mutex::new(RotatingLog::open(log_path).await?);
+    // Start the reader first. Each stage has its own owned tree; failure to
+    // launch either stage tears down everything already started.
+    let mut consumer = platform::OwnedChild::spawn_with_stdin(consumer_spec)?;
+    let mut producer = match platform::OwnedChild::spawn(producer_spec) {
+        Ok(child) => child,
+        Err(error) => {
+            consumer
+                .terminate_and_wait()
+                .await
+                .map_err(SupervisorError::Cleanup)?;
+            return Err(SupervisorError::Io(error));
+        }
+    };
+    let (producer_stdout, producer_stderr) = producer.take_pipes();
+    let consumer_stdin = consumer.take_stdin();
+    let (consumer_stdout, consumer_stderr) = consumer.take_pipes();
+    let delivered = AtomicBool::new(false);
+    let execution = async {
+        let producer_wait = producer.wait_and_terminate_descendants();
+        let consumer_wait = consumer.wait_and_terminate_descendants();
+        let transfer = transfer_binary(producer_stdout, consumer_stdin, &delivered);
+        let diagnostics = async {
+            tokio::try_join!(
+                drain_stage(producer_stderr, true, Some("producer"), &events, &log),
+                drain_stage(consumer_stdout, false, Some("consumer"), &events, &log),
+                drain_stage(consumer_stderr, true, Some("consumer"), &events, &log),
+            )?;
+            Ok::<_, SupervisorError>(())
+        };
+        tokio::pin!(producer_wait, consumer_wait, transfer, diagnostics);
+        let (mut producer_status, mut consumer_status, mut bytes_transferred) = (None, None, None);
+        let mut diagnostics_done = false;
+        loop {
+            tokio::select! {
+                biased;
+                status = &mut producer_wait, if producer_status.is_none() => {
+                    let status = status?;
+                    if !status.success() {
+                        return Err(SupervisorError::StageFailed { stage: PipelineStage::Producer, status });
+                    }
+                    producer_status = Some(status);
+                }
+                status = &mut consumer_wait, if consumer_status.is_none() => {
+                    let status = status?;
+                    if !status.success() {
+                        return Err(SupervisorError::StageFailed { stage: PipelineStage::Consumer, status });
+                    }
+                    if !delivered.load(Ordering::Acquire) { return Err(SupervisorError::EarlyConsumerExit); }
+                    consumer_status = Some(status);
+                }
+                result = &mut transfer, if bytes_transferred.is_none() => {
+                    bytes_transferred = Some(result?);
+                }
+                result = &mut diagnostics, if !diagnostics_done => {
+                    result?;
+                    diagnostics_done = true;
+                }
+            }
+            if let (Some(producer_status), Some(consumer_status), Some(bytes_transferred), true) = (
+                producer_status,
+                consumer_status,
+                bytes_transferred,
+                diagnostics_done,
+            ) {
+                return Ok(PipelineResult {
+                    producer_status,
+                    consumer_status,
+                    bytes_transferred,
+                });
+            }
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
+        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        result = execution => result,
+    };
+    // Await both cleanups even if one reports failure. Killing both trees also
+    // releases any blocking anonymous-pipe IO still finishing on Windows.
+    let (producer_cleanup, consumer_cleanup) =
+        tokio::join!(producer.terminate_and_wait(), consumer.terminate_and_wait(),);
+    producer_cleanup.map_err(SupervisorError::Cleanup)?;
+    consumer_cleanup.map_err(SupervisorError::Cleanup)?;
+    log.lock().await.flush().await?;
+    result
+}
+
+async fn transfer_binary(
+    mut producer: impl AsyncRead + Unpin,
+    mut consumer: impl AsyncWrite + Unpin,
+    delivered: &AtomicBool,
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; PIPE_BYTES];
+    let mut total = 0_u64;
+    loop {
+        let count = read_pipe(&mut producer, &mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        consumer.write_all(&buffer[..count]).await?;
+        total += count as u64;
+    }
+    consumer.flush().await?;
+    consumer.shutdown().await?;
+    drop(consumer); // EOF must reach the encoder before its success is accepted.
+    delivered.store(true, Ordering::Release);
+    Ok(total)
+}
+
 async fn read_pipe(stream: &mut (impl AsyncRead + Unpin), buffer: &mut [u8]) -> io::Result<usize> {
     match stream.read(buffer).await {
         // Anonymous Windows pipes report a broken pipe when the writer closes.
@@ -191,8 +347,18 @@ async fn capture(
 }
 
 async fn drain(
+    stream: impl AsyncRead + Unpin,
+    stderr: bool,
+    events: &mpsc::Sender<ProcessEvent>,
+    log: &Mutex<RotatingLog>,
+) -> Result<(), SupervisorError> {
+    drain_stage(stream, stderr, None, events, log).await
+}
+
+async fn drain_stage(
     mut stream: impl AsyncRead + Unpin,
     stderr: bool,
+    stage: Option<&str>,
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
 ) -> Result<(), SupervisorError> {
@@ -202,20 +368,20 @@ async fn drain(
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {
             if !pending.is_empty() {
-                record(&pending, stderr, events, log).await?;
+                record_stage(&pending, stderr, stage, events, log).await?;
             }
             return Ok(());
         }
         for &byte in &buffer[..count] {
             if byte == b'\r' || byte == b'\n' {
                 if !pending.is_empty() {
-                    record(&pending, stderr, events, log).await?;
+                    record_stage(&pending, stderr, stage, events, log).await?;
                     pending.clear();
                 }
             } else {
                 pending.push(byte);
                 if pending.len() == RECORD_BYTES {
-                    record(&pending, stderr, events, log).await?;
+                    record_stage(&pending, stderr, stage, events, log).await?;
                     pending.clear();
                 }
             }
@@ -223,14 +389,29 @@ async fn drain(
     }
 }
 
-async fn record(
+async fn record_stage(
     bytes: &[u8],
     stderr: bool,
+    stage: Option<&str>,
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
 ) -> io::Result<()> {
-    log.lock().await.write_record(bytes, stderr).await?;
-    let text = String::from_utf8_lossy(bytes).into_owned();
+    let staged = stage.map(|stage| {
+        let mut staged = format!("[{stage}] ").into_bytes();
+        staged.extend_from_slice(bytes);
+        staged
+    });
+    log.lock()
+        .await
+        .write_record(staged.as_deref().unwrap_or(bytes), stderr)
+        .await?;
+    // Consumer stdout stays parseable; stderr events identify their stage.
+    let event_bytes = if stderr {
+        staged.as_deref().unwrap_or(bytes)
+    } else {
+        bytes
+    };
+    let text = String::from_utf8_lossy(event_bytes).into_owned();
     let _ = events.try_send(if stderr {
         ProcessEvent::Stderr(text)
     } else {

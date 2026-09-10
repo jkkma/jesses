@@ -38,12 +38,21 @@ use windows_sys::Win32::{
 pub(super) struct OwnedChild {
     job: OwnedHandle,
     process: OwnedHandle,
+    stdin: Option<tokio::fs::File>,
     stdout: Option<tokio::fs::File>,
     stderr: Option<tokio::fs::File>,
 }
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false)
+    }
+
+    pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
+        Self::spawn_with_input(spec, true)
+    }
+
+    fn spawn_with_input(spec: &CommandSpec, pipe_stdin: bool) -> io::Result<Self> {
         if spec
             .executable
             .extension()
@@ -70,8 +79,18 @@ impl OwnedChild {
         let (stdout_read, stdout_write) = pipe()?;
         let (stderr_read, stderr_write) = pipe()?;
         let (stdin_read, stdin_write) = pipe()?;
-        // stdin has no writer, so tools receive EOF rather than waiting for UI input.
-        drop(stdin_write);
+        // The parent writer must never be inherited: an inherited writer would
+        // keep stdin open forever even after the producer completes.
+        check(unsafe {
+            SetHandleInformation(stdin_write.as_raw_handle(), HANDLE_FLAG_INHERIT, 0)
+        })?;
+        let stdin_write = if pipe_stdin {
+            Some(stdin_write)
+        } else {
+            // Non-pipeline tools receive EOF rather than waiting for UI input.
+            drop(stdin_write);
+            None
+        };
         // pipe() clears inheritance on the read end; stdin is the exception.
         check(unsafe {
             SetHandleInformation(
@@ -163,6 +182,7 @@ impl OwnedChild {
         Ok(Self {
             job,
             process,
+            stdin: stdin_write.map(|file| tokio::fs::File::from_std(std::fs::File::from(file))),
             stdout: Some(tokio::fs::File::from_std(std::fs::File::from(stdout_read))),
             stderr: Some(tokio::fs::File::from_std(std::fs::File::from(stderr_read))),
         })
@@ -173,6 +193,10 @@ impl OwnedChild {
             self.stdout.take().expect("piped stdout"),
             self.stderr.take().expect("piped stderr"),
         )
+    }
+
+    pub(super) fn take_stdin(&mut self) -> tokio::fs::File {
+        self.stdin.take().expect("piped stdin")
     }
 
     fn try_wait(&self) -> io::Result<Option<ExitStatus>> {

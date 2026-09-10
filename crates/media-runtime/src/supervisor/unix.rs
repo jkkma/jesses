@@ -4,7 +4,11 @@ use std::{
     process::{ExitStatus, Stdio},
     time::Duration,
 };
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+
+#[cfg(target_os = "macos")]
+#[path = "macos.rs"]
+mod macos;
 
 pub(super) struct OwnedChild {
     child: Child,
@@ -14,10 +18,22 @@ pub(super) struct OwnedChild {
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false)
+    }
+
+    pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
+        Self::spawn_with_input(spec, true)
+    }
+
+    fn spawn_with_input(spec: &CommandSpec, pipe_stdin: bool) -> io::Result<Self> {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.args)
-            .stdin(Stdio::null())
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -42,6 +58,10 @@ impl OwnedChild {
         )
     }
 
+    pub(super) fn take_stdin(&mut self) -> ChildStdin {
+        self.child.stdin.take().expect("piped stdin")
+    }
+
     fn terminate_tree(&mut self) -> io::Result<()> {
         if self.terminated {
             return Ok(());
@@ -49,6 +69,17 @@ impl OwnedChild {
         // SAFETY: pgid belongs to the newly created process group, never ours.
         if unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == -1 {
             let error = io::Error::last_os_error();
+            // Darwin's group signalling skips zombies and can report EPERM
+            // for a zombie-only group. Do not suppress real permission errors:
+            // prove the leader exited and enumerate all remaining group members.
+            #[cfg(target_os = "macos")]
+            if error.raw_os_error() == Some(libc::EPERM)
+                && self.has_exited()?
+                && !macos::group_has_live_members(self.pgid)?
+            {
+                self.terminated = true;
+                return Ok(());
+            }
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(error);
             }
