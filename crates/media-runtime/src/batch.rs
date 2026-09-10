@@ -596,7 +596,16 @@ mod tests {
                 destination_key(&queued).unwrap(),
                 destination_key(&fixture.0.join("TITLE 日本語_AV1_2.MKV")).unwrap()
             );
-            assert_eq!(path_key(&directory), path_key(&fixture.0));
+            // The Windows TEMP path may contain an 8.3 alias. Destination
+            // identity resolves the parent; path_key only normalizes spelling.
+            assert_eq!(
+                destination_key(&fixture.0.join("alias-check.mkv")).unwrap(),
+                path_key(&directory.join("alias-check.mkv"))
+            );
+            assert_eq!(
+                path_key(Path::new(r"\\?\C:\media\movie.mkv")),
+                path_key(Path::new(r"C:\media\movie.mkv"))
+            );
             assert_eq!(
                 path_key(Path::new(r"\\?\UNC\server\share\movie.mkv")),
                 path_key(Path::new(r"\\server\share\movie.mkv"))
