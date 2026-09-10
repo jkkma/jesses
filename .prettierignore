@@ -1,0 +1,10 @@
+pnpm-lock.yaml
+Cargo.lock
+target/
+dist/
+node_modules/
+src-tauri/gen/
+src/lib/ipc/generated.ts
+test-results/
+playwright-report/
+tests/fixtures/generated/

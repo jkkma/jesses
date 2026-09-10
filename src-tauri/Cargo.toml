@@ -1,0 +1,22 @@
+[package]
+name = "jesses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Desktop media encoding, muxing, and analysis. Created by jkkma."
+
+[lib]
+name = "jesses_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+media-core = { path = "../crates/media-core" }
+media-runtime = { path = "../crates/media-runtime" }
+tokio.workspace = true
