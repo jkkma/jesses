@@ -57,25 +57,32 @@ impl OwnedChild {
         Ok(())
     }
 
+    fn has_exited(&self) -> io::Result<bool> {
+        // Keep platform siginfo_t entirely outside the async state machine:
+        // macOS includes raw pointers here, which must never survive an await.
+        // WNOWAIT retains the leader, pinning its PID until group cleanup.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pgid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
     pub(super) async fn wait_and_terminate_descendants(&mut self) -> io::Result<ExitStatus> {
         loop {
-            // Observe exit without reaping: retaining the leader pins its PID and
-            // prevents a reused process-group ID from being signalled by cleanup.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.pgid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            } else if unsafe { info.si_pid() } != 0 {
+            if self.has_exited()? {
                 self.terminate_tree()?;
                 return self.child.wait().await;
             }
