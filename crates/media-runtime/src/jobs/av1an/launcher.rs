@@ -297,7 +297,9 @@ mod tests {
         let av1an = original.join("av1an.exe");
         let encoder = selected.join("SvtAv1EncApp.exe");
         for path in [&av1an, &original.join("SvtAv1EncApp.exe"), &encoder] {
-            std::fs::hard_link(&current, path).unwrap();
+            // Hosted Windows runners can place TEMP and the checkout on
+            // different volumes. Each helper owns a copy of the test image.
+            std::fs::copy(&current, path).unwrap();
         }
         std::fs::write(original.join("identity"), "wrong-mainline").unwrap();
         std::fs::write(selected.join("identity"), "selected-fork").unwrap();
