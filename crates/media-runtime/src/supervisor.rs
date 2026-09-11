@@ -54,6 +54,14 @@ pub struct CapturedOutput {
 }
 
 #[derive(Debug)]
+pub struct StreamedOutput<T> {
+    pub status: ExitStatus,
+    pub value: T,
+    /// The newest stderr bytes, truncated to the requested diagnostic limit.
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub struct PipelineResult {
     pub producer_status: ExitStatus,
     pub consumer_status: ExitStatus,
@@ -83,6 +91,8 @@ pub enum SupervisorError {
     Timeout,
     #[error("The tool produced more output than the capture limit allows.")]
     OutputLimit,
+    #[error("The tool output could not be parsed: {0}")]
+    OutputParse(String),
     #[error("The {stage} stage failed ({status}).")]
     StageFailed {
         stage: PipelineStage,
@@ -110,7 +120,7 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 
 /// UI events are bounded, lossy diagnostics. Disk logs retain the newest two
 /// 4 MiB segments. Never reconstruct machine-readable tool output from events;
-/// use `run_capture` instead.
+/// use `run_capture` or `run_streaming_stdout` instead.
 pub async fn run(
     spec: &CommandSpec,
     cancel: watch::Receiver<bool>,
@@ -193,6 +203,153 @@ pub async fn run_capture(
         .await
         .map_err(SupervisorError::Cleanup)?;
     result
+}
+
+/// Lossless stdout streaming for large machine-readable commands. The parser
+/// runs on a blocking worker and receives backpressure through a two-chunk
+/// channel; stdout is never retained in full or sent to diagnostic events.
+/// Stderr is drained concurrently, retaining only its newest `stderr_max_bytes`.
+///
+/// The callback must consume and validate the complete stream, including any
+/// trailing syntax, and perform bounded work between reads. Returning an error
+/// stops the process tree. Cancellation and timeout close the reader, stop and
+/// await the tree, and await the parser worker before returning. An aborted
+/// future also closes the reader and terminates the tree through its guard.
+/// A successful parse still requires checking the returned process exit status.
+pub async fn run_streaming_stdout<T, F>(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    stderr_max_bytes: usize,
+    time_limit: Duration,
+    parse: F,
+) -> Result<StreamedOutput<T>, SupervisorError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn io::Read) -> Result<T, String> + Send + 'static,
+{
+    if *cancel.borrow() {
+        return Err(SupervisorError::Cancelled);
+    }
+    let mut child = platform::OwnedChild::spawn(spec)?;
+    let (stdout, stderr) = child.take_pipes();
+    let (sender, receiver) = mpsc::channel(2);
+    let mut parser = tokio::task::spawn_blocking(move || {
+        let mut reader = StreamingReader {
+            receiver,
+            current: io::Cursor::new(Vec::new()),
+        };
+        let value = parse(&mut reader).map_err(SupervisorError::OutputParse)?;
+        // A callback must not silently accept an unread suffix. This also waits
+        // for genuine pipe EOF when a parser returns immediately after a value.
+        if io::Read::read(&mut reader, &mut [0])? != 0 {
+            return Err(SupervisorError::OutputParse(
+                "The parser returned before consuming all stdout bytes.".into(),
+            ));
+        }
+        Ok(value)
+    });
+    let mut parser_done = false;
+    // Own the sender inside this future so cancellation immediately closes the
+    // blocking reader. No blocking worker owns the process or its pipe handles.
+    let execution = async {
+        let ((), stderr, status, value) = tokio::try_join!(
+            forward_stdout(stdout, sender),
+            capture_tail(stderr, stderr_max_bytes),
+            async {
+                child
+                    .wait_and_terminate_descendants()
+                    .await
+                    .map_err(SupervisorError::Io)
+            },
+            async {
+                let value = (&mut parser).await;
+                parser_done = true;
+                value.map_err(|error| SupervisorError::Io(io::Error::other(error)))?
+            },
+        )?;
+        Ok(StreamedOutput {
+            status,
+            value,
+            stderr,
+        })
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
+        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        result = execution => result,
+    };
+    // Even a failed tree cleanup must not leave the parser worker blocked. The
+    // sender has already closed, so it can finish without waiting on pipe EOF.
+    let cleanup = child.terminate_and_wait().await;
+    if !parser_done {
+        let _ = parser.await;
+    }
+    cleanup.map_err(SupervisorError::Cleanup)?;
+    result
+}
+
+struct StreamingReader {
+    receiver: mpsc::Receiver<Vec<u8>>,
+    current: io::Cursor<Vec<u8>>,
+}
+
+impl io::Read for StreamingReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let count = io::Read::read(&mut self.current, output)?;
+            if count != 0 {
+                return Ok(count);
+            }
+            match self.receiver.blocking_recv() {
+                Some(bytes) => self.current = io::Cursor::new(bytes),
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+async fn forward_stdout(
+    mut stdout: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<Vec<u8>>,
+) -> Result<(), SupervisorError> {
+    loop {
+        let mut bytes = vec![0; PIPE_BYTES];
+        let count = read_pipe(&mut stdout, &mut bytes).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        bytes.truncate(count);
+        if sender.send(bytes).await.is_err() {
+            // The parser finished or panicked; its task carries the actual error.
+            return Ok(());
+        }
+    }
+}
+
+async fn capture_tail(
+    mut stream: impl AsyncRead + Unpin,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SupervisorError> {
+    let mut result = Vec::with_capacity(max_bytes.min(RECORD_BYTES));
+    let mut buffer = [0; RECORD_BYTES];
+    loop {
+        let count = read_pipe(&mut stream, &mut buffer).await?;
+        if count == 0 {
+            return Ok(result);
+        }
+        if count >= max_bytes {
+            result.clear();
+            result.extend_from_slice(&buffer[count - max_bytes..count]);
+        } else {
+            let remove = result.len().saturating_add(count).saturating_sub(max_bytes);
+            result.drain(..remove);
+            result.extend_from_slice(&buffer[..count]);
+        }
+    }
 }
 
 /// Streams producer stdout directly into consumer stdin through a fixed-size

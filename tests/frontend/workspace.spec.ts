@@ -99,7 +99,16 @@ test('browser preview starts empty, identifies sample data, and keeps encoding u
   ).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Start encode' })).toBeDisabled();
-  await expect(page.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(
+    page
+      .getByRole('region', { name: 'Quick Convert workspace' })
+      .getByLabel('Quality', { exact: true }),
+  ).toHaveValue('30');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const av1an = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await expect(av1an).toBeVisible();
+  await expect(av1an.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Change source' }).click();
   await page.getByRole('button', { name: 'Remove Coastal walk.mkv' }).click();
   await expect(page.getByRole('heading', { name: 'Your media starts here.' })).toBeVisible();
@@ -148,6 +157,12 @@ test('palette survives dark OS theme and minimum-size layout remains usable', as
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'av1an', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  await page.screenshot({ path: test.info().outputPath('av1an-minimum-size.png'), fullPage: true });
 });
 
 test('keyboard opens native picker and activity disclosure retains state on reload', async ({

@@ -78,6 +78,8 @@ type Mock = {
   calls: { command: string; payload: unknown }[];
   emit: (jobs: JobSnapshot[]) => void;
   setMedia: (media: MediaFile) => void;
+  hold: (command: string) => void;
+  release: (command: string) => void;
 };
 const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
   id: 'encode-1',
@@ -108,6 +110,8 @@ async function desktopMock(
     late?: 'start' | 'cancel' | 'enqueue';
     connectionFailures?: number;
     lateStop?: boolean;
+    held?: string[];
+    pickerFailure?: AppError;
   } = {},
 ) {
   await page.addInitScript(
@@ -120,6 +124,8 @@ async function desktopMock(
       late,
       connectionFailures,
       lateStop,
+      heldCommands,
+      pickerFailure,
     }) => {
       const state = globalThis as unknown as Record<string, unknown>;
       let selectedMedia = initialMedia;
@@ -127,6 +133,15 @@ async function desktopMock(
       let callbackId = 0;
       let remainingFailures = connectionFailures;
       const calls: Mock['calls'] = [];
+      const held = new Set(heldCommands);
+      const waiting = new Map<string, (() => void)[]>();
+      const wait = async (command: string) => {
+        if (held.has(command)) {
+          await new Promise<void>((resolve) => {
+            waiting.set(command, [...(waiting.get(command) ?? []), resolve]);
+          });
+        }
+      };
       let channel: { onmessage: (jobs: JobSnapshot[]) => void } | undefined;
       const publish = (next: JobSnapshot[]) => {
         jobs = next;
@@ -138,6 +153,12 @@ async function desktopMock(
         setMedia: (next) => {
           selectedMedia = next;
         },
+        hold: (command) => held.add(command),
+        release: (command) => {
+          held.delete(command);
+          for (const resolve of waiting.get(command) ?? []) resolve();
+          waiting.delete(command);
+        },
       } satisfies Mock;
       state.isTauri = true;
       state.__TAURI_INTERNALS__ = {
@@ -146,9 +167,13 @@ async function desktopMock(
         unregisterCallback: () => {},
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
+          await wait(command);
           if (command === 'get_capabilities') return capabilities;
           if (command === 'plugin:dialog|open') return [selectedMedia.path];
-          if (command === 'plugin:dialog|save') return destination;
+          if (command === 'plugin:dialog|save') {
+            if (pickerFailure) throw pickerFailure;
+            return destination;
+          }
           if (command.startsWith('plugin:event|')) return ++callbackId;
           if (command === 'probe_media') return selectedMedia;
           if (command === 'list_jobs') return jobs;
@@ -222,14 +247,21 @@ async function desktopMock(
       late: options.late,
       connectionFailures: options.connectionFailures ?? 0,
       lateStop: options.lateStop ?? false,
+      heldCommands: options.held ?? [],
+      pickerFailure: options.pickerFailure,
     },
   );
 }
-async function openEncode(page: Page) {
+const quickWorkspace = (page: Page) =>
+  page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
+const av1anWorkspace = (page: Page) =>
+  page.getByRole('region', { name: 'av1an workspace', exact: true });
+
+async function openEncode(page: Page, tab: 'Quick Convert' | 'av1an' = 'Quick Convert') {
   await page.goto('/');
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: media.name, exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: tab, exact: true }).click();
 }
 async function calls(page: Page, command: string) {
   return page.evaluate(
@@ -247,22 +279,46 @@ async function emit(page: Page, jobs: JobSnapshot[]) {
   );
 }
 
+async function release(page: Page, command: string) {
+  await page.evaluate(async (name) => {
+    (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.release(name);
+    // Let the released IPC reply and the Svelte update settle before asserting
+    // that no stale error or destination has appeared in the current draft.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  }, command);
+}
+
+async function importAnotherSource(page: Page, next: MediaFile) {
+  await page.evaluate(
+    (value) => (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.setMedia(value),
+    next,
+  );
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  await expect(page.getByRole('heading', { name: next.name, exact: true })).toBeVisible();
+}
+
 test('encode submits the selected video, quality, preset, copied tracks, and native destination', async ({
   page,
 }) => {
   await desktopMock(page);
   await page.setViewportSize({ width: 760, height: 600 });
   await openEncode(page);
-  await expect(page.getByLabel('Quality', { exact: true })).toHaveValue('30');
-  await expect(page.getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
-  await page.getByLabel('Video stream', { exact: true }).selectOption('4');
-  await page.getByLabel('Quality', { exact: true }).fill('28');
-  await page.getByLabel('Encoder preset', { exact: true }).selectOption('6');
-  await page.getByLabel('Copy stream #7', { exact: true }).uncheck();
+  await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
+  await quickWorkspace(page).getByLabel('Video stream', { exact: true }).selectOption('4');
+  await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill('28');
+  await quickWorkspace(page).getByLabel('Encoder preset', { exact: true }).selectOption('6');
+  await quickWorkspace(page).getByLabel('Copy stream #7', { exact: true }).uncheck();
   await page.getByRole('button', { name: 'Choose encode destination', exact: true }).click();
-  await expect(page.getByLabel('Encode destination', { exact: true })).toHaveValue(outputPath);
+  await expect(quickWorkspace(page).getByLabel('Encode destination', { exact: true })).toHaveValue(
+    outputPath,
+  );
   await expect(
-    page.getByText(
+    quickWorkspace(page).getByText(
       'Selected audio, subtitles, and attachments are copied without encoding. Audio keeps its source codec and channels.',
     ),
   ).toBeVisible();
@@ -301,23 +357,27 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
 test('encode draft survives navigation and Reset settings restores defaults', async ({ page }) => {
   await desktopMock(page);
   await openEncode(page);
-  await page.getByLabel('Video stream', { exact: true }).selectOption('4');
-  await page.getByLabel('Quality', { exact: true }).fill('20');
-  await page.getByLabel('Encoder preset', { exact: true }).selectOption('8');
-  await page.getByLabel('Copy stream #3', { exact: true }).uncheck();
-  await page.getByLabel('Encode destination', { exact: true }).fill(outputPath);
+  await quickWorkspace(page).getByLabel('Video stream', { exact: true }).selectOption('4');
+  await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill('20');
+  await quickWorkspace(page).getByLabel('Encoder preset', { exact: true }).selectOption('8');
+  await quickWorkspace(page).getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quickWorkspace(page).getByLabel('Encode destination', { exact: true }).fill(outputPath);
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByLabel('Video stream', { exact: true })).toHaveValue('4');
-  await expect(page.getByLabel('Quality', { exact: true })).toHaveValue('20');
-  await expect(page.getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
-  await expect(page.getByLabel('Copy stream #3', { exact: true })).not.toBeChecked();
-  await expect(page.getByLabel('Encode destination', { exact: true })).toHaveValue(outputPath);
+  await expect(quickWorkspace(page).getByLabel('Video stream', { exact: true })).toHaveValue('4');
+  await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('20');
+  await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
+  await expect(
+    quickWorkspace(page).getByLabel('Copy stream #3', { exact: true }),
+  ).not.toBeChecked();
+  await expect(quickWorkspace(page).getByLabel('Encode destination', { exact: true })).toHaveValue(
+    outputPath,
+  );
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
-  await expect(page.getByLabel('Quality', { exact: true })).toHaveValue('30');
-  await expect(page.getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
-  await expect(page.getByLabel('Video stream', { exact: true })).toHaveValue('0');
-  await expect(page.getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
+  await expect(quickWorkspace(page).getByLabel('Video stream', { exact: true })).toHaveValue('0');
+  await expect(quickWorkspace(page).getByLabel('Copy stream #3', { exact: true })).toBeChecked();
 });
 
 for (const missing of ['ffmpeg', 'ffprobe', 'svt-av1']) {
@@ -335,11 +395,11 @@ test('invalid quality, blank output, and audio-only sources cannot start an enco
   await desktopMock(page);
   await openEncode(page);
   for (const invalid of ['0', '64', '2.5', '']) {
-    await page.getByLabel('Quality', { exact: true }).fill(invalid);
+    await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill(invalid);
     await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   }
-  await page.getByLabel('Quality', { exact: true }).fill('30');
-  await page.getByLabel('Encode destination', { exact: true }).fill('  ');
+  await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill('30');
+  await quickWorkspace(page).getByLabel('Encode destination', { exact: true }).fill('  ');
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   const next: MediaFile = {
     ...media,
@@ -358,9 +418,9 @@ test('invalid quality, blank output, and audio-only sources cannot start an enco
     .click();
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByLabel('Quality', { exact: true })).toHaveValue('30');
-  await expect(page.getByLabel('Copy stream #12', { exact: true })).toBeChecked();
-  await expect(page.getByLabel('Copy stream #3', { exact: true })).toHaveCount(0);
+  await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(quickWorkspace(page).getByLabel('Copy stream #12', { exact: true })).toBeChecked();
+  await expect(quickWorkspace(page).getByLabel('Copy stream #3', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   expect(await calls(page, 'start_encode')).toEqual([]);
 });
@@ -426,20 +486,156 @@ for (const late of ['start', 'cancel', 'enqueue'] as const) {
   });
 }
 
-test('reconnected encode jobs show progress, finalization, and a verified output', async ({
+test('reconnected encode jobs distinguish source scans, encoding, and output validation', async ({
   page,
 }) => {
-  await desktopMock(page, { jobs: [snapshot()] });
+  const durationSeconds = 7200;
+  await desktopMock(page, {
+    jobs: [{ ...snapshot('preparing'), progressSeconds: null, durationSeconds: null }],
+  });
   await page.goto('/');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByRole('progressbar', { name: 'Encode progress' })).toHaveAttribute(
-    'value',
-    '3',
-  );
-  await emit(page, [snapshot('finalizing')]);
+  const job = page.getByRole('region', { name: 'Current encode job' });
+  const source = job.getByRole('progressbar', { name: 'Source validation progress', exact: true });
+  const encode = job.getByRole('progressbar', { name: 'Encode progress', exact: true });
+  const output = job.getByRole('progressbar', { name: 'Output validation progress', exact: true });
+  await expect(source).toBeVisible();
+  await expect(source).not.toHaveAttribute('value');
+  await expect(job).toContainText('Checking source metadata and frames before encoding.');
+  await expect(job).toContainText('Source validation · Waiting for scan progress…');
+  await expect(encode).toHaveCount(0);
+  await expect(job.getByRole('button', { name: 'Cancel job', exact: true })).toBeEnabled();
+
+  await emit(page, [{ ...snapshot('preparing'), progressSeconds: 1800, durationSeconds }]);
+  await expect(source).toHaveAttribute('value', '1800');
+  await expect(source).toHaveAttribute('max', '7200');
+  await expect(job).toContainText('Source validation · 00:30:00 / 02:00:00 of video scanned');
+  await page.screenshot({
+    path: test.info().outputPath('source-validation-progress.png'),
+    fullPage: true,
+  });
+
+  await emit(page, [{ ...snapshot('running'), progressSeconds: 0, durationSeconds }]);
+  await expect(source).toHaveCount(0);
+  await expect(encode).toHaveAttribute('value', '0');
+  await expect(job).toContainText('Encoding · 00:00:00 / 02:00:00 of video processed');
+  await emit(page, [{ ...snapshot('running'), progressSeconds: durationSeconds, durationSeconds }]);
+  await expect(encode).toHaveAttribute('value', '7200');
+
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: null, durationSeconds }]);
   await expect(page.getByText('Finalizing', { exact: true })).toBeVisible();
+  await expect(encode).toHaveCount(0);
+  await expect(output).toBeVisible();
+  await expect(output).not.toHaveAttribute('value');
+  await expect(job).toContainText('Combining tracks and checking the output before saving it.');
+  await expect(job).toContainText('Output validation · Waiting for scan progress…');
+  await expect(job.getByRole('button', { name: 'Cancel job', exact: true })).toBeEnabled();
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: 0, durationSeconds }]);
+  await expect(output).toHaveAttribute('value', '0');
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: 1800, durationSeconds }]);
+  await expect(output).toHaveAttribute('value', '1800');
+  await expect(job).toContainText('Output validation · 00:30:00 / 02:00:00 of video scanned');
+  await expect(job.getByText('Output verified and saved.', { exact: true })).toHaveCount(0);
+
   await emit(page, [snapshot('succeeded')]);
   await expect(page.getByText('Output verified and saved.', { exact: true })).toBeVisible();
+  await expect(job.getByRole('progressbar')).toHaveCount(0);
+});
+
+test('validation stays indeterminate when source duration is unknown and supports cancellation', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    jobs: [{ ...snapshot('preparing'), progressSeconds: 3600, durationSeconds: null }],
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const job = page.getByRole('region', { name: 'Current encode job' });
+  const progress = job.getByRole('progressbar', {
+    name: 'Source validation progress',
+    exact: true,
+  });
+  await expect(progress).toBeVisible();
+  await expect(progress).not.toHaveAttribute('value');
+  await expect(job).toContainText('01:00:00 of video scanned · Duration unavailable');
+  await job.getByRole('button', { name: 'Cancel job', exact: true }).click();
+  await expect
+    .poll(() => calls(page, 'cancel_job'))
+    .toEqual([{ command: 'cancel_job', payload: { id: 'encode-1' } }]);
+  await expect(job.getByRole('progressbar')).toHaveCount(0);
+  await expect(job.getByRole('button', { name: 'Cancel job', exact: true })).toBeDisabled();
+  await expect(job).toContainText('Canceling');
+});
+
+test('phase estimates use observed time, age during a stall, and reset before output validation', async ({
+  page,
+}) => {
+  const now = new Date('2026-09-11T12:00:00Z');
+  await page.clock.install({ time: now });
+  await page.clock.pauseAt(now);
+  await desktopMock(page, {
+    jobs: [{ ...snapshot('preparing'), progressSeconds: 600, durationSeconds: 7_200 }],
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const job = page.getByRole('region', { name: 'Current encode job' });
+  const estimate = job.getByLabel('Current phase estimate', { exact: true });
+  await expect(estimate).toHaveCount(0);
+  await page.clock.runFor(5_000);
+  await emit(page, [{ ...snapshot('preparing'), progressSeconds: 610, durationSeconds: 7_200 }]);
+  await expect(estimate).toHaveText(
+    'Estimated speed ~2.0× realtime · ~00:54:55 remaining in source validation',
+  );
+  await page.clock.runFor(5_000);
+  await expect(estimate).toHaveText(
+    'Estimated speed ~1.0× realtime · ~01:49:50 remaining in source validation',
+  );
+  await page.clock.runFor(10_000);
+  await expect(estimate).toHaveText('Waiting for new progress; estimate unavailable.');
+
+  await emit(page, [{ ...snapshot('running'), progressSeconds: 0, durationSeconds: 100 }]);
+  await expect(estimate).toHaveCount(0);
+  await page.clock.runFor(5_000);
+  await emit(page, [{ ...snapshot('running'), progressSeconds: 5, durationSeconds: 100 }]);
+  await expect(estimate).toHaveText(
+    'Estimated speed ~1.0× realtime · ~00:01:35 remaining in encoding',
+  );
+  await emit(page, [{ ...snapshot('running'), progressSeconds: 2, durationSeconds: 100 }]);
+  await expect(estimate).toHaveCount(0);
+
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: null, durationSeconds: 100 }]);
+  await page.clock.runFor(20_000);
+  await expect(estimate).toHaveCount(0);
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: 0, durationSeconds: 100 }]);
+  await page.clock.runFor(5_000);
+  await emit(page, [{ ...snapshot('finalizing'), progressSeconds: 10, durationSeconds: 100 }]);
+  await expect(estimate).toHaveText(
+    'Estimated speed ~2.0× realtime · ~00:00:45 remaining in output validation',
+  );
+  await emit(page, [snapshot('succeeded')]);
+  await expect(estimate).toHaveCount(0);
+});
+
+test('unknown duration shows estimated speed alone and canceling clears it', async ({ page }) => {
+  const now = new Date('2026-09-11T12:00:00Z');
+  await page.clock.install({ time: now });
+  await page.clock.pauseAt(now);
+  await desktopMock(page, {
+    jobs: [{ ...snapshot('preparing'), progressSeconds: 0, durationSeconds: null }],
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const job = page.getByRole('region', { name: 'Current encode job' });
+  const estimate = job.getByLabel('Current phase estimate', { exact: true });
+  await page.clock.runFor(5_000);
+  await emit(page, [{ ...snapshot('preparing'), progressSeconds: 0.025, durationSeconds: null }]);
+  await expect(estimate).toHaveText('Estimated speed ~0.0050× realtime');
+  await emit(page, [snapshot('canceling')]);
+  await expect(estimate).toHaveCount(0);
+  await emit(page, [snapshot('queued')]);
+  await page.clock.runFor(5_000);
+  await emit(page, [{ ...snapshot('queued'), progressSeconds: 10 }]);
+  await expect(estimate).toHaveCount(0);
 });
 
 test('encodes can be queued for different sources while another job is running', async ({
@@ -447,7 +643,9 @@ test('encodes can be queued for different sources while another job is running',
 }) => {
   await desktopMock(page, { jobs: [snapshot()] });
   await openEncode(page);
-  await page.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\second.mkv');
+  await quickWorkspace(page)
+    .getByLabel('Encode destination', { exact: true })
+    .fill('C:\\exports\\second.mkv');
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const next: MediaFile = {
@@ -557,33 +755,37 @@ test('interrupted history is terminal and never resumes automatically', async ({
   expect(await calls(page, 'enqueue_encode')).toEqual([]);
 });
 
-test('job storage errors are visible and reconnect preserves the imported source', async ({
-  page,
-}) => {
-  await desktopMock(page, { connectionFailures: 1 });
-  await openEncode(page);
-  await expect(page.getByRole('alert')).toContainText('The job history could not be read.');
-  await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: 'Reconnect jobs', exact: true }).click();
-  await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
-  await expect(page.getByLabel('Video stream', { exact: true })).toHaveValue('0');
-  await expect.poll(() => calls(page, 'subscribe_jobs')).toHaveLength(2);
-});
+for (const tab of ['Quick Convert', 'av1an'] as const) {
+  test(`${tab} exposes job storage errors and reconnect preserves the source`, async ({ page }) => {
+    await desktopMock(page, { connectionFailures: 1 });
+    await openEncode(page, tab);
+    await expect(page.getByRole('alert')).toContainText('The job history could not be read.');
+    await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Reconnect jobs', exact: true }).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+    const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    await expect(workspace.getByLabel('Video stream', { exact: true })).toHaveValue('0');
+    await expect.poll(() => calls(page, 'subscribe_jobs')).toHaveLength(2);
+  });
+}
 
-test('advanced encode settings are explicit, immutable in queued jobs, and reset safely', async ({
+test('av1an tab settings are explicit, immutable in queued jobs, and reset safely', async ({
   page,
 }) => {
   await desktopMock(page);
-  await openEncode(page);
-  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
   await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
   await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
   await expect(workspace).toContainText('does not exactly restore the original grain');
   await expect(workspace).toContainText('dynamic metadata to be discarded');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
   await expect(workspace).toContainText('first video track only');
+  await expect(
+    workspace.getByLabel('Video stream', { exact: true }).getByRole('option', { name: /#4/ }),
+  ).toBeDisabled();
   await expect(workspace).toContainText('at most 240 frames');
   await expect(workspace).toContainText('VapourSynth with the L-SMASH Works source plugin');
   await expect(workspace).toContainText('inside the output folder');
@@ -593,7 +795,7 @@ test('advanced encode settings are explicit, immutable in queued jobs, and reset
   await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('12');
   await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
   await page.screenshot({
-    path: test.info().outputPath('advanced-encode-options.png'),
+    path: test.info().outputPath('av1an-workspace-options.png'),
     fullPage: true,
   });
   await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
@@ -608,7 +810,8 @@ test('advanced encode settings are explicit, immutable in queued jobs, and reset
     hdr10Fallback: true,
   });
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
-  await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue('svtAv1');
+  await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
   await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
   await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
   await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
@@ -620,12 +823,14 @@ test('advanced encode settings are explicit, immutable in queued jobs, and reset
   expect((await calls(page, 'enqueue_encode'))[0].payload).toEqual(submitted);
 });
 
-test('grain and av1an worker ranges block submission and av1an requires its capability', async ({
+test('Quick Convert validates grain and stays available without av1an installed', async ({
   page,
 }) => {
   await desktopMock(page, { missing: 'av1an' });
   await openEncode(page);
-  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
+  const workspace = quickWorkspace(page);
+  await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveCount(0);
   const start = page.getByRole('button', { name: 'Start encode', exact: true });
   for (const invalid of ['-1', '51', '1.5', '']) {
     await workspace.getByLabel('Film grain synthesis', { exact: true }).fill(invalid);
@@ -633,19 +838,19 @@ test('grain and av1an worker ranges block submission and av1an requires its capa
   }
   await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('50');
   await expect(start).toBeEnabled();
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(start).toBeDisabled();
-  await expect(workspace).toContainText('and av1an');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('svtAv1');
+  await expect(av1anWorkspace(page)).toContainText('and av1an');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(start).toBeEnabled();
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('50');
   expect(await calls(page, 'start_encode')).toHaveLength(0);
 });
 
 test('av1an accepts only whole worker counts in range', async ({ page }) => {
   await desktopMock(page);
-  await openEncode(page);
-  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
   for (const invalid of ['0', '33', '2.5', '']) {
     await workspace.getByLabel('Parallel chunks', { exact: true }).fill(invalid);
     await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
@@ -653,3 +858,327 @@ test('av1an accepts only whole worker counts in range', async ({ page }) => {
   await workspace.getByLabel('Parallel chunks', { exact: true }).fill('32');
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
 });
+
+for (const missing of ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an']) {
+  test(`the dedicated av1an tab requires ${missing}`, async ({ page }) => {
+    await desktopMock(page, { missing });
+    await openEncode(page, 'av1an');
+    const workspace = av1anWorkspace(page);
+    await expect(workspace).toBeVisible();
+    await expect(
+      workspace.getByRole('button', { name: 'Start encode', exact: true }),
+    ).toBeDisabled();
+    await expect(
+      workspace.getByRole('button', { name: 'Add to queue', exact: true }),
+    ).toBeDisabled();
+    expect(await calls(page, 'start_encode')).toEqual([]);
+    expect(await calls(page, 'enqueue_encode')).toEqual([]);
+  });
+}
+
+test('standalone and av1an drafts stay independent across navigation and reset', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const av1an = av1anWorkspace(page);
+  await expect(quick.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
+  await expect(quick.getByLabel('Parallel chunks', { exact: true })).toHaveCount(0);
+  await quick.getByLabel('Video stream', { exact: true }).selectOption('4');
+  await quick.getByLabel('Quality', { exact: true }).fill('20');
+  await quick.getByLabel('Encoder preset', { exact: true }).selectOption('8');
+  await quick.getByLabel('Film grain synthesis', { exact: true }).fill('6');
+  await quick.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+  await quick.getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quick.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\standalone.mkv');
+
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an).toBeVisible();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(av1an.getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
+  await expect(av1an.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+  await expect(av1an.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+  await expect(av1an.getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await expect(av1an.getByLabel('Video stream', { exact: true })).toHaveValue('0');
+  await av1an.getByLabel('Quality', { exact: true }).fill('27');
+  await av1an.getByLabel('Encoder preset', { exact: true }).selectOption('5');
+  await av1an.getByLabel('Film grain synthesis', { exact: true }).fill('12');
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('3');
+  await av1an.getByLabel('Copy stream #7', { exact: true }).uncheck();
+  await av1an.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\chunks.mkv');
+  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Video stream', { exact: true })).toHaveValue('4');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('20');
+  await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
+  await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('6');
+  await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toBeChecked();
+  await expect(quick.getByLabel('Copy stream #3', { exact: true })).not.toBeChecked();
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\exports\\standalone.mkv',
+  );
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('27');
+  await expect(av1an.getByLabel('Encoder preset', { exact: true })).toHaveValue('5');
+  await expect(av1an.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('12');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
+  await expect(av1an.getByLabel('Copy stream #7', { exact: true })).not.toBeChecked();
+  await expect(av1an.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\exports\\chunks.mkv',
+  );
+  await av1an.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+  await expect(av1an.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
+  expect(await calls(page, 'start_encode')).toEqual([]);
+  expect(await calls(page, 'enqueue_encode')).toEqual([]);
+});
+
+test('each encoder restores its own source draft and resets only that source', async ({ page }) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const av1an = av1anWorkspace(page);
+  await quick.getByLabel('Quality', { exact: true }).fill('21');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await av1an.getByLabel('Quality', { exact: true }).fill('27');
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('3');
+
+  const next: MediaFile = {
+    ...media,
+    id: 'second-draft-source',
+    name: 'second.mkv',
+    path: 'C:\\media\\second.mkv',
+    streams: [{ ...baseStream, index: 12 }],
+  };
+  await page.evaluate(
+    (value) => (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.setMedia(value),
+    next,
+  );
+  const files = page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ });
+  await files.click();
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  await expect(page.getByRole('heading', { name: next.name, exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(quick.getByLabel('Video stream', { exact: true })).toHaveValue('12');
+  await quick.getByLabel('Quality', { exact: true }).fill('35');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+  await expect(av1an.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\media\\second_av1an.mkv',
+  );
+  await av1an.getByLabel('Quality', { exact: true }).fill('33');
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('6');
+
+  await files.click();
+  await page.locator('button.file-select').filter({ hasText: media.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('27');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
+  await av1an.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await files.click();
+  await page.locator('button.file-select').filter({ hasText: next.name }).click();
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('33');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('6');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('35');
+  await files.click();
+  await page.locator('button.file-select').filter({ hasText: media.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+});
+
+test('standalone and av1an submit fixed backends into one shared queue and history', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const av1an = av1anWorkspace(page);
+  const standaloneOutput = 'C:\\exports\\standalone.mkv';
+  const av1anOutput = 'C:\\exports\\chunked.mkv';
+  await quick.getByLabel('Quality', { exact: true }).fill('25');
+  await quick.getByLabel('Encode destination', { exact: true }).fill(standaloneOutput);
+  await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
+  const started = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
+  expect(started.request.settings.backend).toBe('svtAv1');
+  expect(started.request.settings.crf).toBe(25);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('3');
+  await av1an.getByLabel('Quality', { exact: true }).fill('22');
+  await av1an.getByLabel('Copy stream #7', { exact: true }).uncheck();
+  await av1an.getByLabel('Encode destination', { exact: true }).fill(av1anOutput);
+  await av1an.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request).toEqual({
+    source: { inputPath, outputPath: av1anOutput, streamIndices: [0, 3, 9] },
+    settings: {
+      videoStreamIndex: 0,
+      crf: 22,
+      preset: 4,
+      backend: 'av1an',
+      workers: 3,
+      filmGrain: 0,
+      hdr10Fallback: false,
+    },
+  });
+  const current = page.getByRole('region', { name: 'Current encode job' });
+  const pending = page.getByRole('article', { name: 'Job encode-2', exact: true });
+  await expect(current).toContainText(standaloneOutput);
+  await expect(current).toContainText('Standalone SVT-AV1');
+  await expect(pending).toContainText(av1anOutput);
+  await pending.getByText('Saved settings and log', { exact: true }).click();
+  await expect(pending).toContainText('av1an / SVT-AV1 · 3 parallel chunks');
+  await av1an.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(current).toContainText(standaloneOutput);
+  await expect(pending).toContainText(av1anOutput);
+  await expect(pending).toContainText('av1an / SVT-AV1 · 3 parallel chunks');
+  await pending.getByRole('button', { name: 'Cancel queued job encode-2', exact: true }).click();
+  await expect(pending).toContainText('Canceled');
+  await expect(current).toContainText('Running');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(pending).toContainText('Canceled');
+  await expect(current).toContainText(standaloneOutput);
+  expect((await calls(page, 'start_encode'))[0].payload).toEqual(started);
+  expect((await calls(page, 'enqueue_encode'))[0].payload).toEqual(queued);
+});
+
+for (const tab of ['Quick Convert', 'av1an'] as const) {
+  test(`${tab} discards a deferred enqueue error after changing source without unlocking duplicate submission`, async ({
+    page,
+  }) => {
+    await desktopMock(page, {
+      held: ['enqueue_encode'],
+      failure: {
+        code: 'ENCODE_UNSUPPORTED_SOURCE',
+        message: 'The original source could not be queued.',
+        path: inputPath,
+      },
+    });
+    await openEncode(page, tab);
+    const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    await workspace.getByLabel('Quality', { exact: true }).fill('24');
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    await expect.poll(() => calls(page, 'enqueue_encode')).toHaveLength(1);
+    const next: MediaFile = {
+      ...media,
+      id: 'pending-enqueue-next',
+      name: 'later.mkv',
+      path: 'C:\\media\\later.mkv',
+    };
+    await importAnotherSource(page, next);
+    await page.getByRole('button', { name: tab, exact: true }).click();
+    await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('30');
+    await expect(workspace.getByLabel('Quality', { exact: true })).toBeDisabled();
+    await expect(workspace.getByRole('button', { name: 'Starting…', exact: true })).toBeDisabled();
+    await expect(
+      workspace.getByRole('button', { name: 'Add to queue', exact: true }),
+    ).toBeDisabled();
+    await release(page, 'enqueue_encode');
+    await expect(
+      workspace.getByRole('button', { name: 'Add to queue', exact: true }),
+    ).toBeEnabled();
+    await expect(
+      workspace.getByRole('button', { name: 'Start encode', exact: true }),
+    ).toBeEnabled();
+    await expect(workspace.getByRole('alert')).toHaveCount(0);
+    await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+      `C:\\media\\later_${tab === 'av1an' ? 'av1an' : 'av1'}.mkv`,
+    );
+    await workspace.getByLabel('Quality', { exact: true }).fill('32');
+    const requests = await calls(page, 'enqueue_encode');
+    expect(requests).toHaveLength(1);
+    const original = requests[0].payload as { request: EncodeRequest };
+    expect(original.request.source.inputPath).toBe(inputPath);
+    expect(original.request.settings.crf).toBe(24);
+    expect(original.request.settings.backend).toBe(tab === 'av1an' ? 'av1an' : 'svtAv1');
+    expect(await calls(page, 'start_encode')).toEqual([]);
+  });
+
+  for (const outcome of ['destination', 'error'] as const) {
+    test(`${tab} ignores a deferred picker ${outcome} after source changes or reset`, async ({
+      page,
+    }) => {
+      const pickerMessage = 'The original destination picker failed.';
+      await desktopMock(page, {
+        held: ['plugin:dialog|save'],
+        pickerFailure:
+          outcome === 'error'
+            ? { code: 'PICKER_FAILED', message: pickerMessage, path: null }
+            : undefined,
+      });
+      await openEncode(page, tab);
+      const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+      await workspace
+        .getByRole('button', { name: 'Choose encode destination', exact: true })
+        .click();
+      await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(1);
+      const next: MediaFile = {
+        ...media,
+        id: 'pending-picker-next',
+        name: 'later.mkv',
+        path: 'C:\\media\\later.mkv',
+      };
+      await importAnotherSource(page, next);
+      await page.getByRole('button', { name: tab, exact: true }).click();
+      const expectedDestination = `C:\\media\\later_${tab === 'av1an' ? 'av1an' : 'av1'}.mkv`;
+      await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+        expectedDestination,
+      );
+      await release(page, 'plugin:dialog|save');
+      await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+        expectedDestination,
+      );
+      await expect(workspace.getByRole('alert')).toHaveCount(0);
+
+      await page.evaluate(() => {
+        (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.hold('plugin:dialog|save');
+      });
+      await workspace
+        .getByLabel('Encode destination', { exact: true })
+        .fill('C:\\exports\\draft.mkv');
+      await workspace
+        .getByRole('button', { name: 'Choose encode destination', exact: true })
+        .click();
+      await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(2);
+      await workspace.getByRole('button', { name: 'Reset settings', exact: true }).click();
+      await release(page, 'plugin:dialog|save');
+      await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+        expectedDestination,
+      );
+      await expect(workspace.getByRole('alert')).toHaveCount(0);
+
+      // A new picker on the current draft must still be able to update its
+      // destination or surface its own error after the stale replies were ignored.
+      await workspace
+        .getByRole('button', { name: 'Choose encode destination', exact: true })
+        .click();
+      if (outcome === 'error') {
+        await expect(workspace.getByRole('alert')).toContainText(pickerMessage);
+      } else {
+        await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+          outputPath,
+        );
+      }
+      expect(await calls(page, 'plugin:dialog|save')).toHaveLength(3);
+      expect(await calls(page, 'start_encode')).toEqual([]);
+      expect(await calls(page, 'enqueue_encode')).toEqual([]);
+    });
+  }
+}

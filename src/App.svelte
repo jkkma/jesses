@@ -25,6 +25,7 @@
   import { Button } from '$lib/components/ui/button';
   import FileInspector from '$lib/features/files/FileInspector.svelte';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
+  import Av1an from '$lib/features/av1an/Av1an.svelte';
   import BatchEncode from '$lib/features/batch/BatchEncode.svelte';
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
@@ -60,7 +61,7 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'convert' | 'batch' | 'remux' | 'tools';
+  type View = 'files' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
@@ -488,6 +489,12 @@
       >
       <button
         type="button"
+        class:active={view === 'av1an'}
+        aria-current={view === 'av1an' ? 'page' : undefined}
+        onclick={() => (view = 'av1an')}>av1an</button
+      >
+      <button
+        type="button"
         class:active={view === 'batch'}
         aria-current={view === 'batch' ? 'page' : undefined}
         onclick={() => (view = 'batch')}>Batch encode</button
@@ -723,7 +730,7 @@
         onrefresh={refreshTools}
       />
     {/if}
-    {#if (view === 'convert' || view === 'batch' || view === 'remux') && jobsError}
+    {#if (view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux') && jobsError}
       <div class="notice error-notice" role="alert">
         <CircleAlert size={16} aria-hidden="true" />
         <div>
@@ -740,6 +747,17 @@
     {/if}
     <div hidden={view !== 'convert'}>
       <QuickConvert
+        file={selectedFile}
+        {tools}
+        {jobs}
+        connected={jobsConnected}
+        onfiles={() => (view = 'files')}
+        onstart={submitEncode}
+        onqueue={queueEncode}
+      />
+    </div>
+    <div hidden={view !== 'av1an'}>
+      <Av1an
         file={selectedFile}
         {tools}
         {jobs}
@@ -768,7 +786,7 @@
         onstart={submitRemux}
       />
     </div>
-    {#if view === 'convert' || view === 'batch' || view === 'remux'}<JobStatus
+    {#if view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux'}<JobStatus
         job={currentJob}
         {jobs}
         oncancel={stopJob}

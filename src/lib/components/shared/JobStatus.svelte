@@ -2,6 +2,7 @@
   import { Square } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { errorMessage, formatDuration } from './format';
+  import { ProgressEstimator, type ProgressEstimate } from './progress-estimate';
   import type { EncodeSettings, JobSnapshot } from '$lib/ipc/generated';
 
   let {
@@ -30,6 +31,48 @@
       ...jobs.filter((entry) => terminal(entry.state)),
     ].filter((entry) => entry.id !== job?.id),
   );
+  const validationPhase = $derived(
+    job?.encodeSettings && (job.state === 'preparing' || job.state === 'finalizing')
+      ? job.state
+      : null,
+  );
+  const progressLabel = $derived(
+    validationPhase === 'preparing'
+      ? 'Source validation progress'
+      : validationPhase === 'finalizing'
+        ? 'Output validation progress'
+        : job?.encodeSettings
+          ? 'Encode progress'
+          : 'Remux progress',
+  );
+  const duration = $derived(
+    job?.durationSeconds != null && Number.isFinite(job.durationSeconds) && job.durationSeconds > 0
+      ? job.durationSeconds
+      : null,
+  );
+  const progress = $derived(
+    job?.progressSeconds != null && Number.isFinite(job.progressSeconds)
+      ? Math.max(0, Math.min(job.progressSeconds, duration ?? Infinity))
+      : null,
+  );
+  const estimateKey = $derived(
+    job?.encodeSettings && (validationPhase || job.state === 'running')
+      ? `${job.id}:${job.state}`
+      : null,
+  );
+  const estimator = new ProgressEstimator();
+  let estimate = $state<ProgressEstimate | null>(null);
+  $effect(() => {
+    estimator.observe(estimateKey, progress, performance.now());
+    estimate = estimator.estimate(performance.now(), duration);
+  });
+  $effect(() => {
+    if (estimateKey === null) return;
+    const timer = setInterval(() => {
+      estimate = estimator.estimate(performance.now(), duration);
+    }, 1_000);
+    return () => clearInterval(timer);
+  });
   $effect(() => {
     job?.id;
     error = null;
@@ -73,17 +116,59 @@
       {#if job.encodeSettings}<p class="small-muted">
           {encodeSummary(job.encodeSettings)}
         </p>{/if}
-      {#if job.state === 'running'}
-        <progress
-          aria-label={job.encodeSettings ? 'Encode progress' : 'Remux progress'}
-          max={job.durationSeconds ?? 1}
-          value={job.progressSeconds ?? undefined}
-        ></progress>
-        <p class="small-muted">
-          {formatDuration(job.progressSeconds)} / {formatDuration(job.durationSeconds)}
+      {#if validationPhase === 'preparing'}
+        <p>
+          Checking source metadata and frames before encoding. Long videos can take several minutes.
+        </p>
+      {:else if validationPhase === 'finalizing'}
+        <p>
+          Combining tracks and checking the output before saving it. Long videos can take several
+          minutes.
         </p>
       {/if}
-      {#if job.state === 'finalizing'}<p>Checking the output before saving it.</p>{/if}
+      {#if job.state === 'running' || validationPhase}
+        {#if duration !== null && progress !== null}
+          <progress aria-label={progressLabel} max={duration} value={progress}></progress>
+        {:else}
+          <progress aria-label={progressLabel}></progress>
+        {/if}
+        <p class="small-muted">
+          {#if validationPhase === 'preparing'}Source validation ·
+          {:else if validationPhase === 'finalizing'}Output validation ·
+          {:else if job.encodeSettings}Encoding ·
+          {:else}Remuxing ·{/if}
+          {#if progress !== null}
+            {formatDuration(progress)}{duration !== null ? ` / ${formatDuration(duration)}` : ''}
+            of video {validationPhase ? 'scanned' : 'processed'}
+            {#if duration === null}
+              · Duration unavailable{/if}
+          {:else if validationPhase}Waiting for scan progress…
+          {:else}Waiting for progress…{/if}
+        </p>
+        {#if estimate?.kind === 'estimate'}
+          <p class="small-muted" aria-label="Current phase estimate">
+            Estimated speed ~{estimate.speed.toLocaleString(undefined, {
+              minimumSignificantDigits: 2,
+              maximumSignificantDigits: 3,
+            })}× realtime
+            {#if estimate.remainingSeconds !== null}
+              · ~{formatDuration(estimate.remainingSeconds)} remaining in
+              {validationPhase === 'preparing'
+                ? 'source validation'
+                : validationPhase === 'finalizing'
+                  ? 'output validation'
+                  : 'encoding'}
+            {/if}
+          </p>
+        {:else if estimate?.kind === 'waiting'}
+          <p class="small-muted" aria-label="Current phase estimate">
+            Waiting for new progress; estimate unavailable.
+          </p>
+        {/if}
+      {/if}
+      {#if job.state === 'finalizing' && !job.encodeSettings}<p>
+          Checking the output before saving it.
+        </p>{/if}
       {#if job.state === 'succeeded'}<p>Output verified and saved.</p>{/if}
       {#if job.state === 'interrupted'}<p>
           The previous session was interrupted. Review the destination and any temporary files

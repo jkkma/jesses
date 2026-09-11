@@ -1,5 +1,7 @@
 pub(super) use super::encode_plan::validate_settings;
-use super::encode_plan::{Frames, Plan};
+use super::encode_plan::{Plan, Validation};
+#[path = "frame_scan.rs"]
+mod frame_scan;
 use super::*;
 
 impl JobManager {
@@ -92,10 +94,15 @@ impl JobManager {
             .iter()
             .find(|stream| stream.index == plan.video_index)
             .expect("validated video selection");
-        self.phase(id,JobState::Preparing,"Decoding the source once to verify every frame timestamp, progressive scan, color, and HDR metadata (bounded to 10 minutes and 64 MiB of metadata).").await;
-        let source_frames = frame_scan(&ffprobe, &source.path, plan.video_index, cancel).await?;
+        self.change(id, |snapshot| {
+            snapshot.progress_seconds = Some(0.0);
+            snapshot.duration_seconds = document.duration().filter(|duration| *duration > 0.0);
+            append_log(snapshot, "Decoding the complete source to verify every frame timestamp, progressive scan, color, and HDR metadata with bounded memory.".into());
+        }).await;
         let declared_rate = (plan.fps_num, plan.fps_den);
-        let frame_count = plan.validate_source_frames(&source_frames, video)?;
+        let frame_count = self
+            .scan_frames(id, &ffprobe, &source.path, &mut plan, video, false, cancel)
+            .await?;
         if declared_rate != (plan.fps_num, plan.fps_den) {
             self.change(id, |snapshot| {
                 append_log(snapshot, format!(
@@ -105,12 +112,12 @@ impl JobManager {
                 ));
             }).await;
         }
-        drop(source_frames);
         check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         source.verify()?;
         check_cancel(cancel)?;
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
+            snapshot.progress_seconds = None;
             append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; CRF {}, preset {}, film grain {} (denoising off).",plan.fps_num,plan.fps_den,settings.crf,settings.preset,settings.film_grain));
             if plan.is_hdr10() {
                 append_log(snapshot, "HDR10: preserving BT.2020/PQ color and validated static mastering/content light metadata.".into());
@@ -165,7 +172,7 @@ impl JobManager {
             };
             self.phase(id,JobState::Running,"Encoding 10-bit AV1 with the standalone SVT encoder; audio, subtitles, and attachments will be copied afterward.").await;
             let (sender, events) = mpsc::channel(256);
-            let event_task = self.observe_encode(id, events, plan.frame_seconds());
+            let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
             let result = supervisor::run_pipeline_to_file(
                 &producer,
                 &consumer,
@@ -186,10 +193,16 @@ impl JobManager {
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned())
         })
         .await;
-        self.phase(id,JobState::Finalizing,"Muxing encoded video with the selected original audio, subtitles, metadata, chapters, and attachments.").await;
+        self.change(id, |snapshot| {
+            if snapshot.state != JobState::Canceling {
+                snapshot.state = JobState::Finalizing;
+            }
+            snapshot.progress_seconds = None;
+            append_log(snapshot, "Muxing encoded video with the selected original audio, subtitles, metadata, chapters, and attachments.".into());
+        }).await;
         let mux_log = log_path.with_extension("mux.log");
         let (sender, events) = mpsc::channel(256);
-        let observer = self.observe_encode(id, events, plan.frame_seconds());
+        let observer = self.observe_encode(id, events, None);
         let result = supervisor::run(
             &CommandSpec {
                 executable: ffmpeg,
@@ -226,16 +239,11 @@ impl JobManager {
             .expect("selected video");
         let encoded = &artifact.streams[position];
         plan.validate_encoded_stream(video, encoded)?;
-        let frames = frame_scan(&ffprobe, &temp.path, encoded.index, cancel).await?;
-        let decoded_count = plan
-            .validate_frames(&frames, encoded, true)
-            .map_err(|error| {
-                files::error(
-                    "ENCODE_VALIDATION_FAILED",
-                    format!("Encoded frame validation failed: {}", error.message),
-                    &temp.path,
-                )
-            })?;
+        self.change(id, |snapshot| snapshot.progress_seconds = Some(0.0))
+            .await;
+        let decoded_count = self
+            .scan_frames(id, &ffprobe, &temp.path, &mut plan, encoded, true, cancel)
+            .await?;
         if decoded_count != frame_count {
             return Err(AppError::new(
                 "ENCODE_VALIDATION_FAILED",
@@ -248,11 +256,51 @@ impl JobManager {
         self.finalize(id, cancel, &source, temp, &output).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_frames(
+        &self,
+        id: &str,
+        ffprobe: &Path,
+        input: &Path,
+        plan: &mut Plan,
+        stream: &metadata::Stream,
+        encoded: bool,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<usize, AppError> {
+        let (progress, mut updates) = watch::channel(0.0_f64);
+        let observer = async {
+            while updates.changed().await.is_ok() {
+                let seconds = *updates.borrow_and_update();
+                self.change(id, |snapshot| {
+                    snapshot.progress_seconds = Some(
+                        snapshot
+                            .duration_seconds
+                            .map_or(seconds, |duration| seconds.min(duration)),
+                    );
+                })
+                .await;
+            }
+        };
+        let (result, ()) = tokio::join!(
+            frame_scan(
+                ffprobe,
+                input,
+                plan,
+                stream,
+                encoded,
+                cancel,
+                Some(progress)
+            ),
+            observer,
+        );
+        result
+    }
+
     fn observe_encode(
         &self,
         id: &str,
         mut events: mpsc::Receiver<ProcessEvent>,
-        frame_seconds: f64,
+        frame_seconds: Option<f64>,
     ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         let id = id.to_owned();
@@ -263,7 +311,9 @@ impl JobManager {
                 };
                 manager
                     .change(&id, |snapshot| {
-                        if let Some(value) = svt_frame_counter(&line) {
+                        if let (Some(value), Some(frame_seconds)) =
+                            (svt_frame_counter(&line), frame_seconds)
+                        {
                             let progress = value as f64 * frame_seconds;
                             snapshot.progress_seconds = Some(
                                 snapshot
@@ -291,13 +341,85 @@ fn svt_frame_counter(line: &str) -> Option<u64> {
         .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn frame_scan(
     ffprobe: &Path,
     input: &Path,
-    index: u32,
+    plan: &mut Plan,
+    stream: &metadata::Stream,
+    encoded: bool,
     cancel: &watch::Receiver<bool>,
-) -> Result<Frames, AppError> {
+    progress: Option<watch::Sender<f64>>,
+) -> Result<usize, AppError> {
     check_cancel(cancel)?;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8);
+    let args = frame_scan_args(input, stream.index, threads);
+    let mut validation = Validation::new(plan.clone(), stream.clone(), encoded);
+    let output = supervisor::run_streaming_stdout(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(24 * 60 * 60),
+        move |reader| {
+            let mut last_update = std::time::Instant::now();
+            frame_scan::parse(reader, |frame| {
+                validation.push(&frame);
+                if last_update.elapsed() >= Duration::from_millis(500) {
+                    if let Some(progress) = &progress {
+                        progress.send_replace(validation.progress_seconds());
+                    }
+                    last_update = std::time::Instant::now();
+                }
+            })?;
+            if let Some(progress) = &progress {
+                progress.send_replace(validation.progress_seconds());
+            }
+            Ok(validation.finish())
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        SupervisorError::OutputParse(detail) => files::error(
+            "PROBE_INVALID_RESPONSE",
+            format!("The frame scan did not return valid metadata: {detail}"),
+            input,
+        ),
+        error => process_error(error, input),
+    })?;
+    check_cancel(cancel)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        let detail: String = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(600)
+            .collect();
+        return Err(files::error(
+            "DECODE_VALIDATION_FAILED",
+            format!("The complete video could not be decoded without errors: {detail}"),
+            input,
+        ));
+    }
+    let (validated, count) = output.value.map_err(|error| {
+        if encoded {
+            files::error(
+                "ENCODE_VALIDATION_FAILED",
+                format!("Encoded frame validation failed: {}", error.message),
+                input,
+            )
+        } else {
+            error
+        }
+    })?;
+    *plan = validated;
+    Ok(count)
+}
+
+fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -311,39 +433,13 @@ async fn frame_scan(
     .map(OsString::from)
     .collect();
     args.push(index.to_string().into());
+    args.extend([
+        format!("-threads:{}", index).into(),
+        threads.to_string().into(),
+    ]);
     args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag","-of","json","-i"].into_iter().map(OsString::from));
     args.push(input.as_os_str().to_owned());
-    let output = supervisor::run_capture(
-        &CommandSpec {
-            executable: ffprobe.to_owned(),
-            args,
-            cwd: None,
-        },
-        cancel.clone(),
-        64 * 1024 * 1024,
-        Duration::from_secs(10 * 60),
-    )
-    .await
-    .map_err(|e| process_error(e, input))?;
-    check_cancel(cancel)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        let detail: String = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(600)
-            .collect();
-        return Err(files::error(
-            "DECODE_VALIDATION_FAILED",
-            format!("The complete video could not be decoded without errors: {detail}"),
-            input,
-        ));
-    }
-    serde_json::from_slice(&output.stdout).map_err(|_| {
-        files::error(
-            "PROBE_INVALID_RESPONSE",
-            "The frame scan did not return valid metadata.",
-            input,
-        )
-    })
+    args
 }
 
 pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
@@ -584,6 +680,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "manual real-media qualification; set JESSES_VALIDATION_INPUT"]
+    async fn validates_external_source_without_encoding() {
+        let Some(input) = std::env::var_os("JESSES_VALIDATION_INPUT") else {
+            eprintln!(
+                "External source qualification was NOT run: set JESSES_VALIDATION_INPUT to an absolute media path. Synthetic media tests cover CI."
+            );
+            return;
+        };
+        let input = PathBuf::from(input);
+        assert!(
+            input.is_absolute(),
+            "JESSES_VALIDATION_INPUT must be absolute"
+        );
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        let document = probe(&ffprobe, &input, &cancel).await.unwrap();
+        let video = document
+            .streams
+            .iter()
+            .find(|stream| {
+                stream.codec_type.as_deref() == Some("video")
+                    && !stream
+                        .disposition
+                        .get("attached_pic")
+                        .is_some_and(|value| *value != 0)
+            })
+            .expect("movie video stream");
+        let fallback = std::env::var("JESSES_HDR10_FALLBACK")
+            .ok()
+            .is_some_and(|value| value == "true" || value == "1");
+        let mut plan = Plan::build(
+            &document,
+            &[video],
+            &EncodeSettings {
+                video_stream_index: video.index,
+                hdr10_fallback: fallback,
+                ..EncodeSettings::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (progress, mut updates) = watch::channel(0.0_f64);
+        let observer = async {
+            let mut last = std::time::Instant::now();
+            while updates.changed().await.is_ok() {
+                let scanned = *updates.borrow_and_update();
+                if last.elapsed() >= Duration::from_secs(10) {
+                    eprintln!(
+                        "Source qualification: {scanned:.1} seconds of video scanned; {:.1}s elapsed",
+                        started.elapsed().as_secs_f64()
+                    );
+                    last = std::time::Instant::now();
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(
+            frame_scan(
+                &ffprobe,
+                &input,
+                &mut plan,
+                video,
+                false,
+                &cancel,
+                Some(progress)
+            ),
+            observer
+        );
+        let count = result.unwrap();
+        eprintln!(
+            "Complete source qualified: {count} frames, {}/{} fps, HDR10={}, cadence reconciled={}, {:.1}s elapsed",
+            plan.fps_num,
+            plan.fps_den,
+            plan.is_hdr10(),
+            plan.cadence_reconciled,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn frame_scan_selects_the_video_decoder_and_bounded_thread_count() {
+        let args = frame_scan_args(Path::new("movie.mkv"), 3, 8);
+        assert!(args.windows(2).any(|pair| pair == ["-select_streams", "3"]));
+        assert!(args.windows(2).any(|pair| pair == ["-threads:3", "8"]));
+        assert!(!args.iter().any(|arg| arg == "-read_intervals"));
+    }
+
     #[test]
     fn parses_supported_standalone_progress_formats() {
         assert_eq!(
@@ -729,8 +912,24 @@ mod tests {
             document.streams[0].color_transfer.as_deref(),
             Some("smpte2084")
         );
-        let decoded = frame_scan(&ffprobe, &output, 0, &cancel).await.unwrap();
-        assert_eq!(decoded.frames.len(), 12);
+        let mut plan = Plan::build(
+            &document,
+            &document.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        let count = frame_scan(
+            &ffprobe,
+            &output,
+            &mut plan,
+            &document.streams[0],
+            false,
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 12);
         assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|entry| {
             entry
                 .unwrap()

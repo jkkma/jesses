@@ -5,6 +5,8 @@ use super::metadata::{Document, Stream};
 
 mod hdr;
 use hdr::{Hdr10, StaticMetadata, validate_side_data};
+mod validation;
+pub(super) use validation::Validation;
 
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
@@ -245,7 +247,45 @@ impl Plan {
         args
     }
 
+    #[cfg(test)]
     pub fn validate_source_frames(
+        &mut self,
+        frames: &Frames,
+        stream: &Stream,
+    ) -> Result<usize, AppError> {
+        let mut validation = Validation::new(self.clone(), stream.clone(), false);
+        for frame in &frames.frames {
+            validation.push(frame);
+        }
+        let actual = validation.finish();
+        let mut reference = self.clone();
+        let expected = reference.validate_source_frames_buffered(frames, stream);
+        assert_eq!(
+            actual.as_ref().map(|(_, count)| *count),
+            expected.as_ref().copied()
+        );
+        if let Ok((plan, _)) = &actual {
+            assert_eq!(plan.hdr_arguments(), reference.hdr_arguments());
+            assert_eq!(
+                (plan.fps_num, plan.fps_den, plan.cadence_reconciled),
+                (
+                    reference.fps_num,
+                    reference.fps_den,
+                    reference.cadence_reconciled
+                )
+            );
+            assert_eq!(plan.tolerance, reference.tolerance);
+        }
+        actual.map(|(plan, count)| {
+            *self = plan;
+            count
+        })
+    }
+
+    // Retain the prior buffered implementation only as a test oracle. Every
+    // existing metadata/cadence fixture exercises the production online validator.
+    #[cfg(test)]
+    fn validate_source_frames_buffered(
         &mut self,
         frames: &Frames,
         stream: &Stream,
@@ -263,7 +303,7 @@ impl Plan {
                 ));
             }
         }
-        let declared_error = match self.validate_frames(frames, stream, false) {
+        let declared_error = match self.validate_frames_buffered(frames, stream, false) {
             Ok(count) => return Ok(count),
             Err(error) => error,
         };
@@ -278,7 +318,7 @@ impl Plan {
         candidate.fps_num = 2997;
         candidate.fps_den = 125;
         candidate.cadence_reconciled = true;
-        match candidate.validate_frames(frames, stream, false) {
+        match candidate.validate_frames_buffered(frames, stream, false) {
             Ok(count) => {
                 *self = candidate;
                 Ok(count)
@@ -287,7 +327,27 @@ impl Plan {
         }
     }
 
+    #[cfg(test)]
     pub fn validate_frames(
+        &self,
+        frames: &Frames,
+        stream: &Stream,
+        encoded: bool,
+    ) -> Result<usize, AppError> {
+        let mut validation = Validation::exact(self.clone(), stream.clone(), encoded);
+        for frame in &frames.frames {
+            validation.push(frame);
+        }
+        let actual = validation.finish().map(|(_, count)| count);
+        assert_eq!(
+            actual,
+            self.validate_frames_buffered(frames, stream, encoded)
+        );
+        actual
+    }
+
+    #[cfg(test)]
+    fn validate_frames_buffered(
         &self,
         frames: &Frames,
         stream: &Stream,
@@ -428,6 +488,7 @@ impl Plan {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(super) struct Frames {
     pub frames: Vec<Frame>,
@@ -821,6 +882,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn online_validation_rejects_empty_video_and_late_hdr_changes() {
+        let (source, hdr_frames) = hdr_source_and_frames();
+        let mut plan =
+            Plan::build(&source, &[&source.streams[0]], &EncodeSettings::default()).unwrap();
+        let empty = Frames { frames: Vec::new() };
+        assert!(
+            plan.validate_source_frames(&empty, &source.streams[0])
+                .is_err()
+        );
+        assert!(
+            plan.validate_frames(&empty, &source.streams[0], true)
+                .is_err()
+        );
+        let mut decoded = long_cfr_frames(24000, 1001);
+        for frame in &mut decoded.frames {
+            frame.pix_fmt = hdr_frames.frames[0].pix_fmt.clone();
+            frame.color_primaries = hdr_frames.frames[0].color_primaries.clone();
+            frame.color_space = hdr_frames.frames[0].color_space.clone();
+            frame.color_transfer = hdr_frames.frames[0].color_transfer.clone();
+        }
+        decoded.frames[0].side_data_list = hdr_frames.frames[0].side_data_list.clone();
+        let mut valid = plan.clone();
+        assert_eq!(
+            valid
+                .validate_source_frames(&decoded, &source.streams[0])
+                .unwrap(),
+            40_000
+        );
+        let mut changed = mastering();
+        changed["max_luminance"] = "2000/1".into();
+        decoded
+            .frames
+            .last_mut()
+            .unwrap()
+            .side_data_list
+            .push(changed);
+        assert!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .is_err()
+        );
+        assert!(
+            valid
+                .validate_frames(&decoded, &source.streams[0], true)
+                .is_err()
+        );
     }
 
     #[test]

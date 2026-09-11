@@ -12,13 +12,15 @@ FFmpeg, FFprobe, standalone SVT-AV1, and av1an on PATH. The interface uses a fix
 parchment-and-rust light theme. The Remux tab copies selected streams from one
 source into a new Matroska file, with progress, cancellation, and output validation.
 
-Quick Convert encodes one selected video with standalone SVT-AV1 or av1an's parallel
-SVT-AV1 chunks and copies the selected audio, subtitles, and attachments. Both
-backends support validated HDR10 output and optional film grain synthesis.
+Quick Convert drives standalone encoder executables; SVT-AV1 is the first
+implemented driver. The separate av1an tab handles scene detection and parallel
+SVT-AV1 chunks. Both workflows copy selected audio, subtitles, and attachments,
+and support validated HDR10 output and optional film grain synthesis.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
 Jobs run sequentially, and their settings and history survive restart. Multi-source
-muxing, thumbnails, audio conversion, pause/resume, and bundled media tools remain pending.
+muxing, thumbnails, audio conversion, additional standalone encoders, av1an quality
+targets and configurable chunk methods, pause/resume, and bundled media tools remain pending.
 This is a development build, not a release.
 
 ## Encode a file
@@ -28,6 +30,10 @@ and select a new `.mkv` destination. CRF 30 and preset 4 are the initial setting
 CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
 FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
 must be on PATH. The selected tool and its version appear in the job log.
+Standalone `aomenc`, `vpxenc`, `x264`, and `x265` drivers remain pending; Quick
+Convert will expose them as encoder choices as each driver is implemented.
+See the [standalone driver implementation plan](docs/standalone-encoders.md) for
+the remaining architecture and qualification gates.
 
 The encoder supports progressive, constant-frame-rate SDR video with
 explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. HDR10 uses
@@ -35,19 +41,29 @@ limited-range 10-bit BT.2020/PQ with validated mastering metadata. It rejects
 unsupported HDR formats, variable frame rates, rotation, unsupported chroma placement, and nonzero
 video/container start times. Dimensions must be even, from 64 through 8192 pixels,
 and frame rates must be between 1 and 120 fps. Source and encoded frames are decoded for timing,
-frame count, geometry, and color validation before the output is published. Each
-frame scan has a 10-minute and 64 MiB metadata limit; sources beyond those limits
-fail explicitly. Long HDR movies can exceed these bounds; short excerpts are
-qualified, while streaming frame validation for full movies remains pending.
+frame count, geometry, and color validation before the output is published. Frame
+metadata is parsed and checked incrementally, so memory does not grow with video
+length. Each frame's metadata is limited to 1 MiB, and each complete scan has a
+24-hour execution limit. Scans use up to eight decoder threads, capped by the
+available logical processors. Preparation and finalization show separate scan
+progress. After observing progress for five seconds, the app estimates the current
+phase's speed and remaining time; estimates reset between phases and disappear
+when progress stops arriving. Cancellation stops and awaits the scanner's process tree.
 Selected non-video tracks keep their original codecs.
 
-**Encode backend** defaults to standalone SVT-AV1. Choose **av1an** to use scene
-detection and parallel encoding with 1–32 workers (default 2), capped at 240 frames
+Open the separate **av1an** tab to use scene detection and parallel encoding with
+1–32 workers (default 2), capped at 240 frames
 per chunk. This integration requires av1an, VapourSynth, and L-SMASH Works in
 addition to FFmpeg, FFprobe, and SVT-AV1. Jesses checks av1an's reported plugin
 availability. av1an currently encodes the first video track only; standalone SVT
 can encode another selected video track. Jobs remain sequential; workers run
 chunks within the active job. More workers require more CPU and memory.
+
+Quick Convert and av1an keep independent settings, copied-track selections, and
+destinations for each source while the app remains open. Returning to a source
+restores that workflow's draft; **Reset settings** resets only its current draft.
+Default destinations end in `_av1.mkv` and `_av1an.mkv`, respectively. Quick Convert
+always starts the standalone encoder directly; the av1an tab always starts av1an.
 
 av1an runs in a uniquely reserved workspace inside the output folder, with caches
 kept there. Completed-chunk frame counts drive progress. The output passes the
@@ -56,7 +72,8 @@ validates the concatenated IVF frame records and corrects its rate/count header
 before muxing, covering av1an versions that write a fixed 30 fps header. Existing
 destinations are never replaced. Cancel stops the supervised av1an worker tree;
 remaining chunk work files are retained with their location in the job log.
-There is no automatic resume. Source files and their folders receive no caches.
+There is no automatic resume. Source files are never modified; caches stay in the
+reserved output workspace, even when the output folder also contains the source.
 
 **Film grain synthesis** accepts 0–50, default 0 (off). Nonzero values add AV1
 grain synthesis; encoder denoising remains disabled. Synthesis does not reproduce
@@ -200,6 +217,8 @@ See the upstream [av1an CLI reference](https://rust-av.github.io/Av1an/) and
 for the underlying tools.
 See the [local av1an/HDR validation record](tests/fixtures/av1an-validation.md)
 for tested media characteristics and remaining qualification limits.
+See the [streaming validation record](tests/fixtures/streaming-validation.md)
+for full-source scans, bounded-memory checks, and native UI qualification.
 
 Build a native executable with embedded frontend assets:
 

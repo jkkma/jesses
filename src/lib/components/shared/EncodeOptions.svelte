@@ -4,6 +4,7 @@
   let {
     idPrefix,
     disabled = false,
+    allowBackendSelection = true,
     backend = $bindable<EncodeBackend>('svtAv1'),
     workers = $bindable<number | undefined>(2),
     filmGrain = $bindable<number | undefined>(0),
@@ -11,6 +12,7 @@
   }: {
     idPrefix: string;
     disabled?: boolean;
+    allowBackendSelection?: boolean;
     backend?: EncodeBackend;
     workers?: number;
     filmGrain?: number;
@@ -18,14 +20,16 @@
   } = $props();
 </script>
 
-<div class="field full-width">
-  <label for={`${idPrefix}-backend`}>Encode backend</label>
-  <select id={`${idPrefix}-backend`} bind:value={backend} {disabled}>
-    <option value="svtAv1">Standalone SVT-AV1</option>
-    <option value="av1an">av1an · SVT-AV1 chunks</option>
-  </select>
-  <p>Both use SVT-AV1. av1an splits the video into chunks that can encode in parallel.</p>
-</div>
+{#if allowBackendSelection}
+  <div class="field full-width">
+    <label for={`${idPrefix}-backend`}>Encode backend</label>
+    <select id={`${idPrefix}-backend`} bind:value={backend} {disabled}>
+      <option value="svtAv1">Standalone SVT-AV1</option>
+      <option value="av1an">av1an · SVT-AV1 chunks</option>
+    </select>
+    <p>Both use SVT-AV1. av1an splits the video into chunks that can encode in parallel.</p>
+  </div>
+{/if}
 {#if backend === 'av1an'}
   <div class="field full-width av1an-details">
     <p>

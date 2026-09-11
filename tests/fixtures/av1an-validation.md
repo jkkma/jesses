@@ -39,8 +39,8 @@ with all av1an dependencies installed. Ordinary CI runs the portable tests and
 the separately installed FFmpeg/SVT gates; it does not silently skip failed
 av1an dependency checks.
 
-The full movie has not been encoded. Source/output frame scans still have a
-64 MiB metadata limit and a ten-minute execution limit, so long HDR sources can
-fail preflight. Streaming validation, resume, target-quality modes, additional
-source plugins, bundled tools, and Linux av1an runtime qualification remain
-future work.
+The full movie has not been encoded. Source/output frame scans now validate
+incrementally with bounded memory; see the [streaming validation record](streaming-validation.md)
+for complete-source qualification and current limits. Resume, target-quality
+modes, additional source plugins, bundled tools, and Linux av1an runtime
+qualification remain future work.

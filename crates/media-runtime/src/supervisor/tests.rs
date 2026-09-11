@@ -10,6 +10,9 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 #[path = "pipeline_tests.rs"]
 mod pipeline;
 
+#[path = "streaming_tests.rs"]
+mod streaming;
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(mode: &str) -> Self {
@@ -108,6 +111,16 @@ fn fake_tool() {
     let mode = std::fs::read_to_string(path.join("mode")).unwrap();
     std::fs::write(path.join("pid"), std::process::id().to_string()).unwrap();
     match mode.as_str() {
+        "stream-large" => streaming::large_output(),
+        "stream-reject-tree" => {
+            spawn_fixture_child(&path, "branch");
+            while !path.join("child/child/pid").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::io::stdout()
+                .write_all(b"\nSTREAM_TREE_READY\n")
+                .unwrap();
+        }
         "binary-producer" => {
             let diagnostics = std::thread::spawn(|| {
                 let mut stderr = std::io::stderr().lock();

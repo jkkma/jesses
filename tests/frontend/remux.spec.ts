@@ -397,6 +397,12 @@ test('a webview reload recovers the running job and follows finalization to succ
   await expect(page.getByRole('button', { name: 'Cancel job', exact: true })).toBeEnabled();
   await emitJobs(page, [snapshot('finalizing')]);
   await expect(page.getByText('Finalizing', { exact: true })).toBeVisible();
+  await expect(
+    page.getByText('Checking the output before saving it.', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('progressbar', { name: 'Output validation progress' })).toHaveCount(
+    0,
+  );
   await emitJobs(page, [snapshot('succeeded')]);
   await expect(page.getByText('Succeeded', { exact: true })).toBeVisible();
   await expect(page.getByText('Running', { exact: true })).toHaveCount(0);
