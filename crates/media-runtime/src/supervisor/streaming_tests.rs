@@ -185,7 +185,9 @@ async fn streaming_parser_rejection_stops_and_awaits_grandchildren() {
         fixture.pid(1).await,
         fixture.pid(2).await,
     ];
-    assert!(pids.iter().all(|&pid| !alive(pid)));
+    // Unix group SIGKILL can be observed before every descendant finishes its
+    // exit transition. Keep the same bounded termination check as other tests.
+    assert_dead(&pids).await;
 }
 
 #[tokio::test]
@@ -237,7 +239,7 @@ async fn streaming_cancellation_stops_tree_and_joins_parser() {
         Err(SupervisorError::Cancelled)
     ));
     assert!(parser_done.load(Ordering::Acquire));
-    assert!(pids.iter().all(|&pid| !alive(pid)));
+    assert_dead(&pids).await;
 }
 
 #[tokio::test]
@@ -268,7 +270,7 @@ async fn streaming_timeout_stops_tree_and_joins_parser() {
     ];
     assert!(matches!(task.await.unwrap(), Err(SupervisorError::Timeout)));
     assert!(parser_done.load(Ordering::Acquire));
-    assert!(pids.iter().all(|&pid| !alive(pid)));
+    assert_dead(&pids).await;
 }
 
 #[tokio::test]
