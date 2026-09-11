@@ -2,6 +2,7 @@
 use media_core::{
     AppError, BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest,
     EncodeRequest, EncodeSettings, FolderScanRequest, FolderScanResult, MediaFile, RemuxRequest,
+    VideoEncoder,
 };
 use std::{
     collections::HashSet,
@@ -343,6 +344,7 @@ pub(crate) fn safe_stem(path: &Path) -> String {
 fn proposed_output(
     directory: &Path,
     input: &Path,
+    encoder: VideoEncoder,
     reserved: &mut HashSet<String>,
 ) -> Result<PathBuf, AppError> {
     let stem = safe_stem(input);
@@ -352,7 +354,11 @@ fn proposed_output(
         } else {
             format!("_{number}")
         };
-        let candidate = directory.join(format!("{stem}_av1{suffix}.mkv"));
+        let codec = match encoder {
+            VideoEncoder::SvtAv1 => "av1",
+            VideoEncoder::X264 => "x264",
+        };
+        let candidate = directory.join(format!("{stem}_{codec}{suffix}.mkv"));
         let key = path_key(&candidate);
         if key == path_key(input) || reserved.contains(&key) {
             continue;
@@ -413,6 +419,7 @@ pub(crate) async fn preview(
             film_grain: request.film_grain,
             hdr10_fallback: request.hdr10_fallback,
             backend: request.backend,
+            encoder: request.encoder,
             workers: request.workers,
         };
         let mut item = BatchEncodeItem {
@@ -426,7 +433,12 @@ pub(crate) async fn preview(
                 return Err(error);
             }
             Err(error) => item.error = Some(error),
-            Ok(media) => match proposed_output(&directory, Path::new(&media.path), &mut reserved) {
+            Ok(media) => match proposed_output(
+                &directory,
+                Path::new(&media.path),
+                request.encoder,
+                &mut reserved,
+            ) {
                 Err(error) => item.error = Some(error),
                 Ok(output) => {
                     let output_path = output.to_string_lossy().into_owned();
@@ -515,13 +527,40 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &linked).unwrap();
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            let result = std::process::Command::new("cmd.exe")
-                .args(["/d", "/c", "mklink", "/J"])
-                .arg(&linked)
-                .arg(&outside)
-                .creation_flags(0x08000000)
-                .output()
+            let script = fixture.0.join("create-junction.ps1");
+            fs::write(
+                &script,
+                "New-Item -ItemType Junction -Path (Join-Path $PSScriptRoot 'media\\linked outside') -Target (Join-Path $PSScriptRoot 'outside') -ErrorAction Stop | Out-Null",
+            )
+            .unwrap();
+            let (_owner, cancel) = tokio::sync::watch::channel(false);
+            let result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(crate::supervisor::run_capture(
+                    &crate::supervisor::CommandSpec {
+                        executable: std::env::var_os("SystemRoot")
+                            .map(PathBuf::from)
+                            .unwrap()
+                            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+                        // PowerShell -File accepts ordinary native arguments;
+                        // cmd /C uses its own incompatible quoting grammar.
+                        args: [
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                        ]
+                        .into_iter()
+                        .map(std::ffi::OsString::from)
+                        .chain([script.into_os_string()])
+                        .collect(),
+                        cwd: None,
+                    },
+                    cancel,
+                    65536,
+                    std::time::Duration::from_secs(5),
+                ))
                 .unwrap();
             assert!(
                 result.status.success(),
@@ -571,8 +610,10 @@ mod tests {
         fs::write(&existing, b"existing").unwrap();
         let queued = directory.join("Title 日本語_av1_2.mkv");
         let mut reserved = HashSet::from([path_key(&queued)]);
-        let third = proposed_output(&directory, &input, &mut reserved).unwrap();
-        let fourth = proposed_output(&directory, &input, &mut reserved).unwrap();
+        let third =
+            proposed_output(&directory, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
+        let fourth =
+            proposed_output(&directory, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
         assert_eq!(third.file_name().unwrap(), "Title 日本語_av1_3.mkv");
         assert_eq!(fourth.file_name().unwrap(), "Title 日本語_av1_4.mkv");
         assert!(!third.exists());
@@ -588,7 +629,13 @@ mod tests {
             stem.chars().count() > 30,
             "Unicode names remain recognizable"
         );
-        let output = proposed_output(&directory, Path::new(&long), &mut reserved).unwrap();
+        let output = proposed_output(
+            &directory,
+            Path::new(&long),
+            VideoEncoder::SvtAv1,
+            &mut reserved,
+        )
+        .unwrap();
         assert!(output.file_name().unwrap().to_string_lossy().len() < 255);
         assert_eq!(
             writable_directory(&fixture.0.join("missing"))
@@ -620,6 +667,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn x264_preview_propagates_encoder_before_inspecting_sources() {
+        let fixture = Fixture::new();
+        let manager = crate::JobManager::new(fixture.0.join("logs"));
+        let request = BatchEncodeRequest {
+            inputs: vec![BatchEncodeInput {
+                input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
+                stream_indices: vec![0],
+                video_stream_index: 0,
+            }],
+            output_directory: fixture.0.to_string_lossy().into_owned(),
+            crf: 0, // Valid x264 CRF 0; the SVT default would reject it.
+            preset: 5,
+            film_grain: 0,
+            hdr10_fallback: false,
+            backend: Default::default(),
+            encoder: VideoEncoder::X264,
+            workers: 2,
+        };
+        let result = manager.preview_encode_batch(request.clone()).await.unwrap();
+        assert_eq!(
+            result.items[0].error.as_ref().unwrap().code,
+            "FILE_NOT_FOUND"
+        );
+        for invalid in [
+            BatchEncodeRequest {
+                film_grain: 1,
+                ..request.clone()
+            },
+            BatchEncodeRequest {
+                hdr10_fallback: true,
+                ..request.clone()
+            },
+            BatchEncodeRequest {
+                backend: media_core::EncodeBackend::Av1an,
+                ..request
+            },
+        ] {
+            assert_eq!(
+                manager
+                    .preview_encode_batch(invalid)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "ENCODE_SETTINGS_INVALID"
+            );
+        }
+        assert!(manager.list_jobs().await.is_empty());
+    }
+
+    #[test]
+    fn x264_proposals_have_distinct_names_and_preserve_existing_destinations() {
+        let fixture = Fixture::new();
+        let input = fixture.0.join("Title 日本語.mkv");
+        let existing = fixture.0.join("Title 日本語_x264.mkv");
+        fs::write(&input, b"source").unwrap();
+        fs::write(&existing, b"existing").unwrap();
+        let mut reserved = HashSet::new();
+        let second =
+            proposed_output(&fixture.0, &input, VideoEncoder::X264, &mut reserved).unwrap();
+        let third = proposed_output(&fixture.0, &input, VideoEncoder::X264, &mut reserved).unwrap();
+        let av1 = proposed_output(&fixture.0, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
+        assert_eq!(second.file_name().unwrap(), "Title 日本語_x264_2.mkv");
+        assert_eq!(third.file_name().unwrap(), "Title 日本語_x264_3.mkv");
+        assert_eq!(av1.file_name().unwrap(), "Title 日本語_av1.mkv");
+        assert!(!second.exists() && !third.exists() && !av1.exists());
+        assert_eq!(fs::read(input).unwrap(), b"source");
+        assert_eq!(fs::read(existing).unwrap(), b"existing");
+    }
+
+    #[tokio::test]
     async fn preview_keeps_per_file_source_and_selection_errors_visible() {
         let fixture = Fixture::new();
         let manager = crate::JobManager::new(fixture.0.join("logs"));
@@ -647,6 +764,7 @@ mod tests {
                 film_grain: 0,
                 hdr10_fallback: false,
                 backend: Default::default(),
+                encoder: Default::default(),
                 workers: 2,
             })
             .await

@@ -1,6 +1,5 @@
 //! Opt-in integration gate using locally synthesized media.
 use super::*;
-use std::process::Stdio;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -59,7 +58,8 @@ async fn remux_preserves_selected_order_tags_chapters_attachments_and_source_byt
         .await
         .unwrap()
         .expect("FFmpeg installed");
-    let mut command = tokio::process::Command::new(ffmpeg);
+    // Build native arguments without spawning outside the owned supervisor.
+    let mut command = std::process::Command::new(ffmpeg);
     command
         .args([
             "-v",
@@ -110,17 +110,17 @@ async fn remux_preserves_selected_order_tags_chapters_attachments_and_source_byt
         ])
         .arg(&attachment_path)
         .args(["-metadata:s:t:0", "mimetype=text/plain"])
-        .arg(&input)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    let generated = tokio::time::timeout(Duration::from_secs(20), command.output())
-        .await
-        .unwrap()
-        .unwrap();
+        .arg(&input);
+    let spec = crate::supervisor::CommandSpec {
+        executable: command.get_program().into(),
+        args: command.get_args().map(Into::into).collect(),
+        cwd: None,
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let generated =
+        crate::supervisor::run_capture(&spec, cancel, 4 * 1024 * 1024, Duration::from_secs(20))
+            .await
+            .unwrap();
     assert!(
         generated.status.success(),
         "{}",

@@ -9,7 +9,9 @@ pub use batch::{
     BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest, FolderScanRequest,
     FolderScanResult,
 };
-pub use jobs::{EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
+pub use jobs::{
+    EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest, VideoEncoder,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +114,7 @@ pub fn typescript_contracts() -> String {
         AppError::decl(&config),
         RemuxRequest::decl(&config),
         EncodeBackend::decl(&config),
+        VideoEncoder::decl(&config),
         EncodeSettings::decl(&config),
         EncodeRequest::decl(&config),
         JobState::decl(&config),

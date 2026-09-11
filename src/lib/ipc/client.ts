@@ -119,7 +119,7 @@ export async function startRemux(request: RemuxRequest): Promise<JobSnapshot> {
 export async function chooseEncodeDestination(defaultPath: string): Promise<string | null> {
   requireDesktop();
   return save({
-    title: 'Save AV1 encode',
+    title: 'Save encoded video',
     defaultPath,
     filters: [{ name: 'Matroska', extensions: ['mkv'] }],
   });

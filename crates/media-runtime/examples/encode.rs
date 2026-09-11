@@ -1,15 +1,21 @@
-//! cargo run -p media-runtime --example encode -- INPUT OUTPUT [CRF] [PRESET] [GRAIN] [HDR10_FALLBACK] [BACKEND] [WORKERS]
+//! cargo run -p media-runtime --example encode -- INPUT OUTPUT [CRF] [PRESET] [GRAIN] [HDR10_FALLBACK] [BACKEND] [WORKERS] [ENCODER]
 use media_runtime::{
-    EncodeBackend, EncodeRequest, EncodeSettings, JobManager, JobState, RemuxRequest, probe_media,
+    EncodeBackend, EncodeRequest, EncodeSettings, JobManager, JobState, RemuxRequest, VideoEncoder,
+    probe_media,
 };
 use std::{path::PathBuf, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=8).contains(&args.len()) {
-        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [svtAv1|av1an] [WORKERS_1_32]".into());
+    if !(2..=9).contains(&args.len()) {
+        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [standalone|av1an] [WORKERS_1_32] [svtAv1|x264]".into());
     }
+    let encoder = match args.get(8).map(String::as_str) {
+        None | Some("svtAv1") => VideoEncoder::SvtAv1,
+        Some("x264") => VideoEncoder::X264,
+        _ => return Err("Encoder must be svtAv1 or x264".into()),
+    };
     let media = probe_media(args[0].clone()).await?;
     let video = media
         .streams
@@ -18,14 +24,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("No video stream")?;
     let settings = EncodeSettings {
         video_stream_index: video.index,
-        crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(30),
-        preset: args.get(3).map(|v| v.parse()).transpose()?.unwrap_or(4),
+        encoder,
+        crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(
+            if encoder == VideoEncoder::X264 {
+                23
+            } else {
+                30
+            },
+        ),
+        preset: args
+            .get(3)
+            .map(|v| v.parse())
+            .transpose()?
+            .unwrap_or(if encoder == VideoEncoder::X264 { 5 } else { 4 }),
         film_grain: args.get(4).map(|v| v.parse()).transpose()?.unwrap_or(0),
         hdr10_fallback: args.get(5).map(|v| v.parse()).transpose()?.unwrap_or(false),
         backend: match args.get(6).map(String::as_str) {
-            None | Some("svtAv1") => EncodeBackend::SvtAv1,
+            None | Some("standalone" | "svtAv1") => EncodeBackend::Standalone,
             Some("av1an") => EncodeBackend::Av1an,
-            _ => return Err("Backend must be svtAv1 or av1an".into()),
+            _ => return Err("Backend must be standalone or av1an".into()),
         },
         workers: args.get(7).map(|v| v.parse()).transpose()?.unwrap_or(2),
     };

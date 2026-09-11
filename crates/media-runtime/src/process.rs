@@ -1,15 +1,6 @@
-use std::{
-    ffi::OsString,
-    io,
-    path::Path,
-    process::{ExitStatus, Stdio},
-    time::Duration,
-};
+use std::{ffi::OsString, io, path::Path, process::ExitStatus, time::Duration};
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-};
+use crate::supervisor::{self, CommandSpec, SupervisorError};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProcessError {
@@ -27,82 +18,166 @@ pub(crate) struct ProcessOutput {
     pub stderr: Vec<u8>,
 }
 
-async fn read_bounded(
-    mut stream: impl AsyncRead + Unpin,
-    max_bytes: usize,
-) -> Result<Vec<u8>, ProcessError> {
-    let mut output = Vec::with_capacity(max_bytes.min(8192));
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = stream.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(output);
-        }
-        if output.len().saturating_add(count) > max_bytes {
-            return Err(ProcessError::OutputLimit);
-        }
-        output.extend_from_slice(&buffer[..count]);
-    }
-}
-
 /// Launch a known executable directly. Both pipes are drained concurrently and
-/// bounded independently. Cancellation drops/kills the direct child; this
-/// read-only adapter is deliberately not an encoding/job process supervisor.
+/// bounded independently. Inspection uses the same owned process launcher as
+/// encoding: on Windows every spawn must explicitly restrict handle inheritance,
+/// so a concurrent probe cannot inherit another encoder's protected output.
 pub(crate) async fn run_tool(
     executable: &Path,
     args: &[OsString],
     time_limit: Duration,
     max_bytes: usize,
 ) -> Result<ProcessOutput, ProcessError> {
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().expect("stdout was configured as piped");
-    let stderr = child.stderr.take().expect("stderr was configured as piped");
-    let result = tokio::time::timeout(time_limit, async {
-        let (stdout, stderr, status) = tokio::try_join!(
-            read_bounded(stdout, max_bytes),
-            read_bounded(stderr, max_bytes),
-            async { child.wait().await.map_err(ProcessError::Io) },
-        )?;
-        Ok(ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        })
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let output = supervisor::run_capture(
+        &CommandSpec {
+            executable: executable.to_owned(),
+            args: args.to_owned(),
+            cwd: None,
+        },
+        cancel,
+        max_bytes,
+        time_limit,
+    )
+    .await
+    .map_err(|error| match error {
+        SupervisorError::Timeout => ProcessError::Timeout,
+        SupervisorError::OutputLimit => ProcessError::OutputLimit,
+        SupervisorError::Io(error) | SupervisorError::Cleanup(error) => ProcessError::Io(error),
+        error => ProcessError::Io(io::Error::other(error)),
+    })?;
+    Ok(ProcessOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
-    .await;
-    match result {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
-            Err(error)
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            Err(ProcessError::Timeout)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "exact subprocess fixture for handle inheritance regression"]
+    fn inspection_fixture() {
+        let args: Vec<_> = std::env::args_os().collect();
+        if !args
+            .windows(2)
+            .any(|pair| pair[0] == "--exact" && pair[1] == "process::tests::inspection_fixture")
+            || !args.iter().any(|arg| arg == "--ignored")
+        {
+            return;
+        }
+        let directory = std::path::PathBuf::from(args.last().unwrap());
+        std::fs::write(directory.join("inspecting"), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inspection fixture timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
-    async fn bounds_output_and_accepts_exact_limit() {
-        assert_eq!(read_bounded(&b"abcd"[..], 4).await.unwrap(), b"abcd");
-        assert!(matches!(
-            read_bounded(&b"abcde"[..], 4).await,
-            Err(ProcessError::OutputLimit)
+    async fn inspection_cannot_inherit_a_concurrent_encoders_protected_output() {
+        use std::os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        };
+        use windows_sys::Win32::{
+            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+            System::Threading::GetCurrentProcess,
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "jesses-inspection-handles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let output = directory.join("owned.partial.mkv");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(1 | 2)
+            .open(&output)
+            .unwrap();
+        let mut raw = std::ptr::null_mut();
+        // Reproduce the exact encoder-spawn window deterministically: its owned
+        // stdout duplicate is inheritable until CreateProcessW consumes it.
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    file.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut raw,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            },
+            0
+        );
+        // SAFETY: DuplicateHandle succeeded and returned a uniquely owned handle.
+        let inheritable = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let args: Vec<OsString> = [
+            "--exact",
+            "process::tests::inspection_fixture",
+            "--ignored",
+            "--nocapture",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([directory.as_os_str().to_owned()])
+        .collect();
+        let inspection = tokio::spawn(async move {
+            run_tool(
+                &std::env::current_exe().unwrap(),
+                &args,
+                Duration::from_secs(15),
+                65536,
+            )
+            .await
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while !directory.join("inspecting").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        drop(inheritable);
+        drop(file);
+        // Cleanup must be possible while inspection is still running, rather
+        // than relying on eventual inspection exit or a deletion retry.
+        let exclusive_delete = std::fs::OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .share_mode(1 | 2)
+            .open(&output);
+        std::fs::write(directory.join("release"), b"done").unwrap();
+        let inspected = inspection.await.unwrap();
+        assert!(
+            started.is_ok(),
+            "inspection must start before checking inheritance"
+        );
+        assert!(inspected.unwrap().status.success());
+        drop(exclusive_delete.expect("inspection inherited the unrelated protected output handle"));
+        std::fs::remove_file(output).unwrap();
     }
 
     #[tokio::test]

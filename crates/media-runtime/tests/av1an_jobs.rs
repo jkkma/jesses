@@ -3,12 +3,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use media_runtime::{
     EncodeBackend, EncodeRequest, EncodeSettings, JobManager, JobSnapshot, JobState, RemuxRequest,
+    get_capabilities,
+    supervisor::{CapturedOutput, CommandSpec, run_capture},
 };
 use serde_json::Value;
 
@@ -34,25 +35,36 @@ impl Drop for Fixture {
     }
 }
 
-fn command(tool: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(tool);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    command
+async fn command(tool: &str) -> std::process::Command {
+    let executable = get_capabilities()
+        .await
+        .into_iter()
+        .find(|entry| entry.id == tool && entry.available)
+        .and_then(|entry| entry.path)
+        .unwrap_or_else(|| panic!("{tool} must resolve to an installed executable"));
+    // This is only an argument builder. The supervisor owns every child.
+    std::process::Command::new(executable)
+}
+
+async fn output(command: &mut std::process::Command) -> CapturedOutput {
+    let spec = CommandSpec {
+        executable: command.get_program().into(),
+        args: command.get_args().map(Into::into).collect(),
+        cwd: command.get_current_dir().map(Into::into),
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    run_capture(&spec, cancel, 4 * 1024 * 1024, Duration::from_secs(20))
+        .await
+        .expect("fixture tool completes within its capture and time limits")
 }
 
 async fn synthesize(path: &Path, size: &str, frames: u32) {
     let filter = format!(
         "testsrc2=size={size}:rate=24000/1001,negate=enable='between(t,1,2)',format=yuv420p10le,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
     );
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
+    let output = output(
         command("ffmpeg")
+            .await
             .args([
                 "-v",
                 "error",
@@ -99,12 +111,9 @@ async fn synthesize(path: &Path, size: &str, frames: u32) {
                 "-metadata:s:a:0",
                 "title=Test tone",
             ])
-            .arg(path)
-            .output(),
+            .arg(path),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
     assert!(
         output.status.success(),
         "Fixture generation: {}",
@@ -158,9 +167,9 @@ async fn wait_for(
 }
 
 async fn probe(path: &Path) -> Value {
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
+    let output = output(
         command("ffprobe")
+            .await
             .args([
                 "-v",
                 "error",
@@ -170,12 +179,9 @@ async fn probe(path: &Path) -> Value {
                 "-of",
                 "json",
             ])
-            .arg(path)
-            .output(),
+            .arg(path),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
     assert!(
         output.status.success(),
         "Output probe: {}",

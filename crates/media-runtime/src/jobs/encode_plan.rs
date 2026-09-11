@@ -1,4 +1,4 @@
-use media_core::{AppError, EncodeSettings};
+use media_core::{AppError, EncodeBackend, EncodeSettings, VideoEncoder};
 use serde::Deserialize;
 
 use super::metadata::{Document, Stream};
@@ -10,6 +10,8 @@ pub(super) use validation::Validation;
 
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
+    pub encoder: VideoEncoder,
+    pub output_pixel_format: &'static str,
     pub video_index: u32,
     pub width: u32,
     pub height: u32,
@@ -30,14 +32,29 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
-    if !(1..=63).contains(&settings.crf)
-        || settings.preset > 13
-        || settings.film_grain > 50
-        || !(1..=32).contains(&settings.workers)
-    {
+    let valid = match settings.encoder {
+        VideoEncoder::SvtAv1 => {
+            (1..=63).contains(&settings.crf) && settings.preset <= 13 && settings.film_grain <= 50
+        }
+        VideoEncoder::X264 => {
+            settings.backend == EncodeBackend::Standalone
+                && settings.crf <= 51
+                && settings.preset <= 9
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+    };
+    if !valid || !(1..=32).contains(&settings.workers) {
         return Err(AppError::new(
             "ENCODE_SETTINGS_INVALID",
-            "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers.",
+            match settings.encoder {
+                VideoEncoder::SvtAv1 => {
+                    "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers."
+                }
+                VideoEncoder::X264 => {
+                    "Standalone x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers. av1an with x264 is not supported yet."
+                }
+            },
             None,
         ));
     }
@@ -82,9 +99,13 @@ impl Plan {
             ));
         }
         let video = videos[0];
-        if !matches!(video.pix_fmt.as_deref(), Some("yuv420p" | "yuv420p10le")) {
+        let full_range_8bit = settings.encoder == VideoEncoder::X264
+            && video.pix_fmt.as_deref() == Some("yuvj420p")
+            && video.color_range.as_deref() == Some("pc");
+        if !matches!(video.pix_fmt.as_deref(), Some("yuv420p" | "yuv420p10le")) && !full_range_8bit
+        {
             return Err(unsupported(
-                "This first encoder supports 8-bit or 10-bit planar 4:2:0 video only.",
+                "Encoding supports 8-bit or 10-bit planar 4:2:0 video only.",
             ));
         }
         if !matches!(
@@ -97,7 +118,7 @@ impl Plan {
         }
         if video.sample_aspect_ratio.as_deref() != Some("1:1") {
             return Err(unsupported(
-                "This first encoder requires explicit square pixels (sample aspect ratio 1:1).",
+                "Encoding requires explicit square pixels (sample aspect ratio 1:1).",
             ));
         }
         let is_hdr10 = video.color_primaries.as_deref() == Some("bt2020")
@@ -105,6 +126,11 @@ impl Plan {
             && video.color_space.as_deref() == Some("bt2020nc")
             && video.pix_fmt.as_deref() == Some("yuv420p10le")
             && video.color_range.as_deref() == Some("tv");
+        if is_hdr10 && settings.encoder == VideoEncoder::X264 {
+            return Err(unsupported(
+                "Standalone x264 currently supports SDR only. Select SVT-AV1 for HDR10 output; no automatic tone mapping or HDR metadata removal is performed.",
+            ));
+        }
         let hdr10 = if is_hdr10 {
             Some(Hdr10::build(
                 &video.side_data_list,
@@ -150,7 +176,7 @@ impl Plan {
             }
             _ => {
                 return Err(unsupported(
-                    "The first encoder requires even dimensions between 64 and 8192 pixels.",
+                    "Encoding requires even dimensions between 64 and 8192 pixels.",
                 ));
             }
         };
@@ -160,7 +186,7 @@ impl Plan {
         let fps = f64::from(fps_num) / f64::from(fps_den);
         if !(1.0..=120.0).contains(&fps) {
             return Err(unsupported(
-                "The first encoder supports constant frame rates from 1 through 120 fps.",
+                "Encoding supports constant frame rates from 1 through 120 fps.",
             ));
         }
         let tick = rational(video.time_base.as_deref())
@@ -176,11 +202,19 @@ impl Plan {
         ] {
             if !seconds(start).is_some_and(|value| value.abs() <= tolerance) {
                 return Err(unsupported(
-                    "The first encoder requires video and container timelines that start at zero. Timestamp offset handling is not available yet.",
+                    "Encoding requires video and container timelines that start at zero. Timestamp offset handling is not available yet.",
                 ));
             }
         }
         Ok(Self {
+            encoder: settings.encoder,
+            output_pixel_format: if settings.encoder == VideoEncoder::SvtAv1
+                || video.pix_fmt.as_deref() == Some("yuv420p10le")
+            {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            },
             video_index: video.index,
             width,
             height,
@@ -216,10 +250,15 @@ impl Plan {
             chroma: match video.chroma_location.as_deref() {
                 Some("left") => "left",
                 Some("topleft") => "topleft",
-                None | Some("unspecified" | "unknown") => "unknown",
+                Some("center") if settings.encoder == VideoEncoder::X264 => "center",
+                None | Some("unspecified" | "unknown")
+                    if settings.encoder == VideoEncoder::SvtAv1 =>
+                {
+                    "unknown"
+                }
                 _ => {
                     return Err(unsupported(
-                        "This first encoder supports left, top-left, or unspecified chroma placement only.",
+                        "SVT supports left, top-left, or unspecified chroma placement; x264 requires explicit left, center, or top-left placement.",
                     ));
                 }
             },
@@ -228,6 +267,29 @@ impl Plan {
 
     pub fn frame_seconds(&self) -> f64 {
         f64::from(self.fps_den) / f64::from(self.fps_num)
+    }
+
+    pub fn output_codec(&self) -> &'static str {
+        match self.encoder {
+            VideoEncoder::SvtAv1 => "av1",
+            VideoEncoder::X264 => "h264",
+        }
+    }
+
+    pub fn output_bit_depth(&self) -> u8 {
+        if self.output_pixel_format == "yuv420p10le" {
+            10
+        } else {
+            8
+        }
+    }
+
+    pub fn matches_output_format(&self, format: Option<&str>) -> bool {
+        format == Some(self.output_pixel_format)
+            || (self.encoder == VideoEncoder::X264
+                && self.full_range
+                && self.output_pixel_format == "yuv420p"
+                && format == Some("yuvj420p"))
     }
 
     pub fn is_hdr10(&self) -> bool {
@@ -390,6 +452,7 @@ impl Plan {
                 None | Some("unspecified" | "unknown") => "unknown",
                 Some("left") => "left",
                 Some("topleft") => "topleft",
+                Some("center") => "center",
                 _ => "unsupported",
             };
             if normalize_chroma(frame.chroma_location.as_deref())
@@ -399,12 +462,11 @@ impl Plan {
                     "Decoded frame chroma placement differs from the selected source.",
                 ));
             }
-            let expected_format = if encoded {
-                Some("yuv420p10le")
+            if if encoded {
+                !self.matches_output_format(frame.pix_fmt.as_deref())
             } else {
-                stream.pix_fmt.as_deref()
-            };
-            if frame.pix_fmt.as_deref() != expected_format {
+                frame.pix_fmt != stream.pix_fmt
+            } {
                 return Err(unsupported(
                     "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
                 ));
@@ -457,13 +519,14 @@ impl Plan {
         let chroma_matches = match self.chroma {
             "left" => output.chroma_location.as_deref() == Some("left"),
             "topleft" => output.chroma_location.as_deref() == Some("topleft"),
+            "center" => output.chroma_location.as_deref() == Some("center"),
             _ => matches!(
                 output.chroma_location.as_deref(),
                 None | Some("unspecified" | "unknown")
             ),
         };
-        if output.codec_name.as_deref() != Some("av1")
-            || output.pix_fmt.as_deref() != Some("yuv420p10le")
+        if output.codec_name.as_deref() != Some(self.output_codec())
+            || !self.matches_output_format(output.pix_fmt.as_deref())
             || output.width != Some(self.width)
             || output.height != Some(self.height)
             || output.sample_aspect_ratio.as_deref() != Some("1:1")
@@ -475,7 +538,7 @@ impl Plan {
         {
             return Err(AppError::new(
                 "ENCODE_VALIDATION_FAILED",
-                "The AV1 output dimensions, 10-bit format, aspect ratio, or color metadata differ from the plan.",
+                "The encoded output codec, dimensions, bit depth, aspect ratio, or color metadata differ from the plan.",
                 None,
             ));
         }
@@ -800,6 +863,129 @@ mod tests {
     }
     fn frames(times: &[&str]) -> Frames {
         serde_json::from_value(serde_json::json!({"frames": times.iter().map(|time| serde_json::json!({"best_effort_timestamp_time":time,"interlaced_frame":0,"width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"})).collect::<Vec<_>>()})).unwrap()
+    }
+
+    fn x264_settings() -> EncodeSettings {
+        EncodeSettings {
+            encoder: VideoEncoder::X264,
+            crf: 23,
+            preset: 5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn x264_requires_standalone_settings_and_rejects_hdr_or_unknown_chroma() {
+        for crf in [0, 23, 51] {
+            for preset in [0, 5, 9] {
+                assert!(
+                    validate_settings(&EncodeSettings {
+                        crf,
+                        preset,
+                        ..x264_settings()
+                    })
+                    .is_ok()
+                );
+            }
+        }
+        for invalid in [
+            EncodeSettings {
+                crf: 52,
+                ..x264_settings()
+            },
+            EncodeSettings {
+                preset: 10,
+                ..x264_settings()
+            },
+            EncodeSettings {
+                film_grain: 1,
+                ..x264_settings()
+            },
+            EncodeSettings {
+                hdr10_fallback: true,
+                ..x264_settings()
+            },
+            EncodeSettings {
+                backend: EncodeBackend::Av1an,
+                ..x264_settings()
+            },
+        ] {
+            assert!(validate_settings(&invalid).is_err());
+        }
+        let unknown_chroma = source();
+        assert!(
+            Plan::build(
+                &unknown_chroma,
+                &unknown_chroma.selected(&[0]).unwrap(),
+                &x264_settings()
+            )
+            .is_err()
+        );
+        let (hdr, _) = hdr_source_and_frames();
+        let error = Plan::build(&hdr, &hdr.selected(&[0]).unwrap(), &x264_settings()).unwrap_err();
+        assert!(error.message.contains("SDR only"));
+    }
+
+    #[test]
+    fn x264_preserves_sdr_depth_range_chroma_and_fractional_timing() {
+        for depth in [8, 10] {
+            for range in ["tv", "pc"] {
+                for chroma in ["left", "center", "topleft"] {
+                    let mut source = source();
+                    let pixel = if depth == 10 {
+                        "yuv420p10le"
+                    } else if range == "pc" {
+                        "yuvj420p"
+                    } else {
+                        "yuv420p"
+                    };
+                    source.streams[0].pix_fmt = Some(pixel.into());
+                    source.streams[0].color_range = Some(range.into());
+                    source.streams[0].chroma_location = Some(chroma.into());
+                    let mut plan =
+                        Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings())
+                            .unwrap();
+                    assert_eq!(plan.output_bit_depth(), depth);
+                    assert_eq!(plan.output_codec(), "h264");
+                    let mut decoded = frames(&["0", "0.042", "0.083", "0.125"]);
+                    for frame in &mut decoded.frames {
+                        frame.pix_fmt = Some(pixel.into());
+                        frame.color_range = Some(range.into());
+                        frame.chroma_location = Some(chroma.into());
+                    }
+                    assert_eq!(
+                        plan.validate_source_frames(&decoded, &source.streams[0])
+                            .unwrap(),
+                        4
+                    );
+                    plan.validate_encoded_stream(&source.streams[0], &source.streams[0])
+                        .unwrap();
+                    assert_eq!(
+                        plan.validate_frames(&decoded, &source.streams[0], true)
+                            .unwrap(),
+                        4
+                    );
+                    let mut wrong_codec = source.streams[0].clone();
+                    wrong_codec.codec_name = Some("av1".into());
+                    assert!(
+                        plan.validate_encoded_stream(&source.streams[0], &wrong_codec)
+                            .is_err()
+                    );
+                    decoded.frames[1].pix_fmt = Some(
+                        if depth == 10 {
+                            "yuv420p"
+                        } else {
+                            "yuv420p10le"
+                        }
+                        .into(),
+                    );
+                    assert!(
+                        plan.validate_frames(&decoded, &source.streams[0], true)
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn fractional_cfr_accepts_timestamp_rounding_but_rejects_vfr() {

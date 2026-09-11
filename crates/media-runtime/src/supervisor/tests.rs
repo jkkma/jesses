@@ -382,20 +382,7 @@ async fn abrupt_supervisor_host_exit_closes_noninherited_job() {
     let spec = fixture.spec();
     // The host itself deliberately has no supervisor-owned Job Object, so this
     // test cannot accidentally pass through an outer job's cleanup.
-    let mut host = tokio::process::Command::new(spec.executable)
-        .args(spec.args)
-        .current_dir(fixture.0.clone())
-        .creation_flags(0x08000000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let status = tokio::time::timeout(Duration::from_secs(10), host.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let status = platform::run_unowned_test_host(&spec).await.unwrap();
     assert!(status.success());
     assert_dead(&[
         fixture.pid(1).await,

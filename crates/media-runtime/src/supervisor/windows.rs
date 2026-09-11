@@ -309,6 +309,77 @@ impl Drop for OwnedChild {
     }
 }
 
+/// The abrupt-host regression must have no outer job to rescue its descendants.
+/// Disable all handle inheritance so this test-only host cannot capture a
+/// concurrent supervisor's temporary stdio handles through Rust's broad spawn.
+#[cfg(test)]
+pub(super) async fn run_unowned_test_host(spec: &CommandSpec) -> io::Result<ExitStatus> {
+    use windows_sys::Win32::System::Threading::{STARTUPINFOW, TerminateProcess};
+    let executable = wide(spec.executable.as_os_str())?;
+    let mut command_line = Vec::new();
+    quote(spec.executable.as_os_str(), &mut command_line)?;
+    for arg in &spec.args {
+        command_line.push(b' ' as u16);
+        quote(arg, &mut command_line)?;
+    }
+    command_line.push(0);
+    let cwd = spec
+        .cwd
+        .as_ref()
+        .map(|path| wide(path.as_os_str()))
+        .transpose()?;
+    let mut startup: STARTUPINFOW = unsafe { zeroed() };
+    startup.cb = size_of::<STARTUPINFOW>() as u32;
+    let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    // SAFETY: all strings and structure buffers remain live throughout the call.
+    check(unsafe {
+        CreateProcessW(
+            executable.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW,
+            null(),
+            cwd.as_ref().map_or(null(), |value| value.as_ptr()),
+            &startup,
+            &mut info,
+        )
+    })?;
+    struct Host(OwnedHandle);
+    impl Drop for Host {
+        fn drop(&mut self) {
+            // Also prevent a failed/aborted test from leaving its host alive.
+            unsafe {
+                TerminateProcess(self.0.as_raw_handle(), 1);
+            }
+        }
+    }
+    // SAFETY: successful CreateProcessW returned two uniquely owned handles.
+    let host = Host(unsafe { OwnedHandle::from_raw_handle(info.hProcess) });
+    drop(unsafe { OwnedHandle::from_raw_handle(info.hThread) });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match unsafe { WaitForSingleObject(host.0.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                check(unsafe { GetExitCodeProcess(host.0.as_raw_handle(), &mut code) })?;
+                return Ok(ExitStatus::from_raw(code));
+            }
+            WAIT_TIMEOUT if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            WAIT_TIMEOUT => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test host did not exit",
+                ));
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+}
+
 fn check(success: i32) -> io::Result<()> {
     if success == 0 {
         Err(io::Error::last_os_error())

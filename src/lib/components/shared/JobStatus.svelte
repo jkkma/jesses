@@ -3,7 +3,8 @@
   import { Button } from '$lib/components/ui/button';
   import { errorMessage, formatDuration } from './format';
   import { ProgressEstimator, type ProgressEstimate } from './progress-estimate';
-  import type { EncodeSettings, JobSnapshot } from '$lib/ipc/generated';
+  import type { JobSnapshot } from '$lib/ipc/generated';
+  import { encodeSummary } from './encoder-options';
 
   let {
     job,
@@ -19,8 +20,6 @@
   let error = $state<string | null>(null);
   let canceling = $state(false);
   let stopping = $state(false);
-  const encodeSummary = (settings: EncodeSettings) =>
-    `${settings.backend === 'av1an' ? `av1an / SVT-AV1 · ${settings.workers ?? 2} parallel chunks` : 'Standalone SVT-AV1'} · 10-bit · CRF ${settings.crf} · Preset ${settings.preset} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'}`;
   const terminal = (state: string) =>
     ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
   const pending = $derived(jobs.filter((entry) => !terminal(entry.state)));
@@ -108,7 +107,13 @@
     aria-label={job.encodeSettings ? 'Current encode job' : 'Current remux job'}
   >
     <div class="section-heading">
-      <span class="eyebrow">{job.encodeSettings ? 'AV1 encode' : 'Remux'} · Job status</span>
+      <span class="eyebrow"
+        >{job.encodeSettings
+          ? job.encodeSettings.encoder === 'x264'
+            ? 'H.264 encode'
+            : 'AV1 encode'
+          : 'Remux'} · Job status</span
+      >
       <strong role="status">{job.state.charAt(0).toUpperCase() + job.state.slice(1)}</strong>
     </div>
     <div class="job-body">
@@ -214,9 +219,11 @@
         <article class="queue-entry" aria-label={`Job ${entry.id}`}>
           <div class="queue-description">
             <strong
-              >{entry.encodeSettings ? 'AV1 encode' : 'Remux'} · {entry.state
-                .charAt(0)
-                .toUpperCase() + entry.state.slice(1)}</strong
+              >{entry.encodeSettings
+                ? entry.encodeSettings.encoder === 'x264'
+                  ? 'H.264 encode'
+                  : 'AV1 encode'
+                : 'Remux'} · {entry.state.charAt(0).toUpperCase() + entry.state.slice(1)}</strong
             >
             <p class="job-path">{entry.request.outputPath}</p>
             {#if entry.error}<p class="job-error">{entry.error.message}</p>{/if}

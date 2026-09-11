@@ -13,12 +13,20 @@
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
+  import {
+    encoderOptions,
+    requiredEncoderTools,
+    presetLabel,
+    sourceBitDepth,
+    knownHdr,
+  } from './encoder-options';
   import type {
     EncodeBackend,
     EncodeRequest,
     JobSnapshot,
     MediaFile,
     ToolInfo,
+    VideoEncoder,
   } from '$lib/ipc/generated';
 
   let {
@@ -41,6 +49,7 @@
     onqueue: (request: EncodeRequest) => Promise<void>;
   } = $props();
   let videoIndex = $state<number | undefined>();
+  let selectedEncoder = $state<VideoEncoder>('svtAv1');
   let crf = $state<number | undefined>(30);
   let preset = $state(4);
   let workers = $state<number | undefined>(2);
@@ -67,11 +76,22 @@
   let draftGeneration = 0;
   const desktop = isDesktop();
   const chunked = $derived(backend === 'av1an');
+  const encoder = $derived(chunked ? 'svtAv1' : selectedEncoder);
+  const options = $derived(encoderOptions(encoder));
   const idPrefix = $derived(chunked ? 'av1an' : 'encode');
   const terminal = (state: string) =>
     ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
   const active = $derived(jobs.find((job) => !terminal(job.state)));
   const videos = $derived(file?.streams.filter((stream) => stream.kind === 'video') ?? []);
+  const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
+  const hdrUnsupported = $derived(encoder === 'x264' && knownHdr(selectedVideo));
+  const depthLabel = $derived(
+    encoder === 'svtAv1'
+      ? '10-bit'
+      : sourceBitDepth(selectedVideo)
+        ? `${sourceBitDepth(selectedVideo)}-bit source`
+        : 'Source bit depth',
+  );
   const selectedVideoSupported = $derived(
     videos.some((stream) => stream.index === videoIndex) &&
       (!chunked || videoIndex === videos[0]?.index),
@@ -79,7 +99,7 @@
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const usableSource = $derived(!!file && !file.id.startsWith('jesses-synthetic'));
   const toolsReady = $derived(
-    ['ffmpeg', 'ffprobe', 'svt-av1', ...(backend === 'av1an' ? ['av1an'] : [])].every((id) =>
+    requiredEncoderTools(backend, encoder).every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
@@ -87,15 +107,16 @@
   const validSettings = $derived(
     typeof crf === 'number' &&
       Number.isInteger(crf) &&
-      crf >= 1 &&
-      crf <= 63 &&
+      crf >= options.crfMin &&
+      crf <= options.crfMax &&
       Number.isInteger(preset) &&
       preset >= 0 &&
-      preset <= 13 &&
-      typeof filmGrain === 'number' &&
-      Number.isInteger(filmGrain) &&
-      filmGrain >= 0 &&
-      filmGrain <= 50 &&
+      preset < options.presets.length &&
+      (encoder === 'x264' ||
+        (typeof filmGrain === 'number' &&
+          Number.isInteger(filmGrain) &&
+          filmGrain >= 0 &&
+          filmGrain <= 50)) &&
       (backend !== 'av1an' ||
         (typeof workers === 'number' &&
           Number.isInteger(workers) &&
@@ -107,6 +128,7 @@
       connected &&
       toolsReady &&
       selectedVideoSupported &&
+      !hdrUnsupported &&
       validSettings &&
       !!destination.trim(),
   );
@@ -115,8 +137,8 @@
   function reset(source: MediaFile | undefined) {
     ++draftGeneration;
     videoIndex = source?.streams.find((stream) => stream.kind === 'video')?.index;
-    crf = 30;
-    preset = 4;
+    crf = options.defaultCrf;
+    preset = options.defaultPreset;
     workers = 2;
     filmGrain = 0;
     hdr10Fallback = false;
@@ -125,13 +147,13 @@
       [];
     destination =
       source && !source.id.startsWith('jesses-synthetic')
-        ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? '_av1an.mkv' : '_av1.mkv')
+        ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? '_av1an.mkv' : options.suffix)
         : '';
     error = null;
   }
   $effect(() => {
     const source = file;
-    const identity = source ? JSON.stringify(source) : null;
+    const identity = source ? JSON.stringify([encoder, source]) : null;
     untrack(() => {
       ++draftGeneration;
       if (draftIdentity !== null) {
@@ -166,7 +188,7 @@
     return (
       generation === draftGeneration &&
       identity === draftIdentity &&
-      identity === (file ? JSON.stringify(file) : null)
+      identity === (file ? JSON.stringify([encoder, file]) : null)
     );
   }
   async function chooseOutput() {
@@ -186,7 +208,7 @@
       !file ||
       videoIndex === undefined ||
       crf === undefined ||
-      filmGrain === undefined
+      (encoder === 'svtAv1' && filmGrain === undefined)
     )
       return;
     submitting = true;
@@ -208,9 +230,10 @@
           crf,
           preset,
           backend,
+          encoder,
           workers: backend === 'av1an' ? workers! : 2,
-          filmGrain,
-          hdr10Fallback,
+          filmGrain: encoder === 'x264' ? 0 : filmGrain!,
+          hdr10Fallback: encoder === 'x264' ? false : hdr10Fallback,
         },
       });
     } catch (cause) {
@@ -236,18 +259,26 @@
       <p>
         {chunked
           ? 'Detect scenes and encode AV1 chunks in parallel with av1an and SVT-AV1.'
-          : 'Encode with standalone encoder executables. SVT-AV1 is currently available.'}
+          : 'Encode with standalone SVT-AV1 or x264 executables.'}
       </p>
     </div>
-    <span class="status-label">{chunked ? 'av1an / SVT-AV1' : 'Standalone SVT-AV1'} · 10-bit</span>
+    <span class="status-label"
+      >{chunked ? 'av1an / SVT-AV1' : `Standalone ${options.name}`} · {depthLabel}</span
+    >
   </div>
   <div class="notice convert-notice">
     <Info size={16} aria-hidden="true" />
-    <p>
-      Supports progressive SDR and compatible HDR10 video with a constant frame rate, square pixels,
-      and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing, resizing, and
-      audio encoding are not supported yet. Source compatibility is checked before encoding.
-    </p>
+    {#if encoder === 'x264'}<p>
+        Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
+        The source's 8-bit or 10-bit depth is retained when supported by the installed x264 build.
+        HDR, resizing, interlacing, and audio encoding are not supported. Source compatibility and
+        encoder depth support are checked before encoding.
+      </p>{:else}<p>
+        Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
+        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing,
+        resizing, and audio encoding are not supported yet. Source compatibility is checked before
+        encoding.
+      </p>{/if}
   </div>
   {#if error}<div class="notice error-notice" role="alert">
       <Info size={16} aria-hidden="true" />
@@ -265,6 +296,14 @@
           >
         </div>
         <div class="setting-fields">
+          {#if !chunked}<div class="field full-width">
+              <label for={`${idPrefix}-encoder`}>Video encoder</label>
+              <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
+                <option value="svtAv1">SVT-AV1 · AV1</option>
+                <option value="x264">x264 · H.264</option>
+              </select>
+              <p>Each encoder keeps its own settings and output destination for this source.</p>
+            </div>{/if}
           <div class="field full-width">
             <label for={`${idPrefix}-video-stream`}>Video stream</label>
             <select
@@ -286,7 +325,7 @@
             <p>
               {chunked
                 ? 'av1an encodes the first video track only.'
-                : 'Standalone SVT-AV1 executable · 10-bit AV1 · Source dimensions and frame rate'}
+                : `Standalone ${options.name} executable · ${depthLabel} ${options.codec} · Source dimensions and frame rate`}
             </p>
           </div>
           <div class="field">
@@ -295,28 +334,30 @@
               <input
                 id={`${idPrefix}-quality`}
                 type="number"
-                min="1"
-                max="63"
+                min={options.crfMin}
+                max={options.crfMax}
                 step="1"
                 bind:value={crf}
                 {disabled}
               /><span>CRF</span>
             </div>
-            <p>1–63 · Lower values retain more detail</p>
+            <p>
+              {options.crfMin}–{options.crfMax} · Lower values retain more detail
+            </p>
           </div>
           <div class="field">
             <label for={`${idPrefix}-preset`}>Encoder preset</label>
             <select id={`${idPrefix}-preset`} bind:value={preset} {disabled}
-              >{#each Array.from({ length: 14 }, (_, index) => index) as value}<option {value}
-                  >{value}</option
+              >{#each options.presets as choice}<option value={choice.value}>{choice.label}</option
                 >{/each}</select
             >
-            <p>0–13 · Higher values encode faster</p>
+            <p>{options.presetHelp}</p>
           </div>
           <EncodeOptions
             {idPrefix}
             {disabled}
             {backend}
+            {encoder}
             allowBackendSelection={false}
             bind:workers
             bind:filmGrain
@@ -389,9 +430,13 @@
         <div class="output-summary">
           <Clapperboard size={15} aria-hidden="true" />
           <p>
-            <strong>10-bit AV1 + copied tracks</strong><span
-              >{backend === 'av1an' ? `av1an · ${workers ?? '—'} workers` : 'Standalone SVT-AV1'} · CRF
-              {crf ?? '—'} · Preset {preset} · Grain {filmGrain ?? '—'} · MKV</span
+            <strong>{depthLabel} {options.codec} + copied tracks</strong><span
+              >{backend === 'av1an'
+                ? `av1an · ${workers ?? '—'} workers`
+                : `Standalone ${options.name}`} · CRF
+              {crf ?? '—'} · Preset {presetLabel(encoder, preset)}{encoder === 'svtAv1'
+                ? ` · Grain ${filmGrain ?? '—'}`
+                : ''} · MKV</span
             >
           </p>
         </div>
@@ -410,14 +455,19 @@
             Choose a local source with a video stream.
           </p>
         {:else if !toolsReady}<p class="disabled-reason">
-            Install FFmpeg, FFprobe, standalone SVT-AV1{backend === 'av1an' ? ', and av1an' : ''},
-            then refresh Tools & settings.
+            Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
+              ? ', and av1an'
+              : ''}, then refresh Tools & settings.
           </p>
         {:else if !selectedVideoSupported}<p class="disabled-reason">
             av1an requires the first video track. Use Quick Convert for another video track.
           </p>
+        {:else if hdrUnsupported}<p class="disabled-reason">
+            x264 supports SDR sources only. Choose SVT-AV1 for compatible HDR10 video.
+          </p>
         {:else if !validSettings}<p class="disabled-reason">
-            Use whole numbers: CRF 1–63, preset 0–13, and grain 0–50{chunked
+            Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
+              .length - 1}{encoder === 'svtAv1' ? ', and grain 0–50' : ''}{chunked
               ? '; parallel chunks 1–32'
               : ''}.
           </p>

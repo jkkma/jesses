@@ -8,14 +8,14 @@ Rust, Tauri, Svelte, and shadcn-svelte.
 
 The development build provides a desktop media workspace with native file
 selection and drag/drop, FFprobe metadata and stream inspection, and detection of
-FFmpeg, FFprobe, standalone SVT-AV1, and av1an on PATH. The interface uses a fixed
+FFmpeg, FFprobe, standalone SVT-AV1, x264, and av1an on PATH. The interface uses a fixed
 parchment-and-rust light theme. The Remux tab copies selected streams from one
 source into a new Matroska file, with progress, cancellation, and output validation.
 
-Quick Convert drives standalone encoder executables; SVT-AV1 is the first
-implemented driver. The separate av1an tab handles scene detection and parallel
-SVT-AV1 chunks. Both workflows copy selected audio, subtitles, and attachments,
-and support validated HDR10 output and optional film grain synthesis.
+Quick Convert drives standalone SVT-AV1 and x264 executables. The separate av1an
+tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
+selected audio, subtitles, and attachments. SVT-AV1 supports validated HDR10 output
+and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
 Jobs run sequentially, and their settings and history survive restart. Multi-source
@@ -26,17 +26,33 @@ This is a development build, not a release.
 ## Encode a file
 
 Add a local file in Files, open Quick Convert, choose the video and copied tracks,
-and select a new `.mkv` destination. CRF 30 and preset 4 are the initial settings;
+and select a new `.mkv` destination. SVT-AV1 starts at CRF 30 and preset 4;
 CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
 FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
 must be on PATH. The selected tool and its version appear in the job log.
-Standalone `aomenc`, `vpxenc`, `x264`, and `x265` drivers remain pending; Quick
+Standalone `aomenc`, `vpxenc`, and `x265` drivers remain pending; Quick
 Convert will expose them as encoder choices as each driver is implemented.
 See the [standalone driver implementation plan](docs/standalone-encoders.md) for
 the remaining architecture and qualification gates.
 
-The encoder supports progressive, constant-frame-rate SDR video with
-explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. HDR10 uses
+Choose **x264 · H.264** in Quick Convert for direct x264 encoding, or choose x264
+with the standalone workflow in Batch encode. It defaults to CRF 23 and the
+**medium** preset; CRF 0–51 and the ten named x264 presets are supported. The
+installed executable must advertise Y4M input, Matroska output, and the source's
+8-bit or 10-bit depth. Source depth, range, dimensions, cadence, and SDR color are
+retained; x264 currently requires explicit left, center, or top-left chroma
+placement. HDR sources, film grain synthesis, and HDR10 fallback are rejected for
+x264. CRF 0 does not promise lossless 10-bit output; a separate lossless mode is
+not implemented. Existing SVT-AV1 settings and saved jobs remain readable.
+
+x264 writes a timed Matroska intermediate through the supervised pipeline before
+selected tracks are copied into the final Matroska output. This preserves B-frame
+presentation order without disabling B-frames or reconstructing timestamps from a
+raw H.264 stream. The completed output must pass the same complete decoded-frame,
+track, and metadata checks before publication. See the [x264 validation record](tests/fixtures/x264-validation.md).
+
+Encoding supports progressive, constant-frame-rate SDR video with
+explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. SVT-AV1 HDR10 uses
 limited-range 10-bit BT.2020/PQ with validated mastering metadata. It rejects
 unsupported HDR formats, variable frame rates, rotation, unsupported chroma placement, and nonzero
 video/container start times. Dimensions must be even, from 64 through 8192 pixels,
@@ -55,14 +71,14 @@ Open the separate **av1an** tab to use scene detection and parallel encoding wit
 1–32 workers (default 2), capped at 240 frames
 per chunk. This integration requires av1an, VapourSynth, and L-SMASH Works in
 addition to FFmpeg, FFprobe, and SVT-AV1. Jesses checks av1an's reported plugin
-availability. av1an currently encodes the first video track only; standalone SVT
+availability. av1an currently encodes the first video track only; standalone encoders
 can encode another selected video track. Jobs remain sequential; workers run
 chunks within the active job. More workers require more CPU and memory.
 
 Quick Convert and av1an keep independent settings, copied-track selections, and
-destinations for each source while the app remains open. Returning to a source
+destinations for each source and encoder while the app remains open. Returning to a source
 restores that workflow's draft; **Reset settings** resets only its current draft.
-Default destinations end in `_av1.mkv` and `_av1an.mkv`, respectively. Quick Convert
+Default destinations end in `_av1.mkv`, `_x264.mkv`, or `_av1an.mkv`. Quick Convert
 always starts the standalone encoder directly; the av1an tab always starts av1an.
 
 av1an runs in a uniquely reserved workspace inside the output folder, with caches
@@ -77,8 +93,8 @@ reserved output workspace, even when the output folder also contains the source.
 
 **Film grain synthesis** accepts 0–50, default 0 (off). Nonzero values add AV1
 grain synthesis; encoder denoising remains disabled. Synthesis does not reproduce
-the source grain exactly. The same setting is available for both backends and
-batch encoding; no content preset silently enables grain.
+the source grain exactly. The same setting is available for SVT-AV1 in Quick
+Convert, av1an, and batch encoding; no content preset silently enables grain.
 
 Static HDR mastering and content light metadata are checked in the source and
 decoded output, allowing only AV1's fixed-point precision difference. **Allow
@@ -114,17 +130,19 @@ with a smaller folder. **Stop import** keeps completed imports and discards late
 results; the current read-only scan or probe may finish in the background.
 
 Open **Batch encode**, select up to 100 files, and review the video and copied
-tracks for each file. Choose common backend, workers, CRF/preset, grain, and HDR10
+tracks for each file. Choose the workflow and encoder, then common workers,
+CRF/preset and the encoder's supported grain/HDR10
 fallback settings and an existing writable
 output folder, then select **Preview batch**. The app proposes names such as
 `episode_av1.mkv` and `episode_av1_2.mkv`, avoiding existing files and destinations
-already reserved in the queue. Unicode names and spaces are retained where valid.
+already reserved in the queue. x264 proposals use `_x264` instead of `_av1`. Unicode
+names and spaces are retained where valid.
 The preview creates no output files or folders.
 
 The preview reports per-file selection and header compatibility errors. Each
 FFprobe header inspection is limited to 30 seconds and 2 MiB of metadata. A ready
 row still requires the full decoded-frame and output validation when its job runs.
-Changing files, tracks, backend, workers, quality, grain, HDR fallback, or the output folder requires a new
+Changing files, tracks, workflow, encoder, workers, quality, grain, HDR fallback, or the output folder requires a new
 preview.
 
 **Queue ready files** submits only the ready rows, with immutable per-file
@@ -192,7 +210,7 @@ pnpm contracts:check
 ```
 
 Run the real-tool integration tests separately with FFmpeg, FFprobe, and
-standalone SvtAv1EncApp on PATH:
+standalone SvtAv1EncApp and x264 on PATH:
 
 ```sh
 cargo test -p media-runtime --lib --locked -- --include-ignored
@@ -201,6 +219,8 @@ cargo run -p media-runtime --example inspect
 cargo run -p media-runtime --example inspect -- /path/to/video.mkv
 cargo run -p media-runtime --example remux -- /path/to/video.mkv /path/to/new-output.mkv
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 30 4
+cargo test -p media-runtime --test x264_jobs --locked -- --ignored --test-threads=1
+cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 23 5 0 false standalone 2 x264
 ```
 
 With av1an, VapourSynth and L-SMASH Works installed, run its integration gate:
@@ -211,7 +231,9 @@ cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encod
 ```
 
 The encode example's optional arguments are CRF, preset, grain strength, explicit
-HDR10 fallback (`true`/`false`), backend (`svtAv1`/`av1an`), and worker count.
+HDR10 fallback (`true`/`false`), workflow (`standalone`/`av1an`), worker count, and
+encoder (`svtAv1`/`x264`). The old `svtAv1` workflow name remains accepted by the
+example and when loading older history. x264 integration tests require x264 on PATH.
 See the upstream [av1an CLI reference](https://rust-av.github.io/Av1an/) and
 [SVT-AV1 parameters](https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/v4.0.0/Docs/Parameters.md)
 for the underlying tools.

@@ -5,4 +5,4 @@
   let props: Omit<ComponentProps<typeof SingleEncode>, 'backend'> = $props();
 </script>
 
-<SingleEncode {...props} backend="svtAv1" />
+<SingleEncode {...props} backend="standalone" />

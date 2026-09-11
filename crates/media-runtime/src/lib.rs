@@ -1,4 +1,4 @@
-//! Local discovery, folder previews, and supervised remux and AV1 encode jobs.
+//! Local discovery, folder previews, and supervised remux and video encode jobs.
 //!
 //! PATH discovery is the initial development provider. Installed tool manifests,
 //! automatic recovery, and broader codec workflows remain future adapters.
@@ -19,6 +19,6 @@ pub use media_core::{
     FolderScanResult,
 };
 pub use media_core::{
-    EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest,
+    EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest, VideoEncoder,
 };
 pub use probe::probe_media;

@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
@@ -59,6 +59,9 @@ jobs:
         run: |
           cargo test -p media-runtime --lib --locked -- --include-ignored
           cargo test -p media-runtime --test real_tools --locked -- --include-ignored
+      - name: Verify standalone x264 integration
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test x264_jobs --locked -- --include-ignored
       - run: pnpm contracts:check
       - name: Check the native executable with embedded frontend
         run: pnpm tauri build --debug --no-bundle --target ${{ matrix.target }}

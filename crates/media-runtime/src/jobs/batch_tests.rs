@@ -466,7 +466,7 @@ fn batch_header_preflight_honors_explicit_hdr10_fallback_for_both_backends() {
     });
     let bytes = serde_json::to_vec(&document).unwrap();
     for backend in [
-        media_core::EncodeBackend::SvtAv1,
+        media_core::EncodeBackend::Standalone,
         media_core::EncodeBackend::Av1an,
     ] {
         let settings = EncodeSettings {
@@ -570,6 +570,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
     };
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![
                 selected.clone(),
                 selected.clone(),
@@ -629,6 +630,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         .unwrap();
     let queued_preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![BatchEncodeInput {
                 input_path: input.to_string_lossy().into_owned(),
                 stream_indices: vec![0],

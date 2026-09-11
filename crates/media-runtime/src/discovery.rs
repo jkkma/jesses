@@ -18,7 +18,7 @@ struct ToolSpec {
     version_arg: &'static str,
 }
 
-const TOOLS: [ToolSpec; 4] = [
+const TOOLS: [ToolSpec; 5] = [
     ToolSpec {
         id: "ffmpeg",
         name: "FFmpeg",
@@ -41,6 +41,12 @@ const TOOLS: [ToolSpec; 4] = [
         id: "av1an",
         name: "av1an",
         executables: &["av1an"],
+        version_arg: "--version",
+    },
+    ToolSpec {
+        id: "x264",
+        name: "x264",
+        executables: &["x264"],
         version_arg: "--version",
     },
 ];
@@ -228,16 +234,17 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
     info
 }
 
-/// Checks all four known tools concurrently; missing optional tools remain
+/// Checks all known tools concurrently; missing optional tools remain
 /// explicit capability results and do not prevent media inspection.
 pub async fn get_capabilities() -> Vec<ToolInfo> {
-    let (ffmpeg, ffprobe, svt, av1an) = tokio::join!(
+    let (ffmpeg, ffprobe, svt, av1an, x264) = tokio::join!(
         discover(TOOLS[0]),
         discover(TOOLS[1]),
         discover(TOOLS[2]),
         discover(TOOLS[3]),
+        discover(TOOLS[4]),
     );
-    vec![ffmpeg, ffprobe, svt, av1an]
+    vec![ffmpeg, ffprobe, svt, av1an, x264]
 }
 
 #[cfg(test)]

@@ -3,10 +3,10 @@
 
 use std::{
     path::PathBuf,
-    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use media_runtime::supervisor::{CommandSpec, run_capture};
 use media_runtime::{get_capabilities, probe_media};
 
 struct FixtureDirectory(PathBuf);
@@ -35,7 +35,7 @@ impl Drop for FixtureDirectory {
 #[ignore = "requires FFmpeg and FFprobe on PATH"]
 async fn discovers_tools_and_probes_a_synthetic_multistream_file() {
     let capabilities = get_capabilities().await;
-    assert_eq!(capabilities.len(), 4);
+    assert_eq!(capabilities.len(), 5);
     let ffmpeg = capabilities
         .iter()
         .find(|tool| tool.id == "ffmpeg")
@@ -63,7 +63,8 @@ async fn discovers_tools_and_probes_a_synthetic_multistream_file() {
 
     let directory = FixtureDirectory::create();
     let path = directory.0.join("- jesses's & $ % 测试.mkv");
-    let mut command = tokio::process::Command::new(ffmpeg.path.as_ref().unwrap());
+    // Build native arguments without spawning outside the owned supervisor.
+    let mut command = std::process::Command::new(ffmpeg.path.as_ref().unwrap());
     command
         .args([
             "-v",
@@ -93,16 +94,15 @@ async fn discovers_tools_and_probes_a_synthetic_multistream_file() {
             "-metadata:s:a:0",
             "title=Test tone",
         ])
-        .arg(&path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+        .arg(&path);
+    let spec = CommandSpec {
+        executable: command.get_program().into(),
+        args: command.get_args().map(Into::into).collect(),
+        cwd: None,
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let output = run_capture(&spec, cancel, 4 * 1024 * 1024, Duration::from_secs(20))
         .await
-        .unwrap()
         .unwrap();
     assert!(
         output.status.success(),

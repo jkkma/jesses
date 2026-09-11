@@ -40,6 +40,10 @@ pub(super) struct Stream {
     pub time_base: Option<String>,
     pub start_time: Option<String>,
     pub color_space: Option<String>,
+    // Subtitle stream headers can inherit the container's start even when the
+    // first cue is later. Filled from a bounded packet probe, never JSON headers.
+    #[serde(skip)]
+    pub packet_start_time: Option<f64>,
     pub color_transfer: Option<String>,
     pub color_primaries: Option<String>,
     pub color_range: Option<String>,
@@ -200,15 +204,21 @@ pub(super) fn verify_encoded(
     selected: &[&Stream],
     output: &Document,
     video_index: u32,
+    expected_codec: &str,
 ) -> Result<(), AppError> {
-    verify_inner(source, selected, output, Some(video_index))
+    verify_inner(
+        source,
+        selected,
+        output,
+        Some((video_index, expected_codec)),
+    )
 }
 
 fn verify_inner(
     source: &Document,
     selected: &[&Stream],
     output: &Document,
-    encoded_video: Option<u32>,
+    encoded_video: Option<(u32, &str)>,
 ) -> Result<(), AppError> {
     let fail = |message: &str| AppError::new("OUTPUT_VALIDATION_FAILED", message, None);
     if selected.len() != output.streams.len() {
@@ -217,16 +227,17 @@ fn verify_inner(
         ));
     }
     for (expected, actual) in selected.iter().zip(&output.streams) {
-        let encoded = encoded_video == Some(expected.index);
-        if let Some(source_start) = expected
-            .start_time
-            .as_deref()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            let output_start = actual
-                .start_time
-                .as_deref()
-                .and_then(|v| v.parse::<f64>().ok());
+        let encoded = encoded_video.is_some_and(|(index, _)| index == expected.index);
+        let track_start = |stream: &Stream| {
+            stream.packet_start_time.or_else(|| {
+                stream
+                    .start_time
+                    .as_deref()
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+        };
+        if let Some(source_start) = track_start(expected) {
+            let output_start = track_start(actual);
             if !output_start
                 .is_some_and(|start| start.is_finite() && (start - source_start).abs() <= 0.002)
             {
@@ -237,7 +248,7 @@ fn verify_inner(
         }
         if expected.codec_type != actual.codec_type
             || if encoded {
-                actual.codec_name.as_deref() != Some("av1")
+                actual.codec_name.as_deref() != encoded_video.map(|(_, codec)| codec)
             } else {
                 expected.codec_name != actual.codec_name
             }
@@ -352,6 +363,21 @@ mod tests {
     }
 
     #[test]
+    fn encoded_codec_is_checked_without_relaxing_copied_tracks() {
+        let source = fixture();
+        let selected = source.selected(&[2, 0, 5]).unwrap();
+        let mut output = fixture();
+        output.streams.swap(0, 1);
+        verify_encoded(&source, &selected, &output, 0, "h264").unwrap();
+        assert!(verify_encoded(&source, &selected, &output, 0, "av1").is_err());
+        output.streams[1].codec_name = Some("av1".into());
+        verify_encoded(&source, &selected, &output, 0, "av1").unwrap();
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264").is_err());
+        output.streams[0].codec_name = Some("aac".into());
+        assert!(verify_encoded(&source, &selected, &output, 0, "av1").is_err());
+    }
+
+    #[test]
     fn rejects_reordered_or_short_outputs_and_lost_chapters() {
         let source = fixture();
         let selected = source.selected(&[0, 2, 5]).unwrap();
@@ -366,6 +392,23 @@ mod tests {
         assert!(verify(&source, &selected, &output).is_err());
         assert!(source.selected(&[5, 0]).is_err());
         assert!(source.selected(&[5]).is_err());
+    }
+
+    #[test]
+    fn subtitle_packet_start_overrides_estimated_header_but_rejects_shifted_cues() {
+        let mut source = fixture();
+        source.streams[1].codec_type = Some("subtitle".into());
+        source.streams[1].codec_name = Some("ass".into());
+        source.streams[1].start_time = Some("0".into());
+        source.streams[1].packet_start_time = Some(0.740);
+        let selected = source.selected(&[0, 2, 5]).unwrap();
+        let mut output = source.clone();
+        output.streams[1].start_time = Some("0.740".into());
+        verify(&source, &selected, &output).unwrap();
+        output.streams[1].packet_start_time = Some(0.750);
+        assert!(verify(&source, &selected, &output).is_err());
+        output.streams[1].packet_start_time = Some(f64::NAN);
+        assert!(verify(&source, &selected, &output).is_err());
     }
 
     #[test]

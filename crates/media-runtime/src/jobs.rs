@@ -206,6 +206,7 @@ impl JobManager {
             film_grain: request.film_grain,
             hdr10_fallback: request.hdr10_fallback,
             backend: request.backend,
+            encoder: request.encoder,
             workers: request.workers,
         })?;
         let (queued, epoch) = {
@@ -840,7 +841,13 @@ impl JobManager {
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
-        let document = probe(&ffprobe, &source.path, cancel).await?;
+        let document = probe(
+            &ffprobe,
+            &source.path,
+            cancel,
+            Some(&request.stream_indices),
+        )
+        .await?;
         let selected = document.selected(&request.stream_indices)?;
         let duration = document.selected_duration(&selected);
         source.verify()?;
@@ -915,7 +922,7 @@ impl JobManager {
         )
         .await;
         temp.flush_nonempty_async().await?;
-        let artifact = probe(&ffprobe, &temp.path, cancel).await?;
+        let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
         metadata::verify(&document, &selected, &artifact)?;
         source.verify()?;
         check_cancel(cancel)?;
@@ -1130,6 +1137,7 @@ async fn probe(
     executable: &Path,
     path: &Path,
     cancel: &watch::Receiver<bool>,
+    selected: Option<&[u32]>,
 ) -> Result<Document, AppError> {
     check_cancel(cancel)?;
     let args = [
@@ -1176,13 +1184,101 @@ async fn probe(
             path,
         ));
     }
-    serde_json::from_slice(&output.stdout).map_err(|_| {
+    let mut document: Document = serde_json::from_slice(&output.stdout).map_err(|_| {
         files::error(
             "PROBE_INVALID_RESPONSE",
             "FFprobe returned unreadable metadata.",
             path,
         )
-    })
+    })?;
+    // A Matroska subtitle header may report the container start rather than the
+    // first cue. Compare actual packet starts so remuxing cannot create a false
+    // synchronization failure or conceal a real cue offset.
+    for stream in &mut document.streams {
+        if stream.codec_type.as_deref() == Some("subtitle")
+            && selected.is_none_or(|indices| indices.contains(&stream.index))
+            && stream
+                .nb_read_packets
+                .as_deref()
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n > 0)
+        {
+            stream.packet_start_time =
+                Some(subtitle_packet_start(executable, path, stream.index, cancel).await?);
+        }
+    }
+    Ok(document)
+}
+
+async fn subtitle_packet_start(
+    executable: &Path,
+    path: &Path,
+    index: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<f64, AppError> {
+    check_cancel(cancel)?;
+    let args = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-select_streams",
+        &index.to_string(),
+        "-read_intervals",
+        "%+#1",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "json",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(path.as_os_str().to_owned()))
+    .collect();
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: executable.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(5 * 60),
+    )
+    .await
+    .map_err(|e| process_error(e, path))?;
+    check_cancel(cancel)?;
+    #[derive(serde::Deserialize)]
+    struct Packets {
+        packets: Vec<Packet>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Packet {
+        pts_time: String,
+    }
+    let start = serde_json::from_slice::<Packets>(&result.stdout)
+        .ok()
+        .and_then(|packets| {
+            if packets.packets.len() == 1 {
+                packets.packets[0]
+                    .pts_time
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|pts| pts.is_finite())
+            } else {
+                None
+            }
+        });
+    if !result.status.success() || !result.stderr.is_empty() || start.is_none() {
+        return Err(files::error(
+            "PROBE_INVALID_RESPONSE",
+            "The first subtitle packet timestamp could not be validated.",
+            path,
+        ));
+    }
+    Ok(start.expect("validated subtitle timestamp"))
 }
 
 fn remux_arguments(input: &Path, output: &Path, selected: &[&metadata::Stream]) -> Vec<OsString> {
@@ -1250,6 +1346,82 @@ fn progress_seconds(line: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires installed FFmpeg and FFprobe"]
+    async fn subtitle_start_uses_the_first_selected_packet_after_earlier_media_packets() {
+        let nonce = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "jesses-subtitle-start-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("delayed subtitle.mkv");
+        let subtitles = dir.join("cues.srt");
+        std::fs::write(&subtitles, b"1\n00:00:00,740 --> 00:00:01,900\nLater cue\n").unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let ffmpeg = discover("ffmpeg", &cancel).await.unwrap();
+        let ffprobe = discover("ffprobe", &cancel).await.unwrap();
+        let mut args: Vec<OsString> = [
+            "-v",
+            "error",
+            "-nostdin",
+            "-n",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=128x72:rate=24:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=2",
+            "-i",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args.push(subtitles.as_os_str().to_owned());
+        args.extend(
+            [
+                "-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:v", "ffv1", "-c:a", "flac",
+                "-c:s", "ass",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        args.push(input.as_os_str().to_owned());
+        let output = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args,
+                cwd: None,
+            },
+            cancel.clone(),
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document = probe(&ffprobe, &input, &cancel, Some(&[0, 1, 2]))
+            .await
+            .unwrap();
+        assert_eq!(document.streams[2].packet_start_time, Some(0.740));
+        assert_eq!(document.streams[2].nb_read_packets.as_deref(), Some("1"));
+        assert!(document.streams[0].packet_start_time.is_none());
+        let without_subtitles = probe(&ffprobe, &input, &cancel, Some(&[0, 1]))
+            .await
+            .unwrap();
+        assert!(
+            without_subtitles.streams[2].packet_start_time.is_none(),
+            "Unselected subtitle tracks must not require supplemental packet inspection"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn progress_rejects_missing_negative_and_nonfinite_values() {
@@ -1334,6 +1506,12 @@ mod tests {
                     },
                     settings: EncodeSettings {
                         preset: index + 4,
+                        encoder: if index == 1 {
+                            media_core::VideoEncoder::X264
+                        } else {
+                            media_core::VideoEncoder::SvtAv1
+                        },
+                        crf: if index == 1 { 23 } else { 30 },
                         ..Default::default()
                     },
                 })
@@ -1365,53 +1543,79 @@ mod tests {
             jobs.iter()
                 .all(|job| !job.logs.iter().any(|line| line.contains("Checking")))
         );
+        assert_eq!(
+            jobs[1].encode_settings.as_ref().unwrap().encoder,
+            media_core::VideoEncoder::X264
+        );
+        assert_eq!(jobs[1].encode_settings.as_ref().unwrap().crf, 23);
         drop(slot);
     }
 
     #[tokio::test]
     async fn unfinished_history_reopens_as_interrupted_without_touching_files() {
-        let path = std::env::temp_dir().join(format!(
-            "jesses-recovery-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        let input = path.join("source.mkv");
-        let output = path.join("existing.mkv");
-        std::fs::write(&input, b"original source").unwrap();
-        std::fs::write(&output, b"existing output").unwrap();
-        let (history, _) = history::History::open(path.join("history")).await.unwrap();
-        history
-            .save(vec![JobSnapshot {
-                id: "previous-session-job".into(),
-                state: JobState::Running,
-                request: RemuxRequest {
-                    input_path: input.to_string_lossy().into(),
-                    output_path: output.to_string_lossy().into(),
-                    stream_indices: vec![0],
-                },
-                encode_settings: Some(EncodeSettings::default()),
-                progress_seconds: Some(1.0),
-                duration_seconds: Some(5.0),
-                logs: vec!["Started with saved settings".into()],
-                error: None,
-                log_path: None,
-            }])
-            .await
-            .unwrap();
-        drop(history);
-        let manager = JobManager::open(path.join("logs"), path.join("history")).await;
-        manager.ready().await.unwrap();
-        let jobs = manager.list_jobs().await;
-        assert_eq!(jobs[0].state, JobState::Interrupted);
-        assert_eq!(jobs[0].error.as_ref().unwrap().code, "JOB_INTERRUPTED");
-        assert_eq!(jobs[0].encode_settings, Some(EncodeSettings::default()));
-        manager.shutdown().await;
-        drop(manager);
-        assert_eq!(std::fs::read(input).unwrap(), b"original source");
-        assert_eq!(std::fs::read(output).unwrap(), b"existing output");
-        assert!(!path.join("logs").exists());
-        std::fs::remove_dir_all(path).unwrap();
+        for settings in [
+            EncodeSettings::default(),
+            EncodeSettings {
+                encoder: media_core::VideoEncoder::X264,
+                crf: 23,
+                preset: 5,
+                ..Default::default()
+            },
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "jesses-recovery-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            let input = path.join("source.mkv");
+            let output = path.join("existing.mkv");
+            std::fs::write(&input, b"original source").unwrap();
+            std::fs::write(&output, b"existing output").unwrap();
+            let (history, _) = history::History::open(path.join("history")).await.unwrap();
+            history
+                .save(vec![JobSnapshot {
+                    id: "previous-session-job".into(),
+                    state: JobState::Running,
+                    request: RemuxRequest {
+                        input_path: input.to_string_lossy().into(),
+                        output_path: output.to_string_lossy().into(),
+                        stream_indices: vec![0],
+                    },
+                    encode_settings: Some(settings.clone()),
+                    progress_seconds: Some(1.0),
+                    duration_seconds: Some(5.0),
+                    logs: vec!["Started with saved settings".into()],
+                    error: None,
+                    log_path: None,
+                }])
+                .await
+                .unwrap();
+            drop(history);
+            if settings.encoder == media_core::VideoEncoder::SvtAv1 {
+                // Reopen an actual pre-encoder-field record, including the old
+                // standalone backend spelling, through the history boundary.
+                let record_path = path.join("history").join("jobs.json");
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                let saved = record["jobs"][0]["encodeSettings"].as_object_mut().unwrap();
+                saved.remove("encoder");
+                saved.insert("backend".into(), serde_json::json!("svtAv1"));
+                std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            let manager = JobManager::open(path.join("logs"), path.join("history")).await;
+            manager.ready().await.unwrap();
+            let jobs = manager.list_jobs().await;
+            assert_eq!(jobs[0].state, JobState::Interrupted);
+            assert_eq!(jobs[0].error.as_ref().unwrap().code, "JOB_INTERRUPTED");
+            assert_eq!(jobs[0].encode_settings, Some(settings));
+            manager.shutdown().await;
+            drop(manager);
+            assert_eq!(std::fs::read(input).unwrap(), b"original source");
+            assert_eq!(std::fs::read(output).unwrap(), b"existing output");
+            assert!(!path.join("logs").exists());
+            std::fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[tokio::test]

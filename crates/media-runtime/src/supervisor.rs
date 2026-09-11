@@ -571,7 +571,9 @@ async fn capture(
     max_bytes: usize,
 ) -> Result<Vec<u8>, SupervisorError> {
     let mut result = Vec::with_capacity(max_bytes.min(RECORD_BYTES));
-    let mut buffer = [0; RECORD_BYTES];
+    // Capability discovery nests several capture futures in one join. Keep the
+    // bounded read buffers off Windows' small async worker/test thread stacks.
+    let mut buffer = vec![0; RECORD_BYTES];
     loop {
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {

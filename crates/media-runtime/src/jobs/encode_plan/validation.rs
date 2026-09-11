@@ -162,6 +162,7 @@ impl Cadence {
             None | Some("unspecified" | "unknown") => "unknown",
             Some("left") => "left",
             Some("topleft") => "topleft",
+            Some("center") => "center",
             _ => "unsupported",
         };
         if normalize_chroma(frame.chroma_location.as_deref())
@@ -171,12 +172,11 @@ impl Cadence {
                 "Decoded frame chroma placement differs from the selected source.",
             ));
         }
-        let expected_format = if self.encoded {
-            Some("yuv420p10le")
+        if if self.encoded {
+            !self.plan.matches_output_format(frame.pix_fmt.as_deref())
         } else {
-            self.stream.pix_fmt.as_deref()
-        };
-        if frame.pix_fmt.as_deref() != expected_format {
+            frame.pix_fmt != self.stream.pix_fmt
+        } {
             return Err(unsupported(
                 "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
             ));

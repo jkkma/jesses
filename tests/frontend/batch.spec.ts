@@ -94,7 +94,7 @@ async function desktopMock(
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
           if (command === 'get_capabilities')
-            return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an'].map((id) => ({
+            return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'x264'].map((id) => ({
               id,
               name: id,
               available: options.missing !== id,
@@ -163,7 +163,7 @@ async function desktopMock(
                     .split('\\')
                     .at(-1)!
                     .replace(/\.mkv$/, '') +
-                  '_av1.mkv';
+                  (request.encoder === 'x264' ? '_x264.mkv' : '_av1.mkv');
                 return {
                   inputPath: input.inputPath,
                   outputPath,
@@ -178,6 +178,7 @@ async function desktopMock(
                       crf: request.crf,
                       preset: request.preset,
                       backend: request.backend,
+                      encoder: request.encoder,
                       workers: request.workers,
                       filmGrain: request.filmGrain,
                       hdr10Fallback: request.hdr10Fallback,
@@ -256,6 +257,229 @@ async function openBatch(page: Page) {
   await expect(page.getByRole('heading', { name: 'Episode 2.mkv', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
   await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
+}
+
+test('x264 batch defaults and copied tracks become immutable reviewed H.264 queue requests', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('10');
+  await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
+  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('5');
+  await expect(
+    workspace.getByLabel('Preset', { exact: true }).locator('option:checked'),
+  ).toHaveText('medium');
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
+  for (const invalid of ['-1', '52', '23.5', '']) {
+    await workspace.getByLabel('CRF', { exact: true }).fill(invalid);
+    await expect(
+      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+    ).toBeDisabled();
+  }
+  for (const valid of ['0', '51', '23']) {
+    await workspace.getByLabel('CRF', { exact: true }).fill(valid);
+    await expect(
+      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+    ).toBeEnabled();
+  }
+  await workspace.getByText('Video and copied tracks · 3 copies', { exact: true }).first().click();
+  await workspace.getByLabel('Video stream for Episode 1.mkv', { exact: true }).selectOption('9');
+  await workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const preview = page.getByRole('region', { name: 'Batch output preview' });
+  await expect(preview).toContainText('2 ready / 2 reviewed');
+  await expect(preview).toContainText('Episode 1_x264.mkv');
+  await expect(preview).toContainText('Episode 2_x264.mkv');
+  const settings = {
+    crf: 23,
+    preset: 5,
+    backend: 'standalone',
+    encoder: 'x264',
+    workers: 2,
+    filmGrain: 0,
+    hdr10Fallback: false,
+  };
+  expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toEqual({
+    outputDirectory: 'C:\\exports',
+    ...settings,
+    inputs: [
+      { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11] },
+      { inputPath: episodes[1].path, videoStreamIndex: 2, streamIndices: [2, 5, 8, 11] },
+    ],
+  });
+  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued).toEqual([
+    {
+      source: {
+        inputPath: episodes[0].path,
+        outputPath: 'C:\\exports\\Episode 1_x264.mkv',
+        streamIndices: [9, 8, 11],
+      },
+      settings: { ...settings, videoStreamIndex: 9 },
+    },
+    {
+      source: {
+        inputPath: episodes[1].path,
+        outputPath: 'C:\\exports\\Episode 2_x264.mkv',
+        streamIndices: [2, 5, 8, 11],
+      },
+      settings: { ...settings, videoStreamIndex: 2 },
+    },
+  ]);
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const job = page.getByRole('article', { name: 'Job batch-2', exact: true });
+  await job.getByText('Saved settings and log', { exact: true }).click();
+  await expect(job).toContainText('H.264 encode');
+  await expect(job).toContainText(
+    'Standalone x264 · H.264 · Source bit depth · CRF 23 · Preset medium',
+  );
+  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
+});
+
+test('x264 batch encoder switches restore source choices and common settings while av1an stays SVT', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const encoder = workspace.getByLabel('Video encoder', { exact: true });
+  await workspace.getByLabel('CRF', { exact: true }).fill('29');
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
+  await workspace.getByText('Video and copied tracks · 3 copies', { exact: true }).first().click();
+  await workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await encoder.selectOption('x264');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
+  await expect(
+    workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }),
+  ).toBeChecked();
+  await workspace.getByLabel('CRF', { exact: true }).fill('19');
+  await workspace.getByLabel('Preset', { exact: true }).selectOption('8');
+  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).uncheck();
+  await encoder.selectOption('svtAv1');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
+  await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).toBeChecked();
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
+  await expect(
+    workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }),
+  ).not.toBeChecked();
+  await encoder.selectOption('x264');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(encoder).toHaveCount(0);
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  await expect(
+    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeEnabled();
+  expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toMatchObject({
+    backend: 'av1an',
+    encoder: 'svtAv1',
+    crf: 29,
+    filmGrain: 8,
+  });
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
+  await expect(encoder).toHaveValue('x264');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('19');
+  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('8');
+  await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).not.toBeChecked();
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
+  await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
+  await expect(encoder).toHaveValue('x264');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
+  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('5');
+  await encoder.selectOption('svtAv1');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
+});
+
+test('x264 batch keeps HDR failures visible while queueing only reviewed SDR requests', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    invalidPath: episodes[1].path,
+    files: [
+      episodes[0],
+      { ...episodes[1], streams: [{ ...stream, bitDepth: 10, colorTransfer: 'smpte2084' }] },
+    ],
+  });
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(
+    workspace.getByText('HDR is not supported by x264. Deselect this source or choose SVT-AV1.', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(workspace).not.toContainText('lossless');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    '1 ready / 2 reviewed',
+  );
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    'unsupported HDR metadata',
+  );
+  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
+    .requests as EncodeRequest[];
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({
+    source: { inputPath: episodes[0].path },
+    settings: { encoder: 'x264', backend: 'standalone', filmGrain: 0, hdr10Fallback: false },
+  });
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
+});
+
+test('x264 switching away and back invalidates an outstanding batch preview', async ({ page }) => {
+  await desktopMock(page, { held: ['preview'] });
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await release(page, 'preview');
+  await expect(
+    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).not.toContainText(
+    '_av1.mkv',
+  );
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  await expect(
+    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeEnabled();
+  expect(
+    (await calls(page, 'preview_encode_batch')).map(
+      ({ payload }) => (payload.request as BatchEncodeRequest).encoder,
+    ),
+  ).toEqual(['svtAv1', 'x264']);
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    '_x264.mkv',
+  );
+});
+
+for (const missing of ['x264', 'svt-av1'] as const) {
+  test(`x264 batch uses independent discovery gates when ${missing} is missing`, async ({
+    page,
+  }) => {
+    await desktopMock(page, { missing });
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+    await expect(preview).toBeEnabled({ enabled: missing === 'x264' });
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+    await expect(preview).toBeEnabled({ enabled: missing === 'svt-av1' });
+  });
 }
 
 test('folder import passes recursion and reports scan limits, skipped entries, and individual probe failures', async ({
@@ -346,7 +570,8 @@ test('batch defaults preserve original per-file stream indices and keep attachme
       outputDirectory: 'C:\\exports',
       crf: 27,
       preset: 4,
-      backend: 'svtAv1',
+      backend: 'standalone',
+      encoder: 'svtAv1',
       workers: 2,
       filmGrain: 0,
       hdr10Fallback: false,
@@ -592,7 +817,8 @@ for (const setting of ['grain', 'fallback', 'backend', 'workers'] as const) {
     expect(submitted).toHaveLength(2);
     for (const request of submitted) {
       expect(request.settings).toMatchObject({
-        backend: setting === 'backend' || setting === 'workers' ? 'av1an' : 'svtAv1',
+        backend: setting === 'backend' || setting === 'workers' ? 'av1an' : 'standalone',
+        encoder: 'svtAv1',
         workers: setting === 'workers' ? 4 : 2,
         filmGrain: setting === 'grain' ? 10 : 0,
         hdr10Fallback: setting === 'fallback',
@@ -602,7 +828,9 @@ for (const setting of ['grain', 'fallback', 'backend', 'workers'] as const) {
     expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(submitted);
     await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
     await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
-    await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue('svtAv1');
+    await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue(
+      setting === 'backend' || setting === 'workers' ? 'av1an' : 'standalone',
+    );
   });
 }
 
@@ -619,7 +847,7 @@ test('batch validates grain and requires av1an only when selected', async ({ pag
   await expect(preview).toBeEnabled();
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
   await expect(preview).toBeDisabled();
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('svtAv1');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
   await expect(preview).toBeEnabled();
 });
 

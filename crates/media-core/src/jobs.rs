@@ -17,6 +17,8 @@ pub struct RemuxRequest {
 pub struct EncodeSettings {
     #[serde(default)]
     pub backend: EncodeBackend,
+    #[serde(default)]
+    pub encoder: VideoEncoder,
     #[serde(default = "default_workers")]
     pub workers: u8,
     pub video_stream_index: u32,
@@ -34,6 +36,7 @@ impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
             backend: EncodeBackend::default(),
+            encoder: VideoEncoder::default(),
             workers: default_workers(),
             video_stream_index: 0,
             crf: 30,
@@ -44,12 +47,38 @@ impl Default for EncodeSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum EncodeBackend {
     #[default]
-    SvtAv1,
+    Standalone,
     Av1an,
+}
+
+impl<'de> Deserialize<'de> for EncodeBackend {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the old workflow name readable without advertising it in the
+        // generated frontend contract. New history uses the canonical name.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum Wire {
+            #[serde(alias = "svtAv1")]
+            Standalone,
+            Av1an,
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Standalone => Self::Standalone,
+            Wire::Av1an => Self::Av1an,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoEncoder {
+    #[default]
+    SvtAv1,
+    X264,
 }
 
 pub(crate) fn default_workers() -> u8 {
@@ -130,6 +159,29 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<EncodeSettings>(saved).unwrap(),
             new
+        );
+    }
+
+    #[test]
+    fn legacy_standalone_backend_and_new_encoder_round_trip_without_ambiguity() {
+        let old: EncodeSettings = serde_json::from_str(
+            r#"{"backend":"svtAv1","videoStreamIndex":0,"crf":30,"preset":4}"#,
+        )
+        .unwrap();
+        assert_eq!(old.backend, EncodeBackend::Standalone);
+        assert_eq!(old.encoder, VideoEncoder::SvtAv1);
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::X264,
+            crf: 23,
+            preset: 5,
+            ..old
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["backend"], "standalone");
+        assert_eq!(value["encoder"], "x264");
+        assert_eq!(
+            serde_json::from_value::<EncodeSettings>(value).unwrap(),
+            settings
         );
     }
 }

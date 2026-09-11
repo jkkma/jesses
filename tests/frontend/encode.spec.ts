@@ -66,7 +66,7 @@ const media: MediaFile = {
     },
   ],
 };
-const tools: ToolInfo[] = ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an'].map((id) => ({
+const tools: ToolInfo[] = ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'x264'].map((id) => ({
   id,
   name: id,
   available: true,
@@ -89,7 +89,8 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
     videoStreamIndex: 0,
     crf: 30,
     preset: 4,
-    backend: 'svtAv1',
+    backend: 'standalone',
+    encoder: 'svtAv1',
     workers: 2,
     filmGrain: 0,
     hdr10Fallback: false,
@@ -112,6 +113,7 @@ async function desktopMock(
     lateStop?: boolean;
     held?: string[];
     pickerFailure?: AppError;
+    media?: MediaFile;
   } = {},
 ) {
   await page.addInitScript(
@@ -237,7 +239,7 @@ async function desktopMock(
       };
     },
     {
-      initialMedia: media,
+      initialMedia: options.media ?? media,
       capabilities: tools.map((tool) =>
         tool.id === options.missing ? { ...tool, available: false, path: null } : tool,
       ),
@@ -256,6 +258,301 @@ const quickWorkspace = (page: Page) =>
   page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
 const av1anWorkspace = (page: Page) =>
   page.getByRole('region', { name: 'av1an workspace', exact: true });
+
+const x264PresetNames = [
+  'ultrafast',
+  'superfast',
+  'veryfast',
+  'faster',
+  'fast',
+  'medium',
+  'slow',
+  'slower',
+  'veryslow',
+  'placebo',
+];
+
+test('x264 uses its own defaults, preset names, validation, copied tracks, and immutable job settings', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    media: {
+      ...media,
+      streams: media.streams.map((stream) => ({ ...stream, pixelFormat: 'yuv420p' })),
+    },
+  });
+  await page.setViewportSize({ width: 760, height: 600 });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Film grain synthesis', { exact: true }).fill('12');
+  await quick.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
+  await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('5');
+  await expect(quick.getByLabel('Encoder preset', { exact: true }).locator('option')).toHaveText(
+    x264PresetNames,
+  );
+  await expect(quick.getByText('Standalone x264 · 8-bit source', { exact: true })).toBeVisible();
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    inputPath.replace(/\.mkv$/, '_x264.mkv'),
+  );
+  await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
+  await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
+  await expect(quick.getByLabel('Parallel chunks', { exact: true })).toHaveCount(0);
+  const start = quick.getByRole('button', { name: 'Start encode', exact: true });
+  for (const invalid of ['-1', '52', '23.5', '']) {
+    await quick.getByLabel('Quality', { exact: true }).fill(invalid);
+    await expect(start).toBeDisabled();
+  }
+  for (const valid of ['0', '51', '23']) {
+    await quick.getByLabel('Quality', { exact: true }).fill(valid);
+    await expect(start).toBeEnabled();
+  }
+  await quick.getByLabel('Video stream', { exact: true }).selectOption('4');
+  await quick.getByLabel('Copy stream #7', { exact: true }).uncheck();
+  await start.click();
+  const started = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
+  expect(started.request).toEqual({
+    source: {
+      inputPath,
+      outputPath: inputPath.replace(/\.mkv$/, '_x264.mkv'),
+      streamIndices: [4, 3, 9],
+    },
+    settings: {
+      videoStreamIndex: 4,
+      crf: 23,
+      preset: 5,
+      backend: 'standalone',
+      encoder: 'x264',
+      workers: 2,
+      filmGrain: 0,
+      hdr10Fallback: false,
+    },
+  });
+  const current = page.getByRole('region', { name: 'Current encode job' });
+  await expect(current).toContainText('H.264 encode');
+  await expect(current).toContainText(
+    'Standalone x264 · H.264 · Source bit depth · CRF 23 · Preset medium',
+  );
+  await expect(current).not.toContainText('10-bit');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(current).toContainText('Preset medium');
+  expect((await calls(page, 'start_encode'))[0].payload).toEqual(started);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+});
+
+test('x264 and SVT restore independent drafts for each source and reset only the selected encoder', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const encoder = quick.getByLabel('Video encoder', { exact: true });
+  await quick.getByLabel('Quality', { exact: true }).fill('21');
+  await quick.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+  await quick.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+  await quick.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\source-av1.mkv');
+  await encoder.selectOption('x264');
+  await quick.getByLabel('Quality', { exact: true }).fill('18');
+  await quick.getByLabel('Encoder preset', { exact: true }).selectOption('7');
+  await quick.getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quick
+    .getByLabel('Encode destination', { exact: true })
+    .fill('C:\\exports\\source-h264.mkv');
+  const next = {
+    ...media,
+    id: 'x264-second-source',
+    path: 'C:\\media\\second.mkv',
+    name: 'second.mkv',
+  };
+  await importAnotherSource(page, next);
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(encoder).toHaveValue('x264');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\media\\second_x264.mkv',
+  );
+  await quick.getByLabel('Quality', { exact: true }).fill('26');
+  await encoder.selectOption('svtAv1');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  await page.locator('button.file-select').filter({ hasText: media.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
+  await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
+  await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toBeChecked();
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\exports\\source-av1.mkv',
+  );
+  await encoder.selectOption('x264');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('18');
+  await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('7');
+  await expect(quick.getByLabel('Copy stream #3', { exact: true })).not.toBeChecked();
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\exports\\source-h264.mkv',
+  );
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(encoder).toHaveValue('x264');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
+  await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('5');
+  await expect(quick.getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await encoder.selectOption('svtAv1');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1anWorkspace(page).getByLabel('Video encoder', { exact: true })).toHaveCount(0);
+  await expect(av1anWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  await page.locator('button.file-select').filter({ hasText: next.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await encoder.selectOption('x264');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('26');
+});
+
+for (const missing of ['x264', 'svt-av1'] as const) {
+  test(`x264 tool discovery is independent when ${missing} is missing`, async ({ page }) => {
+    await desktopMock(page, { missing });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    const start = quick.getByRole('button', { name: 'Start encode', exact: true });
+    await expect(start).toBeEnabled({ enabled: missing === 'x264' });
+    await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+    await expect(start).toBeEnabled({ enabled: missing === 'svt-av1' });
+    await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled({
+      enabled: missing === 'svt-av1',
+    });
+    await page.getByRole('button', { name: 'av1an', exact: true }).click();
+    await expect(
+      av1anWorkspace(page).getByRole('button', { name: 'Start encode', exact: true }),
+    ).toBeEnabled({ enabled: missing === 'x264' });
+  });
+}
+
+for (const depth of [8, 10]) {
+  test(`x264 displays ${depth}-bit SDR source depth without offering HDR controls`, async ({
+    page,
+  }) => {
+    await desktopMock(page, { media: { ...media, streams: [{ ...baseStream, bitDepth: depth }] } });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+    await expect(
+      quick.getByText(`Standalone x264 · ${depth}-bit source`, { exact: true }),
+    ).toBeVisible();
+    await expect(quick).not.toContainText('lossless');
+    await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+  });
+}
+
+test('x264 ignores an enqueue error after source replacement and keeps submission locked until settlement', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    held: ['enqueue_encode'],
+    failure: {
+      code: 'ENCODE_UNSUPPORTED_SOURCE',
+      message: 'The original x264 source could not be queued.',
+      path: inputPath,
+    },
+  });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await quick.getByLabel('Quality', { exact: true }).fill('18');
+  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  await expect.poll(() => calls(page, 'enqueue_encode')).toHaveLength(1);
+  await expect(quick.getByLabel('Video encoder', { exact: true })).toBeDisabled();
+  await importAnotherSource(page, {
+    ...media,
+    id: 'x264-pending-next',
+    name: 'next.mkv',
+    path: 'C:\\media\\next.mkv',
+  });
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
+  await expect(quick.getByLabel('Video encoder', { exact: true })).toBeDisabled();
+  await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await release(page, 'enqueue_encode');
+  await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
+  await expect(quick.getByRole('alert')).toHaveCount(0);
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\media\\next_x264.mkv',
+  );
+  expect(
+    ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request,
+  ).toMatchObject({
+    source: { inputPath },
+    settings: {
+      encoder: 'x264',
+      backend: 'standalone',
+      crf: 18,
+      filmGrain: 0,
+      hdr10Fallback: false,
+    },
+  });
+});
+
+test('x264 blocks known HDR while SVT remains selectable', async ({ page }) => {
+  await desktopMock(page, {
+    media: { ...media, streams: [{ ...baseStream, bitDepth: 10, colorTransfer: 'smpte2084' }] },
+  });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(
+    quick.getByText('x264 supports SDR sources only. Choose SVT-AV1 for compatible HDR10 video.', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+});
+
+for (const outcome of ['destination', 'error'] as const) {
+  test(`x264 encoder switches and resets invalidate a deferred picker ${outcome}`, async ({
+    page,
+  }) => {
+    await desktopMock(page, {
+      held: ['plugin:dialog|save'],
+      pickerFailure:
+        outcome === 'error'
+          ? { code: 'PICKER_FAILED', message: 'Stale picker error', path: null }
+          : undefined,
+    });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    const encoder = quick.getByLabel('Video encoder', { exact: true });
+    const destination = quick.getByLabel('Encode destination', { exact: true });
+    await quick.getByRole('button', { name: 'Choose encode destination', exact: true }).click();
+    await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(1);
+    await encoder.selectOption('x264');
+    await encoder.selectOption('svtAv1');
+    await release(page, 'plugin:dialog|save');
+    await expect(destination).toHaveValue(inputPath.replace(/\.mkv$/, '_av1.mkv'));
+    await expect(quick.getByRole('alert')).toHaveCount(0);
+    await encoder.selectOption('x264');
+    await page.evaluate(() =>
+      (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.hold('plugin:dialog|save'),
+    );
+    await destination.fill('C:\\exports\\x264-draft.mkv');
+    await quick.getByRole('button', { name: 'Choose encode destination', exact: true }).click();
+    await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(2);
+    await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+    await release(page, 'plugin:dialog|save');
+    await expect(destination).toHaveValue(inputPath.replace(/\.mkv$/, '_x264.mkv'));
+    await expect(quick.getByRole('alert')).toHaveCount(0);
+  });
+}
 
 async function openEncode(page: Page, tab: 'Quick Convert' | 'av1an' = 'Quick Convert') {
   await page.goto('/');
@@ -335,7 +632,8 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
               videoStreamIndex: 4,
               crf: 28,
               preset: 6,
-              backend: 'svtAv1',
+              backend: 'standalone',
+              encoder: 'svtAv1',
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
@@ -683,7 +981,8 @@ test('encodes can be queued for different sources while another job is running',
               videoStreamIndex: 0,
               crf: 30,
               preset: 4,
-              backend: 'svtAv1',
+              backend: 'standalone',
+              encoder: 'svtAv1',
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
@@ -704,7 +1003,8 @@ test('encodes can be queued for different sources while another job is running',
               videoStreamIndex: 12,
               crf: 30,
               preset: 4,
-              backend: 'svtAv1',
+              backend: 'standalone',
+              encoder: 'svtAv1',
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
@@ -805,6 +1105,7 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
     crf: 30,
     preset: 4,
     backend: 'av1an',
+    encoder: 'svtAv1',
     workers: 3,
     filmGrain: 12,
     hdr10Fallback: true,
@@ -1014,7 +1315,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
   await quick.getByLabel('Encode destination', { exact: true }).fill(standaloneOutput);
   await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
   const started = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
-  expect(started.request.settings.backend).toBe('svtAv1');
+  expect(started.request.settings.backend).toBe('standalone');
   expect(started.request.settings.crf).toBe(25);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(av1an.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
@@ -1031,6 +1332,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
       crf: 22,
       preset: 4,
       backend: 'av1an',
+      encoder: 'svtAv1',
       workers: 3,
       filmGrain: 0,
       hdr10Fallback: false,
@@ -1107,7 +1409,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     const original = requests[0].payload as { request: EncodeRequest };
     expect(original.request.source.inputPath).toBe(inputPath);
     expect(original.request.settings.crf).toBe(24);
-    expect(original.request.settings.backend).toBe(tab === 'av1an' ? 'av1an' : 'svtAv1');
+    expect(original.request.settings.backend).toBe(tab === 'av1an' ? 'av1an' : 'standalone');
     expect(await calls(page, 'start_encode')).toEqual([]);
   });
 

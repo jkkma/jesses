@@ -38,9 +38,11 @@ export type AppError = { code: string, message: string, path: string | null, };
 
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
 
-export type EncodeBackend = "svtAv1" | "av1an";
+export type EncodeBackend = "standalone" | "av1an";
 
-export type EncodeSettings = { backend: EncodeBackend, workers: number, videoStreamIndex: number, crf: number, preset: number,
+export type VideoEncoder = "svtAv1" | "x264";
+
+export type EncodeSettings = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number, crf: number, preset: number,
 /**
  * AV1 grain synthesis strength; zero leaves synthesis disabled.
  */
@@ -62,7 +64,7 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { backend: EncodeBackend, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, hdr10Fallback: boolean, };
+export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 

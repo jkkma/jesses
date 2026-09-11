@@ -132,19 +132,21 @@
   async function submitEncode(request: EncodeRequest) {
     const job = await startEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog('AV1 encode job submitted.');
+    addLog(`${request.settings.encoder === 'x264' ? 'H.264 / x264' : 'AV1'} encode job submitted.`);
   }
   async function queueEncode(request: EncodeRequest) {
     const job = await enqueueEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog('AV1 encode added to the queue.');
+    addLog(
+      `${request.settings.encoder === 'x264' ? 'H.264 / x264' : 'AV1'} encode added to the queue.`,
+    );
   }
   async function queueBatch(requests: EncodeRequest[]) {
     const submitted = await enqueueEncodeBatch(requests);
     // Keep authoritative channel updates that beat the command response.
     const missing = submitted.filter((job) => !jobs.some((entry) => entry.id === job.id));
     jobs = [...missing.reverse(), ...jobs];
-    addLog(`${submitted.length} AV1 encodes added to the queue.`);
+    addLog(`${submitted.length} encodes added to the queue.`);
   }
   async function stopQueue() {
     const snapshots = await cancelAllJobs();

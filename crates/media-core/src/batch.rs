@@ -31,6 +31,8 @@ pub struct BatchEncodeInput {
 pub struct BatchEncodeRequest {
     #[serde(default)]
     pub backend: crate::EncodeBackend,
+    #[serde(default)]
+    pub encoder: crate::VideoEncoder,
     #[serde(default = "crate::jobs::default_workers")]
     pub workers: u8,
     pub inputs: Vec<BatchEncodeInput>,

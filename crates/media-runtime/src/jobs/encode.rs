@@ -2,7 +2,10 @@ pub(super) use super::encode_plan::validate_settings;
 use super::encode_plan::{Plan, Validation};
 #[path = "frame_scan.rs"]
 mod frame_scan;
+#[path = "x264.rs"]
+mod x264;
 use super::*;
+use media_core::VideoEncoder;
 
 impl JobManager {
     #[allow(clippy::too_many_arguments)]
@@ -20,7 +23,7 @@ impl JobManager {
         self.phase(
             id,
             JobState::Preparing,
-            "Inspecting selected streams and standalone SVT-AV1 capabilities.",
+            "Inspecting selected streams and encoder capabilities.",
         )
         .await;
         let input = PathBuf::from(&request.input_path);
@@ -35,13 +38,17 @@ impl JobManager {
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
-        let encoder = find_executable(&["SvtAv1EncApp", "svtav1encapp"])
+        let encoder_names: &[&str] = match settings.encoder {
+            VideoEncoder::SvtAv1 => &["SvtAv1EncApp", "svtav1encapp"],
+            VideoEncoder::X264 => &["x264"],
+        };
+        let encoder = find_executable(encoder_names)
             .await
             .map_err(|e| AppError::new("TOOL_DISCOVERY_FAILED", e, None))?
             .ok_or_else(|| {
                 AppError::new(
                     "TOOL_MISSING",
-                    "The standalone SvtAv1EncApp was not found on PATH.",
+                    format!("The standalone {} was not found on PATH.", encoder_names[0]),
                     None,
                 )
             })?;
@@ -84,11 +91,20 @@ impl JobManager {
             })
             .await;
         }
-        let document = probe(&ffprobe, &source.path, cancel).await?;
+        let document = probe(
+            &ffprobe,
+            &source.path,
+            cancel,
+            Some(&request.stream_indices),
+        )
+        .await?;
         let selected = document.selected(&request.stream_indices)?;
         let mut plan = Plan::build(&document, &selected, settings)?;
         if settings.backend == media_core::EncodeBackend::Av1an {
             super::av1an::validate_input(&document, &plan)?;
+        }
+        if settings.encoder == VideoEncoder::X264 {
+            check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         }
         let video = selected
             .iter()
@@ -112,13 +128,18 @@ impl JobManager {
                 ));
             }).await;
         }
-        check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
+        if settings.encoder == VideoEncoder::SvtAv1 {
+            check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
+        }
         source.verify()?;
         check_cancel(cancel)?;
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; CRF {}, preset {}, film grain {} (denoising off).",plan.fps_num,plan.fps_den,settings.crf,settings.preset,settings.film_grain));
+            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, CRF {}, preset {}.",plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),settings.crf,settings.preset));
+            if settings.encoder == VideoEncoder::SvtAv1 {
+                append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
+            }
             if plan.is_hdr10() {
                 append_log(snapshot, "HDR10: preserving BT.2020/PQ color and validated static mastering/content light metadata.".into());
                 if settings.hdr10_fallback { append_log(snapshot, "HDR10 fallback enabled: Dolby Vision enhancement data and HDR10+ dynamic metadata are discarded.".into()); }
@@ -128,9 +149,12 @@ impl JobManager {
             .await
             .map_err(|e| files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref()))?;
         *temporary = Some(Temporary::create(&output, id)?);
-        scratch.push(Temporary::create_ivf(&output, &format!("{id}-video"))?);
+        scratch.push(match settings.encoder {
+            VideoEncoder::SvtAv1 => Temporary::create_ivf(&output, &format!("{id}-video"))?,
+            VideoEncoder::X264 => Temporary::create(&output, &format!("{id}-video"))?,
+        });
         let temp = temporary.as_ref().expect("owned Matroska output");
-        let ivf = scratch.last().expect("owned IVF output");
+        let intermediate = scratch.last().expect("owned encoded video intermediate");
         self.change(id, |snapshot| {
             append_log(
                 snapshot,
@@ -138,7 +162,7 @@ impl JobManager {
             );
             append_log(
                 snapshot,
-                format!("Owned temporary AV1: {}", ivf.path.display()),
+                format!("Owned temporary video: {}", intermediate.path.display()),
             );
         })
         .await;
@@ -148,7 +172,7 @@ impl JobManager {
             self.encode_av1an(
                 id,
                 &source.path,
-                ivf,
+                intermediate,
                 &plan,
                 settings,
                 cancel,
@@ -164,13 +188,18 @@ impl JobManager {
             };
             let consumer = CommandSpec {
                 executable: encoder,
-                // SVT's path writer uses exclusive CRT sharing on Windows. Its
-                // documented stdout mode lets the supervisor write our owned file
-                // handle without releasing the identity guard or narrowing Unicode.
-                args: encoder_args(Path::new("stdout"), &plan, settings),
+                // Both native encoders write into the already-owned file handle
+                // through stdout, preserving its identity guard and Unicode path.
+                args: match settings.encoder {
+                    VideoEncoder::SvtAv1 => encoder_args(Path::new("stdout"), &plan, settings),
+                    VideoEncoder::X264 => x264::arguments(&plan, settings),
+                },
                 cwd: None,
             };
-            self.phase(id,JobState::Running,"Encoding 10-bit AV1 with the standalone SVT encoder; audio, subtitles, and attachments will be copied afterward.").await;
+            self.phase(id, JobState::Running, match settings.encoder {
+                VideoEncoder::SvtAv1 => "Encoding 10-bit AV1 with the standalone SVT encoder; selected tracks will be copied afterward.",
+                VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected tracks will be copied afterward.",
+            }).await;
             let (sender, events) = mpsc::channel(256);
             let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
             let result = supervisor::run_pipeline_to_file(
@@ -180,7 +209,7 @@ impl JobManager {
                 sender,
                 log_path,
                 Duration::from_secs(24 * 60 * 60),
-                ivf.clone_file()?,
+                intermediate.clone_file()?,
             )
             .await;
             let _ = event_task.await;
@@ -188,7 +217,7 @@ impl JobManager {
         }
         check_cancel(cancel)?;
         source.verify()?;
-        ivf.flush_nonempty_async().await?;
+        intermediate.flush_nonempty_async().await?;
         self.change(id, |snapshot| {
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned())
         })
@@ -206,7 +235,13 @@ impl JobManager {
         let result = supervisor::run(
             &CommandSpec {
                 executable: ffmpeg,
-                args: mux_args(&source.path, &ivf.path, &temp.path, &selected, &plan),
+                args: mux_args(
+                    &source.path,
+                    &intermediate.path,
+                    &temp.path,
+                    &selected,
+                    &plan,
+                ),
                 cwd: None,
             },
             cancel.clone(),
@@ -230,9 +265,15 @@ impl JobManager {
         .await;
         check_cancel(cancel)?;
         temp.flush_nonempty_async().await?;
-        self.phase(id,JobState::Finalizing,"Decoding the completed AV1 output to verify exact frame count and timing, then checking copied tracks and metadata.").await;
-        let artifact = probe(&ffprobe, &temp.path, cancel).await?;
-        metadata::verify_encoded(&document, &selected, &artifact, plan.video_index)?;
+        self.phase(id,JobState::Finalizing,"Decoding the completed output to verify exact frame count and timing, then checking copied tracks and metadata.").await;
+        let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+        metadata::verify_encoded(
+            &document,
+            &selected,
+            &artifact,
+            plan.video_index,
+            plan.output_codec(),
+        )?;
         let position = selected
             .iter()
             .position(|s| s.index == plan.video_index)
@@ -311,9 +352,10 @@ impl JobManager {
                 };
                 manager
                     .change(&id, |snapshot| {
-                        if let (Some(value), Some(frame_seconds)) =
-                            (svt_frame_counter(&line), frame_seconds)
-                        {
+                        if let (Some(value), Some(frame_seconds)) = (
+                            svt_frame_counter(&line).or_else(|| x264::frame_counter(&line)),
+                            frame_seconds,
+                        ) {
                             let progress = value as f64 * frame_seconds;
                             snapshot.progress_seconds = Some(
                                 snapshot
@@ -462,7 +504,7 @@ pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     args.push(input.as_os_str().to_owned());
     args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
     // All source frames already match this cadence within one timestamp tick.
-    // Use it for the Y4M header as well as SVT/IVF, so a reconciled decimal rate
+    // Use it for the Y4M header as well as the encoder, so a reconciled decimal rate
     // cannot be overwritten by the input's declared nominal rate.
     if plan.cadence_reconciled {
         args.extend([
@@ -482,7 +524,9 @@ pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
                 "passthrough"
             },
             "-pix_fmt",
-            "yuv420p10le",
+            plan.output_pixel_format,
+            "-color_range",
+            if plan.full_range { "pc" } else { "tv" },
             "-strict",
             "-1",
             "-f",
@@ -551,7 +595,13 @@ async fn check_encoder_capabilities(
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: encoder.to_owned(),
-            args: vec!["--help".into()],
+            args: vec![
+                match settings.encoder {
+                    VideoEncoder::SvtAv1 => "--help",
+                    VideoEncoder::X264 => "--fullhelp",
+                }
+                .into(),
+            ],
             cwd: None,
         },
         cancel.clone(),
@@ -565,6 +615,19 @@ async fn check_encoder_capabilities(
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    if settings.encoder == VideoEncoder::X264 {
+        let capabilities = x264::validate_help(&help, plan.output_bit_depth());
+        if !result.status.success() || capabilities.is_err() {
+            return Err(files::error(
+                "ENCODER_CAPABILITY_UNSUPPORTED",
+                capabilities
+                    .err()
+                    .unwrap_or_else(|| "The installed x264 failed its capability check.".into()),
+                encoder,
+            ));
+        }
+        return Ok(());
+    }
     let mut required = vec!["--film-grain", "--film-grain-denoise"];
     if plan.is_hdr10() {
         required.extend(["--mastering-display", "--content-light"]);
@@ -696,7 +759,7 @@ mod tests {
         );
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
         let (_owner, cancel) = watch::channel(false);
-        let document = probe(&ffprobe, &input, &cancel).await.unwrap();
+        let document = probe(&ffprobe, &input, &cancel, None).await.unwrap();
         let video = document
             .streams
             .iter()
@@ -907,7 +970,7 @@ mod tests {
         assert_eq!(std::fs::read(&input).unwrap(), original);
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
         let (_sender, cancel) = watch::channel(false);
-        let document = probe(&ffprobe, &output, &cancel).await.unwrap();
+        let document = probe(&ffprobe, &output, &cancel, None).await.unwrap();
         assert_eq!(
             document.streams[0].color_transfer.as_deref(),
             Some("smpte2084")
@@ -1231,7 +1294,7 @@ mod tests {
         let source_bytes = std::fs::read(&input).unwrap();
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
         let (_probe_sender, probe_cancel) = watch::channel(false);
-        let source_document = probe(&ffprobe, &input, &probe_cancel).await.unwrap();
+        let source_document = probe(&ffprobe, &input, &probe_cancel, None).await.unwrap();
         assert_eq!(
             tag_value(&source_document.streams[0], "BPS"),
             Some("90000000")
@@ -1281,7 +1344,7 @@ mod tests {
             ["audio", "video", "subtitle", "attachment"]
         );
         assert_eq!(media.streams[1].codec.as_deref(), Some("av1"));
-        let output_document = probe(&ffprobe, &output, &probe_cancel).await.unwrap();
+        let output_document = probe(&ffprobe, &output, &probe_cancel, None).await.unwrap();
         let encoded = &output_document.streams[1];
         for key in source_document.streams[0]
             .tags
