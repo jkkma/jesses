@@ -19,7 +19,24 @@ static NEXT_WRITE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(super) struct History {
     path: PathBuf,
-    _lock: Arc<fs::File>,
+    _lock: Arc<HistoryLock>,
+}
+
+struct HistoryLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // A concurrent fork can inherit this open file description until exec
+        // applies CLOEXEC. Closing our last descriptor alone leaves flock held
+        // by that child. Release it explicitly when the final history/write
+        // owner drops, so a new manager can reopen the history immediately.
+        // SAFETY: the uniquely owned file remains open throughout this call.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,7 +84,7 @@ impl History {
             }
             let history = Self {
                 path: directory.join("jobs.json"),
-                _lock: Arc::new(lock),
+                _lock: Arc::new(HistoryLock { _file: lock }),
             };
             let jobs = history.read()?;
             Ok((history, jobs))
@@ -186,6 +203,30 @@ mod tests {
         fs::remove_file(file).unwrap();
         fs::remove_file(path.join("jobs.lock")).unwrap();
         fs::remove_dir(path).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn last_history_owner_unlocks_even_with_an_inherited_descriptor() {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-history-inherited-{}-{}",
+            std::process::id(),
+            NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (history, _) = History::open(path.clone()).await.unwrap();
+        history.save(vec![]).await.unwrap();
+        // dup and fork preserve the same open file description. A concurrent
+        // child can retain this descriptor until exec applies CLOEXEC.
+        let inherited = history._lock._file.try_clone().unwrap();
+        let writer = history.clone();
+        drop(history);
+        assert!(History::open(path.clone()).await.is_err());
+        drop(writer);
+        let (reopened, _) = History::open(path.clone()).await.unwrap();
+        drop(inherited);
+        assert!(History::open(path.clone()).await.is_err());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
