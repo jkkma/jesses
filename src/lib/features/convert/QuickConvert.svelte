@@ -11,7 +11,14 @@
   import { Button } from '$lib/components/ui/button';
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
-  import type { EncodeRequest, JobSnapshot, MediaFile, ToolInfo } from '$lib/ipc/generated';
+  import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
+  import type {
+    EncodeBackend,
+    EncodeRequest,
+    JobSnapshot,
+    MediaFile,
+    ToolInfo,
+  } from '$lib/ipc/generated';
 
   let {
     file,
@@ -33,6 +40,10 @@
   let videoIndex = $state<number | undefined>();
   let crf = $state<number | undefined>(30);
   let preset = $state(4);
+  let backend = $state<EncodeBackend>('svtAv1');
+  let workers = $state<number | undefined>(2);
+  let filmGrain = $state<number | undefined>(0);
+  let hdr10Fallback = $state(false);
   let included = $state<number[]>([]);
   let destination = $state('');
   let error = $state<string | null>(null);
@@ -45,7 +56,7 @@
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const usableSource = $derived(!!file && !file.id.startsWith('jesses-synthetic'));
   const toolsReady = $derived(
-    ['ffmpeg', 'ffprobe', 'svt-av1'].every((id) =>
+    ['ffmpeg', 'ffprobe', 'svt-av1', ...(backend === 'av1an' ? ['av1an'] : [])].every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
@@ -57,7 +68,16 @@
       crf <= 63 &&
       Number.isInteger(preset) &&
       preset >= 0 &&
-      preset <= 13,
+      preset <= 13 &&
+      typeof filmGrain === 'number' &&
+      Number.isInteger(filmGrain) &&
+      filmGrain >= 0 &&
+      filmGrain <= 50 &&
+      (backend !== 'av1an' ||
+        (typeof workers === 'number' &&
+          Number.isInteger(workers) &&
+          workers >= 1 &&
+          workers <= 32)),
   );
   const canQueue = $derived(
     !disabled &&
@@ -73,6 +93,10 @@
     videoIndex = source?.streams.find((stream) => stream.kind === 'video')?.index;
     crf = 30;
     preset = 4;
+    backend = 'svtAv1';
+    workers = 2;
+    filmGrain = 0;
+    hdr10Fallback = false;
     included =
       source?.streams.filter((stream) => stream.kind !== 'video').map((stream) => stream.index) ??
       [];
@@ -99,7 +123,13 @@
     }
   }
   async function start(queue = false) {
-    if (!(queue ? canQueue : canStart) || !file || videoIndex === undefined || crf === undefined)
+    if (
+      !(queue ? canQueue : canStart) ||
+      !file ||
+      videoIndex === undefined ||
+      crf === undefined ||
+      filmGrain === undefined
+    )
       return;
     submitting = true;
     error = null;
@@ -113,7 +143,15 @@
           outputPath: destination.trim(),
           streamIndices: [videoIndex, ...copies.map((stream) => stream.index)],
         },
-        settings: { videoStreamIndex: videoIndex, crf, preset },
+        settings: {
+          videoStreamIndex: videoIndex,
+          crf,
+          preset,
+          backend,
+          workers: backend === 'av1an' ? workers! : 2,
+          filmGrain,
+          hdr10Fallback,
+        },
       });
     } catch (cause) {
       error = errorMessage(cause);
@@ -135,9 +173,9 @@
   <div class="notice convert-notice">
     <Info size={16} aria-hidden="true" />
     <p>
-      Supports progressive SDR video with a constant frame rate, square pixels, and 4:2:0 color.
-      HDR, rotation, interlacing, resizing, and audio encoding are not supported yet. Source
-      compatibility is checked before encoding.
+      Supports progressive SDR and compatible HDR10 video with a constant frame rate, square pixels,
+      and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing, resizing, and
+      audio encoding are not supported yet. Source compatibility is checked before encoding.
     </p>
   </div>
   {#if error}<div class="notice error-notice" role="alert">
@@ -170,7 +208,7 @@
                 >{/each}
               {#if !videos.length}<option value={undefined}>No video stream available</option>{/if}
             </select>
-            <p>Standalone SVT-AV1 · 10-bit AV1 · Source dimensions and frame rate</p>
+            <p>SVT-AV1 · 10-bit AV1 · Source dimensions and frame rate</p>
           </div>
           <div class="field">
             <label for="encode-quality">Quality</label>
@@ -196,6 +234,14 @@
             >
             <p>0–13 · Higher values encode faster</p>
           </div>
+          <EncodeOptions
+            idPrefix="encode"
+            {disabled}
+            bind:backend
+            bind:workers
+            bind:filmGrain
+            bind:hdr10Fallback
+          />
         </div>
       </section>
       <section class="panel settings-panel">
@@ -264,7 +310,8 @@
           <Clapperboard size={15} aria-hidden="true" />
           <p>
             <strong>10-bit AV1 + copied tracks</strong><span
-              >CRF {crf ?? '—'} · Preset {preset} · MKV</span
+              >{backend === 'av1an' ? `av1an · ${workers ?? '—'} workers` : 'Standalone SVT-AV1'} · CRF
+              {crf ?? '—'} · Preset {preset} · Grain {filmGrain ?? '—'} · MKV</span
             >
           </p>
         </div>
@@ -283,10 +330,11 @@
             Choose a local source with a video stream.
           </p>
         {:else if !toolsReady}<p class="disabled-reason">
-            Install FFmpeg, FFprobe, and standalone SVT-AV1, then refresh Tools & settings.
+            Install FFmpeg, FFprobe, standalone SVT-AV1{backend === 'av1an' ? ', and av1an' : ''},
+            then refresh Tools & settings.
           </p>
         {:else if !validSettings}<p class="disabled-reason">
-            Use a whole-number CRF from 1 to 63 and preset from 0 to 13.
+            Use whole numbers: CRF 1–63, preset 0–13, grain 0–50, and parallel chunks 1–32.
           </p>
         {:else if active}<p class="disabled-reason">
             A job is active. Add this encode to the queue to run it next.

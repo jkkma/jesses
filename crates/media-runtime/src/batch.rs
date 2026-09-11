@@ -376,6 +376,7 @@ fn proposed_output(
 pub(crate) async fn inspect_selection(
     manager: &crate::JobManager,
     input: &BatchEncodeInput,
+    settings: &EncodeSettings,
     epoch: u64,
 ) -> Result<MediaFile, AppError> {
     let path = Path::new(&input.input_path);
@@ -389,7 +390,7 @@ pub(crate) async fn inspect_selection(
             path,
         ));
     }
-    manager.inspect_encode_source(input, epoch).await
+    manager.inspect_encode_source(input, settings, epoch).await
 }
 
 pub(crate) async fn preview(
@@ -405,13 +406,22 @@ pub(crate) async fn preview(
         .map_err(|e| AppError::new("INVALID_OUTPUT", e.to_string(), None))??;
     let mut items = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
+        let settings = EncodeSettings {
+            video_stream_index: input.video_stream_index,
+            crf: request.crf,
+            preset: request.preset,
+            film_grain: request.film_grain,
+            hdr10_fallback: request.hdr10_fallback,
+            backend: request.backend,
+            workers: request.workers,
+        };
         let mut item = BatchEncodeItem {
             input_path: input.input_path.clone(),
             output_path: None,
             request: None,
             error: None,
         };
-        match inspect_selection(manager, &input, epoch).await {
+        match inspect_selection(manager, &input, &settings, epoch).await {
             Err(error) if matches!(error.code.as_str(), "BATCH_CANCELED" | "APP_CLOSING") => {
                 return Err(error);
             }
@@ -427,11 +437,7 @@ pub(crate) async fn preview(
                             output_path,
                             stream_indices: input.stream_indices,
                         },
-                        settings: EncodeSettings {
-                            video_stream_index: input.video_stream_index,
-                            crf: request.crf,
-                            preset: request.preset,
-                        },
+                        settings,
                     });
                 }
             },
@@ -638,6 +644,10 @@ mod tests {
                 output_directory: fixture.0.to_string_lossy().into_owned(),
                 crf: 30,
                 preset: 4,
+                film_grain: 0,
+                hdr10_fallback: false,
+                backend: Default::default(),
+                workers: 2,
             })
             .await
             .unwrap();

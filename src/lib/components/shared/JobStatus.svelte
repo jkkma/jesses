@@ -2,7 +2,7 @@
   import { Square } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { errorMessage, formatDuration } from './format';
-  import type { JobSnapshot } from '$lib/ipc/generated';
+  import type { EncodeSettings, JobSnapshot } from '$lib/ipc/generated';
 
   let {
     job,
@@ -18,6 +18,8 @@
   let error = $state<string | null>(null);
   let canceling = $state(false);
   let stopping = $state(false);
+  const encodeSummary = (settings: EncodeSettings) =>
+    `${settings.backend === 'av1an' ? `av1an / SVT-AV1 · ${settings.workers ?? 2} parallel chunks` : 'Standalone SVT-AV1'} · 10-bit · CRF ${settings.crf} · Preset ${settings.preset} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'}`;
   const terminal = (state: string) =>
     ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
   const pending = $derived(jobs.filter((entry) => !terminal(entry.state)));
@@ -69,7 +71,7 @@
     <div class="job-body">
       <p class="job-path">{job.request.outputPath}</p>
       {#if job.encodeSettings}<p class="small-muted">
-          SVT-AV1 · 10-bit · CRF {job.encodeSettings.crf} · Preset {job.encodeSettings.preset}
+          {encodeSummary(job.encodeSettings)}
         </p>{/if}
       {#if job.state === 'running'}
         <progress
@@ -141,8 +143,7 @@
               <p class="small-muted job-path">Source: {entry.request.inputPath}</p>
               <p class="small-muted">Selected streams: {entry.request.streamIndices.join(', ')}</p>
               {#if entry.encodeSettings}<p class="small-muted">
-                  SVT-AV1 · 10-bit · CRF {entry.encodeSettings.crf} · Preset {entry.encodeSettings
-                    .preset}
+                  {encodeSummary(entry.encodeSettings)}
                 </p>{/if}
               <pre>{entry.logs.join('\n') || 'No tool output was recorded.'}</pre>
               {#if entry.logPath}<p class="small-muted job-path">

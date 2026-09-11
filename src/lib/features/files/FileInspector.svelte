@@ -98,6 +98,56 @@
               >
                 {stream.title}
               </p>{/if}
+            {#if stream.kind === 'video'}
+              <dl class="video-color" aria-label={`Video metadata for stream ${stream.index}`}>
+                <div>
+                  <dt>Pixel format</dt>
+                  <dd>
+                    {stream.pixelFormat ?? 'Not reported'}{stream.bitDepth
+                      ? ` · ${stream.bitDepth}-bit`
+                      : ''}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Primaries</dt>
+                  <dd>{stream.colorPrimaries ?? 'Not reported'}</dd>
+                </div>
+                <div>
+                  <dt>Transfer</dt>
+                  <dd>{stream.colorTransfer ?? 'Not reported'}</dd>
+                </div>
+                <div>
+                  <dt>Matrix / range</dt>
+                  <dd>
+                    {stream.colorSpace ?? 'Not reported'} · {stream.colorRange ?? 'Not reported'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>HDR transfer</dt>
+                  <dd>{stream.hdrFormat ?? 'Not reported'}</dd>
+                </div>
+                <div>
+                  <dt>Static HDR</dt>
+                  <dd>
+                    {stream.hasHdrStaticMetadata
+                      ? 'Reported in stream headers'
+                      : 'Not reported in stream headers'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Dynamic HDR detected</dt>
+                  <dd>
+                    {stream.dynamicHdrFormats?.length
+                      ? stream.dynamicHdrFormats.join(' · ')
+                      : 'Not reported in stream headers'}
+                  </dd>
+                </div>
+              </dl>
+              <p class="header-note">
+                Frame metadata may contain additional HDR information. Encode compatibility is
+                checked separately.
+              </p>
+            {/if}
           </div>
         {:else}
           <p class="quiet-message">No streams were reported for this source.</p>
@@ -140,3 +190,30 @@
     </div>
   {/if}
 </aside>
+
+<style>
+  .video-color {
+    margin-top: 12px;
+    display: grid;
+    gap: 7px;
+    font-size: 11px;
+  }
+  .video-color div {
+    display: grid;
+    grid-template-columns: 100px minmax(0, 1fr);
+    gap: 8px;
+  }
+  .video-color dt,
+  .header-note {
+    color: var(--muted-foreground);
+  }
+  .video-color dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .header-note {
+    font-size: 10px;
+    line-height: 1.5;
+    margin-top: 10px;
+  }
+</style>

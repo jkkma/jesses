@@ -371,7 +371,12 @@ fn batch_header_preflight_rejects_unsupported_encoding_before_queueing() {
         }],
         "format":{"start_time":"0"}
     });
-    validate_encode_preview(&serde_json::to_vec(&document).unwrap(), &input).unwrap();
+    validate_encode_preview(
+        &serde_json::to_vec(&document).unwrap(),
+        &input,
+        &EncodeSettings::default(),
+    )
+    .unwrap();
     for (field, value) in [
         ("color_transfer", serde_json::json!("smpte2084")),
         ("field_order", serde_json::json!("tt")),
@@ -381,11 +386,113 @@ fn batch_header_preflight_rejects_unsupported_encoding_before_queueing() {
         let mut unsupported = document.clone();
         unsupported["streams"][0][field] = value;
         assert_eq!(
-            validate_encode_preview(&serde_json::to_vec(&unsupported).unwrap(), &input)
-                .unwrap_err()
-                .code,
+            validate_encode_preview(
+                &serde_json::to_vec(&unsupported).unwrap(),
+                &input,
+                &EncodeSettings::default()
+            )
+            .unwrap_err()
+            .code,
             "ENCODE_INPUT_UNSUPPORTED",
             "{field}"
+        );
+    }
+}
+
+#[test]
+fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
+    let video = |index| {
+        serde_json::json!({
+            "index":index,"codec_type":"video","codec_name":"h264",
+            "width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive",
+            "sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001",
+            "time_base":"1/1000","start_time":"0","color_range":"tv",
+            "color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709",
+            "chroma_location":"left"
+        })
+    };
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "streams":[{"index":0,"codec_type":"audio","codec_name":"aac"},video(2),video(9)],
+        "format":{"start_time":"0"}
+    }))
+    .unwrap();
+    let av1an = EncodeSettings {
+        backend: media_core::EncodeBackend::Av1an,
+        ..EncodeSettings::default()
+    };
+    for index in [2, 9] {
+        let input = BatchEncodeInput {
+            input_path: "multi-video.mkv".into(),
+            stream_indices: vec![index, 0],
+            video_stream_index: index,
+        };
+        validate_encode_preview(&bytes, &input, &EncodeSettings::default()).unwrap();
+        let result = validate_encode_preview(&bytes, &input, &av1an);
+        if index == 2 {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "ENCODE_INPUT_UNSUPPORTED");
+            assert!(error.message.contains("first video track"));
+        }
+    }
+}
+
+#[test]
+fn batch_header_preflight_honors_explicit_hdr10_fallback_for_both_backends() {
+    let input = BatchEncodeInput {
+        input_path: "hdr-base.mkv".into(),
+        stream_indices: vec![2],
+        video_stream_index: 2,
+    };
+    // Mastering metadata may be carried by the first decoded frame. Header
+    // preview must preserve consent and defer that full scan to execution.
+    let document = serde_json::json!({
+        "streams":[{
+            "index":2,"codec_type":"video","codec_name":"hevc",
+            "width":3840,"height":2160,"pix_fmt":"yuv420p10le","field_order":"progressive",
+            "sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001",
+            "time_base":"1/1000","start_time":"0","color_range":"tv",
+            "color_space":"bt2020nc","color_transfer":"smpte2084","color_primaries":"bt2020",
+            "chroma_location":"topleft",
+            "side_data_list":[
+                {"side_data_type":"DOVI configuration record","dv_profile":7,
+                 "dv_bl_signal_compatibility_id":6,"bl_present_flag":1,
+                 "rpu_present_flag":1,"el_present_flag":1},
+                {"side_data_type":"HEVC enhancement-layer decoder configuration"}
+            ]
+        }],
+        "format":{"start_time":"0"}
+    });
+    let bytes = serde_json::to_vec(&document).unwrap();
+    for backend in [
+        media_core::EncodeBackend::SvtAv1,
+        media_core::EncodeBackend::Av1an,
+    ] {
+        let settings = EncodeSettings {
+            backend,
+            ..EncodeSettings::default()
+        };
+        let error = validate_encode_preview(&bytes, &input, &settings).unwrap_err();
+        assert_eq!(error.code, "ENCODE_INPUT_UNSUPPORTED");
+        assert!(error.message.contains("explicit HDR10 fallback"));
+        let allowed = EncodeSettings {
+            hdr10_fallback: true,
+            ..settings
+        };
+        validate_encode_preview(&bytes, &input, &allowed).unwrap();
+
+        let mut incompatible = document.clone();
+        incompatible["streams"][0]["side_data_list"][0]["dv_profile"] = 5.into();
+        assert_eq!(
+            validate_encode_preview(
+                &serde_json::to_vec(&incompatible).unwrap(),
+                &input,
+                &allowed
+            )
+            .unwrap_err()
+            .code,
+            "ENCODE_INPUT_UNSUPPORTED"
         );
     }
 }
@@ -474,6 +581,10 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
             output_directory: fixture.0.to_string_lossy().into_owned(),
             crf: 30,
             preset: 12,
+            film_grain: 0,
+            hdr10_fallback: false,
+            backend: Default::default(),
+            workers: 2,
         })
         .await
         .unwrap();
@@ -526,6 +637,10 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
             output_directory: fixture.0.to_string_lossy().into_owned(),
             crf: 30,
             preset: 12,
+            film_grain: 0,
+            hdr10_fallback: false,
+            backend: Default::default(),
+            workers: 2,
         })
         .await
         .unwrap();

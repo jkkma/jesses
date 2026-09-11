@@ -54,7 +54,7 @@ const capabilities: ToolInfo[] = [
   },
 ];
 
-async function desktopMock(page: Page, paths: string[]) {
+async function desktopMock(page: Page, paths: string[], media = fixture) {
   await page.addInitScript(
     ({ media, tools, pickedPaths }) => {
       const state = globalThis as unknown as Record<string, unknown>;
@@ -82,7 +82,7 @@ async function desktopMock(page: Page, paths: string[]) {
         },
       };
     },
-    { media: fixture, tools: capabilities, pickedPaths: paths },
+    { media, tools: capabilities, pickedPaths: paths },
   );
 }
 
@@ -164,4 +164,50 @@ test('keyboard opens native picker and activity disclosure retains state on relo
     'aria-expanded',
     'true',
   );
+});
+
+test('inspector exposes HDR detection and color precision without treating missing header metadata as absent', async ({
+  page,
+}) => {
+  const hdr: MediaFile = {
+    ...fixture,
+    streams: [
+      {
+        ...fixture.streams[0],
+        codec: 'hevc',
+        width: 3840,
+        height: 2160,
+        pixelFormat: 'yuv420p10le',
+        bitDepth: 10,
+        colorPrimaries: 'bt2020',
+        colorTransfer: 'smpte2084',
+        colorSpace: 'bt2020nc',
+        colorRange: 'tv',
+        hdrFormat: 'HDR / PQ',
+        hasHdrStaticMetadata: false,
+        dynamicHdrFormats: ['Dolby Vision'],
+      },
+    ],
+  };
+  await desktopMock(page, [hdr.path], hdr);
+  await page.setViewportSize({ width: 760, height: 600 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  const inspector = page.getByRole('complementary', { name: 'Media inspector' });
+  await expect(inspector).toContainText('yuv420p10le · 10-bit');
+  await expect(inspector).toContainText('bt2020');
+  await expect(inspector).toContainText('smpte2084');
+  await expect(inspector).toContainText('bt2020nc · tv');
+  await expect(inspector).toContainText('HDR / PQ');
+  await expect(inspector).toContainText('Dolby Vision');
+  await expect(inspector).toContainText('Not reported in stream headers');
+  await expect(inspector).toContainText('Frame metadata may contain additional HDR information');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('hdr-inspector.png'), fullPage: true });
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(
+    page
+      .getByRole('region', { name: 'Quick Convert workspace' })
+      .getByLabel('Allow HDR10 fallback', { exact: true }),
+  ).not.toBeChecked();
 });

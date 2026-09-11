@@ -35,6 +35,14 @@ struct ProbeStream {
     channels: Option<u32>,
     duration: Option<Value>,
     tags: Option<HashMap<String, String>>,
+    pix_fmt: Option<String>,
+    bits_per_raw_sample: Option<Value>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
+    color_range: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<Value>,
 }
 
 fn positive_rational(value: &str) -> bool {
@@ -64,6 +72,77 @@ fn sample_rate(value: Option<&Value>) -> Option<u32> {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|text| !text.trim().is_empty())
+}
+
+fn color_value(value: Option<String>) -> Option<String> {
+    nonempty(value).filter(|text| !matches!(text.as_str(), "unknown" | "unspecified" | "reserved"))
+}
+
+fn pixel_depth(pixel_format: Option<&str>) -> Option<u32> {
+    let format = pixel_format?;
+    if matches!(
+        format,
+        "yuv420p"
+            | "yuv422p"
+            | "yuv444p"
+            | "yuvj420p"
+            | "yuvj422p"
+            | "yuvj444p"
+            | "nv12"
+            | "nv21"
+            | "gray"
+            | "rgb24"
+            | "bgr24"
+            | "rgba"
+            | "bgra"
+    ) {
+        return Some(8);
+    }
+    // Read the bit depth suffix only for known planar/high-depth format families.
+    if format.starts_with("yuv") || format.starts_with("gbr") || format.starts_with("gray") {
+        let suffix = format
+            .strip_suffix("le")
+            .or_else(|| format.strip_suffix("be"))?;
+        return [9, 10, 12, 14, 16]
+            .into_iter()
+            .find(|depth| suffix.ends_with(&depth.to_string()));
+    }
+    match format {
+        "p010le" | "p010be" => Some(10),
+        "p012le" | "p012be" => Some(12),
+        "p016le" | "p016be" => Some(16),
+        _ => None,
+    }
+}
+
+fn hdr_headers(side_data: &[Value]) -> (bool, Vec<String>) {
+    let mut static_metadata = false;
+    let mut dynamic_formats = Vec::new();
+    for data in side_data {
+        let name = data
+            .get("side_data_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        static_metadata |=
+            name.contains("mastering display") || name.contains("content light level");
+        let dynamic = if name.contains("dovi") || name.contains("dolby vision") {
+            Some("Dolby Vision")
+        } else if name.contains("hdr10+")
+            || name.contains("smpte2094-40")
+            || name.contains("smpte 2094-40")
+        {
+            Some("HDR10+")
+        } else {
+            None
+        };
+        if let Some(dynamic) = dynamic
+            && !dynamic_formats.iter().any(|value| value == dynamic)
+        {
+            dynamic_formats.push(dynamic.to_string());
+        }
+    }
+    (static_metadata, dynamic_formats)
 }
 
 fn tag(tags: &HashMap<String, String>, name: &str) -> Option<String> {
@@ -112,6 +191,17 @@ pub(crate) fn parse_probe(
         .streams
         .into_iter()
         .map(|stream| {
+            let is_video = stream.codec_type.as_deref() == Some("video");
+            let bit_depth = sample_rate(stream.bits_per_raw_sample.as_ref())
+                .filter(|depth| *depth <= 64)
+                .or_else(|| pixel_depth(stream.pix_fmt.as_deref()));
+            let color_transfer = color_value(stream.color_transfer);
+            let hdr_format = match color_transfer.as_deref() {
+                Some("smpte2084") => Some("HDR / PQ".to_string()),
+                Some("arib-std-b67") => Some("HDR / HLG".to_string()),
+                _ => None,
+            };
+            let (static_metadata, dynamic_formats) = hdr_headers(&stream.side_data_list);
             let tags = stream.tags.unwrap_or_default();
             let frame_rate = stream
                 .avg_frame_rate
@@ -128,6 +218,15 @@ pub(crate) fn parse_probe(
                 channels: stream.channels,
                 language: tag(&tags, "language"),
                 title: tag(&tags, "title"),
+                pixel_format: nonempty(stream.pix_fmt),
+                bit_depth,
+                color_primaries: color_value(stream.color_primaries),
+                color_transfer,
+                color_space: color_value(stream.color_space),
+                color_range: color_value(stream.color_range),
+                hdr_format,
+                has_hdr_static_metadata: is_video.then_some(static_metadata),
+                dynamic_hdr_formats: is_video.then_some(dynamic_formats),
             }
         })
         .collect();
@@ -311,6 +410,47 @@ mod tests {
         let error = parse_probe(b"not json", "broken".into(), "broken".into(), 0).unwrap_err();
         assert_eq!(error.code, "PROBE_INVALID_RESPONSE");
         assert_eq!(error.path.as_deref(), Some("broken"));
+    }
+
+    #[test]
+    fn exposes_hdr_headers_without_assuming_frame_metadata_is_absent() {
+        let parsed = parse_probe(br#"{"streams":[
+          {"index":0,"codec_type":"video","pix_fmt":"yuv420p10le","bits_per_raw_sample":"0","color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc","color_range":"tv","side_data_list":[
+            {"side_data_type":"DOVI configuration record","dv_profile":7},
+            {"side_data_type":"Mastering display metadata"},
+            {"side_data_type":"Content light level metadata"},
+            {"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}
+          ]},
+          {"index":1,"codec_type":"video","pix_fmt":"p010le","color_transfer":"arib-std-b67"},
+          {"index":2,"codec_type":"video","pix_fmt":"yuv420p","color_primaries":"unknown"}
+        ]}"#, "hdr.mkv".into(), "hdr.mkv".into(), 1).unwrap();
+        let pq = &parsed.streams[0];
+        assert_eq!(pq.pixel_format.as_deref(), Some("yuv420p10le"));
+        assert_eq!(pq.bit_depth, Some(10));
+        assert_eq!(pq.hdr_format.as_deref(), Some("HDR / PQ"));
+        assert_eq!(pq.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(pq.color_space.as_deref(), Some("bt2020nc"));
+        assert_eq!(pq.color_range.as_deref(), Some("tv"));
+        assert_eq!(pq.has_hdr_static_metadata, Some(true));
+        assert_eq!(
+            pq.dynamic_hdr_formats.as_deref(),
+            Some(["Dolby Vision".into(), "HDR10+".into()].as_slice())
+        );
+        let hlg = &parsed.streams[1];
+        assert_eq!(hlg.hdr_format.as_deref(), Some("HDR / HLG"));
+        assert_eq!(hlg.bit_depth, Some(10));
+        assert_eq!(hlg.has_hdr_static_metadata, Some(false));
+        assert_eq!(hlg.dynamic_hdr_formats.as_deref(), Some([].as_slice()));
+        assert_eq!(parsed.streams[2].bit_depth, Some(8));
+        assert_eq!(parsed.streams[2].color_primaries, None);
+        assert_eq!(parsed.streams[2].hdr_format, None);
+    }
+
+    #[test]
+    fn pixel_depth_only_infers_known_formats() {
+        assert_eq!(pixel_depth(Some("gbrp12le")), Some(12));
+        assert_eq!(pixel_depth(Some("unknown10le")), None);
+        assert_eq!(pixel_depth(None), None);
     }
 
     #[test]

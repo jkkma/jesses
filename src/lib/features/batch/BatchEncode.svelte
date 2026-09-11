@@ -4,10 +4,12 @@
   import { Button } from '$lib/components/ui/button';
   import { chooseOutputFolder, isDesktop, previewEncodeBatch } from '$lib/ipc/client';
   import { errorMessage, fileName, formatDuration } from '$lib/components/shared/format';
+  import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import type {
     BatchEncodePreview,
     BatchEncodeRequest,
     EncodeRequest,
+    EncodeBackend,
     MediaFile,
     ToolInfo,
   } from '$lib/ipc/generated';
@@ -37,6 +39,10 @@
   let nextVersion = 0;
   let crf = $state<number | undefined>(30);
   let preset = $state(4);
+  let backend = $state<EncodeBackend>('svtAv1');
+  let workers = $state<number | undefined>(2);
+  let filmGrain = $state<number | undefined>(0);
+  let hdr10Fallback = $state(false);
   let outputDirectory = $state('');
   let preview = $state<{ key: string; result: BatchEncodePreview } | null>(null);
   let previewing = $state(false);
@@ -80,7 +86,7 @@
 
   const selectedFiles = $derived(files.filter((file) => drafts[file.id]?.selected));
   const toolsReady = $derived(
-    ['ffmpeg', 'ffprobe', 'svt-av1'].every((id) =>
+    ['ffmpeg', 'ffprobe', 'svt-av1', ...(backend === 'av1an' ? ['av1an'] : [])].every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
@@ -91,9 +97,30 @@
       crf <= 63 &&
       Number.isInteger(preset) &&
       preset >= 0 &&
-      preset <= 13,
+      preset <= 13 &&
+      typeof filmGrain === 'number' &&
+      Number.isInteger(filmGrain) &&
+      filmGrain >= 0 &&
+      filmGrain <= 50 &&
+      (backend !== 'av1an' ||
+        (typeof workers === 'number' &&
+          Number.isInteger(workers) &&
+          workers >= 1 &&
+          workers <= 32)),
   );
-  const draftKey = $derived(JSON.stringify({ files, drafts, crf, preset, outputDirectory }));
+  const draftKey = $derived(
+    JSON.stringify({
+      files,
+      drafts,
+      crf,
+      preset,
+      backend,
+      workers,
+      filmGrain,
+      hdr10Fallback,
+      outputDirectory,
+    }),
+  );
   const currentPreview = $derived(preview?.key === draftKey ? preview.result : null);
   const ready = $derived(currentPreview?.items.filter((item) => item.request && !item.error) ?? []);
   const canPreview = $derived(
@@ -173,13 +200,17 @@
   }
 
   async function previewBatch() {
-    if (!canPreview || crf === undefined) return;
+    if (!canPreview || crf === undefined || filmGrain === undefined) return;
     const key = draftKey;
     const generation = ++previewGeneration;
     const request: BatchEncodeRequest = {
       outputDirectory: outputDirectory.trim(),
       crf,
       preset,
+      backend,
+      workers: backend === 'av1an' ? workers! : 2,
+      filmGrain,
+      hdr10Fallback,
       inputs: selectedFiles.map((file) => {
         const draft = drafts[file.id];
         const copies = file.streams
@@ -254,9 +285,9 @@
   <div class="notice">
     <Info size={16} aria-hidden="true" />
     <p>
-      Progressive SDR, constant frame rate, square pixels, and 4:2:0 color only. Selected audio,
-      subtitles, and attachments are copied. Full source compatibility is checked before each
-      encode.
+      Progressive SDR and compatible HDR10, constant frame rate, square pixels, and 4:2:0 color.
+      HDR10 preserves static HDR metadata. Selected audio, subtitles, and attachments are copied.
+      Full source compatibility is checked before each encode.
     </p>
   </div>
   {#if error}<div class="notice error-notice" role="alert"><p>{error}</p></div>{/if}
@@ -389,6 +420,14 @@
             >
             <p>0–13 · Higher encodes faster</p>
           </div>
+          <EncodeOptions
+            idPrefix="batch"
+            disabled={submitting || !desktop}
+            bind:backend
+            bind:workers
+            bind:filmGrain
+            bind:hdr10Fallback
+          />
         </div>
         <button
           class="text-button"
@@ -397,6 +436,10 @@
           onclick={() => {
             crf = 30;
             preset = 4;
+            backend = 'svtAv1';
+            workers = 2;
+            filmGrain = 0;
+            hdr10Fallback = false;
           }}>Reset batch settings</button
         >
         <div class="field">
@@ -423,9 +466,10 @@
         {#if !desktop}<p class="disabled-reason">
             Batch encoding requires the desktop app.
           </p>{:else if !toolsReady}<p class="disabled-reason">
-            Install FFmpeg, FFprobe, and standalone SVT-AV1, then refresh Tools & settings.
+            Install FFmpeg, FFprobe, standalone SVT-AV1{backend === 'av1an' ? ', and av1an' : ''},
+            then refresh Tools & settings.
           </p>{:else if !validSettings}<p class="disabled-reason">
-            Use a whole-number CRF from 1 to 63 and preset from 0 to 13.
+            Use whole numbers: CRF 1–63, preset 0–13, grain 0–50, and parallel chunks 1–32.
           </p>{:else if !selectedFiles.length}<p class="disabled-reason">
             Select at least one episode.
           </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">

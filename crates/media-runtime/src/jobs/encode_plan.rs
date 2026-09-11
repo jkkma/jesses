@@ -3,6 +3,9 @@ use serde::Deserialize;
 
 use super::metadata::{Document, Stream};
 
+mod hdr;
+use hdr::{Hdr10, StaticMetadata, validate_side_data};
+
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
     pub video_index: u32,
@@ -17,6 +20,7 @@ pub(super) struct Plan {
     pub matrix: u8,
     pub full_range: bool,
     pub chroma: &'static str,
+    hdr10: Option<Hdr10>,
 }
 
 pub(super) fn unsupported(message: &str) -> AppError {
@@ -24,10 +28,14 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
-    if !(1..=63).contains(&settings.crf) || settings.preset > 13 {
+    if !(1..=63).contains(&settings.crf)
+        || settings.preset > 13
+        || settings.film_grain > 50
+        || !(1..=32).contains(&settings.workers)
+    {
         return Err(AppError::new(
             "ENCODE_SETTINGS_INVALID",
-            "Use CRF 1–63 and an SVT preset from 0–13.",
+            "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers.",
             None,
         ));
     }
@@ -50,29 +58,9 @@ fn sdr_color(text: Option<&str>) -> Result<u8, AppError> {
         Some("bt470bg") => Ok(5),
         Some("smpte170m") => Ok(6),
         _ => Err(unsupported(
-            "This first encoder supports explicitly tagged BT.709, BT.470BG, or SMPTE 170M SDR color. HDR and unknown color metadata require a later workflow.",
+            "Encoding requires explicitly tagged BT.709, BT.470BG, or SMPTE 170M SDR, or limited-range 10-bit BT.2020/PQ HDR10.",
         )),
     }
-}
-
-fn unsupported_side_data(values: &[serde_json::Value]) -> bool {
-    values.iter().any(|value| {
-        let kind = value
-            .get("side_data_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        [
-            "mastering",
-            "content light",
-            "dovi",
-            "dolby",
-            "hdr",
-            "display matrix",
-        ]
-        .iter()
-        .any(|term| kind.contains(term))
-    })
 }
 
 impl Plan {
@@ -110,14 +98,34 @@ impl Plan {
                 "This first encoder requires explicit square pixels (sample aspect ratio 1:1).",
             ));
         }
-        if unsupported_side_data(&video.side_data_list)
-            || video
-                .tags
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("rotate") && value != "0")
+        let is_hdr10 = video.color_primaries.as_deref() == Some("bt2020")
+            && video.color_transfer.as_deref() == Some("smpte2084")
+            && video.color_space.as_deref() == Some("bt2020nc")
+            && video.pix_fmt.as_deref() == Some("yuv420p10le")
+            && video.color_range.as_deref() == Some("tv");
+        let hdr10 = if is_hdr10 {
+            Some(Hdr10::build(
+                &video.side_data_list,
+                settings.hdr10_fallback,
+            )?)
+        } else {
+            None
+        };
+        if hdr10.as_ref().is_some_and(|hdr| hdr.dolby.is_some())
+            && video.codec_name.as_deref() != Some("hevc")
         {
             return Err(unsupported(
-                "Rotation, display transforms, and HDR side data are not supported by this encoding workflow.",
+                "Dolby Vision HDR10 fallback supports HEVC profile 7/8 base layers only.",
+            ));
+        }
+        validate_side_data(&video.side_data_list, hdr10.as_ref(), false)?;
+        if video
+            .tags
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("rotate") && value != "0")
+        {
+            return Err(unsupported(
+                "Rotation and display transforms are not supported by this encoding workflow.",
             ));
         }
         if video
@@ -178,9 +186,22 @@ impl Plan {
             fps_den,
             cadence_reconciled: false,
             tolerance,
-            primaries: sdr_color(video.color_primaries.as_deref())?,
-            transfer: sdr_color(video.color_transfer.as_deref())?,
-            matrix: sdr_color(video.color_space.as_deref())?,
+            primaries: if is_hdr10 {
+                9
+            } else {
+                sdr_color(video.color_primaries.as_deref())?
+            },
+            transfer: if is_hdr10 {
+                16
+            } else {
+                sdr_color(video.color_transfer.as_deref())?
+            },
+            matrix: if is_hdr10 {
+                9
+            } else {
+                sdr_color(video.color_space.as_deref())?
+            },
+            hdr10,
             full_range: match video.color_range.as_deref() {
                 Some("tv") => false,
                 Some("pc") => true,
@@ -207,11 +228,41 @@ impl Plan {
         f64::from(self.fps_den) / f64::from(self.fps_num)
     }
 
+    pub fn is_hdr10(&self) -> bool {
+        self.hdr10.is_some()
+    }
+
+    pub fn hdr_arguments(&self) -> Vec<std::ffi::OsString> {
+        let mut args = Vec::new();
+        if let Some(hdr) = &self.hdr10 {
+            if let Some(mastering) = &hdr.metadata.mastering {
+                args.extend(["--mastering-display".into(), mastering.argument().into()]);
+            }
+            if let Some((cll, fall)) = hdr.metadata.light {
+                args.extend(["--content-light".into(), format!("{cll},{fall}").into()]);
+            }
+        }
+        args
+    }
+
     pub fn validate_source_frames(
         &mut self,
         frames: &Frames,
         stream: &Stream,
     ) -> Result<usize, AppError> {
+        if let Some(hdr) = &mut self.hdr10 {
+            let first = frames
+                .frames
+                .first()
+                .ok_or_else(|| unsupported("The video did not decode to any frames."))?;
+            hdr.metadata
+                .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
+            if hdr.metadata.mastering.is_none() {
+                return Err(unsupported(
+                    "HDR10 encoding requires valid mastering display metadata in the stream or first decoded frame.",
+                ));
+            }
+        }
         let declared_error = match self.validate_frames(frames, stream, false) {
             Ok(count) => return Ok(count),
             Err(error) => error,
@@ -256,6 +307,8 @@ impl Plan {
         if frames.frames.is_empty() {
             return Err(unsupported("The video did not decode to any frames."));
         }
+        let mut observed_hdr = StaticMetadata::parse(&stream.side_data_list)?;
+        validate_side_data(&stream.side_data_list, self.hdr10.as_ref(), encoded)?;
         for (index, frame) in frames.frames.iter().enumerate() {
             let time = seconds(frame.best_effort_timestamp_time.as_deref())
                 .ok_or_else(|| unsupported("A decoded frame has no usable timestamp."))?;
@@ -291,12 +344,23 @@ impl Plan {
             } else {
                 stream.pix_fmt.as_deref()
             };
-            if frame.pix_fmt.as_deref() != expected_format
-                || unsupported_side_data(&frame.side_data_list)
-            {
+            if frame.pix_fmt.as_deref() != expected_format {
                 return Err(unsupported(
                     "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
                 ));
+            }
+            validate_side_data(&frame.side_data_list, self.hdr10.as_ref(), encoded)?;
+            if let Some(hdr) = &self.hdr10 {
+                let actual = StaticMetadata::parse(&frame.side_data_list)?;
+                hdr.metadata.validate_present(&actual, encoded)?;
+                // Metadata need not be repeated on every frame, but output must
+                // contain all planned static metadata somewhere in the stream.
+                if actual.mastering.is_some() {
+                    observed_hdr.mastering = actual.mastering;
+                }
+                if actual.light.is_some() {
+                    observed_hdr.light = actual.light;
+                }
             }
             for (actual, expected) in [
                 (&frame.color_space, &stream.color_space),
@@ -309,6 +373,17 @@ impl Plan {
                         "Decoded frame color metadata differs from the selected source.",
                     ));
                 }
+            }
+        }
+        if let Some(hdr) = &self.hdr10 {
+            hdr.metadata.validate_present(&observed_hdr, encoded)?;
+            if encoded
+                && (observed_hdr.mastering.is_none()
+                    || (hdr.metadata.light.is_some() && observed_hdr.light.is_none()))
+            {
+                return Err(unsupported(
+                    "The encoded video is missing planned HDR10 mastering or content light metadata.",
+                ));
             }
         }
         Ok(frames.frames.len())
@@ -340,9 +415,14 @@ impl Plan {
         {
             return Err(AppError::new(
                 "ENCODE_VALIDATION_FAILED",
-                "The AV1 output dimensions, 10-bit format, aspect ratio, or SDR color metadata differ from the plan.",
+                "The AV1 output dimensions, 10-bit format, aspect ratio, or color metadata differ from the plan.",
                 None,
             ));
+        }
+        validate_side_data(&output.side_data_list, self.hdr10.as_ref(), true)?;
+        if let Some(hdr) = &self.hdr10 {
+            hdr.metadata
+                .validate_present(&StaticMetadata::parse(&output.side_data_list)?, true)?;
         }
         Ok(())
     }
@@ -373,6 +453,287 @@ pub(super) struct Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mastering() -> serde_json::Value {
+        serde_json::json!({"side_data_type":"Mastering display metadata", "red_x":"34000/50000", "red_y":"16000/50000", "green_x":"13250/50000", "green_y":"34500/50000", "blue_x":"7500/50000", "blue_y":"3000/50000", "white_point_x":"15635/50000", "white_point_y":"16450/50000", "max_luminance":"10000000/10000", "min_luminance":"1/10000"})
+    }
+
+    fn hdr_source_and_frames() -> (Document, Frames) {
+        let mut source = source();
+        let stream = &mut source.streams[0];
+        stream.codec_name = Some("hevc".into());
+        stream.pix_fmt = Some("yuv420p10le".into());
+        stream.color_primaries = Some("bt2020".into());
+        stream.color_transfer = Some("smpte2084".into());
+        stream.color_space = Some("bt2020nc".into());
+        let mut decoded = frames(&["0", "0.042", "0.083"]);
+        for frame in &mut decoded.frames {
+            frame.pix_fmt = stream.pix_fmt.clone();
+            frame.color_primaries = stream.color_primaries.clone();
+            frame.color_transfer = stream.color_transfer.clone();
+            frame.color_space = stream.color_space.clone();
+        }
+        decoded.frames[0].side_data_list = vec![
+            mastering(),
+            serde_json::json!({"side_data_type":"Content light level metadata", "max_content":200, "max_average":142}),
+        ];
+        (source, decoded)
+    }
+
+    #[test]
+    fn hdr10_uses_first_frame_metadata_and_verifies_av1_precision() {
+        let (source, mut decoded) = hdr_source_and_frames();
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .unwrap(),
+            3
+        );
+        assert_eq!((plan.primaries, plan.transfer, plan.matrix), (9, 16, 9));
+        let args = plan.hdr_arguments();
+        assert_eq!(args[2], "--content-light");
+        assert_eq!(args[3], "200,142");
+        assert!(
+            args[1]
+                .to_string_lossy()
+                .starts_with("G(0.2650000000,0.6900000000)")
+        );
+        let mut encoded = source.streams[0].clone();
+        encoded.codec_name = Some("av1".into());
+        assert!(
+            plan.validate_encoded_stream(&source.streams[0], &encoded)
+                .is_ok()
+        );
+        // AV1 stores coordinates /65536, peak luminance /256, minimum /16384.
+        decoded.frames[0].side_data_list[0]["red_x"] = "44564/65536".into();
+        decoded.frames[0].side_data_list[0]["min_luminance"] = "2/16384".into();
+        assert!(plan.validate_frames(&decoded, &encoded, true).is_ok());
+        assert!(
+            plan.validate_frames(&decoded, &source.streams[0], false)
+                .is_err()
+        );
+        decoded.frames[0].side_data_list[0]["red_x"] = "44567/65536".into();
+        assert!(plan.validate_frames(&decoded, &encoded, true).is_err());
+    }
+
+    #[test]
+    fn hdr10_rejects_missing_changed_malformed_or_new_static_metadata() {
+        for defect in [
+            "missing",
+            "zero-denominator",
+            "missing-coordinate",
+            "changed",
+            "stream-mismatch",
+            "late-light",
+            "missing-output",
+            "wrong-light",
+            "output-dynamic",
+        ] {
+            let (mut source, mut decoded) = hdr_source_and_frames();
+            match defect {
+                "missing" => decoded.frames[0].side_data_list.clear(),
+                "zero-denominator" => decoded.frames[0].side_data_list[0]["red_x"] = "1/0".into(),
+                "missing-coordinate" => {
+                    decoded.frames[0].side_data_list[0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("red_y");
+                }
+                "changed" => {
+                    let mut changed = mastering();
+                    changed["max_luminance"] = "2000/1".into();
+                    decoded.frames[1].side_data_list.push(changed);
+                }
+                "stream-mismatch" => {
+                    let mut changed = mastering();
+                    changed["max_luminance"] = "2000/1".into();
+                    source.streams[0].side_data_list.push(changed);
+                }
+                "late-light" => {
+                    let light = decoded.frames[0].side_data_list.pop().unwrap();
+                    decoded.frames[1].side_data_list.push(light);
+                }
+                _ => {}
+            }
+            let mut plan = Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings::default(),
+            )
+            .unwrap();
+            if matches!(defect, "missing-output" | "wrong-light" | "output-dynamic") {
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .unwrap();
+                match defect {
+                    "missing-output" => decoded.frames[0].side_data_list.clear(),
+                    "wrong-light" => decoded.frames[0].side_data_list[1]["max_content"] = 201.into(),
+                    _ => decoded.frames[0].side_data_list.push(serde_json::json!({"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}))
+                }
+                assert!(
+                    plan.validate_frames(&decoded, &source.streams[0], true)
+                        .is_err(),
+                    "{defect}"
+                );
+            } else {
+                assert!(
+                    plan.validate_source_frames(&decoded, &source.streams[0])
+                        .is_err(),
+                    "{defect}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_hdr_requires_opt_in_and_confirmed_compatible_dolby_base_layer() {
+        for (profile, compatibility, allowed) in [
+            (7, 6, true),
+            (8, 1, true),
+            (5, 0, false),
+            (5, 1, false),
+            (8, 4, false),
+            (8, 2, false),
+            (7, 0, false),
+            (9, 1, false),
+        ] {
+            for fallback in [false, true] {
+                let (mut source, mut decoded) = hdr_source_and_frames();
+                source.streams[0].side_data_list.push(serde_json::json!({"side_data_type":"DOVI configuration record", "dv_profile":profile, "dv_bl_signal_compatibility_id":compatibility,"bl_present_flag":1,"rpu_present_flag":1,"el_present_flag":u8::from(profile==7)}));
+                decoded.frames[0]
+                    .side_data_list
+                    .push(serde_json::json!({"side_data_type":"Dolby Vision RPU Data"}));
+                decoded.frames[0].side_data_list.push(serde_json::json!({"side_data_type":"Dolby Vision Metadata", "bl_bit_depth":10, "bl_video_full_range_flag":0}));
+                decoded.frames[0].side_data_list.push(serde_json::json!({"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}));
+                let settings = EncodeSettings {
+                    hdr10_fallback: fallback,
+                    ..EncodeSettings::default()
+                };
+                let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings);
+                if allowed && fallback {
+                    assert!(
+                        plan.unwrap()
+                            .validate_source_frames(&decoded, &source.streams[0])
+                            .is_ok()
+                    );
+                } else {
+                    assert!(
+                        plan.is_err(),
+                        "profile{profile} compat{compatibility} fallback{fallback}"
+                    );
+                }
+            }
+        }
+        let (source, mut decoded) = hdr_source_and_frames();
+        decoded.frames[1]
+            .side_data_list
+            .push(serde_json::json!({"side_data_type":"Dolby Vision RPU Data"}));
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings {
+                hdr10_fallback: true,
+                ..EncodeSettings::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .is_err(),
+            "No stream configuration to confirm Dolby compatibility"
+        );
+    }
+
+    #[test]
+    fn grain_and_worker_settings_are_bounded() {
+        for grain in [0, 1, 50] {
+            assert!(
+                validate_settings(&EncodeSettings {
+                    film_grain: grain,
+                    ..EncodeSettings::default()
+                })
+                .is_ok()
+            );
+        }
+        for grain in [51, 255] {
+            assert!(
+                validate_settings(&EncodeSettings {
+                    film_grain: grain,
+                    ..EncodeSettings::default()
+                })
+                .is_err()
+            );
+        }
+        for workers in [0, 33, 255] {
+            assert!(
+                validate_settings(&EncodeSettings {
+                    workers,
+                    ..EncodeSettings::default()
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn hdr10plus_alone_needs_fallback_and_unknown_rendering_data_is_rejected() {
+        let (source, mut decoded) = hdr_source_and_frames();
+        decoded.frames[1].side_data_list.push(serde_json::json!({
+            "side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+        }));
+        for fallback in [false, true] {
+            let mut plan = Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings {
+                    hdr10_fallback: fallback,
+                    ..EncodeSettings::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .is_ok(),
+                fallback
+            );
+        }
+        for kind in [
+            "Display Matrix",
+            "ICC profile",
+            "HDR Vivid",
+            "future rendering metadata",
+        ] {
+            decoded.frames[1].side_data_list = vec![serde_json::json!({"side_data_type": kind})];
+            let mut plan = Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings {
+                    hdr10_fallback: true,
+                    ..EncodeSettings::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .is_err(),
+                "{kind}"
+            );
+        }
+        let mut full_range = source.clone();
+        full_range.streams[0].color_range = Some("pc".into());
+        assert!(
+            Plan::build(
+                &full_range,
+                &full_range.selected(&[0]).unwrap(),
+                &EncodeSettings::default()
+            )
+            .is_err()
+        );
+    }
     fn source() -> Document {
         serde_json::from_str(r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001","time_base":"1/1000","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}],"format":{"start_time":"0","duration":"1"}}"#).unwrap()
     }

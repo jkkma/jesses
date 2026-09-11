@@ -9,7 +9,7 @@ pub use batch::{
     BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest, FolderScanRequest,
     FolderScanResult,
 };
-pub use jobs::{EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
+pub use jobs::{EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +51,36 @@ pub struct MediaStream {
     pub channels: Option<u32>,
     pub language: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub pixel_format: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub bit_depth: Option<u32>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub color_primaries: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub color_transfer: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub color_space: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub color_range: Option<String>,
+    /// HDR transfer family; this does not establish encode compatibility.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub hdr_format: Option<String>,
+    /// Whether stream headers report mastering or content light metadata.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub has_hdr_static_metadata: Option<bool>,
+    /// Formats reported in stream headers; absence does not rule out frame metadata.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub dynamic_hdr_formats: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, thiserror::Error)]
@@ -81,6 +111,7 @@ pub fn typescript_contracts() -> String {
         MediaFile::decl(&config),
         AppError::decl(&config),
         RemuxRequest::decl(&config),
+        EncodeBackend::decl(&config),
         EncodeSettings::decl(&config),
         EncodeRequest::decl(&config),
         JobState::decl(&config),
@@ -128,5 +159,14 @@ mod tests {
         assert!(value.get("size_bytes").is_none());
         assert!(typescript_contracts().contains("sizeBytes: string"));
         assert!(typescript_contracts().contains("durationSeconds: number | null"));
+    }
+
+    #[test]
+    fn older_stream_records_keep_hdr_metadata_unknown() {
+        let stream: MediaStream = serde_json::from_str(r#"{"index":0,"kind":"video","codec":"h264","width":1920,"height":1080,"frameRate":"24/1","sampleRate":null,"channels":null,"language":null,"title":null}"#).unwrap();
+        assert_eq!(stream.pixel_format, None);
+        assert_eq!(stream.has_hdr_static_metadata, None);
+        assert_eq!(stream.dynamic_hdr_formats, None);
+        assert!(typescript_contracts().contains("pixelFormat?: string | null"));
     }
 }

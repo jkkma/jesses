@@ -56,7 +56,9 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Verify actual FFmpeg, FFprobe, and standalone SVT-AV1 integration
         if: runner.os == 'Linux'
-        run: cargo test -p media-runtime --locked -- --include-ignored
+        run: |
+          cargo test -p media-runtime --lib --locked -- --include-ignored
+          cargo test -p media-runtime --test real_tools --locked -- --include-ignored
       - run: pnpm contracts:check
       - name: Check the native executable with embedded frontend
         run: pnpm tauri build --debug --no-bundle --target ${{ matrix.target }}

@@ -155,19 +155,24 @@ impl Document {
     }
 }
 
+/// Computed stream statistics and encoder provenance describe the old bitstream
+/// after transcoding. Copied streams keep these tags; encodes must clear them.
+pub(super) fn is_derived_stream_tag(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes"
+    ) || key.starts_with("_statistics_")
+        || key.starts_with("bps-")
+        || key.starts_with("number_of_frames-")
+        || key.starts_with("number_of_bytes-")
+}
+
 fn stable_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     tags.iter()
         .filter_map(|(key, value)| {
             let key = key.to_ascii_lowercase();
-            if matches!(
-                key.as_str(),
-                "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes"
-            ) || key.starts_with("_statistics_")
-                || key.starts_with("bps-")
-                || key.starts_with("number_of_frames-")
-                || key.starts_with("number_of_bytes-")
-                || (key == "language" && value == "und")
-            {
+            if is_derived_stream_tag(&key) || (key == "language" && value == "und") {
                 return None;
             }
             Some((key, value.clone()))

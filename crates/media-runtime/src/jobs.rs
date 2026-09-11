@@ -1,6 +1,7 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
+mod av1an;
 #[cfg(test)]
 mod batch_tests;
 mod encode;
@@ -202,6 +203,10 @@ impl JobManager {
             video_stream_index: 0,
             crf: request.crf,
             preset: request.preset,
+            film_grain: request.film_grain,
+            hdr10_fallback: request.hdr10_fallback,
+            backend: request.backend,
+            workers: request.workers,
         })?;
         let (queued, epoch) = {
             let state = self.state.lock().await;
@@ -226,11 +231,13 @@ impl JobManager {
     pub(crate) async fn inspect_encode_source(
         &self,
         input: &BatchEncodeInput,
+        settings: &EncodeSettings,
         epoch: u64,
     ) -> Result<media_core::MediaFile, AppError> {
         let input = input.clone();
+        let settings = settings.clone();
         self.run_preflight(epoch, move |cancel| async move {
-            inspect_encode_source(&input, &cancel).await
+            inspect_encode_source(&input, &settings, &cancel).await
         })
         .await
     }
@@ -299,6 +306,7 @@ impl JobManager {
                     stream_indices: request.source.stream_indices.clone(),
                     video_stream_index: request.settings.video_stream_index,
                 },
+                &request.settings,
                 epoch,
             )
             .await?;
@@ -986,6 +994,7 @@ async fn discover(name: &str, cancel: &watch::Receiver<bool>) -> Result<PathBuf,
 /// remain part of execution, where they are cancelable and visibly Preparing.
 async fn inspect_encode_source(
     input: &BatchEncodeInput,
+    settings: &EncodeSettings,
     cancel: &watch::Receiver<bool>,
 ) -> Result<media_core::MediaFile, AppError> {
     check_cancel(cancel)?;
@@ -1046,7 +1055,7 @@ async fn inspect_encode_source(
             &source.path,
         ));
     }
-    validate_encode_preview(&output.stdout, input).map_err(|mut error| {
+    validate_encode_preview(&output.stdout, input, settings).map_err(|mut error| {
         error.path = Some(source.path.to_string_lossy().into_owned());
         error
     })?;
@@ -1079,7 +1088,11 @@ async fn inspect_encode_source(
     )
 }
 
-fn validate_encode_preview(bytes: &[u8], input: &BatchEncodeInput) -> Result<(), AppError> {
+fn validate_encode_preview(
+    bytes: &[u8],
+    input: &BatchEncodeInput,
+    settings: &EncodeSettings,
+) -> Result<(), AppError> {
     let document: Document = serde_json::from_slice(bytes).map_err(|_| {
         AppError::new(
             "PROBE_INVALID_RESPONSE",
@@ -1099,14 +1112,17 @@ fn validate_encode_preview(bytes: &[u8], input: &BatchEncodeInput) -> Result<(),
             None,
         ));
     }
-    encode_plan::Plan::build(
+    let plan = encode_plan::Plan::build(
         &document,
         &selected,
         &EncodeSettings {
             video_stream_index: input.video_stream_index,
-            ..EncodeSettings::default()
+            ..settings.clone()
         },
     )?;
+    if settings.backend == media_core::EncodeBackend::Av1an {
+        av1an::validate_input(&document, &plan)?;
+    }
     Ok(())
 }
 

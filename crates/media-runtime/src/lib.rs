@@ -18,5 +18,7 @@ pub use media_core::{
     BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest, FolderScanRequest,
     FolderScanResult,
 };
-pub use media_core::{EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest};
+pub use media_core::{
+    EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest,
+};
 pub use probe::probe_media;

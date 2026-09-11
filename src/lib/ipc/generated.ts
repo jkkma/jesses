@@ -10,7 +10,19 @@ index: number, kind: string, codec: string | null, width: number | null, height:
 /**
  * Original rational frame rate, for example `24000/1001`.
  */
-frameRate: string | null, sampleRate: number | null, channels: number | null, language: string | null, title: string | null, };
+frameRate: string | null, sampleRate: number | null, channels: number | null, language: string | null, title: string | null, pixelFormat?: string | null, bitDepth?: number | null, colorPrimaries?: string | null, colorTransfer?: string | null, colorSpace?: string | null, colorRange?: string | null,
+/**
+ * HDR transfer family; this does not establish encode compatibility.
+ */
+hdrFormat?: string | null,
+/**
+ * Whether stream headers report mastering or content light metadata.
+ */
+hasHdrStaticMetadata?: boolean | null,
+/**
+ * Formats reported in stream headers; absence does not rule out frame metadata.
+ */
+dynamicHdrFormats?: Array<string> | null, };
 
 export type MediaFile = {
 /**
@@ -26,7 +38,17 @@ export type AppError = { code: string, message: string, path: string | null, };
 
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
 
-export type EncodeSettings = { videoStreamIndex: number, crf: number, preset: number, };
+export type EncodeBackend = "svtAv1" | "av1an";
+
+export type EncodeSettings = { backend: EncodeBackend, workers: number, videoStreamIndex: number, crf: number, preset: number,
+/**
+ * AV1 grain synthesis strength; zero leaves synthesis disabled.
+ */
+filmGrain: number,
+/**
+ * Explicit consent to discard dynamic HDR metadata for an HDR10 base layer.
+ */
+hdr10Fallback: boolean, };
 
 export type EncodeRequest = { source: RemuxRequest, settings: EncodeSettings, };
 
@@ -40,7 +62,7 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, };
+export type BatchEncodeRequest = { backend: EncodeBackend, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 

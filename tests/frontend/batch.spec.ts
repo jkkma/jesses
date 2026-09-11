@@ -94,7 +94,7 @@ async function desktopMock(
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
           if (command === 'get_capabilities')
-            return ['ffmpeg', 'ffprobe', 'svt-av1'].map((id) => ({
+            return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an'].map((id) => ({
               id,
               name: id,
               available: options.missing !== id,
@@ -177,6 +177,10 @@ async function desktopMock(
                       videoStreamIndex: input.videoStreamIndex,
                       crf: request.crf,
                       preset: request.preset,
+                      backend: request.backend,
+                      workers: request.workers,
+                      filmGrain: request.filmGrain,
+                      hdr10Fallback: request.hdr10Fallback,
                     },
                   },
                   error: null,
@@ -342,6 +346,10 @@ test('batch defaults preserve original per-file stream indices and keep attachme
       outputDirectory: 'C:\\exports',
       crf: 27,
       preset: 4,
+      backend: 'svtAv1',
+      workers: 2,
+      filmGrain: 0,
+      hdr10Fallback: false,
       inputs: [
         { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11] },
         { inputPath: episodes[1].path, videoStreamIndex: 2, streamIndices: [2, 5, 8, 11] },
@@ -457,10 +465,9 @@ test('missing tools and invalid settings block batch preparation; defaults can b
   await expect(page.getByRole('button', { name: 'Preview batch', exact: true })).toBeDisabled();
   await expect(
     page
-      .getByText(
-        'Install FFmpeg, FFprobe, and standalone SVT-AV1, then refresh Tools & settings.',
-        { exact: true },
-      )
+      .getByText('Install FFmpeg, FFprobe, standalone SVT-AV1, then refresh Tools & settings.', {
+        exact: true,
+      })
       .last(),
   ).toBeVisible();
   await page.getByLabel('CRF', { exact: true }).fill('64');
@@ -549,4 +556,84 @@ test('a late batch reply clears submitted rows while preserving a newly imported
   await expect(page.getByLabel('Select Episode 3.mkv', { exact: true })).toBeChecked();
   await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
   expect(await calls(page, 'enqueue_encode_batch')).toHaveLength(1);
+});
+
+for (const setting of ['grain', 'fallback', 'backend', 'workers'] as const) {
+  test(`changing ${setting} invalidates a late batch preview and preserves the submitted settings`, async ({
+    page,
+  }) => {
+    await desktopMock(page, { held: ['preview'] });
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    if (setting === 'workers')
+      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+    await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect
+      .poll(() => calls(page, 'preview_encode_batch').then((items) => items.length))
+      .toBe(1);
+    const original = (await calls(page, 'preview_encode_batch'))[0].payload;
+    if (setting === 'grain')
+      await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('10');
+    if (setting === 'fallback')
+      await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+    if (setting === 'backend')
+      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+    if (setting === 'workers')
+      await workspace.getByLabel('Parallel chunks', { exact: true }).fill('4');
+    await release(page, 'preview');
+    await expect(
+      page.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeDisabled();
+    expect((await calls(page, 'preview_encode_batch'))[0].payload).toEqual(original);
+    await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+    const submitted = (await calls(page, 'enqueue_encode_batch'))[0].payload
+      .requests as EncodeRequest[];
+    expect(submitted).toHaveLength(2);
+    for (const request of submitted) {
+      expect(request.settings).toMatchObject({
+        backend: setting === 'backend' || setting === 'workers' ? 'av1an' : 'svtAv1',
+        workers: setting === 'workers' ? 4 : 2,
+        filmGrain: setting === 'grain' ? 10 : 0,
+        hdr10Fallback: setting === 'fallback',
+      });
+    }
+    await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
+    expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(submitted);
+    await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+    await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+    await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue('svtAv1');
+  });
+}
+
+test('batch validates grain and requires av1an only when selected', async ({ page }) => {
+  await desktopMock(page, { missing: 'av1an' });
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const preview = page.getByRole('button', { name: 'Preview batch', exact: true });
+  for (const invalid of ['-1', '51', '1.5', '']) {
+    await workspace.getByLabel('Film grain synthesis', { exact: true }).fill(invalid);
+    await expect(preview).toBeDisabled();
+  }
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('0');
+  await expect(preview).toBeEnabled();
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(preview).toBeDisabled();
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('svtAv1');
+  await expect(preview).toBeEnabled();
+});
+
+test('batch rejects invalid parallel chunk counts before native preview', async ({ page }) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const preview = page.getByRole('button', { name: 'Preview batch', exact: true });
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  for (const invalid of ['0', '33', '2.5', '']) {
+    await workspace.getByLabel('Parallel chunks', { exact: true }).fill(invalid);
+    await expect(preview).toBeDisabled();
+  }
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('2');
+  await expect(preview).toBeEnabled();
+  expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
 });

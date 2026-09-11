@@ -85,11 +85,14 @@ impl JobManager {
         let document = probe(&ffprobe, &source.path, cancel).await?;
         let selected = document.selected(&request.stream_indices)?;
         let mut plan = Plan::build(&document, &selected, settings)?;
+        if settings.backend == media_core::EncodeBackend::Av1an {
+            super::av1an::validate_input(&document, &plan)?;
+        }
         let video = selected
             .iter()
             .find(|stream| stream.index == plan.video_index)
             .expect("validated video selection");
-        self.phase(id,JobState::Preparing,"Decoding the source once to verify every frame timestamp, progressive scan, and SDR format (bounded to 10 minutes and 64 MiB of metadata).").await;
+        self.phase(id,JobState::Preparing,"Decoding the source once to verify every frame timestamp, progressive scan, color, and HDR metadata (bounded to 10 minutes and 64 MiB of metadata).").await;
         let source_frames = frame_scan(&ffprobe, &source.path, plan.video_index, cancel).await?;
         let declared_rate = (plan.fps_num, plan.fps_den);
         let frame_count = plan.validate_source_frames(&source_frames, video)?;
@@ -103,11 +106,16 @@ impl JobManager {
             }).await;
         }
         drop(source_frames);
+        check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         source.verify()?;
         check_cancel(cancel)?;
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
-            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; CRF {}, preset {}.",plan.fps_num,plan.fps_den,settings.crf,settings.preset));
+            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; CRF {}, preset {}, film grain {} (denoising off).",plan.fps_num,plan.fps_den,settings.crf,settings.preset,settings.film_grain));
+            if plan.is_hdr10() {
+                append_log(snapshot, "HDR10: preserving BT.2020/PQ color and validated static mastering/content light metadata.".into());
+                if settings.hdr10_fallback { append_log(snapshot, "HDR10 fallback enabled: Dolby Vision enhancement data and HDR10+ dynamic metadata are discarded.".into()); }
+            }
         }).await;
         tokio::fs::create_dir_all(self.log_dir.as_ref())
             .await
@@ -128,34 +136,49 @@ impl JobManager {
         })
         .await;
         check_cancel(cancel)?;
-        let producer = CommandSpec {
-            executable: ffmpeg.clone(),
-            args: decoder_args(&source.path, &plan),
-            cwd: None,
-        };
-        let consumer = CommandSpec {
-            executable: encoder,
-            // SVT's path writer uses exclusive CRT sharing on Windows. Its
-            // documented stdout mode lets the supervisor write our owned file
-            // handle without releasing the identity guard or narrowing Unicode.
-            args: encoder_args(Path::new("stdout"), &plan, settings),
-            cwd: None,
-        };
-        self.phase(id,JobState::Running,"Encoding 10-bit AV1 with the standalone SVT encoder; audio, subtitles, and attachments will be copied afterward.").await;
-        let (sender, events) = mpsc::channel(256);
-        let event_task = self.observe_encode(id, events, plan.frame_seconds());
-        let result = supervisor::run_pipeline_to_file(
-            &producer,
-            &consumer,
-            cancel.clone(),
-            sender,
-            log_path,
-            Duration::from_secs(24 * 60 * 60),
-            ivf.clone_file()?,
-        )
-        .await;
-        let _ = event_task.await;
-        result.map_err(|e| process_error(e, &source.path))?;
+        if settings.backend == media_core::EncodeBackend::Av1an {
+            self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected tracks will be copied afterward.").await;
+            self.encode_av1an(
+                id,
+                &source.path,
+                ivf,
+                &plan,
+                settings,
+                cancel,
+                log_path,
+                frame_count,
+            )
+            .await?;
+        } else {
+            let producer = CommandSpec {
+                executable: ffmpeg.clone(),
+                args: decoder_args(&source.path, &plan),
+                cwd: None,
+            };
+            let consumer = CommandSpec {
+                executable: encoder,
+                // SVT's path writer uses exclusive CRT sharing on Windows. Its
+                // documented stdout mode lets the supervisor write our owned file
+                // handle without releasing the identity guard or narrowing Unicode.
+                args: encoder_args(Path::new("stdout"), &plan, settings),
+                cwd: None,
+            };
+            self.phase(id,JobState::Running,"Encoding 10-bit AV1 with the standalone SVT encoder; audio, subtitles, and attachments will be copied afterward.").await;
+            let (sender, events) = mpsc::channel(256);
+            let event_task = self.observe_encode(id, events, plan.frame_seconds());
+            let result = supervisor::run_pipeline_to_file(
+                &producer,
+                &consumer,
+                cancel.clone(),
+                sender,
+                log_path,
+                Duration::from_secs(24 * 60 * 60),
+                ivf.clone_file()?,
+            )
+            .await;
+            let _ = event_task.await;
+            result.map_err(|e| process_error(e, &source.path))?;
+        }
         check_cancel(cancel)?;
         source.verify()?;
         ivf.flush_nonempty_async().await?;
@@ -288,7 +311,7 @@ async fn frame_scan(
     .map(OsString::from)
     .collect();
     args.push(index.to_string().into());
-    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation","-of","json","-i"].into_iter().map(OsString::from));
+    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag","-of","json","-i"].into_iter().map(OsString::from));
     args.push(input.as_os_str().to_owned());
     let output = supervisor::run_capture(
         &CommandSpec {
@@ -323,7 +346,7 @@ async fn frame_scan(
     })
 }
 
-fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
+pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -376,7 +399,7 @@ fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     args
 }
 
-fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
     let values = [
         "--input-depth".into(),
         "10".into(),
@@ -399,14 +422,72 @@ fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<Os
         "--chroma-sample-position".into(),
         plan.chroma.into(),
     ];
+    let mut args: Vec<OsString> = values.into_iter().map(OsString::from).collect();
+    args.extend(plan.hdr_arguments());
+    // Keep the coded source texture. Synthesis is an explicit setting and never
+    // enables SVT's source denoiser, regardless of encoder version defaults.
+    args.extend([
+        "--film-grain".into(),
+        settings.film_grain.to_string().into(),
+        "--film-grain-denoise".into(),
+        "0".into(),
+    ]);
+    args
+}
+
+fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-i", "stdin", "--progress", "2", "--passes", "1"]
         .into_iter()
         .map(OsString::from)
         .collect();
-    args.extend(values.into_iter().map(OsString::from));
+    args.extend(encoder_parameters(plan, settings));
     args.push("-b".into());
     args.push(output.as_os_str().to_owned());
     args
+}
+
+async fn check_encoder_capabilities(
+    encoder: &Path,
+    plan: &Plan,
+    settings: &EncodeSettings,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: encoder.to_owned(),
+            args: vec!["--help".into()],
+            cwd: None,
+        },
+        cancel.clone(),
+        512 * 1024,
+        Duration::from_secs(5),
+    )
+    .await
+    .map_err(|e| process_error(e, encoder))?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut required = vec!["--film-grain", "--film-grain-denoise"];
+    if plan.is_hdr10() {
+        required.extend(["--mastering-display", "--content-light"]);
+    }
+    if !result.status.success()
+        || required
+            .iter()
+            .any(|option| !help.split_whitespace().any(|word| word == *option))
+    {
+        return Err(files::error(
+            "ENCODER_CAPABILITY_UNSUPPORTED",
+            format!(
+                "The installed standalone SVT encoder does not advertise the required HDR10/film-grain options (grain level {}).",
+                settings.film_grain
+            ),
+            encoder,
+        ));
+    }
+    Ok(())
 }
 
 fn mux_args(
@@ -472,6 +553,20 @@ fn mux_args(
                 format!("-aspect:{index}").into(),
                 format!("{}:{}", plan.width, plan.height).into(),
             ]);
+            // Keep descriptive tags, but source bitrate/frame/byte statistics
+            // and encoder provenance no longer describe this encoded stream.
+            // Match the exact source key and output position, including when
+            // selected tracks have been reordered; copied tracks are untouched.
+            for key in stream
+                .tags
+                .keys()
+                .filter(|key| metadata::is_derived_stream_tag(key))
+            {
+                args.extend([
+                    format!("-metadata:s:{index}").into(),
+                    format!("{key}=").into(),
+                ]);
+            }
         }
     }
     args.extend(["-f", "matroska", "-y"].into_iter().map(OsString::from));
@@ -497,6 +592,152 @@ mod tests {
         );
         assert_eq!(svt_frame_counter("Encoding frame 9 40 fps"), Some(9));
         assert_eq!(svt_frame_counter("Total Encoding Time: 300 ms"), None);
+    }
+
+    fn tag_value<'a>(stream: &'a metadata::Stream, key: &str) -> Option<&'a str> {
+        stream
+            .tags
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn encode_mux_clears_only_derived_tags_on_the_reordered_video_stream() {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"0"},
+            "streams":[
+                {"index":3,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv",
+                    "tags":{"bPs":"1","DURATION":"stale","EnCoDeR":"old","NUMBER_OF_FRAMES":"2","NUMBER_OF_BYTES":"3","BPS-eng":"4","number_of_frames-jpn":"5","NUMBER_OF_BYTES-fra":"6","_Statistics_Tags":"old","title":"Picture","language":"eng","comment":"Keep me","encoder-notes":"Descriptive"}},
+                {"index":7,"codec_type":"audio","tags":{"BPS":"768000","title":"Original audio"}}
+            ]
+        })).unwrap();
+        let selected = document.selected(&[7, 3]).unwrap();
+        let plan = Plan::build(
+            &document,
+            &selected,
+            &EncodeSettings {
+                video_stream_index: 3,
+                ..EncodeSettings::default()
+            },
+        )
+        .unwrap();
+        let args = mux_args(
+            Path::new("input.mkv"),
+            Path::new("video.ivf"),
+            Path::new("output.mkv"),
+            &selected,
+            &plan,
+        );
+        let cleared: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-metadata:s:1")
+            .map(|pair| pair[1].to_str().unwrap())
+            .collect();
+        for expected in [
+            "bPs=",
+            "DURATION=",
+            "EnCoDeR=",
+            "NUMBER_OF_FRAMES=",
+            "NUMBER_OF_BYTES=",
+            "BPS-eng=",
+            "number_of_frames-jpn=",
+            "NUMBER_OF_BYTES-fra=",
+            "_Statistics_Tags=",
+        ] {
+            assert!(cleared.contains(&expected), "{expected}");
+        }
+        assert_eq!(cleared.len(), 9);
+        assert!(!args.iter().any(|arg| arg == "-metadata:s:0"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFmpeg with libx265, FFprobe, and standalone SVT-AV1"]
+    async fn standalone_hdr10_preserves_static_metadata_with_grain_synthesis() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("jesses-hdr10-{}-{nonce}", std::process::id())),
+        );
+        std::fs::create_dir(&fixture.0).unwrap();
+        let input = fixture.0.join("hdr10-source.mkv");
+        let output = fixture.0.join("hdr10-av1.mkv");
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        let mut args:Vec<OsString> = ["-v","error","-nostdin","-n","-f","lavfi","-i","testsrc2=s=128x96:r=24","-t","0.5","-vf","setparams=field_mode=prog:range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc","-c:v","libx265","-preset","ultrafast","-pix_fmt","yuv420p10le","-color_range","tv","-colorspace","bt2020nc","-color_trc","smpte2084","-color_primaries","bt2020","-x265-params","log-level=error:pools=2:frame-threads=2:bframes=0:hdr10=1:chromaloc=2:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=200,142"].into_iter().map(OsString::from).collect();
+        args.push(input.as_os_str().to_owned());
+        let (_sender, cancel) = watch::channel(false);
+        let generated = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args,
+                cwd: None,
+            },
+            cancel,
+            128 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let original = std::fs::read(&input).unwrap();
+        let manager = JobManager::new(fixture.0.join("logs"));
+        manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    preset: 12,
+                    film_grain: 8,
+                    ..EncodeSettings::default()
+                },
+            })
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let job = manager.list_jobs().await.remove(0);
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+        assert!(
+            job.logs
+                .iter()
+                .any(|line| line.contains("HDR10: preserving"))
+        );
+        assert!(output.exists());
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let document = probe(&ffprobe, &output, &cancel).await.unwrap();
+        assert_eq!(
+            document.streams[0].color_transfer.as_deref(),
+            Some("smpte2084")
+        );
+        let decoded = frame_scan(&ffprobe, &output, 0, &cancel).await.unwrap();
+        assert_eq!(decoded.frames.len(), 12);
+        assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".partial.")
+        }));
     }
 
     #[tokio::test]
@@ -730,10 +971,30 @@ mod tests {
                 "srt",
                 "-metadata:s:v:0",
                 "title=Picture",
+                "-metadata:s:v:0",
+                "language=jpn",
+                "-metadata:s:v:0",
+                "BPS=90000000",
+                "-metadata:s:v:0",
+                "BPS-eng=90000001",
+                "-metadata:s:v:0",
+                "NUMBER_OF_FRAMES=999999",
+                "-metadata:s:v:0",
+                "NUMBER_OF_FRAMES-eng=888888",
+                "-metadata:s:v:0",
+                "NUMBER_OF_BYTES=777777",
+                "-metadata:s:v:0",
+                "NUMBER_OF_BYTES-eng=666666",
+                "-metadata:s:v:0",
+                "_STATISTICS_WRITING_APP=stale source statistics",
+                "-metadata:s:v:0",
+                "_STATISTICS_TAGS=BPS NUMBER_OF_FRAMES NUMBER_OF_BYTES",
                 "-metadata:s:a:0",
                 "language=jpn",
                 "-metadata:s:a:0",
                 "title=Original audio",
+                "-metadata:s:a:0",
+                "BPS=768000",
                 "-metadata:s:s:0",
                 "language=eng",
                 "-disposition:s:0",
@@ -769,6 +1030,17 @@ mod tests {
             String::from_utf8_lossy(&generated.stderr)
         );
         let source_bytes = std::fs::read(&input).unwrap();
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_probe_sender, probe_cancel) = watch::channel(false);
+        let source_document = probe(&ffprobe, &input, &probe_cancel).await.unwrap();
+        assert_eq!(
+            tag_value(&source_document.streams[0], "BPS"),
+            Some("90000000")
+        );
+        assert_eq!(
+            tag_value(&source_document.streams[0], "NUMBER_OF_FRAMES-eng"),
+            Some("888888")
+        );
         let manager = JobManager::new(fixture.0.join("logs"));
         manager
             .start_encode(EncodeRequest {
@@ -810,6 +1082,36 @@ mod tests {
             ["audio", "video", "subtitle", "attachment"]
         );
         assert_eq!(media.streams[1].codec.as_deref(), Some("av1"));
+        let output_document = probe(&ffprobe, &output, &probe_cancel).await.unwrap();
+        let encoded = &output_document.streams[1];
+        for key in source_document.streams[0]
+            .tags
+            .keys()
+            .filter(|key| metadata::is_derived_stream_tag(key))
+        {
+            if !key.eq_ignore_ascii_case("duration") && !key.eq_ignore_ascii_case("encoder") {
+                assert!(
+                    tag_value(encoded, key).is_none(),
+                    "Stale video statistic survived: {key}"
+                );
+            }
+        }
+        // The muxer can write current duration/provenance, but the source FFV1
+        // encoder must never be presented as the encoder of the AV1 bitstream.
+        assert_ne!(
+            tag_value(encoded, "encoder"),
+            tag_value(&source_document.streams[0], "encoder")
+        );
+        assert_eq!(tag_value(encoded, "title"), Some("Picture"));
+        assert_eq!(tag_value(encoded, "language"), Some("jpn"));
+        assert_eq!(
+            tag_value(&output_document.streams[0], "BPS"),
+            Some("768000")
+        );
+        assert_eq!(
+            tag_value(&output_document.streams[0], "title"),
+            Some("Original audio")
+        );
         assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|e| {
             e.unwrap()
                 .file_name()

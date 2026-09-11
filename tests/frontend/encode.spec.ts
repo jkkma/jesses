@@ -66,7 +66,7 @@ const media: MediaFile = {
     },
   ],
 };
-const tools: ToolInfo[] = ['ffmpeg', 'ffprobe', 'svt-av1'].map((id) => ({
+const tools: ToolInfo[] = ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an'].map((id) => ({
   id,
   name: id,
   available: true,
@@ -83,7 +83,15 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
   id: 'encode-1',
   state,
   request: { inputPath, outputPath, streamIndices: [0, 3, 7, 9] },
-  encodeSettings: { videoStreamIndex: 0, crf: 30, preset: 4 },
+  encodeSettings: {
+    videoStreamIndex: 0,
+    crf: 30,
+    preset: 4,
+    backend: 'svtAv1',
+    workers: 2,
+    filmGrain: 0,
+    hdr10Fallback: false,
+  },
   progressSeconds: 3,
   durationSeconds: 12,
   logs: ['Encoding video with standalone SVT-AV1.'],
@@ -267,7 +275,15 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
         payload: {
           request: {
             source: { inputPath, outputPath, streamIndices: [4, 3, 9] },
-            settings: { videoStreamIndex: 4, crf: 28, preset: 6 },
+            settings: {
+              videoStreamIndex: 4,
+              crf: 28,
+              preset: 6,
+              backend: 'svtAv1',
+              workers: 2,
+              filmGrain: 0,
+              hdr10Fallback: false,
+            },
           },
         },
       },
@@ -355,13 +371,13 @@ test('backend compatibility errors remain visible and allow correcting the draft
   await desktopMock(page, {
     failure: {
       code: 'ENCODE_UNSUPPORTED_SOURCE',
-      message: 'HDR video is not supported by this workflow.',
+      message: 'This HDR source has no compatible HDR10 base layer.',
       path: inputPath,
     },
   });
   await openEncode(page);
   await page.getByRole('button', { name: 'Start encode', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('HDR video is not supported');
+  await expect(page.getByRole('alert')).toContainText('no compatible HDR10 base layer');
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
 });
 
@@ -465,7 +481,15 @@ test('encodes can be queued for different sources while another job is running',
               outputPath: 'C:\\exports\\second.mkv',
               streamIndices: [0, 3, 7, 9],
             },
-            settings: { videoStreamIndex: 0, crf: 30, preset: 4 },
+            settings: {
+              videoStreamIndex: 0,
+              crf: 30,
+              preset: 4,
+              backend: 'svtAv1',
+              workers: 2,
+              filmGrain: 0,
+              hdr10Fallback: false,
+            },
           },
         },
       },
@@ -478,7 +502,15 @@ test('encodes can be queued for different sources while another job is running',
               outputPath: 'C:\\media\\next_av1.mkv',
               streamIndices: [12],
             },
-            settings: { videoStreamIndex: 12, crf: 30, preset: 4 },
+            settings: {
+              videoStreamIndex: 12,
+              crf: 30,
+              preset: 4,
+              backend: 'svtAv1',
+              workers: 2,
+              filmGrain: 0,
+              hdr10Fallback: false,
+            },
           },
         },
       },
@@ -538,4 +570,86 @@ test('job storage errors are visible and reconnect preserves the imported source
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
   await expect(page.getByLabel('Video stream', { exact: true })).toHaveValue('0');
   await expect.poll(() => calls(page, 'subscribe_jobs')).toHaveLength(2);
+});
+
+test('advanced encode settings are explicit, immutable in queued jobs, and reset safely', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+  await expect(workspace).toContainText('does not exactly restore the original grain');
+  await expect(workspace).toContainText('dynamic metadata to be discarded');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(workspace).toContainText('first video track only');
+  await expect(workspace).toContainText('at most 240 frames');
+  await expect(workspace).toContainText('VapourSynth with the L-SMASH Works source plugin');
+  await expect(workspace).toContainText('inside the output folder');
+  await expect(workspace).toContainText('remaining work files are retained');
+  await expect(workspace).toContainText('Jobs never resume automatically');
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('3');
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('12');
+  await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+  await page.screenshot({
+    path: test.info().outputPath('advanced-encode-options.png'),
+    fullPage: true,
+  });
+  await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const submitted = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(submitted.request.settings).toEqual({
+    videoStreamIndex: 0,
+    crf: 30,
+    preset: 4,
+    backend: 'av1an',
+    workers: 3,
+    filmGrain: 12,
+    hdr10Fallback: true,
+  });
+  await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue('svtAv1');
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+    'av1an / SVT-AV1 · 3 parallel chunks',
+  );
+  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+    'Grain 12 · HDR10 fallback allowed',
+  );
+  expect((await calls(page, 'enqueue_encode'))[0].payload).toEqual(submitted);
+});
+
+test('grain and av1an worker ranges block submission and av1an requires its capability', async ({
+  page,
+}) => {
+  await desktopMock(page, { missing: 'av1an' });
+  await openEncode(page);
+  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
+  const start = page.getByRole('button', { name: 'Start encode', exact: true });
+  for (const invalid of ['-1', '51', '1.5', '']) {
+    await workspace.getByLabel('Film grain synthesis', { exact: true }).fill(invalid);
+    await expect(start).toBeDisabled();
+  }
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('50');
+  await expect(start).toBeEnabled();
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(start).toBeDisabled();
+  await expect(workspace).toContainText('and av1an');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('svtAv1');
+  await expect(start).toBeEnabled();
+  expect(await calls(page, 'start_encode')).toHaveLength(0);
+});
+
+test('av1an accepts only whole worker counts in range', async ({ page }) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const workspace = page.getByRole('region', { name: 'Quick Convert workspace' });
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  for (const invalid of ['0', '33', '2.5', '']) {
+    await workspace.getByLabel('Parallel chunks', { exact: true }).fill(invalid);
+    await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  }
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('32');
+  await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
 });
