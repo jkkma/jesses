@@ -15,12 +15,14 @@
     tools,
     desktop,
     loading,
+    checked,
     error,
     onrefresh,
   }: {
     tools: ToolInfo[];
     desktop: boolean;
     loading: boolean;
+    checked: boolean;
     error: string | null;
     onrefresh: () => void;
   } = $props();
@@ -47,11 +49,15 @@
       <span class="heading-with-icon"
         ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Tool detection</span></span
       ><span class="small-muted"
-        >{desktop && tools.length
-          ? `${available} / ${tools.length} available`
-          : desktop
-            ? 'Local environment'
-            : 'Desktop required'}</span
+        >{desktop && loading
+          ? 'Checking local tools…'
+          : desktop && !checked
+            ? 'Tools have not been checked'
+            : desktop && tools.length
+              ? `${available} / ${tools.length} available`
+              : desktop
+                ? 'Local environment'
+                : 'Desktop required'}</span
       >
     </div>
     {#if !desktop}
@@ -77,15 +83,24 @@
               <tr
                 ><td><strong>{tool.name}</strong><span class="tool-id mono">{tool.id}</span></td><td
                   ><span class:available={tool.available} class="tool-status"
-                    >{#if tool.available}<Check
+                    >{#if !checked && loading}<LoaderCircle
+                        size={13}
+                        class="spinning"
+                        aria-hidden="true"
+                      />Checking…{:else if !checked}<Info size={13} aria-hidden="true" />Not checked{:else if tool.available}<Check
                         size={13}
                         aria-hidden="true"
                       />Available{:else}<CircleAlert size={13} aria-hidden="true" />Not found{/if}</span
                   ></td
                 ><td
-                  ><span class="tool-version mono">{tool.version ?? 'Version unavailable'}</span
+                  ><span class="tool-version mono"
+                    >{!checked
+                      ? 'Awaiting detection'
+                      : (tool.version ?? 'Version unavailable')}</span
                   ><span class="tool-path mono" title={tool.path ?? undefined}
-                    >{tool.path ?? tool.detail ?? 'No executable detected'}</span
+                    >{!checked
+                      ? 'Executable location and version are not known yet.'
+                      : (tool.path ?? tool.detail ?? 'No executable detected')}</span
                   >{#if tool.path && tool.detail}<span class="tool-detail">{tool.detail}</span
                     >{/if}</td
                 ></tr

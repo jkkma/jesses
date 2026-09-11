@@ -35,7 +35,23 @@ impl Drop for FixtureDirectory {
 #[ignore = "requires FFmpeg and FFprobe on PATH"]
 async fn discovers_tools_and_probes_a_synthetic_multistream_file() {
     let capabilities = get_capabilities().await;
-    assert_eq!(capabilities.len(), 5);
+    assert_eq!(capabilities.len(), 7);
+    for id in ["svt-av1-5fish", "svt-av1-hdr"] {
+        let fork = capabilities.iter().find(|tool| tool.id == id).unwrap();
+        if fork.available {
+            let marker = if id == "svt-av1-5fish" {
+                "[5fish]"
+            } else {
+                "SVT-AV1-HDR"
+            };
+            assert!(
+                fork.version
+                    .as_deref()
+                    .is_some_and(|version| version.contains(marker))
+            );
+            assert!(fork.path.is_some());
+        }
+    }
     let ffmpeg = capabilities
         .iter()
         .find(|tool| tool.id == "ffmpeg")

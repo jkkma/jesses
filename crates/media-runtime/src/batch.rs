@@ -356,6 +356,8 @@ fn proposed_output(
         };
         let codec = match encoder {
             VideoEncoder::SvtAv1 => "av1",
+            VideoEncoder::SvtAv1FiveFish => "av1_5fish",
+            VideoEncoder::SvtAv1Hdr => "av1_hdr",
             VideoEncoder::X264 => "x264",
         };
         let candidate = directory.join(format!("{stem}_{codec}{suffix}.mkv"));
@@ -417,6 +419,9 @@ pub(crate) async fn preview(
             crf: request.crf,
             preset: request.preset,
             film_grain: request.film_grain,
+            lineart_psy_bias: request.lineart_psy_bias,
+            texture_psy_bias: request.texture_psy_bias,
+            hdr_tune: request.hdr_tune,
             hdr10_fallback: request.hdr10_fallback,
             backend: request.backend,
             encoder: request.encoder,
@@ -680,6 +685,9 @@ mod tests {
             crf: 0, // Valid x264 CRF 0; the SVT default would reject it.
             preset: 5,
             film_grain: 0,
+            lineart_psy_bias: 0,
+            texture_psy_bias: 0,
+            hdr_tune: Default::default(),
             hdr10_fallback: false,
             backend: Default::default(),
             encoder: VideoEncoder::X264,
@@ -762,6 +770,9 @@ mod tests {
                 crf: 30,
                 preset: 4,
                 film_grain: 0,
+                lineart_psy_bias: 0,
+                texture_psy_bias: 0,
+                hdr_tune: Default::default(),
                 hdr10_fallback: false,
                 backend: Default::default(),
                 encoder: Default::default(),

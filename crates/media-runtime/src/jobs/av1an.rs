@@ -1,6 +1,12 @@
 //! Chunked SVT encoding under the same process ownership and artifact gates.
 use super::{encode::encoder_parameters, encode_plan::Plan, *};
 
+mod launcher;
+
+pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
+    launcher::validate_encoder_path(encoder)
+}
+
 pub(super) fn validate_input(document: &Document, plan: &Plan) -> Result<(), AppError> {
     if document
         .streams
@@ -41,7 +47,10 @@ fn arguments(
         "--chunk-method",
         "lsmash",
         "--concat",
-        "ivf",
+        // av1an's av-ivf concatenator can panic on valid small AV1 packets.
+        // FFmpeg copies the IVF chunks; our complete record and decode checks
+        // still verify the resulting stream before publication.
+        "ffmpeg",
         "--split-method",
         "av-scenechange",
         "--sc-downscale-height",
@@ -84,6 +93,7 @@ impl JobManager {
         &self,
         id: &str,
         input: &Path,
+        encoder: &Path,
         ivf: &Temporary,
         plan: &Plan,
         settings: &EncodeSettings,
@@ -92,15 +102,40 @@ impl JobManager {
         frame_count: usize,
     ) -> Result<(), AppError> {
         let executable = discover("av1an", cancel).await?;
-        let version = supervisor::run_capture(
+        validate_encoder_path(encoder)?;
+        let work = ivf
+            .path
+            .parent()
+            .expect("owned output parent")
+            .join(format!(".jesses-{id}.av1an"));
+        // A new private workspace keeps staged tools and chunks separate from
+        // every preexisting directory. No original executable is changed.
+        tokio::fs::create_dir(&work).await.map_err(|e| {
+            files::error(
+                "OUTPUT_CREATE_FAILED",
+                format!("Cannot reserve av1an workspace: {e}"),
+                &work,
+            )
+        })?;
+        let launch_executable = executable.clone();
+        let launch_encoder = encoder.to_owned();
+        let launch_work = work.clone();
+        let mut launch = tokio::task::spawn_blocking(move || {
+            launcher::Launch::prepare(&launch_executable, &launch_encoder, &launch_work)
+        })
+        .await
+        .map_err(|e| files::error("AV1AN_STAGE_FAILED", e.to_string(), &executable))??;
+        check_cancel(cancel)?;
+        let version = supervisor::run_capture_with_path(
             &CommandSpec {
-                executable: executable.clone(),
+                executable: launch.executable.clone(),
                 args: vec!["--version".into()],
-                cwd: None,
+                cwd: Some(work.clone()),
             },
             cancel.clone(),
             128 * 1024,
             Duration::from_secs(15),
+            Some(&launch.path),
         )
         .await
         .map_err(|e| process_error(e, &executable))?;
@@ -132,22 +167,10 @@ impl JobManager {
             .find(|v| !v.is_empty())
             .unwrap_or("unknown av1an version")
             .to_owned();
-        let work = ivf
-            .path
-            .parent()
-            .expect("owned output parent")
-            .join(format!(".jesses-{id}.av1an"));
-        // create_dir (not create_dir_all) refuses every preexisting workspace.
-        tokio::fs::create_dir(&work).await.map_err(|e| {
-            files::error(
-                "OUTPUT_CREATE_FAILED",
-                format!("Cannot reserve av1an workspace: {e}"),
-                &work,
-            )
-        })?;
         let internal_log = log_path.with_extension("av1an.log");
         self.change(id, |snapshot| {
             append_log(snapshot, format!("Tool: {} — {version}", executable.display()));
+            append_log(snapshot, format!("av1an selected encoder: {}", encoder.display()));
             append_log(snapshot, format!("av1an: {} parallel workers; scene detection and at most 240 frames per chunk. Workspace: {}", settings.workers, work.display()));
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
@@ -179,9 +202,9 @@ impl JobManager {
                 }
             }
         });
-        let result = supervisor::run(
+        let result = supervisor::run_with_path(
             &CommandSpec {
-                executable,
+                executable: launch.executable.clone(),
                 args: arguments(input, &ivf.path, &work, &internal_log, plan, settings),
                 cwd: Some(work.clone()),
             },
@@ -189,9 +212,11 @@ impl JobManager {
             sender,
             log_path,
             Duration::from_secs(24 * 60 * 60),
+            Some(&launch.path),
         )
         .await;
         let _ = event_task.await;
+        let stage_cleanup = launch.cleanup();
         // av1an removes its own chunk tree after successful concatenation. Only
         // remove our empty parent; interrupted work is retained and identified.
         if tokio::fs::remove_dir(&work).await.is_err() {
@@ -207,6 +232,7 @@ impl JobManager {
             .await;
         }
         let result = result.map_err(|e| process_error(e, input))?;
+        stage_cleanup?;
         if !result.status.success() {
             return Err(files::error(
                 "AV1AN_FAILED",
@@ -393,6 +419,7 @@ mod tests {
         );
         assert!(args.windows(2).any(|a| a == ["--workers", "3"]));
         assert!(args.windows(2).any(|a| a == ["--chunk-method", "lsmash"]));
+        assert!(args.windows(2).any(|a| a == ["--concat", "ffmpeg"]));
         let params = args.windows(2).find(|a| a[0] == "--video-params").unwrap()[1]
             .to_str()
             .unwrap();

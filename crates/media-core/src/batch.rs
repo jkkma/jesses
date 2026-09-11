@@ -42,6 +42,12 @@ pub struct BatchEncodeRequest {
     #[serde(default)]
     pub film_grain: u8,
     #[serde(default)]
+    pub lineart_psy_bias: u8,
+    #[serde(default)]
+    pub texture_psy_bias: u8,
+    #[serde(default)]
+    pub hdr_tune: crate::HdrTune,
+    #[serde(default)]
     pub hdr10_fallback: bool,
 }
 

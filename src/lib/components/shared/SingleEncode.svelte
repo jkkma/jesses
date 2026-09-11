@@ -19,6 +19,11 @@
     presetLabel,
     sourceBitDepth,
     knownHdr,
+    encoderChoices,
+    isSvtEncoder,
+    validForkSettings,
+    forkSettingsSummary,
+    type HdrTune,
   } from './encoder-options';
   import type {
     EncodeBackend,
@@ -55,6 +60,9 @@
   let workers = $state<number | undefined>(2);
   let filmGrain = $state<number | undefined>(0);
   let hdr10Fallback = $state(false);
+  let lineartPsyBias = $state<number | undefined>(0);
+  let texturePsyBias = $state<number | undefined>(0);
+  let hdrTune = $state<HdrTune>('visualQuality');
   let included = $state<number[]>([]);
   let destination = $state('');
   let error = $state<string | null>(null);
@@ -66,6 +74,9 @@
     workers: number | undefined;
     filmGrain: number | undefined;
     hdr10Fallback: boolean;
+    lineartPsyBias: number | undefined;
+    texturePsyBias: number | undefined;
+    hdrTune: HdrTune;
     included: number[];
     destination: string;
   };
@@ -76,7 +87,7 @@
   let draftGeneration = 0;
   const desktop = isDesktop();
   const chunked = $derived(backend === 'av1an');
-  const encoder = $derived(chunked ? 'svtAv1' : selectedEncoder);
+  const encoder = $derived(selectedEncoder);
   const options = $derived(encoderOptions(encoder));
   const idPrefix = $derived(chunked ? 'av1an' : 'encode');
   const terminal = (state: string) =>
@@ -86,7 +97,7 @@
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
   const hdrUnsupported = $derived(encoder === 'x264' && knownHdr(selectedVideo));
   const depthLabel = $derived(
-    encoder === 'svtAv1'
+    isSvtEncoder(encoder)
       ? '10-bit'
       : sourceBitDepth(selectedVideo)
         ? `${sourceBitDepth(selectedVideo)}-bit source`
@@ -105,7 +116,9 @@
   );
   const disabled = $derived(!desktop || !usableSource || submitting);
   const validSettings = $derived(
-    typeof crf === 'number' &&
+    (!chunked || isSvtEncoder(encoder)) &&
+      validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
+      typeof crf === 'number' &&
       Number.isInteger(crf) &&
       crf >= options.crfMin &&
       crf <= options.crfMax &&
@@ -142,12 +155,15 @@
     workers = 2;
     filmGrain = 0;
     hdr10Fallback = false;
+    lineartPsyBias = options.defaultLineartPsyBias;
+    texturePsyBias = options.defaultTexturePsyBias;
+    hdrTune = options.defaultHdrTune;
     included =
       source?.streams.filter((stream) => stream.kind !== 'video').map((stream) => stream.index) ??
       [];
     destination =
       source && !source.id.startsWith('jesses-synthetic')
-        ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? '_av1an.mkv' : options.suffix)
+        ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? options.av1anSuffix : options.suffix)
         : '';
     error = null;
   }
@@ -164,13 +180,27 @@
           workers,
           filmGrain,
           hdr10Fallback,
+          lineartPsyBias,
+          texturePsyBias,
+          hdrTune,
           included: [...included],
           destination,
         });
       }
       const draft = identity === null ? undefined : drafts.get(identity);
       if (draft) {
-        ({ videoIndex, crf, preset, workers, filmGrain, hdr10Fallback, destination } = draft);
+        ({
+          videoIndex,
+          crf,
+          preset,
+          workers,
+          filmGrain,
+          hdr10Fallback,
+          lineartPsyBias,
+          texturePsyBias,
+          hdrTune,
+          destination,
+        } = draft);
         included = [...draft.included];
         error = null;
       } else {
@@ -208,7 +238,7 @@
       !file ||
       videoIndex === undefined ||
       crf === undefined ||
-      (encoder === 'svtAv1' && filmGrain === undefined)
+      (isSvtEncoder(encoder) && filmGrain === undefined)
     )
       return;
     submitting = true;
@@ -234,6 +264,9 @@
           workers: backend === 'av1an' ? workers! : 2,
           filmGrain: encoder === 'x264' ? 0 : filmGrain!,
           hdr10Fallback: encoder === 'x264' ? false : hdr10Fallback,
+          lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
+          texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
+          hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
         },
       });
     } catch (cause) {
@@ -258,12 +291,12 @@
       <h1>{chunked ? 'av1an' : 'Quick Convert'}</h1>
       <p>
         {chunked
-          ? 'Detect scenes and encode AV1 chunks in parallel with av1an and SVT-AV1.'
-          : 'Encode with standalone SVT-AV1 or x264 executables.'}
+          ? 'Detect scenes and encode AV1 chunks in parallel with your selected SVT-AV1 build.'
+          : 'Choose SVT-AV1, 5fish for anime, SVT-AV1-HDR for HDR movies, or x264 for H.264.'}
       </p>
     </div>
     <span class="status-label"
-      >{chunked ? 'av1an / SVT-AV1' : `Standalone ${options.name}`} · {depthLabel}</span
+      >{chunked ? `av1an / ${options.name}` : `Standalone ${options.name}`} · {depthLabel}</span
     >
   </div>
   <div class="notice convert-notice">
@@ -296,14 +329,15 @@
           >
         </div>
         <div class="setting-fields">
-          {#if !chunked}<div class="field full-width">
-              <label for={`${idPrefix}-encoder`}>Video encoder</label>
-              <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
-                <option value="svtAv1">SVT-AV1 · AV1</option>
-                <option value="x264">x264 · H.264</option>
-              </select>
-              <p>Each encoder keeps its own settings and output destination for this source.</p>
-            </div>{/if}
+          <div class="field full-width">
+            <label for={`${idPrefix}-encoder`}>{chunked ? 'SVT-AV1 build' : 'Video encoder'}</label>
+            <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
+              {#each encoderChoices.filter((choice) => !chunked || isSvtEncoder(choice.value)) as choice}
+                <option value={choice.value}>{choice.label}</option>
+              {/each}
+            </select>
+            <p>Each encoder keeps its own settings and output destination for this source.</p>
+          </div>
           <div class="field full-width">
             <label for={`${idPrefix}-video-stream`}>Video stream</label>
             <select
@@ -362,6 +396,9 @@
             bind:workers
             bind:filmGrain
             bind:hdr10Fallback
+            bind:lineartPsyBias
+            bind:texturePsyBias
+            bind:hdrTune
           />
         </div>
       </section>
@@ -432,11 +469,14 @@
           <p>
             <strong>{depthLabel} {options.codec} + copied tracks</strong><span
               >{backend === 'av1an'
-                ? `av1an · ${workers ?? '—'} workers`
+                ? `av1an / ${options.name} · ${workers ?? '—'} workers`
                 : `Standalone ${options.name}`} · CRF
-              {crf ?? '—'} · Preset {presetLabel(encoder, preset)}{encoder === 'svtAv1'
-                ? ` · Grain ${filmGrain ?? '—'}`
-                : ''} · MKV</span
+              {crf ?? '—'} · Preset {presetLabel(encoder, preset)}{forkSettingsSummary({
+                encoder,
+                lineartPsyBias,
+                texturePsyBias,
+                hdrTune,
+              })}{isSvtEncoder(encoder) ? ` · Grain ${filmGrain ?? '—'}` : ''} · MKV</span
             >
           </p>
         </div>
@@ -467,9 +507,10 @@
           </p>
         {:else if !validSettings}<p class="disabled-reason">
             Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
-              .length - 1}{encoder === 'svtAv1' ? ', and grain 0–50' : ''}{chunked
-              ? '; parallel chunks 1–32'
-              : ''}.
+              .length - 1}{isSvtEncoder(encoder) ? ', and grain 0–50' : ''}{encoder ===
+            'svtAv1FiveFish'
+              ? '; lineart and texture bias 0–7'
+              : ''}{chunked ? '; parallel chunks 1–32' : ''}.
           </p>
         {:else if active}<p class="disabled-reason">
             A job is active. Add this encode to the queue to run it next.

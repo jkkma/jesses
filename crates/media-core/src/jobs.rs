@@ -27,6 +27,13 @@ pub struct EncodeSettings {
     /// AV1 grain synthesis strength; zero leaves synthesis disabled.
     #[serde(default)]
     pub film_grain: u8,
+    /// 5fish's paired anime controls; never passed to another SVT build.
+    #[serde(default)]
+    pub lineart_psy_bias: u8,
+    #[serde(default)]
+    pub texture_psy_bias: u8,
+    #[serde(default)]
+    pub hdr_tune: HdrTune,
     /// Explicit consent to discard dynamic HDR metadata for an HDR10 base layer.
     #[serde(default)]
     pub hdr10_fallback: bool,
@@ -42,6 +49,9 @@ impl Default for EncodeSettings {
             crf: 30,
             preset: 4,
             film_grain: 0,
+            lineart_psy_bias: 0,
+            texture_psy_bias: 0,
+            hdr_tune: HdrTune::default(),
             hdr10_fallback: false,
         }
     }
@@ -78,7 +88,32 @@ impl<'de> Deserialize<'de> for EncodeBackend {
 pub enum VideoEncoder {
     #[default]
     SvtAv1,
+    SvtAv1FiveFish,
+    SvtAv1Hdr,
     X264,
+}
+
+impl VideoEncoder {
+    pub fn is_svt(self) -> bool {
+        matches!(self, Self::SvtAv1 | Self::SvtAv1FiveFish | Self::SvtAv1Hdr)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SvtAv1 => "SVT-AV1",
+            Self::SvtAv1FiveFish => "SVT-AV1 5fish",
+            Self::SvtAv1Hdr => "SVT-AV1-HDR",
+            Self::X264 => "x264",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum HdrTune {
+    #[default]
+    VisualQuality,
+    FilmGrain,
 }
 
 pub(crate) fn default_workers() -> u8 {
@@ -183,5 +218,39 @@ mod tests {
             serde_json::from_value::<EncodeSettings>(value).unwrap(),
             settings
         );
+    }
+
+    #[test]
+    fn fork_identity_and_tuning_survive_history_round_trip() {
+        for (encoder, wire) in [
+            (VideoEncoder::SvtAv1FiveFish, "svtAv1FiveFish"),
+            (VideoEncoder::SvtAv1Hdr, "svtAv1Hdr"),
+        ] {
+            let settings = EncodeSettings {
+                encoder,
+                lineart_psy_bias: if encoder == VideoEncoder::SvtAv1FiveFish {
+                    5
+                } else {
+                    0
+                },
+                texture_psy_bias: if encoder == VideoEncoder::SvtAv1FiveFish {
+                    4
+                } else {
+                    0
+                },
+                hdr_tune: if encoder == VideoEncoder::SvtAv1Hdr {
+                    HdrTune::FilmGrain
+                } else {
+                    HdrTune::VisualQuality
+                },
+                ..Default::default()
+            };
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["encoder"], wire);
+            assert_eq!(
+                serde_json::from_value::<EncodeSettings>(value).unwrap(),
+                settings
+            );
+        }
     }
 }

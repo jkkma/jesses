@@ -399,7 +399,7 @@ impl Temporary {
 }
 
 #[cfg(windows)]
-fn windows_file_id(file: &File) -> std::io::Result<(u32, u32, u32)> {
+pub(super) fn windows_file_id(file: &File) -> std::io::Result<(u32, u32, u32)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -419,7 +419,7 @@ fn windows_file_id(file: &File) -> std::io::Result<(u32, u32, u32)> {
 }
 
 #[cfg(windows)]
-fn windows_delete_owned(path: &Path, expected: (u32, u32, u32)) -> std::io::Result<()> {
+pub(super) fn windows_delete_owned(path: &Path, expected: (u32, u32, u32)) -> std::io::Result<()> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,

@@ -32,8 +32,21 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    let fork_options_valid = (if settings.encoder == VideoEncoder::SvtAv1FiveFish {
+        settings.lineart_psy_bias <= 7 && settings.texture_psy_bias <= 7
+    } else {
+        settings.lineart_psy_bias == 0 && settings.texture_psy_bias == 0
+    }) && (settings.encoder == VideoEncoder::SvtAv1Hdr
+        || settings.hdr_tune == media_core::HdrTune::VisualQuality);
+    if !fork_options_valid {
+        return Err(AppError::new(
+            "ENCODE_SETTINGS_INVALID",
+            "Line-art and texture bias (0–7) belong to SVT-AV1 5fish. The film-grain tune belongs to SVT-AV1-HDR. Reset settings that belong to another build.",
+            None,
+        ));
+    }
     let valid = match settings.encoder {
-        VideoEncoder::SvtAv1 => {
+        VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
             (1..=63).contains(&settings.crf) && settings.preset <= 13 && settings.film_grain <= 50
         }
         VideoEncoder::X264 => {
@@ -48,7 +61,7 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
         return Err(AppError::new(
             "ENCODE_SETTINGS_INVALID",
             match settings.encoder {
-                VideoEncoder::SvtAv1 => {
+                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                     "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers."
                 }
                 VideoEncoder::X264 => {
@@ -208,7 +221,7 @@ impl Plan {
         }
         Ok(Self {
             encoder: settings.encoder,
-            output_pixel_format: if settings.encoder == VideoEncoder::SvtAv1
+            output_pixel_format: if settings.encoder.is_svt()
                 || video.pix_fmt.as_deref() == Some("yuv420p10le")
             {
                 "yuv420p10le"
@@ -251,11 +264,7 @@ impl Plan {
                 Some("left") => "left",
                 Some("topleft") => "topleft",
                 Some("center") if settings.encoder == VideoEncoder::X264 => "center",
-                None | Some("unspecified" | "unknown")
-                    if settings.encoder == VideoEncoder::SvtAv1 =>
-                {
-                    "unknown"
-                }
+                None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => "unknown",
                 _ => {
                     return Err(unsupported(
                         "SVT supports left, top-left, or unspecified chroma placement; x264 requires explicit left, center, or top-left placement.",
@@ -271,7 +280,7 @@ impl Plan {
 
     pub fn output_codec(&self) -> &'static str {
         match self.encoder {
-            VideoEncoder::SvtAv1 => "av1",
+            VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "av1",
             VideoEncoder::X264 => "h264",
         }
     }
@@ -860,6 +869,104 @@ mod tests {
     }
     fn source() -> Document {
         serde_json::from_str(r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001","time_base":"1/1000","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}],"format":{"start_time":"0","duration":"1"}}"#).unwrap()
+    }
+
+    #[test]
+    fn fork_options_are_validated_without_leaking_to_other_encoders() {
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::SvtAv1FiveFish,
+            VideoEncoder::SvtAv1Hdr,
+        ] {
+            let settings = EncodeSettings {
+                encoder,
+                ..Default::default()
+            };
+            let document = source();
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            assert_eq!(plan.output_codec(), "av1");
+            assert_eq!(plan.output_pixel_format, "yuv420p10le");
+            for bias in [0, 5, 7, 8] {
+                let result = validate_settings(&EncodeSettings {
+                    lineart_psy_bias: bias,
+                    texture_psy_bias: bias,
+                    ..settings.clone()
+                });
+                assert_eq!(
+                    result.is_ok(),
+                    bias == 0 || (encoder == VideoEncoder::SvtAv1FiveFish && bias <= 7)
+                );
+            }
+            assert_eq!(
+                validate_settings(&EncodeSettings {
+                    hdr_tune: media_core::HdrTune::FilmGrain,
+                    ..settings
+                })
+                .is_ok(),
+                encoder == VideoEncoder::SvtAv1Hdr
+            );
+        }
+    }
+
+    #[test]
+    fn fork_parameters_and_hdr_fallback_remain_independent() {
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::SvtAv1FiveFish,
+            VideoEncoder::SvtAv1Hdr,
+        ] {
+            let (mut document, _) = hdr_source_and_frames();
+            document.streams[0].side_data_list.push(
+                serde_json::json!({"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}),
+            );
+            for fallback in [false, true] {
+                let settings = EncodeSettings {
+                    encoder,
+                    hdr10_fallback: fallback,
+                    lineart_psy_bias: if encoder == VideoEncoder::SvtAv1FiveFish {
+                        5
+                    } else {
+                        0
+                    },
+                    texture_psy_bias: if encoder == VideoEncoder::SvtAv1FiveFish {
+                        4
+                    } else {
+                        0
+                    },
+                    hdr_tune: if encoder == VideoEncoder::SvtAv1Hdr {
+                        media_core::HdrTune::FilmGrain
+                    } else {
+                        Default::default()
+                    },
+                    ..Default::default()
+                };
+                let result = Plan::build(&document, &document.selected(&[0]).unwrap(), &settings);
+                assert_eq!(result.is_ok(), fallback);
+                if let Ok(plan) = result {
+                    let args = super::super::encode::encoder_parameters(&plan, &settings);
+                    assert_eq!(
+                        args.iter().any(|arg| arg == "--lineart-psy-bias"),
+                        encoder == VideoEncoder::SvtAv1FiveFish
+                    );
+                    assert_eq!(
+                        args.iter().any(|arg| arg == "--texture-psy-bias"),
+                        encoder == VideoEncoder::SvtAv1FiveFish
+                    );
+                    assert_eq!(
+                        args.iter().any(|arg| arg == "--tune"),
+                        encoder == VideoEncoder::SvtAv1Hdr
+                    );
+                    assert!(
+                        args.windows(2)
+                            .any(|pair| pair == ["--film-grain-denoise", "0"])
+                    );
+                    if encoder == VideoEncoder::SvtAv1Hdr {
+                        assert!(args.windows(2).any(|pair| pair == ["--tune", "5"]));
+                    }
+                }
+            }
+        }
     }
     fn frames(times: &[&str]) -> Frames {
         serde_json::from_value(serde_json::json!({"frames": times.iter().map(|time| serde_json::json!({"best_effort_timestamp_time":time,"interlaced_frame":0,"width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"})).collect::<Vec<_>>()})).unwrap()

@@ -30,6 +30,7 @@
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
+  import { encoderChoices, encoderOptions } from '$lib/components/shared/encoder-options';
   import {
     chooseMediaFiles,
     chooseMediaFolder,
@@ -68,8 +69,19 @@
   let view = $state<View>('files');
   let files = $state<MediaFile[]>([]);
   let selectedId = $state<string | null>(null);
-  let tools = $state<ToolInfo[]>([]);
+  let tools = $state<ToolInfo[]>(
+    [
+      { id: 'ffmpeg', name: 'FFmpeg' },
+      { id: 'ffprobe', name: 'FFprobe' },
+      ...encoderChoices.map(({ value }) => {
+        const { tool, name } = encoderOptions(value);
+        return { id: tool, name };
+      }),
+      { id: 'av1an', name: 'av1an' },
+    ].map((tool) => ({ ...tool, available: false, path: null, version: null, detail: null })),
+  );
   let toolsLoading = $state(desktop);
+  let toolsChecked = $state(false);
   let toolsError = $state<string | null>(null);
   let importing = $state(false);
   let importingName = $state('');
@@ -177,6 +189,7 @@
     toolsError = null;
     try {
       tools = await getCapabilities();
+      toolsChecked = true;
       addLog(
         `Tool check complete: ${tools.filter((tool) => tool.available).length} of ${tools.length} available.`,
       );
@@ -728,6 +741,7 @@
         {tools}
         {desktop}
         loading={toolsLoading}
+        checked={toolsChecked}
         error={toolsError}
         onrefresh={refreshTools}
       />

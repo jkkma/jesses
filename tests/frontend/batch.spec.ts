@@ -94,7 +94,15 @@ async function desktopMock(
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
           if (command === 'get_capabilities')
-            return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'x264'].map((id) => ({
+            return [
+              'ffmpeg',
+              'ffprobe',
+              'svt-av1',
+              'svt-av1-5fish',
+              'svt-av1-hdr',
+              'av1an',
+              'x264',
+            ].map((id) => ({
               id,
               name: id,
               available: options.missing !== id,
@@ -163,7 +171,12 @@ async function desktopMock(
                     .split('\\')
                     .at(-1)!
                     .replace(/\.mkv$/, '') +
-                  (request.encoder === 'x264' ? '_x264.mkv' : '_av1.mkv');
+                  {
+                    svtAv1: '_av1.mkv',
+                    svtAv1FiveFish: '_av1_5fish.mkv',
+                    svtAv1Hdr: '_av1_hdr.mkv',
+                    x264: '_x264.mkv',
+                  }[request.encoder];
                 return {
                   inputPath: input.inputPath,
                   outputPath,
@@ -182,6 +195,9 @@ async function desktopMock(
                       workers: request.workers,
                       filmGrain: request.filmGrain,
                       hdr10Fallback: request.hdr10Fallback,
+                      lineartPsyBias: request.lineartPsyBias,
+                      texturePsyBias: request.texturePsyBias,
+                      hdrTune: request.hdrTune,
                     },
                   },
                   error: null,
@@ -259,6 +275,163 @@ async function openBatch(page: Page) {
   await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
 }
 
+for (const variant of ['svtAv1FiveFish', 'svtAv1Hdr'] as const) {
+  test(`SVT fork ${variant} batch snapshots retain reviewed controls and output names`, async ({
+    page,
+  }) => {
+    await desktopMock(page);
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    const fiveFish = variant === 'svtAv1FiveFish';
+    if (fiveFish)
+      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+    const selector = workspace.getByLabel(fiveFish ? 'SVT-AV1 build' : 'Video encoder', {
+      exact: true,
+    });
+    await selector.selectOption(variant);
+    await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue(fiveFish ? '18' : '30');
+    await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('2');
+    if (fiveFish) {
+      await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
+      await expect(workspace.getByLabel('Texture psy bias', { exact: true })).toHaveValue('4');
+      await workspace.getByLabel('Texture psy bias', { exact: true }).fill('6');
+    } else {
+      await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
+      await workspace.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
+    }
+    await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect(
+      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeEnabled();
+    const preview = (await calls(page, 'preview_encode_batch'))[0].payload
+      .request as BatchEncodeRequest;
+    expect(preview).toMatchObject({
+      backend: fiveFish ? 'av1an' : 'standalone',
+      encoder: variant,
+      crf: fiveFish ? 18 : 30,
+      preset: 2,
+      lineartPsyBias: fiveFish ? 5 : 0,
+      texturePsyBias: fiveFish ? 6 : 0,
+      hdrTune: 'visualQuality',
+      filmGrain: 0,
+      hdr10Fallback: false,
+    });
+    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+      `Episode 1_av1_${fiveFish ? '5fish' : 'hdr'}.mkv`,
+    );
+    await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+    const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
+      .requests as EncodeRequest[];
+    expect(requests).toHaveLength(2);
+    for (const request of requests)
+      expect(request.settings).toMatchObject({
+        encoder: preview.encoder,
+        crf: preview.crf,
+        preset: preview.preset,
+        lineartPsyBias: preview.lineartPsyBias,
+        texturePsyBias: preview.texturePsyBias,
+        hdrTune: preview.hdrTune,
+      });
+    await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
+    await selector.selectOption('svtAv1');
+    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+    const job = page.getByRole('article', { name: 'Job batch-2', exact: true });
+    await job.getByText('Saved settings and log', { exact: true }).click();
+    await expect(job).toContainText(fiveFish ? 'av1an / SVT-AV1 5fish' : 'Standalone SVT-AV1-HDR');
+    await expect(job).toContainText(fiveFish ? 'Lineart 5 · Texture 6' : 'HDR tune visual quality');
+    expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(requests);
+  });
+
+  test(`SVT fork ${variant} batch requires its exact tool`, async ({ page }) => {
+    await desktopMock(page, {
+      missing: variant === 'svtAv1FiveFish' ? 'svt-av1-5fish' : 'svt-av1-hdr',
+    });
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    await expect(
+      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+    ).toBeEnabled();
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(variant);
+    await expect(
+      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+    ).toBeDisabled();
+    await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption(variant);
+    await expect(
+      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+    ).toBeDisabled();
+  });
+}
+
+for (const control of ['Lineart psy bias', 'Texture psy bias', 'HDR tune'] as const) {
+  test(`SVT fork batch invalidates a deferred preview after editing ${control}`, async ({
+    page,
+  }) => {
+    await desktopMock(page, { held: ['preview'] });
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    await workspace
+      .getByLabel('Video encoder', { exact: true })
+      .selectOption(control === 'HDR tune' ? 'svtAv1Hdr' : 'svtAv1FiveFish');
+    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
+    if (control === 'HDR tune')
+      await workspace.getByLabel(control, { exact: true }).selectOption('visualQuality');
+    else await workspace.getByLabel(control, { exact: true }).fill('7');
+    await release(page, 'preview');
+    await expect(
+      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+      'Review required before queueing',
+    );
+    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect(
+      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeEnabled();
+    const latest = (await calls(page, 'preview_encode_batch'))[1].payload
+      .request as BatchEncodeRequest;
+    if (control === 'HDR tune') expect(latest.hdrTune).toBe('visualQuality');
+    else
+      expect(control === 'Lineart psy bias' ? latest.lineartPsyBias : latest.texturePsyBias).toBe(
+        7,
+      );
+  });
+}
+
+test('SVT fork batch preserves independent standalone and av1an build choices and per-build source drafts', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
+  await workspace.getByLabel('Lineart psy bias', { exact: true }).fill('7');
+  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1Hdr');
+  await expect(
+    workspace.getByLabel('SVT-AV1 build', { exact: true }).locator('option[value="x264"]'),
+  ).toHaveCount(0);
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
+  await workspace.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('3');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
+  await expect(workspace.getByLabel('Video encoder', { exact: true })).toHaveValue(
+    'svtAv1FiveFish',
+  );
+  await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('7');
+  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(workspace.getByLabel('SVT-AV1 build', { exact: true })).toHaveValue('svtAv1Hdr');
+  await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('visualQuality');
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
+});
+
 test('x264 batch defaults and copied tracks become immutable reviewed H.264 queue requests', async ({
   page,
 }) => {
@@ -303,6 +476,9 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
     workers: 2,
     filmGrain: 0,
     hdr10Fallback: false,
+    lineartPsyBias: 0,
+    texturePsyBias: 0,
+    hdrTune: 'visualQuality',
   };
   expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toEqual({
     outputDirectory: 'C:\\exports',
@@ -575,6 +751,9 @@ test('batch defaults preserve original per-file stream indices and keep attachme
       workers: 2,
       filmGrain: 0,
       hdr10Fallback: false,
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
       inputs: [
         { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11] },
         { inputPath: episodes[1].path, videoStreamIndex: 2, streamIndices: [2, 5, 8, 11] },
@@ -822,6 +1001,9 @@ for (const setting of ['grain', 'fallback', 'backend', 'workers'] as const) {
         workers: setting === 'workers' ? 4 : 2,
         filmGrain: setting === 'grain' ? 10 : 0,
         hdr10Fallback: setting === 'fallback',
+        lineartPsyBias: 0,
+        texturePsyBias: 0,
+        hdrTune: 'visualQuality',
       });
     }
     await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();

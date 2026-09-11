@@ -40,13 +40,19 @@ export type RemuxRequest = { inputPath: string, outputPath: string, streamIndice
 
 export type EncodeBackend = "standalone" | "av1an";
 
-export type VideoEncoder = "svtAv1" | "x264";
+export type VideoEncoder = "svtAv1" | "svtAv1FiveFish" | "svtAv1Hdr" | "x264";
+
+export type HdrTune = "visualQuality" | "filmGrain";
 
 export type EncodeSettings = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number, crf: number, preset: number,
 /**
  * AV1 grain synthesis strength; zero leaves synthesis disabled.
  */
 filmGrain: number,
+/**
+ * 5fish's paired anime controls; never passed to another SVT build.
+ */
+lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune,
 /**
  * Explicit consent to discard dynamic HDR metadata for an HDR10 base layer.
  */
@@ -64,7 +70,7 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, hdr10Fallback: boolean, };
+export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 

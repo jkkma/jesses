@@ -455,6 +455,9 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
             crf: 23,
             preset: 5,
             film_grain: 0,
+            lineart_psy_bias: 0,
+            texture_psy_bias: 0,
+            hdr_tune: Default::default(),
             hdr10_fallback: false,
         })
         .await
@@ -535,6 +538,9 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
             crf: 23,
             preset: 5,
             film_grain: 0,
+            lineart_psy_bias: 0,
+            texture_psy_bias: 0,
+            hdr_tune: Default::default(),
             hdr10_fallback: false,
         })
         .await

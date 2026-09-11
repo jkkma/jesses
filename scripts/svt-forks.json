@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "encoders": [
+    {
+      "id": "svt-av1-5fish",
+      "selector": "5fish",
+      "environmentVariable": "JESSES_SVT_AV1_5FISH",
+      "repository": "https://github.com/5fish/SVT-AV1",
+      "release": "v2.3.260827",
+      "commit": "1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
+      "versionMarker": "SVT-AV1 [5fish] v2.3.260827",
+      "licenseBaseUrl": "https://raw.githubusercontent.com/5fish/SVT-AV1/1c4fb91a06b0b14aafefe11835dafd91d337a3a4/",
+      "licenses": ["LICENSE.md", "LICENSE-BSD2.md", "PATENTS.md"],
+      "assets": {
+        "windowsX86_64": {
+          "architecture": "x86-64-v3",
+          "url": "https://github.com/5fish/SVT-AV1/releases/download/v2.3.260827/Windows_x86-64_x86-64-v3%2Bznver2.tar.xz",
+          "sha256": "ce597db27fa02448f3004d5b77c0f662d201d88214d7b99deea7f05ae1b8ca15",
+          "entry": "SvtAv1EncApp.exe",
+          "executableSha256": "77e507215d46357e341f1915ae386a00b1504dbd2a54eeab5c6564beee2c716c"
+        },
+        "linuxX86_64": {
+          "architecture": "x86-64-v3",
+          "url": "https://github.com/5fish/SVT-AV1/releases/download/v2.3.260827/Linux_x86-64_x86-64-v3%2Bznver2.tar.xz",
+          "sha256": "d974729fb1c57cac13a2c6d516a547af21a56da6d3603e84483a70ca373c48da",
+          "entry": "SvtAv1EncApp"
+        }
+      }
+    },
+    {
+      "id": "svt-av1-hdr",
+      "selector": "hdr",
+      "environmentVariable": "JESSES_SVT_AV1_HDR",
+      "repository": "https://github.com/juliobbv-p/svt-av1-hdr",
+      "release": "pgo-build-2026-09-01-0033340",
+      "commit": "00333404f455471aaa6ee2c927cac3c93efb76e3",
+      "versionMarker": "SVT-AV1-HDR v4.1.0-21-g00333404f",
+      "licenseBaseUrl": "https://raw.githubusercontent.com/juliobbv-p/svt-av1-hdr/00333404f455471aaa6ee2c927cac3c93efb76e3/",
+      "licenses": ["LICENSE.md", "LICENSE-BSD2.md", "PATENTS.md"],
+      "assets": {
+        "windowsX86_64": {
+          "architecture": "x86-64-v3",
+          "url": "https://github.com/juliobbv-p/svt-av1-hdr/releases/download/pgo-build-2026-09-01-0033340/Windows_x86-64_x86-64-v3%2Bznver2.tar.xz",
+          "sha256": "f79a637d829d2b4c976e76fb35fa0fad8e55169b4f9c56371c5351e4c15b16db",
+          "entry": "SvtAv1EncApp.exe",
+          "executableSha256": "093be47df62d6fae97be0e4afadee36145cf9fd99ce5c955f4dc1697c985bd42"
+        },
+        "linuxX86_64": {
+          "architecture": "x86-64-v3",
+          "url": "https://github.com/juliobbv-p/svt-av1-hdr/releases/download/pgo-build-2026-09-01-0033340/Linux_x86-64_x86-64-v3%2Bznver2.tar.xz",
+          "sha256": "158714125f4f8eb6950233b7471083aa1454a31938ca22e2e21b698dce386517",
+          "entry": "SvtAv1EncApp"
+        }
+      }
+    }
+  ]
+}

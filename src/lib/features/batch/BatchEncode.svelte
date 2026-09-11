@@ -9,6 +9,10 @@
     encoderOptions,
     requiredEncoderTools,
     knownHdr,
+    encoderChoices,
+    isSvtEncoder,
+    validForkSettings,
+    type HdrTune,
   } from '$lib/components/shared/encoder-options';
   import type {
     BatchEncodePreview,
@@ -47,11 +51,15 @@
   let preset = $state(4);
   let backend = $state<EncodeBackend>('standalone');
   let selectedEncoder = $state<VideoEncoder>('svtAv1');
-  const encoder = $derived(backend === 'av1an' ? 'svtAv1' : selectedEncoder);
+  let av1anEncoder = $state<VideoEncoder>('svtAv1');
+  const encoder = $derived(backend === 'av1an' ? av1anEncoder : selectedEncoder);
   const options = $derived(encoderOptions(encoder));
   let workers = $state<number | undefined>(2);
   let filmGrain = $state<number | undefined>(0);
   let hdr10Fallback = $state(false);
+  let lineartPsyBias = $state<number | undefined>(0);
+  let texturePsyBias = $state<number | undefined>(0);
+  let hdrTune = $state<HdrTune>('visualQuality');
   let outputDirectory = $state('');
   let preview = $state<{ key: string; result: BatchEncodePreview } | null>(null);
   let previewing = $state(false);
@@ -66,6 +74,9 @@
     workers: number | undefined;
     filmGrain: number | undefined;
     hdr10Fallback: boolean;
+    lineartPsyBias: number | undefined;
+    texturePsyBias: number | undefined;
+    hdrTune: HdrTune;
   };
   const savedSettings = new Map<VideoEncoder, CommonSettings>();
   const savedDrafts = new Map<VideoEncoder, Record<string, Draft>>();
@@ -78,10 +89,29 @@
       if (activeEncoder === currentEncoder) return drafts;
       if (activeEncoder !== null) {
         savedDrafts.set(activeEncoder, drafts);
-        savedSettings.set(activeEncoder, { crf, preset, workers, filmGrain, hdr10Fallback });
+        savedSettings.set(activeEncoder, {
+          crf,
+          preset,
+          workers,
+          filmGrain,
+          hdr10Fallback,
+          lineartPsyBias,
+          texturePsyBias,
+          hdrTune,
+        });
       }
       const priorSettings = savedSettings.get(currentEncoder);
-      if (priorSettings) ({ crf, preset, workers, filmGrain, hdr10Fallback } = priorSettings);
+      if (priorSettings)
+        ({
+          crf,
+          preset,
+          workers,
+          filmGrain,
+          hdr10Fallback,
+          lineartPsyBias,
+          texturePsyBias,
+          hdrTune,
+        } = priorSettings);
       else resetSettings();
       activeEncoder = currentEncoder;
       return savedDrafts.get(currentEncoder) ?? {};
@@ -122,7 +152,9 @@
     ),
   );
   const validSettings = $derived(
-    typeof crf === 'number' &&
+    (backend !== 'av1an' || isSvtEncoder(encoder)) &&
+      validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
+      typeof crf === 'number' &&
       Number.isInteger(crf) &&
       crf >= options.crfMin &&
       crf <= options.crfMax &&
@@ -151,6 +183,9 @@
       workers,
       filmGrain,
       hdr10Fallback,
+      lineartPsyBias,
+      texturePsyBias,
+      hdrTune,
       outputDirectory,
     }),
   );
@@ -190,6 +225,9 @@
     workers = 2;
     filmGrain = 0;
     hdr10Fallback = false;
+    lineartPsyBias = options.defaultLineartPsyBias;
+    texturePsyBias = options.defaultTexturePsyBias;
+    hdrTune = options.defaultHdrTune;
   }
 
   function updateDraft(id: string, patch: Partial<Draft>) {
@@ -241,7 +279,7 @@
   }
 
   async function previewBatch() {
-    if (!canPreview || crf === undefined || (encoder === 'svtAv1' && filmGrain === undefined))
+    if (!canPreview || crf === undefined || (isSvtEncoder(encoder) && filmGrain === undefined))
       return;
     const key = draftKey;
     const generation = ++previewGeneration;
@@ -254,6 +292,9 @@
       workers: backend === 'av1an' ? workers! : 2,
       filmGrain: encoder === 'x264' ? 0 : filmGrain!,
       hdr10Fallback: encoder === 'x264' ? false : hdr10Fallback,
+      lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
+      texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
+      hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
       inputs: selectedFiles.map((file) => {
         const draft = drafts[file.id];
         const copies = file.streams
@@ -459,8 +500,20 @@
                 bind:value={selectedEncoder}
                 disabled={submitting || !desktop}
               >
-                <option value="svtAv1">SVT-AV1 · AV1</option>
-                <option value="x264">x264 · H.264</option>
+                {#each encoderChoices as choice}
+                  <option value={choice.value}>{choice.label}</option>
+                {/each}
+              </select>
+            </div>{:else}<div class="field full-width">
+              <label for="batch-svt-build">SVT-AV1 build</label>
+              <select
+                id="batch-svt-build"
+                bind:value={av1anEncoder}
+                disabled={submitting || !desktop}
+              >
+                {#each encoderChoices.filter((choice) => isSvtEncoder(choice.value)) as choice}
+                  <option value={choice.value}>{choice.label}</option>
+                {/each}
               </select>
             </div>{/if}
           <div class="field">
@@ -495,6 +548,9 @@
             bind:workers
             bind:filmGrain
             bind:hdr10Fallback
+            bind:lineartPsyBias
+            bind:texturePsyBias
+            bind:hdrTune
           />
         </div>
         <button class="text-button" type="button" disabled={submitting} onclick={resetSettings}
@@ -529,9 +585,9 @@
               : ''}, then refresh Tools & settings.
           </p>{:else if !validSettings}<p class="disabled-reason">
             Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
-              .length - 1}{encoder === 'svtAv1' ? ', grain 0–50' : ''}{backend === 'av1an'
-              ? ', and parallel chunks 1–32'
-              : ''}.
+              .length - 1}{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder === 'svtAv1FiveFish'
+              ? '; lineart and texture bias 0–7'
+              : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
           </p>{:else if !selectedFiles.length}<p class="disabled-reason">
             Select at least one episode.
           </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">

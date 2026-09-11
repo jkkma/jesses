@@ -13,6 +13,9 @@ mod pipeline;
 #[path = "streaming_tests.rs"]
 mod streaming;
 
+#[path = "path_tests.rs"]
+mod path_overrides;
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(mode: &str) -> Self {
@@ -111,6 +114,18 @@ fn fake_tool() {
     let mode = std::fs::read_to_string(path.join("mode")).unwrap();
     std::fs::write(path.join("pid"), std::process::id().to_string()).unwrap();
     match mode.as_str() {
+        "environment" => {
+            path_overrides::dump_environment(&path);
+            std::process::exit(0);
+        }
+        "environment-parent" => {
+            path_overrides::dump_environment(&path);
+            spawn_fixture_child(&path, "environment");
+            while !path.join("child/environment.json").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::process::exit(0);
+        }
         "stream-large" => streaming::large_output(),
         "stream-reject-tree" => {
             spawn_fixture_child(&path, "branch");

@@ -5,7 +5,7 @@
 //! detach from that group. Dropping the run future also terminates the tree.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -23,6 +23,9 @@ mod platform;
 #[cfg(unix)]
 #[path = "supervisor/unix.rs"]
 mod platform;
+
+#[path = "supervisor/ansi.rs"]
+mod ansi;
 
 const RECORD_BYTES: usize = 8192;
 const LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -128,11 +131,24 @@ pub async fn run(
     log_path: &Path,
     time_limit: Duration,
 ) -> Result<ProcessResult, SupervisorError> {
+    run_with_path(spec, cancel, events, log_path, time_limit, None).await
+}
+
+/// Override PATH for this owned child and its descendants only. Every other
+/// environment entry is inherited unchanged, including Windows drive state.
+pub async fn run_with_path(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    path: Option<&OsStr>,
+) -> Result<ProcessResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
-    let mut child = platform::OwnedChild::spawn(spec)?;
+    let mut child = platform::OwnedChild::spawn_with_path(spec, path)?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (_, _, status) = tokio::try_join!(
@@ -170,10 +186,21 @@ pub async fn run_capture(
     max_bytes: usize,
     time_limit: Duration,
 ) -> Result<CapturedOutput, SupervisorError> {
+    run_capture_with_path(spec, cancel, max_bytes, time_limit, None).await
+}
+
+/// Bounded capture with the same child-only PATH override as `run_with_path`.
+pub async fn run_capture_with_path(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    max_bytes: usize,
+    time_limit: Duration,
+    path: Option<&OsStr>,
+) -> Result<CapturedOutput, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
-    let mut child = platform::OwnedChild::spawn(spec)?;
+    let mut child = platform::OwnedChild::spawn_with_path(spec, path)?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (stdout, stderr, status) = tokio::try_join!(
@@ -604,6 +631,7 @@ async fn drain_stage(
 ) -> Result<(), SupervisorError> {
     let mut buffer = [0; RECORD_BYTES];
     let mut pending = Vec::with_capacity(RECORD_BYTES);
+    let mut terminal = ansi::Filter::default();
     loop {
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {
@@ -613,6 +641,9 @@ async fn drain_stage(
             return Ok(());
         }
         for &byte in &buffer[..count] {
+            let Some(byte) = terminal.push(byte) else {
+                continue;
+            };
             if byte == b'\r' || byte == b'\n' {
                 if !pending.is_empty() {
                     record_stage(&pending, stderr, stage, events, log).await?;

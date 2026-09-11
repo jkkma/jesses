@@ -38,17 +38,16 @@ impl JobManager {
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
-        let encoder_names: &[&str] = match settings.encoder {
-            VideoEncoder::SvtAv1 => &["SvtAv1EncApp", "svtav1encapp"],
-            VideoEncoder::X264 => &["x264"],
-        };
-        let encoder = find_executable(encoder_names)
+        let encoder = crate::discovery::find_video_encoder(settings.encoder)
             .await
             .map_err(|e| AppError::new("TOOL_DISCOVERY_FAILED", e, None))?
             .ok_or_else(|| {
                 AppError::new(
                     "TOOL_MISSING",
-                    format!("The standalone {} was not found on PATH.", encoder_names[0]),
+                    format!(
+                        "{} was not found. Check its separate entry in Tools.",
+                        settings.encoder.name()
+                    ),
                     None,
                 )
             })?;
@@ -76,6 +75,15 @@ impl JobManager {
                     path,
                 ));
             }
+            if path == &encoder {
+                let identity = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&version.stdout),
+                    String::from_utf8_lossy(&version.stderr)
+                );
+                crate::discovery::validate_video_encoder_version(settings.encoder, &identity)
+                    .map_err(|message| files::error("ENCODER_BUILD_MISMATCH", message, path))?;
+            }
             let bytes = if version.stdout.is_empty() {
                 &version.stderr
             } else {
@@ -101,6 +109,7 @@ impl JobManager {
         let selected = document.selected(&request.stream_indices)?;
         let mut plan = Plan::build(&document, &selected, settings)?;
         if settings.backend == media_core::EncodeBackend::Av1an {
+            super::av1an::validate_encoder_path(&encoder)?;
             super::av1an::validate_input(&document, &plan)?;
         }
         if settings.encoder == VideoEncoder::X264 {
@@ -128,7 +137,7 @@ impl JobManager {
                 ));
             }).await;
         }
-        if settings.encoder == VideoEncoder::SvtAv1 {
+        if settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         }
         source.verify()?;
@@ -137,8 +146,13 @@ impl JobManager {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
             append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, CRF {}, preset {}.",plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),settings.crf,settings.preset));
-            if settings.encoder == VideoEncoder::SvtAv1 {
+            if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
+            }
+            match settings.encoder {
+                VideoEncoder::SvtAv1FiveFish => append_log(snapshot, format!("SVT-AV1 5fish: line-art bias {}, texture bias {}.", settings.lineart_psy_bias, settings.texture_psy_bias)),
+                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("SVT-AV1-HDR: {} tune.", match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)", media_core::HdrTune::FilmGrain => "film grain retention (5)" })),
+                _ => {},
             }
             if plan.is_hdr10() {
                 append_log(snapshot, "HDR10: preserving BT.2020/PQ color and validated static mastering/content light metadata.".into());
@@ -150,7 +164,9 @@ impl JobManager {
             .map_err(|e| files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref()))?;
         *temporary = Some(Temporary::create(&output, id)?);
         scratch.push(match settings.encoder {
-            VideoEncoder::SvtAv1 => Temporary::create_ivf(&output, &format!("{id}-video"))?,
+            VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+                Temporary::create_ivf(&output, &format!("{id}-video"))?
+            }
             VideoEncoder::X264 => Temporary::create(&output, &format!("{id}-video"))?,
         });
         let temp = temporary.as_ref().expect("owned Matroska output");
@@ -172,6 +188,7 @@ impl JobManager {
             self.encode_av1an(
                 id,
                 &source.path,
+                &encoder,
                 intermediate,
                 &plan,
                 settings,
@@ -191,13 +208,15 @@ impl JobManager {
                 // Both native encoders write into the already-owned file handle
                 // through stdout, preserving its identity guard and Unicode path.
                 args: match settings.encoder {
-                    VideoEncoder::SvtAv1 => encoder_args(Path::new("stdout"), &plan, settings),
+                    VideoEncoder::SvtAv1
+                    | VideoEncoder::SvtAv1FiveFish
+                    | VideoEncoder::SvtAv1Hdr => encoder_args(Path::new("stdout"), &plan, settings),
                     VideoEncoder::X264 => x264::arguments(&plan, settings),
                 },
                 cwd: None,
             };
             self.phase(id, JobState::Running, match settings.encoder {
-                VideoEncoder::SvtAv1 => "Encoding 10-bit AV1 with the standalone SVT encoder; selected tracks will be copied afterward.",
+                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "Encoding 10-bit AV1 with the standalone SVT encoder; selected tracks will be copied afterward.",
                 VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected tracks will be copied afterward.",
             }).await;
             let (sender, events) = mpsc::channel(256);
@@ -572,6 +591,23 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         "--film-grain-denoise".into(),
         "0".into(),
     ]);
+    match settings.encoder {
+        VideoEncoder::SvtAv1FiveFish => args.extend([
+            "--lineart-psy-bias".into(),
+            settings.lineart_psy_bias.to_string().into(),
+            "--texture-psy-bias".into(),
+            settings.texture_psy_bias.to_string().into(),
+        ]),
+        VideoEncoder::SvtAv1Hdr => args.extend([
+            "--tune".into(),
+            match settings.hdr_tune {
+                media_core::HdrTune::VisualQuality => "0",
+                media_core::HdrTune::FilmGrain => "5",
+            }
+            .into(),
+        ]),
+        _ => {}
+    }
     args
 }
 
@@ -597,7 +633,9 @@ async fn check_encoder_capabilities(
             executable: encoder.to_owned(),
             args: vec![
                 match settings.encoder {
-                    VideoEncoder::SvtAv1 => "--help",
+                    VideoEncoder::SvtAv1
+                    | VideoEncoder::SvtAv1FiveFish
+                    | VideoEncoder::SvtAv1Hdr => "--help",
                     VideoEncoder::X264 => "--fullhelp",
                 }
                 .into(),
@@ -629,6 +667,13 @@ async fn check_encoder_capabilities(
         return Ok(());
     }
     let mut required = vec!["--film-grain", "--film-grain-denoise"];
+    match settings.encoder {
+        VideoEncoder::SvtAv1FiveFish => {
+            required.extend(["--lineart-psy-bias", "--texture-psy-bias"])
+        }
+        VideoEncoder::SvtAv1Hdr => required.push("--tune"),
+        _ => {}
+    }
     if plan.is_hdr10() {
         required.extend(["--mastering-display", "--content-light"]);
     }

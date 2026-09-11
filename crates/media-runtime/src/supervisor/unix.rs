@@ -1,5 +1,6 @@
 use super::CommandSpec;
 use std::{
+    ffi::OsStr,
     io,
     process::{ExitStatus, Stdio},
     time::Duration,
@@ -18,24 +19,29 @@ pub(super) struct OwnedChild {
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false, None)
+        Self::spawn_with_path(spec, None)
+    }
+
+    pub(super) fn spawn_with_path(spec: &CommandSpec, path: Option<&OsStr>) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false, None, path)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, None)
+        Self::spawn_with_input(spec, true, None, None)
     }
 
     pub(super) fn spawn_with_stdin_to_file(
         spec: &CommandSpec,
         output: std::fs::File,
     ) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, Some(output))
+        Self::spawn_with_input(spec, true, Some(output), None)
     }
 
     fn spawn_with_input(
         spec: &CommandSpec,
         pipe_stdin: bool,
         output: Option<std::fs::File>,
+        path: Option<&OsStr>,
     ) -> io::Result<Self> {
         let mut command = Command::new(&spec.executable);
         command
@@ -50,6 +56,9 @@ impl OwnedChild {
             .kill_on_drop(true);
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
         }
         // setpgid happens in the child before exec, closing the spawn/assign race.
         command.process_group(0);

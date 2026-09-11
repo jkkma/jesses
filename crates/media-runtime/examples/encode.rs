@@ -1,20 +1,22 @@
-//! cargo run -p media-runtime --example encode -- INPUT OUTPUT [CRF] [PRESET] [GRAIN] [HDR10_FALLBACK] [BACKEND] [WORKERS] [ENCODER]
+//! cargo run -p media-runtime --example encode -- INPUT OUTPUT [CRF] [PRESET] [GRAIN] [HDR10_FALLBACK] [BACKEND] [WORKERS] [ENCODER] [LINEART_BIAS] [TEXTURE_BIAS] [HDR_TUNE]
 use media_runtime::{
-    EncodeBackend, EncodeRequest, EncodeSettings, JobManager, JobState, RemuxRequest, VideoEncoder,
-    probe_media,
+    EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobManager, JobState, RemuxRequest,
+    VideoEncoder, probe_media,
 };
 use std::{path::PathBuf, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=9).contains(&args.len()) {
-        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [standalone|av1an] [WORKERS_1_32] [svtAv1|x264]".into());
+    if !(2..=12).contains(&args.len()) {
+        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [standalone|av1an] [WORKERS_1_32] [svtAv1|svtAv1FiveFish|svtAv1Hdr|x264] [LINEART_0_7] [TEXTURE_0_7] [visualQuality|filmGrain]".into());
     }
     let encoder = match args.get(8).map(String::as_str) {
         None | Some("svtAv1") => VideoEncoder::SvtAv1,
+        Some("svtAv1FiveFish") => VideoEncoder::SvtAv1FiveFish,
+        Some("svtAv1Hdr") => VideoEncoder::SvtAv1Hdr,
         Some("x264") => VideoEncoder::X264,
-        _ => return Err("Encoder must be svtAv1 or x264".into()),
+        _ => return Err("Encoder must be svtAv1, svtAv1FiveFish, svtAv1Hdr, or x264".into()),
     };
     let media = probe_media(args[0].clone()).await?;
     let video = media
@@ -28,6 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(
             if encoder == VideoEncoder::X264 {
                 23
+            } else if encoder == VideoEncoder::SvtAv1FiveFish {
+                18
             } else {
                 30
             },
@@ -36,7 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get(3)
             .map(|v| v.parse())
             .transpose()?
-            .unwrap_or(if encoder == VideoEncoder::X264 { 5 } else { 4 }),
+            .unwrap_or(match encoder {
+                VideoEncoder::X264 => 5,
+                VideoEncoder::SvtAv1 => 4,
+                _ => 2,
+            }),
         film_grain: args.get(4).map(|v| v.parse()).transpose()?.unwrap_or(0),
         hdr10_fallback: args.get(5).map(|v| v.parse()).transpose()?.unwrap_or(false),
         backend: match args.get(6).map(String::as_str) {
@@ -45,6 +53,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("Backend must be standalone or av1an".into()),
         },
         workers: args.get(7).map(|v| v.parse()).transpose()?.unwrap_or(2),
+        lineart_psy_bias: args.get(9).map(|v| v.parse()).transpose()?.unwrap_or(
+            if encoder == VideoEncoder::SvtAv1FiveFish {
+                5
+            } else {
+                0
+            },
+        ),
+        texture_psy_bias: args.get(10).map(|v| v.parse()).transpose()?.unwrap_or(
+            if encoder == VideoEncoder::SvtAv1FiveFish {
+                4
+            } else {
+                0
+            },
+        ),
+        hdr_tune: match args.get(11).map(String::as_str) {
+            Some("visualQuality") => HdrTune::VisualQuality,
+            Some("filmGrain") => HdrTune::FilmGrain,
+            None if encoder == VideoEncoder::SvtAv1Hdr => HdrTune::FilmGrain,
+            None => HdrTune::VisualQuality,
+            _ => return Err("HDR tune must be visualQuality or filmGrain".into()),
+        },
     };
     let stream_indices = media
         .streams

@@ -19,6 +19,7 @@ pub use media_core::{
     FolderScanResult,
 };
 pub use media_core::{
-    EncodeBackend, EncodeRequest, EncodeSettings, JobSnapshot, JobState, RemuxRequest, VideoEncoder,
+    EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState, RemuxRequest,
+    VideoEncoder,
 };
 pub use probe::probe_media;

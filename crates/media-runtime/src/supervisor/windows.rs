@@ -29,14 +29,18 @@ use windows_sys::Win32::{
         },
         Pipes::CreatePipe,
         Threading::{
-            CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList,
-            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+            GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
             STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
+
+#[path = "environment.rs"]
+mod environment;
+use environment::environment_with_path;
 
 pub(super) struct OwnedChild {
     job: OwnedHandle,
@@ -48,24 +52,29 @@ pub(super) struct OwnedChild {
 
 impl OwnedChild {
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false, None)
+        Self::spawn_with_path(spec, None)
+    }
+
+    pub(super) fn spawn_with_path(spec: &CommandSpec, path: Option<&OsStr>) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false, None, path)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, None)
+        Self::spawn_with_input(spec, true, None, None)
     }
 
     pub(super) fn spawn_with_stdin_to_file(
         spec: &CommandSpec,
         output: std::fs::File,
     ) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, Some(output))
+        Self::spawn_with_input(spec, true, Some(output), None)
     }
 
     fn spawn_with_input(
         spec: &CommandSpec,
         pipe_stdin: bool,
         output: Option<std::fs::File>,
+        path: Option<&OsStr>,
     ) -> io::Result<Self> {
         if spec
             .executable
@@ -78,6 +87,7 @@ impl OwnedChild {
             ));
         }
         let executable = wide(spec.executable.as_os_str())?;
+        let environment = path.map(environment_with_path).transpose()?;
         let mut command_line = Vec::new();
         quote(spec.executable.as_os_str(), &mut command_line)?;
         for arg in &spec.args {
@@ -197,8 +207,10 @@ impl OwnedChild {
                 null(),
                 null(),
                 1,
-                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-                null(),
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                environment
+                    .as_ref()
+                    .map_or(null(), |block| block.as_ptr().cast()),
                 cwd.as_ref().map_or(null(), |value| value.as_ptr()),
                 &startup.StartupInfo,
                 &mut info,

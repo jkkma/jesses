@@ -52,6 +52,22 @@ const capabilities: ToolInfo[] = [
     version: null,
     detail: 'Install the standalone encoder.',
   },
+  {
+    id: 'svt-av1-5fish',
+    name: 'SVT-AV1 5fish',
+    available: true,
+    path: 'C:\\tools\\5fish\\SvtAv1EncApp.exe',
+    version: 'SVT-AV1 5fish test version',
+    detail: null,
+  },
+  {
+    id: 'svt-av1-hdr',
+    name: 'SVT-AV1-HDR',
+    available: false,
+    path: null,
+    version: null,
+    detail: 'Install the HDR build in its own tool location.',
+  },
 ];
 
 async function desktopMock(page: Page, paths: string[], media = fixture) {
@@ -138,6 +154,16 @@ test('desktop import retains good files through errors, deduplicates, and expose
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await expect(page.getByText('ffprobe test version', { exact: true })).toBeVisible();
   await expect(page.getByText('Install the standalone encoder.')).toBeVisible();
+  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
+    'SVT-AV1 5fish test version',
+  );
+  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
+    'C:\\tools\\5fish\\SvtAv1EncApp.exe',
+  );
+  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText('Not found');
+  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText(
+    'Install the HDR build in its own tool location.',
+  );
 });
 
 test('palette survives dark OS theme and minimum-size layout remains usable', async ({ page }) => {

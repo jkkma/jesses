@@ -66,7 +66,15 @@ const media: MediaFile = {
     },
   ],
 };
-const tools: ToolInfo[] = ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'x264'].map((id) => ({
+const tools: ToolInfo[] = [
+  'ffmpeg',
+  'ffprobe',
+  'svt-av1',
+  'svt-av1-5fish',
+  'svt-av1-hdr',
+  'av1an',
+  'x264',
+].map((id) => ({
   id,
   name: id,
   available: true,
@@ -94,6 +102,9 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
     workers: 2,
     filmGrain: 0,
     hdr10Fallback: false,
+    lineartPsyBias: 0,
+    texturePsyBias: 0,
+    hdrTune: 'visualQuality',
   },
   progressSeconds: 3,
   durationSeconds: 12,
@@ -272,6 +283,264 @@ const x264PresetNames = [
   'placebo',
 ];
 
+test('tool discovery shows all seven tools as pending before the native reply', async ({
+  page,
+}) => {
+  await desktopMock(page, { held: ['get_capabilities'], missing: 'svt-av1-hdr' });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
+  const workspace = page.getByRole('region', { name: 'Tools and settings', exact: true });
+  await expect(workspace.getByRole('row')).toHaveCount(8);
+  await expect(workspace.getByText('Checking…', { exact: true })).toHaveCount(7);
+  await expect(workspace.getByText('Not found', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
+    'SVT-AV1 5fish',
+  );
+  await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText(
+    'SVT-AV1-HDR',
+  );
+  await release(page, 'get_capabilities');
+  await expect(workspace).toContainText('6 / 7 available');
+  await expect(workspace.getByText('Checking…', { exact: true })).toHaveCount(0);
+  await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText(
+    'Not found',
+  );
+  await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
+    'Available',
+  );
+});
+
+for (const tab of ['Quick Convert', 'av1an'] as const) {
+  test(`SVT forks in ${tab} use explicit defaults and preserve both variants in queue history`, async ({
+    page,
+  }) => {
+    await desktopMock(page);
+    await openEncode(page, tab);
+    const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+      exact: true,
+    });
+    await expect(selector).toHaveValue('svtAv1');
+    if (tab === 'av1an') await expect(selector.locator('option[value="x264"]')).toHaveCount(0);
+    await selector.selectOption('svtAv1FiveFish');
+    await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('18');
+    await expect(workspace.getByLabel('Encoder preset', { exact: true })).toHaveValue('2');
+    await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
+    await expect(workspace.getByLabel('Texture psy bias', { exact: true })).toHaveValue('4');
+    await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveCount(0);
+    await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+      inputPath.replace(/\.mkv$/, `_${tab === 'av1an' ? 'av1an' : 'av1'}_5fish.mkv`),
+    );
+    await workspace.getByLabel('Lineart psy bias', { exact: true }).fill('6');
+    await workspace.getByLabel('Texture psy bias', { exact: true }).fill('3');
+    await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    const first = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+    expect(first.request.settings).toEqual({
+      backend: tab === 'av1an' ? 'av1an' : 'standalone',
+      encoder: 'svtAv1FiveFish',
+      videoStreamIndex: 0,
+      workers: 2,
+      crf: 18,
+      preset: 2,
+      lineartPsyBias: 6,
+      texturePsyBias: 3,
+      hdrTune: 'visualQuality',
+      filmGrain: 8,
+      hdr10Fallback: false,
+    });
+    await selector.selectOption('svtAv1Hdr');
+    await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('30');
+    await expect(workspace.getByLabel('Encoder preset', { exact: true })).toHaveValue('2');
+    await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
+    await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveCount(0);
+    await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+    await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+    await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+      inputPath.replace(/\.mkv$/, `_${tab === 'av1an' ? 'av1an' : 'av1'}_hdr.mkv`),
+    );
+    await workspace.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
+    await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    const second = (await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest };
+    expect(second.request.settings).toEqual({
+      backend: tab === 'av1an' ? 'av1an' : 'standalone',
+      encoder: 'svtAv1Hdr',
+      videoStreamIndex: 0,
+      workers: 2,
+      crf: 30,
+      preset: 2,
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
+      filmGrain: 0,
+      hdr10Fallback: true,
+    });
+    await workspace.getByRole('button', { name: 'Reset settings', exact: true }).click();
+    await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
+    await selector.selectOption('svtAv1FiveFish');
+    await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('6');
+    await expect(workspace.getByLabel('Texture psy bias', { exact: true })).toHaveValue('3');
+    await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+      'SVT-AV1 5fish',
+    );
+    await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+      'Lineart 6 · Texture 3',
+    );
+    const history = page.getByRole('article', { name: 'Job encode-2', exact: true });
+    await history.getByText('Saved settings and log', { exact: true }).click();
+    await expect(history).toContainText('SVT-AV1-HDR');
+    await expect(history).toContainText('HDR tune visual quality');
+    expect((await calls(page, 'enqueue_encode')).map((call) => call.payload)).toEqual([
+      first,
+      second,
+    ]);
+  });
+
+  test(`SVT 5fish in ${tab} validates both biases without applying them to other builds`, async ({
+    page,
+  }) => {
+    await desktopMock(page);
+    await openEncode(page, tab);
+    const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+      exact: true,
+    });
+    await selector.selectOption('svtAv1FiveFish');
+    for (const label of ['Lineart psy bias', 'Texture psy bias']) {
+      for (const invalid of ['-1', '8', '2.5', '']) {
+        await workspace.getByLabel(label, { exact: true }).fill(invalid);
+        await expect(
+          workspace.getByRole('button', { name: 'Start encode', exact: true }),
+        ).toBeDisabled();
+      }
+      for (const valid of ['0', '7']) {
+        await workspace.getByLabel(label, { exact: true }).fill(valid);
+        await expect(
+          workspace.getByRole('button', { name: 'Start encode', exact: true }),
+        ).toBeEnabled();
+      }
+    }
+    await selector.selectOption('svtAv1');
+    await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveCount(0);
+    await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('30');
+    await expect(workspace.getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    expect(
+      ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request
+        .settings,
+    ).toMatchObject({
+      encoder: 'svtAv1',
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
+    });
+  });
+
+  for (const [variant, tool, name] of [
+    ['svtAv1FiveFish', 'svt-av1-5fish', 'SVT-AV1 5fish'],
+    ['svtAv1Hdr', 'svt-av1-hdr', 'SVT-AV1-HDR'],
+  ] as const) {
+    test(`SVT fork ${variant} in ${tab} requires its own executable`, async ({ page }) => {
+      await desktopMock(page, { missing: tool });
+      await openEncode(page, tab);
+      const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+      const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+        exact: true,
+      });
+      await expect(
+        workspace.getByRole('button', { name: 'Start encode', exact: true }),
+      ).toBeEnabled();
+      await selector.selectOption(variant);
+      await expect(
+        workspace.getByRole('button', { name: 'Start encode', exact: true }),
+      ).toBeDisabled();
+      await expect(
+        workspace.getByRole('button', { name: 'Add to queue', exact: true }),
+      ).toBeDisabled();
+      await expect(workspace.locator('.disabled-reason')).toContainText(`standalone ${name}`);
+      await selector.selectOption(variant === 'svtAv1Hdr' ? 'svtAv1FiveFish' : 'svtAv1Hdr');
+      await expect(
+        workspace.getByRole('button', { name: 'Start encode', exact: true }),
+      ).toBeEnabled();
+    });
+  }
+}
+
+test('SVT fork drafts stay separate between sources and workflows without guessing content', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
+  await quick.getByLabel('Lineart psy bias', { exact: true }).fill('7');
+  await quick
+    .getByLabel('Encode destination', { exact: true })
+    .fill('C:\\exports\\anime-custom.mkv');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const av1an = av1anWorkspace(page);
+  await expect(av1an.getByLabel('SVT-AV1 build', { exact: true })).toHaveValue('svtAv1');
+  await av1an.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+  await expect(av1an.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
+  await av1an.getByLabel('Texture psy bias', { exact: true }).fill('2');
+  const next = {
+    ...media,
+    id: 'fork-second-source',
+    name: 'HDR movie.mkv',
+    path: 'C:\\media\\HDR movie.mkv',
+    streams: [{ ...baseStream, colorTransfer: 'smpte2084', bitDepth: 10 }],
+  };
+  await importAnotherSource(page, next);
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1FiveFish');
+  await expect(quick.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
+  await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
+  await quick.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  await page.locator('button.file-select').filter({ hasText: media.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
+  await expect(quick.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('7');
+  await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    'C:\\exports\\anime-custom.mkv',
+  );
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1an.getByLabel('Texture psy bias', { exact: true })).toHaveValue('2');
+});
+
+for (const outcome of ['destination', 'error'] as const) {
+  test(`SVT fork switch discards a deferred picker ${outcome} even after returning to the same build`, async ({
+    page,
+  }) => {
+    await desktopMock(page, {
+      held: ['plugin:dialog|save'],
+      pickerFailure:
+        outcome === 'error'
+          ? { code: 'PICKER_FAILED', message: 'Old fork picker failed', path: null }
+          : undefined,
+    });
+    await openEncode(page, 'av1an');
+    const workspace = av1anWorkspace(page);
+    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+    await workspace.getByRole('button', { name: 'Choose encode destination', exact: true }).click();
+    await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(1);
+    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1Hdr');
+    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+    await release(page, 'plugin:dialog|save');
+    await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+      inputPath.replace(/\.mkv$/, '_av1an_5fish.mkv'),
+    );
+    await expect(workspace.getByRole('alert')).toHaveCount(0);
+  });
+}
+
 test('x264 uses its own defaults, preset names, validation, copied tracks, and immutable job settings', async ({
   page,
 }) => {
@@ -327,6 +596,9 @@ test('x264 uses its own defaults, preset names, validation, copied tracks, and i
       workers: 2,
       filmGrain: 0,
       hdr10Fallback: false,
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
     },
   });
   const current = page.getByRole('region', { name: 'Current encode job' });
@@ -496,6 +768,9 @@ test('x264 ignores an enqueue error after source replacement and keeps submissio
       crf: 18,
       filmGrain: 0,
       hdr10Fallback: false,
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
     },
   });
 });
@@ -637,6 +912,9 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
+              lineartPsyBias: 0,
+              texturePsyBias: 0,
+              hdrTune: 'visualQuality',
             },
           },
         },
@@ -986,6 +1264,9 @@ test('encodes can be queued for different sources while another job is running',
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
+              lineartPsyBias: 0,
+              texturePsyBias: 0,
+              hdrTune: 'visualQuality',
             },
           },
         },
@@ -1008,6 +1289,9 @@ test('encodes can be queued for different sources while another job is running',
               workers: 2,
               filmGrain: 0,
               hdr10Fallback: false,
+              lineartPsyBias: 0,
+              texturePsyBias: 0,
+              hdrTune: 'visualQuality',
             },
           },
         },
@@ -1109,6 +1393,9 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
     workers: 3,
     filmGrain: 12,
     hdr10Fallback: true,
+    lineartPsyBias: 0,
+    texturePsyBias: 0,
+    hdrTune: 'visualQuality',
   });
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
@@ -1336,6 +1623,9 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
       workers: 3,
       filmGrain: 0,
       hdr10Fallback: false,
+      lineartPsyBias: 0,
+      texturePsyBias: 0,
+      hdrTune: 'visualQuality',
     },
   });
   const current = page.getByRole('region', { name: 'Current encode job' });

@@ -8,11 +8,13 @@ Rust, Tauri, Svelte, and shadcn-svelte.
 
 The development build provides a desktop media workspace with native file
 selection and drag/drop, FFprobe metadata and stream inspection, and detection of
-FFmpeg, FFprobe, standalone SVT-AV1, x264, and av1an on PATH. The interface uses a fixed
+FFmpeg, FFprobe, standalone SVT-AV1, its 5fish and HDR builds, x264, and av1an. The interface uses a fixed
 parchment-and-rust light theme. The Remux tab copies selected streams from one
 source into a new Matroska file, with progress, cancellation, and output validation.
 
-Quick Convert drives standalone SVT-AV1 and x264 executables. The separate av1an
+SVT-AV1 is the primary encoding workflow, with **5fish for anime** and
+**SVT-AV1-HDR for HDR movies** available as distinct builds. Quick Convert drives
+standalone SVT-AV1 and x264 executables. The separate av1an
 tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
 selected audio, subtitles, and attachments. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
@@ -30,6 +32,27 @@ and select a new `.mkv` destination. SVT-AV1 starts at CRF 30 and preset 4;
 CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
 FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
 must be on PATH. The selected tool and its version appear in the job log.
+
+Choose **SVT-AV1 5fish** for anime or **SVT-AV1-HDR** for HDR movies in Quick
+Convert, av1an, or Batch encode. Each build has its own executable, draft settings,
+output suffix, capability result, and saved job identity. Jesses verifies the
+binary's version signature before encoding and fails explicitly if another build
+occupies its configured path. It never substitutes a different SVT build.
+
+5fish starts at CRF 18, preset 2, line-art bias 5, and texture bias 4. Both bias
+controls accept 0–7 and are only sent to 5fish. These defaults follow the
+[5fish maintainer's high-quality anime guidance](https://github.com/5fish/SVT-AV1).
+SVT-AV1-HDR starts at CRF 30, preset 2, and **Film grain retention** (`--tune 5`);
+**Visual quality** (`--tune 0`) is also available, following the
+[HDR project's tuning guidance](https://github.com/juliobbv-p/svt-av1-hdr).
+Grain retention tunes the encoding of source texture; optional grain synthesis is
+a separate control and remains off by default. Selecting either fork does not
+grant permission to discard dynamic HDR metadata. Jesses currently exposes integer
+CRF 1–63 and presets 0–13 for all three SVT builds; the forks' extended CRF and
+research preset ranges are not exposed yet.
+
+See [SVT fork setup and validation](docs/svt-forks.md) for pinned tool installation,
+custom executable paths, and the checks covering both workflows.
 Standalone `aomenc`, `vpxenc`, and `x265` drivers remain pending; Quick
 Convert will expose them as encoder choices as each driver is implemented.
 See the [standalone driver implementation plan](docs/standalone-encoders.md) for
@@ -78,7 +101,8 @@ chunks within the active job. More workers require more CPU and memory.
 Quick Convert and av1an keep independent settings, copied-track selections, and
 destinations for each source and encoder while the app remains open. Returning to a source
 restores that workflow's draft; **Reset settings** resets only its current draft.
-Default destinations end in `_av1.mkv`, `_x264.mkv`, or `_av1an.mkv`. Quick Convert
+Default destinations identify the encoder/workflow, such as `_av1.mkv`,
+`_av1_5fish.mkv`, `_av1_hdr.mkv`, `_x264.mkv`, or `_av1an_5fish.mkv`. Quick Convert
 always starts the standalone encoder directly; the av1an tab always starts av1an.
 
 av1an runs in a uniquely reserved workspace inside the output folder, with caches
