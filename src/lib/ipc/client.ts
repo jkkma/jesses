@@ -1,7 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
-import type { MediaFile, ToolInfo } from './generated';
+import type { EncodeJob, EncodeRequest, MediaFile, ToolInfo } from './generated';
 
 export function isDesktop(): boolean {
   return isTauri();
@@ -65,6 +65,32 @@ export async function probeMedia(path: string): Promise<MediaFile> {
 export async function getCapabilities(): Promise<ToolInfo[]> {
   requireDesktop();
   return invoke<ToolInfo[]>('get_capabilities');
+}
+
+export async function chooseOutputDirectory(defaultPath?: string): Promise<string | null> {
+  requireDesktop();
+  const path = await open({
+    multiple: false,
+    directory: true,
+    title: 'Choose encode destination',
+    ...(defaultPath ? { defaultPath } : {}),
+  });
+  return Array.isArray(path) ? (path[0] ?? null) : path;
+}
+
+export async function startEncode(request: EncodeRequest): Promise<EncodeJob> {
+  requireDesktop();
+  return invoke<EncodeJob>('start_encode', { request });
+}
+
+export async function listJobs(): Promise<EncodeJob[]> {
+  requireDesktop();
+  return invoke<EncodeJob[]>('list_jobs');
+}
+
+export async function cancelEncode(id: string): Promise<void> {
+  requireDesktop();
+  return invoke<void>('cancel_encode', { id });
 }
 
 export async function subscribeDrop(handler: (paths: string[]) => void): Promise<() => void> {

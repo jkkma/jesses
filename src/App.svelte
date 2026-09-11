@@ -462,7 +462,10 @@
                     ? 'Sample ready for inspection'
                     : 'Source metadata loaded'}</span
                 ><button type="button" class="text-button" onclick={() => (view = 'convert')}
-                  >Review conversion defaults<ArrowRight size={13} aria-hidden="true" /></button
+                  >{desktop ? 'Set up an encode' : 'Review conversion defaults'}<ArrowRight
+                    size={13}
+                    aria-hidden="true"
+                  /></button
                 >
               </div>
             {:else}
@@ -517,7 +520,16 @@
         </div>
       </section>
     {:else if view === 'convert'}
-      <QuickConvert file={selectedFile} onfiles={() => (view = 'files')} />
+      <QuickConvert
+        file={selectedFile}
+        {desktop}
+        {tools}
+        {toolsLoading}
+        sample={selectedFile?.id === sampleId}
+        onfiles={() => (view = 'files')}
+        ontools={() => (view = 'tools')}
+        onlog={addLog}
+      />
     {:else}
       <ToolsPanel
         {tools}

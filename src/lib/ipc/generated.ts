@@ -23,3 +23,17 @@ id: string, path: string, name: string,
 sizeBytes: string, durationSeconds: number | null, format: string | null, streams: Array<MediaStream>, };
 
 export type AppError = { code: string, message: string, path: string | null, };
+
+export type EncodeRequest = { inputPath: string, outputPath: string, crf: number, preset: number, audioBitrateKbps: number,
+/**
+ * None preserves each audio track's channel count.
+ */
+audioChannels: number | null, };
+
+export type JobStatus = "preparing" | "encoding" | "muxing" | "validating" | "publishing" | "completed" | "cancelled" | "failed" | "interrupted";
+
+export type EncodeJob = { id: string, request: EncodeRequest, status: JobStatus, progress: number | null, message: string,
+/**
+ * Decimal Unix epoch milliseconds, independent of the desktop's timezone.
+ */
+createdAtMs: string, updatedAtMs: string, };
