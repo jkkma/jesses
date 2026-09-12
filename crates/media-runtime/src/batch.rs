@@ -565,9 +565,12 @@ mod tests {
                     },
                     cancel,
                     65536,
-                    std::time::Duration::from_secs(5),
+                    // Cold PowerShell startup can exceed five seconds while
+                    // the Windows CI runner starts the parallel runtime tests.
+                    // This bounds fixture setup, not folder-scan performance.
+                    std::time::Duration::from_secs(30),
                 ))
-                .unwrap();
+                .expect("PowerShell must create the owned test junction within 30 seconds");
             assert!(
                 result.status.success(),
                 "Could not create owned test junction: {}",
