@@ -1,9 +1,11 @@
 # Audio conversion validation
 
 Development qualification on Windows on 2026-09-12 covers per-track audio
-conversion in the standalone encoding workflow. The automated gates and short
-real-media checks below have passed. Full-episode, native-interface, and CI
-qualification remain pending in the final section.
+conversion in the standalone encoding workflow. The local automated gates,
+short-excerpt checks, full-episode runtime qualification, native-interface
+completion and restart checks, and independent verification of the native
+interface's full-episode output below have passed. Windows and Linux CI also
+passed on the implementation commit recorded below.
 
 ## Supported behavior
 
@@ -98,8 +100,76 @@ Independent checks of all three outputs verified:
 - Decoded audio sample counts, rate, and timing.
 - Waveform alignment by correlation at the beginning, middle, and end.
 
-These are short-excerpt results. They do not establish full-episode or packaged
-application qualification.
+These excerpt results supplement the full-episode runtime checks below.
+
+## Full-episode runtime qualification
+
+A complete 1280 × 720 episode, approximately 23 minutes 40 seconds long,
+completed with standalone SVT-AV1 5fish at CRF 30, preset 8, lineart bias 5,
+texture bias 4, and grain synthesis off. Audio used Opus at 128 kb/s with the
+source channel count preserved. The complete job took 414.279 seconds, including
+validation.
+
+Independent output checks established:
+
+- All 34,047 decoded video frames were present, and every presentation timestamp
+  matched the source exactly.
+- Source audio contained 62,626,816 decoded samples per channel at 44,100 Hz;
+  output audio contained 68,165,242 at 48,000 Hz. Both decoded timelines started
+  at zero. Their decoded-duration difference was 0.001984 ms.
+- All 353 ASS subtitle packet hashes and timestamps matched, as did the hashes
+  of all 24 font attachments.
+- The source file hash remained unchanged.
+
+PCM waveform correlation at three positions independently checked audio
+alignment:
+
+| Position  | Correlation | Measured lag |
+| --------- | ----------- | ------------ |
+| Beginning | 0.99814     | −0.104 ms    |
+| Middle    | 0.99268     | +0.146 ms    |
+| End       | 0.99890     | +0.292 ms    |
+
+## Native interface qualification
+
+The rebuilt desktop application imported the full episode and initially offered
+Copy source for its audio. Selecting 5fish showed CRF 18, preset 2, lineart bias
+5, and texture bias 4. The native form was then set to CRF 30, preset 8, and Opus
+128 kb/s with preserved channels and a new output destination. That full-episode
+job reached Succeeded. Its saved request retained all 27 selected tracks,
+5fish CRF 30, preset 8, grain synthesis off, lineart bias 5, texture bias 4,
+and Opus 128 kb/s with preserved channels.
+
+Independent verification of that native output passed. The 265,308,053-byte
+file contained all 34,047 video frames with a maximum presentation-time error
+of 0 ms. Audio again converted 62,626,816 samples per channel at 44,100 Hz into
+68,165,242 at 48,000 Hz, starting at zero with a duration difference of
+0.001984 ms. All 353 subtitle packet hashes and timestamps and all 24 font
+hashes were unchanged. The beginning, middle, and end waveform correlations
+and measured lags exactly matched the full-episode runtime results above.
+
+A separate draft using AAC at 128 kb/s with preserved channels and another new
+destination was added to the queue. The interface displayed its saved AAC
+request. Canceling only that queued job succeeded while the full-episode Opus
+job continued running.
+
+A fresh AAC job was also started and canceled during source-video validation,
+after approximately ten minutes of the 23-minute source had been scanned. It
+reached Canceled without an error, published output, owned temporary files, or
+remaining media child processes. This native-interface check covers active
+cancellation during preflight; cancellation during audio finalization is
+covered separately by the native integration gate.
+
+The application was closed and restarted into a new process. The interface
+showed zero pending jobs, the full Opus job still marked Succeeded, and both the
+queued and active AAC jobs still marked Canceled. Expanded history retained the
+27-track selection and all saved video and Opus settings. All 17 job records
+were present: the 14 existing records plus the successful Opus job and two
+canceled AAC jobs. Existing records retained their meaning, with missing audio
+settings normalized to the empty-array default. Final source hash checks
+matched their recorded originals. The application was closed after
+verification; neither canceled job had a published output, and no owned
+temporary files or media child processes remained.
 
 ## Automated gates
 
@@ -131,16 +201,21 @@ The audio implementation and native fixtures are in
 [`audio.rs`](../../crates/media-runtime/src/jobs/audio.rs) and
 [`audio_jobs.rs`](../../crates/media-runtime/tests/audio_jobs.rs).
 
-## Qualification still in progress
+## Continuous integration
 
-- **Full episode — pending:** complete the approximately 23-minute real source,
-  then record final decoded-video and audio results and independent timing,
-  subtitle, attachment, and metadata checks.
-- **Native interface — pending:** record the rebuilt desktop application's
-  import, per-track audio controls, submission, completed history, cancellation,
-  and output verification results.
-- **CI — pending:** record the final remote run after the completed change is
-  published.
+Implementation commit
+[`ebdf944`](https://github.com/jkkma/jesses/commit/ebdf94477eeacd51a2e202699b9bb14542ca7b23)
+passed all three jobs in
+[run 34686964988](https://github.com/jkkma/jesses/actions/runs/34686964988):
+frontend, Windows x64 desktop, and Linux x64 desktop. Both native executables
+built with the embedded frontend, and contract, formatting, lint, and workspace
+checks passed.
+
+Linux also passed the existing real-tool and x264 gates, rejected the older
+FFmpeg/FFprobe 6.1.1 pair before video encoding, built the SHA-256-pinned official
+FFmpeg 9.0.1 source, passed all eight audio integration tests with that pair, and
+passed the standalone 5fish/HDR gate. The source build includes x264, x265, Opus,
+and dav1d; its exact configuration and dependency versions form the cache key.
 
 Installer, bundled-tool, and clean-machine qualification are not established by
 the checks above.
