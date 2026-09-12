@@ -71,6 +71,16 @@ async fn cancel_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, Ap
 }
 
 #[tauri::command]
+async fn stop_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
+    jobs.manager.stop_job(id).await
+}
+
+#[tauri::command]
+async fn resume_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
+    jobs.manager.resume_job(id).await
+}
+
+#[tauri::command]
 async fn list_jobs(jobs: State<'_, Jobs>) -> Result<Vec<JobSnapshot>, AppError> {
     jobs.manager.ready().await?;
     Ok(jobs.manager.list_jobs().await)
@@ -138,6 +148,8 @@ pub fn run() {
             enqueue_encode_batch,
             cancel_all_jobs,
             cancel_job,
+            stop_job,
+            resume_job,
             list_jobs,
             subscribe_jobs
         ])

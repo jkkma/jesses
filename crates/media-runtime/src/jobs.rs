@@ -12,6 +12,8 @@ mod history;
 mod metadata;
 #[cfg(test)]
 mod real_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 use std::{
     collections::HashSet,
@@ -126,12 +128,12 @@ impl JobManager {
                         snapshot.state = JobState::Interrupted;
                         snapshot.error = Some(AppError::new(
                             "JOB_INTERRUPTED",
-                            "The previous session ended before completion was recorded. Review the output and logs before submitting a new job; no processes were restarted or old temporary files deleted.",
+                            "The previous session ended before completion was recorded. Saved av1an work can be resumed after verification; no processes were restarted or old files deleted.",
                             Some(snapshot.request.output_path.clone()),
                         ));
                         append_log(
                             &mut snapshot,
-                            "Interrupted job restored for review. Automatic resume is unavailable."
+                            "Interrupted job restored for review. Resume is available only for verified saved av1an work and must be requested explicitly."
                                 .into(),
                         );
                     }
@@ -390,6 +392,7 @@ impl JobManager {
             .enumerate()
             .filter(|(_, entry)| {
                 entry.snapshot.state.is_terminal()
+                    && entry.snapshot.recovery.is_none()
                     && entry.task.as_ref().is_none_or(|task| task.is_finished())
             })
             .take(remove_count)
@@ -419,6 +422,7 @@ impl JobManager {
                 state: JobState::Queued,
                 request: request.source,
                 encode_settings: Some(request.settings),
+                recovery: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec!["Media job admitted with an atomic batch.".into()],
@@ -535,6 +539,7 @@ impl JobManager {
                 .iter()
                 .position(|e| {
                     e.snapshot.state.is_terminal()
+                        && e.snapshot.recovery.is_none()
                         && e.task.as_ref().is_none_or(|task| task.is_finished())
                 })
                 .ok_or_else(|| {
@@ -561,6 +566,7 @@ impl JobManager {
             state: JobState::Queued,
             request,
             encode_settings,
+            recovery: None,
             progress_seconds: None,
             duration_seconds: None,
             logs: vec!["Media job queued.".into()],
@@ -620,8 +626,16 @@ impl JobManager {
                     append_log(snapshot, error.message.clone());
                     snapshot.error = Some(error);
                 } else {
-                    snapshot.state = JobState::Canceled;
-                    append_log(snapshot, "Queued job canceled before starting.".into());
+                    snapshot.state = if snapshot.state == JobState::Stopping {
+                        JobState::Stopped
+                    } else {
+                        JobState::Canceled
+                    };
+                    append_log(
+                        snapshot,
+                        "Queued job stopped before starting; any saved progress was retained."
+                            .into(),
+                    );
                 }
             })
             .await;
@@ -669,6 +683,174 @@ impl JobManager {
         Ok(snapshot)
     }
 
+    /// Stops the owned worker tree while retaining av1an recovery artifacts.
+    pub async fn stop_job(&self, id: String) -> Result<JobSnapshot, AppError> {
+        let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; stop requests are no longer accepted.",
+                None,
+            ));
+        }
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.snapshot.id == id)
+            .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None))?;
+        if entry
+            .snapshot
+            .encode_settings
+            .as_ref()
+            .is_none_or(|settings| settings.backend != media_core::EncodeBackend::Av1an)
+        {
+            return Err(AppError::new(
+                "JOB_STOP_UNAVAILABLE",
+                "Only av1an jobs can keep encoded progress for resume.",
+                None,
+            ));
+        }
+        if !entry.snapshot.state.is_terminal()
+            && !matches!(
+                entry.snapshot.state,
+                JobState::Stopping | JobState::Canceling
+            )
+        {
+            entry.cancel.send_replace(true);
+            entry.snapshot.state = JobState::Stopping;
+            append_log(
+                &mut entry.snapshot,
+                "Stop requested; waiting for owned processes to exit and keeping av1an progress."
+                    .into(),
+            );
+        }
+        let snapshot = entry.snapshot.clone();
+        self.persist(&mut state).await?;
+        self.queue_changed.notify_waiters();
+        Ok(snapshot)
+    }
+
+    /// Resumes the immutable original job after verifying its recovery locator.
+    /// Full source, tool and chunk checks happen again before the encoder starts.
+    pub async fn resume_job(&self, id: String) -> Result<JobSnapshot, AppError> {
+        let (original, epoch) = {
+            let state = self.state.lock().await;
+            if let Some(error) = &state.storage_error {
+                return Err(error.clone());
+            }
+            if state.shutting_down {
+                return Err(AppError::new(
+                    "APP_CLOSING",
+                    "The application is closing; jobs cannot resume.",
+                    None,
+                ));
+            }
+            let entry = state
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .ok_or_else(|| {
+                    AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None)
+                })?;
+            if !entry.snapshot.state.is_terminal()
+                || entry.snapshot.state == JobState::Succeeded
+                || entry.snapshot.recovery.is_none()
+                || entry
+                    .snapshot
+                    .encode_settings
+                    .as_ref()
+                    .is_none_or(|settings| settings.backend != media_core::EncodeBackend::Av1an)
+            {
+                return Err(AppError::new(
+                    "JOB_RESUME_UNAVAILABLE",
+                    "This job has no stopped av1an progress available to resume.",
+                    None,
+                ));
+            }
+            if entry.task.as_ref().is_some_and(|task| !task.is_finished()) {
+                return Err(AppError::new(
+                    "JOB_BUSY",
+                    "The previous attempt is still finishing cleanup. Try Resume again when it has finished.",
+                    None,
+                ));
+            }
+            (entry.snapshot.clone(), state.submission_epoch)
+        };
+        self.validate_recovery(&id).await?;
+        let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; jobs cannot resume.",
+                None,
+            ));
+        }
+        if state.submission_epoch != epoch {
+            return Err(batch_canceled());
+        }
+        let index = state
+            .entries
+            .iter()
+            .position(|entry| entry.snapshot.id == id)
+            .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None))?;
+        if state.entries[index].snapshot != original {
+            return Err(AppError::new(
+                "JOB_BUSY",
+                "This job changed while resume was being checked. Review its current state.",
+                None,
+            ));
+        }
+        let destination = crate::batch::destination_key(Path::new(&original.request.output_path))?;
+        if state.entries.iter().any(|entry| {
+            !entry.snapshot.state.is_terminal()
+                && crate::batch::destination_key(Path::new(&entry.snapshot.request.output_path))
+                    .unwrap_or_else(|_| {
+                        crate::batch::path_key(Path::new(&entry.snapshot.request.output_path))
+                    })
+                    == destination
+        }) {
+            return Err(AppError::new(
+                "OUTPUT_QUEUED",
+                "This destination is already assigned to an unfinished job.",
+                Some(original.request.output_path),
+            ));
+        }
+        let log_path = self.log_dir.join(format!("{id}.log"));
+        let (cancel, receiver) = watch::channel(false);
+        let mut entry = state.entries.remove(index);
+        entry.snapshot.state = JobState::Queued;
+        entry.snapshot.error = None;
+        entry.snapshot.progress_seconds = None;
+        entry.cancel = cancel;
+        entry.task = None;
+        append_log(&mut entry.snapshot, "Resume requested with the original saved settings; source, tools and completed chunks will be verified before reuse.".into());
+        let snapshot = entry.snapshot.clone();
+        state.entries.push(entry);
+        if let Err(error) = self.persist(&mut state).await {
+            let mut entry = state.entries.pop().expect("reserved resume entry");
+            entry.snapshot = original;
+            entry.snapshot.error = Some(error.clone());
+            state.entries.insert(index, entry);
+            return Err(error);
+        }
+        let worker = self.clone();
+        state
+            .entries
+            .last_mut()
+            .expect("reserved resume entry")
+            .task = Some(tokio::spawn(async move {
+            worker.run_queued(id, receiver, log_path).await;
+        }));
+        self.queue_changed.notify_waiters();
+        Ok(snapshot)
+    }
+
     pub async fn cancel_all_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {
         let mut state = self.state.lock().await;
         state.submission_epoch = state.submission_epoch.wrapping_add(1);
@@ -706,7 +888,9 @@ impl JobManager {
                 .filter_map(|e| {
                     if !e.snapshot.state.is_terminal() {
                         e.cancel.send_replace(true);
-                        e.snapshot.state = JobState::Canceling;
+                        if e.snapshot.state != JobState::Stopping {
+                            e.snapshot.state = JobState::Canceling;
+                        }
                     }
                     e.task.take()
                 })
@@ -728,8 +912,12 @@ impl JobManager {
         let mut state = self.state.lock().await;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             let before = entry.snapshot.state;
+            let recovery_before = entry.snapshot.recovery.clone();
             update(&mut entry.snapshot);
-            if entry.snapshot.state != before || entry.snapshot.state.is_terminal() {
+            if entry.snapshot.state != before
+                || entry.snapshot.recovery != recovery_before
+                || entry.snapshot.state.is_terminal()
+            {
                 let _ = self.persist(&mut state).await;
                 self.queue_changed.notify_waiters();
             }
@@ -738,7 +926,7 @@ impl JobManager {
 
     async fn phase(&self, id: &str, phase: JobState, message: &str) {
         self.change(id, |s| {
-            if s.state != JobState::Canceling {
+            if !matches!(s.state, JobState::Canceling | JobState::Stopping) {
                 s.state = phase;
             }
             append_log(s, message.into());
@@ -800,12 +988,23 @@ impl JobManager {
             // A successful publication already transitioned under the cancel lock.
             if let Err(error) = result {
                 snapshot.state = if error.code == "JOB_CANCELED" {
-                    JobState::Canceled
+                    if snapshot.state == JobState::Stopping {
+                        JobState::Stopped
+                    } else {
+                        JobState::Canceled
+                    }
                 } else {
                     JobState::Failed
                 };
                 append_log(snapshot, error.message.clone());
-                snapshot.error = if snapshot.state == JobState::Canceled {
+                if snapshot.state == JobState::Stopped {
+                    append_log(snapshot, if snapshot.recovery.is_some() {
+                        "Stopped. Saved av1an progress is available for explicit resume.".into()
+                    } else {
+                        "Stopped before resumable work was created; start a new job to encode this source.".into()
+                    });
+                }
+                snapshot.error = if matches!(snapshot.state, JobState::Canceled | JobState::Stopped) {
                     None
                 } else {
                     Some(error)
@@ -1591,6 +1790,7 @@ mod tests {
                         stream_indices: vec![0],
                     },
                     encode_settings: Some(settings.clone()),
+                    recovery: None,
                     progress_seconds: Some(1.0),
                     duration_seconds: Some(5.0),
                     logs: vec!["Started with saved settings".into()],

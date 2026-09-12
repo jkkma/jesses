@@ -11,6 +11,8 @@ fn main() {
             "enqueue_encode_batch",
             "cancel_all_jobs",
             "cancel_job",
+            "stop_job",
+            "resume_job",
             "list_jobs",
             "subscribe_jobs",
         ]),

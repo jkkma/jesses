@@ -218,6 +218,7 @@ async function desktopMock(
               durationSeconds: 1400,
               logs: [],
               error: null,
+              recovery: null,
               logPath: null,
             }));
             if (!options.queueFailure) {

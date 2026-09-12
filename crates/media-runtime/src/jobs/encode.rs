@@ -20,6 +20,15 @@ impl JobManager {
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         check_cancel(cancel)?;
+        let attempt_id = if settings.backend == media_core::EncodeBackend::Av1an {
+            format!(
+                "{id}-attempt-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            )
+        } else {
+            id.to_owned()
+        };
         self.phase(
             id,
             JobState::Preparing,
@@ -116,7 +125,10 @@ impl JobManager {
                 "Checking audio codec delay with the installed FFmpeg and FFprobe.",
             )
             .await;
-            scratch.push(Temporary::create(&output, &format!("{id}-audio-tools"))?);
+            scratch.push(Temporary::create(
+                &output,
+                &format!("{attempt_id}-audio-tools"),
+            )?);
             audio::check_delay_support(
                 &ffmpeg,
                 &ffprobe,
@@ -194,15 +206,60 @@ impl JobManager {
         tokio::fs::create_dir_all(self.log_dir.as_ref())
             .await
             .map_err(|e| files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref()))?;
-        *temporary = Some(Temporary::create(&output, id)?);
-        scratch.push(match settings.encoder {
-            VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-                Temporary::create_ivf(&output, &format!("{id}-video"))?
-            }
-            VideoEncoder::X264 => Temporary::create(&output, &format!("{id}-video"))?,
-        });
+        let mut recovery = None;
+        let mut av1an_executable = None;
+        let durable = if settings.backend == media_core::EncodeBackend::Av1an {
+            let executable = discover("av1an", cancel).await?;
+            let locator = self
+                .state
+                .lock()
+                .await
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .and_then(|entry| entry.snapshot.recovery.clone());
+            let (workspace, intermediate) = av1an::Recovery::prepare(
+                id,
+                request,
+                settings,
+                &source.path,
+                vec![
+                    ffmpeg.clone(),
+                    ffprobe.clone(),
+                    encoder.clone(),
+                    executable.clone(),
+                ],
+                &plan,
+                declared_rate,
+                frame_count,
+                locator,
+                cancel,
+            )
+            .await?;
+            let summary = workspace.summary().await?;
+            self.change(id, |snapshot| snapshot.recovery = Some(summary))
+                .await;
+            check_cancel(cancel)?;
+            av1an_executable = Some(executable);
+            recovery = Some(workspace);
+            Some(intermediate)
+        } else {
+            None
+        };
+        *temporary = Some(Temporary::create(&output, &attempt_id)?);
+        if durable.is_none() {
+            scratch.push(match settings.encoder {
+                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+                    Temporary::create_ivf(&output, &format!("{attempt_id}-video"))?
+                }
+                VideoEncoder::X264 => Temporary::create(&output, &format!("{attempt_id}-video"))?,
+            });
+        }
         let temp = temporary.as_ref().expect("owned Matroska output");
-        let intermediate = scratch.last().expect("owned encoded video intermediate");
+        let intermediate = durable
+            .as_ref()
+            .or_else(|| scratch.last())
+            .expect("owned encoded video intermediate");
         self.change(id, |snapshot| {
             append_log(
                 snapshot,
@@ -216,19 +273,29 @@ impl JobManager {
         .await;
         check_cancel(cancel)?;
         if settings.backend == media_core::EncodeBackend::Av1an {
-            self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected tracks will be copied afterward.").await;
-            self.encode_av1an(
-                id,
-                &source.path,
-                &encoder,
-                intermediate,
-                &plan,
-                settings,
-                cancel,
-                log_path,
-                frame_count,
-            )
-            .await?;
+            let recovery = recovery.as_ref().expect("av1an recovery workspace");
+            if !recovery.finalizing {
+                self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected tracks will be copied afterward.").await;
+                self.encode_av1an(
+                    id,
+                    &source.path,
+                    &encoder,
+                    av1an_executable.as_ref().expect("av1an executable"),
+                    recovery,
+                    intermediate,
+                    &plan,
+                    settings,
+                    cancel,
+                    log_path,
+                    frame_count,
+                )
+                .await?;
+                let summary = recovery.finalizing().await?;
+                self.change(id, |snapshot| snapshot.recovery = Some(summary))
+                    .await;
+            } else {
+                self.change(id,|snapshot|append_log(snapshot,"Reusing the verified durable AV1 intermediate; continuing output finalization.".into())).await;
+            }
         } else {
             let producer = CommandSpec {
                 executable: ffmpeg.clone(),
@@ -274,7 +341,7 @@ impl JobManager {
         })
         .await;
         self.change(id, |snapshot| {
-            if snapshot.state != JobState::Canceling {
+            if !matches!(snapshot.state, JobState::Canceling | JobState::Stopping) {
                 snapshot.state = JobState::Finalizing;
             }
             snapshot.progress_seconds = None;
@@ -370,7 +437,26 @@ impl JobManager {
         }
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, temp, &output).await
+        self.finalize(id, cancel, &source, temp, &output).await?;
+        drop(durable);
+        if let Some(recovery) = recovery {
+            match recovery.cleanup().await {
+                Ok(()) => self.change(id, |snapshot| snapshot.recovery = None).await,
+                Err(error) => {
+                    self.change(id, |snapshot| {
+                        append_log(
+                            snapshot,
+                            format!(
+                                "Output succeeded; recovery files were retained: {}",
+                                error.message
+                            ),
+                        )
+                    })
+                    .await
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

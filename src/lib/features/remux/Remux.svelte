@@ -4,6 +4,7 @@
   import { chooseRemuxDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
   import type { JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from '$lib/ipc/generated';
+  import { terminalJob } from '$lib/components/shared/job-state';
   let {
     file,
     tools,
@@ -25,9 +26,7 @@
   let error = $state<string | null>(null);
   let submitting = $state(false);
   const desktop = isDesktop();
-  const terminal = (state: string) =>
-    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
-  const active = $derived(jobs.find((job) => !terminal(job.state)));
+  const active = $derived(jobs.find((job) => !terminalJob(job.state)));
   const toolsReady = $derived(
     ['ffmpeg', 'ffprobe'].every((id) => tools.some((tool) => tool.id === id && tool.available)),
   );

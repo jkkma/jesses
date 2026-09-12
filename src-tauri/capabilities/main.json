@@ -18,6 +18,8 @@
     "allow-enqueue-encode-batch",
     "allow-cancel-all-jobs",
     "allow-cancel-job",
+    "allow-stop-job",
+    "allow-resume-job",
     "allow-list-jobs",
     "allow-subscribe-jobs"
   ]

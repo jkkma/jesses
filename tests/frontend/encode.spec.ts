@@ -112,6 +112,7 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
   durationSeconds: 12,
   logs: ['Encoding video with standalone SVT-AV1.'],
   error: null,
+  recovery: null,
   logPath: 'C:\\logs\\encode-1.log',
 });
 
@@ -215,6 +216,7 @@ async function desktopMock(
               durationSeconds: selectedMedia.durationSeconds,
               logs: ['Encoding video with standalone SVT-AV1.'],
               error: null,
+              recovery: null,
               logPath: null,
             };
             const terminalBeforeReply = late === 'start' || late === 'enqueue';

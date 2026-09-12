@@ -29,6 +29,7 @@
   import BatchEncode from '$lib/features/batch/BatchEncode.svelte';
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
+  import { terminalJob } from '$lib/components/shared/job-state';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import { encoderChoices, encoderOptions } from '$lib/components/shared/encoder-options';
   import {
@@ -46,6 +47,8 @@
     enqueueEncodeBatch,
     cancelAllJobs,
     cancelJob,
+    stopJob as stopAndKeepProgress,
+    resumeJob,
   } from '$lib/ipc/client';
   import type {
     EncodeRequest,
@@ -100,8 +103,6 @@
   let jobsConnecting = $state(false);
   let stopJobSubscription: (() => void) | undefined;
   let jobsDisposed = false;
-  const terminalJob = (state: string) =>
-    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
   const currentJob = $derived(
     jobs.find((job) => !terminalJob(job.state) && job.state !== 'queued') ??
       jobs.filter((job) => job.state === 'queued').at(-1) ??
@@ -140,6 +141,23 @@
   async function stopJob(id: string) {
     const job = await cancelJob(id);
     jobs = jobs.map((entry) => (entry.id === id && !terminalJob(entry.state) ? job : entry));
+  }
+  async function keepJobProgress(id: string) {
+    const before = jobs.find((entry) => entry.id === id);
+    const snapshot = await stopAndKeepProgress(id);
+    // The command can reply after its channel has already advanced the job.
+    jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
+    addLog('Requested a stop with progress kept.');
+  }
+  async function resumeSavedJob(id: string) {
+    const before = jobs.find((entry) => entry.id === id);
+    const snapshot = await resumeJob(id);
+    if (jobs.find((entry) => entry.id === id) === before) {
+      // New queued work is stored first and displayed in reverse queue order.
+      // A resumed job joins the tail behind jobs that were already waiting.
+      jobs = [snapshot, ...jobs.filter((entry) => entry.id !== id)];
+    }
+    addLog('Saved job submitted for resume.');
   }
   async function submitEncode(request: EncodeRequest) {
     const job = await startEncode(request);
@@ -802,12 +820,16 @@
         onstart={submitRemux}
       />
     </div>
-    {#if view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux'}<JobStatus
+    <div hidden={!(view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux')}>
+      <JobStatus
         job={currentJob}
         {jobs}
         oncancel={stopJob}
         onstop={stopQueue}
-      />{/if}
+        onkeep={keepJobProgress}
+        onresume={resumeSavedJob}
+      />
+    </div>
   </main>
 
   <section class="log-panel" class:expanded={logOpen} aria-label="Activity log">

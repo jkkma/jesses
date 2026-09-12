@@ -41,6 +41,7 @@ av1an dependency checks.
 
 The full movie has not been encoded. Source/output frame scans now validate
 incrementally with bounded memory; see the [streaming validation record](streaming-validation.md)
-for complete-source qualification and current limits. Resume, target-quality
-modes, additional source plugins, bundled tools, and Linux av1an runtime
-qualification remain future work.
+for complete-source qualification and current limits. Explicit stop and durable
+resume are covered in the [recovery validation record](av1an-recovery-validation.md).
+Target-quality modes, additional source plugins, bundled tools, and Linux av1an
+runtime qualification remain future work.

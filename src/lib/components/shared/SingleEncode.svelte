@@ -14,6 +14,7 @@
   import { errorMessage } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from './AudioOptions.svelte';
+  import { terminalJob } from './job-state';
   import FramingOptions from './FramingOptions.svelte';
   import {
     copyFramingDraft,
@@ -113,9 +114,7 @@
   const encoder = $derived(selectedEncoder);
   const options = $derived(encoderOptions(encoder));
   const idPrefix = $derived(chunked ? 'av1an' : 'encode');
-  const terminal = (state: string) =>
-    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
-  const active = $derived(jobs.find((job) => !terminal(job.state)));
+  const active = $derived(jobs.find((job) => !terminalJob(job.state)));
   const videos = $derived(file?.streams.filter((stream) => stream.kind === 'video') ?? []);
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
   const framingResult = $derived(framingDimensions(framing, selectedVideo));

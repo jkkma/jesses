@@ -145,6 +145,16 @@ export async function cancelJob(id: string): Promise<JobSnapshot> {
   return invoke<JobSnapshot>('cancel_job', { id });
 }
 
+export async function stopJob(id: string): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('stop_job', { id });
+}
+
+export async function resumeJob(id: string): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('resume_job', { id });
+}
+
 export async function subscribeJobs(handler: (jobs: JobSnapshot[]) => void): Promise<() => void> {
   requireDesktop();
   let disposed = false;

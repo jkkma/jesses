@@ -207,6 +207,7 @@ pub(super) fn ensure_absent(output: &Path) -> Result<(), AppError> {
 pub(super) struct Temporary {
     pub path: PathBuf,
     file: Option<File>,
+    preserve: bool,
     #[cfg(unix)]
     identity: (u64, u64),
     #[cfg(windows)]
@@ -227,8 +228,17 @@ impl Temporary {
             .parent()
             .expect("validated output parent")
             .join(format!(".jesses-{id}.partial.{extension}"));
+        Self::open_at(path, false, false)
+    }
+
+    /// Durable intermediates belong to a recovery workspace, outside scratch cleanup.
+    pub fn durable(path: &Path, existing: bool) -> Result<Self, AppError> {
+        Self::open_at(path.to_owned(), existing, true)
+    }
+
+    fn open_at(path: PathBuf, existing: bool, preserve: bool) -> Result<Self, AppError> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
+        options.read(true).write(true).create_new(!existing);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -255,6 +265,7 @@ impl Temporary {
         Ok(Self {
             path,
             file: Some(file),
+            preserve,
             #[cfg(unix)]
             identity,
             #[cfg(windows)]
@@ -427,7 +438,7 @@ pub(super) fn windows_delete_owned(path: &Path, expected: (u32, u32, u32)) -> st
     let file = OpenOptions::new()
         .access_mode(0x0001_0000 | 0x80) // DELETE | FILE_READ_ATTRIBUTES
         .share_mode(1 | 2) // deny replacement while checking identity and deleting
-        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT: do not follow symlinks
+        .custom_flags(0x0020_0000 | 0x0200_0000) // OPEN_REPARSE_POINT | BACKUP_SEMANTICS: files or empty directories, no links
         .open(path)?;
     if windows_file_id(&file)? != expected {
         return Err(std::io::Error::other(
@@ -452,7 +463,7 @@ pub(super) fn windows_delete_owned(path: &Path, expected: (u32, u32, u32)) -> st
 
 impl Drop for Temporary {
     fn drop(&mut self) {
-        if self.file.is_some() {
+        if self.file.is_some() && !self.preserve {
             let _ = self.cleanup();
         }
     }

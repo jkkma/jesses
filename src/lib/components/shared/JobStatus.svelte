@@ -5,29 +5,33 @@
   import { ProgressEstimator, type ProgressEstimate } from './progress-estimate';
   import type { JobSnapshot } from '$lib/ipc/generated';
   import { encodeSummary } from './encoder-options';
+  import { canKeepProgress, canResumeJob, savedProgressSummary, terminalJob } from './job-state';
 
   let {
     job,
     jobs,
     oncancel,
     onstop,
+    onkeep,
+    onresume,
   }: {
     job: JobSnapshot | undefined;
     jobs: JobSnapshot[];
     oncancel: (id: string) => Promise<void>;
     onstop: () => Promise<void>;
+    onkeep: (id: string) => Promise<void>;
+    onresume: (id: string) => Promise<void>;
   } = $props();
-  let error = $state<string | null>(null);
-  let canceling = $state(false);
+  let errors = $state<Record<string, string>>({});
+  let queueError = $state<string | null>(null);
+  let actions = $state<Record<string, 'cancel' | 'keep' | 'resume' | undefined>>({});
   let stopping = $state(false);
-  const terminal = (state: string) =>
-    ['succeeded', 'failed', 'canceled', 'interrupted'].includes(state);
-  const pending = $derived(jobs.filter((entry) => !terminal(entry.state)));
+  const pending = $derived(jobs.filter((entry) => !terminalJob(entry.state)));
   const history = $derived(
     [
-      ...jobs.filter((entry) => !terminal(entry.state) && entry.state !== 'queued'),
+      ...jobs.filter((entry) => !terminalJob(entry.state) && entry.state !== 'queued'),
       ...jobs.filter((entry) => entry.state === 'queued').reverse(),
-      ...jobs.filter((entry) => terminal(entry.state)),
+      ...jobs.filter((entry) => terminalJob(entry.state)),
     ].filter((entry) => entry.id !== job?.id),
   );
   const validationPhase = $derived(
@@ -72,34 +76,69 @@
     }, 1_000);
     return () => clearInterval(timer);
   });
-  $effect(() => {
-    job?.id;
-    error = null;
-  });
-
-  async function cancel(id: string) {
-    canceling = true;
-    error = null;
+  async function runAction(id: string, action: 'cancel' | 'keep' | 'resume') {
+    if (actions[id] || stopping) return;
+    const entry = jobs.find((candidate) => candidate.id === id);
+    if (
+      !entry ||
+      (action === 'keep' && !canKeepProgress(entry)) ||
+      (action === 'resume' && !canResumeJob(entry))
+    )
+      return;
+    actions = { ...actions, [id]: action };
+    const nextErrors = { ...errors };
+    delete nextErrors[id];
+    errors = nextErrors;
     try {
-      await oncancel(id);
+      await (action === 'cancel' ? oncancel : action === 'keep' ? onkeep : onresume)(id);
     } catch (cause) {
-      error = errorMessage(cause);
+      errors = { ...errors, [id]: errorMessage(cause) };
     } finally {
-      canceling = false;
+      actions = { ...actions, [id]: undefined };
     }
   }
   async function stop() {
+    if (stopping) return;
     stopping = true;
-    error = null;
+    queueError = null;
     try {
       await onstop();
     } catch (cause) {
-      error = errorMessage(cause);
+      queueError = errorMessage(cause);
     } finally {
       stopping = false;
     }
   }
 </script>
+
+{#snippet recoveryControls(entry: JobSnapshot)}
+  {#if entry.state === 'stopping'}
+    <p class="small-muted" role="status">Stopping and saving progress…</p>
+  {:else if entry.state === 'stopped' && !entry.recovery}
+    <p class="small-muted">Stopped before progress was saved. Start a new encode to try again.</p>
+  {:else if canResumeJob(entry)}
+    <div class="saved-progress">
+      <p><strong>Progress saved · Ready to resume</strong></p>
+      <p class="small-muted">{savedProgressSummary(entry)}</p>
+    </div>
+  {/if}
+  {#if canKeepProgress(entry)}
+    <Button
+      variant="outline"
+      disabled={!!actions[entry.id] || stopping}
+      onclick={() => runAction(entry.id, 'keep')}
+      >{actions[entry.id] === 'keep' ? 'Saving progress…' : 'Stop and keep progress'}</Button
+    >
+    <p class="small-muted">Keep completed chunks and resume this job later.</p>
+  {:else if canResumeJob(entry)}
+    <Button
+      variant="outline"
+      disabled={!!actions[entry.id] || stopping}
+      onclick={() => runAction(entry.id, 'resume')}
+      >{actions[entry.id] === 'resume' ? 'Resuming…' : 'Resume'}</Button
+    >
+  {/if}
+{/snippet}
 
 {#if job}
   <section
@@ -175,23 +214,27 @@
           Checking the output before saving it.
         </p>{/if}
       {#if job.state === 'succeeded'}<p>Output verified and saved.</p>{/if}
-      {#if job.state === 'interrupted'}<p>
+      {#if job.state === 'interrupted' && !canResumeJob(job)}<p>
           The previous session was interrupted. Review the destination and any temporary files
           before starting a new job. Nothing resumes automatically.
         </p>{/if}
       {#if job.error}<p class="job-error" role="alert">{job.error.message}</p>{/if}
-      {#if error}<p class="job-error" role="alert">{error}</p>{/if}
-      {#if !terminal(job.state)}
+      {#if errors[job.id]}<p class="job-error" role="alert">{errors[job.id]}</p>{/if}
+      {@render recoveryControls(job)}
+      {#if !terminalJob(job.state)}
         <Button
           variant="outline"
-          disabled={job.state === 'canceling' || canceling}
-          onclick={() => cancel(job.id)}
+          disabled={job.state === 'canceling' ||
+            job.state === 'stopping' ||
+            !!actions[job.id] ||
+            stopping}
+          onclick={() => runAction(job.id, 'cancel')}
         >
           <Square size={12} aria-hidden="true" />Cancel job
         </Button>
         <p class="small-muted">
-          Closing jesses cancels active and queued jobs. Interrupted jobs never restart
-          automatically.
+          Closing jesses cancels active and queued jobs. Saved jobs resume only when you choose
+          Resume.
         </p>
       {/if}
       <details>
@@ -212,6 +255,7 @@
         >{/if}
     </div>
     <div class="queue-body">
+      {#if queueError}<p class="job-error" role="alert">{queueError}</p>{/if}
       <p class="small-muted">
         {pending.length} pending · One job runs at a time. Queued jobs appear in processing order.
       </p>
@@ -227,9 +271,11 @@
             >
             <p class="job-path">{entry.request.outputPath}</p>
             {#if entry.error}<p class="job-error">{entry.error.message}</p>{/if}
-            {#if entry.state === 'interrupted'}<p class="small-muted">
+            {#if entry.state === 'interrupted' && !canResumeJob(entry)}<p class="small-muted">
                 Review the previous output before starting a new job. This job will not resume.
               </p>{/if}
+            {#if errors[entry.id]}<p class="job-error" role="alert">{errors[entry.id]}</p>{/if}
+            <div class="history-recovery">{@render recoveryControls(entry)}</div>
             <details>
               <summary>Saved settings and log</summary>
               <p class="small-muted job-path">Source: {entry.request.inputPath}</p>
@@ -243,11 +289,14 @@
                 </p>{/if}
             </details>
           </div>
-          {#if !terminal(entry.state)}<Button
+          {#if !terminalJob(entry.state)}<Button
               variant="outline"
               aria-label={`Cancel queued job ${entry.id}`}
-              disabled={entry.state === 'canceling' || canceling || stopping}
-              onclick={() => cancel(entry.id)}>Cancel</Button
+              disabled={entry.state === 'canceling' ||
+                entry.state === 'stopping' ||
+                !!actions[entry.id] ||
+                stopping}
+              onclick={() => runAction(entry.id, 'cancel')}>Cancel</Button
             >{/if}
         </article>
       {/each}
@@ -316,5 +365,25 @@
   .queue-description p {
     font-size: 12px;
     margin-top: 5px;
+  }
+  .history-recovery {
+    display: grid;
+    justify-items: start;
+    gap: 8px;
+    margin: 8px 0;
+  }
+  .history-recovery:empty {
+    display: none;
+  }
+  .saved-progress p + p {
+    margin-top: 6px;
+  }
+  @media (max-width: 520px) {
+    .queue-entry {
+      flex-wrap: wrap;
+    }
+    .queue-description {
+      flex-basis: 100%;
+    }
   }
 </style>

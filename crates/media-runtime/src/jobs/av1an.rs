@@ -2,6 +2,9 @@
 use super::{encode::encoder_parameters, encode_plan::Plan, *};
 
 mod launcher;
+mod recovery;
+mod recovery_receipts;
+pub(super) use recovery::Recovery;
 
 pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
     launcher::validate_encoder_path(encoder)
@@ -30,6 +33,7 @@ fn arguments(
     log: &Path,
     plan: &Plan,
     settings: &EncodeSettings,
+    resume: bool,
 ) -> Vec<OsString> {
     // Only planner-owned scalars enter av1an's nested encoder argument string.
     // User paths are always separate native arguments, never shell text.
@@ -65,6 +69,7 @@ fn arguments(
         "temp",
         "--max-tries",
         "3",
+        "--keep",
         "--verbose",
         "--log-level",
         "info",
@@ -73,6 +78,9 @@ fn arguments(
     .into_iter()
     .map(OsString::from)
     .collect();
+    if resume {
+        args.push("--resume".into());
+    }
     for (key, value) in [
         ("-i", input.as_os_str().to_owned()),
         ("-o", output.as_os_str().to_owned()),
@@ -80,7 +88,9 @@ fn arguments(
         ("--log-file", log.as_os_str().to_owned()),
         ("--workers", settings.workers.to_string().into()),
         ("--video-params", params.into()),
-        ("--audio-params", "-an -sn -dn".into()),
+        // av1an starts with `-map 0`; disabling audio/subtitles/data still
+        // leaves attachments, which its concat step mistakes for valid audio.
+        ("--audio-params", "-an -sn -dn -map -0:t?".into()),
     ] {
         args.extend([key.into(), value]);
     }
@@ -94,6 +104,8 @@ impl JobManager {
         id: &str,
         input: &Path,
         encoder: &Path,
+        executable: &Path,
+        recovery: &Recovery,
         ivf: &Temporary,
         plan: &Plan,
         settings: &EncodeSettings,
@@ -101,30 +113,32 @@ impl JobManager {
         log_path: &Path,
         frame_count: usize,
     ) -> Result<(), AppError> {
-        let executable = discover("av1an", cancel).await?;
         validate_encoder_path(encoder)?;
-        let work = ivf
-            .path
-            .parent()
-            .expect("owned output parent")
-            .join(format!(".jesses-{id}.av1an"));
-        // A new private workspace keeps staged tools and chunks separate from
-        // every preexisting directory. No original executable is changed.
-        tokio::fs::create_dir(&work).await.map_err(|e| {
-            files::error(
-                "OUTPUT_CREATE_FAILED",
-                format!("Cannot reserve av1an workspace: {e}"),
-                &work,
-            )
-        })?;
-        let launch_executable = executable.clone();
+        let work = recovery.root.clone();
+        // A crashed staged host remains in its owned attempt directory. Never
+        // replace it or let it shadow the encoder selected for this attempt.
+        let launch_directory = work.join(format!(
+            "launch-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::create_dir(&launch_directory)
+            .await
+            .map_err(|e| {
+                files::error(
+                    "OUTPUT_CREATE_FAILED",
+                    format!("Cannot reserve av1an workspace: {e}"),
+                    &work,
+                )
+            })?;
+        let launch_executable = executable.to_owned();
         let launch_encoder = encoder.to_owned();
-        let launch_work = work.clone();
+        let launch_work = launch_directory.clone();
         let mut launch = tokio::task::spawn_blocking(move || {
             launcher::Launch::prepare(&launch_executable, &launch_encoder, &launch_work)
         })
         .await
-        .map_err(|e| files::error("AV1AN_STAGE_FAILED", e.to_string(), &executable))??;
+        .map_err(|e| files::error("AV1AN_STAGE_FAILED", e.to_string(), executable))??;
         check_cancel(cancel)?;
         let version = supervisor::run_capture_with_path(
             &CommandSpec {
@@ -138,12 +152,12 @@ impl JobManager {
             Some(&launch.path),
         )
         .await
-        .map_err(|e| process_error(e, &executable))?;
+        .map_err(|e| process_error(e, executable))?;
         if !version.status.success() {
             return Err(files::error(
                 "TOOL_FAILED",
                 "av1an failed its version check.",
-                &executable,
+                executable,
             ));
         }
         let version_text = format!(
@@ -159,7 +173,7 @@ impl JobManager {
             return Err(files::error(
                 "AV1AN_DEPENDENCY_MISSING",
                 "av1an requires VapourSynth with the L-SMASH Works source plugin. Its version check did not report that plugin as available.",
-                &executable,
+                executable,
             ));
         }
         let version = version_text
@@ -167,6 +181,7 @@ impl JobManager {
             .find(|v| !v.is_empty())
             .unwrap_or("unknown av1an version")
             .to_owned();
+        recovery.version(version_text).await?;
         let internal_log = log_path.with_extension("av1an.log");
         self.change(id, |snapshot| {
             append_log(snapshot, format!("Tool: {} — {version}", executable.display()));
@@ -178,6 +193,7 @@ impl JobManager {
         let (sender, mut events) = mpsc::channel(256);
         let observer = self.clone();
         let event_id = id.to_owned();
+        let event_recovery = recovery.clone();
         let progress_path = work.join("chunks/done.json");
         let frame_seconds = plan.frame_seconds();
         let event_task = tokio::spawn(async move {
@@ -190,6 +206,9 @@ impl JobManager {
                         observer.change(&event_id, |snapshot| append_log(snapshot, line)).await;
                     }
                     _ = interval.tick() => {
+                        if let Ok(summary) = event_recovery.checkpoint(false).await {
+                            observer.change(&event_id, |snapshot| snapshot.recovery = Some(summary)).await;
+                        }
                         if let Some((frames, chunks)) = read_progress(&progress_path, frame_count).await
                             && frames > previous {
                                 previous = frames;
@@ -205,7 +224,15 @@ impl JobManager {
         let result = supervisor::run_with_path(
             &CommandSpec {
                 executable: launch.executable.clone(),
-                args: arguments(input, &ivf.path, &work, &internal_log, plan, settings),
+                args: arguments(
+                    input,
+                    &ivf.path,
+                    &work,
+                    &internal_log,
+                    plan,
+                    settings,
+                    recovery.resume_chunks,
+                ),
                 cwd: Some(work.clone()),
             },
             cancel.clone(),
@@ -217,19 +244,18 @@ impl JobManager {
         .await;
         let _ = event_task.await;
         let stage_cleanup = launch.cleanup();
-        // av1an removes its own chunk tree after successful concatenation. Only
-        // remove our empty parent; interrupted work is retained and identified.
-        if tokio::fs::remove_dir(&work).await.is_err() {
-            self.change(id, |snapshot| {
-                append_log(
-                    snapshot,
-                    format!(
-                        "av1an work files retained at {}. They are not resumed automatically.",
-                        work.display()
-                    ),
-                )
-            })
+        let _ = tokio::fs::remove_dir(&launch_directory).await;
+        // The process has exited, so seal its last complete receipts even when
+        // cancellation won. A crash before this point reuses only prior receipts.
+        let checkpoint = recovery
+            .checkpoint(result.as_ref().is_ok_and(|result| result.status.success()))
             .await;
+        match checkpoint {
+            Ok(summary) => {
+                self.change(id, |snapshot| snapshot.recovery = Some(summary))
+                    .await
+            }
+            Err(error) => return Err(error),
         }
         let result = result.map_err(|e| process_error(e, input))?;
         stage_cleanup?;
@@ -412,6 +438,7 @@ mod tests {
             Path::new("/logs/job.log"),
             &plan,
             &settings,
+            false,
         );
         assert!(
             args.windows(2)
@@ -420,6 +447,10 @@ mod tests {
         assert!(args.windows(2).any(|a| a == ["--workers", "3"]));
         assert!(args.windows(2).any(|a| a == ["--chunk-method", "lsmash"]));
         assert!(args.windows(2).any(|a| a == ["--concat", "ffmpeg"]));
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--audio-params", "-an -sn -dn -map -0:t?"])
+        );
         let params = args.windows(2).find(|a| a[0] == "--video-params").unwrap()[1]
             .to_str()
             .unwrap();

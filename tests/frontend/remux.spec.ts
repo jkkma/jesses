@@ -80,6 +80,7 @@ function snapshot(state: JobSnapshot['state'] = 'running'): JobSnapshot {
     durationSeconds: 12,
     logs: ['Reading source streams.'],
     error: null,
+    recovery: null,
     logPath: 'C:\\logs\\remux-job-1.log',
   };
 }
@@ -136,6 +137,7 @@ async function desktopMock(
               durationSeconds: media.durationSeconds,
               logs: ['Copying selected streams.'],
               error: null,
+              recovery: null,
               logPath: 'C:\\logs\\remux-job-1.log',
             };
             if (terminalBeforeResponse === 'start') {

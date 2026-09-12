@@ -200,6 +200,8 @@ pub enum JobState {
     Finalizing,
     Succeeded,
     Canceling,
+    Stopping,
+    Stopped,
     Canceled,
     Failed,
     Interrupted,
@@ -209,9 +211,28 @@ impl JobState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Canceled | Self::Failed | Self::Interrupted
+            Self::Succeeded | Self::Canceled | Self::Failed | Self::Interrupted | Self::Stopped
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryPhase {
+    Encoding,
+    Finalizing,
+}
+
+/// Display information and a workspace locator; runtime manifests authorize reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Av1anRecovery {
+    pub workspace: String,
+    pub phase: RecoveryPhase,
+    #[ts(type = "number")]
+    pub completed_frames: u64,
+    #[ts(type = "number")]
+    pub total_frames: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -222,6 +243,8 @@ pub struct JobSnapshot {
     pub request: RemuxRequest,
     #[serde(default)]
     pub encode_settings: Option<EncodeSettings>,
+    #[serde(default)]
+    pub recovery: Option<Av1anRecovery>,
     pub progress_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub logs: Vec<String>,
@@ -232,6 +255,34 @@ pub struct JobSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_history_is_not_resumable_and_new_recovery_survives_round_trip() {
+        let mut snapshot: JobSnapshot = serde_json::from_str(
+            r#"{
+            "id":"saved-job","state":"interrupted",
+            "request":{"inputPath":"source.mkv","outputPath":"output.mkv","streamIndices":[0]},
+            "encodeSettings":null,"progressSeconds":null,"durationSeconds":null,
+            "logs":[],"error":null,"logPath":null
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.recovery, None);
+        snapshot.state = JobState::Stopped;
+        snapshot.recovery = Some(Av1anRecovery {
+            workspace: "owned-work".into(),
+            phase: RecoveryPhase::Finalizing,
+            completed_frames: 240,
+            total_frames: 240,
+        });
+        assert_eq!(
+            serde_json::from_value::<JobSnapshot>(serde_json::to_value(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
+        assert!(JobState::Stopped.is_terminal());
+        assert!(!JobState::Stopping.is_terminal());
+    }
 
     #[test]
     fn framing_defaults_preserve_old_history_and_per_file_wire_contracts() {

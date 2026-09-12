@@ -23,7 +23,7 @@ Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
 Jobs run sequentially, and their settings and history survive restart. Multi-source
 muxing, thumbnails, additional audio/video encoders, av1an quality
-targets and configurable chunk methods, pause/resume, and bundled media tools remain pending.
+targets, configurable chunk methods, live process suspension, and bundled media tools remain pending.
 This is a development build, not a release.
 
 ## Encode a file
@@ -163,9 +163,27 @@ kept there. Completed-chunk frame counts drive progress. The output passes the
 same decoded-frame, track, and metadata checks as standalone encoding. Jesses
 validates the concatenated IVF frame records and corrects its rate/count header
 before muxing, covering av1an versions that write a fixed 30 fps header. Existing
-destinations are never replaced. Cancel stops the supervised av1an worker tree;
-remaining chunk work files are retained with their location in the job log.
-There is no automatic resume. Source files are never modified; caches stay in the
+destinations are never replaced. **Stop and keep progress** waits for the supervised
+av1an worker tree to exit and retains its completed chunks. **Resume** in the job
+history continues with the original saved settings, including the selected SVT
+build. It works after restarting Jesses and never starts automatically. Source
+preparation runs again to verify the source before completed work is reused.
+
+Recovery checks source content, selected tool identities, encoder settings,
+frame timing, saved commands and chunk fingerprints. Incompatible or damaged
+work is rejected without deleting it. Chunks completed after the last durable
+checkpoint are encoded again. The encoded video remains available if stopping
+or crashing interrupts final muxing or output validation; resuming that phase
+reuses the validated intermediate. A completed output is never overwritten.
+Cancel and Stop queue also retain available av1an recovery work. Stopping before
+recovery preparation finishes may leave no saved progress to resume.
+
+Saved source commands must match the qualified av1an 0.5.2-unstable (7df934d)
+L-SMASH script format. An incompatible engine or changed source script is
+rejected; see the [recovery validation record](tests/fixtures/av1an-recovery-validation.md)
+for the tested scope.
+
+Source files are never modified; caches stay in the
 reserved output workspace, even when the output folder also contains the source.
 
 **Film grain synthesis** accepts 0–50, default 0 (off). Nonzero values add AV1
@@ -247,10 +265,12 @@ the source and output, so preparing/finalizing can take time for large files.
 Cancel stops the owned process trees and removes temporary output. Closing the
 app cancels and awaits active and queued jobs. The desktop app saves up to 100 job
 records under its platform data directory. Jobs left unfinished after a crash are
-shown as **Interrupted** on restart; they never resume automatically, signal old
-process IDs, or delete old media paths. Review their output and logs before
-submitting a new job. Encoder frames/chunks cannot be resumed yet. Job settings
-are retained for history; they do not become defaults for new jobs.
+shown as **Interrupted** on restart; they never resume automatically or signal old
+process IDs. Eligible av1an jobs show **Resume** after a saved recovery workspace
+was created. Old jobs without recovery records and standalone jobs require a new
+encode. Recoverable jobs stay in history until successful completion rather than
+being evicted when new jobs arrive. Job settings are retained for history; they
+do not become defaults for new jobs.
 
 History uses an exclusive instance lock and atomic file replacement. If history
 cannot be read or saved, new jobs are blocked and the error remains visible;
@@ -305,6 +325,7 @@ With av1an, VapourSynth and L-SMASH Works installed, run its integration gate:
 
 ```sh
 cargo test -p media-runtime --test av1an_jobs --locked -- --ignored --test-threads=1
+cargo test -p media-runtime --test av1an_recovery --locked -- --ignored --test-threads=1
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 30 4 0 false av1an 2
 ```
 
@@ -346,7 +367,7 @@ directly with argument arrays, bounded output, and timeouts. Job supervision use
 atomic Job Object assignment on Windows 10+ and process groups on Unix. Unix tools
 must not deliberately detach from their process group. Binary pipelines use
 bounded buffers and owned file handles, require success from both stages, and
-stop both trees on failure. Full encode resume and cross-platform native UI
+stop both trees on failure. Standalone encode resume and cross-platform native UI
 qualification remain future gates.
 
 The activity panel retains at most 200 entries in memory. Only its open/closed

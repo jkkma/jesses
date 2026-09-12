@@ -82,9 +82,13 @@ hdr10Fallback: boolean, };
 
 export type EncodeRequest = { source: RemuxRequest, settings: EncodeSettings, };
 
-export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "canceled" | "failed" | "interrupted";
+export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "stopping" | "stopped" | "canceled" | "failed" | "interrupted";
 
-export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, encodeSettings: EncodeSettings | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+export type RecoveryPhase = "encoding" | "finalizing";
+
+export type Av1anRecovery = { workspace: string, phase: RecoveryPhase, completedFrames: number, totalFrames: number, };
+
+export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, encodeSettings: EncodeSettings | null, recovery: Av1anRecovery | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
 
 export type FolderScanRequest = { path: string, recursive: boolean, };
 
