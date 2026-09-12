@@ -145,7 +145,9 @@ async fn batch_persists_all_items_before_spawn_and_stop_sees_all_or_none() {
     let fixture = Fixture::new();
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     let slot = manager.execution.lock().await;
-    let requests = vec![fixture.request(0), fixture.request(1)];
+    let mut requests = vec![fixture.request(0), fixture.request(1)];
+    requests[0].settings.framing.crop.left = 16;
+    requests[1].settings.framing.resize_width = Some(960);
     let (admitted, stopped) = tokio::join!(
         manager.admit_encode_batch(requests.clone()),
         manager.cancel_all_jobs()
@@ -171,6 +173,14 @@ async fn batch_persists_all_items_before_spawn_and_stop_sees_all_or_none() {
     assert_eq!(record["jobs"].as_array().unwrap().len(), 2);
     assert_eq!(record["jobs"][0]["id"], admitted[0].id);
     assert_eq!(record["jobs"][1]["id"], admitted[1].id);
+    assert_eq!(
+        record["jobs"][0]["encodeSettings"]["framing"]["crop"]["left"],
+        16
+    );
+    assert_eq!(
+        record["jobs"][1]["encodeSettings"]["framing"]["resizeWidth"],
+        960
+    );
     assert!(manager.list_jobs().await.iter().all(|job| matches!(
         job.state,
         JobState::Queued | JobState::Canceling | JobState::Canceled
@@ -356,6 +366,7 @@ async fn batch_preflight_processes_stop_and_shutdown_awaits_dropped_requests() {
 #[test]
 fn batch_header_preflight_rejects_unsupported_encoding_before_queueing() {
     let input = BatchEncodeInput {
+        framing: Default::default(),
         audio: Vec::new(),
         input_path: "source.mkv".into(),
         stream_indices: vec![2],
@@ -423,6 +434,7 @@ fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
     };
     for index in [2, 9] {
         let input = BatchEncodeInput {
+            framing: Default::default(),
             audio: Vec::new(),
             input_path: "multi-video.mkv".into(),
             stream_indices: vec![index, 0],
@@ -443,6 +455,7 @@ fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
 #[test]
 fn batch_header_preflight_honors_explicit_hdr10_fallback_for_both_backends() {
     let input = BatchEncodeInput {
+        framing: Default::default(),
         audio: Vec::new(),
         input_path: "hdr-base.mkv".into(),
         stream_indices: vec![2],
@@ -567,6 +580,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     let slot = manager.execution.lock().await;
     let selected = BatchEncodeInput {
+        framing: Default::default(),
         audio: Vec::new(),
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![0],
@@ -579,6 +593,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
                 selected.clone(),
                 selected.clone(),
                 BatchEncodeInput {
+                    framing: Default::default(),
                     audio: Vec::new(),
                     stream_indices: vec![99],
                     ..selected
@@ -640,6 +655,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         .preview_encode_batch(BatchEncodeRequest {
             encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![BatchEncodeInput {
+                framing: Default::default(),
                 audio: Vec::new(),
                 input_path: input.to_string_lossy().into_owned(),
                 stream_indices: vec![0],

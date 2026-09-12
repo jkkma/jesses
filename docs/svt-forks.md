@@ -5,6 +5,10 @@ encode. Selecting a build selects its executable and its supported tuning
 controls. Existing `svtAv1` job history still denotes the original generic SVT
 choice; new fork jobs retain `svtAv1FiveFish` or `svtAv1Hdr` across restarts.
 
+SVT-AV1-HDR is the default in Quick Convert, av1an, and Batch encode. Choose
+5fish for anime; mainline SVT-AV1 remains an additional option. Default selection
+does not turn on HDR10 fallback or reinterpret existing saved job identities.
+
 | Build                                                    | Fresh settings                          | Additional controls                                              |
 | -------------------------------------------------------- | --------------------------------------- | ---------------------------------------------------------------- |
 | SVT-AV1                                                  | CRF 30, preset 4                        | Grain synthesis, HDR10 fallback                                  |

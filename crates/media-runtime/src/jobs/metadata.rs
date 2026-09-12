@@ -206,13 +206,14 @@ pub(super) fn verify_encoded(
     output: &Document,
     video_index: u32,
     expected_codec: &str,
+    expected_dimensions: (u32, u32),
     audio: &[media_core::AudioTrackSettings],
 ) -> Result<(), AppError> {
     verify_inner(
         source,
         selected,
         output,
-        Some((video_index, expected_codec)),
+        Some((video_index, expected_codec, expected_dimensions)),
         audio,
     )
 }
@@ -221,7 +222,7 @@ fn verify_inner(
     source: &Document,
     selected: &[&Stream],
     output: &Document,
-    encoded_video: Option<(u32, &str)>,
+    encoded_video: Option<(u32, &str, (u32, u32))>,
     audio: &[media_core::AudioTrackSettings],
 ) -> Result<(), AppError> {
     let fail = |message: &str| AppError::new("OUTPUT_VALIDATION_FAILED", message, None);
@@ -231,7 +232,13 @@ fn verify_inner(
         ));
     }
     for (expected, actual) in selected.iter().zip(&output.streams) {
-        let encoded = encoded_video.is_some_and(|(index, _)| index == expected.index);
+        let encoded = encoded_video.is_some_and(|(index, _, _)| index == expected.index);
+        let (expected_width, expected_height) = if encoded {
+            let (_, _, (width, height)) = encoded_video.expect("encoded video plan");
+            (Some(width), Some(height))
+        } else {
+            (expected.width, expected.height)
+        };
         let converted_audio = audio.iter().find(|track| {
             track.stream_index == expected.index && track.codec != media_core::AudioCodec::Copy
         });
@@ -255,7 +262,7 @@ fn verify_inner(
         }
         if expected.codec_type != actual.codec_type
             || if encoded {
-                actual.codec_name.as_deref() != encoded_video.map(|(_, codec)| codec)
+                actual.codec_name.as_deref() != encoded_video.map(|(_, codec, _)| codec)
             } else if let Some(track) = converted_audio {
                 actual.codec_name.as_deref()
                     != Some(if track.codec == media_core::AudioCodec::Opus {
@@ -266,8 +273,8 @@ fn verify_inner(
             } else {
                 expected.codec_name != actual.codec_name
             }
-            || expected.width != actual.width
-            || expected.height != actual.height
+            || expected_width != actual.width
+            || expected_height != actual.height
             || converted_audio.map_or_else(
                 || expected.sample_rate.clone(),
                 |track| super::audio::expected_rate(expected, track),
@@ -415,13 +422,31 @@ mod tests {
         let selected = source.selected(&[2, 0, 5]).unwrap();
         let mut output = fixture();
         output.streams.swap(0, 1);
-        verify_encoded(&source, &selected, &output, 0, "h264", &[]).unwrap();
-        assert!(verify_encoded(&source, &selected, &output, 0, "av1", &[]).is_err());
+        verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &[]).unwrap();
+        assert!(verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).is_err());
         output.streams[1].codec_name = Some("av1".into());
-        verify_encoded(&source, &selected, &output, 0, "av1", &[]).unwrap();
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", &[]).is_err());
+        verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).unwrap();
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &[]).is_err());
         output.streams[0].codec_name = Some("aac".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "av1", &[]).is_err());
+        assert!(verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).is_err());
+    }
+
+    #[test]
+    fn framing_uses_planned_dimensions_only_for_the_encoded_video() {
+        let mut source = fixture();
+        let mut copied_video = source.streams[0].clone();
+        copied_video.index = 9;
+        source.streams.insert(2, copied_video);
+        let selected = source.selected(&[2, 0, 9, 5]).unwrap();
+        let mut output = source.clone();
+        output.streams.swap(0, 1);
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).is_err());
+        output.streams[1].width = Some(96);
+        output.streams[1].height = Some(128);
+        verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).unwrap();
+        assert!(verify(&source, &selected, &output).is_err());
+        output.streams[2].width = Some(96);
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).is_err());
     }
 
     #[test]
@@ -443,12 +468,12 @@ mod tests {
             bitrate_kbps: 128,
             channels: media_core::AudioChannels::Preserve,
         }];
-        verify_encoded(&source, &selected, &output, 0, "h264", &tracks).unwrap();
+        verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).unwrap();
         output.streams[1].start_time = Some("0.006".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", &tracks).is_err());
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).is_err());
         output.streams[1].start_time = Some("0".into());
         output.streams[2].nb_read_packets = Some("1".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", &tracks).is_err());
+        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).is_err());
     }
 
     #[test]

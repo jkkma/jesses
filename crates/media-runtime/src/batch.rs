@@ -415,6 +415,7 @@ pub(crate) async fn preview(
     let mut items = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
         let settings = EncodeSettings {
+            framing: input.framing,
             audio: input.audio.clone(),
             video_stream_index: input.video_stream_index,
             crf: request.crf,
@@ -681,6 +682,7 @@ mod tests {
         let manager = crate::JobManager::new(fixture.0.join("logs"));
         let request = BatchEncodeRequest {
             inputs: vec![BatchEncodeInput {
+                framing: Default::default(),
                 audio: Vec::new(),
                 input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
                 stream_indices: vec![0],
@@ -757,12 +759,14 @@ mod tests {
             .preview_encode_batch(BatchEncodeRequest {
                 inputs: vec![
                     BatchEncodeInput {
+                        framing: Default::default(),
                         audio: Vec::new(),
                         input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
                         stream_indices: vec![0],
                         video_stream_index: 0,
                     },
                     BatchEncodeInput {
+                        framing: Default::default(),
                         audio: Vec::new(),
                         input_path: fixture
                             .0

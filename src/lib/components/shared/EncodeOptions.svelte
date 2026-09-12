@@ -7,7 +7,7 @@
     disabled = false,
     allowBackendSelection = true,
     backend = $bindable<EncodeBackend>('standalone'),
-    encoder = 'svtAv1',
+    encoder = 'svtAv1Hdr',
     workers = $bindable<number | undefined>(2),
     filmGrain = $bindable<number | undefined>(0),
     hdr10Fallback = $bindable(false),

@@ -12,12 +12,12 @@ FFmpeg, FFprobe, standalone SVT-AV1, its 5fish and HDR builds, x264, and av1an. 
 parchment-and-rust light theme. The Remux tab copies selected streams from one
 source into a new Matroska file, with progress, cancellation, and output validation.
 
-SVT-AV1 is the primary encoding workflow, with **5fish for anime** and
-**SVT-AV1-HDR for HDR movies** available as distinct builds. Quick Convert drives
+SVT-AV1 is the primary encoding workflow. **SVT-AV1-HDR is the default**,
+**5fish is the anime option**, and mainline SVT-AV1 is also available. Quick Convert drives
 standalone SVT-AV1 and x264 executables. The separate av1an
 tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
 selected audio, subtitles, and attachments by default. Quick Convert and standalone
-batch jobs can convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
+batch jobs can crop and resize each video and convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
@@ -29,10 +29,11 @@ This is a development build, not a release.
 ## Encode a file
 
 Add a local file in Files, open Quick Convert, choose the video and copied tracks,
-and select a new `.mkv` destination. SVT-AV1 starts at CRF 30 and preset 4;
+and select a new `.mkv` destination. The default SVT-AV1-HDR build starts at CRF 30,
+preset 2, and Film grain retention tune. Mainline SVT-AV1 starts at CRF 30 and preset 4;
 CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
-FFmpeg, FFprobe, and the standalone `SvtAv1EncApp`
-must be on PATH. The selected tool and its version appear in the job log.
+FFmpeg and FFprobe must be on PATH. Install the selected standalone SVT build
+using the setup instructions below. The selected tool and its version appear in the job log.
 
 Choose **SVT-AV1 5fish** for anime or **SVT-AV1-HDR** for HDR movies in Quick
 Convert, av1an, or Batch encode. Each build has its own executable, draft settings,
@@ -54,7 +55,7 @@ research preset ranges are not exposed yet.
 
 See [SVT fork setup and validation](docs/svt-forks.md) for pinned tool installation,
 custom executable paths, and the checks covering both workflows.
-Standalone `aomenc`, `vpxenc`, and `x265` drivers remain pending; Quick
+SVT workflow development takes priority. Standalone `aomenc`, `vpxenc`, and `x265` drivers remain pending; Quick
 Convert will expose them as encoder choices as each driver is implemented.
 See the [standalone driver implementation plan](docs/standalone-encoders.md) for
 the remaining architecture and qualification gates.
@@ -91,6 +92,23 @@ phase's speed and remaining time; estimates reset between phases and disappear
 when progress stops arriving. Cancellation stops and awaits the scanner's process tree.
 Selected subtitles and attachments keep their original codecs. Audio remains copied
 unless its per-track conversion setting is explicitly changed.
+
+**Crop and resize:** Quick Convert and standalone Batch encode provide per-file
+crop edges and an optional output width. Crop counts must be nonnegative even
+pixels. Cropping happens before Lanczos resizing; output height follows the
+cropped aspect ratio and rounds to the nearest even pixel, with halfway values
+rounded upward. The form displays source, cropped, and output dimensions.
+Cropped and output dimensions must stay between 64 and 8192 pixels. A larger
+explicit width enlarges the picture; pixels remain square. These controls keep
+the original duration and selected tracks, and retain supported SDR or HDR10
+color metadata. Choosing the HDR encoder leaves dynamic-HDR fallback off.
+
+Framing survives source/build/workflow draft changes and saved jobs; editing
+batch framing requires a fresh preview. Old jobs without framing retain their
+original dimensions. Every source frame is checked at its original size and
+every encoded frame at the planned output size before publication. av1an
+framing, automatic crop, borders, trim, and additional resize modes remain pending.
+See the [crop and resize validation record](tests/fixtures/framing-validation.md).
 
 **Audio conversion:** Quick Convert and standalone Batch encode provide **Copy**, **Opus**, and **AAC**
 for each selected audio track. Copy is the initial setting and retains the source

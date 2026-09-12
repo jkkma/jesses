@@ -9,6 +9,11 @@ VPX, and x265 remain pending; this milestone does not complete those integration
 
 ## Implementation order
 
+SVT-AV1-HDR is the application default, 5fish is the anime option, and mainline
+SVT remains selectable. SVT workflow migration takes priority over adding the
+remaining drivers below. Manual crop and width resize are now available in the
+standalone workflow; see the [validation record](../tests/fixtures/framing-validation.md).
+
 1. Retain an encoder identity independent of the workflow. Keep existing serialized
    SVT defaults and job history readable, and carry the encoder through batch
    requests, immutable queue snapshots, and generated TypeScript contracts.

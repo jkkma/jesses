@@ -325,6 +325,7 @@ impl JobManager {
             &artifact,
             plan.video_index,
             plan.output_codec(),
+            (plan.width, plan.height),
             &settings.audio,
         )?;
         for (track, timeline) in &audio_timelines {
@@ -578,6 +579,9 @@ pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     .collect();
     args.push(input.as_os_str().to_owned());
     args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
+    if let Some(filter) = plan.framing_filter() {
+        args.extend(["-vf".into(), filter.into()]);
+    }
     // All source frames already match this cadence within one timestamp tick.
     // Use it for the Y4M header as well as the encoder, so a reconciled decimal rate
     // cannot be overwritten by the input's declared nominal rate.

@@ -3,6 +3,7 @@ use serde::Deserialize;
 
 use super::metadata::{Document, Stream};
 
+mod framing;
 mod hdr;
 use hdr::{Hdr10, StaticMetadata, validate_side_data};
 mod validation;
@@ -15,6 +16,7 @@ pub(super) struct Plan {
     pub video_index: u32,
     pub width: u32,
     pub height: u32,
+    geometry: framing::Geometry,
     pub fps_num: u32,
     pub fps_den: u32,
     pub cadence_reconciled: bool,
@@ -33,6 +35,7 @@ pub(super) fn unsupported(message: &str) -> AppError {
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     super::audio::validate_settings(settings)?;
+    framing::validate(settings)?;
     let fork_options_valid = (if settings.encoder == VideoEncoder::SvtAv1FiveFish {
         settings.lineart_psy_bias <= 7 && settings.texture_psy_bias <= 7
     } else {
@@ -195,6 +198,7 @@ impl Plan {
                 ));
             }
         };
+        let geometry = framing::Geometry::build(width, height, settings.framing)?;
         let (fps_num, fps_den) = rational(video.avg_frame_rate.as_deref())
             .or_else(|| rational(video.r_frame_rate.as_deref()))
             .ok_or_else(|| unsupported("The source has no usable rational frame rate."))?;
@@ -231,8 +235,9 @@ impl Plan {
                 "yuv420p"
             },
             video_index: video.index,
-            width,
-            height,
+            width: geometry.width,
+            height: geometry.height,
+            geometry,
             fps_num,
             fps_den,
             cadence_reconciled: false,
@@ -278,6 +283,19 @@ impl Plan {
 
     pub fn frame_seconds(&self) -> f64 {
         f64::from(self.fps_den) / f64::from(self.fps_num)
+    }
+
+    pub fn framing_filter(&self) -> Option<String> {
+        self.geometry
+            .filter(self.matrix, self.full_range, self.chroma)
+    }
+
+    fn frame_dimensions(&self, encoded: bool) -> (u32, u32) {
+        if encoded {
+            (self.width, self.height)
+        } else {
+            (self.geometry.source_width, self.geometry.source_height)
+        }
     }
 
     pub fn output_codec(&self) -> &'static str {
@@ -450,9 +468,10 @@ impl Plan {
                     "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
                 ));
             }
+            let (width, height) = self.frame_dimensions(encoded);
             if frame.interlaced_frame != Some(0)
-                || frame.width != Some(self.width)
-                || frame.height != Some(self.height)
+                || frame.width != Some(width)
+                || frame.height != Some(height)
                 || frame.sample_aspect_ratio.as_deref() != Some("1:1")
             {
                 return Err(unsupported(
@@ -588,6 +607,87 @@ pub(super) struct Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framing_validates_original_source_frames_and_transformed_output_frames_separately() {
+        for hdr in [false, true] {
+            let (source, decoded) = if hdr {
+                hdr_source_and_frames()
+            } else {
+                (source(), frames(&["0", "0.042", "0.083"]))
+            };
+            let settings = EncodeSettings {
+                framing: media_core::VideoFraming {
+                    crop: media_core::CropSettings {
+                        left: 16,
+                        right: 16,
+                        ..Default::default()
+                    },
+                    resize_width: Some(64),
+                },
+                ..Default::default()
+            };
+            let selected = source.selected(&[0]).unwrap();
+            let mut plan = Plan::build(&source, &selected, &settings).unwrap();
+            assert_eq!((plan.width, plan.height), (64, 64));
+            assert_eq!(plan.frame_dimensions(false), (128, 96));
+            assert_eq!(
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .unwrap(),
+                3
+            );
+            let mut unchanged_plan =
+                Plan::build(&source, &selected, &EncodeSettings::default()).unwrap();
+            unchanged_plan
+                .validate_source_frames(&decoded, &source.streams[0])
+                .unwrap();
+            assert_eq!(plan.hdr_arguments(), unchanged_plan.hdr_arguments());
+            let mut encoded = source.streams[0].clone();
+            encoded.codec_name = Some("av1".into());
+            encoded.pix_fmt = Some("yuv420p10le".into());
+            assert!(
+                plan.validate_encoded_stream(&source.streams[0], &encoded)
+                    .is_err()
+            );
+            encoded.width = Some(64);
+            encoded.height = Some(64);
+            plan.validate_encoded_stream(&source.streams[0], &encoded)
+                .unwrap();
+            let mut output = Frames {
+                frames: decoded.frames.clone(),
+            };
+            for frame in &mut output.frames {
+                frame.width = Some(64);
+                frame.height = Some(64);
+                frame.pix_fmt = Some("yuv420p10le".into());
+            }
+            assert_eq!(plan.validate_frames(&output, &encoded, true).unwrap(), 3);
+            assert!(
+                plan.validate_source_frames(&output, &source.streams[0])
+                    .is_err()
+            );
+            assert!(plan.validate_frames(&decoded, &encoded, true).is_err());
+            for defect in ["geometry", "depth", "sar", "chroma", "color", "time"] {
+                let mut wrong = Frames {
+                    frames: output.frames.clone(),
+                };
+                let last = wrong.frames.last_mut().unwrap();
+                match defect {
+                    "geometry" => last.width = Some(128),
+                    "depth" => last.pix_fmt = Some("yuv420p".into()),
+                    "sar" => last.sample_aspect_ratio = Some("4:3".into()),
+                    "chroma" => last.chroma_location = Some("center".into()),
+                    "color" => last.color_primaries = Some("bt470bg".into()),
+                    "time" => last.best_effort_timestamp_time = Some("0.100".into()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    plan.validate_frames(&wrong, &encoded, true).is_err(),
+                    "{defect}, HDR {hdr}"
+                );
+            }
+        }
+    }
 
     fn mastering() -> serde_json::Value {
         serde_json::json!({"side_data_type":"Mastering display metadata", "red_x":"34000/50000", "red_y":"16000/50000", "green_x":"13250/50000", "green_y":"34500/50000", "blue_x":"7500/50000", "blue_y":"3000/50000", "white_point_x":"15635/50000", "white_point_y":"16450/50000", "max_luminance":"10000000/10000", "min_luminance":"1/10000"})

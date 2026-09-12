@@ -10,8 +10,8 @@ pub use batch::{
     FolderScanResult,
 };
 pub use jobs::{
-    AudioChannels, AudioCodec, AudioTrackSettings, EncodeBackend, EncodeRequest, EncodeSettings,
-    HdrTune, JobSnapshot, JobState, RemuxRequest, VideoEncoder,
+    AudioChannels, AudioCodec, AudioTrackSettings, CropSettings, EncodeBackend, EncodeRequest,
+    EncodeSettings, HdrTune, JobSnapshot, JobState, RemuxRequest, VideoEncoder, VideoFraming,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -120,6 +120,8 @@ pub fn typescript_contracts() -> String {
         EncodeBackend::decl(&config),
         VideoEncoder::decl(&config),
         HdrTune::decl(&config),
+        CropSettings::decl(&config),
+        VideoFraming::decl(&config),
         EncodeSettings::decl(&config),
         EncodeRequest::decl(&config),
         JobState::decl(&config),

@@ -92,6 +92,9 @@ jobs:
       - name: Verify standalone anime and HDR fork integration
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test svt_forks --locked standalone_forks -- --include-ignored
+      - name: Verify crop, resize, decoded pixels, HDR and batch history
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test framing_jobs --locked -- --include-ignored --test-threads=1
       - run: pnpm contracts:check
       - name: Check the native executable with embedded frontend
         run: pnpm tauri build --debug --no-bundle --target ${{ matrix.target }}

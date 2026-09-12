@@ -6,6 +6,15 @@
   import { errorMessage, fileName, formatDuration } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from '$lib/components/shared/AudioOptions.svelte';
+  import FramingOptions from '$lib/components/shared/FramingOptions.svelte';
+  import {
+    defaultFraming,
+    defaultFramingDraft,
+    validFramingDraft,
+    framingSummary,
+    selectedFraming,
+    type FramingDraft,
+  } from '$lib/components/shared/framing-options';
   import {
     audioSummary,
     defaultAudio,
@@ -52,15 +61,16 @@
     video: number | undefined;
     copies: number[];
     audio: AudioTrackDraft[];
+    framing: FramingDraft;
   };
   const desktop = isDesktop();
   let drafts = $state<Record<string, Draft>>({});
   let nextVersion = 0;
   let crf = $state<number | undefined>(30);
-  let preset = $state(4);
+  let preset = $state(2);
   let backend = $state<EncodeBackend>('standalone');
-  let selectedEncoder = $state<VideoEncoder>('svtAv1');
-  let av1anEncoder = $state<VideoEncoder>('svtAv1');
+  let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
+  let av1anEncoder = $state<VideoEncoder>('svtAv1Hdr');
   const encoder = $derived(backend === 'av1an' ? av1anEncoder : selectedEncoder);
   const options = $derived(encoderOptions(encoder));
   let workers = $state<number | undefined>(2);
@@ -68,7 +78,7 @@
   let hdr10Fallback = $state(false);
   let lineartPsyBias = $state<number | undefined>(0);
   let texturePsyBias = $state<number | undefined>(0);
-  let hdrTune = $state<HdrTune>('visualQuality');
+  let hdrTune = $state<HdrTune>('filmGrain');
   let outputDirectory = $state('');
   let preview = $state<{ key: string; result: BatchEncodePreview } | null>(null);
   let previewing = $state(false);
@@ -148,6 +158,7 @@
               .filter((stream) => stream.kind !== 'video')
               .map((stream) => stream.index),
             audio: defaultAudio(file.streams),
+            framing: defaultFramingDraft(),
           } satisfies Draft,
         ];
       }),
@@ -200,11 +211,23 @@
     }),
   );
   const currentPreview = $derived(preview?.key === draftKey ? preview.result : null);
+  const validFraming = $derived(
+    backend === 'av1an' ||
+      selectedFiles.every((file) =>
+        validFramingDraft(
+          drafts[file.id].framing,
+          file.streams.find(
+            (stream) => stream.kind === 'video' && stream.index === drafts[file.id].video,
+          ),
+        ),
+      ),
+  );
   const ready = $derived(currentPreview?.items.filter((item) => item.request && !item.error) ?? []);
   const canPreview = $derived(
     desktop &&
       toolsReady &&
       validSettings &&
+      validFraming &&
       (backend === 'av1an' ||
         selectedFiles.every((file) =>
           validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams),
@@ -319,6 +342,7 @@
           videoStreamIndex: draft.video!,
           streamIndices: [draft.video!, ...copies.map((stream) => stream.index)],
           audio: backend === 'av1an' ? [] : selectedAudio(draft.audio, draft.copies),
+          framing: backend === 'av1an' ? defaultFraming() : selectedFraming(draft.framing),
         };
       }),
     };
@@ -453,7 +477,7 @@
               {#if encoder === 'x264' && knownHdr(file.streams.find((stream) => stream.index === draft.video))}<p
                   class="disabled-reason"
                 >
-                  HDR is not supported by x264. Deselect this source or choose SVT-AV1.
+                  HDR is not supported by x264. Deselect this source or choose SVT-AV1-HDR.
                 </p>{/if}
               {#if draft.selected}
                 <details class="episode-tracks">
@@ -473,6 +497,17 @@
                         >{/each}</select
                     >
                   </div>
+                  {#if backend === 'standalone'}
+                    <div class="episode-framing">
+                      <FramingOptions
+                        idPrefix={`batch-${draft.version}`}
+                        draft={draft.framing}
+                        stream={videos.find((stream) => stream.index === draft.video)}
+                        disabled={submitting}
+                        onchange={(next) => updateDraft(file.id, { framing: next })}
+                      />
+                    </div>
+                  {/if}
                   <div class="track-choices">
                     {#each file.streams.filter((stream) => stream.kind !== 'video') as stream (stream.index)}<label
                         ><input
@@ -628,6 +663,8 @@
               .length - 1}{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder === 'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
+          </p>{:else if !validFraming}<p class="disabled-reason">
+            Check crop and resize values in each selected episode's video settings.
           </p>{:else if backend === 'standalone' && !selectedFiles.every( (file) => validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams) )}<p
             class="disabled-reason"
           >
@@ -658,6 +695,8 @@
                   >{#if item.error}<span class="preview-error">{item.error.message}</span
                     >{:else if item.request}<span>Ready</span><small class="preview-audio"
                       >{audioSummary(item.request.settings.audio)}</small
+                    ><small class="preview-audio"
+                      >{framingSummary(item.request.settings.framing)}</small
                     >{:else}Unavailable{/if}</td
                 ></tr
               >{/each}</tbody
@@ -757,6 +796,9 @@
     max-height: 240px;
     overflow-y: auto;
     font-size: 12px;
+  }
+  .episode-framing {
+    margin-top: 18px;
   }
   .track-choices span {
     overflow-wrap: anywhere;

@@ -50,7 +50,19 @@ export type VideoEncoder = "svtAv1" | "svtAv1FiveFish" | "svtAv1Hdr" | "x264";
 
 export type HdrTune = "visualQuality" | "filmGrain";
 
+export type CropSettings = { top: number, right: number, bottom: number, left: number, };
+
+export type VideoFraming = { crop: CropSettings,
+/**
+ * Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
+ */
+resizeWidth: number | null, };
+
 export type EncodeSettings = {
+/**
+ * Per-source framing, applied before standalone video encoding.
+ */
+framing: VideoFraming,
 /**
  * Per-source-track overrides; omitted selected audio streams are copied.
  */
@@ -78,7 +90,7 @@ export type FolderScanRequest = { path: string, recursive: boolean, };
 
 export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, skippedCount: number, truncated: boolean, };
 
-export type BatchEncodeInput = { audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+export type BatchEncodeInput = { framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
 export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 

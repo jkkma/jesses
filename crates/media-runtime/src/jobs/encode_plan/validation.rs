@@ -149,9 +149,10 @@ impl Cadence {
                 "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
             ));
         }
+        let (width, height) = self.plan.frame_dimensions(self.encoded);
         if frame.interlaced_frame != Some(0)
-            || frame.width != Some(self.plan.width)
-            || frame.height != Some(self.plan.height)
+            || frame.width != Some(width)
+            || frame.height != Some(height)
             || frame.sample_aspect_ratio.as_deref() != Some("1:1")
         {
             return Err(unsupported(

@@ -19,7 +19,7 @@ pub use media_core::{
     BatchEncodePreview, BatchEncodeRequest, FolderScanRequest, FolderScanResult,
 };
 pub use media_core::{
-    EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState, RemuxRequest,
-    VideoEncoder,
+    CropSettings, EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState,
+    RemuxRequest, VideoEncoder, VideoFraming,
 };
 pub use probe::probe_media;

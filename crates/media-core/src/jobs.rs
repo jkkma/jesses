@@ -15,6 +15,9 @@ pub struct RemuxRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeSettings {
+    /// Per-source framing, applied before standalone video encoding.
+    #[serde(default)]
+    pub framing: VideoFraming,
     /// Per-source-track overrides; omitted selected audio streams are copied.
     #[serde(default)]
     pub audio: Vec<AudioTrackSettings>,
@@ -45,6 +48,7 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            framing: VideoFraming::default(),
             audio: Vec::new(),
             backend: EncodeBackend::default(),
             encoder: VideoEncoder::default(),
@@ -59,6 +63,29 @@ impl Default for EncodeSettings {
             hdr10_fallback: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoFraming {
+    #[serde(default)]
+    pub crop: CropSettings,
+    /// Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
+    #[serde(default)]
+    pub resize_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CropSettings {
+    #[serde(default)]
+    pub top: u32,
+    #[serde(default)]
+    pub right: u32,
+    #[serde(default)]
+    pub bottom: u32,
+    #[serde(default)]
+    pub left: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -205,6 +232,59 @@ pub struct JobSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framing_defaults_preserve_old_history_and_per_file_wire_contracts() {
+        let old_settings: EncodeSettings =
+            serde_json::from_str(r#"{"videoStreamIndex":0,"crf":30,"preset":4}"#).unwrap();
+        let old_input: crate::BatchEncodeInput = serde_json::from_str(
+            r#"{"inputPath":"source.mkv","streamIndices":[0],"videoStreamIndex":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old_settings.framing, VideoFraming::default());
+        assert_eq!(old_input.framing, VideoFraming::default());
+        assert_eq!(
+            serde_json::from_str::<VideoFraming>("{}").unwrap(),
+            VideoFraming::default()
+        );
+        let framing: VideoFraming =
+            serde_json::from_str(r#"{"crop":{"left":16,"right":8},"resizeWidth":960}"#).unwrap();
+        assert_eq!(framing.crop.top, 0);
+        assert_eq!(framing.crop.bottom, 0);
+        assert_eq!(framing.resize_width, Some(960));
+        let settings = EncodeSettings {
+            framing,
+            ..old_settings
+        };
+        let input = crate::BatchEncodeInput {
+            framing,
+            ..old_input
+        };
+        assert_eq!(
+            serde_json::from_value::<EncodeSettings>(serde_json::to_value(&settings).unwrap())
+                .unwrap(),
+            settings
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::BatchEncodeInput>(
+                serde_json::to_value(&input).unwrap()
+            )
+            .unwrap(),
+            input
+        );
+        for malformed in [
+            r#"{"resizeWidth":-2}"#,
+            r#"{"resizeWidth":128.5}"#,
+            r#"{"resizeWidth":4294967296}"#,
+            r#"{"crop":{"left":-2}}"#,
+            r#"{"crop":{"top":2.5}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<VideoFraming>(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
     #[test]
     fn audio_defaults_and_overrides_survive_old_and_new_snapshots() {
         let old: crate::BatchEncodeInput = serde_json::from_str(

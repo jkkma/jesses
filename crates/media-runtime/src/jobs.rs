@@ -201,6 +201,7 @@ impl JobManager {
         request: BatchEncodeRequest,
     ) -> Result<BatchEncodePreview, AppError> {
         encode::validate_settings(&EncodeSettings {
+            framing: Default::default(),
             audio: Vec::new(),
             video_stream_index: 0,
             crf: request.crf,
@@ -308,6 +309,7 @@ impl JobManager {
             let media = crate::batch::inspect_selection(
                 self,
                 &BatchEncodeInput {
+                    framing: request.settings.framing,
                     audio: request.settings.audio.clone(),
                     input_path: request.source.input_path.clone(),
                     stream_indices: request.source.stream_indices.clone(),

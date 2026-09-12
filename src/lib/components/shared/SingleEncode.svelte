@@ -14,6 +14,17 @@
   import { errorMessage } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from './AudioOptions.svelte';
+  import FramingOptions from './FramingOptions.svelte';
+  import {
+    copyFramingDraft,
+    defaultFraming,
+    defaultFramingDraft,
+    framingDimensions,
+    framingSummary,
+    selectedFraming,
+    validFramingDraft,
+    type FramingDraft,
+  } from './framing-options';
   import {
     defaultAudio,
     validAudio,
@@ -62,17 +73,18 @@
     onqueue: (request: EncodeRequest) => Promise<void>;
   } = $props();
   let videoIndex = $state<number | undefined>();
-  let selectedEncoder = $state<VideoEncoder>('svtAv1');
+  let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
   let crf = $state<number | undefined>(30);
-  let preset = $state(4);
+  let preset = $state(2);
   let workers = $state<number | undefined>(2);
   let filmGrain = $state<number | undefined>(0);
   let hdr10Fallback = $state(false);
   let lineartPsyBias = $state<number | undefined>(0);
   let texturePsyBias = $state<number | undefined>(0);
-  let hdrTune = $state<HdrTune>('visualQuality');
+  let hdrTune = $state<HdrTune>('filmGrain');
   let included = $state<number[]>([]);
   let audio = $state<AudioTrackDraft[]>([]);
+  let framing = $state(defaultFramingDraft());
   let destination = $state('');
   let error = $state<string | null>(null);
   let submitting = $state(false);
@@ -88,6 +100,7 @@
     hdrTune: HdrTune;
     included: number[];
     audio: AudioTrackDraft[];
+    framing: FramingDraft;
     destination: string;
   };
   // Each fixed workflow instance owns its source drafts. Navigation keeps both
@@ -105,6 +118,8 @@
   const active = $derived(jobs.find((job) => !terminal(job.state)));
   const videos = $derived(file?.streams.filter((stream) => stream.kind === 'video') ?? []);
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
+  const framingResult = $derived(framingDimensions(framing, selectedVideo));
+  const framingValid = $derived(validFramingDraft(framing, selectedVideo));
   const hdrUnsupported = $derived(encoder === 'x264' && knownHdr(selectedVideo));
   const depthLabel = $derived(
     isSvtEncoder(encoder)
@@ -153,6 +168,7 @@
       selectedVideoSupported &&
       !hdrUnsupported &&
       validSettings &&
+      (chunked || framingValid) &&
       (chunked || validAudio(audio, included, file?.streams ?? [])) &&
       !!destination.trim(),
   );
@@ -173,6 +189,7 @@
       source?.streams.filter((stream) => stream.kind !== 'video').map((stream) => stream.index) ??
       [];
     audio = defaultAudio(source?.streams ?? []);
+    framing = defaultFramingDraft();
     destination =
       source && !source.id.startsWith('jesses-synthetic')
         ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? options.av1anSuffix : options.suffix)
@@ -197,6 +214,7 @@
           hdrTune,
           included: [...included],
           audio: audio.map((track) => ({ ...track })),
+          framing: copyFramingDraft(framing),
           destination,
         });
       }
@@ -216,6 +234,7 @@
         } = draft);
         included = [...draft.included];
         audio = draft.audio.map((track) => ({ ...track }));
+        framing = copyFramingDraft(draft.framing);
         error = null;
       } else {
         reset(source);
@@ -282,6 +301,7 @@
           texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
           hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
           audio: chunked ? [] : selectedAudio(audio, included),
+          framing: chunked ? defaultFraming() : selectedFraming(framing),
         },
       });
     } catch (cause) {
@@ -307,7 +327,7 @@
       <p>
         {chunked
           ? 'Detect scenes and encode AV1 chunks in parallel with your selected SVT-AV1 build.'
-          : 'Choose SVT-AV1, 5fish for anime, SVT-AV1-HDR for HDR movies, or x264 for H.264.'}
+          : 'Start with SVT-AV1-HDR, choose 5fish for anime, or use standard SVT-AV1 or x264.'}
       </p>
     </div>
     <span class="status-label"
@@ -319,12 +339,12 @@
     {#if encoder === 'x264'}<p>
         Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
         The source's 8-bit or 10-bit depth is retained when supported by the installed x264 build.
-        HDR, resizing, and interlacing are not supported. Source compatibility and encoder depth
-        support are checked before encoding.
+        HDR and interlacing are not supported. Source compatibility and encoder depth support are
+        checked before encoding.
       </p>{:else}<p>
         Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
-        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing, and
-        resizing are not supported yet. Source compatibility is checked before encoding.
+        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation and interlacing are
+        not supported. Source compatibility is checked before encoding.
       </p>{/if}
   </div>
   {#if error}<div class="notice error-notice" role="alert">
@@ -373,7 +393,7 @@
             <p>
               {chunked
                 ? 'av1an encodes the first video track only.'
-                : `Standalone ${options.name} executable · ${depthLabel} ${options.codec} · Source dimensions and frame rate`}
+                : `Standalone ${options.name} executable · ${depthLabel} ${options.codec} · Source frame rate`}
             </p>
           </div>
           <div class="field">
@@ -414,6 +434,17 @@
             bind:texturePsyBias
             bind:hdrTune
           />
+          {#if !chunked}
+            <div class="full-width">
+              <FramingOptions
+                {idPrefix}
+                draft={framing}
+                stream={selectedVideo}
+                {disabled}
+                onchange={(next) => (framing = next)}
+              />
+            </div>
+          {/if}
         </div>
       </section>
       <section class="panel settings-panel">
@@ -514,6 +545,13 @@
                 ? 'Audio copied when selected'
                 : audioSummary(audio.filter((track) => included.includes(track.streamIndex)))}</span
             >
+            {#if !chunked}
+              <span
+                >{framingResult.error
+                  ? 'Check crop and resize values'
+                  : framingSummary(selectedFraming(framing))}</span
+              >
+            {/if}
           </p>
         </div>
         <Button class="start-encode" onclick={() => start()} disabled={!canStart}
@@ -539,7 +577,7 @@
             av1an requires the first video track. Use Quick Convert for another video track.
           </p>
         {:else if hdrUnsupported}<p class="disabled-reason">
-            x264 supports SDR sources only. Choose SVT-AV1 for compatible HDR10 video.
+            x264 supports SDR sources only. Choose SVT-AV1-HDR for compatible HDR10 video.
           </p>
         {:else if !validSettings}<p class="disabled-reason">
             Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
@@ -547,6 +585,9 @@
             'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{chunked ? '; parallel chunks 1–32' : ''}.
+          </p>
+        {:else if !chunked && !framingValid}<p class="disabled-reason">
+            {framingResult.error}
           </p>
         {:else if !chunked && !validAudio(audio, included, file?.streams ?? [])}<p
             class="disabled-reason"
