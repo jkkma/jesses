@@ -21,6 +21,8 @@ pub struct FolderScanResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEncodeInput {
+    #[serde(default)]
+    pub audio: Vec<crate::AudioTrackSettings>,
     pub input_path: String,
     pub stream_indices: Vec<u32>,
     pub video_stream_index: u32,

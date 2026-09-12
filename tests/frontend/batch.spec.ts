@@ -198,6 +198,7 @@ async function desktopMock(
                       lineartPsyBias: request.lineartPsyBias,
                       texturePsyBias: request.texturePsyBias,
                       hdrTune: request.hdrTune,
+                      audio: input.audio,
                     },
                   },
                   error: null,
@@ -460,9 +461,14 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
       workspace.getByRole('button', { name: 'Preview batch', exact: true }),
     ).toBeEnabled();
   }
-  await workspace.getByText('Video and copied tracks · 3 copies', { exact: true }).first().click();
+  await workspace
+    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
+    .first()
+    .click();
   await workspace.getByLabel('Video stream for Episode 1.mkv', { exact: true }).selectOption('9');
-  await workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await workspace
+    .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
+    .uncheck();
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   const preview = page.getByRole('region', { name: 'Batch output preview' });
   await expect(preview).toContainText('2 ready / 2 reviewed');
@@ -484,8 +490,13 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
     outputDirectory: 'C:\\exports',
     ...settings,
     inputs: [
-      { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11] },
-      { inputPath: episodes[1].path, videoStreamIndex: 2, streamIndices: [2, 5, 8, 11] },
+      { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11], audio: [] },
+      {
+        inputPath: episodes[1].path,
+        videoStreamIndex: 2,
+        streamIndices: [2, 5, 8, 11],
+        audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+      },
     ],
   });
   await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
@@ -497,7 +508,7 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
         outputPath: 'C:\\exports\\Episode 1_x264.mkv',
         streamIndices: [9, 8, 11],
       },
-      settings: { ...settings, videoStreamIndex: 9 },
+      settings: { ...settings, videoStreamIndex: 9, audio: [] },
     },
     {
       source: {
@@ -505,7 +516,11 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
         outputPath: 'C:\\exports\\Episode 2_x264.mkv',
         streamIndices: [2, 5, 8, 11],
       },
-      settings: { ...settings, videoStreamIndex: 2 },
+      settings: {
+        ...settings,
+        videoStreamIndex: 2,
+        audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+      },
     },
   ]);
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
@@ -530,13 +545,18 @@ test('x264 batch encoder switches restore source choices and common settings whi
   await workspace.getByLabel('CRF', { exact: true }).fill('29');
   await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
   await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
-  await workspace.getByText('Video and copied tracks · 3 copies', { exact: true }).first().click();
-  await workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await workspace
+    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
+    .first()
+    .click();
+  await workspace
+    .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
+    .uncheck();
   await encoder.selectOption('x264');
   await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
   await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
   await expect(
-    workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }),
+    workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
   ).toBeChecked();
   await workspace.getByLabel('CRF', { exact: true }).fill('19');
   await workspace.getByLabel('Preset', { exact: true }).selectOption('8');
@@ -547,12 +567,12 @@ test('x264 batch encoder switches restore source choices and common settings whi
   await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).toBeChecked();
   await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
   await expect(
-    workspace.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }),
+    workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
   ).not.toBeChecked();
   await encoder.selectOption('x264');
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
   await expect(encoder).toHaveCount(0);
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
+  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('30');
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   await expect(
     workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
@@ -560,8 +580,8 @@ test('x264 batch encoder switches restore source choices and common settings whi
   expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toMatchObject({
     backend: 'av1an',
     encoder: 'svtAv1',
-    crf: 29,
-    filmGrain: 8,
+    crf: 30,
+    filmGrain: 0,
   });
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
   await expect(encoder).toHaveValue('x264');
@@ -733,9 +753,12 @@ test('batch defaults preserve original per-file stream indices and keep attachme
   await openBatch(page);
   await expect(page.getByLabel('CRF', { exact: true })).toHaveValue('30');
   await expect(page.getByLabel('Preset', { exact: true })).toHaveValue('4');
-  await page.getByText('Video and copied tracks · 3 copies', { exact: true }).first().click();
+  await page
+    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
+    .first()
+    .click();
   await page.getByLabel('Video stream for Episode 1.mkv', { exact: true }).selectOption('9');
-  await page.getByLabel('Copy stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await page.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }).uncheck();
   await page.getByLabel('CRF', { exact: true }).fill('27');
   await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
   await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
@@ -755,8 +778,13 @@ test('batch defaults preserve original per-file stream indices and keep attachme
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
       inputs: [
-        { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11] },
-        { inputPath: episodes[1].path, videoStreamIndex: 2, streamIndices: [2, 5, 8, 11] },
+        { inputPath: episodes[0].path, videoStreamIndex: 9, streamIndices: [9, 8, 11], audio: [] },
+        {
+          inputPath: episodes[1].path,
+          videoStreamIndex: 2,
+          streamIndices: [2, 5, 8, 11],
+          audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+        },
       ],
     },
   });
@@ -1046,4 +1074,124 @@ test('batch rejects invalid parallel chunk counts before native preview', async 
   await workspace.getByLabel('Parallel chunks', { exact: true }).fill('2');
   await expect(preview).toBeEnabled();
   expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
+});
+
+test('batch audio converts independently per source and queues reviewed immutable settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+  const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
+  await first.locator('summary').click();
+  await second.locator('summary').click();
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
+  await first.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
+  await expect(second.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(preview.inputs.map((input) => input.audio)).toEqual([
+    [{ streamIndex: 5, codec: 'opus', bitrateKbps: 192, channels: 'stereo' }],
+    [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+  ]);
+  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued.map((request) => request.settings.audio)).toEqual(
+    preview.inputs.map((input) => input.audio),
+  );
+  await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
+  await first.locator('summary').click();
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+    'Audio #5 → Opus 192 kb/s · stereo',
+  );
+  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
+});
+
+for (const edit of ['codec', 'bitrate', 'channels', 'selection'] as const) {
+  test(`batch audio ${edit} changes discard an outstanding preview`, async ({ page }) => {
+    await desktopMock(page, { held: ['preview'] });
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+    await first.locator('summary').click();
+    await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
+    if (edit === 'codec')
+      await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+    if (edit === 'bitrate') await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
+    if (edit === 'channels')
+      await first.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+    if (edit === 'selection')
+      await first
+        .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
+        .uncheck();
+    await release(page, 'preview');
+    await expect(
+      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+      'Review required before queueing',
+    );
+    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+    await expect(
+      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
+    ).toBeEnabled();
+  });
+}
+
+test('batch audio drafts are isolated by encoder and workflow, with av1an using copy', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+  await first.locator('summary').click();
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
+  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await expect(workspace.getByLabel('Audio codec', { exact: true })).toHaveCount(0);
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(preview.inputs.every((input) => input.audio.length === 0)).toBe(true);
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
+  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
+});
+
+test('batch invalid audio blocks preview only for selected source tracks', async ({ page }) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+  await first.locator('summary').click();
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await first.getByLabel('Audio bitrate', { exact: true }).fill('');
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  await expect(preview).toBeDisabled();
+  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).uncheck();
+  await expect(preview).toBeEnabled();
+  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).check();
+  await first.locator('summary').click();
+  await expect(preview).toBeDisabled();
+  await first.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }).uncheck();
+  await expect(preview).toBeEnabled();
+  await preview.click();
+  const request = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(request.inputs[0].audio).toEqual([]);
+  expect(request.inputs[0].streamIndices).toEqual([2, 8, 11]);
 });

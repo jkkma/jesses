@@ -1,7 +1,7 @@
 pub(super) use super::encode_plan::validate_settings;
 use super::encode_plan::{Plan, Validation};
 #[path = "frame_scan.rs"]
-mod frame_scan;
+pub(super) mod frame_scan;
 #[path = "x264.rs"]
 mod x264;
 use super::*;
@@ -108,6 +108,38 @@ impl JobManager {
         .await?;
         let selected = document.selected(&request.stream_indices)?;
         let mut plan = Plan::build(&document, &selected, settings)?;
+        audio::check_encoders(&ffmpeg, settings, cancel).await?;
+        if audio::converted(settings).next().is_some() {
+            self.phase(
+                id,
+                JobState::Preparing,
+                "Checking audio codec delay with the installed FFmpeg and FFprobe.",
+            )
+            .await;
+            scratch.push(Temporary::create(&output, &format!("{id}-audio-tools"))?);
+            audio::check_delay_support(
+                &ffmpeg,
+                &ffprobe,
+                scratch.last().expect("owned audio tool probe"),
+                cancel,
+            )
+            .await?;
+        }
+        let mut audio_timelines = Vec::new();
+        for track in audio::converted(settings) {
+            let source_track = selected
+                .iter()
+                .find(|stream| stream.index == track.stream_index)
+                .expect("validated audio selection");
+            self.phase(
+                id,
+                JobState::Preparing,
+                "Decoding selected audio to verify its complete sample timeline.",
+            )
+            .await;
+            let timeline = audio::scan(&ffprobe, &source.path, source_track, false, cancel).await?;
+            audio_timelines.push((track, timeline));
+        }
         if settings.backend == media_core::EncodeBackend::Av1an {
             super::av1an::validate_encoder_path(&encoder)?;
             super::av1an::validate_input(&document, &plan)?;
@@ -216,8 +248,8 @@ impl JobManager {
                 cwd: None,
             };
             self.phase(id, JobState::Running, match settings.encoder {
-                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "Encoding 10-bit AV1 with the standalone SVT encoder; selected tracks will be copied afterward.",
-                VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected tracks will be copied afterward.",
+                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "Encoding 10-bit AV1 with the standalone SVT encoder; selected audio settings will be applied afterward.",
+                VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected audio settings will be applied afterward.",
             }).await;
             let (sender, events) = mpsc::channel(256);
             let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
@@ -246,7 +278,7 @@ impl JobManager {
                 snapshot.state = JobState::Finalizing;
             }
             snapshot.progress_seconds = None;
-            append_log(snapshot, "Muxing encoded video with the selected original audio, subtitles, metadata, chapters, and attachments.".into());
+            append_log(snapshot, "Muxing encoded video, applying selected audio settings, and preserving subtitles, metadata, chapters, and attachments.".into());
         }).await;
         let mux_log = log_path.with_extension("mux.log");
         let (sender, events) = mpsc::channel(256);
@@ -260,6 +292,7 @@ impl JobManager {
                     &temp.path,
                     &selected,
                     &plan,
+                    settings,
                 ),
                 cwd: None,
             },
@@ -292,7 +325,30 @@ impl JobManager {
             &artifact,
             plan.video_index,
             plan.output_codec(),
+            &settings.audio,
         )?;
+        for (track, timeline) in &audio_timelines {
+            let position = selected
+                .iter()
+                .position(|stream| stream.index == track.stream_index)
+                .expect("selected audio");
+            let decoded = audio::scan(
+                &ffprobe,
+                &temp.path,
+                &artifact.streams[position],
+                true,
+                cancel,
+            )
+            .await?;
+            let evidence = audio::verify_timeline(timeline, &decoded, track.codec)?;
+            self.change(id, |snapshot| {
+                append_log(
+                    snapshot,
+                    format!("Source audio stream {}: {evidence}", track.stream_index),
+                )
+            })
+            .await;
+        }
         let position = selected
             .iter()
             .position(|s| s.index == plan.video_index)
@@ -700,6 +756,7 @@ fn mux_args(
     output: &Path,
     selected: &[&metadata::Stream],
     plan: &Plan,
+    settings: &EncodeSettings,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-hide_banner",
@@ -715,6 +772,11 @@ fn mux_args(
     .map(OsString::from)
     .collect();
     args.push(input.as_os_str().to_owned());
+    if audio::converted(settings).next().is_some() {
+        // Codec delay can create negative packet DTS. Keep source timestamps
+        // and prohibit the muxer from shifting every track to compensate.
+        args.insert(0, "-copyts".into());
+    }
     args.push("-i".into());
     args.push(ivf.as_os_str().to_owned());
     for stream in selected {
@@ -733,6 +795,11 @@ fn mux_args(
             .map(OsString::from),
     );
     for (index, stream) in selected.iter().enumerate() {
+        let converted_audio =
+            audio::converted(settings).find(|track| track.stream_index == stream.index);
+        if let Some(track) = converted_audio {
+            audio::append_arguments(&mut args, index, track, stream);
+        }
         args.extend([
             format!("-map_metadata:s:{index}").into(),
             format!("0:s:{}", stream.index).into(),
@@ -757,6 +824,8 @@ fn mux_args(
                 format!("-aspect:{index}").into(),
                 format!("{}:{}", plan.width, plan.height).into(),
             ]);
+        }
+        if stream.index == plan.video_index || converted_audio.is_some() {
             // Keep descriptive tags, but source bitrate/frame/byte statistics
             // and encoder provenance no longer describe this encoded stream.
             // Match the exact source key and output position, including when
@@ -772,6 +841,9 @@ fn mux_args(
                 ]);
             }
         }
+    }
+    if audio::converted(settings).next().is_some() {
+        args.extend(["-avoid_negative_ts".into(), "disabled".into()]);
     }
     args.extend(["-f", "matroska", "-y"].into_iter().map(OsString::from));
     args.push(output.as_os_str().to_owned());
@@ -919,6 +991,7 @@ mod tests {
             Path::new("output.mkv"),
             &selected,
             &plan,
+            &EncodeSettings::default(),
         );
         let cleared: Vec<_> = args
             .windows(2)

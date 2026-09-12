@@ -13,6 +13,14 @@
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
+  import AudioOptions from './AudioOptions.svelte';
+  import {
+    defaultAudio,
+    validAudio,
+    selectedAudio,
+    audioSummary,
+    type AudioTrackDraft,
+  } from './audio-options';
   import {
     encoderOptions,
     requiredEncoderTools,
@@ -64,6 +72,7 @@
   let texturePsyBias = $state<number | undefined>(0);
   let hdrTune = $state<HdrTune>('visualQuality');
   let included = $state<number[]>([]);
+  let audio = $state<AudioTrackDraft[]>([]);
   let destination = $state('');
   let error = $state<string | null>(null);
   let submitting = $state(false);
@@ -78,6 +87,7 @@
     texturePsyBias: number | undefined;
     hdrTune: HdrTune;
     included: number[];
+    audio: AudioTrackDraft[];
     destination: string;
   };
   // Each fixed workflow instance owns its source drafts. Navigation keeps both
@@ -143,6 +153,7 @@
       selectedVideoSupported &&
       !hdrUnsupported &&
       validSettings &&
+      (chunked || validAudio(audio, included, file?.streams ?? [])) &&
       !!destination.trim(),
   );
   const canStart = $derived(canQueue && !active);
@@ -161,6 +172,7 @@
     included =
       source?.streams.filter((stream) => stream.kind !== 'video').map((stream) => stream.index) ??
       [];
+    audio = defaultAudio(source?.streams ?? []);
     destination =
       source && !source.id.startsWith('jesses-synthetic')
         ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? options.av1anSuffix : options.suffix)
@@ -184,6 +196,7 @@
           texturePsyBias,
           hdrTune,
           included: [...included],
+          audio: audio.map((track) => ({ ...track })),
           destination,
         });
       }
@@ -202,6 +215,7 @@
           destination,
         } = draft);
         included = [...draft.included];
+        audio = draft.audio.map((track) => ({ ...track }));
         error = null;
       } else {
         reset(source);
@@ -267,6 +281,7 @@
           lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
           texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
           hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
+          audio: chunked ? [] : selectedAudio(audio, included),
         },
       });
     } catch (cause) {
@@ -304,13 +319,12 @@
     {#if encoder === 'x264'}<p>
         Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
         The source's 8-bit or 10-bit depth is retained when supported by the installed x264 build.
-        HDR, resizing, interlacing, and audio encoding are not supported. Source compatibility and
-        encoder depth support are checked before encoding.
+        HDR, resizing, and interlacing are not supported. Source compatibility and encoder depth
+        support are checked before encoding.
       </p>{:else}<p>
         Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
-        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing,
-        resizing, and audio encoding are not supported yet. Source compatibility is checked before
-        encoding.
+        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation, interlacing, and
+        resizing are not supported yet. Source compatibility is checked before encoding.
       </p>{/if}
   </div>
   {#if error}<div class="notice error-notice" role="alert">
@@ -406,20 +420,21 @@
         <div class="section-heading">
           <span class="heading-with-icon"
             ><AudioLines size={16} aria-hidden="true" /><span class="eyebrow"
-              >Copy source tracks</span
+              >{chunked ? 'Copy source tracks' : 'Audio & source tracks'}</span
             ></span
           >
         </div>
         <p class="copy-note">
-          Selected audio, subtitles, and attachments are copied without encoding. Audio keeps its
-          source codec and channels.
+          {chunked
+            ? 'Selected audio, subtitles, and attachments are copied without encoding. Audio keeps its source codec and channels.'
+            : 'Choose Copy source, Opus, or AAC for each selected audio track. Subtitles and attachments are copied.'}
         </p>
         <div class="copy-streams">
           {#each copiedStreams as stream (stream.index)}
             <label class="copy-stream"
               ><input
                 type="checkbox"
-                aria-label={`Copy stream #${stream.index}`}
+                aria-label={`${stream.kind === 'audio' ? 'Include audio' : 'Copy'} stream #${stream.index}`}
                 checked={included.includes(stream.index)}
                 {disabled}
                 onchange={() => toggle(stream.index)}
@@ -432,6 +447,22 @@
                 ></span
               >
             </label>
+            {#if !chunked && stream.kind === 'audio' && included.includes(stream.index)}
+              {@const settings = audio.find((track) => track.streamIndex === stream.index)}
+              {#if settings}
+                <AudioOptions
+                  {idPrefix}
+                  {stream}
+                  {settings}
+                  {disabled}
+                  onchange={(next) => {
+                    audio = audio.map((track) =>
+                      track.streamIndex === next.streamIndex ? next : track,
+                    );
+                  }}
+                />
+              {/if}
+            {/if}
           {:else}<p class="small-muted">No additional tracks to copy.</p>{/each}
         </div>
       </section>
@@ -467,7 +498,7 @@
         <div class="output-summary">
           <Clapperboard size={15} aria-hidden="true" />
           <p>
-            <strong>{depthLabel} {options.codec} + copied tracks</strong><span
+            <strong>{depthLabel} {options.codec}</strong><span
               >{backend === 'av1an'
                 ? `av1an / ${options.name} · ${workers ?? '—'} workers`
                 : `Standalone ${options.name}`} · CRF
@@ -477,6 +508,11 @@
                 texturePsyBias,
                 hdrTune,
               })}{isSvtEncoder(encoder) ? ` · Grain ${filmGrain ?? '—'}` : ''} · MKV</span
+            >
+            <span
+              >{chunked
+                ? 'Audio copied when selected'
+                : audioSummary(audio.filter((track) => included.includes(track.streamIndex)))}</span
             >
           </p>
         </div>
@@ -511,6 +547,11 @@
             'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{chunked ? '; parallel chunks 1–32' : ''}.
+          </p>
+        {:else if !chunked && !validAudio(audio, included, file?.streams ?? [])}<p
+            class="disabled-reason"
+          >
+            Check the bitrate range shown for each selected audio track. Use whole numbers.
           </p>
         {:else if active}<p class="disabled-reason">
             A job is active. Add this encode to the queue to run it next.

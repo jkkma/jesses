@@ -38,13 +38,23 @@ export type AppError = { code: string, message: string, path: string | null, };
 
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
 
+export type AudioCodec = "copy" | "opus" | "aac";
+
+export type AudioChannels = "preserve" | "mono" | "stereo";
+
+export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, };
+
 export type EncodeBackend = "standalone" | "av1an";
 
 export type VideoEncoder = "svtAv1" | "svtAv1FiveFish" | "svtAv1Hdr" | "x264";
 
 export type HdrTune = "visualQuality" | "filmGrain";
 
-export type EncodeSettings = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number, crf: number, preset: number,
+export type EncodeSettings = {
+/**
+ * Per-source-track overrides; omitted selected audio streams are copied.
+ */
+audio: Array<AudioTrackSettings>, backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number, crf: number, preset: number,
 /**
  * AV1 grain synthesis strength; zero leaves synthesis disabled.
  */
@@ -68,7 +78,7 @@ export type FolderScanRequest = { path: string, recursive: boolean, };
 
 export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, skippedCount: number, truncated: boolean, };
 
-export type BatchEncodeInput = { inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+export type BatchEncodeInput = { audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
 export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 

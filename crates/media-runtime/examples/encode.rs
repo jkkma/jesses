@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|s| s.kind == "video")
         .ok_or("No video stream")?;
     let settings = EncodeSettings {
+        audio: Vec::new(),
         video_stream_index: video.index,
         encoder,
         crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(

@@ -16,12 +16,13 @@ SVT-AV1 is the primary encoding workflow, with **5fish for anime** and
 **SVT-AV1-HDR for HDR movies** available as distinct builds. Quick Convert drives
 standalone SVT-AV1 and x264 executables. The separate av1an
 tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
-selected audio, subtitles, and attachments. SVT-AV1 supports validated HDR10 output
+selected audio, subtitles, and attachments by default. Quick Convert and standalone
+batch jobs can convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
 Jobs run sequentially, and their settings and history survive restart. Multi-source
-muxing, thumbnails, audio conversion, additional standalone encoders, av1an quality
+muxing, thumbnails, additional audio/video encoders, av1an quality
 targets and configurable chunk methods, pause/resume, and bundled media tools remain pending.
 This is a development build, not a release.
 
@@ -88,7 +89,41 @@ available logical processors. Preparation and finalization show separate scan
 progress. After observing progress for five seconds, the app estimates the current
 phase's speed and remaining time; estimates reset between phases and disappear
 when progress stops arriving. Cancellation stops and awaits the scanner's process tree.
-Selected non-video tracks keep their original codecs.
+Selected subtitles and attachments keep their original codecs. Audio remains copied
+unless its per-track conversion setting is explicitly changed.
+
+**Audio conversion:** Quick Convert and standalone Batch encode provide **Copy**, **Opus**, and **AAC**
+for each selected audio track. Copy is the initial setting and retains the source
+audio. Conversion offers 32–512 kb/s (initially 128 kb/s) and **Preserve source**,
+**Mono**, or **Stereo** channel choices. The bitrate is the target for that track,
+without hidden scaling by channel count. The upper limit adjusts to the codec,
+sample rate, and channel count; mono Opus is limited to 256 kb/s. Deselecting a
+track omits it from the output.
+
+Opus uses FFmpeg's `libopus` encoder at 48 kHz. AAC uses FFmpeg's native AAC-LC
+encoder at the supported source sample rate. Use a matching FFmpeg and FFprobe
+pair from 8.1 or newer. A small synthetic preflight checks that both tools correctly
+handle AAC priming before conversion starts. Older tools remain usable for copied
+audio. Required encoders and source channel
+layouts are checked before video encoding. Track order, titles, languages,
+dispositions, chapters, subtitles, and attachments retain the selected mapping.
+Obsolete encoder and bitrate statistics are removed from converted audio tracks.
+
+The runtime decodes each converted source and output audio track, checks continuous
+timestamps, and compares audible start times and sample counts after codec delay
+has been applied. AAC may retain padding in its final 1024-sample frame; this does
+not shift the beginning of the audio or any video timestamps. Copied audio retains
+the existing copy validation. Conversion adds work to preparation and finalization,
+and these checks remain cancellable. Bounded source timestamp rounding is measured
+against its declared time base. Converted audio follows the validated sample clock
+while preserving its first decoded timestamp; no samples are inserted or dropped
+to hide a timing gap.
+
+Each file in a batch owns its audio choices. Changing them requires a new batch
+preview, and a queued job keeps its submitted settings. Older saved jobs without
+audio settings still copy their selected audio. The av1an workflow remains
+copy-only for this milestone. Other audio codecs and loudness normalization remain
+pending. See the [audio validation record](tests/fixtures/audio-validation.md).
 
 Open the separate **av1an** tab to use scene detection and parallel encoding with
 1–32 workers (default 2), capped at 240 frames
@@ -244,6 +279,7 @@ cargo run -p media-runtime --example inspect -- /path/to/video.mkv
 cargo run -p media-runtime --example remux -- /path/to/video.mkv /path/to/new-output.mkv
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 30 4
 cargo test -p media-runtime --test x264_jobs --locked -- --ignored --test-threads=1
+cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 23 5 0 false standalone 2 x264
 ```
 
@@ -258,6 +294,8 @@ The encode example's optional arguments are CRF, preset, grain strength, explici
 HDR10 fallback (`true`/`false`), workflow (`standalone`/`av1an`), worker count, and
 encoder (`svtAv1`/`x264`). The old `svtAv1` workflow name remains accepted by the
 example and when loading older history. x264 integration tests require x264 on PATH.
+For a complete immutable request including per-track audio settings, run
+`cargo run -p media-runtime --example encode_request -- /path/to/request.json`.
 See the upstream [av1an CLI reference](https://rust-av.github.io/Av1an/) and
 [SVT-AV1 parameters](https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/v4.0.0/Docs/Parameters.md)
 for the underlying tools.

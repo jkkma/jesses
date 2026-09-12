@@ -5,6 +5,14 @@
   import { chooseOutputFolder, isDesktop, previewEncodeBatch } from '$lib/ipc/client';
   import { errorMessage, fileName, formatDuration } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
+  import AudioOptions from '$lib/components/shared/AudioOptions.svelte';
+  import {
+    audioSummary,
+    defaultAudio,
+    selectedAudio,
+    validAudio,
+    type AudioTrackDraft,
+  } from '$lib/components/shared/audio-options';
   import {
     encoderOptions,
     requiredEncoderTools,
@@ -43,6 +51,7 @@
     selected: boolean;
     video: number | undefined;
     copies: number[];
+    audio: AudioTrackDraft[];
   };
   const desktop = isDesktop();
   let drafts = $state<Record<string, Draft>>({});
@@ -78,18 +87,18 @@
     texturePsyBias: number | undefined;
     hdrTune: HdrTune;
   };
-  const savedSettings = new Map<VideoEncoder, CommonSettings>();
-  const savedDrafts = new Map<VideoEncoder, Record<string, Draft>>();
-  let activeEncoder: VideoEncoder | null = null;
+  const savedSettings = new Map<string, CommonSettings>();
+  const savedDrafts = new Map<string, Record<string, Draft>>();
+  let activeWorkflow: string | null = null;
 
   $effect(() => {
     const currentFiles = files;
-    const currentEncoder = encoder;
+    const currentWorkflow = `${backend}:${encoder}`;
     const prior = untrack(() => {
-      if (activeEncoder === currentEncoder) return drafts;
-      if (activeEncoder !== null) {
-        savedDrafts.set(activeEncoder, drafts);
-        savedSettings.set(activeEncoder, {
+      if (activeWorkflow === currentWorkflow) return drafts;
+      if (activeWorkflow !== null) {
+        savedDrafts.set(activeWorkflow, drafts);
+        savedSettings.set(activeWorkflow, {
           crf,
           preset,
           workers,
@@ -100,7 +109,7 @@
           hdrTune,
         });
       }
-      const priorSettings = savedSettings.get(currentEncoder);
+      const priorSettings = savedSettings.get(currentWorkflow);
       if (priorSettings)
         ({
           crf,
@@ -113,8 +122,8 @@
           hdrTune,
         } = priorSettings);
       else resetSettings();
-      activeEncoder = currentEncoder;
-      return savedDrafts.get(currentEncoder) ?? {};
+      activeWorkflow = currentWorkflow;
+      return savedDrafts.get(currentWorkflow) ?? {};
     });
     let selectedCount = currentFiles.filter(
       (file) => prior[file.id]?.selected && prior[file.id]?.identity === JSON.stringify(file),
@@ -138,6 +147,7 @@
             copies: file.streams
               .filter((stream) => stream.kind !== 'video')
               .map((stream) => stream.index),
+            audio: defaultAudio(file.streams),
           } satisfies Draft,
         ];
       }),
@@ -195,6 +205,10 @@
     desktop &&
       toolsReady &&
       validSettings &&
+      (backend === 'av1an' ||
+        selectedFiles.every((file) =>
+          validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams),
+        )) &&
       !!outputDirectory.trim() &&
       selectedFiles.length > 0 &&
       selectedFiles.length <= 100 &&
@@ -304,6 +318,7 @@
           inputPath: file.path,
           videoStreamIndex: draft.video!,
           streamIndices: [draft.video!, ...copies.map((stream) => stream.index)],
+          audio: backend === 'av1an' ? [] : selectedAudio(draft.audio, draft.copies),
         };
       }),
     };
@@ -373,12 +388,12 @@
     {#if encoder === 'x264'}<p>
         Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
         Each source retains its 8-bit or 10-bit depth when supported by the installed x264 build.
-        HDR is not supported. Selected audio, subtitles, and attachments are copied. Full source and
-        encoder compatibility is checked before each encode.
+        HDR is not supported. Subtitles and attachments are copied. Full source and encoder
+        compatibility is checked before each encode.
       </p>{:else}<p>
         Progressive SDR and compatible HDR10, constant frame rate, square pixels, and 4:2:0 color.
-        HDR10 preserves static HDR metadata. Selected audio, subtitles, and attachments are copied.
-        Full source compatibility is checked before each encode.
+        HDR10 preserves static HDR metadata. Subtitles and attachments are copied. Full source
+        compatibility is checked before each encode.
       </p>{/if}
   </div>
   {#if error}<div class="notice error-notice" role="alert"><p>{error}</p></div>{/if}
@@ -442,7 +457,7 @@
                 </p>{/if}
               {#if draft.selected}
                 <details class="episode-tracks">
-                  <summary>Video and copied tracks · {draft.copies.length} copies</summary>
+                  <summary>Video, audio & source tracks · {draft.copies.length} selected</summary>
                   <div class="field">
                     <label for={`batch-video-${draft.version}`}>Video stream for {file.name}</label
                     ><select
@@ -462,7 +477,7 @@
                     {#each file.streams.filter((stream) => stream.kind !== 'video') as stream (stream.index)}<label
                         ><input
                           type="checkbox"
-                          aria-label={`Copy stream #${stream.index} from ${file.name}`}
+                          aria-label={`${stream.kind === 'audio' ? 'Include audio' : 'Copy'} stream #${stream.index} from ${file.name}`}
                           checked={draft.copies.includes(stream.index)}
                           disabled={submitting}
                           onchange={() => toggleCopy(file.id, stream.index)}
@@ -472,8 +487,33 @@
                             ? ` · ${stream.title}`
                             : ''}</span
                         ></label
-                      >{/each}
+                      >
+                      {#if backend === 'standalone' && stream.kind === 'audio' && draft.copies.includes(stream.index)}
+                        {@const settings = draft.audio.find(
+                          (track) => track.streamIndex === stream.index,
+                        )}
+                        {#if settings}
+                          <AudioOptions
+                            idPrefix={`batch-${draft.version}`}
+                            {stream}
+                            {settings}
+                            disabled={submitting}
+                            onchange={(next) =>
+                              updateDraft(file.id, {
+                                audio: draft.audio.map((track) =>
+                                  track.streamIndex === next.streamIndex ? next : track,
+                                ),
+                              })}
+                          />
+                        {/if}
+                      {/if}
+                    {/each}
                   </div>
+                  <p class="small-muted audio-guidance">
+                    {backend === 'av1an'
+                      ? 'av1an copies selected audio without encoding.'
+                      : 'Audio starts with Copy source. Choose Opus or AAC separately for each selected track.'}
+                  </p>
                 </details>
               {/if}
             </article>
@@ -588,6 +628,10 @@
               .length - 1}{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder === 'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
+          </p>{:else if backend === 'standalone' && !selectedFiles.every( (file) => validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams) )}<p
+            class="disabled-reason"
+          >
+            Check the bitrate range shown for each selected audio track. Use whole numbers.
           </p>{:else if !selectedFiles.length}<p class="disabled-reason">
             Select at least one episode.
           </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">
@@ -612,7 +656,9 @@
                   >{item.outputPath ?? '—'}</td
                 ><td
                   >{#if item.error}<span class="preview-error">{item.error.message}</span
-                    >{:else if item.request}Ready{:else}Unavailable{/if}</td
+                    >{:else if item.request}<span>Ready</span><small class="preview-audio"
+                      >{audioSummary(item.request.settings.audio)}</small
+                    >{:else}Unavailable{/if}</td
                 ></tr
               >{/each}</tbody
           >
@@ -665,13 +711,13 @@
     background: color-mix(in srgb, var(--background) 40%, transparent);
   }
   .episode-choice,
-  .track-choices label {
+  .track-choices > label {
     display: flex;
     gap: 10px;
     align-items: flex-start;
   }
   .episode-choice input,
-  .track-choices input {
+  .track-choices > label > input {
     width: 16px;
     height: 16px;
     flex: 0 0 auto;
@@ -715,6 +761,9 @@
   .track-choices span {
     overflow-wrap: anywhere;
   }
+  .audio-guidance {
+    margin-top: 12px;
+  }
   .batch-settings-content {
     display: grid;
     gap: 16px;
@@ -751,6 +800,12 @@
   }
   .preview-error {
     color: #8b3328;
+  }
+  .preview-audio {
+    display: block;
+    margin-top: 6px;
+    font-size: 10px;
+    color: var(--muted-foreground);
   }
   .preview-placeholder,
   .batch-empty {

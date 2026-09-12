@@ -15,6 +15,9 @@ pub struct RemuxRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeSettings {
+    /// Per-source-track overrides; omitted selected audio streams are copied.
+    #[serde(default)]
+    pub audio: Vec<AudioTrackSettings>,
     #[serde(default)]
     pub backend: EncodeBackend,
     #[serde(default)]
@@ -42,6 +45,7 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            audio: Vec::new(),
             backend: EncodeBackend::default(),
             encoder: VideoEncoder::default(),
             workers: default_workers(),
@@ -55,6 +59,39 @@ impl Default for EncodeSettings {
             hdr10_fallback: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioCodec {
+    #[default]
+    Copy,
+    Opus,
+    Aac,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioChannels {
+    #[default]
+    Preserve,
+    Mono,
+    Stereo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackSettings {
+    pub stream_index: u32,
+    pub codec: AudioCodec,
+    #[serde(default = "default_audio_bitrate")]
+    pub bitrate_kbps: u16,
+    #[serde(default)]
+    pub channels: AudioChannels,
+}
+
+fn default_audio_bitrate() -> u16 {
+    128
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, TS)]
@@ -168,6 +205,28 @@ pub struct JobSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_defaults_and_overrides_survive_old_and_new_snapshots() {
+        let old: crate::BatchEncodeInput = serde_json::from_str(
+            r#"{"inputPath":"source.mkv","streamIndices":[0,1],"videoStreamIndex":0}"#,
+        )
+        .unwrap();
+        assert!(old.audio.is_empty());
+        let track: AudioTrackSettings =
+            serde_json::from_str(r#"{"streamIndex":4,"codec":"opus"}"#).unwrap();
+        assert_eq!(track.bitrate_kbps, 128);
+        assert_eq!(track.channels, AudioChannels::Preserve);
+        let settings = EncodeSettings {
+            audio: vec![track],
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&settings).unwrap();
+        assert_eq!(wire["audio"][0]["codec"], "opus");
+        assert_eq!(
+            serde_json::from_value::<EncodeSettings>(wire).unwrap(),
+            settings
+        );
+    }
     #[test]
     fn older_history_defaults_to_standalone_without_hdr_metadata_loss_or_added_grain() {
         let old: EncodeSettings =

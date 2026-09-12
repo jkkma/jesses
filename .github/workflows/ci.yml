@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm pkg-config libx264-dev libx265-dev libopus-dev libdav1d-dev zlib1g-dev libbz2-dev liblzma-dev
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
@@ -62,6 +62,30 @@ jobs:
       - name: Verify standalone x264 integration
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test x264_jobs --locked -- --include-ignored
+      - name: Verify older audio tools fail before video encoding
+        if: runner.os == 'Linux'
+        env:
+          JESSES_TEST_LEGACY_AUDIO_TOOLS: '1'
+        run: cargo test -p media-runtime --test audio_jobs --locked audio_toolchain_priming_preflight -- --include-ignored
+      - name: Identify FFmpeg source build dependencies
+        if: runner.os == 'Linux'
+        id: ffmpeg-dependencies
+        run: |
+          dpkg-query -W -f='${binary:Package}=${Version}\n' gcc gcc-13 g++ g++-13 binutils make nasm pkg-config libc6-dev libx264-dev libx265-dev libopus-dev libdav1d-dev zlib1g-dev libbz2-dev liblzma-dev > "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
+          cat "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
+          printf 'fingerprint=%s\n' "$(sha256sum "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache the exact FFmpeg source build
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-9.0.1
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg-${{ hashFiles('scripts/ci-install-ffmpeg.py') }}-${{ steps.ffmpeg-dependencies.outputs.fingerprint }}
+      - name: Build the verified audio qualification tool pair
+        if: runner.os == 'Linux'
+        run: python3 scripts/ci-install-ffmpeg.py
+      - name: Verify per-track AAC and Opus conversion
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored
       - name: Install verified 5fish and HDR builds
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-svt-forks.py

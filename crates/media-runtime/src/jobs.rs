@@ -1,6 +1,7 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
+mod audio;
 mod av1an;
 #[cfg(test)]
 mod batch_tests;
@@ -200,6 +201,7 @@ impl JobManager {
         request: BatchEncodeRequest,
     ) -> Result<BatchEncodePreview, AppError> {
         encode::validate_settings(&EncodeSettings {
+            audio: Vec::new(),
             video_stream_index: 0,
             crf: request.crf,
             preset: request.preset,
@@ -306,6 +308,7 @@ impl JobManager {
             let media = crate::batch::inspect_selection(
                 self,
                 &BatchEncodeInput {
+                    audio: request.settings.audio.clone(),
                     input_path: request.source.input_path.clone(),
                     stream_indices: request.source.stream_indices.clone(),
                     video_stream_index: request.settings.video_stream_index,

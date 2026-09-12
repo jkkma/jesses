@@ -356,6 +356,7 @@ async fn batch_preflight_processes_stop_and_shutdown_awaits_dropped_requests() {
 #[test]
 fn batch_header_preflight_rejects_unsupported_encoding_before_queueing() {
     let input = BatchEncodeInput {
+        audio: Vec::new(),
         input_path: "source.mkv".into(),
         stream_indices: vec![2],
         video_stream_index: 2,
@@ -422,6 +423,7 @@ fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
     };
     for index in [2, 9] {
         let input = BatchEncodeInput {
+            audio: Vec::new(),
             input_path: "multi-video.mkv".into(),
             stream_indices: vec![index, 0],
             video_stream_index: index,
@@ -441,6 +443,7 @@ fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
 #[test]
 fn batch_header_preflight_honors_explicit_hdr10_fallback_for_both_backends() {
     let input = BatchEncodeInput {
+        audio: Vec::new(),
         input_path: "hdr-base.mkv".into(),
         stream_indices: vec![2],
         video_stream_index: 2,
@@ -564,6 +567,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     let slot = manager.execution.lock().await;
     let selected = BatchEncodeInput {
+        audio: Vec::new(),
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![0],
         video_stream_index: 0,
@@ -575,6 +579,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
                 selected.clone(),
                 selected.clone(),
                 BatchEncodeInput {
+                    audio: Vec::new(),
                     stream_indices: vec![99],
                     ..selected
                 },
@@ -635,6 +640,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         .preview_encode_batch(BatchEncodeRequest {
             encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![BatchEncodeInput {
+                audio: Vec::new(),
                 input_path: input.to_string_lossy().into_owned(),
                 stream_indices: vec![0],
                 video_stream_index: 0,

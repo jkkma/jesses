@@ -2,6 +2,7 @@
 //! metadata cap: a long movie uses the same parser/validator memory as a clip.
 use std::io::{BufReader, Read};
 
+#[cfg(test)]
 use super::super::encode_plan::Frame;
 
 // Includes all fields and side data for one frame (or an unknown envelope field).
@@ -9,7 +10,10 @@ use super::super::encode_plan::Frame;
 const FRAME_BYTES: usize = 1024 * 1024;
 const MAX_DEPTH: usize = 128;
 
-pub(super) fn parse(reader: &mut dyn Read, mut frame: impl FnMut(Frame)) -> Result<(), String> {
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(
+    reader: &mut dyn Read,
+    mut frame: impl FnMut(T),
+) -> Result<(), String> {
     let mut json = Json {
         bytes: BufReader::with_capacity(64 * 1024, reader).bytes(),
         pending: None,
@@ -35,7 +39,7 @@ pub(super) fn parse(reader: &mut dyn Read, mut frame: impl FnMut(Frame)) -> Resu
                 let mut item = json.required()?;
                 if item != b']' {
                     loop {
-                        let decoded = serde_json::from_slice::<Frame>(json.value(item)?)
+                        let decoded = serde_json::from_slice::<T>(json.value(item)?)
                             .map_err(|error| error.to_string())?;
                         frame(decoded);
                         match json.required()? {
@@ -176,7 +180,7 @@ mod tests {
 
     fn count(input: &[u8]) -> Result<usize, String> {
         let mut count = 0;
-        parse(&mut &*input, |_| count += 1)?;
+        parse(&mut &*input, |_: Frame| count += 1)?;
         Ok(count)
     }
 
@@ -219,7 +223,7 @@ mod tests {
             r#"{"frames":[{"side_data_list":[{"note":"} ] { \\"}],"pix_fmt":"日本語"},{}]}"#
                 .as_bytes();
         let mut frames = 0;
-        parse(&mut Chunks(bytes), |_| frames += 1).unwrap();
+        parse(&mut Chunks(bytes), |_: Frame| frames += 1).unwrap();
         assert_eq!(frames, 2);
     }
 
@@ -247,7 +251,7 @@ mod tests {
     fn late_truncation_never_accepts_the_valid_prefix() {
         let prefix = br#"{"frames":[{},{},{},{},{},{},"#;
         let mut observed = 0;
-        assert!(parse(&mut &prefix[..], |_| observed += 1).is_err());
+        assert!(parse(&mut &prefix[..], |_: Frame| observed += 1).is_err());
         assert_eq!(observed, 6);
     }
 
@@ -282,7 +286,7 @@ mod tests {
         };
         let mut reader = (&br#"{"frames":["#[..]).chain(records).chain(&b"{}]}"[..]);
         let mut count = 0;
-        parse(&mut reader, |_| count += 1).unwrap();
+        parse(&mut reader, |_: Frame| count += 1).unwrap();
         assert_eq!(count, 40_001);
     }
 }

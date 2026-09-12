@@ -15,8 +15,8 @@ pub use discovery::get_capabilities;
 pub use jobs::JobManager;
 pub use media_core::{AppError, MediaFile, MediaStream, ToolInfo};
 pub use media_core::{
-    BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest, FolderScanRequest,
-    FolderScanResult,
+    AudioChannels, AudioCodec, AudioTrackSettings, BatchEncodeInput, BatchEncodeItem,
+    BatchEncodePreview, BatchEncodeRequest, FolderScanRequest, FolderScanResult,
 };
 pub use media_core::{
     EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState, RemuxRequest,

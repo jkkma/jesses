@@ -1,4 +1,5 @@
 import type { EncodeBackend, EncodeSettings, MediaStream, VideoEncoder } from '$lib/ipc/generated';
+import { audioSummary } from './audio-options';
 
 export type HdrTune = EncodeSettings['hdrTune'];
 export const encoderChoices: { value: VideoEncoder; label: string }[] = [
@@ -143,8 +144,8 @@ export function knownHdr(stream: MediaStream | undefined): boolean {
 
 export function encodeSummary(settings: EncodeSettings): string {
   if (settings.encoder === 'x264') {
-    return `Standalone x264 · H.264 · Source bit depth · CRF ${settings.crf} · Preset ${presetLabel('x264', settings.preset)}`;
+    return `Standalone x264 · H.264 · Source bit depth · CRF ${settings.crf} · Preset ${presetLabel('x264', settings.preset)} · ${audioSummary(settings.audio)}`;
   }
   const name = encoderOptions(settings.encoder).name;
-  return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · 10-bit · CRF ${settings.crf} · Preset ${settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'}`;
+  return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · 10-bit · CRF ${settings.crf} · Preset ${settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'} · ${audioSummary(settings.audio)}`;
 }

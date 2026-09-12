@@ -105,6 +105,7 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
     lineartPsyBias: 0,
     texturePsyBias: 0,
     hdrTune: 'visualQuality',
+    audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
   },
   progressSeconds: 3,
   durationSeconds: 12,
@@ -346,6 +347,10 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       lineartPsyBias: 6,
       texturePsyBias: 3,
       hdrTune: 'visualQuality',
+      audio:
+        tab === 'av1an'
+          ? []
+          : [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       filmGrain: 8,
       hdr10Fallback: false,
     });
@@ -373,6 +378,10 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
+      audio:
+        tab === 'av1an'
+          ? []
+          : [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       filmGrain: 0,
       hdr10Fallback: true,
     });
@@ -599,6 +608,7 @@ test('x264 uses its own defaults, preset names, validation, copied tracks, and i
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
+      audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
     },
   });
   const current = page.getByRole('region', { name: 'Current encode job' });
@@ -630,7 +640,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   await encoder.selectOption('x264');
   await quick.getByLabel('Quality', { exact: true }).fill('18');
   await quick.getByLabel('Encoder preset', { exact: true }).selectOption('7');
-  await quick.getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quick.getByLabel('Include audio stream #3', { exact: true }).uncheck();
   await quick
     .getByLabel('Encode destination', { exact: true })
     .fill('C:\\exports\\source-h264.mkv');
@@ -665,7 +675,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   await encoder.selectOption('x264');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('18');
   await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('7');
-  await expect(quick.getByLabel('Copy stream #3', { exact: true })).not.toBeChecked();
+  await expect(quick.getByLabel('Include audio stream #3', { exact: true })).not.toBeChecked();
   await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
     'C:\\exports\\source-h264.mkv',
   );
@@ -673,7 +683,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   await expect(encoder).toHaveValue('x264');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
   await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('5');
-  await expect(quick.getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await expect(quick.getByLabel('Include audio stream #3', { exact: true })).toBeChecked();
   await encoder.selectOption('svtAv1');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
@@ -771,6 +781,7 @@ test('x264 ignores an enqueue error after source replacement and keeps submissio
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
+      audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
     },
   });
 });
@@ -891,7 +902,7 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
   );
   await expect(
     quickWorkspace(page).getByText(
-      'Selected audio, subtitles, and attachments are copied without encoding. Audio keeps its source codec and channels.',
+      'Choose Copy source, Opus, or AAC for each selected audio track. Subtitles and attachments are copied.',
     ),
   ).toBeVisible();
   await page.getByRole('button', { name: 'Start encode', exact: true }).click();
@@ -915,6 +926,7 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'visualQuality',
+              audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
             },
           },
         },
@@ -936,7 +948,7 @@ test('encode draft survives navigation and Reset settings restores defaults', as
   await quickWorkspace(page).getByLabel('Video stream', { exact: true }).selectOption('4');
   await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill('20');
   await quickWorkspace(page).getByLabel('Encoder preset', { exact: true }).selectOption('8');
-  await quickWorkspace(page).getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quickWorkspace(page).getByLabel('Include audio stream #3', { exact: true }).uncheck();
   await quickWorkspace(page).getByLabel('Encode destination', { exact: true }).fill(outputPath);
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
@@ -944,7 +956,7 @@ test('encode draft survives navigation and Reset settings restores defaults', as
   await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('20');
   await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
   await expect(
-    quickWorkspace(page).getByLabel('Copy stream #3', { exact: true }),
+    quickWorkspace(page).getByLabel('Include audio stream #3', { exact: true }),
   ).not.toBeChecked();
   await expect(quickWorkspace(page).getByLabel('Encode destination', { exact: true })).toHaveValue(
     outputPath,
@@ -953,7 +965,9 @@ test('encode draft survives navigation and Reset settings restores defaults', as
   await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
   await expect(quickWorkspace(page).getByLabel('Video stream', { exact: true })).toHaveValue('0');
-  await expect(quickWorkspace(page).getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await expect(
+    quickWorkspace(page).getByLabel('Include audio stream #3', { exact: true }),
+  ).toBeChecked();
 });
 
 for (const missing of ['ffmpeg', 'ffprobe', 'svt-av1']) {
@@ -995,8 +1009,12 @@ test('invalid quality, blank output, and audio-only sources cannot start an enco
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
-  await expect(quickWorkspace(page).getByLabel('Copy stream #12', { exact: true })).toBeChecked();
-  await expect(quickWorkspace(page).getByLabel('Copy stream #3', { exact: true })).toHaveCount(0);
+  await expect(
+    quickWorkspace(page).getByLabel('Include audio stream #12', { exact: true }),
+  ).toBeChecked();
+  await expect(
+    quickWorkspace(page).getByLabel('Include audio stream #3', { exact: true }),
+  ).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   expect(await calls(page, 'start_encode')).toEqual([]);
 });
@@ -1267,6 +1285,7 @@ test('encodes can be queued for different sources while another job is running',
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'visualQuality',
+              audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
             },
           },
         },
@@ -1292,6 +1311,7 @@ test('encodes can be queued for different sources while another job is running',
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'visualQuality',
+              audio: [],
             },
           },
         },
@@ -1396,6 +1416,7 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
     lineartPsyBias: 0,
     texturePsyBias: 0,
     hdrTune: 'visualQuality',
+    audio: [],
   });
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
@@ -1478,7 +1499,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   await quick.getByLabel('Encoder preset', { exact: true }).selectOption('8');
   await quick.getByLabel('Film grain synthesis', { exact: true }).fill('6');
   await quick.getByLabel('Allow HDR10 fallback', { exact: true }).check();
-  await quick.getByLabel('Copy stream #3', { exact: true }).uncheck();
+  await quick.getByLabel('Include audio stream #3', { exact: true }).uncheck();
   await quick.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\standalone.mkv');
 
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
@@ -1487,7 +1508,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   await expect(av1an.getByLabel('Encoder preset', { exact: true })).toHaveValue('4');
   await expect(av1an.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
   await expect(av1an.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
-  await expect(av1an.getByLabel('Copy stream #3', { exact: true })).toBeChecked();
+  await expect(av1an.getByLabel('Include audio stream #3', { exact: true })).toBeChecked();
   await expect(av1an.getByLabel('Video stream', { exact: true })).toHaveValue('0');
   await av1an.getByLabel('Quality', { exact: true }).fill('27');
   await av1an.getByLabel('Encoder preset', { exact: true }).selectOption('5');
@@ -1502,7 +1523,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
   await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('6');
   await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toBeChecked();
-  await expect(quick.getByLabel('Copy stream #3', { exact: true })).not.toBeChecked();
+  await expect(quick.getByLabel('Include audio stream #3', { exact: true })).not.toBeChecked();
   await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
     'C:\\exports\\standalone.mkv',
   );
@@ -1626,6 +1647,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
+      audio: [],
     },
   });
   const current = page.getByRole('region', { name: 'Current encode job' });
@@ -1774,3 +1796,197 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     });
   }
 }
+
+test('per-track audio settings retain source details and queue independent Opus, AAC, and copied tracks', async ({
+  page,
+}) => {
+  const multiAudio = {
+    ...media,
+    streams: [
+      ...media.streams,
+      { ...media.streams[2], index: 10, codec: 'flac', channels: 6, title: 'Surround' },
+      { ...media.streams[2], index: 12, codec: 'ac3', title: 'Commentary' },
+    ],
+  };
+  await desktopMock(page, { media: multiAudio });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const first = quick.getByRole('group', { name: 'Audio settings for stream #3', exact: true });
+  const second = quick.getByRole('group', { name: 'Audio settings for stream #10', exact: true });
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveCount(0);
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  await first.getByLabel('Audio bitrate', { exact: true }).fill('160');
+  await first.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
+  await second.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await second.getByLabel('Audio bitrate', { exact: true }).fill('256');
+  await second.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+  await expect(second).toContainText('Source: flac · 6 channels · 48 kHz');
+  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request.settings.audio).toEqual([
+    { streamIndex: 3, codec: 'opus', bitrateKbps: 160, channels: 'stereo' },
+    { streamIndex: 10, codec: 'aac', bitrateKbps: 256, channels: 'mono' },
+    { streamIndex: 12, codec: 'copy', bitrateKbps: 128, channels: 'preserve' },
+  ]);
+  expect(queued.request.source.streamIndices).toEqual([0, 3, 7, 10, 12, 9]);
+  await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  const current = page.getByRole('region', { name: 'Current encode job' });
+  await expect(current).toContainText('Audio #3 → Opus 160 kb/s · stereo');
+  await expect(current).toContainText('Audio #10 → AAC 256 kb/s · mono');
+  await expect(current).toContainText('Audio #12 copied');
+  expect((await calls(page, 'enqueue_encode'))[0].payload).toEqual(queued);
+});
+
+test('audio bitrate validation applies only to included converted tracks and reselect restores the draft', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const codec = quick.getByLabel('Audio codec', { exact: true });
+  await codec.selectOption('opus');
+  const start = quick.getByRole('button', { name: 'Start encode', exact: true });
+  for (const value of ['', '31', '513', '160.5']) {
+    await quick.getByLabel('Audio bitrate', { exact: true }).fill(value);
+    await expect(start).toBeDisabled();
+  }
+  await quick.getByLabel('Include audio stream #3', { exact: true }).uncheck();
+  await expect(codec).toHaveCount(0);
+  await expect(start).toBeEnabled();
+  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request.settings.audio).toEqual([]);
+  expect(queued.request.source.streamIndices).toEqual([0, 7, 9]);
+  await quick.getByLabel('Include audio stream #3', { exact: true }).check();
+  await expect(codec).toHaveValue('opus');
+  await expect(quick.getByLabel('Audio bitrate', { exact: true })).toHaveValue('160.5');
+  await codec.selectOption('copy');
+  await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
+  await expect(quick.getByLabel('Audio channels', { exact: true })).toHaveCount(0);
+});
+
+test('audio drafts are isolated by source and video encoder while av1an stays copy-only', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  await quick.getByLabel('Audio bitrate', { exact: true }).fill('192');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const chunked = av1anWorkspace(page);
+  await expect(chunked.getByLabel('Audio codec', { exact: true })).toHaveCount(0);
+  await chunked.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request.settings.audio).toEqual([]);
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
+  await expect(quick.getByLabel('Audio channels', { exact: true })).toHaveValue('mono');
+  const next = {
+    ...media,
+    id: 'another-audio-source',
+    path: 'C:\\media\\another.mkv',
+    name: 'another.mkv',
+    streams: [media.streams[0], { ...media.streams[2], index: 13 }],
+  };
+  await importAnotherSource(page, next);
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(
+    quick.getByRole('group', { name: 'Audio settings for stream #3', exact: true }),
+  ).toHaveCount(0);
+  await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const nextQueued = (await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest };
+  expect(nextQueued.request.settings.audio).toEqual([
+    { streamIndex: 13, codec: 'copy', bitrateKbps: 128, channels: 'preserve' },
+  ]);
+  expect(nextQueued.request.source.streamIndices).toEqual([0, 13]);
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  await page.locator('button.file-select').filter({ hasText: media.name }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
+  await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
+  await expect(quick.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
+});
+
+test('legacy job history remains readable without audio settings', async ({ page }) => {
+  const legacy = snapshot('succeeded');
+  delete (legacy.encodeSettings as Partial<EncodeRequest['settings']>).audio;
+  await desktopMock(page, { jobs: [legacy] });
+  await openEncode(page);
+  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+    'Audio copied when selected',
+  );
+  await expect(
+    quickWorkspace(page).getByRole('button', { name: 'Start encode', exact: true }),
+  ).toBeEnabled();
+});
+
+for (const sampleRate of [8000, 44100]) {
+  test(`AAC bitrate limits follow ${sampleRate} Hz source audio and selected channels`, async ({
+    page,
+  }) => {
+    const source = {
+      ...media,
+      streams: media.streams.map((stream) =>
+        stream.kind === 'audio' ? { ...stream, sampleRate, channels: 1 } : stream,
+      ),
+    };
+    await desktopMock(page, { media: source });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    await quick.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+    const bitrate = quick.getByLabel('Audio bitrate', { exact: true });
+    const max = Math.floor((sampleRate * 6) / 1000);
+    await expect(bitrate).toHaveAttribute('max', String(max));
+    await expect(bitrate).toHaveValue(String(Math.min(128, max)));
+    await bitrate.fill(String(max + 1));
+    await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+    await quick.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
+    await expect(bitrate).toHaveAttribute('max', String(Math.min(512, max * 2)));
+    await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+    await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+    await expect(bitrate).toHaveValue(String(max));
+    await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+    expect(queued.request.settings.audio).toEqual([
+      { streamIndex: 3, codec: 'aac', bitrateKbps: max, channels: 'mono' },
+    ]);
+  });
+}
+
+test('Opus mono bitrate respects the encoder limit while stereo allows higher rates', async ({
+  page,
+}) => {
+  const source = {
+    ...media,
+    streams: media.streams.map((stream) =>
+      stream.kind === 'audio' ? { ...stream, channels: 1 } : stream,
+    ),
+  };
+  await desktopMock(page, { media: source });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  const bitrate = quick.getByLabel('Audio bitrate', { exact: true });
+  await expect(bitrate).toHaveAttribute('max', '256');
+  await bitrate.fill('257');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await quick.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
+  await expect(bitrate).toHaveAttribute('max', '512');
+  await bitrate.fill('512');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+  await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+  await expect(bitrate).toHaveValue('256');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+});

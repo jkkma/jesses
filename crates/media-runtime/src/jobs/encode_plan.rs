@@ -32,6 +32,7 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    super::audio::validate_settings(settings)?;
     let fork_options_valid = (if settings.encoder == VideoEncoder::SvtAv1FiveFish {
         settings.lineart_psy_bias <= 7 && settings.texture_psy_bias <= 7
     } else {
@@ -102,6 +103,7 @@ impl Plan {
         settings: &EncodeSettings,
     ) -> Result<Self, AppError> {
         validate_settings(settings)?;
+        super::audio::validate_selection(selected, settings)?;
         let videos: Vec<_> = selected
             .iter()
             .filter(|s| s.codec_type.as_deref() == Some("video"))

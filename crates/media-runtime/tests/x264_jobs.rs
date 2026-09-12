@@ -441,6 +441,7 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     manager.ready().await.unwrap();
     let input = BatchEncodeInput {
+        audio: Vec::new(),
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![3, 2, 1, 4],
         video_stream_index: 1,
@@ -527,6 +528,7 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
             inputs: vec![BatchEncodeInput {
+                audio: Vec::new(),
                 input_path: request.source.input_path.clone(),
                 stream_indices: request.source.stream_indices.clone(),
                 video_stream_index: 1,
