@@ -33,7 +33,8 @@ Local Windows x64 qualification on 2026-09-13 used the working tree on
 `dev/svt-x264-borders`, based on `e04126b`. The qualified executable's SHA-256,
 request JSON, process logs, independent media reports and source-integrity checks
 are retained in `Jesses-borders-validation-20260913` under the local Videos
-directory. This is local evidence, with no new commit or remote CI run claimed.
+directory. These initial results describe local validation before publication.
+Remote CI status is recorded separately.
 
 - All 163 frontend tests passed, including request values, invalid edges and
   final-size limits, disabled-border draft retention, reset, source/build/workflow
@@ -57,6 +58,12 @@ directory. This is local evidence, with no new commit or remote CI run claimed.
   frames each. All 201,600 samples matched, including range extremes, below-black
   and above-white values, neutral chroma and SVT's 8-to-10-bit conversion.
   The retained script, JSON results and notes include commands and tool versions.
+
+The first publication run exposed an existing Linux supervisor-test race:
+consumer pipe closure can be reported before process-exit polling completes.
+The test now accepts only that specific `BrokenPipe` error alongside the expected
+early/nonzero consumer-exit errors. Its timeout and process-death assertions stay
+active. Production pipeline behavior is unchanged.
 
 The local FFmpeg/FFprobe pair is 9.0.1. The managed 5fish and HDR tools use the
 existing pinned installations. The separately selected generic SVT executable

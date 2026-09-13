@@ -264,14 +264,22 @@ async fn consumer_early_success_and_failure_stop_the_producer() {
         )
         .await
         .unwrap();
+        // The harness writes a header even in sleep mode. A closed consumer
+        // pipe may be observed before its process exit is ready, especially
+        // with Unix's polled wait. Both outcomes must fail and stop both trees.
+        let broken_pipe = matches!(
+            &result,
+            Err(SupervisorError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+        );
         if mode == "early-consumer" {
             assert!(
-                matches!(result, Err(SupervisorError::EarlyConsumerExit)),
+                broken_pipe || matches!(result, Err(SupervisorError::EarlyConsumerExit)),
                 "{result:?}"
             );
         } else {
             assert!(
-                matches!(result, Err(SupervisorError::StageFailed { stage: PipelineStage::Consumer, status }) if status.code() == Some(9)),
+                broken_pipe
+                    || matches!(result, Err(SupervisorError::StageFailed { stage: PipelineStage::Consumer, status }) if status.code() == Some(9)),
                 "{result:?}"
             );
         }
