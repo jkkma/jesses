@@ -112,7 +112,12 @@ fn fake_tool() {
     }
     let path = std::env::current_dir().unwrap();
     let mode = std::fs::read_to_string(path.join("mode")).unwrap();
-    std::fs::write(path.join("pid"), std::process::id().to_string()).unwrap();
+    // Descendants use PID-file existence as their ready signal. Publish only
+    // after the complete PID is written, so cancellation cannot leave an empty
+    // file between create and write when a parent announces that the tree is ready.
+    let pending_pid = path.join("pid.pending");
+    std::fs::write(&pending_pid, std::process::id().to_string()).unwrap();
+    std::fs::rename(pending_pid, path.join("pid")).unwrap();
     match mode.as_str() {
         "pause-tree" | "pause-branch" | "pause-leaf" => {
             if mode == "pause-tree" {

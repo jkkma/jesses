@@ -8,6 +8,10 @@ use std::{
 };
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod linux;
+
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod macos;
@@ -17,6 +21,8 @@ pub(super) struct OwnedChild {
     child: Child,
     pgid: i32,
     terminated: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tree_exited: bool,
 }
 
 pub(super) struct PauseTarget {
@@ -174,6 +180,8 @@ impl OwnedChild {
             child,
             pgid,
             terminated: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            tree_exited: false,
         })
     }
 
@@ -244,11 +252,43 @@ impl OwnedChild {
         Ok(unsafe { info.si_pid() } != 0)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn wait_for_tree_exit(&mut self) -> io::Result<()> {
+        // Normal completion is followed by the shared explicit cleanup path.
+        // Once the leader has been reaped, never inspect a potentially reused PGID.
+        if self.tree_exited {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SIGKILL delivery is asynchronous. Keep the leader unreaped so
+            // its PID pins this group until every descendant has closed its
+            // inherited handles and entered the dead/zombie state.
+            #[cfg(target_os = "linux")]
+            let live = linux::group_has_live_members(self.pgid)?;
+            #[cfg(target_os = "macos")]
+            let live = macos::group_has_live_members(self.pgid)?;
+            if !live {
+                self.tree_exited = true;
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "The process group did not finish terminating.",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub(super) async fn wait_and_terminate_descendants(&mut self) -> io::Result<ExitStatus> {
         loop {
             if self.has_exited()? {
                 self.terminate_tree()?;
                 self.close_pause();
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                self.wait_for_tree_exit().await?;
                 return self.child.wait().await;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -258,6 +298,8 @@ impl OwnedChild {
     pub(super) async fn terminate_and_wait(&mut self) -> io::Result<()> {
         self.terminate_tree()?;
         self.close_pause();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.wait_for_tree_exit().await?;
         self.child.wait().await?;
         Ok(())
     }
