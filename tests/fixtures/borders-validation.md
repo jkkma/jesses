@@ -36,6 +36,12 @@ are retained in `Jesses-borders-validation-20260913` under the local Videos
 directory. These initial results describe local validation before publication.
 Remote CI status is recorded separately.
 
+The published combined branch at `6d127ac` passed
+[CI run 34738421008](https://github.com/jkkma/jesses/actions/runs/34738421008)
+on Windows x64, Linux x64, and the frontend. The Linux job includes the opt-in
+framing gate. The final commit changes only a supervisor test and this record;
+the production code is unchanged from the local border qualification.
+
 - All 163 frontend tests passed, including request values, invalid edges and
   final-size limits, disabled-border draft retention, reset, source/build/workflow
   isolation, old history, per-file batch settings and preview invalidation.
@@ -105,6 +111,12 @@ Native UI verification could not be completed: the computer-use helper returned
 single recovery retry. No targetable Jesses window was returned. This milestone
 therefore claims actual runtime encodes and browser interaction coverage, with
 native desktop interaction still unverified.
+
+A follow-up on 2026-09-13 confirmed that the desktop executable still matched
+the recorded qualified binary. Fresh app and window discovery succeeded, but
+two launch attempts again returned `computer-use request timed out: launch_app`
+and exposed no targetable Jesses window. This follow-up does not qualify native
+border interaction; that gate remains open after main integration.
 
 ## Boundaries
 
