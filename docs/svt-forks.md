@@ -47,13 +47,16 @@ licenses and provenance, and places each build in its own directory:
 The installer does not change PATH or overwrite a different existing install.
 Open Tools and refresh capability checks after installation. The pinned URLs,
 commits, and hashes are in [svt-forks.json](../scripts/svt-forks.json). These builds
-are optional external tools; they are not included in the Jesses app bundle.
+can be installed externally for a development build. The unsigned package recipe
+also stages the pinned fork binaries with their corresponding sources, notices
+and verified manifests; see [packaging](packaging.md) for current artifact checks.
 
 ## Custom builds and other platforms
 
 Each fork resolves in this order: its explicit environment override, its managed
-directory, then its distinct PATH alias. An invalid override or managed install
-fails visibly instead of falling through. Overrides must be absolute native
+directory, a verified package entry, then its distinct PATH alias. An invalid
+override, managed install or package entry fails visibly instead of falling
+through. Overrides must be absolute native
 executable paths:
 
 - `JESSES_SVT_AV1_5FISH`

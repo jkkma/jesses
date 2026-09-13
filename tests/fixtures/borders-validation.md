@@ -105,6 +105,32 @@ time. No media processes or partial outputs remained after qualification.
 
 ### Desktop boundary
 
+#### Native continuation, 2026-09-13
+
+The retained qualified executable (SHA-256
+`85F6ABF5BD9763DAB087E77367B79FD8B2413A47A0330CA5BE30A9793D658BF4`)
+launched successfully in a later native Windows session. Quick Convert rejected
+an odd three-pixel border with disabled submission. Valid 32-pixel top/bottom
+borders changed 1920x1080 to 1920x1144; disabling/re-enabling borders retained
+the entered values and restored the expected dimensions.
+
+A native x264 CRF 23/medium encode completed and passed the independent verifier:
+236 frames, all 27 selected streams, source color/depth, copied payloads and
+attachments, and at most 1 ms of container timestamp rounding. Border interiors
+were exactly Y=16/U=128/V=128. Source SHA-256, byte size and modification time
+were unchanged. Native request/history, screenshots and independent JSON are
+retained in `Jesses-borders-native-20260913` under the local Videos directory.
+The same session exercised native per-file Batch border controls and reviewed
+the output preview before queueing. Its standalone SVT-AV1-HDR CRF 30/preset 2
+output added 32-pixel left/right borders to produce 1984x1080. Independent
+verification again passed all 236 frames, 27 streams, copied packets and fonts,
+border samples and timestamp checks. Both outputs and native job snapshots are
+retained in the same evidence directory. This completes native Quick Convert and
+Batch border interaction/output qualification for this Windows executable;
+packaged clean-machine and Linux native desktop checks remain separate gates.
+
+#### Earlier helper failures
+
 The Windows executable built successfully and browser layouts were inspected.
 Native UI verification could not be completed: the computer-use helper returned
 `computer-use request timed out: launch_app` on the initial attempt and the
@@ -120,7 +146,9 @@ border interaction; that gate remains open after main integration.
 
 ## Boundaries
 
-av1an framing remains unavailable. Automatic crop, trim, frame-rate conversion,
+av1an framing was unavailable at this checkpoint; its subsequent
+[framing and audio qualification](av1an-framing-audio-validation.md) records
+implementation and real-tool recovery tests. Automatic crop, trim, frame-rate conversion,
 non-square-pixel sources, arbitrary resize aspect ratios and colored borders
 remain pending. x264 retains its existing SDR-only support. HDR10 tests use the
 existing supported SVT path; selecting borders does not enable dynamic-HDR

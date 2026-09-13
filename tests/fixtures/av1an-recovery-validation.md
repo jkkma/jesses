@@ -53,8 +53,10 @@ are rejected rather than executed as saved instructions.
 Resume also requires the saved av1an version report to match. A different
 av1an build or dependency report needs separate compatibility qualification;
 this milestone does not promise cross-version recovery. Additional source
-plugins, arbitrary saved commands, target-quality modes, audio conversion,
-and crop/resize within av1an remain outside this implementation. The earlier
+plugins, arbitrary saved commands, and target-quality modes remain outside
+this implementation. Audio conversion and framing were outside this checkpoint;
+the subsequent [av1an framing and audio qualification](av1an-framing-audio-validation.md)
+records their stop/reopen/resume coverage. The earlier
 [av1an validation record](av1an-validation.md) describes the underlying encode
 and HDR10 checks.
 

@@ -9,31 +9,40 @@ Rust, Tauri, Svelte, and shadcn-svelte.
 The development build provides a desktop media workspace with native file
 selection and drag/drop, FFprobe metadata and stream inspection, and detection of
 FFmpeg, FFprobe, standalone SVT-AV1, its 5fish and HDR builds, x264, and av1an. The interface uses a fixed
-parchment-and-rust light theme. The Remux tab copies selected streams from one
-source into a new Matroska file, with progress, cancellation, and output validation.
+parchment-and-rust light theme. Remux and Combined mux copy selected streams from
+one or several sources, with track ordering, metadata ownership, progress,
+cancellation, and output validation. Matroska, MP4, MOV and WebM destinations
+have explicit codec and track compatibility checks.
 
 SVT-AV1 is the primary encoding workflow. **SVT-AV1-HDR is the default**,
 **5fish is the anime option**, and mainline SVT-AV1 is also available. Quick Convert drives
-standalone SVT-AV1 and x264 executables. The separate av1an
+standalone SVT-AV1 and x264 executables, plus FFmpeg libx265 (HEVC) and libvpx (VP9). The separate av1an
 tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
 selected audio, subtitles, and attachments by default. Quick Convert and standalone
-batch jobs can crop, resize, and add black borders to each video and convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
+batch jobs can trim, crop, resize, add black borders, process frame rates and
+convert individual audio tracks. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
-Jobs run sequentially, and their settings and history survive restart. Multi-source
-muxing, thumbnails, additional audio/video encoders, av1an quality
-targets, configurable chunk methods, live process suspension, and bundled media tools remain pending.
-This is a development build, not a release.
+Jobs run sequentially, and their settings and history survive restart. av1an
+supports configurable chunk readers and quality targets, live pause/continue,
+and durable stop/resume. Encoding forms offer source previews and automatic crop
+proposals; Files offers bitrate charts and matched-interval quality analysis. Audio controls offer measured
+loudness and explicit flat gain. General preferences and recent media persist.
+Unsigned packages and bundled media tools are being qualified. This is a
+development build; final combined artifacts and cross-platform release checks
+remain in progress.
 
 ## Encode a file
 
 Add a local file in Files, open Quick Convert, choose the video and copied tracks,
-and select a new `.mkv` destination. The default SVT-AV1-HDR build starts at CRF 30,
+and select a new destination and compatible container. The default SVT-AV1-HDR build starts at CRF 30,
 preset 2, and Film grain retention tune. Mainline SVT-AV1 starts at CRF 30 and preset 4;
 CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
-FFmpeg and FFprobe must be on PATH. Install the selected standalone SVT build
-using the setup instructions below. The selected tool and its version appear in the job log.
+FFmpeg, FFprobe and the selected encoder must be available through the configured
+tool paths, a verified bundle or PATH. See the setup instructions below and
+[package documentation](docs/packaging.md). The selected tool and its version
+appear in the job log.
 
 Choose **SVT-AV1 5fish** for anime or **SVT-AV1-HDR** for HDR movies in Quick
 Convert, av1an, or Batch encode. Each build has its own executable, draft settings,
@@ -55,8 +64,8 @@ research preset ranges are not exposed yet.
 
 See [SVT fork setup and validation](docs/svt-forks.md) for pinned tool installation,
 custom executable paths, and the checks covering both workflows.
-SVT-AV1 and x264 are the development priorities. Standalone `aomenc`, `vpxenc`,
-and `x265` drivers are deferred while these workflows are developed and qualified.
+SVT-AV1 remains the primary workflow. x265 HEVC and VP9 run through FFmpeg; separate
+`aomenc`, `vpxenc`, and `x265` executable drivers remain deferred.
 See the [standalone driver implementation plan](docs/standalone-encoders.md) for
 the remaining architecture and qualification gates.
 
@@ -66,17 +75,44 @@ with the standalone workflow in Batch encode. It defaults to CRF 23 and the
 installed executable must advertise Y4M input, Matroska output, and the source's
 8-bit or 10-bit depth. Source depth, range, dimensions, cadence, and SDR color are
 retained; x264 currently requires explicit left, center, or top-left chroma
-placement. HDR sources, film grain synthesis, and HDR10 fallback are rejected for
-x264. CRF 0 does not promise lossless 10-bit output; a separate lossless mode is
+placement. HDR input needs the explicit HDR/HLG to SDR option. Film grain synthesis
+and HDR10 fallback are rejected for x264. CRF 0 does not promise lossless 10-bit output; a separate lossless mode is
 not implemented. Existing SVT-AV1 settings and saved jobs remain readable.
 
 x264 writes a timed Matroska intermediate through the supervised pipeline before
-selected tracks are copied into the final Matroska output. This preserves B-frame
+selected tracks are muxed into the chosen compatible output container. This preserves B-frame
 presentation order without disabling B-frames or reconstructing timestamps from a
 raw H.264 stream. The completed output must pass the same complete decoded-frame,
 track, and metadata checks before publication. See the [x264 validation record](tests/fixtures/x264-validation.md).
 
-Encoding supports progressive, constant-frame-rate SDR video with
+Choose **x265 · HEVC** or **VP9 · libvpx** in Quick Convert or standalone Batch
+encode. x265 defaults to CRF 28 / medium, with CRF 0–51 and ten named presets.
+VP9 defaults to CRF 32 / speed 2, with CRF 0–63 and speeds 0–5 using constant
+quality and the good deadline. Both preserve tagged SDR 8-bit or 10-bit 4:2:0,
+full/limited range, and explicit left/center/top-left chroma. HDR input needs the
+explicit HDR/HLG to SDR option; HDR output, SVT grain synthesis, av1an, and a separate
+lossless mode are unavailable for these two encoders. FFmpeg must advertise
+the selected library and pixel format; missing support never triggers automatic
+depth conversion. The supervised pipeline writes a timed Matroska intermediate,
+then applies framing/audio settings and validates the complete decoded output.
+See [x265 and VP9 qualification](tests/fixtures/ffmpeg-video-validation.md),
+including a verified 480-frame excerpt from real 720p media.
+
+Standalone Quick Convert and Batch encode offer **Constant quality**, **Video
+bitrate**, or **Target file size** for all six encoders. Video bitrate is a whole
+number from 1 to 100000 decimal kb/s, with optional two-pass allocation. Target
+size is a whole number from 1 to 1048576 MiB per file and always uses two passes.
+It measures the selected audio, subtitles, attachments, and their container
+overhead using the actual conversion and trim settings before calculating the
+video budget. It reserves another 1% plus 64 KiB for video/container overhead.
+Targets are approximate: content and encoder decisions can undershoot or exceed
+them, and final container conversion can change overhead. Actual bytes and the
+difference are recorded in job history. Every pass starts a fresh decoder and
+encoder, and cancellation removes owned pass outputs and statistics. Omitted
+rate settings retain CRF behavior in old jobs. av1an supports CRF and per-chunk perceptual quality targets.
+See [rate-control qualification](tests/fixtures/rate-control-validation.md).
+
+Encoding supports validated constant-frame-rate SDR video with
 explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. SVT-AV1 HDR10 uses
 limited-range 10-bit BT.2020/PQ with validated mastering metadata. It rejects
 unsupported HDR formats, variable frame rates, rotation, unsupported chroma placement, and nonzero
@@ -90,12 +126,14 @@ available logical processors. Preparation and finalization show separate scan
 progress. After observing progress for five seconds, the app estimates the current
 phase's speed and remaining time; estimates reset between phases and disappear
 when progress stops arriving. Cancellation stops and awaits the scanner's process tree.
-Selected subtitles and attachments keep their original codecs. Audio remains copied
-unless its per-track conversion setting is explicitly changed.
+Progressive video keeps its cadence unless frame processing is selected;
+uniformly interlaced video requires explicit BWDIF deinterlacing. Selected
+subtitles and attachments are copied by default. Audio remains copied unless
+its per-track conversion setting is explicitly changed.
 
 **Crop, resize, and borders:** Quick Convert and standalone Batch encode provide per-file
 crop edges and an optional output width. Crop counts must be nonnegative even
-pixels. Cropping happens before Lanczos resizing; output height follows the
+pixels. Cropping happens before resizing (Lanczos by default); output height follows the
 cropped aspect ratio and rounds to the nearest even pixel, with halfway values
 rounded upward. The form displays source, cropped, and output dimensions.
 Cropped and output dimensions must stay between 64 and 8192 pixels. A larger
@@ -114,17 +152,46 @@ entered draft values for later use but submits no borders.
 Framing survives source/build/workflow draft changes and saved jobs; editing
 batch framing requires a fresh preview. Old jobs without framing retain their
 original dimensions, and older saved framing without borders adds none. Every source frame is checked at its original size and
-every encoded frame at the planned output size before publication. av1an
-framing, automatic crop, trim, and additional resize modes remain pending.
+every encoded frame at the planned output size before publication. The av1an
+workflow also supports the same manual crop, resize, and black borders.
+Nearest neighbor, bilinear and bicubic kernels are also available.
 See the [crop and resize validation record](tests/fixtures/framing-validation.md).
 See the [black border validation record](tests/fixtures/borders-validation.md).
 
-**Audio conversion:** Quick Convert and standalone Batch encode provide **Copy**, **Opus**, and **AAC**
+**Frame processing:** Standalone Quick Convert and Batch encode offer BWDIF with
+explicit field order, either one output frame per source frame or one per field.
+An optional rational output rate duplicates or drops pictures while retaining
+playback speed and the audio/subtitle timeline. Trim precedes deinterlacing and
+rate conversion. Every source frame must have consistent timing and field order;
+mixed material and unknown field order fail explicitly. QTGMC, telecine/cadence
+repair and arbitrary SAR/DAR conversion remain pending. See the
+[frame processing validation record](tests/fixtures/temporal-validation.md).
+
+**Frame intervals:** Standalone Quick Convert and Batch encode can select a
+zero-based start frame and an exclusive end frame. The complete source still
+passes the original frame and timing checks before the interval is applied.
+Output starts at zero and retains exactly the selected video pictures. Every
+selected audio track requires explicit conversion; boundaries follow its decoded
+sample clock, including codec delay and final padding. Selected ASS, SubRip and
+WebVTT cues and chapters are intersected with the interval and rebased; selected
+text tracks remain present even when they contain no surviving cues. Fonts retain
+their original bytes. A boundary that cuts an animated ASS cue is rejected,
+as are timed WebVTT markup, bitmap subtitles and av1an intervals. Saved jobs
+without an interval continue to process the complete source. A gain calculated
+from a loudness measurement uses the complete source track, including when the
+job trims it. See the [trim validation record](tests/fixtures/trim-validation.md).
+
+**Audio conversion:** Quick Convert, av1an, and Batch encode provide **Copy**, **Opus**, **AAC**,
+**FLAC (24-bit)**, **MP3**, **Vorbis**, and **E-AC-3**
 for each selected audio track. Copy is the initial setting and retains the source
-audio. Conversion offers 32–512 kb/s (initially 128 kb/s) and **Preserve source**,
+audio. Lossy conversion starts at 128 kb/s and offers **Preserve source**,
 **Mono**, or **Stereo** channel choices. The bitrate is the target for that track,
 without hidden scaling by channel count. The upper limit adjusts to the codec,
-sample rate, and channel count; mono Opus is limited to 256 kb/s. Deselecting a
+sample rate, and channel count; mono Opus is limited to 256 kb/s. AAC, Opus, and
+Vorbis offer 32–512 kb/s subject to those limits. MP3 uses standard bitrates,
+up to 320 kb/s at 32–48 kHz or 160 kb/s at lower supported rates. E-AC-3 supports
+32–6,144 kb/s at 48 kHz, with lower maxima at 32/44.1 kHz. FLAC has no bitrate
+target and explicitly converts to 24-bit integer PCM. Deselecting a
 track omits it from the output.
 
 Opus uses FFmpeg's `libopus` encoder at 48 kHz. AAC uses FFmpeg's native AAC-LC
@@ -132,7 +199,11 @@ encoder at the supported source sample rate. Use a matching FFmpeg and FFprobe
 pair from 8.1 or newer. A small synthetic preflight checks that both tools correctly
 handle AAC priming before conversion starts. Older tools remain usable for copied
 audio. Required encoders and source channel
-layouts are checked before video encoding. Track order, titles, languages,
+layouts are checked before video encoding. MP3 requires mono or stereo. Preserve
+rejects layouts that a codec would silently reinterpret or downmix; choose an
+explicit channel conversion or another codec. Additional codecs exercise the
+exact sample rate, bitrate, and channel plan on synthetic audio before processing
+the source, including Matroska codec delay and final padding. Track order, titles, languages,
 dispositions, chapters, subtitles, and attachments retain the selected mapping.
 Obsolete encoder and bitrate statistics are removed from converted audio tracks.
 
@@ -148,15 +219,37 @@ to hide a timing gap.
 
 Each file in a batch owns its audio choices. Changing them requires a new batch
 preview, and a queued job keeps its submitted settings. Older saved jobs without
-audio settings still copy their selected audio. The av1an workflow remains
-copy-only for this milestone. Other audio codecs and loudness normalization remain
-pending. See the [audio validation record](tests/fixtures/audio-validation.md).
+audio settings still copy their selected audio. av1an applies audio conversion
+during final muxing, after its video chunks finish, using the same codec-delay
+and decoded-timeline checks.
+See the [audio validation record](tests/fixtures/audio-validation.md),
+[additional audio codec qualification](tests/fixtures/audio-codecs-validation.md),
+and [av1an framing and audio validation](tests/fixtures/av1an-framing-audio-validation.md).
+
+**Loudness and gain:** Measure a selected source track to see its integrated
+loudness, true peak and loudness range. A target loudness proposes a flat gain;
+Apply makes that value an explicit conversion setting. The source fingerprint
+guards against applying a stale measurement, and gain must remain between -60
+and +24 dB. This changes the level uniformly; it does not compress dynamics.
+Trimming still uses the complete source-track measurement. See the
+[loudness validation record](tests/fixtures/loudness-validation.md).
+
+**Subtitles:** Standalone jobs can explicitly convert text to SubRip, ASS or
+WebVTT, or burn a selected supported track into the picture. Bitmap graphics
+use source coordinates before framing; text rendering follows crop/resize and
+precedes borders. Font attachments are preserved when selected and supplied to
+the renderer. Conversion and destination-container controls explain formatting
+changes and reject content they cannot represent. See the
+[subtitle validation record](tests/fixtures/subtitle-validation.md).
 
 Open the separate **av1an** tab to use scene detection and parallel encoding with
-1–32 workers (default 2), capped at 240 frames
-per chunk. This integration requires av1an, VapourSynth, and L-SMASH Works in
-addition to FFmpeg, FFprobe, and SVT-AV1. Jesses checks av1an's reported plugin
-availability. av1an currently encodes the first video track only; standalone encoders
+1–32 workers (default2). Scene detection can use standard/fast analysis or fixed
+chunks, configurable minimum/maximum lengths, analysis height and chunk order.
+L-SMASH Works, FFMS2 and BestSource require their respective VapourSynth plugin.
+FFmpeg select and hybrid readers require the corrected source-built av1an;
+older generators fail exact frame-count checks. All paths require FFmpeg,
+FFprobe and the selected SVT build. Jesses checks actual engine capabilities
+and selected plugin availability. av1an currently encodes the first video track only; standalone encoders
 can encode another selected video track. Jobs remain sequential; workers run
 chunks within the active job. More workers require more CPU and memory.
 
@@ -187,10 +280,35 @@ reuses the validated intermediate. A completed output is never overwritten.
 Cancel and Stop queue also retain available av1an recovery work. Stopping before
 recovery preparation finishes may leave no saved progress to resume.
 
-Saved source commands must match the qualified av1an 0.5.2-unstable (7df934d)
-L-SMASH script format. An incompatible engine or changed source script is
-rejected; see the [recovery validation record](tests/fixtures/av1an-recovery-validation.md)
-for the tested scope.
+Saved source commands and target probe parameters must match the immutable plan.
+Qualified VapourSynth source templates are checked byte-for-byte after validated
+path/cache/reader substitution. Hybrid source segments also undergo complete
+pixel-sequence comparison with the original before reuse or publication. See the
+[recovery validation record](tests/fixtures/av1an-recovery-validation.md) and
+[scene/target validation](tests/fixtures/av1an-options-validation.md).
+
+**Perceptual targets** choose per-chunk CRF using mean VMAF v0.6.1, SSIMULACRA2,
+Butteraugli INF, or XPSNR minimum Y/U/V. Configure the ordered score range, CRF
+bounds, evaluation resolution, probe count and frame sampling. Higher is better
+for VMAF, SSIMULACRA2 and XPSNR; lower is better for Butteraugli. Changing the
+metric resets its suggested score range. Unreachable ranges can finish outside
+the target, and probe scores are retained in the engine detail log.
+
+VMAF requires a working FFmpeg libvmaf model. SSIMULACRA2 needs vszip or Vship;
+Butteraugli needs Julek with the corrected engine, or Vship. These two metrics
+require a VapourSynth source reader. Every-frame XPSNR uses the selected FFmpeg;
+sampled XPSNR needs vszip R7 or newer and a VapourSynth reader. Actual scorer
+checks run in the same selected child environment before encoding. Windows
+packaging builds CPU vszip and Julek from pinned sources alongside the portable
+frameserver. L-SMASH-only scoring requires the corrected software-probe engine;
+missing dependencies or older incompatible engines produce an explicit error.
+VMAF and every-frame XPSNR also require the corrected FFmpeg metric engine, which
+preserves the Y4M reference pixels during color-matrix negotiation.
+Probes preserve
+the selected SVT build, preset and advanced parameters but score the source before
+final crop, resize and borders; the interface and log explain that limitation.
+Targeting requires SDR; preserved HDR keeps CRF control. Old saved targets with
+no metric field retain VMAF.
 
 Source files are never modified; caches stay in the
 reserved output workspace, even when the output folder also contains the source.
@@ -206,7 +324,17 @@ HDR10 fallback** is off by default. Turning it on explicitly permits discarding
 Dolby Vision enhancement data and HDR10+ dynamic metadata in favor of an HDR10
 base layer. Supported Dolby Vision input is HEVC profile 7/compatibility 6 or
 profile 8/compatibility 1; profile 5 and unrecognized profiles fail explicitly.
-HLG and tone mapping remain pending. Files shows reported pixel format, bit depth,
+**HDR / HLG to SDR** is an explicit standalone option in Quick Convert and each
+batch file. It accepts tagged limited-range 10-bit 4:2:0 BT.2020 PQ or HLG, uses
+Hable with a chosen signal peak (100–10000 nits), and produces 100-nit BT.709
+limited-range 10-bit SDR. HLG uses the 1000-nit reference display transfer.
+Tone mapping precedes subtitles and borders and removes source HDR metadata.
+Compatible dynamic-HDR base layers require its separate opt-in; unselected
+rendering retains the existing HDR10 workflow. All source and output frame
+checks remain. av1an tone mapping awaits chunk/recovery qualification. See the
+[tone-map validation record](tests/fixtures/tone-map-validation.md).
+
+Files shows reported pixel format, bit depth,
 color tags, and HDR indicators; metadata absent from stream headers is labeled
 as unreported because it may still exist on decoded frames.
 
@@ -239,7 +367,7 @@ CRF/preset and the encoder's supported grain/HDR10
 fallback settings and an existing writable
 output folder, then select **Preview batch**. The app proposes names such as
 `episode_av1.mkv` and `episode_av1_2.mkv`, avoiding existing files and destinations
-already reserved in the queue. x264 proposals use `_x264` instead of `_av1`. Unicode
+already reserved in the queue. x264, x265, and VP9 proposals use `_x264`, `_x265`, and `_vp9`. Unicode
 names and spaces are retained where valid.
 The preview creates no output files or folders.
 
@@ -260,9 +388,14 @@ batch.
 ## Remux a file
 
 Add a local file in Files, open Remux, choose the streams and their order, and
-select a new `.mkv` destination. Keep attachments after video/audio/subtitle tracks.
-At least one video or audio track is required. FFmpeg and FFprobe must be on PATH.
-Streams are copied without encoding; unsupported Matroska streams fail explicitly.
+select a new destination. Keep attachments after video/audio/subtitle tracks;
+containers without attachment support require deselecting them. At least one
+video or audio track is required. FFmpeg and FFprobe must be available.
+Media streams are copied; compatible text subtitles may require conversion for
+the chosen container. Unsupported combinations fail explicitly. Combined mux
+provides the same output checks with tracks from multiple imported sources and
+explicit metadata/chapter ownership. See [mux qualification](tests/fixtures/mux-validation.md)
+and [container qualification](tests/fixtures/container-validation.md).
 
 Existing destinations are never replaced. The app writes a temporary sibling,
 checks packet counts, selected stream properties, dispositions, metadata, chapters,
@@ -289,6 +422,28 @@ the newest two 4 MiB segments. Saved history contains only bounded log summaries
 av1an also writes its own detail log there. Cleanup failures are reported with
 their paths; total disk-log retention remains
 future work. Command-line examples use in-memory history.
+
+## Inspect and analyze media
+
+The encoding forms can decode a chosen source frame and propose crop edges from
+sampled frames. A proposal changes the draft only after Apply. In Files, bitrate analysis counts every
+selected video packet and charts bounded time windows, including explicit
+accounting for packets without usable timestamps.
+
+Quality analysis compares a matched frame interval from a reference and candidate
+with SSIM, PSNR or VMAF. The selected source streams must pass complete timing,
+geometry and SDR color checks. The chart retains every measured frame, including
+infinite PSNR values for identical images. CSV and SVG exports preserve the
+completed result, source fingerprints, interval and model settings; changing the
+form does not change an export already being saved. Existing files are never
+overwritten. See [quality qualification](tests/fixtures/quality-validation.md),
+[bitrate qualification](tests/fixtures/bitrate-validation.md) and
+[export qualification](tests/fixtures/analysis-export-validation.md).
+
+Tools & settings saves a default output directory and up to 15 recent media
+paths. Recent paths are checked when opened. A bounded compatibility import
+previews supported general settings before Apply; it does not import executable
+paths or encoder commands. See [preferences qualification](tests/fixtures/preferences-validation.md).
 
 ## Run locally
 
@@ -326,6 +481,7 @@ cargo run -p media-runtime --example inspect -- /path/to/video.mkv
 cargo run -p media-runtime --example remux -- /path/to/video.mkv /path/to/new-output.mkv
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 30 4
 cargo test -p media-runtime --test x264_jobs --locked -- --ignored --test-threads=1
+cargo test -p media-runtime --test ffmpeg_video_jobs --locked -- --ignored --test-threads=1
 cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 23 5 0 false standalone 2 x264
 ```
@@ -340,7 +496,7 @@ cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encod
 
 The encode example's optional arguments are CRF, preset, grain strength, explicit
 HDR10 fallback (`true`/`false`), workflow (`standalone`/`av1an`), worker count, and
-encoder (`svtAv1`/`x264`). The old `svtAv1` workflow name remains accepted by the
+encoder (`svtAv1`/`svtAv1FiveFish`/`svtAv1Hdr`/`x264`/`x265`/`vp9`). The old `svtAv1` workflow name remains accepted by the
 example and when loading older history. x264 integration tests require x264 on PATH.
 For a complete immutable request including per-track audio settings, run
 `cargo run -p media-runtime --example encode_request -- /path/to/request.json`.
@@ -358,8 +514,9 @@ Build a native executable with embedded frontend assets:
 pnpm tauri build --debug --no-bundle
 ```
 
-Native CI targets Windows x64 and Linux x64. macOS support is deferred. Installer,
-signing, clean-machine, and cross-platform runtime qualification remain pending.
+Native CI targets Windows x64 and Linux x64. macOS support is deferred. Local
+unsigned Windows artifact checks are recorded in the [packaging documentation](docs/packaging.md);
+final artifact, signing, clean-machine and Linux runtime qualification remain separate gates.
 
 ## Development layout
 

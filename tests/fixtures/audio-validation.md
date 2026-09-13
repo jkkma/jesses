@@ -17,7 +17,9 @@ channel count, and sample rate continue to describe the input.
 
 Audio settings apply to the original source stream index, even when selected
 tracks are reordered for muxing. Standalone x264, SVT-AV1, SVT-AV1 5fish, and
-SVT-AV1-HDR share this audio stage. av1an remains copy-only, including batch jobs.
+SVT-AV1-HDR share this audio stage. av1an was copy-only at this checkpoint;
+the subsequent [av1an framing and audio qualification](av1an-framing-audio-validation.md)
+extends that shared stage to av1an and its batch jobs.
 Video compatibility requirements for each encoder still apply.
 
 Drafts remain separate for each source, video encoder, and workflow. Deselecting

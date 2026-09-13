@@ -96,8 +96,10 @@ normally after completion.
 An initial input-desktop access failure was resolved before the successful
 native pass. This pass does not establish clean-machine/package qualification.
 
-av1an rejects nondefault framing until its filter path is implemented. Automatic
-crop, borders, trim, frame-rate conversion, arbitrary output aspect ratios,
+av1an rejected nondefault framing at this checkpoint. Subsequent
+[border qualification](borders-validation.md) and
+[av1an framing/audio qualification](av1an-framing-audio-validation.md)
+record those extensions. Automatic crop, trim, frame-rate conversion, arbitrary output aspect ratios,
 additional resize modes and non-square-pixel inputs remain pending. Strict even
 crop input, fixed Lanczos and explicit-width upscaling are deliberate choices
 for this bounded implementation.
