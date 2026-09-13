@@ -278,7 +278,7 @@ async function openBatch(page: Page) {
   await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
 }
 
-test('crop and resize batch preview retains each source framing and immutable queue history', async ({
+test('crop resize and borders batch preview retains each source framing and immutable queue history', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -291,20 +291,36 @@ test('crop and resize batch preview retains each source framing and immutable qu
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Crop bottom (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Resize video', { exact: true }).check();
-  await first.getByLabel('Output width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Add black borders', { exact: true }).check();
+  await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
+  await first.getByLabel('Border bottom (pixels)', { exact: true }).fill('20');
   await expect(first.getByLabel('Video dimensions', { exact: true })).toContainText(
-    'Output 640 × 320',
+    'Picture 640 × 320 → Output 640 × 360',
   );
   await second.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
+  await second.getByLabel('Add black borders', { exact: true }).check();
+  await second.getByLabel('Border left (pixels)', { exact: true }).fill('20');
+  await expect(second.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'Picture 1260 × 720 → Output 1280 × 720',
+  );
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   await expect(workspace.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'Width 640 px',
+    'Picture width 640 px',
   );
   const preview = (await calls(page, 'preview_encode_batch'))[0].payload
     .request as BatchEncodeRequest;
   expect(preview.inputs.map((input) => input.framing)).toEqual([
-    { crop: { top: 40, right: 0, bottom: 40, left: 0 }, resizeWidth: 640 },
-    { crop: { top: 0, right: 0, bottom: 0, left: 20 }, resizeWidth: null },
+    {
+      crop: { top: 40, right: 0, bottom: 40, left: 0 },
+      resizeWidth: 640,
+      borders: { top: 20, right: 0, bottom: 20, left: 0 },
+    },
+    {
+      crop: { top: 0, right: 0, bottom: 0, left: 20 },
+      resizeWidth: null,
+      borders: { top: 0, right: 0, bottom: 0, left: 20 },
+    },
   ]);
   await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
   const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
@@ -314,15 +330,16 @@ test('crop and resize batch preview retains each source framing and immutable qu
   await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
   await first.locator('summary').click();
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('0');
+  await first.getByLabel('Border top (pixels)', { exact: true }).fill('0');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
-    'Crop top 40, right 0, bottom 40, left 0 px · Width 640 px · Automatic height',
+    'Crop top 40, right 0, bottom 40, left 0 px · Picture width 640 px · Automatic height · Black borders top 20, right 0, bottom 20, left 0 px',
   );
   expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
 });
 
-for (const edit of ['crop', 'width', 'resize']) {
-  test(`crop and resize batch ${edit} edit invalidates an outstanding preview`, async ({
+for (const edit of ['crop', 'width', 'resize', 'border', 'bordersEnabled']) {
+  test(`crop resize and borders batch ${edit} edit invalidates an outstanding preview`, async ({
     page,
   }) => {
     await desktopMock(page, { held: ['preview'] });
@@ -331,13 +348,19 @@ for (const edit of ['crop', 'width', 'resize']) {
     const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
     await first.locator('summary').click();
     await first.getByLabel('Resize video', { exact: true }).check();
-    await first.getByLabel('Output width (pixels)', { exact: true }).fill('640');
+    await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
+    await first.getByLabel('Add black borders', { exact: true }).check();
+    await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
     await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
     await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
     if (edit === 'crop') await first.getByLabel('Crop bottom (pixels)', { exact: true }).fill('40');
     if (edit === 'width')
-      await first.getByLabel('Output width (pixels)', { exact: true }).fill('960');
+      await first.getByLabel('Picture width (pixels)', { exact: true }).fill('960');
     if (edit === 'resize') await first.getByLabel('Resize video', { exact: true }).uncheck();
+    if (edit === 'border')
+      await first.getByLabel('Border bottom (pixels)', { exact: true }).fill('20');
+    if (edit === 'bordersEnabled')
+      await first.getByLabel('Add black borders', { exact: true }).uncheck();
     await release(page, 'preview');
     await expect(
       workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
@@ -375,7 +398,7 @@ test('crop and resize default framing permits mixed source compatibility results
   expect(queued.map((request) => request.source.inputPath)).toEqual([episodes[0].path]);
 });
 
-test('crop and resize batch rejects invalid per-file values before requesting preview', async ({
+test('crop resize and borders batch rejects invalid per-file values before requesting preview', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -393,15 +416,31 @@ test('crop and resize batch rejects invalid per-file values before requesting pr
   }
   await first.getByLabel('Resize video', { exact: true }).check();
   for (const invalid of ['', '63', '65', '640.5', '8194', '64']) {
-    await first.getByLabel('Output width (pixels)', { exact: true }).fill(invalid);
+    await first.getByLabel('Picture width (pixels)', { exact: true }).fill(invalid);
     await expect(preview).toBeDisabled();
   }
-  await first.getByLabel('Output width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Add black borders', { exact: true }).check();
+  for (const edge of ['top', 'right', 'bottom', 'left']) {
+    for (const invalid of ['', '-2', '3', '2.5', '8192']) {
+      await first.getByLabel(`Border ${edge} (pixels)`, { exact: true }).fill(invalid);
+      await expect(preview).toBeDisabled();
+    }
+    await first.getByLabel(`Border ${edge} (pixels)`, { exact: true }).fill('0');
+  }
+  await first.getByLabel('Border right (pixels)', { exact: true }).fill('7552');
+  await expect(first.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'Output 8192 × 360',
+  );
+  await expect(preview).toBeEnabled();
+  await first.getByLabel('Border left (pixels)', { exact: true }).fill('2');
+  await expect(preview).toBeDisabled();
+  await first.getByLabel('Add black borders', { exact: true }).uncheck();
   await expect(preview).toBeEnabled();
   expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
 });
 
-test('crop and resize batch drafts restore per encoder and standalone workflow with av1an defaults', async ({
+test('crop resize and border batch drafts restore per encoder and standalone workflow with av1an defaults', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -411,12 +450,18 @@ test('crop and resize batch drafts restore per encoder and standalone workflow w
   await first.locator('summary').click();
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Resize video', { exact: true }).check();
-  await first.getByLabel('Output width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
+  await first.getByLabel('Add black borders', { exact: true }).check();
+  await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(first.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await first.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
+  await first.getByLabel('Add black borders', { exact: true }).check();
+  await first.getByLabel('Border left (pixels)', { exact: true }).fill('40');
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
   await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveCount(0);
+  await expect(first.getByLabel('Add black borders', { exact: true })).toHaveCount(0);
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   const chunked = (await calls(page, 'preview_encode_batch'))[0].payload
     .request as BatchEncodeRequest;
@@ -424,14 +469,19 @@ test('crop and resize batch drafts restore per encoder and standalone workflow w
     chunked.inputs.every(
       (input) =>
         input.framing.resizeWidth === null &&
-        Object.values(input.framing.crop).every((edge) => edge === 0),
+        Object.values(input.framing.crop).every((edge) => edge === 0) &&
+        Object.values(input.framing.borders).every((edge) => edge === 0),
     ),
   ).toBe(true);
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
   await expect(first.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('20');
+  await expect(first.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('40');
+  await expect(first.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('0');
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
   await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('40');
-  await expect(first.getByLabel('Output width (pixels)', { exact: true })).toHaveValue('640');
+  await expect(first.getByLabel('Picture width (pixels)', { exact: true })).toHaveValue('640');
+  await expect(first.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('20');
+  await expect(first.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('0');
   await expect(
     workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
   ).toBeDisabled();
@@ -656,14 +706,22 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
         inputPath: episodes[0].path,
         videoStreamIndex: 9,
         streamIndices: [9, 8, 11],
-        framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+        framing: {
+          crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          resizeWidth: null,
+          borders: { top: 0, right: 0, bottom: 0, left: 0 },
+        },
         audio: [],
       },
       {
         inputPath: episodes[1].path,
         videoStreamIndex: 2,
         streamIndices: [2, 5, 8, 11],
-        framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+        framing: {
+          crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          resizeWidth: null,
+          borders: { top: 0, right: 0, bottom: 0, left: 0 },
+        },
         audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       },
     ],
@@ -680,7 +738,11 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
       settings: {
         ...settings,
         videoStreamIndex: 9,
-        framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+        framing: {
+          crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          resizeWidth: null,
+          borders: { top: 0, right: 0, bottom: 0, left: 0 },
+        },
         audio: [],
       },
     },
@@ -693,7 +755,11 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
       settings: {
         ...settings,
         videoStreamIndex: 2,
-        framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+        framing: {
+          crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          resizeWidth: null,
+          borders: { top: 0, right: 0, bottom: 0, left: 0 },
+        },
         audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       },
     },
@@ -960,14 +1026,22 @@ test('batch defaults preserve original per-file stream indices and keep attachme
           inputPath: episodes[0].path,
           videoStreamIndex: 9,
           streamIndices: [9, 8, 11],
-          framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+          framing: {
+            crop: { top: 0, right: 0, bottom: 0, left: 0 },
+            resizeWidth: null,
+            borders: { top: 0, right: 0, bottom: 0, left: 0 },
+          },
           audio: [],
         },
         {
           inputPath: episodes[1].path,
           videoStreamIndex: 2,
           streamIndices: [2, 5, 8, 11],
-          framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+          framing: {
+            crop: { top: 0, right: 0, bottom: 0, left: 0 },
+            resizeWidth: null,
+            borders: { top: 0, right: 0, bottom: 0, left: 0 },
+          },
           audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
         },
       ],

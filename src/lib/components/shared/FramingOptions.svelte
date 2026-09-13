@@ -21,10 +21,10 @@
 </script>
 
 <fieldset class="framing-options" {disabled} aria-describedby={`${idPrefix}-framing-help`}>
-  <legend>Crop & resize</legend>
+  <legend>Crop, resize & borders</legend>
   <p id={`${idPrefix}-framing-help`} class="small-muted">
-    Crop each edge in even pixels, then optionally resize. The cropped picture keeps its aspect
-    ratio; automatic height rounds to the nearest even pixel, with ties rounded up.
+    Crop in even pixels, resize while keeping the picture's aspect ratio, then add black borders.
+    Automatic picture height rounds to the nearest even pixel, with ties rounded up.
   </p>
   <div class="crop-fields">
     {#each cropEdges as edge}
@@ -62,7 +62,7 @@
   </label>
   {#if draft.resizeEnabled}
     <div class="field resize-width">
-      <label for={`${idPrefix}-resize-width`}>Output width (pixels)</label>
+      <label for={`${idPrefix}-resize-width`}>Picture width (pixels)</label>
       <input
         id={`${idPrefix}-resize-width`}
         type="number"
@@ -73,14 +73,51 @@
         value={draft.resizeWidth ?? ''}
         oninput={(event) => onchange({ ...draft, resizeWidth: readNumber(event.currentTarget) })}
       />
-      <p>Even width, 64–8192 pixels. Height is automatic.</p>
+      <p>Width before borders, 64–8192 even pixels. Height is automatic.</p>
     </div>
+  {/if}
+  <label class="resize-choice" for={`${idPrefix}-borders`}>
+    <input
+      id={`${idPrefix}-borders`}
+      type="checkbox"
+      checked={draft.bordersEnabled}
+      onchange={(event) => onchange({ ...draft, bordersEnabled: event.currentTarget.checked })}
+    />Add black borders
+  </label>
+  {#if draft.bordersEnabled}
+    <div class="crop-fields">
+      {#each cropEdges as edge}
+        <div class="field">
+          <label for={`${idPrefix}-border-${edge}`}>Border {edge} (pixels)</label>
+          <input
+            id={`${idPrefix}-border-${edge}`}
+            type="number"
+            min="0"
+            max="8192"
+            step="2"
+            required
+            value={draft.borders[edge] ?? ''}
+            oninput={(event) =>
+              onchange({
+                ...draft,
+                borders: { ...draft.borders, [edge]: readNumber(event.currentTarget) },
+              })}
+          />
+        </div>
+      {/each}
+    </div>
+    <p class="border-help small-muted">
+      Even pixels per edge. Final dimensions must stay within 8192 × 8192.
+    </p>
   {/if}
   <p class="dimensions small-muted" aria-live="polite" aria-label="Video dimensions">
     {#if dimensions.error}
       <span class="disabled-reason">{dimensions.error}</span>
     {:else}
       Source {stream?.width} × {stream?.height} → Cropped {dimensions.croppedWidth} × {dimensions.croppedHeight}
+      {#if draft.bordersEnabled}
+        → Picture {dimensions.pictureWidth} × {dimensions.pictureHeight}
+      {/if}
       → Output {dimensions.width} × {dimensions.height}
     {/if}
   </p>
@@ -129,6 +166,9 @@
   .dimensions {
     margin-top: 12px;
     overflow-wrap: anywhere;
+  }
+  .border-help {
+    margin-top: 8px;
   }
   @media (max-width: 420px) {
     .crop-fields {

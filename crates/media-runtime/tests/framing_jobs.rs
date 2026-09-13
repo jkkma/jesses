@@ -1,4 +1,4 @@
-//! Opt-in native crop/resize qualification through the public JobManager.
+//! Opt-in native crop/resize/border qualification through the public JobManager.
 //! All sources are synthesized locally; no user media is read or modified.
 use std::{
     path::{Path, PathBuf},
@@ -290,7 +290,68 @@ fn framing() -> media_runtime::VideoFraming {
     .unwrap()
 }
 
-async fn frame_hashes(path: &Path, stream: &str, filter: Option<&str>) -> Vec<String> {
+fn bordered_framing() -> media_runtime::VideoFraming {
+    serde_json::from_value(json!({
+        "crop": {"top":6,"bottom":14,"left":12,"right":20},
+        "resizeWidth":192,
+        "borders": {"top":32,"right":48,"bottom":48,"left":32}
+    }))
+    .unwrap()
+}
+
+fn borders_only() -> media_runtime::VideoFraming {
+    serde_json::from_value(json!({
+        "borders": {"top":48,"right":32,"bottom":32,"left":48}
+    }))
+    .unwrap()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FramingCase {
+    CropResize,
+    CropResizeBorders,
+    BordersOnly,
+}
+
+impl FramingCase {
+    fn settings(self) -> media_runtime::VideoFraming {
+        match self {
+            Self::CropResize => framing(),
+            Self::CropResizeBorders => bordered_framing(),
+            Self::BordersOnly => borders_only(),
+        }
+    }
+
+    fn content_size(self) -> (usize, usize) {
+        match self {
+            Self::CropResize | Self::CropResizeBorders => (192, 106),
+            Self::BordersOnly => (320, 180),
+        }
+    }
+
+    // An independent crop/resize reference deliberately contains no pad filter.
+    // Expected border pixels are constructed from planar YUV values below.
+    fn reference_filter(self, full: bool) -> Option<String> {
+        let (left, top) = match self {
+            Self::CropResize => (16, 10),
+            Self::CropResizeBorders => (12, 6),
+            Self::BordersOnly => return None,
+        };
+        let range = if full { "pc" } else { "tv" };
+        Some(format!(
+            "crop=288:160:{left}:{top}:exact=1,scale=192:106:flags=lanczos:in_range={range}:out_range={range}:in_color_matrix=bt709:out_color_matrix=bt709:in_h_chr_pos=0:out_h_chr_pos=0:in_v_chr_pos=128:out_v_chr_pos=128,setsar=1"
+        ))
+    }
+}
+
+async fn decoded_pixels(
+    path: &Path,
+    stream: &str,
+    filter: Option<&str>,
+    depth: u8,
+    full: bool,
+    frames: u32,
+) -> Vec<u8> {
     let mut cmd = command("ffmpeg");
     cmd.args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
@@ -298,24 +359,169 @@ async fn frame_hashes(path: &Path, stream: &str, filter: Option<&str>) -> Vec<St
     if let Some(filter) = filter {
         cmd.args(["-vf", filter]);
     }
-    cmd.args(["-pix_fmt", "yuv420p", "-f", "framemd5", "-"]);
-    String::from_utf8(output(&mut cmd).await)
-        .unwrap()
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .map(|line| line.rsplit(',').next().unwrap().trim().to_owned())
-        .collect()
+    // Preserve the decoded range instead of implicitly converting yuvj420p to
+    // limited-range yuv420p during inspection.
+    let format = match (depth, full) {
+        (10, _) => "yuv420p10le",
+        (_, true) => "yuvj420p",
+        _ => "yuv420p",
+    };
+    cmd.args([
+        "-frames:v",
+        &frames.to_string(),
+        "-pix_fmt",
+        format,
+        "-f",
+        "rawvideo",
+        "-",
+    ]);
+    output(&mut cmd).await
+}
+
+fn border_edges(framing: media_runtime::VideoFraming) -> [usize; 4] {
+    let borders = framing.borders;
+    [borders.top, borders.right, borders.bottom, borders.left].map(|edge| edge as usize)
+}
+
+fn assert_lossless_reference(actual: &[u8], content: &[u8], case: FramingCase, full: bool) {
+    let (content_width, content_height) = case.content_size();
+    let [top, right, bottom, left] = border_edges(case.settings());
+    let (width, height) = (content_width + left + right, content_height + top + bottom);
+    let content_frame_size = content_width * content_height * 3 / 2;
+    let frame_size = width * height * 3 / 2;
+    assert_eq!(content.len(), content_frame_size * 48);
+    assert_eq!(actual.len(), frame_size * 48);
+    for (index, (actual, content)) in actual
+        .chunks_exact(frame_size)
+        .zip(content.chunks_exact(content_frame_size))
+        .enumerate()
+    {
+        let mut actual_offset = 0;
+        let mut content_offset = 0;
+        for plane in 0..3 {
+            let divisor = if plane == 0 { 1 } else { 2 };
+            let (plane_width, plane_height) = (width / divisor, height / divisor);
+            let (inner_width, inner_height) = (content_width / divisor, content_height / divisor);
+            let black = if plane == 0 {
+                if full { 0 } else { 16 }
+            } else {
+                128
+            };
+            let mut expected = vec![black; plane_width * plane_height];
+            for row in 0..inner_height {
+                let start = (top / divisor + row) * plane_width + left / divisor;
+                let source = content_offset + row * inner_width;
+                expected[start..start + inner_width]
+                    .copy_from_slice(&content[source..source + inner_width]);
+            }
+            // This compares every content and border sample of every frame,
+            // including exact asymmetric offsets, without using FFmpeg pad.
+            if let Some(sample) = actual[actual_offset..actual_offset + expected.len()]
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+            {
+                panic!(
+                    "{case:?}, full={full}, lossless frame {index}, plane {plane}, sample ({}, {}): actual {}, expected {}",
+                    sample % plane_width,
+                    sample / plane_width,
+                    actual[actual_offset + sample],
+                    expected[sample]
+                );
+            }
+            actual_offset += plane_width * plane_height;
+            content_offset += inner_width * inner_height;
+        }
+    }
+}
+
+fn assert_border_levels(
+    pixels: &[u8],
+    content_size: (usize, usize),
+    framing: media_runtime::VideoFraming,
+    depth: u8,
+    full: bool,
+) {
+    let [top, right, bottom, left] = border_edges(framing);
+    assert!([top, right, bottom, left].iter().all(|edge| *edge >= 32));
+    let (content_width, content_height) = content_size;
+    let (width, height) = (content_width + left + right, content_height + top + bottom);
+    let sample_bytes = if depth == 10 { 2 } else { 1 };
+    let frame_bytes = width * height * 3 / 2 * sample_bytes;
+    assert_eq!(pixels.len() % frame_bytes, 0);
+    assert!(!pixels.is_empty());
+    for (index, frame) in pixels.chunks_exact(frame_bytes).enumerate() {
+        let mut offset = 0;
+        for plane in 0..3 {
+            let divisor = if plane == 0 { 1 } else { 2 };
+            let (plane_width, plane_height) = (width / divisor, height / divisor);
+            let (inner_width, inner_height) = (content_width / divisor, content_height / divisor);
+            let (x0, y0) = (left / divisor, top / divisor);
+            let margin = 16 / divisor;
+            let mut samples = Vec::new();
+            for y in 0..plane_height {
+                for x in 0..plane_width {
+                    // Inspect all four border interiors, excluding the 16-pixel
+                    // neighborhood of content where lossy codecs may ring.
+                    if x + margin < x0
+                        || x >= x0 + inner_width + margin
+                        || y + margin < y0
+                        || y >= y0 + inner_height + margin
+                    {
+                        let sample = offset + (y * plane_width + x) * sample_bytes;
+                        samples.push(if depth == 10 {
+                            u16::from_le_bytes([frame[sample], frame[sample + 1]])
+                        } else {
+                            u16::from(frame[sample])
+                        });
+                    }
+                }
+            }
+            samples.sort_unstable();
+            let expected = match (plane, depth, full) {
+                (0, _, true) => 0,
+                (0, 10, false) => 64,
+                (0, _, false) => 16,
+                (_, 10, _) => 512,
+                _ => 128,
+            };
+            let minimum = samples[0];
+            let maximum = samples[samples.len() - 1];
+            let median = samples[samples.len() / 2];
+            // An exact median catches systematic wrong range or chroma offsets
+            // (including limited 10-bit pad producing 514 instead of 512).
+            assert_eq!(
+                median, expected,
+                "frame {index}, plane {plane}, {depth}-bit full={full}: border [{minimum}, {maximum}], median {median}"
+            );
+            let tolerance = if depth == 10 { 8 } else { 2 };
+            assert!(
+                minimum.abs_diff(expected) <= tolerance && maximum.abs_diff(expected) <= tolerance,
+                "frame {index}, plane {plane}: border must stay near {expected}, got [{minimum}, {maximum}]"
+            );
+            offset += plane_width * plane_height * sample_bytes;
+        }
+    }
 }
 
 #[tokio::test]
-#[ignore = "requires FFmpeg, FFprobe, x264, SVT-AV1 5fish and HDR"]
+#[ignore = "requires FFmpeg, FFprobe, x264 and all three SVT-AV1 builds"]
 async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels() {
-    for (encoder, depth, full) in [
-        (VideoEncoder::X264, 8, false),
-        (VideoEncoder::SvtAv1FiveFish, 8, false),
-        (VideoEncoder::SvtAv1FiveFish, 10, false),
-        (VideoEncoder::SvtAv1Hdr, 8, false),
-        (VideoEncoder::SvtAv1Hdr, 10, false),
+    use FramingCase::{BordersOnly, CropResize, CropResizeBorders};
+    for (encoder, depth, full, case) in [
+        (VideoEncoder::X264, 8, false, CropResize),
+        (VideoEncoder::X264, 8, false, CropResizeBorders),
+        (VideoEncoder::X264, 8, true, CropResizeBorders),
+        (VideoEncoder::X264, 10, false, CropResizeBorders),
+        (VideoEncoder::X264, 10, true, CropResizeBorders),
+        (VideoEncoder::SvtAv1, 8, false, CropResizeBorders),
+        (VideoEncoder::SvtAv1, 10, true, CropResizeBorders),
+        (VideoEncoder::SvtAv1FiveFish, 8, false, CropResizeBorders),
+        (VideoEncoder::SvtAv1FiveFish, 10, true, CropResizeBorders),
+        (VideoEncoder::SvtAv1Hdr, 8, false, CropResizeBorders),
+        (VideoEncoder::SvtAv1Hdr, 10, false, CropResizeBorders),
+        (VideoEncoder::X264, 8, false, BordersOnly),
+        (VideoEncoder::X264, 8, true, BordersOnly),
     ] {
         let fixture = Fixture::new();
         let input = fixture.0.join("- crop's & $ % 日本語.mkv");
@@ -332,10 +538,10 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         if encoder == VideoEncoder::SvtAv1Hdr {
             request.settings.hdr_tune = media_runtime::HdrTune::FilmGrain;
         }
-        request.settings.framing = framing();
-        // The 8-bit limited-range lossless run compares actual decoded pixels
-        // against a separately filtered reference, catching wrong offsets/order.
-        request.settings.crf = if encoder == VideoEncoder::X264 && depth == 8 && !full {
+        request.settings.framing = case.settings();
+        // Lossless 8-bit cases check all decoded pixels against a separately
+        // cropped/resized source and independently constructed YUV borders.
+        request.settings.crf = if encoder == VideoEncoder::X264 && depth == 8 {
             0
         } else {
             23
@@ -347,7 +553,7 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         assert_eq!(
             result.state,
             JobState::Succeeded,
-            "{encoder:?}/{depth}/{full}: {result:#?}"
+            "{encoder:?}/{depth}/{full}/{case:?}: {result:#?}"
         );
         assert_eq!(result.encode_settings.as_ref(), Some(&request.settings));
         let actual = probe(
@@ -374,9 +580,14 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         let streams = actual["streams"].as_array().unwrap();
         assert_eq!(streams.len(), 4);
         let video = &streams[2];
+        let (content_width, content_height) = case.content_size();
+        let [top, right, bottom, left] = border_edges(request.settings.framing);
         assert_eq!(
             (video["width"].as_u64(), video["height"].as_u64()),
-            (Some(192), Some(106))
+            (
+                Some((content_width + left + right) as u64),
+                Some((content_height + top + bottom) as u64)
+            )
         );
         assert_eq!(video["nb_read_frames"], "48");
         assert_eq!(video["sample_aspect_ratio"], "1:1");
@@ -421,12 +632,19 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         );
         assert_eq!(actual["chapters"], source["chapters"]);
         if request.settings.crf == 0 {
-            let expected = frame_hashes(&input, "0:1", Some("crop=288:160:16:10,scale=192:106:flags=lanczos:in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709:in_h_chr_pos=0:out_h_chr_pos=0:in_v_chr_pos=128:out_v_chr_pos=128,setsar=1")).await;
-            let actual = frame_hashes(&destination, "0:2", None).await;
-            assert_eq!(actual.len(), 48);
-            assert_eq!(
-                actual, expected,
-                "lossless decoded pixels must match the requested crop then resize"
+            let filter = case.reference_filter(full);
+            let expected = decoded_pixels(&input, "0:1", filter.as_deref(), 8, full, 48).await;
+            let actual = decoded_pixels(&destination, "0:2", None, 8, full, 48).await;
+            assert_lossless_reference(&actual, &expected, case, full);
+        } else {
+            let output_depth = if encoder.is_svt() { 10 } else { depth };
+            let pixels = decoded_pixels(&destination, "0:2", None, output_depth, full, 3).await;
+            assert_border_levels(
+                &pixels,
+                case.content_size(),
+                request.settings.framing,
+                output_depth,
+                full,
             );
         }
         assert_eq!(std::fs::read(&input).unwrap(), original);
@@ -444,6 +662,9 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
     let fixture = Fixture::new();
     let input = fixture.0.join("batch source.mkv");
     synthesize(&input, 8, false, false, "320x180", 24).await;
+    let original = std::fs::read(&input).unwrap();
+    let existing = fixture.0.join("batch source_av1_hdr.mkv");
+    std::fs::write(&existing, b"existing bordered batch destination").unwrap();
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     manager.ready().await.unwrap();
     let base = BatchEncodeInput {
@@ -451,19 +672,22 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
         stream_indices: vec![3, 2, 1, 4],
         video_stream_index: 1,
         audio: Vec::new(),
-        framing: framing(),
+        framing: bordered_framing(),
     };
     let mut invalid = base.clone();
     invalid.framing.crop.left = 300;
+    let mut invalid_borders = base.clone();
+    invalid_borders.framing.borders.left = 1;
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
             inputs: vec![
                 base.clone(),
                 BatchEncodeInput {
-                    framing: Default::default(),
+                    framing: borders_only(),
                     ..base
                 },
                 invalid,
+                invalid_borders,
             ],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             backend: EncodeBackend::Standalone,
@@ -479,22 +703,33 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
         })
         .await
         .unwrap();
-    assert_eq!(preview.items.len(), 3);
-    assert!(preview.items[2].error.is_some());
-    assert!(preview.items[2].request.is_none());
+    assert_eq!(preview.items.len(), 4);
+    for item in &preview.items[2..] {
+        assert!(item.error.is_some());
+        assert!(item.request.is_none());
+    }
     let requests: Vec<_> = preview
         .items
         .into_iter()
         .filter_map(|item| item.request)
         .collect();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].settings.framing, framing());
-    assert_eq!(requests[1].settings.framing, Default::default());
+    assert_eq!(requests[0].settings.framing, bordered_framing());
+    assert_eq!(requests[1].settings.framing, borders_only());
+    assert_ne!(
+        requests[0].source.output_path,
+        requests[1].source.output_path
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| Path::new(&request.source.output_path) != existing)
+    );
     let jobs = manager
         .enqueue_encode_batch(requests.clone())
         .await
         .unwrap();
-    for (job, (width, height)) in jobs.iter().zip([(192, 106), (320, 180)]) {
+    for (job, (width, height)) in jobs.iter().zip([(272, 186), (400, 260)]) {
         let terminal = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
         assert_eq!(terminal.state, JobState::Succeeded, "{terminal:#?}");
         let actual = probe(Path::new(&terminal.request.output_path), &["-show_streams"]).await;
@@ -516,12 +751,17 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
         assert_eq!(saved.state, JobState::Succeeded);
     }
     reopened.shutdown().await;
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"existing bordered batch destination"
+    );
     assert_no_partial_output(&fixture.0);
 }
 
 #[tokio::test]
 #[ignore = "requires FFmpeg with libx265, FFprobe and SVT-AV1-HDR"]
-async fn framing_hdr10_retains_static_metadata_after_crop_and_resize() {
+async fn framing_hdr10_retains_static_metadata_after_crop_resize_and_borders() {
     let fixture = Fixture::new();
     let input = fixture.0.join("HDR source.mkv");
     output(command("ffmpeg").args([
@@ -530,7 +770,9 @@ async fn framing_hdr10_retains_static_metadata_after_crop_and_resize() {
         "-c:v","libx265","-preset","ultrafast","-pix_fmt","yuv420p10le","-color_range","tv","-colorspace","bt2020nc","-color_trc","smpte2084","-color_primaries","bt2020",
         "-x265-params","log-level=error:pools=2:frame-threads=2:bframes=0:hdr10=1:chromaloc=2:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=200,142"
     ]).arg(&input)).await;
-    let destination = fixture.0.join("HDR resized.mkv");
+    let original = std::fs::read(&input).unwrap();
+    let modified = std::fs::metadata(&input).unwrap().modified().unwrap();
+    let destination = fixture.0.join("HDR resized and bordered.mkv");
     let manager = JobManager::new(fixture.0.join("logs"));
     let job = manager
         .start_encode(EncodeRequest {
@@ -542,7 +784,7 @@ async fn framing_hdr10_retains_static_metadata_after_crop_and_resize() {
             settings: EncodeSettings {
                 encoder: VideoEncoder::SvtAv1Hdr,
                 hdr_tune: media_runtime::HdrTune::FilmGrain,
-                framing: framing(),
+                framing: bordered_framing(),
                 preset: 12,
                 ..Default::default()
             },
@@ -554,9 +796,11 @@ async fn framing_hdr10_retains_static_metadata_after_crop_and_resize() {
     assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
     let actual = probe(&destination, &["-show_streams", "-show_frames"]).await;
     let video = &actual["streams"][0];
-    assert_eq!(video["width"], 192);
-    assert_eq!(video["height"], 106);
+    assert_eq!(video["width"], 272);
+    assert_eq!(video["height"], 186);
     assert_eq!(video["pix_fmt"], "yuv420p10le");
+    assert_eq!(video["color_range"], "tv");
+    assert_eq!(video["color_space"], "bt2020nc");
     assert_eq!(video["color_primaries"], "bt2020");
     assert_eq!(video["color_transfer"], "smpte2084");
     let metadata = actual["frames"][0]["side_data_list"].as_array().unwrap();
@@ -570,15 +814,23 @@ async fn framing_hdr10_retains_static_metadata_after_crop_and_resize() {
             && side["max_content"] == 200
             && side["max_average"] == 142
     ));
+    assert_eq!(actual["frames"].as_array().unwrap().len(), 24);
+    let pixels = decoded_pixels(&destination, "0:0", None, 10, false, 3).await;
+    assert_border_levels(&pixels, (192, 106), bordered_framing(), 10, false);
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_eq!(
+        std::fs::metadata(&input).unwrap().modified().unwrap(),
+        modified
+    );
     assert_no_partial_output(&fixture.0);
 }
 
 #[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe and SVT-AV1-HDR"]
-async fn framing_cancel_cleans_owned_outputs_and_keeps_source() {
+async fn framing_cancel_cleans_owned_outputs_and_preserves_source_and_existing_destination() {
     let fixture = Fixture::new();
     let input = fixture.0.join("cancel source.mkv");
-    let destination = fixture.0.join("canceled crop.mkv");
+    let destination = fixture.0.join("canceled borders.mkv");
     synthesize(&input, 8, false, false, "1280x720", 120).await;
     let original = std::fs::read(&input).unwrap();
     let mut request = request(&input, &destination, 9);
@@ -586,18 +838,34 @@ async fn framing_cancel_cleans_owned_outputs_and_keeps_source() {
     request.settings.hdr_tune = media_runtime::HdrTune::FilmGrain;
     request.settings.preset = 2;
     request.settings.framing = serde_json::from_value(json!({
-        "crop":{"left":16,"right":16,"top":8,"bottom":8},"resizeWidth":960
+        "crop":{"left":16,"right":16,"top":8,"bottom":8},"resizeWidth":960,
+        "borders":{"left":32,"right":48,"top":32,"bottom":48}
     }))
     .unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
-    let job = manager.start_encode(request).await.unwrap();
+    let job = manager.start_encode(request.clone()).await.unwrap();
     let running = wait_for(&manager, &job.id, |job| job.state == JobState::Running).await;
     assert_eq!(running.state, JobState::Running, "{running:#?}");
     manager.cancel_job(job.id.clone()).await.unwrap();
     let terminal = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
-    manager.shutdown().await;
     assert_eq!(terminal.state, JobState::Canceled, "{terminal:#?}");
     assert!(!destination.exists());
+    let existing = fixture.0.join("existing bordered output.mkv");
+    std::fs::write(&existing, b"existing output must not be overwritten").unwrap();
+    request.source.output_path = existing.to_string_lossy().into_owned();
+    match manager.start_encode(request).await {
+        Ok(job) => {
+            let failed = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+            assert_eq!(failed.state, JobState::Failed, "{failed:#?}");
+            assert_eq!(failed.error.as_ref().unwrap().code, "OUTPUT_EXISTS");
+        }
+        Err(error) => assert_eq!(error.code, "OUTPUT_EXISTS"),
+    }
+    manager.shutdown().await;
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"existing output must not be overwritten"
+    );
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert_no_partial_output(&fixture.0);
 }

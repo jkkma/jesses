@@ -1,5 +1,9 @@
 # Crop and resize validation
 
+The subsequent [black border milestone](borders-validation.md) extends this
+historical crop/resize checkpoint. SVT-AV1 and x264 are now the active encoder
+priorities; other video encoders are deferred.
+
 Windows x64 development qualification on 2026-09-12 covers manual crop and
 aspect-preserving width resize in Quick Convert and standalone Batch encode.
 SVT-AV1-HDR is the default (CRF 30, preset 2, film grain retention tune, dynamic

@@ -17,7 +17,7 @@ SVT-AV1 is the primary encoding workflow. **SVT-AV1-HDR is the default**,
 standalone SVT-AV1 and x264 executables. The separate av1an
 tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
 selected audio, subtitles, and attachments by default. Quick Convert and standalone
-batch jobs can crop and resize each video and convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
+batch jobs can crop, resize, and add black borders to each video and convert individual audio tracks to AAC or Opus. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
 multiple files with individual track selections and common quality settings.
@@ -55,8 +55,8 @@ research preset ranges are not exposed yet.
 
 See [SVT fork setup and validation](docs/svt-forks.md) for pinned tool installation,
 custom executable paths, and the checks covering both workflows.
-SVT workflow development takes priority. Standalone `aomenc`, `vpxenc`, and `x265` drivers remain pending; Quick
-Convert will expose them as encoder choices as each driver is implemented.
+SVT-AV1 and x264 are the development priorities. Standalone `aomenc`, `vpxenc`,
+and `x265` drivers are deferred while these workflows are developed and qualified.
 See the [standalone driver implementation plan](docs/standalone-encoders.md) for
 the remaining architecture and qualification gates.
 
@@ -93,7 +93,7 @@ when progress stops arriving. Cancellation stops and awaits the scanner's proces
 Selected subtitles and attachments keep their original codecs. Audio remains copied
 unless its per-track conversion setting is explicitly changed.
 
-**Crop and resize:** Quick Convert and standalone Batch encode provide per-file
+**Crop, resize, and borders:** Quick Convert and standalone Batch encode provide per-file
 crop edges and an optional output width. Crop counts must be nonnegative even
 pixels. Cropping happens before Lanczos resizing; output height follows the
 cropped aspect ratio and rounds to the nearest even pixel, with halfway values
@@ -103,12 +103,21 @@ explicit width enlarges the picture; pixels remain square. These controls keep
 the original duration and selected tracks, and retain supported SDR or HDR10
 color metadata. Choosing the HDR encoder leaves dynamic-HDR fallback off.
 
+Enable **Add black borders** to set each border in nonnegative even pixels.
+Borders are added after crop and resize, keeping the picture at its planned
+size. The resize width controls the picture before borders; the dimension
+summary shows the final output including them. Final width and height must
+remain within 8192 pixels. Borders use the source's supported color range and
+bit depth, including static HDR10 with SVT-AV1. Turning borders off keeps the
+entered draft values for later use but submits no borders.
+
 Framing survives source/build/workflow draft changes and saved jobs; editing
 batch framing requires a fresh preview. Old jobs without framing retain their
-original dimensions. Every source frame is checked at its original size and
+original dimensions, and older saved framing without borders adds none. Every source frame is checked at its original size and
 every encoded frame at the planned output size before publication. av1an
-framing, automatic crop, borders, trim, and additional resize modes remain pending.
+framing, automatic crop, trim, and additional resize modes remain pending.
 See the [crop and resize validation record](tests/fixtures/framing-validation.md).
+See the [black border validation record](tests/fixtures/borders-validation.md).
 
 **Audio conversion:** Quick Convert and standalone Batch encode provide **Copy**, **Opus**, and **AAC**
 for each selected audio track. Copy is the initial setting and retains the source

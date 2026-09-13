@@ -73,6 +73,22 @@ pub struct VideoFraming {
     /// Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
     #[serde(default)]
     pub resize_width: Option<u32>,
+    /// Black pixels added after cropping and resizing the content.
+    #[serde(default)]
+    pub borders: BorderSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BorderSettings {
+    #[serde(default)]
+    pub top: u32,
+    #[serde(default)]
+    pub right: u32,
+    #[serde(default)]
+    pub bottom: u32,
+    #[serde(default)]
+    pub left: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -303,6 +319,15 @@ mod tests {
         assert_eq!(framing.crop.top, 0);
         assert_eq!(framing.crop.bottom, 0);
         assert_eq!(framing.resize_width, Some(960));
+        assert_eq!(framing.borders, BorderSettings::default());
+        let framing: VideoFraming = serde_json::from_str(
+            r#"{"crop":{"left":16,"right":8},"resizeWidth":960,"borders":{"top":8,"left":16}}"#,
+        )
+        .unwrap();
+        assert_eq!(framing.borders.top, 8);
+        assert_eq!(framing.borders.left, 16);
+        assert_eq!(framing.borders.right, 0);
+        assert_eq!(framing.borders.bottom, 0);
         let settings = EncodeSettings {
             framing,
             ..old_settings
@@ -329,6 +354,9 @@ mod tests {
             r#"{"resizeWidth":4294967296}"#,
             r#"{"crop":{"left":-2}}"#,
             r#"{"crop":{"top":2.5}}"#,
+            r#"{"borders":{"left":-2}}"#,
+            r#"{"borders":{"top":2.5}}"#,
+            r#"{"borders":{"bottom":4294967296}}"#,
         ] {
             assert!(
                 serde_json::from_str::<VideoFraming>(malformed).is_err(),

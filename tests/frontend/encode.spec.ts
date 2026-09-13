@@ -105,7 +105,11 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
     lineartPsyBias: 0,
     texturePsyBias: 0,
     hdrTune: 'filmGrain',
-    framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+    framing: {
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      resizeWidth: null,
+      borders: { top: 0, right: 0, bottom: 0, left: 0 },
+    },
     audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
   },
   progressSeconds: 3,
@@ -302,7 +306,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
 }
 
 for (const encoder of ['svtAv1Hdr', 'svtAv1FiveFish', 'svtAv1', 'x264'] as const) {
-  test(`crop and resize ${encoder} requests retain immutable framing in job history`, async ({
+  test(`crop resize and borders ${encoder} requests retain immutable framing in job history`, async ({
     page,
   }) => {
     await desktopMock(page);
@@ -314,25 +318,117 @@ for (const encoder of ['svtAv1Hdr', 'svtAv1FiveFish', 'svtAv1', 'x264'] as const
     await quick.getByLabel('Crop left (pixels)', { exact: true }).fill('4');
     await quick.getByLabel('Crop right (pixels)', { exact: true }).fill('4');
     await quick.getByLabel('Resize video', { exact: true }).check();
-    await quick.getByLabel('Output width (pixels)', { exact: true }).fill('160');
+    await quick.getByLabel('Picture width (pixels)', { exact: true }).fill('160');
+    await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveCount(0);
+    await quick.getByLabel('Add black borders', { exact: true }).check();
+    await quick.getByLabel('Border top (pixels)', { exact: true }).fill('6');
+    await quick.getByLabel('Border right (pixels)', { exact: true }).fill('8');
+    await quick.getByLabel('Border bottom (pixels)', { exact: true }).fill('10');
+    await quick.getByLabel('Border left (pixels)', { exact: true }).fill('12');
     await expect(quick.getByLabel('Video dimensions', { exact: true })).toContainText(
-      'Source 320 × 180 → Cropped 312 × 176 → Output 160 × 90',
+      'Source 320 × 180 → Cropped 312 × 176 → Picture 160 × 90 → Output 180 × 106',
     );
     await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
     const started = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
     expect(started.request.settings.framing).toEqual({
       crop: { top: 2, right: 4, bottom: 2, left: 4 },
       resizeWidth: 160,
+      borders: { top: 6, right: 8, bottom: 10, left: 12 },
     });
     await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
     await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
     await expect(quick.getByLabel('Resize video', { exact: true })).not.toBeChecked();
+    await expect(quick.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
+    await quick.getByLabel('Add black borders', { exact: true }).check();
+    await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('0');
     await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
-      'Crop top 2, right 4, bottom 2, left 4 px · Width 160 px · Automatic height',
+      'Crop top 2, right 4, bottom 2, left 4 px · Picture width 160 px · Automatic height · Black borders top 6, right 8, bottom 10, left 12 px',
     );
     expect((await calls(page, 'start_encode'))[0].payload).toEqual(started);
   });
 }
+
+test('black borders toggle retains its draft and omits disabled borders from queued requests', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const toggle = quick.getByLabel('Add black borders', { exact: true });
+  await toggle.check();
+  await quick.getByLabel('Border top (pixels)', { exact: true }).fill('12');
+  await quick.getByLabel('Border bottom (pixels)', { exact: true }).fill('8');
+  await expect(quick.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'Picture 320 × 180 → Output 320 × 200',
+  );
+  await toggle.uncheck();
+  await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveCount(0);
+  await expect(quick.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'Output 320 × 180',
+  );
+  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request.settings.framing.borders).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+  await toggle.check();
+  await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('12');
+  await expect(quick.getByLabel('Border bottom (pixels)', { exact: true })).toHaveValue('8');
+  await expect(page.getByRole('region', { name: 'Current encode job' })).not.toContainText(
+    'Black borders',
+  );
+});
+
+test('black borders reject invalid edges and final dimensions before start or queue', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const start = quick.getByRole('button', { name: 'Start encode', exact: true });
+  const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
+  await quick.getByLabel('Add black borders', { exact: true }).check();
+  for (const edge of ['top', 'right', 'bottom', 'left']) {
+    const input = quick.getByLabel(`Border ${edge} (pixels)`, { exact: true });
+    for (const invalid of ['', '-2', '3', '2.5', '8192']) {
+      await input.fill(invalid);
+      await expect(start).toBeDisabled();
+      await expect(queue).toBeDisabled();
+    }
+    await input.fill('0');
+  }
+  await quick.getByLabel('Border right (pixels)', { exact: true }).fill('7872');
+  await quick.getByLabel('Border bottom (pixels)', { exact: true }).fill('8012');
+  await expect(quick.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'Output 8192 × 8192',
+  );
+  await expect(start).toBeEnabled();
+  await quick.getByLabel('Border left (pixels)', { exact: true }).fill('2');
+  await expect(start).toBeDisabled();
+  await expect(queue).toBeDisabled();
+  await expect(quick.getByLabel('Video dimensions', { exact: true })).toContainText(
+    'including borders must not exceed 8192',
+  );
+  await quick.getByLabel('Add black borders', { exact: true }).uncheck();
+  await expect(start).toBeEnabled();
+  await expect(queue).toBeEnabled();
+  expect(await calls(page, 'start_encode')).toHaveLength(0);
+  expect(await calls(page, 'enqueue_encode')).toHaveLength(0);
+});
+
+test('legacy framing history remains readable when black borders are absent', async ({ page }) => {
+  const legacy = snapshot('succeeded');
+  const framing = legacy.encodeSettings!.framing;
+  framing.crop.top = 4;
+  framing.resizeWidth = 160;
+  delete (framing as Partial<typeof framing>).borders;
+  await desktopMock(page, { jobs: [legacy] });
+  await openEncode(page);
+  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+    'Crop top 4, right 0, bottom 0, left 0 px · Picture width 160 px · Automatic height',
+  );
+  await expect(page.getByRole('region', { name: 'Current encode job' })).not.toContainText(
+    'Black borders',
+  );
+});
 
 test('crop and resize invalid edits block both commands and selected video changes recompute dimensions', async ({
   page,
@@ -362,7 +458,7 @@ test('crop and resize invalid edits block both commands and selected video chang
   await expect(start).toBeDisabled();
   await quick.getByLabel('Crop top (pixels)', { exact: true }).fill('0');
   await quick.getByLabel('Resize video', { exact: true }).check();
-  const width = quick.getByLabel('Output width (pixels)', { exact: true });
+  const width = quick.getByLabel('Picture width (pixels)', { exact: true });
   for (const invalid of ['', '-2', '63', '161', '160.5', '8194', '64']) {
     await width.fill(invalid);
     await expect(start).toBeDisabled();
@@ -381,7 +477,7 @@ test('crop and resize invalid edits block both commands and selected video chang
   expect(await calls(page, 'enqueue_encode')).toHaveLength(0);
 });
 
-test('crop and resize drafts survive source, encoder and workflow switches while av1an sends defaults', async ({
+test('crop resize and border drafts survive source, encoder and workflow switches while av1an sends defaults', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -390,12 +486,18 @@ test('crop and resize drafts survive source, encoder and workflow switches while
   const quick = quickWorkspace(page);
   await quick.getByLabel('Crop top (pixels)', { exact: true }).fill('4');
   await quick.getByLabel('Resize video', { exact: true }).check();
-  await quick.getByLabel('Output width (pixels)', { exact: true }).fill('160');
+  await quick.getByLabel('Picture width (pixels)', { exact: true }).fill('160');
+  await quick.getByLabel('Add black borders', { exact: true }).check();
+  await quick.getByLabel('Border top (pixels)', { exact: true }).fill('12');
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(quick.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await quick.getByLabel('Crop left (pixels)', { exact: true }).fill('8');
+  await quick.getByLabel('Add black borders', { exact: true }).check();
+  await quick.getByLabel('Border left (pixels)', { exact: true }).fill('20');
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('4');
+  await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('12');
   const next = {
     ...media,
     id: 'framing-second',
@@ -405,7 +507,10 @@ test('crop and resize drafts survive source, encoder and workflow switches while
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(quick.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await quick.getByLabel('Crop bottom (pixels)', { exact: true }).fill('8');
+  await quick.getByLabel('Add black borders', { exact: true }).check();
+  await quick.getByLabel('Border top (pixels)', { exact: true }).fill('40');
   await page
     .getByRole('navigation', { name: 'Workspace' })
     .getByRole('button', { name: /^Files/ })
@@ -414,18 +519,24 @@ test('crop and resize drafts survive source, encoder and workflow switches while
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const av1an = av1anWorkspace(page);
   await expect(av1an.getByLabel('Crop top (pixels)', { exact: true })).toHaveCount(0);
+  await expect(av1an.getByLabel('Add black borders', { exact: true })).toHaveCount(0);
   await av1an.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
   expect(queued.request.settings.framing).toEqual({
     crop: { top: 0, right: 0, bottom: 0, left: 0 },
     resizeWidth: null,
+    borders: { top: 0, right: 0, bottom: 0, left: 0 },
   });
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('4');
-  await expect(quick.getByLabel('Output width (pixels)', { exact: true })).toHaveValue('160');
+  await expect(quick.getByLabel('Picture width (pixels)', { exact: true })).toHaveValue('160');
+  await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('12');
+  await expect(quick.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('0');
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(quick.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('8');
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(quick.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('20');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
@@ -505,7 +616,11 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       lineartPsyBias: 6,
       texturePsyBias: 3,
       hdrTune: 'visualQuality',
-      framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+      framing: {
+        crop: { top: 0, right: 0, bottom: 0, left: 0 },
+        resizeWidth: null,
+        borders: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
       audio:
         tab === 'av1an'
           ? []
@@ -537,7 +652,11 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
-      framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+      framing: {
+        crop: { top: 0, right: 0, bottom: 0, left: 0 },
+        resizeWidth: null,
+        borders: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
       audio:
         tab === 'av1an'
           ? []
@@ -769,7 +888,11 @@ test('x264 uses its own defaults, preset names, validation, copied tracks, and i
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
-      framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+      framing: {
+        crop: { top: 0, right: 0, bottom: 0, left: 0 },
+        resizeWidth: null,
+        borders: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
       audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
     },
   });
@@ -943,7 +1066,11 @@ test('x264 ignores an enqueue error after source replacement and keeps submissio
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
-      framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+      framing: {
+        crop: { top: 0, right: 0, bottom: 0, left: 0 },
+        resizeWidth: null,
+        borders: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
       audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
     },
   });
@@ -1092,7 +1219,11 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'filmGrain',
-              framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+              framing: {
+                crop: { top: 0, right: 0, bottom: 0, left: 0 },
+                resizeWidth: null,
+                borders: { top: 0, right: 0, bottom: 0, left: 0 },
+              },
               audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
             },
           },
@@ -1452,7 +1583,11 @@ test('encodes can be queued for different sources while another job is running',
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'filmGrain',
-              framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+              framing: {
+                crop: { top: 0, right: 0, bottom: 0, left: 0 },
+                resizeWidth: null,
+                borders: { top: 0, right: 0, bottom: 0, left: 0 },
+              },
               audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
             },
           },
@@ -1479,7 +1614,11 @@ test('encodes can be queued for different sources while another job is running',
               lineartPsyBias: 0,
               texturePsyBias: 0,
               hdrTune: 'filmGrain',
-              framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+              framing: {
+                crop: { top: 0, right: 0, bottom: 0, left: 0 },
+                resizeWidth: null,
+                borders: { top: 0, right: 0, bottom: 0, left: 0 },
+              },
               audio: [],
             },
           },
@@ -1585,7 +1724,11 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
     lineartPsyBias: 0,
     texturePsyBias: 0,
     hdrTune: 'filmGrain',
-    framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+    framing: {
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      resizeWidth: null,
+      borders: { top: 0, right: 0, bottom: 0, left: 0 },
+    },
     audio: [],
   });
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
@@ -1817,7 +1960,11 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'filmGrain',
-      framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+      framing: {
+        crop: { top: 0, right: 0, bottom: 0, left: 0 },
+        resizeWidth: null,
+        borders: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
       audio: [],
     },
   });

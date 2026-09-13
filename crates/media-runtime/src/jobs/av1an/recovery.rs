@@ -924,6 +924,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_manifest_without_borders_matches_default_framing_without_rewriting_receipts() {
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let manifest_path = workspace.root.join("manifest.json");
+        let mut legacy = serde_json::to_value(&workspace.manifest).unwrap();
+        legacy["settings"]["framing"]
+            .as_object_mut()
+            .unwrap()
+            .remove("borders");
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&manifest_path, &legacy_bytes).unwrap();
+        let (_, loaded) = load(
+            &workspace.manifest.id,
+            &workspace.manifest.request,
+            &workspace.manifest.settings,
+            &workspace.summary(),
+        )
+        .unwrap();
+        assert!(loaded == workspace.manifest);
+        assert_eq!(fs::read(&manifest_path).unwrap(), legacy_bytes);
+        let mut changed = workspace.manifest.settings.clone();
+        changed.framing.borders.left = 2;
+        assert!(
+            load(
+                &workspace.manifest.id,
+                &workspace.manifest.request,
+                &changed,
+                &workspace.summary(),
+            )
+            .is_err()
+        );
+        drop(workspace);
+        drop(intermediate);
+    }
+
+    #[test]
     fn manifests_reject_foreign_locations_owners_settings_and_truncation_without_mutation() {
         let fixture = Fixture::new();
         let (mut workspace, intermediate) = fixture.workspace();

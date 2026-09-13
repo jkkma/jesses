@@ -52,11 +52,17 @@ export type HdrTune = "visualQuality" | "filmGrain";
 
 export type CropSettings = { top: number, right: number, bottom: number, left: number, };
 
+export type BorderSettings = { top: number, right: number, bottom: number, left: number, };
+
 export type VideoFraming = { crop: CropSettings,
 /**
  * Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
  */
-resizeWidth: number | null, };
+resizeWidth: number | null,
+/**
+ * Black pixels added after cropping and resizing the content.
+ */
+borders: BorderSettings, };
 
 export type EncodeSettings = {
 /**

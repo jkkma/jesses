@@ -25,7 +25,11 @@ const savedJob = (
     texturePsyBias: 0,
     hdrTune: 'filmGrain',
     audio: [],
-    framing: { crop: { top: 0, right: 0, bottom: 0, left: 0 }, resizeWidth: null },
+    framing: {
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      resizeWidth: null,
+      borders: { top: 0, right: 0, bottom: 0, left: 0 },
+    },
   },
   recovery: {
     workspace: 'C:\\work\\saved-encode',

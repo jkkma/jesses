@@ -5,14 +5,17 @@ scene detection and parallel chunk execution. The current implementation offers
 standalone SVT-AV1 and x264 in Quick Convert and SVT-AV1 chunks in av1an. Encoder
 identity is separate from workflow identity, including batch and saved jobs.
 x264 uses a timed Matroska intermediate and preserves SDR source depth. AOM,
-VPX, and x265 remain pending; this milestone does not complete those integrations.
+VPX, and x265 are deferred while SVT-AV1 and x264 workflows are developed.
 
 ## Implementation order
 
 SVT-AV1-HDR is the application default, 5fish is the anime option, and mainline
-SVT remains selectable. SVT workflow migration takes priority over adding the
-remaining drivers below. Manual crop and width resize are now available in the
-standalone workflow; see the [validation record](../tests/fixtures/framing-validation.md).
+SVT remains selectable. SVT-AV1 and x264 are the active development priorities;
+the remaining drivers below are low priority. Shared work should improve these
+two workflows first: framing and preview, quality controls, presets, and reliable
+execution. Manual crop, width resize, and black borders are available in the
+standalone workflow; see the [framing record](../tests/fixtures/framing-validation.md)
+and [border record](../tests/fixtures/borders-validation.md).
 
 1. Retain an encoder identity independent of the workflow. Keep existing serialized
    SVT defaults and job history readable, and carry the encoder through batch
@@ -20,7 +23,7 @@ standalone workflow; see the [validation record](../tests/fixtures/framing-valid
 2. Extend the output plan's codec, decoded pixel format, HDR policy,
    intermediate format, and encoder-specific quality settings. Current AV1-only
    checks and metadata precision rules must stay strict for existing jobs.
-3. Extract direct drivers for discovery, capability checks, input/output arguments,
+3. When additional encoders become a priority, extract direct drivers for discovery, capability checks, input/output arguments,
    and progress parsing. Reuse the supervised binary pipeline and owned output
    handles. Add `aomenc`, `vpxenc`, and `x265` individually.
 4. Prove intermediate timing before exposing each driver. IVF provides a starting

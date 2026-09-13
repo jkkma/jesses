@@ -286,8 +286,12 @@ impl Plan {
     }
 
     pub fn framing_filter(&self) -> Option<String> {
-        self.geometry
-            .filter(self.matrix, self.full_range, self.chroma)
+        self.geometry.filter(
+            self.matrix,
+            self.full_range,
+            self.chroma,
+            self.output_pixel_format,
+        )
     }
 
     fn frame_dimensions(&self, encoded: bool) -> (u32, u32) {
@@ -624,12 +628,18 @@ mod tests {
                         ..Default::default()
                     },
                     resize_width: Some(64),
+                    borders: media_core::BorderSettings {
+                        top: 8,
+                        right: 24,
+                        bottom: 16,
+                        left: 32,
+                    },
                 },
                 ..Default::default()
             };
             let selected = source.selected(&[0]).unwrap();
             let mut plan = Plan::build(&source, &selected, &settings).unwrap();
-            assert_eq!((plan.width, plan.height), (64, 64));
+            assert_eq!((plan.width, plan.height), (120, 88));
             assert_eq!(plan.frame_dimensions(false), (128, 96));
             assert_eq!(
                 plan.validate_source_frames(&decoded, &source.streams[0])
@@ -651,14 +661,20 @@ mod tests {
             );
             encoded.width = Some(64);
             encoded.height = Some(64);
+            assert!(
+                plan.validate_encoded_stream(&source.streams[0], &encoded)
+                    .is_err()
+            );
+            encoded.width = Some(120);
+            encoded.height = Some(88);
             plan.validate_encoded_stream(&source.streams[0], &encoded)
                 .unwrap();
             let mut output = Frames {
                 frames: decoded.frames.clone(),
             };
             for frame in &mut output.frames {
-                frame.width = Some(64);
-                frame.height = Some(64);
+                frame.width = Some(120);
+                frame.height = Some(88);
                 frame.pix_fmt = Some("yuv420p10le".into());
             }
             assert_eq!(plan.validate_frames(&output, &encoded, true).unwrap(), 3);

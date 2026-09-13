@@ -664,7 +664,7 @@
               ? '; lineart and texture bias 0–7'
               : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
           </p>{:else if !validFraming}<p class="disabled-reason">
-            Check crop and resize values in each selected episode's video settings.
+            Check crop, resize and border values in each selected episode's video settings.
           </p>{:else if backend === 'standalone' && !selectedFiles.every( (file) => validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams) )}<p
             class="disabled-reason"
           >

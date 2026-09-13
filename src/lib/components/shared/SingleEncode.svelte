@@ -547,7 +547,7 @@
             {#if !chunked}
               <span
                 >{framingResult.error
-                  ? 'Check crop and resize values'
+                  ? 'Check crop, resize and border values'
                   : framingSummary(selectedFraming(framing))}</span
               >
             {/if}
