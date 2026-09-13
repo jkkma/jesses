@@ -15,6 +15,11 @@ av1an. See the [framing record](../tests/fixtures/framing-validation.md),
 [av1an framing/audio record](../tests/fixtures/av1an-framing-audio-validation.md),
 and [x265/VP9 record](../tests/fixtures/ffmpeg-video-validation.md).
 
+Mainline SVT-AV1 requires version 2.0.0 or newer for two-pass bitrate and target
+size. Earlier versions use a different three-pass VBR protocol and are rejected
+before source processing for these modes; CRF and one-pass bitrate remain
+available. Linux CI builds the same pinned mainline version as the packages.
+
 ## Remaining drivers
 
 Separate `aomenc`, `vpxenc`, and `x265` executable drivers are deferred. Preserved

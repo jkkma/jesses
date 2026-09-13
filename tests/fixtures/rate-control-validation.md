@@ -25,6 +25,10 @@ x264 uses `--bitrate`, `--pass`, and `--stats`. x265 uses FFmpeg `-b:v` and
 `pass`/`stats` x265 parameters. VP9 uses `-b:v`, `-pass`, and `-passlogfile`.
 SVT uses VBR `--rc 1 --tbr`, with explicit external `--pass`/`--stats` in two-pass
 mode and `--passes 1` for one pass. CRF arguments are absent in bitrate modes.
+Mainline SVT requires version 2.0.0 or newer for two-pass modes. Older mainline
+builds use three-pass VBR, where pass two is intermediate; they fail version
+preflight before source processing. CRF and one-pass modes keep their existing
+compatibility. Linux CI selects source-pinned SVT 4.2.0 for these gates.
 FFmpeg output options remain after its Y4M input. Y4M input chroma is explicitly
 declared from the validated plan, matching output chroma and preserved pixels.
 

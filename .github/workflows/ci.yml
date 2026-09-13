@@ -48,12 +48,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm pkg-config libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm cmake ninja-build pkg-config libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Verify the mainline SVT source installer
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-ci-install-svt.py
+      - name: Build the pinned mainline SVT qualification tool
+        if: runner.os == 'Linux'
+        run: python3 scripts/ci-install-svt.py
       - name: Verify actual FFmpeg, FFprobe, and standalone SVT-AV1 integration
         if: runner.os == 'Linux'
         run: |

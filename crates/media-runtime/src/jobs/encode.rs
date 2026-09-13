@@ -123,6 +123,9 @@ impl JobManager {
                 );
                 crate::discovery::validate_video_encoder_version(settings.encoder, &identity)
                     .map_err(|message| files::error("ENCODER_BUILD_MISMATCH", message, path))?;
+                super::rate_control::validate_encoder_version(settings, &identity).map_err(
+                    |message| files::error("ENCODER_CAPABILITY_UNSUPPORTED", message, path),
+                )?;
             }
             let bytes = if version.stdout.is_empty() {
                 &version.stderr

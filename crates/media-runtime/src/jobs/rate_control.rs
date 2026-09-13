@@ -39,6 +39,41 @@ pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     }
 }
 
+pub(super) fn validate_encoder_version(
+    settings: &EncodeSettings,
+    identity: &str,
+) -> Result<(), String> {
+    if settings.encoder != VideoEncoder::SvtAv1
+        || !matches!(
+            settings.rate_control,
+            Some(
+                VideoRateControl::Bitrate { two_pass: true, .. }
+                    | VideoRateControl::TargetSize { .. }
+            )
+        )
+    {
+        return Ok(());
+    }
+    // SVT 2.0 replaced three-pass VBR with two-pass VBR. In older builds,
+    // --pass 2 emits an intermediate result, not the final encoded video.
+    let major = identity
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("svt-av1"))
+        .flat_map(str::split_whitespace)
+        .find_map(|word| {
+            let mut parts = word.strip_prefix('v')?.split('.');
+            let major = parts.next()?.parse::<u32>().ok()?;
+            parts.next()?.parse::<u32>().ok()?;
+            parts.next()?.split('-').next()?.parse::<u32>().ok()?;
+            Some(major)
+        });
+    if major.is_some_and(|major| major >= 2) {
+        Ok(())
+    } else {
+        Err("Mainline SVT-AV1 two-pass bitrate and target size require version 2.0.0 or newer. Older versions use three-pass VBR. Update the encoder in Tools, or choose CRF or one-pass bitrate.".into())
+    }
+}
+
 pub(super) struct Rate {
     pub kbps: u32,
     pub two_pass: bool,
@@ -301,6 +336,76 @@ impl Drop for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mainline_two_pass_requires_the_final_pass_protocol() {
+        for control in [
+            VideoRateControl::Bitrate {
+                bitrate_kbps: 300,
+                two_pass: true,
+            },
+            VideoRateControl::TargetSize { target_size_mib: 1 },
+        ] {
+            let settings = EncodeSettings {
+                encoder: VideoEncoder::SvtAv1,
+                rate_control: Some(control),
+                ..Default::default()
+            };
+            for identity in [
+                "SVT-AV1 Encoder Lib v1.7.0",
+                "SVT-AV1 Encoder Lib v1.8.0",
+                "SVT-AV1 development build",
+                "SVT-AV1 version unavailable\nUnrelated tool v4.2.0",
+            ] {
+                assert!(
+                    validate_encoder_version(&settings, identity)
+                        .unwrap_err()
+                        .contains("2.0.0"),
+                    "{identity}"
+                );
+            }
+            for identity in [
+                "SVT-AV1 Encoder Lib v2.0.0",
+                "SVT-AV1 v4.2.0 (release)",
+                "SVT-AV1 v4.2.0-21-g00333404f (release)",
+            ] {
+                validate_encoder_version(&settings, identity).unwrap();
+            }
+            for encoder in [
+                VideoEncoder::SvtAv1FiveFish,
+                VideoEncoder::SvtAv1Hdr,
+                VideoEncoder::X264,
+                VideoEncoder::X265,
+                VideoEncoder::Vp9,
+            ] {
+                validate_encoder_version(
+                    &EncodeSettings {
+                        encoder,
+                        ..settings.clone()
+                    },
+                    "This driver's version is checked separately",
+                )
+                .unwrap();
+            }
+        }
+        for control in [
+            None,
+            Some(VideoRateControl::Bitrate {
+                bitrate_kbps: 300,
+                two_pass: false,
+            }),
+        ] {
+            validate_encoder_version(
+                &EncodeSettings {
+                    encoder: VideoEncoder::SvtAv1,
+                    rate_control: control,
+                    ..Default::default()
+                },
+                "SVT-AV1 Encoder Lib v1.7.0",
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn old_settings_keep_quality_and_new_modes_validate_before_tools() {
         let old: EncodeSettings =
