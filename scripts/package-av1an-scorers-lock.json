@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "inputs": {
+    "vsbindings": {
+      "revision": "b87ff61ce680fa5a4cf7d44a9cb4b605c5037432",
+      "url": "https://codeload.github.com/dnjulek/vapoursynth-zig/tar.gz/b87ff61ce680fa5a4cf7d44a9cb4b605c5037432",
+      "sha256": "2d5c6104d9b11183eebc65298c36adff60f8dd82128bbcdc76611452d68c5c0c",
+      "path": "vsbindings-b87ff61ce680fa5a4cf7d44a9cb4b605c5037432.tar.gz"
+    },
+    "zigimg": {
+      "revision": "0bbe201a5591219177f2444371c2897746b47774",
+      "url": "https://codeload.github.com/zigimg/zigimg/tar.gz/0bbe201a5591219177f2444371c2897746b47774",
+      "sha256": "4f145109a4c4eab3deeb49b1847be9a5826c1c3967a586e879d40e6943c4009c",
+      "path": "zigimg-0bbe201a5591219177f2444371c2897746b47774.tar.gz"
+    },
+    "libjxl": {
+      "revision": "684aa6d030b460de153ffbeeb9c4d7936e514873",
+      "url": "https://codeload.github.com/libjxl/libjxl/tar.gz/684aa6d030b460de153ffbeeb9c4d7936e514873",
+      "sha256": "31d66da3bfa244b7a581d647bff5de4a16e045f11beba6172ed8744e4bbaa56a",
+      "path": "libjxl-684aa6d030b460de153ffbeeb9c4d7936e514873.tar.gz"
+    },
+    "brotli": {
+      "url": "https://codeload.github.com/google/brotli/tar.gz/35ef5c554d888bef217d449346067de05e269b30",
+      "sha256": "e3142f57bedc51eb75256ff265698a4e8c944282b96888b5aa1cb33fe9378cc8",
+      "path": "brotli.tar.gz"
+    },
+    "highway": {
+      "url": "https://codeload.github.com/google/highway/tar.gz/f670ea580bb70b4113b63b9cdaa42ba9b10cd13a",
+      "sha256": "71fa0671e03468ba941fef5aa4d30fbb5338565712ae051f8638a475fc001be9",
+      "path": "highway.tar.gz"
+    },
+    "skcms": {
+      "url": "https://skia.googlesource.com/skcms/+archive/b25b07b4b07990811de121c0356155b2ba0f4318.tar.gz",
+      "sha256": "84630d9fbd3bfd834b9687369a4a2d914def8c06033e6ebee7e4103bff9e726b",
+      "path": "skcms.tar.gz"
+    },
+    "vszip": {
+      "version": "22.1.0",
+      "revision": "beb7a0ab0e4166580b76560ae3f7c7f5e376ac90",
+      "url": "https://codeload.github.com/dnjulek/vapoursynth-zip/tar.gz/beb7a0ab0e4166580b76560ae3f7c7f5e376ac90",
+      "sha256": "f1d0081de36858802795b2e78252654dbc48dd0478cf349fc53a6e7edb65f33c",
+      "path": "vszip-beb7a0ab0e4166580b76560ae3f7c7f5e376ac90.tar.gz"
+    },
+    "julek": {
+      "version": "r3",
+      "revision": "3f2780d2a6fb02d1fb2f23730431c407905dcc32",
+      "url": "https://codeload.github.com/dnjulek/vapoursynth-julek-plugin/tar.gz/3f2780d2a6fb02d1fb2f23730431c407905dcc32",
+      "sha256": "a73f787745f57765c6e81292a1a0f0552e1dfa0de985cffe19b70182ab00b5b5",
+      "path": "julek-3f2780d2a6fb02d1fb2f23730431c407905dcc32.tar.gz"
+    },
+    "zigSource": {
+      "url": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
+      "sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+      "path": "zig-0.16.0.tar.xz",
+      "version": "0.16.0"
+    },
+    "zigBuild": {
+      "url": "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip",
+      "sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
+      "path": "zig-x86_64-windows-0.16.0.zip",
+      "version": "0.16.0"
+    },
+    "vapoursynth": {
+      "path": "vapoursynth-source.tar.gz",
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
+      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
+      "commit": "acabf605b2205b32d65859bb2736405719d2fafd",
+      "version": "R79"
+    },
+    "cmakeBuild": {
+      "version": "4.4.3",
+      "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
+      "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
+      "root": "cmake-4.4.3-windows-x86_64",
+      "path": "cmake-4.4.3-windows-x86_64.zip"
+    }
+  }
+}

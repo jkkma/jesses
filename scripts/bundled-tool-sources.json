@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "sources": {
+    "svt-av1-5fish": {
+      "url": "https://codeload.github.com/5fish/SVT-AV1/tar.gz/1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
+      "sha256": "172a6867239f2e7165829f338358e1a497d9867c2bf19728ebc678de91ee3b4f"
+    },
+    "svt-av1-hdr": {
+      "url": "https://codeload.github.com/juliobbv-p/svt-av1-hdr/tar.gz/00333404f455471aaa6ee2c927cac3c93efb76e3",
+      "sha256": "814218d7fd359973c7c257bf880f8c27d93d2b649b1ac343f6493599f3917f42"
+    }
+  }
+}

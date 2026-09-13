@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "svtAv1": {
+    "version": "4.2.0",
+    "commit": "9292ec8e32bce26f781f277ec8739b53426c4300",
+    "url": "https://gitlab.com/api/v4/projects/AOMediaCodec%2FSVT-AV1/repository/archive.tar.gz?sha=9292ec8e32bce26f781f277ec8739b53426c4300",
+    "sha256": "fe7e58bbd61040b460373ce7cfe0119311464eddbd6e620d84eeed317f598a64",
+    "root": "SVT-AV1-9292ec8e32bce26f781f277ec8739b53426c4300-9292ec8e32bce26f781f277ec8739b53426c4300"
+  },
+  "cmakeWindows": {
+    "version": "4.4.3",
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
+    "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
+    "root": "cmake-4.4.3-windows-x86_64"
+  }
+}

@@ -1,0 +1,191 @@
+name: Unsigned desktop packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Build profile
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/package-build
+      PACKAGE_PROFILE: ${{ inputs.profile }}
+      PACKAGE_TARGET: ${{ matrix.target }}
+      PACKAGE_BUNDLES: ${{ matrix.bundles }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/package-build
+      - name: Install Linux packaging prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf libfuse2 nasm yasm cmake meson ninja-build autoconf automake libtool pkg-config patch git xxd gperf
+      - run: pnpm install --frozen-lockfile
+      - run: python scripts/test-package-desktop.py
+      - run: python scripts/test-package-toolchain.py
+      - run: python scripts/test-package-standalone.py
+      - run: python scripts/test-package-standalone-linux.py
+      - run: python scripts/test-package-av1an.py
+      - run: python scripts/test-package-ffmpeg-linux.py
+      - run: pnpm format:check
+      - run: pnpm check
+      - run: cargo test -p jesses --lib --locked paths::tests
+      - name: Assemble pinned isolated Windows media compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/bootstrap-package-toolchain.py --destination "$RUNNER_TEMP/jesses-media-compiler"
+      - name: Build static Windows FFmpeg pair and retain corresponding sources
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/build-package-ffmpeg.py --destination "$RUNNER_TEMP/jesses-ffmpeg" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build Linux FFmpeg pair with static codecs and retain corresponding sources
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/build-package-ffmpeg-linux.py --build-directory "$RUNNER_TEMP/jesses-ffmpeg" --cache "$RUNNER_TEMP/jesses-ffmpeg-source-cache"
+      - name: Build standalone Windows x264 using the same pinned sources
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/build-package-x264.py --destination "$RUNNER_TEMP/jesses-x264" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build Linux standalone x264 and mainline SVT-AV1
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/build-package-standalone-linux.py --build-directory "$RUNNER_TEMP/jesses-standalone-linux" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --cache "$RUNNER_TEMP/jesses-ffmpeg-source-cache" --jobs 4
+      - name: Build pinned mainline Windows SVT-AV1
+        shell: bash
+        if: runner.os == 'Windows'
+        run: python scripts/build-package-svt.py --destination "$RUNNER_TEMP/jesses-svt" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build portable Windows av1an and its complete frameserver sources
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/build-package-av1an.py --destination "$RUNNER_TEMP/jesses-av1an" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build source-complete Windows CPU quality scorers
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-scorers" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64" --vapoursynth-source "$RUNNER_TEMP/jesses-av1an/frameserver/source/vapoursynth-acabf605b2205b32d65859bb2736405719d2fafd" --python "$RUNNER_TEMP/jesses-av1an/frameserver/python-input/tools/python.exe"
+          python scripts/add-package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-av1an-scorers" --av1an-build "$RUNNER_TEMP/jesses-av1an/delivery" --scorers-build "$RUNNER_TEMP/jesses-scorers/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Stage verified tools and complete source archives
+        shell: bash
+        run: |
+          standalone_args=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-x264/delivery" --svt-build "$RUNNER_TEMP/jesses-svt/delivery" --av1an-build "$RUNNER_TEMP/jesses-av1an-scorers/delivery")
+          else
+            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-standalone-linux/x264/delivery" --svt-build "$RUNNER_TEMP/jesses-standalone-linux/svt-av1/delivery")
+          fi
+          python scripts/stage-bundled-tools.py --destination "$RUNNER_TEMP/jesses-bundled-tools" --target "$PACKAGE_TARGET" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" "${standalone_args[@]}"
+      - name: Build native package discovery gate
+        run: cargo build -p media-runtime --example package_tools --locked
+      - name: Verify Windows bundled discovery with external tools unavailable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an
+      - name: Verify Linux bundled discovery with external tools unavailable
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1
+      - name: Qualify the packaged media pair with real files
+        shell: bash
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; fi
+          export JESSES_FFMPEG="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/ffmpeg/ffmpeg$suffix"
+          export JESSES_FFPROBE="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/ffmpeg/ffprobe$suffix"
+          export JESSES_X264="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/x264/x264$suffix"
+          export JESSES_SVT_AV1="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1/SvtAv1EncApp$suffix"
+          export JESSES_SVT_AV1_5FISH="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-5fish/SvtAv1EncApp$suffix"
+          export JESSES_SVT_AV1_HDR="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-hdr/SvtAv1EncApp$suffix"
+          cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --locked -- --ignored --test-threads=1
+          cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1
+      - name: Qualify portable av1an with external tools and conflicting runtimes unavailable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($testSuite in @('av1an_jobs', 'av1an_recovery')) {
+            $messages = cargo test -p media-runtime --test $testSuite --no-run --locked --message-format=json | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'The portable av1an test runner failed to build.' }
+            $runner = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq $testSuite -and $_.executable })
+            if ($runner.Count -ne 1) { throw 'Expected one exact native test runner.' }
+            $gateArguments = @('scripts/qualify-package-av1an.py', '--runner', $runner[0].executable, '--resources', "$env:RUNNER_TEMP/jesses-bundled-tools", '--receipt', "$env:RUNNER_TEMP/jesses-portable-$testSuite.json")
+            if ($testSuite -eq 'av1an_recovery') { $gateArguments += @('--skip-test', 'configured_source_readers_and_fixed_chunks_stop_reopen_and_resume') }
+            python @gateArguments
+            if ($LASTEXITCODE -ne 0) { throw 'The packaged av1an native gate failed.' }
+          }
+      - name: Build unsigned native bundles
+        shell: bash
+        run: |
+          build_args=()
+          if [ "$PACKAGE_PROFILE" = debug ]; then build_args+=(--debug); fi
+          pnpm tauri build --target "$PACKAGE_TARGET" --bundles "$PACKAGE_BUNDLES" --config "$RUNNER_TEMP/jesses-bundled-tools/tauri-tools.conf.json" "${build_args[@]}"
+      - name: Assemble archives, resource manifests and checksums
+        shell: bash
+        run: python scripts/package-desktop.py collect --build-directory "$CARGO_TARGET_DIR/$PACKAGE_TARGET/$PACKAGE_PROFILE" --destination "$RUNNER_TEMP/jesses-packages" --target "$PACKAGE_TARGET" --profile "$PACKAGE_PROFILE" --tool-resources "$RUNNER_TEMP/jesses-bundled-tools/resources/tools"
+      - name: Verify portable resources with a restricted tool search path
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/package-desktop.py diagnostics "$RUNNER_TEMP/jesses-packages/portable" --sanitized-path
+      - name: Verify native tool discovery from actual installer resources
+        shell: bash
+        run: |
+          suffix=""
+          standalone_args=(--require-tool x264 --require-tool svt-av1)
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an); fi
+          python scripts/verify-bundle-resources.py --packages "$RUNNER_TEMP/jesses-packages" --probe "$CARGO_TARGET_DIR/debug/examples/package_tools$suffix" --destination "$RUNNER_TEMP/jesses-extracted-bundles" --require-media "${standalone_args[@]}"
+      - name: Retain native gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jesses-${{ matrix.target }}-native-gate-evidence
+          path: |
+            ${{ runner.temp }}/jesses-portable-*.json
+            ${{ runner.temp }}/jesses-portable-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jesses-${{ matrix.target }}-${{ inputs.profile }}-unsigned
+          path: |
+            ${{ runner.temp }}/jesses-packages/*.exe
+            ${{ runner.temp }}/jesses-packages/*.zip
+            ${{ runner.temp }}/jesses-packages/*.AppImage
+            ${{ runner.temp }}/jesses-packages/*.deb
+            ${{ runner.temp }}/jesses-packages/*.json
+            ${{ runner.temp }}/jesses-packages/*.md
+            ${{ runner.temp }}/jesses-packages/LICENSE
+            ${{ runner.temp }}/jesses-packages/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

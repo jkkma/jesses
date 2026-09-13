@@ -1,0 +1,209 @@
+{
+  "schemaVersion": 1,
+  "rustVersion": "1.98.1",
+  "inputs": {
+    "diffutilsBuild": {
+      "path": "diffutils-3.12-1-x86_64.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/msys/x86_64/diffutils-3.12-1-x86_64.pkg.tar.zst",
+      "sha256": "7902c8ce3d4dd69a0f5e98dc9d5c83c17b23314ba486169db57ef6e2835ce3b6"
+    },
+    "av1an": {
+      "path": "av1an-modern-source.tar.gz",
+      "url": "https://codeload.github.com/rust-av/Av1an/tar.gz/805dad69143fa0a81cfe2fb89c0b9e90a828ea72",
+      "sha256": "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2",
+      "commit": "805dad69143fa0a81cfe2fb89c0b9e90a828ea72",
+      "version": "0.5.2"
+    },
+    "vapoursynth": {
+      "path": "vapoursynth-source.tar.gz",
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
+      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
+      "commit": "acabf605b2205b32d65859bb2736405719d2fafd",
+      "version": "R79"
+    },
+    "pythonRuntime": {
+      "path": "python-3.14.7-embed-amd64.zip",
+      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip",
+      "sha256": "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15",
+      "version": "3.14.7"
+    },
+    "pythonSbom": {
+      "path": "python-3.14.7-embed-amd64.zip.spdx.json",
+      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip.spdx.json",
+      "sha256": "29c6982ade4b118ee371eb6060d24cb3c0da3f24578f7f1a67e82cca9b007ceb"
+    },
+    "pythonBuild": {
+      "path": "python.3.14.7.nupkg",
+      "url": "https://api.nuget.org/v3-flatcontainer/python/3.14.7/python.3.14.7.nupkg",
+      "sha256": "46a4da5529a92d18ff894911f6e6033a8253198d705b8161bf28c9123c87d46b"
+    },
+    "pythonSource": {
+      "path": "Python-3.14.7.tar.xz",
+      "url": "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tar.xz",
+      "sha256": "3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81"
+    },
+    "cython": {
+      "path": "cython-3.3.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/a9/d8/4981ef716ad0e3ff0d3ef383aefc6b03c4a88dee33b272bf8e0d833001ca/cython-3.3.0.tar.gz",
+      "sha256": "eed0d93fbca7087f143b42c34b05a825849bdf17f101572c2105acfa49aa88b8"
+    },
+    "lsmash": {
+      "path": "lsmash-works-source.tar.gz",
+      "url": "https://codeload.github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works/tar.gz/7e63c8400a252f4dbbeea80cc3bfec895abf12cf",
+      "sha256": "868b923e223ae606579140f2b02e5b92b861a730b3fad9119c23ca98f4e55efb"
+    },
+    "libp2p": {
+      "path": "libp2p-source.tar.gz",
+      "url": "https://codeload.github.com/sekrit-twc/libp2p/tar.gz/869fa993041f9f3af7d9ac8b10158920c6ddce66",
+      "sha256": "cacef2683a19a8b288cf567544b507f7f06dd66160db566bf3349e5ee0b73d90",
+      "commit": "869fa993041f9f3af7d9ac8b10158920c6ddce66"
+    },
+    "zimg": {
+      "repo": "sekrit-twc/zimg",
+      "commit": "67e0603271c080e22c8429856dd4a8a56587e61e",
+      "path": "zimg-vs-source.tar.gz",
+      "sha256": "539495d51fcd8c7ef9b89a611454e0c1173d18e8d4e743efdef67c4aa7e40d4f",
+      "url": "https://codeload.github.com/sekrit-twc/zimg/tar.gz/67e0603271c080e22c8429856dd4a8a56587e61e"
+    },
+    "graphengine": {
+      "repo": "sekrit-twc/graphengine",
+      "commit": "cb5b2ce13384ec2491f0c37256ea210034799f69",
+      "path": "graphengine-source.tar.gz",
+      "sha256": "663bc958094280e3dabfa76a408296a51f5222f56115fd7782eae737edeaa179",
+      "url": "https://codeload.github.com/sekrit-twc/graphengine/tar.gz/cb5b2ce13384ec2491f0c37256ea210034799f69"
+    },
+    "xxhash": {
+      "repo": "Cyan4973/xxHash",
+      "commit": "e626a72bc2321cd320e953a0ccf1584cad60f363",
+      "path": "xxHash-source.tar.gz",
+      "sha256": "34e71c085636fbc1726482996d92719d0a16e6a6097970ecf2990a27b3821162",
+      "url": "https://codeload.github.com/Cyan4973/xxHash/tar.gz/e626a72bc2321cd320e953a0ccf1584cad60f363"
+    },
+    "obuparse": {
+      "repo": "HomeOfAviSynthPlusEvolution/obuparse",
+      "commit": "a67fcab9cd9d56c866a7a860f8c4aeb91b8817e8",
+      "path": "obuparse-source.tar.gz",
+      "sha256": "904af4d87212363b9aa9ea7471a1d33aa5dc53afba6eead245817f8ffab27e3f",
+      "url": "https://codeload.github.com/HomeOfAviSynthPlusEvolution/obuparse/tar.gz/a67fcab9cd9d56c866a7a860f8c4aeb91b8817e8"
+    },
+    "liblsmash": {
+      "repo": "HomeOfAviSynthPlusEvolution/l-smash",
+      "commit": "d186eb95388710a7a91f6fd353169b457ebbb9db",
+      "path": "l-smash-source.tar.gz",
+      "sha256": "a58cf7fb8314d8422257b9f0a4cabe117aa2fb8a8488b4e9a31f4b6d05c8e00c",
+      "url": "https://codeload.github.com/HomeOfAviSynthPlusEvolution/l-smash/tar.gz/d186eb95388710a7a91f6fd353169b457ebbb9db"
+    },
+    "decoderFfmpeg": {
+      "url": "https://codeload.github.com/HomeOfAviSynthPlusEvolution/FFmpeg/tar.gz/39c24f36247f370864ce86ebdf2aa936151f4bfc",
+      "commit": "39c24f36247f370864ce86ebdf2aa936151f4bfc",
+      "path": "lsmash-ffmpeg-source.tar.gz",
+      "sha256": "e3298a272e0adc1bde78f703a1f7916e7cb25d05b6239931af95db1b4cbcf4d1"
+    }
+  },
+  "pythonSources": [
+    {
+      "name": "bzip2",
+      "version": "1.0.8",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/bzip2-1.0.8.tar.gz",
+      "path": "bzip2.tar.gz",
+      "sha256": "ab8d1b0cc087c20d4c32c0e4fcf7d0c733a95da12cedc6d63b3f0a9af07427e2"
+    },
+    {
+      "name": "expat",
+      "version": "2.8.2",
+      "url": "https://github.com/libexpat/libexpat/releases/download/R_2_8_2/expat-2.8.2.tar.gz",
+      "path": "expat-2.8.2.tar.gz",
+      "sha256": "ef7d1994f533c9e7343d6c19f31064fc8ebbcbcaa144be3812b4f43052a05f4c"
+    },
+    {
+      "name": "hacl-star",
+      "version": "8ba599b2f6c9701b3dc961db895b0856a2210f76",
+      "url": "https://github.com/hacl-star/hacl-star/archive/8ba599b2f6c9701b3dc961db895b0856a2210f76.zip",
+      "path": "hacl-star-8ba599b2f6c9701b3dc961db895b0856a2210f76.zip",
+      "sha256": "61e48893f37cb2280d106cefacf6fb5afe84edf625fec39572d0ee94e1018f26"
+    },
+    {
+      "name": "libffi",
+      "version": "3.4.4",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/libffi-3.4.4.tar.gz",
+      "path": "libffi.tar.gz",
+      "sha256": "9d802681adfea27d84cae0487a785fb9caa925bdad44c401b364c59ab2b8edda"
+    },
+    {
+      "name": "macholib",
+      "version": "1.0",
+      "url": "https://files.pythonhosted.org/packages/ec/57/f0a712efc3ed982cf4038a3cee172057303b9be914c32c93b2fbec27f785/macholib-1.0.tar.gz",
+      "path": "macholib-1.0.tar.gz",
+      "sha256": "c76f268f5054024e962f2515a0e522baf85313064f6740d80375afc850787a38"
+    },
+    {
+      "name": "mpdecimal",
+      "version": "4.0.0",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/mpdecimal-4.0.0.tar.gz",
+      "path": "mpdecimal.tar.gz",
+      "sha256": "338fac3fb8cdd60f406b6326431338756f58a8af94229ffd9bf1e7c2b1ad71ca"
+    },
+    {
+      "name": "mpdecimal",
+      "version": "2.5.1",
+      "url": "https://www.bytereef.org/software/mpdecimal/releases/mpdecimal-2.5.1.tar.gz",
+      "path": "mpdecimal-2.5.1.tar.gz",
+      "sha256": "9f9cd4c041f99b5c49ffb7b59d9f12d95b683d88585608aa56a6307667b2b21f"
+    },
+    {
+      "name": "openssl",
+      "version": "3.5.7",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/openssl-3.5.7.tar.gz",
+      "path": "openssl.tar.gz",
+      "sha256": "ca94e7c6c223d9caf77bb51aac5949186379608ea2a0cad3aa8bdf31856912e9"
+    },
+    {
+      "name": "sqlite",
+      "version": "3.50.4.0",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/sqlite-3.50.4.0.tar.gz",
+      "path": "sqlite.tar.gz",
+      "sha256": "fb5ab81f27612b0a7b4861ba655906c76dc85ee969e7a4905d2075aff931e8d0"
+    },
+    {
+      "name": "tcl",
+      "version": "9.0.4.0",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/tcl-9.0.4.0.tar.gz",
+      "path": "tcl.tar.gz",
+      "sha256": "3ac2acd65ddaaac0b2b8df321b558419d21da20bf67ab39149b8248c85f0d214"
+    },
+    {
+      "name": "tk",
+      "version": "9.0.4.1",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/tk-9.0.4.1.tar.gz",
+      "path": "tk.tar.gz",
+      "sha256": "66048966cfa88989333ff1632f454e10e9248516bb45efda7b4d2ae5a61642cb"
+    },
+    {
+      "name": "xz",
+      "version": "5.2.5",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/xz-5.2.5.tar.gz",
+      "path": "xz.tar.gz",
+      "sha256": "a15c168e39e87d750c3dc766edc7f19bdda57dacf01e509678467eace91ad282"
+    },
+    {
+      "name": "zlib-ng",
+      "version": "2.2.4",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/zlib-ng-2.2.4.tar.gz",
+      "path": "zlib-ng.tar.gz",
+      "sha256": "00bbd88709bc416cb96160ab61d3e1c8f76e106799af7328d0fe434dc7dd5004"
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.7",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/zstd-1.5.7.tar.gz",
+      "path": "zstd.tar.gz",
+      "sha256": "f24b52470d12f466e9fa4fcc94e6c530625ada51d7b36de7fdc6ed7e6f499c8e"
+    }
+  ],
+  "cmakeWindows": {
+    "version": "4.4.3",
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
+    "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
+    "root": "cmake-4.4.3-windows-x86_64"
+  }
+}

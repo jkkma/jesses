@@ -13,3 +13,4 @@ src-tauri/icons/ios/
 Thumbs.db
 test-results/
 playwright-report/
+__pycache__/
