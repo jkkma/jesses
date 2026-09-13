@@ -272,19 +272,24 @@ mod tests {
             probe_height: 1080,
         });
         let options = settings.av1an_options.unwrap();
-        assert!(
-            validate_plugin("systems.innocent.lsmas : Found", options)
-                .unwrap_err()
-                .contains("ffmpeg9-passthrough-v1")
+        let supported_version = concat!(
+            "ffmpeg9-passthrough-v1\n",
+            "ffmpeg-metric-matrix-v1\n",
+            "lsmash-software-probes-v1\n",
+            "systems.innocent.lsmas : Found",
         );
-        validate_plugin(
-            "ffmpeg9-passthrough-v1\nsystems.innocent.lsmas : Found",
-            options,
-        )
-        .unwrap();
+        validate_plugin(supported_version, options).unwrap();
+        for missing_fix in ["ffmpeg9-passthrough-v1", "ffmpeg-metric-matrix-v1"] {
+            let version = supported_version.replace(missing_fix, "");
+            assert!(
+                validate_plugin(&version, options)
+                    .unwrap_err()
+                    .contains(missing_fix)
+            );
+        }
         assert!(
             validate_plugin(
-                "ffmpeg9-passthrough-v1\nsystems.innocent.lsmas : Not found",
+                &supported_version.replace("lsmas : Found", "lsmas : Not found"),
                 options
             )
             .unwrap_err()
