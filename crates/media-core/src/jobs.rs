@@ -15,7 +15,28 @@ pub struct RemuxRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeSettings {
-    /// Per-source framing, applied before standalone video encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<crate::EncoderParameter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub temporal: Option<crate::TemporalSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub av1an_options: Option<crate::Av1anOptions>,
+    /// Omission preserves constant-quality encoding and old saved jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rate_control: Option<VideoRateControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tone_map: Option<crate::ToneMapSettings>,
+    /// Zero-based start and exclusive end frames. Omission retains the full source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub trim: Option<VideoTrim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<crate::SubtitleTrackSettings>,
+    /// Per-source framing, applied before video encoding.
     #[serde(default)]
     pub framing: VideoFraming,
     /// Per-source-track overrides; omitted selected audio streams are copied.
@@ -48,6 +69,13 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            temporal: None,
+            parameters: Vec::new(),
+            av1an_options: None,
+            rate_control: None,
+            tone_map: None,
+            trim: None,
+            subtitles: Vec::new(),
             framing: VideoFraming::default(),
             audio: Vec::new(),
             backend: EncodeBackend::default(),
@@ -111,6 +139,10 @@ pub enum AudioCodec {
     Copy,
     Opus,
     Aac,
+    Flac,
+    Mp3,
+    Vorbis,
+    Eac3,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -131,6 +163,37 @@ pub struct AudioTrackSettings {
     pub bitrate_kbps: u16,
     #[serde(default)]
     pub channels: AudioChannels,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub gain: Option<AudioGain>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "mode",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum VideoRateControl {
+    Bitrate { bitrate_kbps: u32, two_pass: bool },
+    TargetSize { target_size_mib: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoTrim {
+    pub start_frame: u32,
+    pub end_frame_exclusive: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioGain {
+    pub tenths_db: i16,
+    /// Present for an applied measurement; manual gain has no measurement claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_fingerprint: Option<String>,
 }
 
 fn default_audio_bitrate() -> u16 {
@@ -171,6 +234,8 @@ pub enum VideoEncoder {
     SvtAv1FiveFish,
     SvtAv1Hdr,
     X264,
+    X265,
+    Vp9,
 }
 
 impl VideoEncoder {
@@ -184,7 +249,13 @@ impl VideoEncoder {
             Self::SvtAv1FiveFish => "SVT-AV1 5fish",
             Self::SvtAv1Hdr => "SVT-AV1-HDR",
             Self::X264 => "x264",
+            Self::X265 => "x265",
+            Self::Vp9 => "VP9",
         }
+    }
+
+    pub fn is_ffmpeg(self) -> bool {
+        matches!(self, Self::X265 | Self::Vp9)
     }
 }
 
@@ -213,6 +284,7 @@ pub enum JobState {
     Queued,
     Preparing,
     Running,
+    Paused,
     Finalizing,
     Succeeded,
     Canceling,
@@ -257,6 +329,11 @@ pub struct JobSnapshot {
     pub id: String,
     pub state: JobState,
     pub request: RemuxRequest,
+    /// Present only for multi-source remux. The ordinary request is a display
+    /// summary; this mapping is the immutable execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub mux_request: Option<crate::MuxRequest>,
     #[serde(default)]
     pub encode_settings: Option<EncodeSettings>,
     #[serde(default)]
@@ -284,6 +361,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.recovery, None);
+        assert_eq!(snapshot.mux_request, None);
+        assert!(
+            serde_json::to_value(&snapshot)
+                .unwrap()
+                .get("muxRequest")
+                .is_none()
+        );
         snapshot.state = JobState::Stopped;
         snapshot.recovery = Some(Av1anRecovery {
             workspace: "owned-work".into(),

@@ -37,7 +37,7 @@ impl Fingerprint {
     }
 }
 
-pub(super) struct Source {
+pub(crate) struct Source {
     pub path: PathBuf,
     // Windows share mode denies writes and deletion for the whole job.
     file: File,
@@ -122,11 +122,12 @@ pub(super) fn validate_request(request: &RemuxRequest) -> Result<(), AppError> {
     if !output
         .extension()
         .and_then(|v| v.to_str())
-        .is_some_and(|v| v.eq_ignore_ascii_case("mkv"))
+        .and_then(media_core::ContainerFormat::from_extension)
+        .is_some()
     {
         return Err(error(
             "OUTPUT_FORMAT_UNSUPPORTED",
-            "This workflow writes Matroska files. Choose an output ending in .mkv.",
+            "Choose an output ending in .mkv, .mp4, .mov or .webm.",
             output,
         ));
     }
@@ -223,12 +224,27 @@ impl Temporary {
         Self::create_extension(output, id, "ivf")
     }
 
-    fn create_extension(output: &Path, id: &str, extension: &str) -> Result<Self, AppError> {
+    pub(super) fn create_extension(
+        output: &Path,
+        id: &str,
+        extension: &str,
+    ) -> Result<Self, AppError> {
         let path = output
             .parent()
             .expect("validated output parent")
             .join(format!(".jesses-{id}.partial.{extension}"));
         Self::open_at(path, false, false)
+    }
+
+    /// libass ignores dot-prefixed font files. Keep its generated assets visible
+    /// inside a reserved private directory, with the same identity and cleanup
+    /// protections as other temporary outputs. Names never come from media tags.
+    pub(super) fn create_font(directory: &Path, source_index: u32) -> Result<Self, AppError> {
+        Self::open_at(
+            directory.join(format!("font-{source_index}.bin")),
+            false,
+            false,
+        )
     }
 
     /// Durable intermediates belong to a recovery workspace, outside scratch cleanup.

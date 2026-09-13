@@ -28,8 +28,18 @@ pub(crate) async fn run_tool(
     time_limit: Duration,
     max_bytes: usize,
 ) -> Result<ProcessOutput, ProcessError> {
+    run_tool_with_environment(executable, args, time_limit, max_bytes, None).await
+}
+
+pub(crate) async fn run_tool_with_environment(
+    executable: &Path,
+    args: &[OsString],
+    time_limit: Duration,
+    max_bytes: usize,
+    environment: Option<&supervisor::ChildEnvironment>,
+) -> Result<ProcessOutput, ProcessError> {
     let (_owner, cancel) = tokio::sync::watch::channel(false);
-    let output = supervisor::run_capture(
+    let output = supervisor::run_capture_with_environment(
         &CommandSpec {
             executable: executable.to_owned(),
             args: args.to_owned(),
@@ -38,6 +48,7 @@ pub(crate) async fn run_tool(
         cancel,
         max_bytes,
         time_limit,
+        environment,
     )
     .await
     .map_err(|error| match error {

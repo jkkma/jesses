@@ -118,6 +118,13 @@ impl History {
             if job.id.is_empty() || !ids.insert(&job.id) {
                 return Err(error(&self.path, "invalid or repeated job identifier"));
             }
+            if let Some(request) = &job.mux_request
+                && (job.encode_settings.is_some()
+                    || job.recovery.is_some()
+                    || !super::mux::summary(request).is_ok_and(|summary| summary == job.request))
+            {
+                return Err(error(&self.path, "inconsistent multi-source remux history"));
+            }
         }
         Ok(record.jobs)
     }
@@ -250,5 +257,77 @@ mod tests {
         fs::remove_file(path.join("jobs.json")).unwrap();
         fs::remove_file(path.join("jobs.lock")).unwrap();
         fs::remove_dir(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inconsistent_mux_receipts_are_preserved_and_block_admission() {
+        use media_core::{JobState, MuxRequest, MuxSource, MuxTrack};
+        let path = std::env::temp_dir().join(format!(
+            "jesses-history-mux-{}-{}",
+            std::process::id(),
+            NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = MuxRequest {
+            sources: vec![MuxSource {
+                id: "source".into(),
+                input_path: path.join("source.mkv").to_string_lossy().into_owned(),
+            }],
+            tracks: vec![MuxTrack {
+                source_id: "source".into(),
+                stream_index: 7,
+                title: None,
+                language: None,
+                default: None,
+                forced: None,
+            }],
+            metadata_source_id: "source".into(),
+            chapters_source_id: None,
+            output_path: path.join("output.mkv").to_string_lossy().into_owned(),
+        };
+        let (history, _) = History::open(path.clone()).await.unwrap();
+        history
+            .save(vec![JobSnapshot {
+                id: "mux".into(),
+                state: JobState::Running,
+                request: super::super::mux::summary(&request).unwrap(),
+                mux_request: Some(request.clone()),
+                encode_settings: None,
+                recovery: None,
+                progress_seconds: None,
+                duration_seconds: None,
+                logs: vec![],
+                error: None,
+                log_path: None,
+            }])
+            .await
+            .unwrap();
+        let record_path = path.join("jobs.json");
+        let original = fs::read(&record_path).unwrap();
+        drop(history);
+        assert_eq!(
+            History::open(path.clone()).await.unwrap().1[0]
+                .mux_request
+                .as_ref(),
+            Some(&request)
+        );
+        for mismatch in 0..3 {
+            let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            match mismatch {
+                0 => record["jobs"][0]["request"]["streamIndices"] = serde_json::json!([99]),
+                1 => {
+                    record["jobs"][0]["encodeSettings"] =
+                        serde_json::to_value(media_core::EncodeSettings::default()).unwrap()
+                }
+                _ => {
+                    record["jobs"][0]["muxRequest"]["tracks"][0]["sourceId"] =
+                        serde_json::json!("removed")
+                }
+            }
+            let malformed = serde_json::to_vec(&record).unwrap();
+            fs::write(&record_path, &malformed).unwrap();
+            assert!(History::open(path.clone()).await.is_err());
+            assert_eq!(fs::read(&record_path).unwrap(), malformed);
+        }
+        fs::remove_dir_all(path).unwrap();
     }
 }

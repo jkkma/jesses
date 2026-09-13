@@ -1,13 +1,34 @@
 //! Audio overrides are tied to source indices; encoder arguments use output
 //! positions. Converted audio is checked using decoded samples, after codec
 //! delay/pre-skip has been applied by the decoder, rather than packet counts.
-use media_core::{AudioChannels, AudioCodec, AudioTrackSettings, EncodeBackend};
+use media_core::{AudioChannels, AudioCodec, AudioTrackSettings};
 use serde::Deserialize;
 
 use super::*;
 
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::new("AUDIO_SETTINGS_INVALID", message, None)
+}
+
+pub(super) fn codec_name(codec: AudioCodec) -> &'static str {
+    match codec {
+        AudioCodec::Copy => "copy",
+        AudioCodec::Aac => "aac",
+        AudioCodec::Opus => "opus",
+        AudioCodec::Flac => "flac",
+        AudioCodec::Mp3 => "mp3",
+        AudioCodec::Vorbis => "vorbis",
+        AudioCodec::Eac3 => "eac3",
+    }
+}
+
+fn encoder_name(codec: AudioCodec) -> &'static str {
+    match codec {
+        AudioCodec::Opus => "libopus",
+        AudioCodec::Mp3 => "libmp3lame",
+        AudioCodec::Vorbis => "libvorbis",
+        codec => codec_name(codec),
+    }
 }
 
 pub(super) fn converted(settings: &EncodeSettings) -> impl Iterator<Item = &AudioTrackSettings> {
@@ -25,19 +46,61 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 "Audio settings contain duplicate source stream indices.",
             ));
         }
-        if !(32..=512).contains(&track.bitrate_kbps) {
-            return Err(invalid(
-                "Audio bitrate must be an integer from 32 to 512 kb/s.",
-            ));
+        let maximum = if track.codec == AudioCodec::Eac3 {
+            6144
+        } else {
+            512
+        };
+        if track.codec != AudioCodec::Flac && !(32..=maximum).contains(&track.bitrate_kbps) {
+            return Err(invalid(format!(
+                "Audio bitrate must be an integer from 32 to {maximum} kb/s."
+            )));
         }
         if track.codec == AudioCodec::Copy && track.channels != AudioChannels::Preserve {
             return Err(invalid("Copy audio requires the original channel layout."));
         }
-        if settings.backend == EncodeBackend::Av1an && track.codec != AudioCodec::Copy {
-            return Err(invalid(
-                "Audio conversion is available in the standalone workflow. av1an currently copies selected audio tracks.",
-            ));
+        if let Some(gain) = &track.gain {
+            if track.codec == AudioCodec::Copy {
+                return Err(invalid(
+                    "Gain requires audio conversion. Copy preserves the original audio.",
+                ));
+            }
+            if !(-600..=240).contains(&gain.tenths_db) {
+                return Err(invalid(
+                    "Audio gain must be between -60 and +24 dB in 0.1 dB steps.",
+                ));
+            }
+            if gain.source_fingerprint.as_ref().is_some_and(|fingerprint| {
+                fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(invalid(
+                    "The loudness measurement source identity is invalid.",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_gain_source(
+    source: &Source,
+    settings: &EncodeSettings,
+) -> Result<(), AppError> {
+    let measured: Vec<_> = settings
+        .audio
+        .iter()
+        .filter_map(|track| track.gain.as_ref()?.source_fingerprint.as_ref())
+        .collect();
+    if measured.is_empty() {
+        return Ok(());
+    }
+    let current = crate::analysis::fingerprint(source)?;
+    if measured.iter().any(|identity| **identity != current) {
+        return Err(AppError::new(
+            "SOURCE_CHANGED",
+            "The source changed since loudness measurement. Measure again or set an explicit manual gain.",
+            Some(source.path.to_string_lossy().into_owned()),
+        ));
     }
     Ok(())
 }
@@ -60,6 +123,20 @@ pub(super) fn validate_selection(
             continue;
         }
         let rate = sample_rate(source)?;
+        let valid_rate = match track.codec {
+            AudioCodec::Mp3 => {
+                [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000].contains(&rate)
+            }
+            AudioCodec::Eac3 => [32000, 44100, 48000].contains(&rate),
+            AudioCodec::Vorbis => (8000..=192000).contains(&rate),
+            _ => true,
+        };
+        if !valid_rate {
+            return Err(invalid(format!(
+                "{} cannot retain this source sample rate ({rate} Hz). Choose another codec; Opus explicitly converts to 48,000 Hz.",
+                codec_name(track.codec)
+            )));
+        }
         if track.codec == AudioCodec::Aac
             && ![
                 7350, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200,
@@ -83,18 +160,60 @@ pub(super) fn validate_selection(
         let maximum_bitrate = match track.codec {
             AudioCodec::Aac => (rate * output_channels * 6 / 1000).min(512),
             AudioCodec::Opus => (output_channels * 256).min(512),
+            AudioCodec::Mp3 => {
+                if rate >= 32000 {
+                    320
+                } else {
+                    160
+                }
+            }
+            AudioCodec::Eac3 => 6144 * rate / 48000,
+            AudioCodec::Flac | AudioCodec::Vorbis => 512,
             AudioCodec::Copy => unreachable!(),
         };
-        if u32::from(track.bitrate_kbps) > maximum_bitrate {
+        if track.codec != AudioCodec::Flac && u32::from(track.bitrate_kbps) > maximum_bitrate {
             return Err(invalid(format!(
                 "Audio stream {} supports at most {maximum_bitrate} kb/s with the selected codec, sample rate, and output channel count.",
                 track.stream_index
             )));
         }
+        if track.codec == AudioCodec::Mp3 {
+            if output_channels > 2 {
+                return Err(invalid(
+                    "MP3 supports mono or stereo. Choose an explicit downmix instead of preserving multichannel audio.",
+                ));
+            }
+            let allowed: &[u16] = if rate >= 32000 {
+                &[
+                    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+                ]
+            } else {
+                &[32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+            };
+            if !allowed.contains(&track.bitrate_kbps) {
+                return Err(invalid(
+                    "MP3 requires one of the displayed standard bitrates for the source sample rate; intermediate values would be rounded by the encoder.",
+                ));
+            }
+        }
+        if source.channels.is_some_and(|channels| channels <= 2)
+            && source.channel_layout.as_deref().is_some_and(|layout| {
+                layout
+                    != if source.channels == Some(1) {
+                        "mono"
+                    } else {
+                        "stereo"
+                    }
+            })
+        {
+            return Err(invalid(
+                "Audio conversion requires a standard mono or stereo layout for sources with one or two channels.",
+            ));
+        }
         if source.channels.is_some_and(|channels| channels > 2) {
             let layout_channels = match source.channel_layout.as_deref() {
                 Some("3.0") => Some(3),
-                Some("quad" | "4.0") => Some(4),
+                Some("quad" | "quad(side)" | "4.0") => Some(4),
                 Some("5.0" | "5.0(side)") => Some(5),
                 Some("5.1" | "5.1(side)") => Some(6),
                 Some("6.1") => Some(7),
@@ -106,15 +225,24 @@ pub(super) fn validate_selection(
                     "Converting multichannel audio requires a recognized speaker layout matching its channel count.",
                 ));
             }
-            if track.codec == AudioCodec::Opus
-                && track.channels == AudioChannels::Preserve
-                && matches!(
+            let unsupported_layout = match track.codec {
+                AudioCodec::Opus | AudioCodec::Vorbis => matches!(
                     source.channel_layout.as_deref(),
-                    Some("4.0" | "5.0(side)" | "5.1(side)")
-                )
-            {
+                    Some("4.0" | "quad(side)" | "5.0(side)" | "5.1(side)")
+                ),
+                AudioCodec::Flac => {
+                    matches!(source.channel_layout.as_deref(), Some("4.0" | "quad(side)"))
+                }
+                AudioCodec::Eac3 => matches!(
+                    source.channel_layout.as_deref(),
+                    Some("quad" | "5.0" | "5.1" | "6.1" | "7.1")
+                ),
+                _ => false,
+            };
+            if track.channels == AudioChannels::Preserve && unsupported_layout {
                 return Err(invalid(format!(
-                    "Opus cannot preserve the speaker layout of audio stream {}. Choose mono or stereo, AAC, or copy.",
+                    "{} cannot preserve the speaker layout of audio stream {}. Choose an explicit mono or stereo downmix, another codec, or copy.",
+                    codec_name(track.codec),
                     track.stream_index
                 )));
             }
@@ -160,16 +288,20 @@ pub(super) fn append_arguments(
     track: &AudioTrackSettings,
     source: &metadata::Stream,
 ) {
-    let encoder = match track.codec {
-        AudioCodec::Copy => return,
-        AudioCodec::Opus => "libopus",
-        AudioCodec::Aac => "aac",
-    };
+    if track.codec == AudioCodec::Copy {
+        return;
+    }
+    let encoder = encoder_name(track.codec);
+    let mut filter = String::from("asetpts=N/SR/TB+STARTPTS");
+    if let Some(gain) = &track.gain {
+        filter.push_str(&format!(
+            ",volume={:.1}dB:precision=double",
+            f64::from(gain.tenths_db) / 10.0
+        ));
+    }
     args.extend([
         format!("-c:{position}").into(),
         encoder.into(),
-        format!("-b:{position}").into(),
-        format!("{}k", track.bitrate_kbps).into(),
         format!("-ar:{position}").into(),
         expected_rate(source, track)
             .expect("validated audio rate")
@@ -179,8 +311,21 @@ pub(super) fn append_arguments(
         // first decoded timestamp and every sample. No async resampling,
         // silence insertion, or dropping is used to conceal timestamp gaps.
         format!("-filter:{position}").into(),
-        "asetpts=N/SR/TB+STARTPTS".into(),
+        filter.into(),
     ]);
+    if track.codec == AudioCodec::Flac {
+        args.extend([
+            format!("-sample_fmt:{position}").into(),
+            "s32".into(),
+            format!("-bits_per_raw_sample:{position}").into(),
+            "24".into(),
+        ]);
+    } else {
+        args.extend([
+            format!("-b:{position}").into(),
+            format!("{}k", track.bitrate_kbps).into(),
+        ]);
+    }
     if track.codec == AudioCodec::Aac {
         args.extend([format!("-profile:{position}").into(), "aac_low".into()]);
     }
@@ -217,11 +362,7 @@ pub(super) async fn check_encoders(
     .map_err(|error| process_error(error, ffmpeg))?;
     let listing = String::from_utf8_lossy(&result.stdout);
     for track in converted(settings) {
-        let name = if track.codec == AudioCodec::Opus {
-            "libopus"
-        } else {
-            "aac"
-        };
+        let name = encoder_name(track.codec);
         if !result.status.success()
             || !listing
                 .lines()
@@ -359,6 +500,145 @@ pub(super) async fn check_delay_support(
     Ok(())
 }
 
+/// Exercise the exact additional codec/rate/layout/bitrate combination before
+/// touching user audio or starting video encoding. Encoder listings alone do
+/// not expose Vorbis rate limits or Matroska delay/discard-padding support.
+pub(super) async fn check_conversion_support(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    temporary: &Temporary,
+    source: &metadata::Stream,
+    track: &AudioTrackSettings,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let fail = || {
+        AppError::new(
+            "AUDIO_TOOL_UNSUPPORTED",
+            format!(
+                "The installed FFmpeg/FFprobe pair cannot preserve {} audio with this sample rate, speaker layout, and bitrate in Matroska. Choose supported settings or install a matching recent tool pair.",
+                codec_name(track.codec)
+            ),
+            None,
+        )
+    };
+    let rate = sample_rate(source)?;
+    let layout = match source.channels {
+        Some(1) => "mono",
+        Some(2) => "stereo",
+        _ => source.channel_layout.as_deref().expect("validated layout"),
+    };
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(format!("anullsrc=r={rate}:cl={layout}:d=1").into());
+    append_arguments(&mut args, 0, track, source);
+    args.extend(
+        [
+            "-copyts",
+            "-avoid_negative_ts",
+            "disabled",
+            "-f",
+            "matroska",
+            "-y",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    args.push(temporary.path.as_os_str().to_owned());
+    let encoded = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffmpeg.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|error| process_error(error, ffmpeg))?;
+    if !encoded.status.success() {
+        return Err(fail());
+    }
+    temporary.flush_nonempty_async().await?;
+    let document = probe(ffprobe, &temporary.path, cancel, None).await?;
+    let stream = document.streams.first().ok_or_else(fail)?;
+    if document.streams.len() != 1
+        || stream.codec_name.as_deref() != Some(codec_name(track.codec))
+        || stream.sample_rate != expected_rate(source, track)
+        || stream.channels != expected_channels(source, track)
+        || (track.channels == AudioChannels::Preserve
+            && source.channels.is_some_and(|channels| channels > 2)
+            && stream.channel_layout != source.channel_layout)
+        || (track.codec == AudioCodec::Flac && stream.bits_per_raw_sample.as_deref() != Some("24"))
+    {
+        return Err(fail());
+    }
+    let decoded = scan(ffprobe, &temporary.path, stream, true, cancel).await?;
+    let original = Timeline {
+        rate,
+        samples: u64::from(rate),
+        ..Default::default()
+    };
+    verify_timeline(&original, &decoded, track.codec).map_err(|_| fail())?;
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-err_detect",
+        "explode",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(temporary.path.as_os_str().to_owned());
+    args.extend(
+        [
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    let pcm = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffmpeg.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        8 * 1024 * 1024,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|error| process_error(error, ffmpeg))?;
+    if !pcm.status.success()
+        || !pcm.stderr.is_empty()
+        || pcm.stdout.len() as u64 != decoded.samples * u64::from(stream.channels.unwrap()) * 2
+    {
+        return Err(fail());
+    }
+    Ok(())
+}
+
 #[derive(Default, Deserialize)]
 struct Frame {
     best_effort_timestamp_time: Option<String>,
@@ -368,7 +648,7 @@ struct Frame {
     channel_layout: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct Timeline {
     start: f64,
     samples: u64,
@@ -379,6 +659,77 @@ pub(super) struct Timeline {
 }
 
 impl Timeline {
+    /// Container edit lists quantize codec delay to their source time base. This
+    /// bound applies only to copying a verified stage into a different container.
+    pub(super) fn verify_container(
+        &self,
+        output: &Self,
+        time_base: f64,
+        aac_last_duration: Option<f64>,
+    ) -> Result<(), AppError> {
+        let tolerance = time_base.max(1.0 / f64::from(self.rate)).min(0.002);
+        // Matroska AAC can decode a complete final frame despite a shorter
+        // packet duration. MP4 applies that already-declared duration as a
+        // discard boundary. Permit only the padding proven by that last packet.
+        let declared_padding = aac_last_duration
+            .filter(|duration| *duration > 0.0)
+            .map(|duration| {
+                (1024.0 / f64::from(self.rate) - duration).clamp(0.0, 1023.0 / f64::from(self.rate))
+            })
+            .unwrap_or(0.0);
+        let source_end = self.start + self.samples as f64 / f64::from(self.rate);
+        let output_end = output.start + output.samples as f64 / f64::from(output.rate);
+        if self.rate != output.rate
+            || (self.start - output.start).abs() > tolerance + 0.000001
+            || output_end - source_end > tolerance + 0.000001
+            || source_end - output_end > declared_padding + tolerance + 0.000001
+            || (output.samples as f64 - self.samples as f64) / f64::from(self.rate)
+                > tolerance + 0.000001
+            || (self.samples as f64 - output.samples as f64) / f64::from(self.rate)
+                > declared_padding + tolerance + 0.000001
+        {
+            return Err(AppError::new(
+                "AUDIO_VALIDATION_FAILED",
+                format!(
+                    "The final container changed decoded audio beyond one source time-base tick (at most 2 ms): start {} -> {}, samples {} -> {}, end {} -> {}.",
+                    self.start, output.start, self.samples, output.samples, source_end, output_end
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Pick samples whose source presentation times lie in [start, end).
+    /// Fractional video boundaries round upward on the audio sample clock.
+    pub(super) fn clipped(&self, start: f64, end: f64) -> Result<(Self, String), AppError> {
+        let sample = |time: f64| {
+            (((time - self.start) * f64::from(self.rate) - 0.0000001)
+                .ceil()
+                .max(0.0) as u64)
+                .min(self.samples)
+        };
+        let first = sample(start);
+        let last = sample(end);
+        if first >= last {
+            return Err(AppError::new(
+                "TRIM_UNSUPPORTED",
+                "The selected audio track has no samples inside this frame interval. Exclude the track or select a wider interval.",
+                None,
+            ));
+        }
+        let output_start = (self.start + first as f64 / f64::from(self.rate) - start).max(0.0);
+        let mut clipped = self.clone();
+        clipped.start = output_start;
+        clipped.samples = last - first;
+        Ok((
+            clipped,
+            format!(
+                "atrim=start_sample={first}:end_sample={last},asetpts=N/SR/TB+{output_start:.12}/TB"
+            ),
+        ))
+    }
+
     fn push(&mut self, frame: Frame) -> Result<(), String> {
         if let Some(value) = frame.sample_rate {
             let rate = value
@@ -583,6 +934,7 @@ mod tests {
             codec,
             bitrate_kbps: 128,
             channels: AudioChannels::Preserve,
+            gain: None,
         }
     }
     fn source() -> Document {
@@ -618,10 +970,56 @@ mod tests {
         settings.audio[0].channels = AudioChannels::Stereo;
         assert!(validate_settings(&settings).is_err());
         settings.audio[0] = track(AudioCodec::Opus);
-        settings.backend = EncodeBackend::Av1an;
-        assert!(validate_settings(&settings).is_err());
+        settings.backend = media_core::EncodeBackend::Av1an;
+        validate_settings(&settings).unwrap();
         settings.audio[0] = track(AudioCodec::Copy);
         validate_settings(&settings).unwrap();
+    }
+
+    #[test]
+    fn additional_codecs_reject_implicit_downmix_layout_changes_and_bitrate_rounding() {
+        for (codec, channels, layout) in [
+            (AudioCodec::Mp3, 6, "5.1"),
+            (AudioCodec::Vorbis, 4, "4.0"),
+            (AudioCodec::Vorbis, 6, "5.1(side)"),
+            (AudioCodec::Flac, 4, "4.0"),
+            (AudioCodec::Eac3, 6, "5.1"),
+            (AudioCodec::Eac3, 8, "7.1"),
+        ] {
+            let mut source = source();
+            source.streams[1].channels = Some(channels);
+            source.streams[1].channel_layout = Some(layout.into());
+            let mut settings = EncodeSettings {
+                audio: vec![track(codec)],
+                ..Default::default()
+            };
+            let selected = source.selected(&[0, 1]).unwrap();
+            assert!(
+                validate_selection(&selected, &settings).is_err(),
+                "{codec:?} must not silently change {layout}"
+            );
+            settings.audio[0].channels = AudioChannels::Stereo;
+            validate_selection(&selected, &settings).unwrap();
+        }
+        let mut source = source();
+        let mut settings = EncodeSettings {
+            audio: vec![track(AudioCodec::Mp3)],
+            ..Default::default()
+        };
+        settings.audio[0].bitrate_kbps = 129;
+        assert!(validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).is_err());
+        settings.audio[0].bitrate_kbps = 320;
+        source.streams[1].sample_rate = Some("22050".into());
+        assert!(validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).is_err());
+        settings.audio[0].bitrate_kbps = 144;
+        validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).unwrap();
+        settings.audio[0].codec = AudioCodec::Eac3;
+        assert!(validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).is_err());
+        source.streams[1].sample_rate = Some("32000".into());
+        settings.audio[0].bitrate_kbps = 4096;
+        validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).unwrap();
+        settings.audio[0].bitrate_kbps = 4097;
+        assert!(validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).is_err());
     }
     #[test]
     fn requires_known_preserved_layout_and_supported_aac_sample_rate() {

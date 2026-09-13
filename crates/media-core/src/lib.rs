@@ -3,17 +3,53 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+mod analysis;
+mod av1an;
+pub use av1an::{
+    Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSceneDetection, Av1anSplitMethod,
+    Av1anTargetMetric, Av1anTargetQuality,
+};
 mod batch;
+mod bitrate;
+mod container;
+mod encoder_parameters;
 mod jobs;
+mod loudness;
+mod preferences;
+mod quality;
+mod reports;
+pub use loudness::{LoudnessRequest, LoudnessResult};
+pub use preferences::{
+    GeneralPreferences, PreferenceImportPreview, SavePreferencesRequest, UserPreferences,
+};
+pub use quality::{QualityMetric, QualityPoint, QualityRequest, QualityResult};
+pub use reports::{AnalysisExportFormat, AnalysisExportRequest, AnalysisReport};
+mod mux;
+mod subtitles;
+mod temporal;
+mod tone_map;
+pub use analysis::{AutoCropRequest, AutoCropResult, FramePreviewRequest, FramePreviewResult};
 pub use batch::{
     BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest, FolderScanRequest,
     FolderScanResult,
 };
-pub use jobs::{
-    AudioChannels, AudioCodec, AudioTrackSettings, Av1anRecovery, BorderSettings, CropSettings,
-    EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState, RecoveryPhase,
-    RemuxRequest, VideoEncoder, VideoFraming,
+pub use bitrate::{BitratePoint, BitrateRequest, BitrateResult};
+pub use container::ContainerFormat;
+pub use encoder_parameters::{
+    EncodeCommandPlan, EncodeCommandStage, EncoderParameter, EncoderParameterCatalog,
+    EncoderParameterPreset, EncoderParameterPresetKey, EncoderParameterQuery, EncoderParameterSpec,
 };
+pub use jobs::{
+    AudioChannels, AudioCodec, AudioGain, AudioTrackSettings, Av1anRecovery, BorderSettings,
+    CropSettings, EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState,
+    RecoveryPhase, RemuxRequest, VideoEncoder, VideoFraming, VideoRateControl, VideoTrim,
+};
+pub use mux::{MuxRequest, MuxSource, MuxTrack};
+pub use subtitles::{SubtitleMode, SubtitleTrackSettings};
+pub use temporal::{
+    DeinterlaceMode, DeinterlaceSettings, FieldOrder, FrameRate, ResizeFilter, TemporalSettings,
+};
+pub use tone_map::ToneMapSettings;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -51,8 +87,14 @@ pub struct MediaStream {
     pub height: Option<u32>,
     /// Original rational frame rate, for example `24000/1001`.
     pub frame_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub field_order: Option<String>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub channel_layout: Option<String>,
     pub language: Option<String>,
     pub title: Option<String>,
     #[serde(default)]
@@ -111,19 +153,70 @@ pub fn typescript_contracts() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         ToolInfo::decl(&config),
+        GeneralPreferences::decl(&config),
+        UserPreferences::decl(&config),
+        EncoderParameterPreset::decl(&config),
+        EncoderParameterPresetKey::decl(&config),
+        SavePreferencesRequest::decl(&config),
+        PreferenceImportPreview::decl(&config),
         MediaStream::decl(&config),
         MediaFile::decl(&config),
         AppError::decl(&config),
+        FramePreviewRequest::decl(&config),
+        FramePreviewResult::decl(&config),
+        AutoCropRequest::decl(&config),
+        AutoCropResult::decl(&config),
+        BitrateRequest::decl(&config),
+        BitratePoint::decl(&config),
+        BitrateResult::decl(&config),
+        LoudnessRequest::decl(&config),
+        LoudnessResult::decl(&config),
+        QualityMetric::decl(&config),
+        QualityPoint::decl(&config),
+        QualityRequest::decl(&config),
+        QualityResult::decl(&config),
+        AnalysisReport::decl(&config),
+        AnalysisExportFormat::decl(&config),
+        AnalysisExportRequest::decl(&config),
+        DeinterlaceMode::decl(&config),
+        FieldOrder::decl(&config),
+        DeinterlaceSettings::decl(&config),
+        FrameRate::decl(&config),
+        ResizeFilter::decl(&config),
+        TemporalSettings::decl(&config),
+        Av1anChunkMethod::decl(&config),
+        Av1anSplitMethod::decl(&config),
+        Av1anSceneDetection::decl(&config),
+        Av1anChunkOrder::decl(&config),
+        Av1anTargetMetric::decl(&config),
+        Av1anTargetQuality::decl(&config),
+        Av1anOptions::decl(&config),
+        ToneMapSettings::decl(&config),
         RemuxRequest::decl(&config),
+        MuxSource::decl(&config),
+        MuxTrack::decl(&config),
+        MuxRequest::decl(&config),
+        ContainerFormat::decl(&config),
+        VideoRateControl::decl(&config),
+        SubtitleMode::decl(&config),
+        SubtitleTrackSettings::decl(&config),
         AudioCodec::decl(&config),
         AudioChannels::decl(&config),
         AudioTrackSettings::decl(&config),
+        AudioGain::decl(&config),
         EncodeBackend::decl(&config),
         VideoEncoder::decl(&config),
         HdrTune::decl(&config),
         CropSettings::decl(&config),
         BorderSettings::decl(&config),
         VideoFraming::decl(&config),
+        VideoTrim::decl(&config),
+        EncoderParameter::decl(&config),
+        EncoderParameterQuery::decl(&config),
+        EncoderParameterSpec::decl(&config),
+        EncoderParameterCatalog::decl(&config),
+        EncodeCommandStage::decl(&config),
+        EncodeCommandPlan::decl(&config),
         EncodeSettings::decl(&config),
         EncodeRequest::decl(&config),
         JobState::decl(&config),

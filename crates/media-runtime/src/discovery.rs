@@ -8,8 +8,6 @@ use std::{
 
 use media_core::{ToolInfo, VideoEncoder};
 
-use crate::process::run_tool;
-
 #[derive(Clone, Copy)]
 struct ToolSpec {
     id: &'static str,
@@ -123,7 +121,10 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
             resolve_fork_location(
                 override_path.as_deref(),
                 || managed_encoder_path(encoder),
-                || find_executable_blocking(&[alias.to_owned()]),
+                || match crate::bundled_tools::find(encoder_tool_id(encoder))? {
+                    Some(path) => Ok(Some(path)),
+                    None => find_executable_blocking(&[alias.to_owned()]),
+                },
             )
             .map_err(|error| {
                 if override_path.is_some() {
@@ -136,9 +137,10 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
             let names = match encoder {
                 VideoEncoder::SvtAv1 => ["SvtAv1EncApp", "svtav1encapp"].as_slice(),
                 VideoEncoder::X264 => ["x264"].as_slice(),
+                VideoEncoder::X265 | VideoEncoder::Vp9 => ["ffmpeg"].as_slice(),
                 _ => unreachable!("forks handled above"),
             };
-            find_executable_blocking(
+            find_configured_executable(
                 &names
                     .iter()
                     .map(|name| (*name).to_owned())
@@ -152,6 +154,16 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
         Err(_) => {
             Err("Encoder discovery timed out while checking its configured locations.".into())
         }
+    }
+}
+
+fn encoder_tool_id(encoder: VideoEncoder) -> &'static str {
+    match encoder {
+        VideoEncoder::SvtAv1 => "svt-av1",
+        VideoEncoder::SvtAv1FiveFish => "svt-av1-5fish",
+        VideoEncoder::SvtAv1Hdr => "svt-av1-hdr",
+        VideoEncoder::X264 => "x264",
+        VideoEncoder::X265 | VideoEncoder::Vp9 => "ffmpeg",
     }
 }
 
@@ -208,6 +220,8 @@ pub(crate) fn validate_video_encoder_version(
             line.to_ascii_lowercase()
                 .starts_with(if encoder == VideoEncoder::X264 {
                     "x264 "
+                } else if encoder.is_ffmpeg() {
+                    "ffmpeg version "
                 } else {
                     "svt-av1"
                 })
@@ -228,6 +242,7 @@ pub(crate) fn validate_video_encoder_version(
         VideoEncoder::SvtAv1FiveFish => five_fish && !hdr,
         VideoEncoder::SvtAv1Hdr => hdr && !five_fish,
         VideoEncoder::X264 => lower.starts_with("x264 "),
+        VideoEncoder::X265 | VideoEncoder::Vp9 => lower.starts_with("ffmpeg version "),
     };
     if matches {
         Ok(())
@@ -246,12 +261,31 @@ pub(crate) fn validate_video_encoder_version(
 /// pool, but a disconnected PATH directory cannot hold up the UI response.
 pub(crate) async fn find_executable(names: &[&str]) -> Result<Option<PathBuf>, String> {
     let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    let search = tokio::task::spawn_blocking(move || find_executable_blocking(&names));
+    let search = tokio::task::spawn_blocking(move || find_configured_executable(&names));
     match tokio::time::timeout(Duration::from_secs(5), search).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(format!("Tool discovery could not finish: {error}")),
         Err(_) => Err("Tool discovery timed out while checking PATH. Check for inaccessible tool directories and try again.".into()),
     }
+}
+
+fn find_configured_executable(names: &[String]) -> Result<Option<PathBuf>, String> {
+    if let Some(spec) = TOOLS.iter().find(|spec| {
+        names
+            .iter()
+            .any(|name| spec.executables.contains(&name.as_str()))
+    }) {
+        let variable = format!("JESSES_{}", spec.id.replace('-', "_").to_ascii_uppercase());
+        if let Some(override_path) = env::var_os(&variable) {
+            return resolve_video_candidate(&PathBuf::from(override_path))
+                .map(Some)
+                .map_err(|error| format!("{variable}: {error}"));
+        }
+        if let Some(path) = crate::bundled_tools::find(spec.id)? {
+            return Ok(Some(path));
+        }
+    }
+    find_executable_blocking(names)
 }
 
 fn find_executable_blocking(names: &[String]) -> Result<Option<PathBuf>, String> {
@@ -391,9 +425,9 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
         Ok(None) => {
             info.detail = Some(
                 if encoder.is_some_and(|encoder| fork_config(encoder).is_some()) {
-                    "Not found in its configured override, managed install, or distinct PATH alias. Install this fork and refresh Tools.".into()
+                    "Not found in its configured override, managed install, package, or distinct PATH alias. Install this fork and refresh Tools.".into()
                 } else {
-                    "Not found on PATH. Install the tool and restart jesses.".into()
+                    "Not found in its configured override, package, or PATH. Install the tool and restart jesses.".into()
                 },
             );
             return info;
@@ -404,11 +438,33 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
         }
     };
     info.path = Some(executable.to_string_lossy().into_owned());
-    match run_tool(
+    let environment = if spec.id == "av1an" {
+        match crate::bundled_tools::av1an_runtime(&executable) {
+            Ok(Some(directory)) => {
+                let mut path = directory.as_os_str().to_owned();
+                if let Some(inherited) = env::var_os("PATH") {
+                    path.push(if cfg!(windows) { ";" } else { ":" });
+                    path.push(inherited);
+                }
+                Some(crate::bundled_tools::frameserver_environment(
+                    &directory, &path,
+                ))
+            }
+            Ok(None) => None,
+            Err(detail) => {
+                info.detail = Some(detail);
+                return info;
+            }
+        }
+    } else {
+        None
+    };
+    match crate::process::run_tool_with_environment(
         &executable,
         &[OsString::from(spec.version_arg)],
         Duration::from_secs(5),
         64 * 1024,
+        environment.as_ref(),
     )
     .await
     {

@@ -17,6 +17,10 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
+        if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+            media_runtime::configure_bundled_tools(PathBuf::from(resources))
+                .expect("the package gate uses one absolute verified resource root");
+        }
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

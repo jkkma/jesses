@@ -5,6 +5,10 @@ use std::{path::PathBuf, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+        media_runtime::configure_bundled_tools(PathBuf::from(resources))
+            .map_err(std::io::Error::other)?;
+    }
     let mut args = std::env::args_os().skip(1);
     let file = args.next().ok_or("Usage: encode_request REQUEST.json")?;
     if args.next().is_some() {

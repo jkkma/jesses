@@ -28,7 +28,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         _ => unreachable!("validated SDR color"),
     };
     let range = if plan.full_range { "pc" } else { "tv" };
-    [
+    let mut args: Vec<OsString> = [
         "--demuxer".into(),
         "y4m".into(),
         "--muxer".into(),
@@ -70,7 +70,12 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     ]
     .into_iter()
     .map(OsString::from)
-    .collect()
+    .collect();
+    args.splice(
+        args.len() - 3..args.len() - 3,
+        super::super::parameters::arguments(settings),
+    );
+    args
 }
 
 pub(super) fn validate_help(help: &str, depth: u8) -> Result<(), String> {

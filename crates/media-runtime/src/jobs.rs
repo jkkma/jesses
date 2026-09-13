@@ -5,15 +5,24 @@ mod audio;
 mod av1an;
 #[cfg(test)]
 mod batch_tests;
+mod container;
 mod encode;
+pub use encode::preview_encode_plan;
 mod encode_plan;
-mod files;
+pub(crate) mod files;
 mod history;
 mod metadata;
+mod mux;
+pub(crate) mod parameters;
+mod rate_control;
 #[cfg(test)]
 mod real_tests;
 #[cfg(test)]
 mod recovery_tests;
+mod reports;
+mod subtitles;
+pub use reports::export_analysis;
+mod trim;
 
 use std::{
     collections::HashSet,
@@ -44,6 +53,7 @@ const MAX_HISTORY: usize = 100;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Entry {
+    pause: supervisor::PauseControl,
     snapshot: JobSnapshot,
     cancel: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -139,6 +149,7 @@ impl JobManager {
                     }
                     let (cancel, _) = watch::channel(true);
                     state.entries.push(Entry {
+                        pause: Default::default(),
                         snapshot,
                         cancel,
                         task: None,
@@ -203,6 +214,13 @@ impl JobManager {
         request: BatchEncodeRequest,
     ) -> Result<BatchEncodePreview, AppError> {
         encode::validate_settings(&EncodeSettings {
+            parameters: request.parameters.clone(),
+            temporal: None,
+            av1an_options: request.av1an_options,
+            rate_control: request.rate_control,
+            tone_map: None,
+            trim: None,
+            subtitles: Vec::new(),
             framing: Default::default(),
             audio: Vec::new(),
             video_stream_index: 0,
@@ -311,6 +329,10 @@ impl JobManager {
             let media = crate::batch::inspect_selection(
                 self,
                 &BatchEncodeInput {
+                    temporal: request.settings.temporal,
+                    tone_map: request.settings.tone_map,
+                    trim: request.settings.trim,
+                    subtitles: request.settings.subtitles.clone(),
                     framing: request.settings.framing,
                     audio: request.settings.audio.clone(),
                     input_path: request.source.input_path.clone(),
@@ -421,6 +443,7 @@ impl JobManager {
                 id,
                 state: JobState::Queued,
                 request: request.source,
+                mux_request: None,
                 encode_settings: Some(request.settings),
                 recovery: None,
                 progress_seconds: None,
@@ -432,6 +455,7 @@ impl JobManager {
             let (cancel, receiver) = watch::channel(false);
             staged.push((
                 Entry {
+                    pause: Default::default(),
                     snapshot,
                     cancel,
                     task: None,
@@ -491,6 +515,17 @@ impl JobManager {
         &self,
         request: RemuxRequest,
         encode_settings: Option<EncodeSettings>,
+        allow_queue: bool,
+    ) -> Result<JobSnapshot, AppError> {
+        self.admit_job(request, encode_settings, None, allow_queue)
+            .await
+    }
+
+    async fn admit_job(
+        &self,
+        request: RemuxRequest,
+        encode_settings: Option<EncodeSettings>,
+        mux_request: Option<media_core::MuxRequest>,
         allow_queue: bool,
     ) -> Result<JobSnapshot, AppError> {
         files::validate_request(&request)?;
@@ -565,6 +600,7 @@ impl JobManager {
             id: id.clone(),
             state: JobState::Queued,
             request,
+            mux_request,
             encode_settings,
             recovery: None,
             progress_seconds: None,
@@ -577,6 +613,7 @@ impl JobManager {
         let worker = self.clone();
         let task_id = id.clone();
         state.entries.push(Entry {
+            pause: Default::default(),
             snapshot: snapshot.clone(),
             cancel,
             task: None,
@@ -653,6 +690,61 @@ impl JobManager {
             .rev()
             .map(|e| e.snapshot.clone())
             .collect()
+    }
+
+    /// Live pause is separate from stop-and-keep-progress and durable resume.
+    pub async fn set_job_paused(&self, id: String, paused: bool) -> Result<JobSnapshot, AppError> {
+        let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; pause requests are no longer accepted.",
+                None,
+            ));
+        }
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.snapshot.id == id)
+            .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The job was not found.", None))?;
+        if !matches!(entry.snapshot.state, JobState::Running | JobState::Paused)
+            || !entry
+                .snapshot
+                .encode_settings
+                .as_ref()
+                .is_some_and(|settings| settings.backend == media_core::EncodeBackend::Av1an)
+        {
+            return Err(AppError::new(
+                "JOB_NOT_PAUSABLE",
+                "Live pause is available while av1an encodes chunks.",
+                None,
+            ));
+        }
+        let control = entry.pause.clone();
+        tokio::task::spawn_blocking(move || control.set_paused(paused))
+            .await
+            .map_err(|e| AppError::new("PAUSE_FAILED", e.to_string(), None))?
+            .map_err(|e| AppError::new("PAUSE_FAILED", e.to_string(), None))?;
+        entry.snapshot.state = if paused {
+            JobState::Paused
+        } else {
+            JobState::Running
+        };
+        append_log(
+            &mut entry.snapshot,
+            if paused {
+                "Paused the live av1an process tree. Memory and open files are retained."
+            } else {
+                "Continued the live av1an process tree."
+            }
+            .into(),
+        );
+        let snapshot = entry.snapshot.clone();
+        self.persist(&mut state).await?;
+        Ok(snapshot)
     }
 
     pub async fn cancel_job(&self, id: String) -> Result<JobSnapshot, AppError> {
@@ -948,7 +1040,10 @@ impl JobManager {
         let request = snapshot.request;
         let mut temporary = None;
         let mut scratch = Vec::new();
-        let result = if let Some(settings) = snapshot.encode_settings {
+        let result = if let Some(mapping) = snapshot.mux_request {
+            self.mux(&id, &mapping, &cancel, &log_path, &mut temporary)
+                .await
+        } else if let Some(settings) = snapshot.encode_settings {
             self.encode(
                 &id,
                 &request,
@@ -1056,6 +1151,7 @@ impl JobManager {
         )
         .await?;
         let selected = document.selected(&request.stream_indices)?;
+        container::preflight(&output, &document, &selected, None)?;
         let duration = document.selected_duration(&selected);
         source.verify()?;
         check_cancel(cancel)?;
@@ -1133,7 +1229,8 @@ impl JobManager {
         metadata::verify(&document, &selected, &artifact)?;
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, temp, &output).await
+        self.finalize(id, cancel, &source, temp, &output, None)
+            .await
     }
 
     async fn finalize(
@@ -1143,10 +1240,13 @@ impl JobManager {
         source: &Source,
         temporary: &Temporary,
         output: &Path,
+        cadence: Option<container::Cadence>,
     ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
         // accepted before this point cannot publish an output; after publication
         // the job is succeeded and cancellation is a no-op.
+        let converted = container::prepare(temporary, output, id, cancel, cadence).await?;
+        let temporary = converted.as_ref().unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         source.verify()?;
@@ -1156,7 +1256,7 @@ impl JobManager {
             entry.snapshot.progress_seconds = entry.snapshot.duration_seconds;
             append_log(
                 &mut entry.snapshot,
-                "Verified Matroska output published. The source was preserved.".into(),
+                "Verified output published. The source was preserved.".into(),
             );
         }
         // Publication is already committed; a history-write error is reported
@@ -1550,6 +1650,15 @@ fn progress_seconds(line: &str) -> Option<f64> {
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
 }
 
+/// Query the installed build's bounded, application-qualified scalar catalog.
+pub async fn get_encoder_parameters(
+    encoder: media_core::VideoEncoder,
+    backend: media_core::EncodeBackend,
+    cancel: watch::Receiver<bool>,
+) -> Result<media_core::EncoderParameterCatalog, AppError> {
+    parameters::catalog(encoder, backend, cancel).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1679,13 +1788,23 @@ mod tests {
         let (_sender, receiver) = watch::channel(true);
         assert_eq!(
             manager
-                .finalize("id", &receiver, &source, &temporary, &output)
+                .finalize("id", &receiver, &source, &temporary, &output, None)
                 .await
                 .unwrap_err()
                 .code,
             "JOB_CANCELED"
         );
         assert!(!output.exists());
+        let mp4 = dir.join("output.mp4");
+        assert_eq!(
+            manager
+                .finalize("id", &receiver, &source, &temporary, &mp4, None)
+                .await
+                .unwrap_err()
+                .code,
+            "JOB_CANCELED"
+        );
+        assert!(!mp4.exists());
         temporary.cleanup().unwrap();
         drop(source);
         assert_eq!(std::fs::read(input).unwrap(), b"source");
@@ -1790,6 +1909,7 @@ mod tests {
                         stream_indices: vec![0],
                     },
                     encode_settings: Some(settings.clone()),
+                    mux_request: None,
                     recovery: None,
                     progress_seconds: Some(1.0),
                     duration_seconds: Some(5.0),

@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm pkg-config libx264-dev libx265-dev libopus-dev libdav1d-dev zlib1g-dev libbz2-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm pkg-config libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
@@ -71,7 +71,7 @@ jobs:
         if: runner.os == 'Linux'
         id: ffmpeg-dependencies
         run: |
-          dpkg-query -W -f='${binary:Package}=${Version}\n' gcc gcc-13 g++ g++-13 binutils make nasm pkg-config libc6-dev libx264-dev libx265-dev libopus-dev libdav1d-dev zlib1g-dev libbz2-dev liblzma-dev > "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
+          dpkg-query -W -f='${binary:Package}=${Version}\n' gcc gcc-13 g++ g++-13 binutils make nasm pkg-config libc6-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev > "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
           cat "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
           printf 'fingerprint=%s\n' "$(sha256sum "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Cache the exact FFmpeg source build
@@ -83,15 +83,53 @@ jobs:
       - name: Build the verified audio qualification tool pair
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-ffmpeg.py
-      - name: Verify per-track AAC and Opus conversion
+      - name: Verify per-track audio codec conversion
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored
+      - name: Verify FFmpeg x265 and VP9 depth, framing, metadata and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test ffmpeg_video_jobs --locked -- --include-ignored
+      - name: Verify exact trim intervals, audio delay, subtitle clipping and cleanup
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test trim_jobs --locked -- --include-ignored
+      - name: Verify subtitle conversion, embedded fonts, bitmap placement and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test subtitle_jobs --locked -- --include-ignored
+      - name: Verify container compatibility, text conversion, exact cadence and packet integrity
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test container_jobs --locked -- --ignored
+      - name: Verify field order, bob timing, rational frame rate and resize kernels
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test temporal_jobs --locked -- --ignored
+      - name: Verify source previews, HDR display, automatic crop and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test analysis_jobs --locked -- --include-ignored --test-threads=1
+      - name: Verify actual packet bitrate analysis and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test bitrate_jobs --locked -- --ignored
+      - name: Verify actual loudness measurement and gain-aware audio output
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test loudness_jobs --locked -- --ignored --test-threads=1
+      - name: Verify multi-source mapping, external subtitles, metadata and packet integrity
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p media-runtime --test mux_jobs --locked -- --include-ignored --test-threads=1
+          cargo test -p media-runtime --lib jobs::mux::tests::actual_packet_comparison --locked -- --ignored
       - name: Install verified 5fish and HDR builds
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-svt-forks.py
       - name: Verify standalone anime and HDR fork integration
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test svt_forks --locked standalone_forks -- --include-ignored
+      - name: Verify installed encoder catalogs, advanced overrides and command plans
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test parameter_jobs --locked -- --ignored
+      - name: Verify HDR and HLG rendering, SDR pixel arithmetic and metadata removal
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test tone_map_jobs --locked -- --include-ignored
+      - name: Verify bitrate, target size, fresh two-pass producers and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test rate_control_jobs --locked -- --include-ignored
       - name: Verify crop, resize, borders, decoded pixels, HDR and batch history
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test framing_jobs --locked -- --include-ignored --test-threads=1

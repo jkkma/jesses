@@ -1,16 +1,45 @@
 //! Preserve the native Unicode environment, including hidden `=C:` drive state.
-use std::{ffi::OsStr, io, os::windows::ffi::OsStrExt};
+use std::{io, os::windows::ffi::OsStrExt};
 use windows_sys::Win32::{
     Globalization::CompareStringOrdinal,
     System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW},
 };
 
-pub(super) fn environment_with_path(path: &OsStr) -> io::Result<Vec<u16>> {
-    let path: Vec<u16> = path.encode_wide().collect();
-    if path.contains(&0) {
+pub(super) fn environment_with_changes(
+    changes: &super::super::ChildEnvironment,
+) -> io::Result<Vec<u16>> {
+    let mut replacements = Vec::new();
+    if let Some(path) = &changes.path {
+        replacements.push((
+            "PATH".encode_utf16().collect(),
+            Some(path.encode_wide().collect()),
+        ));
+    }
+    for (name, value) in &changes.variables {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid child environment name.",
+            ));
+        }
+        replacements.push((
+            name.encode_utf16().collect(),
+            value.as_ref().map(|value| value.encode_wide().collect()),
+        ));
+    }
+    if replacements
+        .iter()
+        .any(|(_, value): &(Vec<u16>, Option<Vec<u16>>)| {
+            value.as_ref().is_some_and(|value| value.contains(&0))
+        })
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "PATH contains a NUL character.",
+            "Child environment value contains NUL.",
         ));
     }
     // GetEnvironmentStringsW gives this caller a stable, read-only snapshot.
@@ -35,25 +64,36 @@ pub(super) fn environment_with_path(path: &OsStr) -> io::Result<Vec<u16>> {
     }
     // SAFETY: length was measured within the API-owned double-NUL-terminated block.
     let inherited = unsafe { std::slice::from_raw_parts(snapshot.0, length + 2) };
-    Ok(replace_path(inherited, &path))
+    Ok(replace_variables(inherited, &replacements))
 }
 
-fn replace_path(inherited: &[u16], path: &[u16]) -> Vec<u16> {
+fn replace_variables(inherited: &[u16], replacements: &[(Vec<u16>, Option<Vec<u16>>)]) -> Vec<u16> {
     let mut entries: Vec<Vec<u16>> = inherited
         .split(|unit| *unit == 0)
         .filter(|entry| !entry.is_empty())
-        .filter(|entry| {
-            !entry.get(..5).is_some_and(|prefix| {
-                prefix.iter().zip(b"PATH=").all(|(unit, expected)| {
-                    *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(expected)
-                })
-            })
-        })
         .map(<[u16]>::to_vec)
         .collect();
-    let mut replacement: Vec<u16> = "PATH=".encode_utf16().collect();
-    replacement.extend_from_slice(path);
-    entries.push(replacement);
+    for (name, value) in replacements {
+        entries.retain(|entry| {
+            !entry.get(..name.len() + 1).is_some_and(|prefix| {
+                prefix.last() == Some(&(b'=' as u16))
+                    && prefix[..name.len()]
+                        .iter()
+                        .zip(name)
+                        .all(|(unit, expected)| {
+                            *unit <= 0x7f
+                                && *expected <= 0x7f
+                                && (*unit as u8).eq_ignore_ascii_case(&(*expected as u8))
+                        })
+            })
+        });
+        if let Some(value) = value {
+            let mut replacement = name.clone();
+            replacement.push(b'=' as u16);
+            replacement.extend_from_slice(value);
+            entries.push(replacement);
+        }
+    }
     // Windows requires case-insensitive Unicode ordering. Comparing complete
     // entries retains the native hidden drive variables and arbitrary values.
     entries.sort_by(|left, right| {
@@ -83,7 +123,18 @@ fn replace_path(inherited: &[u16], path: &[u16]) -> Vec<u16> {
         block.push(0);
     }
     block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
     block
+}
+
+#[cfg(test)]
+fn replace_path(inherited: &[u16], path: &[u16]) -> Vec<u16> {
+    replace_variables(
+        inherited,
+        &[("PATH".encode_utf16().collect(), Some(path.to_vec()))],
+    )
 }
 
 #[cfg(test)]
@@ -111,5 +162,25 @@ mod tests {
         let source = [b'X' as u16, b'=' as u16, 0xd800, 0, 0];
         let actual = replace_path(&source, &[]);
         assert!(actual.windows(4).any(|part| part == &source[..4]));
+    }
+
+    #[test]
+    fn portable_runtime_overrides_remove_aliases_without_mutating_drive_state() {
+        let source: Vec<u16> = "=C:=C:\\作業\0Vsscript_Path=old\0VSSCRIPT_PATH=duplicate\0PythonPath=external\0Other=kept\0\0".encode_utf16().collect();
+        let result = replace_variables(
+            &source,
+            &[
+                (
+                    "VSSCRIPT_PATH".encode_utf16().collect(),
+                    Some("C:\\package\\vsscript.dll".encode_utf16().collect()),
+                ),
+                ("PYTHONPATH".encode_utf16().collect(), None),
+            ],
+        );
+        assert_eq!(
+            String::from_utf16(&result).unwrap(),
+            "=C:=C:\\作業\0Other=kept\0VSSCRIPT_PATH=C:\\package\\vsscript.dll\0\0"
+        );
+        assert_eq!(replace_variables(&[], &[]), [0, 0]);
     }
 }

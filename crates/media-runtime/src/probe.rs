@@ -31,8 +31,10 @@ struct ProbeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    field_order: Option<String>,
     sample_rate: Option<Value>,
     channels: Option<u32>,
+    channel_layout: Option<String>,
     duration: Option<Value>,
     tags: Option<HashMap<String, String>>,
     pix_fmt: Option<String>,
@@ -214,10 +216,21 @@ pub(crate) fn parse_probe(
                 width: stream.width,
                 height: stream.height,
                 frame_rate,
+                field_order: nonempty(stream.field_order),
                 sample_rate: sample_rate(stream.sample_rate.as_ref()),
                 channels: stream.channels,
+                channel_layout: nonempty(stream.channel_layout),
                 language: tag(&tags, "language"),
-                title: tag(&tags, "title"),
+                title: tag(&tags, "title")
+                    .or_else(|| tag(&tags, "name"))
+                    .or_else(|| {
+                        tag(&tags, "handler_name").filter(|value| {
+                            !matches!(
+                                value.as_str(),
+                                "VideoHandler" | "SoundHandler" | "SubtitleHandler"
+                            )
+                        })
+                    }),
                 pixel_format: nonempty(stream.pix_fmt),
                 bit_depth,
                 color_primaries: color_value(stream.color_primaries),

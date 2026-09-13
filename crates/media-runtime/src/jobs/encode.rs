@@ -1,10 +1,15 @@
 pub(super) use super::encode_plan::validate_settings;
 use super::encode_plan::{Plan, Validation};
+#[path = "command_plan.rs"]
+mod command_plan;
+#[path = "ffmpeg_video.rs"]
+mod ffmpeg_video;
 #[path = "frame_scan.rs"]
 pub(super) mod frame_scan;
 #[path = "x264.rs"]
 mod x264;
 use super::*;
+pub use command_plan::preview_encode_plan;
 use media_core::VideoEncoder;
 
 impl JobManager {
@@ -18,6 +23,24 @@ impl JobManager {
         log_path: &Path,
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
+    ) -> Result<(), AppError> {
+        self.encode_mode(
+            id, request, settings, cancel, log_path, temporary, scratch, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_mode(
+        &self,
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        cancel: &watch::Receiver<bool>,
+        log_path: &Path,
+        temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
+        preview: Option<&mut media_core::EncodeCommandPlan>,
     ) -> Result<(), AppError> {
         check_cancel(cancel)?;
         let attempt_id = if settings.backend == media_core::EncodeBackend::Av1an {
@@ -44,6 +67,7 @@ impl JobManager {
         })
         .await
         .map_err(|e| AppError::new("PREFLIGHT_FAILED", e.to_string(), None))??;
+        audio::validate_gain_source(&source, settings)?;
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
@@ -63,7 +87,14 @@ impl JobManager {
         for (path, version_arg) in [
             (&ffmpeg, "-version"),
             (&ffprobe, "-version"),
-            (&encoder, "--version"),
+            (
+                &encoder,
+                if settings.encoder.is_ffmpeg() {
+                    "-version"
+                } else {
+                    "--version"
+                },
+            ),
         ] {
             let version = supervisor::run_capture(
                 &CommandSpec {
@@ -116,9 +147,16 @@ impl JobManager {
         )
         .await?;
         let selected = document.selected(&request.stream_indices)?;
+        container::preflight(&output, &document, &selected, Some(settings))?;
         let mut plan = Plan::build(&document, &selected, settings)?;
+        plan.check_tone_map_tools(&ffmpeg, cancel).await?;
         audio::check_encoders(&ffmpeg, settings, cancel).await?;
-        if audio::converted(settings).next().is_some() {
+        if audio::converted(settings).any(|track| {
+            matches!(
+                track.codec,
+                media_core::AudioCodec::Aac | media_core::AudioCodec::Opus
+            )
+        }) {
             self.phase(
                 id,
                 JobState::Preparing,
@@ -143,6 +181,28 @@ impl JobManager {
                 .iter()
                 .find(|stream| stream.index == track.stream_index)
                 .expect("validated audio selection");
+            if matches!(
+                track.codec,
+                media_core::AudioCodec::Flac
+                    | media_core::AudioCodec::Mp3
+                    | media_core::AudioCodec::Vorbis
+                    | media_core::AudioCodec::Eac3
+            ) {
+                self.phase(id, JobState::Preparing, "Checking selected audio settings, codec delay, and final padding with the installed tools.").await;
+                scratch.push(Temporary::create(
+                    &output,
+                    &format!("{attempt_id}-audio-tools-{}", track.stream_index),
+                )?);
+                audio::check_conversion_support(
+                    &ffmpeg,
+                    &ffprobe,
+                    scratch.last().expect("owned audio tool probe"),
+                    source_track,
+                    track,
+                    cancel,
+                )
+                .await?;
+            }
             self.phase(
                 id,
                 JobState::Preparing,
@@ -156,7 +216,7 @@ impl JobManager {
             super::av1an::validate_encoder_path(&encoder)?;
             super::av1an::validate_input(&document, &plan)?;
         }
-        if settings.encoder == VideoEncoder::X264 {
+        if !settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         }
         let video = selected
@@ -184,12 +244,176 @@ impl JobManager {
         if settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
         }
+        let interval = settings
+            .trim
+            .map(|trim| super::trim::Interval::build(trim, frame_count, plan.fps_num, plan.fps_den))
+            .transpose()?;
+        let mut audio_filters = std::collections::BTreeMap::new();
+        if let Some(interval) = interval {
+            for (track, timeline) in &mut audio_timelines {
+                let (clipped, filter) = timeline.clipped(interval.start, interval.end)?;
+                *timeline = clipped;
+                audio_filters.insert(track.stream_index, filter);
+            }
+        }
+        let frame_count = interval.map_or(frame_count, |interval| interval.frames);
+        let frame_count = plan.activate_temporal(frame_count)?;
+        let prepared_trim = if let Some(interval) = interval {
+            self.phase(
+                id,
+                JobState::Preparing,
+                "Preparing clipped subtitle cues and chapters for the validated frame interval.",
+            )
+            .await;
+            Some(
+                super::trim::Prepared::build(
+                    interval,
+                    &document,
+                    &selected,
+                    &ffmpeg,
+                    &source.path,
+                    &output,
+                    &attempt_id,
+                    scratch,
+                    cancel,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let subtitle_assets = super::subtitles::Prepared::build(
+            settings,
+            &document,
+            &selected,
+            prepared_trim.as_ref(),
+            &ffmpeg,
+            &source.path,
+            &output,
+            &attempt_id,
+            cancel,
+        )
+        .await?;
+        let output_indices = subtitle_assets.effective_indices(&selected);
+        let output_selected = document.selected(&output_indices)?;
+        let measured_nonvideo = if matches!(
+            settings.rate_control,
+            Some(media_core::VideoRateControl::TargetSize { .. })
+        ) {
+            self.phase(
+                id,
+                JobState::Preparing,
+                "Measuring selected audio, subtitles, and attachments for the target file size.",
+            )
+            .await;
+            let dummy = Temporary::create(&output, &format!("{attempt_id}-size-video"))?;
+            let measured = Temporary::create(&output, &format!("{attempt_id}-size-media"))?;
+            let make_dummy = supervisor::run_capture(
+                &CommandSpec {
+                    executable: ffmpeg.clone(),
+                    args: [
+                        "-v",
+                        "error",
+                        "-nostdin",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=s=64x64:r=24",
+                        "-frames:v",
+                        "1",
+                        "-c:v",
+                        "ffv1",
+                        "-f",
+                        "matroska",
+                        "-y",
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                    .chain([dummy.path.as_os_str().to_owned()])
+                    .collect(),
+                    cwd: None,
+                },
+                cancel.clone(),
+                64 * 1024,
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| process_error(e, &dummy.path))?;
+            if !make_dummy.status.success() {
+                return Err(files::error(
+                    "TARGET_SIZE_FAILED",
+                    "Could not create the temporary video placeholder for measuring selected media.",
+                    &dummy.path,
+                ));
+            }
+            dummy.flush_nonempty_async().await?;
+            let mut args = mux_args(
+                &source.path,
+                &dummy.path,
+                &measured.path,
+                &output_selected,
+                &plan,
+                settings,
+            );
+            if let Some(prepared) = &prepared_trim {
+                prepared.apply_mux(&mut args, &output_selected, &audio_filters)?;
+            }
+            subtitle_assets.apply_mux(&mut args, &output_selected);
+            tokio::fs::create_dir_all(self.log_dir.as_ref())
+                .await
+                .map_err(|e| {
+                    files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref())
+                })?;
+            let (sender, events) = mpsc::channel(256);
+            let observer = self.observe_encode(id, events, None);
+            let measured_log = log_path.with_extension("size.log");
+            self.change(id, |snapshot| {
+                snapshot.log_path = Some(measured_log.to_string_lossy().into_owned())
+            })
+            .await;
+            let result = supervisor::run(
+                &CommandSpec {
+                    executable: ffmpeg.clone(),
+                    args,
+                    cwd: None,
+                },
+                cancel.clone(),
+                sender,
+                &measured_log,
+                Duration::from_secs(24 * 60 * 60),
+            )
+            .await;
+            let _ = observer.await;
+            let result = result.map_err(|e| process_error(e, &source.path))?;
+            if !result.status.success() {
+                return Err(files::error(
+                    "TARGET_SIZE_FAILED",
+                    "Selected media could not be measured for the target file size.",
+                    &measured.path,
+                ));
+            }
+            measured.flush_nonempty_async().await?;
+            let bytes = measured
+                .clone_file()?
+                .metadata()
+                .map_err(|e| files::error("OUTPUT_UNREADABLE", e.to_string(), &measured.path))?
+                .len();
+            self.change(id, |snapshot| append_log(snapshot, format!("Target-size budget: measured {bytes} bytes for selected non-video media, its Matroska overhead, and a conservative one-frame placeholder. Container reserve: 1% of target plus 65536 bytes. Measurement log: {}", measured_log.display()))).await;
+            bytes
+        } else {
+            0
+        };
+        let rate = super::rate_control::Rate::resolve(
+            settings,
+            frame_count as f64 * plan.frame_seconds(),
+            measured_nonvideo,
+        )?;
         source.verify()?;
         check_cancel(cancel)?;
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, CRF {}, preset {}.",plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),settings.crf,settings.preset));
+            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
             if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
             }
@@ -203,6 +427,29 @@ impl JobManager {
                 if settings.hdr10_fallback { append_log(snapshot, "HDR10 fallback enabled: Dolby Vision enhancement data and HDR10+ dynamic metadata are discarded.".into()); }
             }
         }).await;
+        if let Some(preview) = preview {
+            command_plan::build(
+                preview,
+                &source,
+                &output,
+                &ffmpeg,
+                &ffprobe,
+                &encoder,
+                &plan,
+                settings,
+                &output_selected,
+                prepared_trim.as_ref(),
+                &subtitle_assets,
+                &audio_filters,
+                rate.as_ref(),
+                frame_count,
+                &attempt_id,
+                cancel,
+            )
+            .await?;
+            source.verify()?;
+            return check_cancel(cancel);
+        }
         tokio::fs::create_dir_all(self.log_dir.as_ref())
             .await
             .map_err(|e| files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref()))?;
@@ -252,7 +499,9 @@ impl JobManager {
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                     Temporary::create_ivf(&output, &format!("{attempt_id}-video"))?
                 }
-                VideoEncoder::X264 => Temporary::create(&output, &format!("{attempt_id}-video"))?,
+                VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::Vp9 => {
+                    Temporary::create(&output, &format!("{attempt_id}-video"))?
+                }
             });
         }
         let temp = temporary.as_ref().expect("owned Matroska output");
@@ -275,12 +524,14 @@ impl JobManager {
         if settings.backend == media_core::EncodeBackend::Av1an {
             let recovery = recovery.as_ref().expect("av1an recovery workspace");
             if !recovery.finalizing {
-                self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected tracks will be copied afterward.").await;
+                self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected audio settings will be applied afterward.").await;
                 self.encode_av1an(
                     id,
                     &source.path,
                     &encoder,
                     av1an_executable.as_ref().expect("av1an executable"),
+                    &ffmpeg,
+                    &ffprobe,
                     recovery,
                     intermediate,
                     &plan,
@@ -299,39 +550,88 @@ impl JobManager {
         } else {
             let producer = CommandSpec {
                 executable: ffmpeg.clone(),
-                args: decoder_args(&source.path, &plan),
-                cwd: None,
+                args: if subtitle_assets.text_filter().is_none()
+                    && subtitle_assets.bitmap_index().is_none()
+                {
+                    decoder_args(&source.path, &plan)
+                } else {
+                    decoder_args_with_subtitles(
+                        &source.path,
+                        &plan,
+                        subtitle_assets.text_filter(),
+                        subtitle_assets.bitmap_index(),
+                    )
+                },
+                cwd: subtitle_assets.decoder_cwd().map(Path::to_path_buf),
             };
-            let consumer = CommandSpec {
-                executable: encoder,
+            let mut consumer = CommandSpec {
+                executable: encoder.clone(),
                 // Both native encoders write into the already-owned file handle
                 // through stdout, preserving its identity guard and Unicode path.
-                args: match settings.encoder {
-                    VideoEncoder::SvtAv1
-                    | VideoEncoder::SvtAv1FiveFish
-                    | VideoEncoder::SvtAv1Hdr => encoder_args(Path::new("stdout"), &plan, settings),
-                    VideoEncoder::X264 => x264::arguments(&plan, settings),
-                },
+                args: consumer_arguments(&plan, settings),
                 cwd: None,
             };
             self.phase(id, JobState::Running, match settings.encoder {
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "Encoding 10-bit AV1 with the standalone SVT encoder; selected audio settings will be applied afterward.",
                 VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected audio settings will be applied afterward.",
+                VideoEncoder::X265 => "Encoding HEVC with FFmpeg libx265 at the source bit depth; selected audio settings will be applied afterward.",
+                VideoEncoder::Vp9 => "Encoding VP9 with FFmpeg libvpx at the source bit depth; selected audio settings will be applied afterward.",
             }).await;
-            let (sender, events) = mpsc::channel(256);
-            let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
-            let result = supervisor::run_pipeline_to_file(
-                &producer,
-                &consumer,
-                cancel.clone(),
-                sender,
-                log_path,
-                Duration::from_secs(24 * 60 * 60),
-                intermediate.clone_file()?,
-            )
-            .await;
-            let _ = event_task.await;
-            result.map_err(|e| process_error(e, &source.path))?;
+            let two_pass = rate.as_ref().is_some_and(|rate| rate.two_pass);
+            let stats = two_pass
+                .then(|| super::rate_control::Stats::create(&output, &attempt_id))
+                .transpose()?;
+            let first_pass = two_pass
+                .then(|| Temporary::create(&output, &format!("{attempt_id}-pass-one")))
+                .transpose()?;
+            let base_arguments = consumer.args.clone();
+            for pass in 1..=if two_pass { 2 } else { 1 } {
+                check_cancel(cancel)?;
+                source.verify()?;
+                consumer.args = base_arguments.clone();
+                if let Some(rate) = &rate {
+                    rate.arguments(&mut consumer.args, settings.encoder, pass);
+                }
+                consumer.cwd = stats.as_ref().map(|stats| stats.path.clone());
+                if let Some(stats) = &stats {
+                    if pass == 2 {
+                        stats.verify_stats()?;
+                    } else {
+                        stats.check()?;
+                    }
+                }
+                let pass_log = if two_pass && pass == 1 {
+                    log_path.with_extension("pass1.log")
+                } else {
+                    log_path.to_owned()
+                };
+                self.change(id, |snapshot| {
+                    snapshot.progress_seconds = Some(0.0);
+                    snapshot.log_path = Some(pass_log.to_string_lossy().into_owned());
+                    if let Some(rate) = &rate {
+                        append_log(snapshot, format!("Video bitrate {} kb/s; pass {pass}/{} starts a fresh source decoder and encoder. Pass log: {}", rate.kbps, if two_pass { 2 } else { 1 }, pass_log.display()));
+                    }
+                }).await;
+                let pass_output = if two_pass && pass == 1 {
+                    first_pass.as_ref().expect("owned first pass")
+                } else {
+                    intermediate
+                };
+                let (sender, events) = mpsc::channel(256);
+                let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
+                let result = supervisor::run_pipeline_to_file(
+                    &producer,
+                    &consumer,
+                    cancel.clone(),
+                    sender,
+                    &pass_log,
+                    Duration::from_secs(24 * 60 * 60),
+                    pass_output.clone_file()?,
+                )
+                .await;
+                let _ = event_task.await;
+                result.map_err(|e| process_error(e, &source.path))?;
+            }
         }
         check_cancel(cancel)?;
         source.verify()?;
@@ -348,19 +648,24 @@ impl JobManager {
             append_log(snapshot, "Muxing encoded video, applying selected audio settings, and preserving subtitles, metadata, chapters, and attachments.".into());
         }).await;
         let mux_log = log_path.with_extension("mux.log");
+        let mut mux_arguments = mux_args(
+            &source.path,
+            &intermediate.path,
+            &temp.path,
+            &output_selected,
+            &plan,
+            settings,
+        );
+        if let Some(prepared) = &prepared_trim {
+            prepared.apply_mux(&mut mux_arguments, &output_selected, &audio_filters)?;
+        }
+        subtitle_assets.apply_mux(&mut mux_arguments, &output_selected);
         let (sender, events) = mpsc::channel(256);
         let observer = self.observe_encode(id, events, None);
         let result = supervisor::run(
             &CommandSpec {
-                executable: ffmpeg,
-                args: mux_args(
-                    &source.path,
-                    &intermediate.path,
-                    &temp.path,
-                    &selected,
-                    &plan,
-                    settings,
-                ),
+                executable: ffmpeg.clone(),
+                args: mux_arguments,
                 cwd: None,
             },
             cancel.clone(),
@@ -386,17 +691,38 @@ impl JobManager {
         temp.flush_nonempty_async().await?;
         self.phase(id,JobState::Finalizing,"Decoding the completed output to verify exact frame count and timing, then checking copied tracks and metadata.").await;
         let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+        let expected_document = subtitle_assets.expected_document(
+            prepared_trim
+                .as_ref()
+                .map_or(&document, |prepared| &prepared.expected),
+        );
+        let expected_document = plan.temporal_document(expected_document);
+        let expected_selected = expected_document.selected(&output_indices)?;
         metadata::verify_encoded(
-            &document,
-            &selected,
+            &expected_document,
+            &expected_selected,
             &artifact,
             plan.video_index,
             plan.output_codec(),
             (plan.width, plan.height),
             &settings.audio,
         )?;
+        if let Some(prepared) = &prepared_trim {
+            prepared
+                .verify_subtitles(
+                    &ffmpeg,
+                    &temp.path,
+                    &output_selected,
+                    subtitle_assets.overridden_indices(),
+                    cancel,
+                )
+                .await?;
+        }
+        subtitle_assets
+            .verify(&ffmpeg, &temp.path, &output_selected, cancel)
+            .await?;
         for (track, timeline) in &audio_timelines {
-            let position = selected
+            let position = output_selected
                 .iter()
                 .position(|stream| stream.index == track.stream_index)
                 .expect("selected audio");
@@ -417,7 +743,7 @@ impl JobManager {
             })
             .await;
         }
-        let position = selected
+        let position = output_selected
             .iter()
             .position(|s| s.index == plan.video_index)
             .expect("selected video");
@@ -431,13 +757,37 @@ impl JobManager {
         if decoded_count != frame_count {
             return Err(AppError::new(
                 "ENCODE_VALIDATION_FAILED",
-                "The encoded video does not decode to exactly the original frame count.",
+                "The encoded video does not decode to exactly the validated frame count for the selected interval.",
                 None,
             ));
         }
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, temp, &output).await?;
+        if let Some(media_core::VideoRateControl::TargetSize { target_size_mib }) =
+            settings.rate_control
+        {
+            let actual = temp
+                .clone_file()?
+                .metadata()
+                .map_err(|e| files::error("OUTPUT_UNREADABLE", e.to_string(), &temp.path))?
+                .len();
+            let target = u64::from(target_size_mib) * 1024 * 1024;
+            self.change(id, |snapshot| append_log(snapshot, format!("Target-size result before any final container conversion: {actual} bytes, requested {target} bytes ({:.2}% difference). Two-pass targets are estimates; encoder content and container overhead determine actual size.", (actual as f64 / target as f64 - 1.0) * 100.0))).await;
+        }
+        self.finalize(
+            id,
+            cancel,
+            &source,
+            temp,
+            &output,
+            Some(container::Cadence {
+                index: position as u32,
+                numerator: plan.fps_num,
+                denominator: plan.fps_den,
+                frames: frame_count,
+            }),
+        )
+        .await?;
         drop(durable);
         if let Some(recovery) = recovery {
             match recovery.cleanup().await {
@@ -641,12 +991,21 @@ fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
         format!("-threads:{}", index).into(),
         threads.to_string().into(),
     ]);
-    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag","-of","json","-i"].into_iter().map(OsString::from));
+    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,top_field_first,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag","-of","json","-i"].into_iter().map(OsString::from));
     args.push(input.as_os_str().to_owned());
     args
 }
 
 pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
+    decoder_args_with_subtitles(input, plan, None, None)
+}
+
+fn decoder_args_with_subtitles(
+    input: &Path,
+    plan: &Plan,
+    text: Option<&str>,
+    bitmap: Option<u32>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -664,9 +1023,44 @@ pub(super) fn decoder_args(input: &Path, plan: &Plan) -> Vec<OsString> {
     .map(OsString::from)
     .collect();
     args.push(input.as_os_str().to_owned());
-    args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
-    if let Some(filter) = plan.framing_filter() {
-        args.extend(["-vf".into(), filter.into()]);
+    if let Some(bitmap) = bitmap {
+        let mut filter = if let Some(prefix) = plan.decoder_prefix() {
+            format!(
+                "[0:{}]{prefix}[jesses_prepared];[jesses_prepared]",
+                plan.video_index
+            )
+        } else {
+            format!("[0:{}]", plan.video_index)
+        };
+        filter.push_str(&format!(
+            "[0:{bitmap}]overlay=eof_action=pass:repeatlast=0:format={}",
+            if plan.output_bit_depth() == 10 {
+                "yuv420p10"
+            } else {
+                "yuv420"
+            }
+        ));
+        if let Some(geometry) = plan.geometry_filter_with_text(text) {
+            filter.push(',');
+            filter.push_str(&geometry);
+        }
+        filter.push_str("[jesses_video]");
+        args.extend([
+            "-filter_complex".into(),
+            filter.into(),
+            "-map".into(),
+            "[jesses_video]".into(),
+        ]);
+    } else {
+        args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
+        let filter = if text.is_none() {
+            plan.decoder_filter()
+        } else {
+            plan.decoder_filter_with_text(text)
+        };
+        if let Some(filter) = filter {
+            args.extend(["-vf".into(), filter.into()]);
+        }
     }
     // All source frames already match this cadence within one timestamp tick.
     // Use it for the Y4M header as well as the encoder, so a reconciled decimal rate
@@ -754,6 +1148,7 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         ]),
         _ => {}
     }
+    args.extend(super::parameters::arguments(settings));
     args
 }
 
@@ -768,12 +1163,58 @@ fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<Os
     args
 }
 
+fn consumer_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+    match settings.encoder {
+        VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+            encoder_args(Path::new("stdout"), plan, settings)
+        }
+        VideoEncoder::X264 => x264::arguments(plan, settings),
+        VideoEncoder::X265 | VideoEncoder::Vp9 => ffmpeg_video::arguments(plan, settings),
+    }
+}
+
 async fn check_encoder_capabilities(
     encoder: &Path,
     plan: &Plan,
     settings: &EncodeSettings,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
+    if settings.encoder.is_ffmpeg() {
+        let result = supervisor::run_capture(
+            &CommandSpec {
+                executable: encoder.to_owned(),
+                args: vec![
+                    "-hide_banner".into(),
+                    "-h".into(),
+                    format!("encoder={}", ffmpeg_video::library(settings.encoder)).into(),
+                ],
+                cwd: None,
+            },
+            cancel.clone(),
+            512 * 1024,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|error| process_error(error, encoder))?;
+        let help = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let capabilities =
+            ffmpeg_video::validate_help(&help, settings.encoder, plan.output_pixel_format);
+        super::parameters::check_help(encoder, settings, &help, cancel).await?;
+        if !result.status.success() || capabilities.is_err() {
+            return Err(files::error(
+                "ENCODER_CAPABILITY_UNSUPPORTED",
+                capabilities
+                    .err()
+                    .unwrap_or_else(|| "FFmpeg failed its video encoder capability check.".into()),
+                encoder,
+            ));
+        }
+        return Ok(());
+    }
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: encoder.to_owned(),
@@ -783,6 +1224,7 @@ async fn check_encoder_capabilities(
                     | VideoEncoder::SvtAv1FiveFish
                     | VideoEncoder::SvtAv1Hdr => "--help",
                     VideoEncoder::X264 => "--fullhelp",
+                    VideoEncoder::X265 | VideoEncoder::Vp9 => unreachable!("FFmpeg checked above"),
                 }
                 .into(),
             ],
@@ -799,8 +1241,20 @@ async fn check_encoder_capabilities(
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    super::parameters::check_help(encoder, settings, &help, cancel).await?;
     if settings.encoder == VideoEncoder::X264 {
         let capabilities = x264::validate_help(&help, plan.output_bit_depth());
+        if settings.rate_control.is_some()
+            && ["--bitrate", "--pass", "--stats"]
+                .iter()
+                .any(|option| !help.split_whitespace().any(|word| word == *option))
+        {
+            return Err(files::error(
+                "ENCODER_CAPABILITY_UNSUPPORTED",
+                "The installed x264 does not advertise bitrate and external pass statistics support.",
+                encoder,
+            ));
+        }
         if !result.status.success() || capabilities.is_err() {
             return Err(files::error(
                 "ENCODER_CAPABILITY_UNSUPPORTED",
@@ -813,6 +1267,9 @@ async fn check_encoder_capabilities(
         return Ok(());
     }
     let mut required = vec!["--film-grain", "--film-grain-denoise"];
+    if settings.rate_control.is_some() {
+        required.extend(["--rc", "--tbr", "--pass", "--stats", "--passes"]);
+    }
     match settings.encoder {
         VideoEncoder::SvtAv1FiveFish => {
             required.extend(["--lineart-psy-bias", "--texture-psy-bias"])

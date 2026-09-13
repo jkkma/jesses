@@ -25,9 +25,11 @@ pub(super) struct Stream {
     pub index: u32,
     pub codec_type: Option<String>,
     pub codec_name: Option<String>,
+    pub codec_tag_string: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub sample_rate: Option<String>,
+    pub bits_per_raw_sample: Option<String>,
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
     pub duration: Option<String>,
@@ -168,6 +170,11 @@ pub(super) fn is_derived_stream_tag(key: &str) -> bool {
         key.as_str(),
         "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes"
     ) || key.starts_with("_statistics_")
+        || ["duration-", "encoder-"].iter().any(|prefix| {
+            key.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 3 && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
+            })
+        })
         || key.starts_with("bps-")
         || key.starts_with("number_of_frames-")
         || key.starts_with("number_of_bytes-")
@@ -197,7 +204,19 @@ pub(super) fn verify(
     selected: &[&Stream],
     output: &Document,
 ) -> Result<(), AppError> {
-    verify_inner(source, selected, output, None, &[])
+    verify_inner(source, selected, output, None, &[], &[])
+}
+
+/// Container text conversion is verified separately against every readable cue.
+/// Native text containers may add empty gap packets, so their packet counts and
+/// header start times do not describe the source cue sequence.
+pub(super) fn verify_container(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    converted_subtitles: &[u32],
+) -> Result<(), AppError> {
+    verify_inner(source, selected, output, None, &[], converted_subtitles)
 }
 
 pub(super) fn verify_encoded(
@@ -215,6 +234,7 @@ pub(super) fn verify_encoded(
         output,
         Some((video_index, expected_codec, expected_dimensions)),
         audio,
+        &[],
     )
 }
 
@@ -224,6 +244,7 @@ fn verify_inner(
     output: &Document,
     encoded_video: Option<(u32, &str, (u32, u32))>,
     audio: &[media_core::AudioTrackSettings],
+    converted_subtitles: &[u32],
 ) -> Result<(), AppError> {
     let fail = |message: &str| AppError::new("OUTPUT_VALIDATION_FAILED", message, None);
     if selected.len() != output.streams.len() {
@@ -250,7 +271,11 @@ fn verify_inner(
                     .and_then(|v| v.parse::<f64>().ok())
             })
         };
-        if let Some(source_start) = track_start(expected).filter(|_| converted_audio.is_none()) {
+        let converted_subtitle = expected.codec_type.as_deref() == Some("subtitle")
+            && converted_subtitles.contains(&expected.index);
+        if let Some(source_start) =
+            track_start(expected).filter(|_| converted_audio.is_none() && !converted_subtitle)
+        {
             let output_start = track_start(actual);
             if !output_start
                 .is_some_and(|start| start.is_finite() && (start - source_start).abs() <= 0.002)
@@ -264,12 +289,7 @@ fn verify_inner(
             || if encoded {
                 actual.codec_name.as_deref() != encoded_video.map(|(_, codec, _)| codec)
             } else if let Some(track) = converted_audio {
-                actual.codec_name.as_deref()
-                    != Some(if track.codec == media_core::AudioCodec::Opus {
-                        "opus"
-                    } else {
-                        "aac"
-                    })
+                actual.codec_name.as_deref() != Some(super::audio::codec_name(track.codec))
             } else {
                 expected.codec_name != actual.codec_name
             }
@@ -287,6 +307,10 @@ fn verify_inner(
                     && expected.channels.is_some_and(|channels| channels > 2)
                     && expected.channel_layout != actual.channel_layout
             })
+            || converted_audio.is_some_and(|track| {
+                track.codec == media_core::AudioCodec::Flac
+                    && actual.bits_per_raw_sample.as_deref() != Some("24")
+            })
         {
             return Err(fail(
                 "The output stream order, codecs, or media properties changed.",
@@ -303,6 +327,7 @@ fn verify_inner(
             .and_then(|v| v.parse::<u64>().ok());
         if !encoded
             && converted_audio.is_none()
+            && !converted_subtitle
             && ((media_track && !expected_packets.is_some_and(|count| count > 0))
                 || expected_packets != actual_packets)
         {
@@ -357,14 +382,18 @@ fn verify_inner(
             .ok_or_else(|| fail("The output duration could not be validated."))?;
         // Keep the original lower bound and copied-track tolerance. A converted
         // AAC track can extend the container's reported end by its last frame
-        // and codec delay, which is visible at low sample rates. Its decoded
-        // start and sample count are checked separately, including final padding.
+        // and codec delay. MP3 retains LAME's 1105-sample delay in its reported
+        // duration (138 ms at 8 kHz), even after decoded samples are trimmed.
+        // Decoded start and sample count remain separately checked, including
+        // final padding; neither codec permits arbitrary audible extension.
         let tolerance = 0.1_f64.max(expected * 0.0001);
         let mut latest_end = expected + tolerance;
-        for track in audio
-            .iter()
-            .filter(|track| track.codec == media_core::AudioCodec::Aac)
-        {
+        for track in audio.iter().filter(|track| {
+            matches!(
+                track.codec,
+                media_core::AudioCodec::Aac | media_core::AudioCodec::Mp3
+            )
+        }) {
             if let Some(stream) = selected
                 .iter()
                 .find(|stream| stream.index == track.stream_index)
@@ -375,7 +404,12 @@ fn verify_inner(
                     .filter(|rate| *rate > 0.0)
                 && let Some(end) = source.selected_duration(&[stream])
             {
-                latest_end = latest_end.max(end + 2047.0 / rate + 0.002);
+                let samples = if track.codec == media_core::AudioCodec::Aac {
+                    2047.0
+                } else {
+                    1105.0
+                };
+                latest_end = latest_end.max(end + samples / rate + 0.002);
             }
         }
         if actual < expected - tolerance || actual > latest_end {
@@ -467,6 +501,7 @@ mod tests {
             codec: media_core::AudioCodec::Opus,
             bitrate_kbps: 128,
             channels: media_core::AudioChannels::Preserve,
+            gain: None,
         }];
         verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).unwrap();
         output.streams[1].start_time = Some("0.006".into());

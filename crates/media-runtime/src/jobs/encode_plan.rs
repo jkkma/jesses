@@ -5,12 +5,17 @@ use super::metadata::{Document, Stream};
 
 mod framing;
 mod hdr;
+mod temporal;
+mod tone_map;
 use hdr::{Hdr10, StaticMetadata, validate_side_data};
 mod validation;
 pub(super) use validation::Validation;
 
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
+    pub trim: Option<media_core::VideoTrim>,
+    tone_map: Option<tone_map::Transform>,
+    temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
     pub output_pixel_format: &'static str,
     pub video_index: u32,
@@ -34,6 +39,13 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    super::parameters::validate(settings)?;
+    temporal::validate(settings)?;
+    super::av1an::validate_settings(settings)?;
+    super::rate_control::validate(settings)?;
+    tone_map::validate_settings(settings)?;
+    super::trim::validate_settings(settings)?;
+    super::subtitles::validate_settings(settings)?;
     super::audio::validate_settings(settings)?;
     framing::validate(settings)?;
     let fork_options_valid = (if settings.encoder == VideoEncoder::SvtAv1FiveFish {
@@ -53,10 +65,17 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
             (1..=63).contains(&settings.crf) && settings.preset <= 13 && settings.film_grain <= 50
         }
-        VideoEncoder::X264 => {
+        VideoEncoder::X264 | VideoEncoder::X265 => {
             settings.backend == EncodeBackend::Standalone
                 && settings.crf <= 51
                 && settings.preset <= 9
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::Vp9 => {
+            settings.backend == EncodeBackend::Standalone
+                && settings.crf <= 63
+                && settings.preset <= 5
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
         }
@@ -68,8 +87,11 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                     "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers."
                 }
-                VideoEncoder::X264 => {
-                    "Standalone x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers. av1an with x264 is not supported yet."
+                VideoEncoder::X264 | VideoEncoder::X265 => {
+                    "x264 and x265 require standalone mode, CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                }
+                VideoEncoder::Vp9 => {
+                    "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
             },
             None,
@@ -107,6 +129,8 @@ impl Plan {
     ) -> Result<Self, AppError> {
         validate_settings(settings)?;
         super::audio::validate_selection(selected, settings)?;
+        super::trim::validate_selection(selected, settings)?;
+        super::subtitles::validate_selection(selected, settings)?;
         let videos: Vec<_> = selected
             .iter()
             .filter(|s| s.codec_type.as_deref() == Some("video"))
@@ -117,7 +141,8 @@ impl Plan {
             ));
         }
         let video = videos[0];
-        let full_range_8bit = settings.encoder == VideoEncoder::X264
+        let tone_map = tone_map::Transform::build(video, settings)?;
+        let full_range_8bit = !settings.encoder.is_svt()
             && video.pix_fmt.as_deref() == Some("yuvj420p")
             && video.color_range.as_deref() == Some("pc");
         if !matches!(video.pix_fmt.as_deref(), Some("yuv420p" | "yuv420p10le")) && !full_range_8bit
@@ -126,12 +151,17 @@ impl Plan {
                 "Encoding supports 8-bit or 10-bit planar 4:2:0 video only.",
             ));
         }
-        if !matches!(
-            video.field_order.as_deref(),
-            None | Some("progressive" | "unknown")
-        ) {
+        if settings
+            .temporal
+            .and_then(|temporal| temporal.deinterlace)
+            .is_none()
+            && !matches!(
+                video.field_order.as_deref(),
+                None | Some("progressive" | "unknown")
+            )
+        {
             return Err(unsupported(
-                "Interlaced video is not supported by this progressive encoding workflow.",
+                "Interlaced video requires explicit BWDIF deinterlacing and the matching TFF/BFF source field order.",
             ));
         }
         if video.sample_aspect_ratio.as_deref() != Some("1:1") {
@@ -144,15 +174,18 @@ impl Plan {
             && video.color_space.as_deref() == Some("bt2020nc")
             && video.pix_fmt.as_deref() == Some("yuv420p10le")
             && video.color_range.as_deref() == Some("tv");
-        if is_hdr10 && settings.encoder == VideoEncoder::X264 {
+        if is_hdr10 && !settings.encoder.is_svt() && tone_map.is_none() {
             return Err(unsupported(
-                "Standalone x264 currently supports SDR only. Select SVT-AV1 for HDR10 output; no automatic tone mapping or HDR metadata removal is performed.",
+                "x264, x265, and VP9 currently support SDR only. Select SVT-AV1 for HDR10 output; no automatic tone mapping or HDR metadata removal is performed.",
             ));
         }
-        let hdr10 = if is_hdr10 {
+        let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg) {
             Some(Hdr10::build(
                 &video.side_data_list,
-                settings.hdr10_fallback,
+                settings.hdr10_fallback
+                    || tone_map
+                        .as_ref()
+                        .is_some_and(|tone| tone.settings.hdr10_base_layer),
             )?)
         } else {
             None
@@ -198,7 +231,10 @@ impl Plan {
                 ));
             }
         };
-        let geometry = framing::Geometry::build(width, height, settings.framing)?;
+        let mut geometry = framing::Geometry::build(width, height, settings.framing)?;
+        geometry.resize_filter = settings
+            .temporal
+            .map_or_default(|temporal| temporal.resize_filter);
         let (fps_num, fps_den) = rational(video.avg_frame_rate.as_deref())
             .or_else(|| rational(video.r_frame_rate.as_deref()))
             .ok_or_else(|| unsupported("The source has no usable rational frame rate."))?;
@@ -226,6 +262,8 @@ impl Plan {
             }
         }
         Ok(Self {
+            temporal: settings.temporal.map(temporal::Transform::new),
+            trim: settings.trim,
             encoder: settings.encoder,
             output_pixel_format: if settings.encoder.is_svt()
                 || video.pix_fmt.as_deref() == Some("yuv420p10le")
@@ -242,17 +280,23 @@ impl Plan {
             fps_den,
             cadence_reconciled: false,
             tolerance,
-            primaries: if is_hdr10 {
+            primaries: if tone_map.is_some() {
+                1
+            } else if is_hdr10 {
                 9
             } else {
                 sdr_color(video.color_primaries.as_deref())?
             },
-            transfer: if is_hdr10 {
+            transfer: if tone_map.is_some() {
+                1
+            } else if is_hdr10 {
                 16
             } else {
                 sdr_color(video.color_transfer.as_deref())?
             },
-            matrix: if is_hdr10 {
+            matrix: if tone_map.is_some() {
+                1
+            } else if is_hdr10 {
                 9
             } else {
                 sdr_color(video.color_space.as_deref())?
@@ -267,17 +311,24 @@ impl Plan {
                     ));
                 }
             },
-            chroma: match video.chroma_location.as_deref() {
-                Some("left") => "left",
-                Some("topleft") => "topleft",
-                Some("center") if settings.encoder == VideoEncoder::X264 => "center",
-                None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => "unknown",
-                _ => {
-                    return Err(unsupported(
-                        "SVT supports left, top-left, or unspecified chroma placement; x264 requires explicit left, center, or top-left placement.",
-                    ));
+            chroma: if tone_map.is_some() {
+                "left"
+            } else {
+                match video.chroma_location.as_deref() {
+                    Some("left") => "left",
+                    Some("topleft") => "topleft",
+                    Some("center") if !settings.encoder.is_svt() => "center",
+                    None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => {
+                        "unknown"
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "SVT supports left, top-left, or unspecified chroma placement; x264, x265, and VP9 require explicit left, center, or top-left placement.",
+                        ));
+                    }
                 }
             },
+            tone_map,
         })
     }
 
@@ -294,6 +345,86 @@ impl Plan {
         )
     }
 
+    pub fn decoder_filter(&self) -> Option<String> {
+        self.decoder_filter_with_text(None)
+    }
+
+    pub fn decoder_filter_with_text(&self, text: Option<&str>) -> Option<String> {
+        let mut filters = Vec::new();
+        if let Some(prefix) = self.decoder_prefix() {
+            filters.push(prefix);
+        }
+        if let Some(framing) = self.geometry.filter_with_text(
+            self.matrix,
+            self.full_range,
+            self.chroma,
+            self.output_pixel_format,
+            text,
+        ) {
+            filters.push(framing);
+        }
+        (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    pub fn decoder_prefix(&self) -> Option<String> {
+        let mut filters = Vec::new();
+        if let Some(trim) = self.trim {
+            filters.push(format!(
+                "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
+                trim.start_frame, trim.end_frame_exclusive
+            ));
+        }
+        if let Some(temporal) = &self.temporal
+            && let Some(filter) = temporal.filter()
+        {
+            filters.push(filter);
+        }
+        if let Some(tone) = &self.tone_map {
+            filters.push(tone.filter());
+        }
+        (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    pub fn geometry_filter_with_text(&self, text: Option<&str>) -> Option<String> {
+        self.geometry.filter_with_text(
+            self.matrix,
+            self.full_range,
+            self.chroma,
+            self.output_pixel_format,
+            text,
+        )
+    }
+
+    pub async fn check_tone_map_tools(
+        &self,
+        ffmpeg: &std::path::Path,
+        cancel: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if let Some(tone) = &self.tone_map {
+            tone.check_tools(ffmpeg, cancel).await?;
+        }
+        Ok(())
+    }
+
+    pub fn is_tone_mapped(&self) -> bool {
+        self.tone_map.is_some()
+    }
+
+    fn validation_hdr(&self, encoded: bool) -> Option<&Hdr10> {
+        if encoded && self.is_tone_mapped() {
+            None
+        } else {
+            self.hdr10.as_ref()
+        }
+    }
+
+    fn needs_mastering_metadata(&self) -> bool {
+        // Preserving HDR10 output requires mastering metadata. Explicit SDR
+        // rendering uses the supplied signal peak; any metadata present is
+        // still parsed and checked across the complete original source.
+        self.tone_map.is_none()
+    }
+
     fn frame_dimensions(&self, encoded: bool) -> (u32, u32) {
         if encoded {
             (self.width, self.height)
@@ -306,6 +437,8 @@ impl Plan {
         match self.encoder {
             VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "av1",
             VideoEncoder::X264 => "h264",
+            VideoEncoder::X265 => "hevc",
+            VideoEncoder::Vp9 => "vp9",
         }
     }
 
@@ -319,19 +452,19 @@ impl Plan {
 
     pub fn matches_output_format(&self, format: Option<&str>) -> bool {
         format == Some(self.output_pixel_format)
-            || (self.encoder == VideoEncoder::X264
+            || (!self.encoder.is_svt()
                 && self.full_range
                 && self.output_pixel_format == "yuv420p"
                 && format == Some("yuvj420p"))
     }
 
     pub fn is_hdr10(&self) -> bool {
-        self.hdr10.is_some()
+        self.validation_hdr(true).is_some()
     }
 
     pub fn hdr_arguments(&self) -> Vec<std::ffi::OsString> {
         let mut args = Vec::new();
-        if let Some(hdr) = &self.hdr10 {
+        if let Some(hdr) = self.validation_hdr(true) {
             if let Some(mastering) = &hdr.metadata.mastering {
                 args.extend(["--mastering-display".into(), mastering.argument().into()]);
             }
@@ -385,6 +518,7 @@ impl Plan {
         frames: &Frames,
         stream: &Stream,
     ) -> Result<usize, AppError> {
+        let needs_mastering = self.needs_mastering_metadata();
         if let Some(hdr) = &mut self.hdr10 {
             let first = frames
                 .frames
@@ -392,7 +526,7 @@ impl Plan {
                 .ok_or_else(|| unsupported("The video did not decode to any frames."))?;
             hdr.metadata
                 .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
-            if hdr.metadata.mastering.is_none() {
+            if needs_mastering && hdr.metadata.mastering.is_none() {
                 return Err(unsupported(
                     "HDR10 encoding requires valid mastering display metadata in the stream or first decoded frame.",
                 ));
@@ -463,7 +597,11 @@ impl Plan {
             return Err(unsupported("The video did not decode to any frames."));
         }
         let mut observed_hdr = StaticMetadata::parse(&stream.side_data_list)?;
-        validate_side_data(&stream.side_data_list, self.hdr10.as_ref(), encoded)?;
+        validate_side_data(
+            &stream.side_data_list,
+            self.validation_hdr(encoded),
+            encoded,
+        )?;
         for (index, frame) in frames.frames.iter().enumerate() {
             let time = seconds(frame.best_effort_timestamp_time.as_deref())
                 .ok_or_else(|| unsupported("A decoded frame has no usable timestamp."))?;
@@ -473,13 +611,13 @@ impl Plan {
                 ));
             }
             let (width, height) = self.frame_dimensions(encoded);
-            if frame.interlaced_frame != Some(0)
-                || frame.width != Some(width)
+            self.validate_fields(frame, encoded)?;
+            if frame.width != Some(width)
                 || frame.height != Some(height)
                 || frame.sample_aspect_ratio.as_deref() != Some("1:1")
             {
                 return Err(unsupported(
-                    "Interlaced frames or changing frame dimensions/pixel aspect ratios are not supported.",
+                    "Changing frame dimensions or non-square pixel aspect ratios are not supported.",
                 ));
             }
             let normalize_chroma = |value: Option<&str>| match value {
@@ -505,8 +643,8 @@ impl Plan {
                     "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
                 ));
             }
-            validate_side_data(&frame.side_data_list, self.hdr10.as_ref(), encoded)?;
-            if let Some(hdr) = &self.hdr10 {
+            validate_side_data(&frame.side_data_list, self.validation_hdr(encoded), encoded)?;
+            if let Some(hdr) = self.validation_hdr(encoded) {
                 let actual = StaticMetadata::parse(&frame.side_data_list)?;
                 hdr.metadata.validate_present(&actual, encoded)?;
                 // Metadata need not be repeated on every frame, but output must
@@ -531,7 +669,7 @@ impl Plan {
                 }
             }
         }
-        if let Some(hdr) = &self.hdr10 {
+        if let Some(hdr) = self.validation_hdr(encoded) {
             hdr.metadata.validate_present(&observed_hdr, encoded)?;
             if encoded
                 && (observed_hdr.mastering.is_none()
@@ -564,10 +702,17 @@ impl Plan {
             || output.width != Some(self.width)
             || output.height != Some(self.height)
             || output.sample_aspect_ratio.as_deref() != Some("1:1")
-            || source.color_space != output.color_space
-            || source.color_transfer != output.color_transfer
-            || source.color_primaries != output.color_primaries
-            || source.color_range != output.color_range
+            || if self.is_tone_mapped() {
+                output.color_space.as_deref() != Some("bt709")
+                    || output.color_transfer.as_deref() != Some("bt709")
+                    || output.color_primaries.as_deref() != Some("bt709")
+                    || output.color_range.as_deref() != Some("tv")
+            } else {
+                source.color_space != output.color_space
+                    || source.color_transfer != output.color_transfer
+                    || source.color_primaries != output.color_primaries
+                    || source.color_range != output.color_range
+            }
             || !chroma_matches
         {
             return Err(AppError::new(
@@ -576,8 +721,8 @@ impl Plan {
                 None,
             ));
         }
-        validate_side_data(&output.side_data_list, self.hdr10.as_ref(), true)?;
-        if let Some(hdr) = &self.hdr10 {
+        validate_side_data(&output.side_data_list, self.validation_hdr(true), true)?;
+        if let Some(hdr) = self.validation_hdr(true) {
             hdr.metadata
                 .validate_present(&StaticMetadata::parse(&output.side_data_list)?, true)?;
         }
@@ -595,6 +740,7 @@ pub(super) struct Frames {
 pub(super) struct Frame {
     best_effort_timestamp_time: Option<String>,
     interlaced_frame: Option<u8>,
+    top_field_first: Option<u8>,
     width: Option<u32>,
     height: Option<u32>,
     pix_fmt: Option<String>,
@@ -1096,6 +1242,57 @@ mod tests {
             crf: 23,
             preset: 5,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ffmpeg_encoders_enforce_independent_quality_speed_and_backend_limits() {
+        for (encoder, max_crf, max_preset) in
+            [(VideoEncoder::X265, 51, 9), (VideoEncoder::Vp9, 63, 5)]
+        {
+            let settings = EncodeSettings {
+                encoder,
+                crf: max_crf,
+                preset: max_preset,
+                ..Default::default()
+            };
+            assert!(validate_settings(&settings).is_ok());
+            assert!(
+                validate_settings(&EncodeSettings {
+                    crf: 0,
+                    preset: 0,
+                    ..settings.clone()
+                })
+                .is_ok()
+            );
+            for invalid in [
+                EncodeSettings {
+                    crf: max_crf + 1,
+                    ..settings.clone()
+                },
+                EncodeSettings {
+                    preset: max_preset + 1,
+                    ..settings.clone()
+                },
+                EncodeSettings {
+                    backend: EncodeBackend::Av1an,
+                    ..settings.clone()
+                },
+                EncodeSettings {
+                    film_grain: 1,
+                    ..settings.clone()
+                },
+                EncodeSettings {
+                    hdr10_fallback: true,
+                    ..settings.clone()
+                },
+                EncodeSettings {
+                    lineart_psy_bias: 1,
+                    ..settings.clone()
+                },
+            ] {
+                assert!(validate_settings(&invalid).is_err(), "{invalid:?}");
+            }
         }
     }
 

@@ -1,6 +1,4 @@
-use media_core::{
-    AppError, BorderSettings, CropSettings, EncodeBackend, EncodeSettings, VideoFraming,
-};
+use media_core::{AppError, BorderSettings, CropSettings, EncodeSettings, VideoFraming};
 
 fn invalid(message: &str) -> AppError {
     AppError::new("ENCODE_SETTINGS_INVALID", message, None)
@@ -11,11 +9,6 @@ fn valid_dimension(value: u32) -> bool {
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
-    if settings.backend == EncodeBackend::Av1an && settings.framing != VideoFraming::default() {
-        return Err(invalid(
-            "Crop, resize, and borders require a standalone encoder. Reset framing before choosing av1an.",
-        ));
-    }
     let crop = settings.framing.crop;
     if [crop.top, crop.right, crop.bottom, crop.left]
         .iter()
@@ -46,6 +39,7 @@ pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
 
 #[derive(Clone, Debug)]
 pub(super) struct Geometry {
+    pub resize_filter: media_core::ResizeFilter,
     pub source_width: u32,
     pub source_height: u32,
     pub width: u32,
@@ -108,6 +102,7 @@ impl Geometry {
             ));
         }
         Ok(Self {
+            resize_filter: media_core::ResizeFilter::Lanczos,
             source_width: width,
             source_height: height,
             width: output_width,
@@ -128,6 +123,17 @@ impl Geometry {
         chroma: &str,
         pixel_format: &str,
     ) -> Option<String> {
+        self.filter_with_text(matrix, full_range, chroma, pixel_format, None)
+    }
+
+    pub(super) fn filter_with_text(
+        &self,
+        matrix: u8,
+        full_range: bool,
+        chroma: &str,
+        pixel_format: &str,
+        text_filter: Option<&str>,
+    ) -> Option<String> {
         let mut filters = Vec::new();
         if self.crop != CropSettings::default() {
             filters.push(format!(
@@ -144,8 +150,14 @@ impl Geometry {
                 _ => unreachable!("Plan validates supported color matrices"),
             };
             let range = if full_range { "full" } else { "limited" };
+            let kernel = match self.resize_filter {
+                media_core::ResizeFilter::Nearest => "neighbor",
+                media_core::ResizeFilter::Bilinear => "bilinear",
+                media_core::ResizeFilter::Bicubic => "bicubic",
+                media_core::ResizeFilter::Lanczos => "lanczos",
+            };
             let mut scale = format!(
-                "scale={}:{}:flags=lanczos:in_color_matrix={matrix}:out_color_matrix={matrix}:in_range={range}:out_range={range}",
+                "scale={}:{}:flags={kernel}:in_color_matrix={matrix}:out_color_matrix={matrix}:in_range={range}:out_range={range}",
                 self.content_width, self.content_height,
             );
             // Explicit sample positions keep scale from assuming centered chroma
@@ -163,6 +175,9 @@ impl Geometry {
                 ));
             }
             filters.push(scale);
+        }
+        if let Some(text_filter) = text_filter {
+            filters.push(text_filter.to_owned());
         }
         if self.borders != BorderSettings::default() {
             // Lock depth before assigning planar sample values. FFmpeg pad's
@@ -199,6 +214,7 @@ impl Geometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use media_core::EncodeBackend;
 
     #[test]
     fn borders_follow_content_resize_and_keep_source_and_output_dimensions_separate() {
@@ -347,9 +363,7 @@ mod tests {
                 },
                 ..Default::default()
             })
-            .unwrap_err()
-            .message
-            .contains("standalone")
+            .is_ok()
         );
     }
 
@@ -405,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_edges_dimensions_overflow_and_av1an_are_rejected() {
+    fn invalid_edges_dimensions_and_overflow_are_rejected_for_both_backends() {
         for framing in [
             VideoFraming {
                 crop: CropSettings {
@@ -519,13 +533,12 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let error = validate(&EncodeSettings {
+            validate(&EncodeSettings {
                 backend: EncodeBackend::Av1an,
                 framing,
                 ..Default::default()
             })
-            .unwrap_err();
-            assert!(error.message.contains("standalone"));
+            .unwrap();
         }
     }
 

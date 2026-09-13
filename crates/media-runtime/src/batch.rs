@@ -345,6 +345,7 @@ fn proposed_output(
     directory: &Path,
     input: &Path,
     encoder: VideoEncoder,
+    container: media_core::ContainerFormat,
     reserved: &mut HashSet<String>,
 ) -> Result<PathBuf, AppError> {
     let stem = safe_stem(input);
@@ -359,8 +360,11 @@ fn proposed_output(
             VideoEncoder::SvtAv1FiveFish => "av1_5fish",
             VideoEncoder::SvtAv1Hdr => "av1_hdr",
             VideoEncoder::X264 => "x264",
+            VideoEncoder::X265 => "x265",
+            VideoEncoder::Vp9 => "vp9",
         };
-        let candidate = directory.join(format!("{stem}_{codec}{suffix}.mkv"));
+        let extension = container.extension();
+        let candidate = directory.join(format!("{stem}_{codec}{suffix}.{extension}"));
         let key = path_key(&candidate);
         if key == path_key(input) || reserved.contains(&key) {
             continue;
@@ -415,6 +419,13 @@ pub(crate) async fn preview(
     let mut items = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
         let settings = EncodeSettings {
+            temporal: input.temporal,
+            parameters: request.parameters.clone(),
+            av1an_options: request.av1an_options,
+            rate_control: request.rate_control,
+            tone_map: input.tone_map,
+            trim: input.trim,
+            subtitles: input.subtitles.clone(),
             framing: input.framing,
             audio: input.audio.clone(),
             video_stream_index: input.video_stream_index,
@@ -444,6 +455,7 @@ pub(crate) async fn preview(
                 &directory,
                 Path::new(&media.path),
                 request.encoder,
+                request.output_container.unwrap_or_default(),
                 &mut reserved,
             ) {
                 Err(error) => item.error = Some(error),
@@ -620,10 +632,22 @@ mod tests {
         fs::write(&existing, b"existing").unwrap();
         let queued = directory.join("Title 日本語_av1_2.mkv");
         let mut reserved = HashSet::from([path_key(&queued)]);
-        let third =
-            proposed_output(&directory, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
-        let fourth =
-            proposed_output(&directory, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
+        let third = proposed_output(
+            &directory,
+            &input,
+            VideoEncoder::SvtAv1,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
+        let fourth = proposed_output(
+            &directory,
+            &input,
+            VideoEncoder::SvtAv1,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
         assert_eq!(third.file_name().unwrap(), "Title 日本語_av1_3.mkv");
         assert_eq!(fourth.file_name().unwrap(), "Title 日本語_av1_4.mkv");
         assert!(!third.exists());
@@ -643,6 +667,7 @@ mod tests {
             &directory,
             Path::new(&long),
             VideoEncoder::SvtAv1,
+            media_core::ContainerFormat::Matroska,
             &mut reserved,
         )
         .unwrap();
@@ -681,7 +706,15 @@ mod tests {
         let fixture = Fixture::new();
         let manager = crate::JobManager::new(fixture.0.join("logs"));
         let request = BatchEncodeRequest {
+            parameters: Vec::new(),
+            av1an_options: None,
+            output_container: None,
+            rate_control: None,
             inputs: vec![BatchEncodeInput {
+                temporal: None,
+                tone_map: None,
+                trim: None,
+                subtitles: Vec::new(),
                 framing: Default::default(),
                 audio: Vec::new(),
                 input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
@@ -707,14 +740,23 @@ mod tests {
         );
         for invalid in [
             BatchEncodeRequest {
+                parameters: Vec::new(),
+                av1an_options: None,
+                output_container: None,
                 film_grain: 1,
                 ..request.clone()
             },
             BatchEncodeRequest {
+                parameters: Vec::new(),
+                av1an_options: None,
+                output_container: None,
                 hdr10_fallback: true,
                 ..request.clone()
             },
             BatchEncodeRequest {
+                parameters: Vec::new(),
+                av1an_options: None,
+                output_container: None,
                 backend: media_core::EncodeBackend::Av1an,
                 ..request
             },
@@ -739,10 +781,30 @@ mod tests {
         fs::write(&input, b"source").unwrap();
         fs::write(&existing, b"existing").unwrap();
         let mut reserved = HashSet::new();
-        let second =
-            proposed_output(&fixture.0, &input, VideoEncoder::X264, &mut reserved).unwrap();
-        let third = proposed_output(&fixture.0, &input, VideoEncoder::X264, &mut reserved).unwrap();
-        let av1 = proposed_output(&fixture.0, &input, VideoEncoder::SvtAv1, &mut reserved).unwrap();
+        let second = proposed_output(
+            &fixture.0,
+            &input,
+            VideoEncoder::X264,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
+        let third = proposed_output(
+            &fixture.0,
+            &input,
+            VideoEncoder::X264,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
+        let av1 = proposed_output(
+            &fixture.0,
+            &input,
+            VideoEncoder::SvtAv1,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
         assert_eq!(second.file_name().unwrap(), "Title 日本語_x264_2.mkv");
         assert_eq!(third.file_name().unwrap(), "Title 日本語_x264_3.mkv");
         assert_eq!(av1.file_name().unwrap(), "Title 日本語_av1.mkv");
@@ -757,8 +819,16 @@ mod tests {
         let manager = crate::JobManager::new(fixture.0.join("logs"));
         let result = manager
             .preview_encode_batch(BatchEncodeRequest {
+                parameters: Vec::new(),
+                av1an_options: None,
+                output_container: None,
+                rate_control: None,
                 inputs: vec![
                     BatchEncodeInput {
+                        temporal: None,
+                        tone_map: None,
+                        trim: None,
+                        subtitles: Vec::new(),
                         framing: Default::default(),
                         audio: Vec::new(),
                         input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
@@ -766,6 +836,10 @@ mod tests {
                         video_stream_index: 0,
                     },
                     BatchEncodeInput {
+                        temporal: None,
+                        tone_map: None,
+                        trim: None,
+                        subtitles: Vec::new(),
                         framing: Default::default(),
                         audio: Vec::new(),
                         input_path: fixture

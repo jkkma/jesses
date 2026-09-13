@@ -124,6 +124,7 @@ fn track(stream_index: u32, codec: AudioCodec, channels: AudioChannels) -> Audio
         codec,
         bitrate_kbps: if stream_index == 2 { 256 } else { 128 },
         channels,
+        gain: None,
     }
 }
 
@@ -331,9 +332,6 @@ async fn reordered_mixed_audio_converts_aac_opus_and_preserves_copied_payloads_m
 #[tokio::test]
 #[ignore = "requires real FFmpeg with native AAC and libopus, FFprobe, and x264"]
 async fn audio_channel_conversion_and_resampling_keep_the_decoded_timeline() {
-    let fixture = Fixture::new();
-    let input = fixture.0.join("source.mkv");
-    synthesize(&input, 2).await;
     let cases = [
         (1, AudioCodec::Opus, AudioChannels::Preserve, 1, 48000),
         (1, AudioCodec::Opus, AudioChannels::Stereo, 2, 48000),
@@ -342,15 +340,146 @@ async fn audio_channel_conversion_and_resampling_keep_the_decoded_timeline() {
         (2, AudioCodec::Aac, AudioChannels::Stereo, 2, 48000),
         (1, AudioCodec::Aac, AudioChannels::Mono, 1, 44100),
     ];
+    qualify_audio_cases(&cases).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with FLAC, libmp3lame, libvorbis, E-AC-3, matching FFprobe and x264"]
+async fn additional_codecs_preserve_timing_signal_and_selected_channels() {
+    qualify_audio_cases(&[
+        (1, AudioCodec::Flac, AudioChannels::Preserve, 1, 44100),
+        (2, AudioCodec::Flac, AudioChannels::Preserve, 6, 48000),
+        (2, AudioCodec::Flac, AudioChannels::Stereo, 2, 48000),
+        (1, AudioCodec::Mp3, AudioChannels::Preserve, 1, 44100),
+        (1, AudioCodec::Mp3, AudioChannels::Stereo, 2, 44100),
+        (2, AudioCodec::Mp3, AudioChannels::Stereo, 2, 48000),
+        (1, AudioCodec::Vorbis, AudioChannels::Preserve, 1, 44100),
+        (2, AudioCodec::Vorbis, AudioChannels::Preserve, 6, 48000),
+        (2, AudioCodec::Vorbis, AudioChannels::Mono, 1, 48000),
+        (1, AudioCodec::Eac3, AudioChannels::Preserve, 1, 44100),
+        (1, AudioCodec::Eac3, AudioChannels::Stereo, 2, 44100),
+        (2, AudioCodec::Eac3, AudioChannels::Stereo, 2, 48000),
+    ])
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with libvorbis, matching FFprobe and x264"]
+async fn additional_codec_preflight_rejects_unsupported_bitrate_before_video() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("must-not-publish.mkv");
+    synthesize(&input, 2).await;
+    let original = std::fs::read(&input).unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
-    for (ordinal, (source_index, codec, channels, count, rate)) in cases.into_iter().enumerate() {
+    // libvorbis cannot initialize its 48 kHz mono rate model at 256 kb/s.
+    let started = manager
+        .start_encode(request(
+            &input,
+            &destination,
+            vec![track(2, AudioCodec::Vorbis, AudioChannels::Mono)],
+        ))
+        .await
+        .unwrap();
+    let finished = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(finished.state, JobState::Failed, "{finished:#?}");
+    assert_eq!(finished.error.unwrap().code, "AUDIO_TOOL_UNSUPPORTED");
+    assert!(
+        !finished
+            .logs
+            .iter()
+            .any(|line| line.contains("Decoding the complete source")
+                || line.contains("Owned temporary video"))
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(
+        !std::fs::read_dir(&fixture.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".partial."))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with additional audio codecs, matching FFprobe and x264"]
+async fn additional_codec_rates_and_eac3_side_surround_are_preserved() {
+    let fixture = Fixture::new();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (index, (codec, rate, bitrate, surround)) in [
+        (AudioCodec::Mp3, 8000, 64, false),
+        (AudioCodec::Mp3, 22050, 144, false),
+        (AudioCodec::Mp3, 32000, 320, false),
+        (AudioCodec::Vorbis, 8000, 32, false),
+        (AudioCodec::Eac3, 32000, 192, false),
+        (AudioCodec::Eac3, 48000, 640, true),
+        (AudioCodec::Flac, 192000, 128, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input = fixture.0.join(format!("source-{index}.mkv"));
+        let destination = fixture.0.join(format!("output-{index}.mkv"));
+        let filter = if surround {
+            "pan=5.1(side)|FL=c0|FR=0.7*c0|FC=0.5*c0|LFE=0.1*c0|SL=0.3*c0|SR=0.2*c0,asetpts=PTS+0.012/TB"
+        } else {
+            "asetpts=PTS+0.012/TB"
+        };
+        output(command("ffmpeg").args(["-v", "error", "-nostdin", "-n", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=24:duration=1.5", "-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate={rate}:duration=2"), "-map", "0:v", "-map", "1:a", "-c:v", "ffv1", "-c:a", "flac", "-af", filter, "-vf", "setsar=1,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709", "-chroma_sample_location", "left", "-avoid_negative_ts", "disabled"]).arg(&input)).await;
+        let original = std::fs::read(&input).unwrap();
+        let mut requested = request(
+            &input,
+            &destination,
+            vec![AudioTrackSettings {
+                stream_index: 1,
+                codec,
+                bitrate_kbps: bitrate,
+                channels: AudioChannels::Preserve,
+                gain: None,
+            }],
+        );
+        requested.source.stream_indices = vec![1, 0];
+        let started = manager.start_encode(requested).await.unwrap();
+        let finished = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+        assert_eq!(
+            finished.state,
+            JobState::Succeeded,
+            "{codec:?} {rate} Hz: {finished:#?}"
+        );
+        let result = probe(&destination, &["-show_streams"]).await;
+        assert_eq!(result["streams"][0]["sample_rate"], rate.to_string());
+        assert_eq!(
+            result["streams"][0]["channels"],
+            if surround { 6 } else { 1 }
+        );
+        assert_eq!(
+            result["streams"][0]["channel_layout"],
+            if surround { "5.1(side)" } else { "mono" }
+        );
+        let source = decoded_timeline(&input, 1).await;
+        let output = decoded_timeline(&destination, 0).await;
+        assert!((source.0 - output.0).abs() <= 0.002);
+        assert_eq!(source.1, output.1);
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    manager.shutdown().await;
+}
+
+async fn qualify_audio_cases(cases: &[(u32, AudioCodec, AudioChannels, u32, u32)]) {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    synthesize(&input, 2).await;
+    let original_bytes = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (ordinal, &(source_index, codec, channels, count, rate)) in cases.iter().enumerate() {
         let destination = fixture.0.join(format!("converted-{ordinal}.mkv"));
+        let mut selected_track = track(source_index, codec, channels);
+        if codec == AudioCodec::Vorbis && count == 1 {
+            selected_track.bitrate_kbps = 128;
+        }
         let started = manager
-            .start_encode(request(
-                &input,
-                &destination,
-                vec![track(source_index, codec, channels)],
-            ))
+            .start_encode(request(&input, &destination, vec![selected_track]))
             .await
             .unwrap();
         let completed = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
@@ -359,11 +488,24 @@ async fn audio_channel_conversion_and_resampling_keep_the_decoded_timeline() {
         let document = probe(&destination, &["-show_streams"]).await;
         assert_eq!(document["streams"][index]["channels"], count);
         assert_eq!(document["streams"][index]["sample_rate"], rate.to_string());
+        let codec_name = match codec {
+            AudioCodec::Aac => "aac",
+            AudioCodec::Opus => "opus",
+            AudioCodec::Flac => "flac",
+            AudioCodec::Mp3 => "mp3",
+            AudioCodec::Vorbis => "vorbis",
+            AudioCodec::Eac3 => "eac3",
+            AudioCodec::Copy => unreachable!(),
+        };
+        assert_eq!(document["streams"][index]["codec_name"], codec_name);
+        if codec == AudioCodec::Flac {
+            assert_eq!(document["streams"][index]["bits_per_raw_sample"], "24");
+        }
         let source = decoded_timeline(&input, source_index).await;
-        let output = decoded_timeline(&destination, index as u32).await;
-        assert!((source.0 - output.0).abs() <= 0.002);
+        let output_timeline = decoded_timeline(&destination, index as u32).await;
+        assert!((source.0 - output_timeline.0).abs() <= 0.002);
         let source_rate = if source_index == 1 { 44100.0 } else { 48000.0 };
-        let difference = output.1 as f64 - source.1 as f64 * rate as f64 / source_rate;
+        let difference = output_timeline.1 as f64 - source.1 as f64 * rate as f64 / source_rate;
         assert!(
             difference >= -2.0
                 && difference
@@ -373,6 +515,61 @@ async fn audio_channel_conversion_and_resampling_keep_the_decoded_timeline() {
                         4.0
                     }
         );
+        let pcm = |path: &Path, stream: u32, format: &str| {
+            let mut command = command("ffmpeg");
+            command
+                .args(["-v", "error", "-nostdin", "-i"])
+                .arg(path)
+                .args([
+                    "-map",
+                    &format!("0:{stream}"),
+                    "-ac",
+                    &count.to_string(),
+                    "-ar",
+                    &rate.to_string(),
+                    "-c:a",
+                    &format!("pcm_{format}"),
+                    "-f",
+                    format,
+                    "-",
+                ]);
+            command
+        };
+        if codec == AudioCodec::Flac && channels == AudioChannels::Preserve {
+            assert_eq!(
+                output(&mut pcm(&input, source_index, "s24le")).await,
+                output(&mut pcm(&destination, index as u32, "s24le")).await,
+                "FLAC changed the source's integer PCM samples"
+            );
+        }
+        let original_pcm = output(&mut pcm(&input, source_index, "f32le")).await;
+        let encoded_pcm = output(&mut pcm(&destination, index as u32, "f32le")).await;
+        let values = |bytes: Vec<u8>| {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f64::from(f32::from_le_bytes(*bytes)))
+                .collect::<Vec<_>>()
+        };
+        let original_pcm = values(original_pcm);
+        let encoded_pcm = values(encoded_pcm);
+        let (mut dot, mut source_power, mut output_power) = (0.0, 0.0, 0.0);
+        for (source, encoded) in original_pcm.iter().zip(&encoded_pcm) {
+            dot += source * encoded;
+            source_power += source * source;
+            output_power += encoded * encoded;
+        }
+        let correlation = dot / (source_power * output_power).sqrt();
+        assert!(
+            correlation > 0.98,
+            "{codec:?} signal shifted, vanished, or changed channel mapping: correlation {correlation}"
+        );
+        assert_eq!(
+            packet_hashes(&input, 4).await,
+            packet_hashes(&destination, 4).await
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original_bytes);
     }
     manager.shutdown().await;
 }

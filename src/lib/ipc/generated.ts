@@ -2,6 +2,22 @@
 
 export type ToolInfo = { id: string, name: string, available: boolean, path: string | null, version: string | null, detail: string | null, };
 
+export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, };
+
+export type UserPreferences = { general: GeneralPreferences, recentPaths: Array<string>, revision: number, parameterPresets?: Array<EncoderParameterPreset>, };
+
+export type EncoderParameterPreset = { name: string, encoder: VideoEncoder, backend: EncodeBackend, parameters: Array<EncoderParameter>, };
+
+export type EncoderParameterPresetKey = { name: string, encoder: VideoEncoder, backend: EncodeBackend, };
+
+export type SavePreferencesRequest = { general: GeneralPreferences,
+/**
+ * Omitted for ordinary edits, so a recent import cannot be lost.
+ */
+recentPaths: Array<string> | null, };
+
+export type PreferenceImportPreview = { request: SavePreferencesRequest, acceptedKeys: Array<string>, ignoredKeyCount: number, warnings: Array<string>, };
+
 export type MediaStream = {
 /**
  * Original source stream index, independent of presentation order.
@@ -10,7 +26,7 @@ index: number, kind: string, codec: string | null, width: number | null, height:
 /**
  * Original rational frame rate, for example `24000/1001`.
  */
-frameRate: string | null, sampleRate: number | null, channels: number | null, language: string | null, title: string | null, pixelFormat?: string | null, bitDepth?: number | null, colorPrimaries?: string | null, colorTransfer?: string | null, colorSpace?: string | null, colorRange?: string | null,
+frameRate: string | null, fieldOrder?: string, sampleRate: number | null, channels: number | null, channelLayout?: string, language: string | null, title: string | null, pixelFormat?: string | null, bitDepth?: number | null, colorPrimaries?: string | null, colorTransfer?: string | null, colorSpace?: string | null, colorRange?: string | null,
 /**
  * HDR transfer family; this does not establish encode compatibility.
  */
@@ -36,17 +52,153 @@ sizeBytes: string, durationSeconds: number | null, format: string | null, stream
 
 export type AppError = { code: string, message: string, path: string | null, };
 
+export type FramePreviewRequest = { inputPath: string, videoStreamIndex: number, positionSeconds: number, };
+
+export type FramePreviewResult = {
+/**
+ * Bounded PNG returned directly; no source path is exposed as a web asset.
+ */
+imageDataUrl: string, width: number, height: number, sourceWidth: number, sourceHeight: number,
+/**
+ * Requested seek position, not a claim of frame-accurate trim timing.
+ */
+positionSeconds: number,
+/**
+ * Metadata and sampled-content identity, not a complete-file SHA-256.
+ */
+sourceFingerprint: string,
+/**
+ * HDR was converted to SDR only for this display image.
+ */
+toneMapped: boolean, };
+
+export type AutoCropRequest = { inputPath: string, videoStreamIndex: number, };
+
+export type AutoCropResult = {
+/**
+ * None means that the samples did not establish a usable crop.
+ */
+crop: CropSettings | null, sourceWidth: number, sourceHeight: number, sampleCount: number, sampledFrames: number, agreementPercent: number, sourceFingerprint: string, message: string, };
+
+export type BitrateRequest = { inputPath: string, streamIndex: number,
+/**
+ * Fixed, presentation-time-aligned windows; packets are assigned by PTS.
+ */
+windowSeconds: number, };
+
+export type BitratePoint = { startSeconds: number, megabitsPerSecond: number, packetBytes: string, };
+
+export type BitrateResult = { streamIndex: number, windowSeconds: number,
+/**
+ * Compressed packet payload only; excludes container overhead.
+ */
+packetBytes: string, packetCount: string, untimedPacketBytes: string, untimedPacketCount: string, dtsFallbackCount: string, startSeconds: number | null, endSeconds: number | null,
+/**
+ * Timed payload divided by measured timestamp span, when known.
+ */
+averageMegabitsPerSecond: number | null, peakWindowMegabitsPerSecond: number, points: Array<BitratePoint>, sourceFingerprint: string, };
+
+export type LoudnessRequest = { inputPath: string, streamIndex: number, channels: AudioChannels, targetLufs: number, peakLimitDbfs: number, };
+
+export type LoudnessResult = { integratedLufs: number | null, truePeakDbfs: number | null, loudnessRangeLu: number | null,
+/**
+ * Flat gain only, rounded down to tenths of a decibel to retain headroom.
+ */
+suggestedGainTenthsDb: number | null, targetLimitedByPeak: boolean, sourceFingerprint: string, message: string, };
+
+export type QualityMetric = "psnr" | "ssim" | "vmaf";
+
+export type QualityPoint = { frame: number,
+/**
+ * None represents infinite PSNR for identical decoded pixels.
+ */
+score: number | null, };
+
+export type QualityRequest = { referencePath: string, referenceStreamIndex: number, referenceStartFrame: number, candidatePath: string, candidateStreamIndex: number, candidateStartFrame: number, frameCount: number, metric: QualityMetric, };
+
+export type QualityResult = { metric: QualityMetric, frameCount: number, score: number | null, points: Array<QualityPoint>, referenceFingerprint: string, candidateFingerprint: string, model: string | null, message: string, };
+
+export type AnalysisReport = { "kind": "bitrate", request: BitrateRequest, result: BitrateResult, } | { "kind": "quality", request: QualityRequest, result: QualityResult, };
+
+export type AnalysisExportFormat = "csv" | "svg";
+
+export type AnalysisExportRequest = { outputPath: string, format: AnalysisExportFormat, report: AnalysisReport, };
+
+export type DeinterlaceMode = "frame" | "bob";
+
+export type FieldOrder = "topFirst" | "bottomFirst";
+
+export type DeinterlaceSettings = { mode: DeinterlaceMode, fieldOrder: FieldOrder, };
+
+export type FrameRate = { numerator: number, denominator: number, };
+
+export type ResizeFilter = "nearest" | "bilinear" | "bicubic" | "lanczos";
+
+export type TemporalSettings = { deinterlace?: DeinterlaceSettings, frameRate?: FrameRate, resizeFilter: ResizeFilter, };
+
+export type Av1anChunkMethod = "lsmash" | "ffms2" | "bestsource" | "select" | "hybrid";
+
+export type Av1anSplitMethod = "sceneDetection" | "fixedChunks";
+
+export type Av1anSceneDetection = "standard" | "fast";
+
+export type Av1anChunkOrder = "longToShort" | "shortToLong" | "sequential" | "random";
+
+export type Av1anTargetMetric = "vmaf" | "ssimulacra2" | "butteraugli" | "xpsnr";
+
+export type Av1anTargetQuality = { metric: Av1anTargetMetric, minimumScoreTenths: number, maximumScoreTenths: number, minimumCrf: number, maximumCrf: number, probes: number, probingRate: number, probeWidth: number, probeHeight: number, };
+
+export type Av1anOptions = { chunkMethod: Av1anChunkMethod, splitMethod: Av1anSplitMethod, sceneDetection: Av1anSceneDetection, maximumChunkFrames: number, minimumSceneFrames: number, sceneDownscaleHeight: number | null, chunkOrder: Av1anChunkOrder, targetQuality?: Av1anTargetQuality, };
+
+export type ToneMapSettings = {
+/**
+ * Signal peak used by Hable, relative to the fixed 100-nit SDR target.
+ */
+sourcePeakNits: number,
+/**
+ * Discard dynamic HDR only for the already-qualified HDR10 base-layer profiles.
+ */
+hdr10BaseLayer: boolean, };
+
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
 
-export type AudioCodec = "copy" | "opus" | "aac";
+export type MuxSource = { id: string, inputPath: string, };
+
+export type MuxTrack = { sourceId: string, streamIndex: number,
+/**
+ * None preserves the source value; an empty string clears the tag.
+ */
+title?: string | null, language?: string | null, default?: boolean | null, forced?: boolean | null, };
+
+export type MuxRequest = { sources: Array<MuxSource>, tracks: Array<MuxTrack>, metadataSourceId: string, chaptersSourceId: string | null, outputPath: string, };
+
+export type ContainerFormat = "matroska" | "mp4" | "mov" | "webm";
+
+export type VideoRateControl = { "mode": "bitrate", bitrateKbps: number, twoPass: boolean, } | { "mode": "targetSize", targetSizeMib: number, };
+
+export type SubtitleMode = "copy" | "subRip" | "ass" | "webVtt" | "burnIn";
+
+export type SubtitleTrackSettings = {
+/**
+ * Original subtitle stream index in the selected source file.
+ */
+streamIndex: number, mode: SubtitleMode, };
+
+export type AudioCodec = "copy" | "opus" | "aac" | "flac" | "mp3" | "vorbis" | "eac3";
 
 export type AudioChannels = "preserve" | "mono" | "stereo";
 
-export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, };
+export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain, };
+
+export type AudioGain = { tenthsDb: number,
+/**
+ * Present for an applied measurement; manual gain has no measurement claim.
+ */
+sourceFingerprint?: string, };
 
 export type EncodeBackend = "standalone" | "av1an";
 
-export type VideoEncoder = "svtAv1" | "svtAv1FiveFish" | "svtAv1Hdr" | "x264";
+export type VideoEncoder = "svtAv1" | "svtAv1FiveFish" | "svtAv1Hdr" | "x264" | "x265" | "vp9";
 
 export type HdrTune = "visualQuality" | "filmGrain";
 
@@ -64,9 +216,31 @@ resizeWidth: number | null,
  */
 borders: BorderSettings, };
 
-export type EncodeSettings = {
+export type VideoTrim = { startFrame: number, endFrameExclusive: number, };
+
+export type EncoderParameter = { name: string, value: string, };
+
+export type EncoderParameterQuery = { encoder: VideoEncoder, backend: EncodeBackend, };
+
+export type EncoderParameterSpec = { name: string, label: string, argument: string, minimum: number, maximum: number, };
+
+export type EncoderParameterCatalog = { encoder: VideoEncoder, backend: EncodeBackend, route: string, toolPath: string, toolVersion: string, parameters: Array<EncoderParameterSpec>, notes: Array<string>, };
+
+export type EncodeCommandStage = { label: string, executable: string, arguments: Array<string>, workingDirectory: string | null, notes: Array<string>, };
+
+export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
+
+export type EncodeSettings = { parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions,
 /**
- * Per-source framing, applied before standalone video encoding.
+ * Omission preserves constant-quality encoding and old saved jobs.
+ */
+rateControl?: VideoRateControl, toneMap?: ToneMapSettings,
+/**
+ * Zero-based start and exclusive end frames. Omission retains the full source.
+ */
+trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>,
+/**
+ * Per-source framing, applied before video encoding.
  */
 framing: VideoFraming,
 /**
@@ -88,21 +262,26 @@ hdr10Fallback: boolean, };
 
 export type EncodeRequest = { source: RemuxRequest, settings: EncodeSettings, };
 
-export type JobState = "queued" | "preparing" | "running" | "finalizing" | "succeeded" | "canceling" | "stopping" | "stopped" | "canceled" | "failed" | "interrupted";
+export type JobState = "queued" | "preparing" | "running" | "paused" | "finalizing" | "succeeded" | "canceling" | "stopping" | "stopped" | "canceled" | "failed" | "interrupted";
 
 export type RecoveryPhase = "encoding" | "finalizing";
 
 export type Av1anRecovery = { workspace: string, phase: RecoveryPhase, completedFrames: number, totalFrames: number, };
 
-export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest, encodeSettings: EncodeSettings | null, recovery: Av1anRecovery | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest,
+/**
+ * Present only for multi-source remux. The ordinary request is a display
+ * summary; this mapping is the immutable execution authority.
+ */
+muxRequest?: MuxRequest | null, encodeSettings: EncodeSettings | null, recovery: Av1anRecovery | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
 
 export type FolderScanRequest = { path: string, recursive: boolean, };
 
 export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, skippedCount: number, truncated: boolean, };
 
-export type BatchEncodeInput = { framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+export type BatchEncodeInput = { temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
+export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 

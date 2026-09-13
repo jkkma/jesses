@@ -176,6 +176,8 @@ async function desktopMock(
                     svtAv1FiveFish: '_av1_5fish.mkv',
                     svtAv1Hdr: '_av1_hdr.mkv',
                     x264: '_x264.mkv',
+                    x265: '_x265.mkv',
+                    vp9: '_vp9.mkv',
                   }[request.encoder];
                 return {
                   inputPath: input.inputPath,

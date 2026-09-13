@@ -26,6 +26,9 @@ mod platform;
 
 #[path = "supervisor/ansi.rs"]
 mod ansi;
+#[path = "supervisor/pause.rs"]
+mod pause;
+pub use pause::PauseControl;
 
 const RECORD_BYTES: usize = 8192;
 const LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -36,6 +39,22 @@ pub struct CommandSpec {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
+}
+
+/// Environment changes apply only to an owned child and its descendants.
+#[derive(Clone, Debug, Default)]
+pub struct ChildEnvironment {
+    pub path: Option<OsString>,
+    pub variables: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl ChildEnvironment {
+    pub fn with_path(path: &OsStr) -> Self {
+        Self {
+            path: Some(path.to_owned()),
+            variables: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -144,11 +163,48 @@ pub async fn run_with_path(
     time_limit: Duration,
     path: Option<&OsStr>,
 ) -> Result<ProcessResult, SupervisorError> {
+    run_with_pause(spec, cancel, events, log_path, time_limit, path, None).await
+}
+
+/// As run_with_path, with live process-tree pause and a clock excluding pauses.
+pub async fn run_with_pause(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    path: Option<&OsStr>,
+    pause: Option<&PauseControl>,
+) -> Result<ProcessResult, SupervisorError> {
+    let environment = path.map(ChildEnvironment::with_path);
+    run_with_environment(
+        spec,
+        cancel,
+        events,
+        log_path,
+        time_limit,
+        environment.as_ref(),
+        pause,
+    )
+    .await
+}
+
+/// Run with scoped environment changes and optional process-tree pause.
+pub async fn run_with_environment(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    environment: Option<&ChildEnvironment>,
+    pause: Option<&PauseControl>,
+) -> Result<ProcessResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
-    let mut child = platform::OwnedChild::spawn_with_path(spec, path)?;
+    let mut child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
+    let attached = pause.map(|control| control.attach(&child)).transpose()?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (_, _, status) = tokio::try_join!(
@@ -166,7 +222,7 @@ pub async fn run_with_path(
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        _ = async { if let Some(control)=pause { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
         result = execution => result,
     };
     // Explicit cleanup also reaps the leader. The guard handles future abortion.
@@ -175,6 +231,7 @@ pub async fn run_with_path(
         .await
         .map_err(SupervisorError::Cleanup)?;
     log.lock().await.flush().await?;
+    drop(attached);
     result
 }
 
@@ -197,10 +254,22 @@ pub async fn run_capture_with_path(
     time_limit: Duration,
     path: Option<&OsStr>,
 ) -> Result<CapturedOutput, SupervisorError> {
+    let environment = path.map(ChildEnvironment::with_path);
+    run_capture_with_environment(spec, cancel, max_bytes, time_limit, environment.as_ref()).await
+}
+
+/// Capture output with child-only environment changes.
+pub async fn run_capture_with_environment(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    max_bytes: usize,
+    time_limit: Duration,
+    environment: Option<&ChildEnvironment>,
+) -> Result<CapturedOutput, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
-    let mut child = platform::OwnedChild::spawn_with_path(spec, path)?;
+    let mut child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (stdout, stderr, status) = tokio::try_join!(

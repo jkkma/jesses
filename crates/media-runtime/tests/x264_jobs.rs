@@ -441,6 +441,10 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     manager.ready().await.unwrap();
     let input = BatchEncodeInput {
+        temporal: None,
+        tone_map: None,
+        trim: None,
+        subtitles: Vec::new(),
         framing: Default::default(),
         audio: Vec::new(),
         input_path: input.to_string_lossy().into_owned(),
@@ -449,6 +453,10 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
     };
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            parameters: Vec::new(),
+            av1an_options: None,
+            output_container: None,
+            rate_control: None,
             inputs: vec![input.clone(), input.clone()],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             backend: EncodeBackend::Standalone,
@@ -528,7 +536,15 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
     let request = request(&input, &destination, 5);
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            parameters: Vec::new(),
+            av1an_options: None,
+            output_container: None,
+            rate_control: None,
             inputs: vec![BatchEncodeInput {
+                temporal: None,
+                tone_map: None,
+                trim: None,
+                subtitles: Vec::new(),
                 framing: Default::default(),
                 audio: Vec::new(),
                 input_path: request.source.input_path.clone(),
@@ -646,7 +662,12 @@ fn missing_x264_child() {
     }
     // This exact helper runs alone in a separate process, before any runtime
     // or discovery workers exist. The parent test process keeps its PATH.
-    unsafe { std::env::set_var("PATH", root.join("bin")) };
+    unsafe {
+        std::env::set_var("PATH", root.join("bin"));
+        for variable in ["JESSES_FFMPEG", "JESSES_FFPROBE", "JESSES_X264"] {
+            std::env::remove_var(variable);
+        }
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

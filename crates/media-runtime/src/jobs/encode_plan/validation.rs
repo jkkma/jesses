@@ -54,10 +54,11 @@ impl Validation {
     }
 
     fn discover(&mut self, first: &Frame) -> Result<(), AppError> {
+        let needs_mastering = self.declared.plan.needs_mastering_metadata();
         if let Some(hdr) = &mut self.declared.plan.hdr10 {
             hdr.metadata
                 .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
-            if hdr.metadata.mastering.is_none() {
+            if needs_mastering && hdr.metadata.mastering.is_none() {
                 return Err(unsupported(
                     "HDR10 encoding requires valid mastering display metadata in the stream or first decoded frame.",
                 ));
@@ -138,7 +139,7 @@ impl Cadence {
             self.observed_hdr = StaticMetadata::parse(&self.stream.side_data_list)?;
             validate_side_data(
                 &self.stream.side_data_list,
-                self.plan.hdr10.as_ref(),
+                self.plan.validation_hdr(self.encoded),
                 self.encoded,
             )?;
         }
@@ -150,13 +151,13 @@ impl Cadence {
             ));
         }
         let (width, height) = self.plan.frame_dimensions(self.encoded);
-        if frame.interlaced_frame != Some(0)
-            || frame.width != Some(width)
+        self.plan.validate_fields(frame, self.encoded)?;
+        if frame.width != Some(width)
             || frame.height != Some(height)
             || frame.sample_aspect_ratio.as_deref() != Some("1:1")
         {
             return Err(unsupported(
-                "Interlaced frames or changing frame dimensions/pixel aspect ratios are not supported.",
+                "Changing frame dimensions or non-square pixel aspect ratios are not supported.",
             ));
         }
         let normalize_chroma = |value: Option<&str>| match value {
@@ -184,10 +185,10 @@ impl Cadence {
         }
         validate_side_data(
             &frame.side_data_list,
-            self.plan.hdr10.as_ref(),
+            self.plan.validation_hdr(self.encoded),
             self.encoded,
         )?;
-        if let Some(hdr) = &self.plan.hdr10 {
+        if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
             let actual = StaticMetadata::parse(&frame.side_data_list)?;
             hdr.metadata.validate_present(&actual, self.encoded)?;
             if actual.mastering.is_some() {
@@ -219,7 +220,7 @@ impl Cadence {
         if let Some(error) = self.error {
             return Err(error);
         }
-        if let Some(hdr) = &self.plan.hdr10 {
+        if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
             hdr.metadata
                 .validate_present(&self.observed_hdr, self.encoded)?;
             if self.encoded

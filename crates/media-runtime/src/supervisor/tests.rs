@@ -114,6 +114,24 @@ fn fake_tool() {
     let mode = std::fs::read_to_string(path.join("mode")).unwrap();
     std::fs::write(path.join("pid"), std::process::id().to_string()).unwrap();
     match mode.as_str() {
+        "pause-tree" | "pause-branch" | "pause-leaf" => {
+            if mode == "pause-tree" {
+                spawn_fixture_child(&path, "pause-branch");
+            }
+            if mode == "pause-branch" {
+                spawn_fixture_child(&path, "pause-leaf");
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path.join("ticks"))
+                .unwrap();
+            loop {
+                file.write_all(b"x").unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         "environment" => {
             path_overrides::dump_environment(&path);
             std::process::exit(0);
@@ -305,6 +323,116 @@ fn wait_peer(path: &Path) {
     while !Path::new(&peer).join("pid").exists() {
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[tokio::test]
+async fn live_pause_halts_descendants_is_idempotent_and_cancel_kills_paused_tree() {
+    let fixture = Fixture::new("pause-tree");
+    let spec = fixture.spec();
+    let path = fixture.0.join("tool.log");
+    let control = PauseControl::default();
+    let active = control.clone();
+    let (owner, cancel) = watch::channel(false);
+    let (events, _receiver) = mpsc::channel(64);
+    let task = tokio::spawn(async move {
+        run_with_pause(
+            &spec,
+            cancel,
+            events,
+            &path,
+            Duration::from_secs(30),
+            None,
+            Some(&active),
+        )
+        .await
+    });
+    let pids = [
+        fixture.pid(0).await,
+        fixture.pid(1).await,
+        fixture.pid(2).await,
+    ];
+    let paths = [
+        fixture.0.join("ticks"),
+        fixture.0.join("child/ticks"),
+        fixture.0.join("child/child/ticks"),
+    ];
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    control.set_paused(true).unwrap();
+    control.set_paused(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let lengths: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lengths,
+        paths
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .collect::<Vec<_>>()
+    );
+    control.set_paused(false).unwrap();
+    control.set_paused(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for (path, previous) in paths.iter().zip(lengths) {
+        assert!(std::fs::metadata(path).unwrap().len() > previous);
+    }
+    control.set_paused(true).unwrap();
+    owner.send_replace(true);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(SupervisorError::Cancelled)
+    ));
+    for pid in pids {
+        assert!(!alive(pid), "paused descendant {pid} survived cancellation");
+    }
+    assert!(control.set_paused(false).is_err());
+}
+
+#[tokio::test]
+async fn live_pause_excludes_suspended_time_from_timeout() {
+    let fixture = Fixture::new("pause-tree");
+    let spec = fixture.spec();
+    let path = fixture.0.join("tool.log");
+    let control = PauseControl::default();
+    let active = control.clone();
+    let (_owner, cancel) = watch::channel(false);
+    let (events, _receiver) = mpsc::channel(64);
+    let mut task = tokio::spawn(async move {
+        run_with_pause(
+            &spec,
+            cancel,
+            events,
+            &path,
+            Duration::from_secs(2),
+            None,
+            Some(&active),
+        )
+        .await
+    });
+    let pids = [
+        fixture.pid(0).await,
+        fixture.pid(1).await,
+        fixture.pid(2).await,
+    ];
+    control.set_paused(true).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2300), &mut task)
+            .await
+            .is_err(),
+        "suspended time consumed the encode timeout"
+    );
+    control.set_paused(false).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::Timeout)));
+    assert_dead(&pids).await;
 }
 
 #[cfg(windows)]

@@ -40,7 +40,7 @@ use windows_sys::Win32::{
 
 #[path = "environment.rs"]
 mod environment;
-use environment::environment_with_path;
+use environment::environment_with_changes;
 
 pub(super) struct OwnedChild {
     job: OwnedHandle,
@@ -50,13 +50,55 @@ pub(super) struct OwnedChild {
     stderr: Option<tokio::fs::File>,
 }
 
+pub(super) struct PauseTarget(OwnedHandle);
+impl PauseTarget {
+    pub(super) fn set_paused(&self, paused: bool) -> io::Result<()> {
+        // Native JobObjectFreezeInformation (18), described in phnt/ntpsapi.h.
+        // Freeze the owned job as a unit, including all inherited descendants.
+        // Unsupported Windows versions return an error; no process-name fallback.
+        #[repr(C)]
+        struct Freeze {
+            flags: u32,
+            freeze: u8,
+            swap: u8,
+            reserved: [u8; 2],
+            wake_filter: [u32; 2],
+        }
+        let information = Freeze {
+            flags: 1,
+            freeze: u8::from(paused),
+            swap: 0,
+            reserved: [0; 2],
+            wake_filter: [0; 2],
+        };
+        check(unsafe {
+            SetInformationJobObject(
+                self.0.as_raw_handle(),
+                18,
+                (&information as *const Freeze).cast(),
+                size_of::<Freeze>() as u32,
+            )
+        })
+    }
+}
+
 impl OwnedChild {
+    pub(super) fn pause_target(&self) -> io::Result<PauseTarget> {
+        Ok(PauseTarget(self.job.try_clone()?))
+    }
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
         Self::spawn_with_path(spec, None)
     }
 
     pub(super) fn spawn_with_path(spec: &CommandSpec, path: Option<&OsStr>) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false, None, path)
+        Self::spawn_with_environment(spec, path.map(super::ChildEnvironment::with_path).as_ref())
+    }
+
+    pub(super) fn spawn_with_environment(
+        spec: &CommandSpec,
+        environment: Option<&super::ChildEnvironment>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false, None, environment)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
@@ -74,7 +116,7 @@ impl OwnedChild {
         spec: &CommandSpec,
         pipe_stdin: bool,
         output: Option<std::fs::File>,
-        path: Option<&OsStr>,
+        changes: Option<&super::ChildEnvironment>,
     ) -> io::Result<Self> {
         if spec
             .executable
@@ -87,7 +129,7 @@ impl OwnedChild {
             ));
         }
         let executable = wide(spec.executable.as_os_str())?;
-        let environment = path.map(environment_with_path).transpose()?;
+        let environment = changes.map(environment_with_changes).transpose()?;
         let mut command_line = Vec::new();
         quote(spec.executable.as_os_str(), &mut command_line)?;
         for arg in &spec.args {

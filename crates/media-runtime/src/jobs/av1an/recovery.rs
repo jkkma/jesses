@@ -170,6 +170,8 @@ struct Manifest {
     scenes: Option<Stamp>,
     script: Option<Stamp>,
     completed: BTreeMap<String, Chunk>,
+    #[serde(default)]
+    segments: Vec<Stamp>,
     intermediate: Identity,
     final_video: Option<Stamp>,
 }
@@ -237,8 +239,26 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             ));
         }
     }
+    for (index, segment) in manifest.segments.iter().enumerate() {
+        if manifest
+            .settings
+            .av1an_options
+            .unwrap_or_default()
+            .chunk_method
+            != media_core::Av1anChunkMethod::Hybrid
+            || (segment.path != root.join("chunks/split").join(format!("{index:05}.mkv"))
+                && !(manifest.segments.len() == 1
+                    && index == 0
+                    && segment.path == root.join("chunks/split/0.mkv")))
+        {
+            return Err(error(root, "Unexpected hybrid source segment location."));
+        }
+    }
     if manifest.queue.is_some() != manifest.scenes.is_some()
-        || manifest.queue.is_some() != manifest.script.is_some()
+        || (manifest.queue.is_some()
+            && super::options::plugin(manifest.settings.av1an_options.unwrap_or_default())
+                .is_some())
+            != manifest.script.is_some()
         || (manifest.queue.is_none() && !manifest.completed.is_empty())
         || (manifest.phase == RecoveryPhase::Finalizing) != manifest.final_video.is_some()
     {
@@ -316,6 +336,7 @@ struct Workspace {
     // durable manifest use the cadence independently proven by every timestamp.
     // Recompute this declaration from the immutable source on every attempt.
     source_rate: (u32, u32),
+    segments_verified: bool,
     // Protect tools from modification during the resumed job on Windows.
     _tools: Vec<Source>,
     chunks: Vec<Source>,
@@ -380,7 +401,12 @@ impl Workspace {
         let chunks = self.root.join("chunks");
         identity(&chunks)?;
         identity(&chunks.join("split"))?;
-        let script_bytes = bytes(&chunks.join("split/loadscript.vpy"))?;
+        let options = self.manifest.settings.av1an_options.unwrap_or_default();
+        let script_bytes = if super::options::plugin(options).is_some() {
+            bytes(&chunks.join("split/loadscript.vpy"))?
+        } else {
+            Vec::new()
+        };
         let script_text =
             std::str::from_utf8(&script_bytes).map_err(|e| error(&chunks, e.to_string()))?;
         super::recovery_receipts::validate(
@@ -397,6 +423,7 @@ impl Workspace {
                 source_fps_num: self.source_rate.0,
                 source_fps_den: self.source_rate.1,
                 script_text,
+                options,
             },
         )
         .map_err(|e| error(&chunks, e))
@@ -417,14 +444,16 @@ impl Workspace {
         if receipts.total_frames != self.manifest.total_frames
             || receipts.completed_frames > receipts.total_frames
             || receipts.queued_chunks == 0
-            || receipts.script_path != self.root.join("chunks/split/loadscript.vpy")
+            || receipts
+                .script_path
+                .as_ref()
+                .is_some_and(|path| *path != self.root.join("chunks/split/loadscript.vpy"))
         {
             return Err(error(&self.root, "Inconsistent av1an recovery receipts."));
         }
         for (path, old) in [
             ("chunks/chunks.json", &mut self.manifest.queue),
             ("chunks/scenes.json", &mut self.manifest.scenes),
-            ("chunks/split/loadscript.vpy", &mut self.manifest.script),
         ] {
             let stamp = digest(&self.root.join(path), None)?;
             if old.as_ref().is_some_and(|old| old != &stamp) {
@@ -434,6 +463,41 @@ impl Workspace {
                 ));
             }
             *old = Some(stamp);
+        }
+        if let Some(path) = &receipts.script_path {
+            let stamp = digest(path, None)?;
+            if self
+                .manifest
+                .script
+                .as_ref()
+                .is_some_and(|old| old != &stamp)
+            {
+                return Err(error(path, "Saved av1an source script changed."));
+            }
+            self.manifest.script = Some(stamp);
+        } else if self.manifest.script.is_some() {
+            return Err(error(
+                &self.root,
+                "Unexpected saved source script for FFmpeg reader.",
+            ));
+        }
+        if self.manifest.segments.is_empty() {
+            for path in &receipts.segments {
+                let guard = Source::open(path)?;
+                self.manifest.segments.push(digest(path, None)?);
+                self.chunks.push(guard);
+            }
+        } else if self
+            .manifest
+            .segments
+            .iter()
+            .map(|stamp| &stamp.path)
+            .ne(receipts.segments.iter())
+        {
+            return Err(error(
+                &self.root,
+                "Saved hybrid source segment list changed.",
+            ));
         }
         let encode = self.root.join("chunks/encode");
         if !receipts.completed.is_empty() {
@@ -472,6 +536,7 @@ impl Workspace {
             .iter()
             .chain(self.manifest.scenes.iter())
             .chain(self.manifest.script.iter())
+            .chain(self.manifest.segments.iter())
             .chain(self.manifest.completed.values().map(|c| &c.file))
             .chain(self.manifest.final_video.iter())
         {
@@ -625,12 +690,12 @@ impl Recovery {
                 fs::create_dir(&root).map_err(|e|error(&root,e.to_string()))?;
                 let intermediate=Temporary::durable(&root.join("video.ivf"),false)?;
                 let manifest=Manifest { version:1,id, directory:identity(&root)?, request,settings, source:source_stamp, tools:tool_stamps,params,fps_num,fps_den,total_frames:frame_count as u64,
-                    phase:RecoveryPhase::Encoding,av1an_version:None,queue:None,scenes:None,script:None,completed:BTreeMap::new(),intermediate:identity(&intermediate.path)?,final_video:None };
+                    phase:RecoveryPhase::Encoding,av1an_version:None,queue:None,scenes:None,script:None,segments:Vec::new(),completed:BTreeMap::new(),intermediate:identity(&intermediate.path)?,final_video:None };
                 (root,manifest,intermediate)
             };
             let (directory_guard,lock)=lock_workspace(&root)?;
-            let chunk_guards=manifest.completed.values().map(|chunk|Source::open(&chunk.file.path)).collect::<Result<Vec<_>,_>>()?;
-            let workspace=Workspace{root:root.clone(),manifest,source_rate,_tools:tool_guards,chunks:chunk_guards,directory_guard:Some(directory_guard),lock:Some(lock)};
+            let chunk_guards=manifest.completed.values().map(|chunk| &chunk.file.path).chain(manifest.segments.iter().map(|stamp| &stamp.path)).map(|path|Source::open(path)).collect::<Result<Vec<_>,_>>()?;
+            let workspace=Workspace{root:root.clone(),manifest,source_rate,segments_verified:false,_tools:tool_guards,chunks:chunk_guards,directory_guard:Some(directory_guard),lock:Some(lock)};
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
             let resume_chunks=workspace.manifest.queue.is_some();
@@ -681,6 +746,144 @@ impl Recovery {
         })
         .await
     }
+    /// Hybrid creates copied GOP segments. Fingerprint/lock each file at its
+    /// first checkpoint, and independently compare their complete decoded pixel
+    /// sequence to the source before reuse or publication. No size/count-only
+    /// receipt is accepted as evidence that a segment contains the right frames.
+    pub(in crate::jobs) async fn verify_segments(
+        &self,
+        ffmpeg: &Path,
+        input: &Path,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        let segments = self
+            .with(|w| {
+                for guard in &w.chunks {
+                    guard.verify()?;
+                }
+                Ok(if w.segments_verified {
+                    Vec::new()
+                } else {
+                    w.manifest
+                        .segments
+                        .iter()
+                        .map(|stamp| stamp.path.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await?;
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let list = self.root.join("segments.ffconcat");
+        let text = format!(
+            "ffconcat version 1.0\n{}",
+            segments
+                .iter()
+                .map(|path| format!(
+                    "file chunks/split/{}\n",
+                    path.file_name()
+                        .expect("validated segment name")
+                        .to_string_lossy()
+                ))
+                .collect::<String>()
+        );
+        match OpenOptions::new().write(true).create_new(true).open(&list) {
+            Ok(mut file) => {
+                file.write_all(text.as_bytes())
+                    .map_err(|e| error(&list, e.to_string()))?;
+                file.sync_all().map_err(|e| error(&list, e.to_string()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if bytes(&list)? != text.as_bytes() {
+                    return Err(error(&list, "Hybrid verification list changed."));
+                }
+            }
+            Err(e) => return Err(error(&list, e.to_string())),
+        }
+        let list_guard = Source::open(&list)?;
+        let mut hashes = Vec::new();
+        for concatenated in [false, true] {
+            let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-threads", "2"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            if concatenated {
+                args.extend(["-f".into(), "concat".into(), "-safe".into(), "1".into()]);
+            }
+            args.extend([
+                "-i".into(),
+                if concatenated {
+                    OsString::from("segments.ffconcat")
+                } else {
+                    input.as_os_str().to_owned()
+                },
+            ]);
+            args.extend(
+                [
+                    "-map",
+                    "0:V:0",
+                    "-an",
+                    "-sn",
+                    "-dn",
+                    "-fps_mode",
+                    "passthrough",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-f",
+                    "hash",
+                    "-hash",
+                    "sha256",
+                    "-",
+                ]
+                .into_iter()
+                .map(Into::into),
+            );
+            let result = supervisor::run_capture(
+                &CommandSpec {
+                    executable: ffmpeg.to_owned(),
+                    args,
+                    cwd: Some(self.root.clone()),
+                },
+                cancel.clone(),
+                64 * 1024,
+                Duration::from_secs(24 * 60 * 60),
+            )
+            .await
+            .map_err(|e| process_error(e, input))?;
+            let hash = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+            if !result.status.success()
+                || !hash.strip_prefix("SHA256=").is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
+                })
+            {
+                return Err(error(
+                    input,
+                    format!(
+                        "Hybrid source identity decode failed: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    ),
+                ));
+            }
+            hashes.push(hash);
+        }
+        list_guard.verify()?;
+        if hashes[0] != hashes[1] {
+            return Err(error(
+                input,
+                "Hybrid segments changed, reordered, omitted, or duplicated decoded source frames.",
+            ));
+        }
+        self.with(|w| {
+            for guard in &w.chunks {
+                guard.verify()?;
+            }
+            w.segments_verified = true;
+            Ok(())
+        })
+        .await
+    }
+
     pub(in crate::jobs) async fn version(&self, version: String) -> Result<(), AppError> {
         self.with(move |w| {
             w.transaction(|w| {
@@ -900,6 +1103,7 @@ mod tests {
                 scenes: None,
                 script: None,
                 completed: BTreeMap::new(),
+                segments: Vec::new(),
                 intermediate: identity(&intermediate.path).unwrap(),
                 final_video: None,
             };
@@ -908,6 +1112,7 @@ mod tests {
                 root,
                 manifest,
                 source_rate: (24, 1),
+                segments_verified: false,
                 _tools: vec![],
                 chunks: vec![],
                 directory_guard: Some(directory),

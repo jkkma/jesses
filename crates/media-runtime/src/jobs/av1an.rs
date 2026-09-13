@@ -2,6 +2,9 @@
 use super::{encode::encoder_parameters, encode_plan::Plan, *};
 
 mod launcher;
+mod metrics;
+mod options;
+pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
 pub(super) use recovery::Recovery;
@@ -26,7 +29,7 @@ pub(super) fn validate_input(document: &Document, plan: &Plan) -> Result<(), App
     Ok(())
 }
 
-fn arguments(
+pub(super) fn arguments(
     input: &Path,
     output: &Path,
     work: &Path,
@@ -48,21 +51,11 @@ fn arguments(
         "--passes",
         "1",
         "--no-defaults",
-        "--chunk-method",
-        "lsmash",
         "--concat",
         // av1an's av-ivf concatenator can panic on valid small AV1 packets.
         // FFmpeg copies the IVF chunks; our complete record and decode checks
         // still verify the resulting stream before publication.
         "ffmpeg",
-        "--split-method",
-        "av-scenechange",
-        "--sc-downscale-height",
-        "360",
-        "--extra-split",
-        "240",
-        "--min-scene-len",
-        "24",
         "--pix-format",
         "yuv420p10le",
         "--cache-mode",
@@ -72,14 +65,27 @@ fn arguments(
         "--keep",
         "--verbose",
         "--log-level",
-        "info",
+        if settings
+            .av1an_options
+            .is_some_and(|options| options.target_quality.is_some())
+        {
+            "debug"
+        } else {
+            "info"
+        },
         "-y",
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
+    options::append(&mut args, settings, &params);
     if resume {
         args.push("--resume".into());
+    }
+    if let Some(filter) = plan.framing_filter() {
+        // The generated filter contains only planner-owned labels, integers,
+        // and fixed FFmpeg options. Paths never enter av1an's nested parser.
+        args.extend(["--ffmpeg".into(), format!("-vf {filter}").into()]);
     }
     for (key, value) in [
         ("-i", input.as_os_str().to_owned()),
@@ -105,6 +111,8 @@ impl JobManager {
         input: &Path,
         encoder: &Path,
         executable: &Path,
+        ffmpeg: &Path,
+        ffprobe: &Path,
         recovery: &Recovery,
         ivf: &Temporary,
         plan: &Plan,
@@ -114,6 +122,17 @@ impl JobManager {
         frame_count: usize,
     ) -> Result<(), AppError> {
         validate_encoder_path(encoder)?;
+        if plan.is_hdr10()
+            && settings
+                .av1an_options
+                .is_some_and(|options| options.target_quality.is_some())
+        {
+            return Err(AppError::new(
+                "ENCODE_INPUT_UNSUPPORTED",
+                "Quality targeting currently requires SDR input. These metric pipelines are not qualified for preserved HDR output.",
+                None,
+            ));
+        }
         let work = recovery.root.clone();
         // A crashed staged host remains in its owned attempt directory. Never
         // replace it or let it shadow the encoder selected for this attempt.
@@ -134,13 +153,21 @@ impl JobManager {
         let launch_executable = executable.to_owned();
         let launch_encoder = encoder.to_owned();
         let launch_work = launch_directory.clone();
+        let launch_ffmpeg = ffmpeg.to_owned();
+        let launch_ffprobe = ffprobe.to_owned();
         let mut launch = tokio::task::spawn_blocking(move || {
-            launcher::Launch::prepare(&launch_executable, &launch_encoder, &launch_work)
+            launcher::Launch::prepare(
+                &launch_executable,
+                &launch_encoder,
+                &launch_ffmpeg,
+                &launch_ffprobe,
+                &launch_work,
+            )
         })
         .await
         .map_err(|e| files::error("AV1AN_STAGE_FAILED", e.to_string(), executable))??;
         check_cancel(cancel)?;
-        let version = supervisor::run_capture_with_path(
+        let version = supervisor::run_capture_with_environment(
             &CommandSpec {
                 executable: launch.executable.clone(),
                 args: vec!["--version".into()],
@@ -149,7 +176,7 @@ impl JobManager {
             cancel.clone(),
             128 * 1024,
             Duration::from_secs(15),
-            Some(&launch.path),
+            Some(&launch.environment),
         )
         .await
         .map_err(|e| process_error(e, executable))?;
@@ -165,28 +192,35 @@ impl JobManager {
             String::from_utf8_lossy(&version.stdout),
             String::from_utf8_lossy(&version.stderr)
         );
-        if !version_text.lines().any(|line| {
-            line.split_once(':').is_some_and(|(key, value)| {
-                key.trim() == "systems.innocent.lsmas" && value.trim() == "Found"
-            })
-        }) {
-            return Err(files::error(
-                "AV1AN_DEPENDENCY_MISSING",
-                "av1an requires VapourSynth with the L-SMASH Works source plugin. Its version check did not report that plugin as available.",
-                executable,
-            ));
-        }
+        let configured = settings.av1an_options.unwrap_or_default();
+        options::validate_plugin(&version_text, configured)
+            .map_err(|message| files::error("AV1AN_DEPENDENCY_MISSING", message, executable))?;
+        options::capabilities(
+            &launch.executable,
+            ffmpeg,
+            &launch.environment,
+            &work,
+            settings,
+            cancel,
+        )
+        .await?;
         let version = version_text
             .lines()
             .find(|v| !v.is_empty())
             .unwrap_or("unknown av1an version")
             .to_owned();
         recovery.version(version_text).await?;
+        recovery.verify_segments(ffmpeg, input, cancel).await?;
         let internal_log = log_path.with_extension("av1an.log");
         self.change(id, |snapshot| {
             append_log(snapshot, format!("Tool: {} — {version}", executable.display()));
             append_log(snapshot, format!("av1an selected encoder: {}", encoder.display()));
-            append_log(snapshot, format!("av1an: {} parallel workers; scene detection and at most 240 frames per chunk. Workspace: {}", settings.workers, work.display()));
+            append_log(snapshot, format!("av1an: {} parallel workers; {} source chunks, {:?} splitting, maximum {} frames (0 means unlimited). Workspace: {}", settings.workers, options::chunk_method(configured), configured.split_method, configured.maximum_chunk_frames, work.display()));
+            if let Some(target) = configured.target_quality {
+                append_log(snapshot, format!("{} target {:.1}–{:.1}, mean score at {}×{}, CRF {}–{}, at most {} probes, sampling every {} frame(s). A search may finish outside the requested score range when its bounds/probes are exhausted.", metrics::label(target.metric), f64::from(target.minimum_score_tenths)/10.0, f64::from(target.maximum_score_tenths)/10.0, target.probe_width, target.probe_height, target.minimum_crf, target.maximum_crf, target.probes, target.probing_rate));
+                if plan.framing_filter().is_some() { append_log(snapshot, "Quality target warning: av1an probes encode and score unfiltered source frames. Crop, resize, and borders run in the final chunk pipeline and are not included in this target search; final output quality may differ. Reference-only filters are deliberately not applied to an unfiltered probe.".into()); }
+                if target.probing_rate > 1 { append_log(snapshot, "Quality target warning: sampled-frame scores may differ from scoring every frame; the target is not a full-output quality measurement.".into()); }
+            }
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
         }).await;
@@ -221,7 +255,17 @@ impl JobManager {
                 }
             }
         });
-        let result = supervisor::run_with_path(
+        let pause = self
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .expect("registered av1an job")
+            .pause
+            .clone();
+        let result = supervisor::run_with_environment(
             &CommandSpec {
                 executable: launch.executable.clone(),
                 args: arguments(
@@ -239,7 +283,8 @@ impl JobManager {
             sender,
             log_path,
             Duration::from_secs(24 * 60 * 60),
-            Some(&launch.path),
+            Some(&launch.environment),
+            Some(&pause),
         )
         .await;
         let _ = event_task.await;
@@ -269,6 +314,10 @@ impl JobManager {
                 input,
             ));
         }
+        if configured.chunk_method == media_core::Av1anChunkMethod::Hybrid {
+            self.change(id, |snapshot| append_log(snapshot, "Verifying the complete decoded hybrid segment sequence against the original source.".into())).await;
+        }
+        recovery.verify_segments(ffmpeg, input, cancel).await?;
         ivf.flush_nonempty_async().await?;
         let mut file = ivf.clone_file()?;
         let geometry = (plan.width, plan.height);

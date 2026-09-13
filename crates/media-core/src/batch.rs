@@ -21,6 +21,17 @@ pub struct FolderScanResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEncodeInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub temporal: Option<crate::TemporalSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tone_map: Option<crate::ToneMapSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub trim: Option<crate::VideoTrim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<crate::SubtitleTrackSettings>,
     #[serde(default)]
     pub framing: crate::VideoFraming,
     #[serde(default)]
@@ -33,6 +44,17 @@ pub struct BatchEncodeInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEncodeRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<crate::EncoderParameter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub av1an_options: Option<crate::Av1anOptions>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub output_container: Option<crate::ContainerFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rate_control: Option<crate::VideoRateControl>,
     #[serde(default)]
     pub backend: crate::EncodeBackend,
     #[serde(default)]

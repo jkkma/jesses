@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     io,
     process::{ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -12,18 +13,113 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 mod macos;
 
 pub(super) struct OwnedChild {
+    pause: Arc<Mutex<Option<i32>>>,
     child: Child,
     pgid: i32,
     terminated: bool,
 }
 
+pub(super) struct PauseTarget {
+    group: Arc<Mutex<Option<i32>>>,
+}
+#[cfg(target_os = "linux")]
+fn confirm_stopped(pgid: i32) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut previous = Vec::new();
+    loop {
+        let mut members = Vec::new();
+        let mut stopped = true;
+        for (index, entry) in std::fs::read_dir("/proc")?.enumerate() {
+            if index > 100_000 {
+                return Err(io::Error::other("Process inventory exceeded its bound."));
+            }
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, tail)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let fields: Vec<_> = tail.split_whitespace().collect();
+            if fields.get(2).and_then(|v| v.parse::<i32>().ok()) != Some(pgid) {
+                continue;
+            }
+            if matches!(fields.first(), Some(&"Z" | &"X")) {
+                continue;
+            }
+            members.push(pid);
+            stopped &= matches!(fields.first(), Some(&"T" | &"t"));
+        }
+        members.sort_unstable();
+        if stopped && !members.is_empty() && members == previous {
+            return Ok(());
+        }
+        previous = members;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Could not confirm every worker was stopped.",
+            ));
+        }
+        // Catch a descendant forked just before its parent received SIGSTOP.
+        if unsafe { libc::kill(-pgid, libc::SIGSTOP) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+impl PauseTarget {
+    pub(super) fn set_paused(&self, paused: bool) -> io::Result<()> {
+        // The leader is unreaped while this attachment exists, pinning the PGID.
+        let group = self
+            .group
+            .lock()
+            .map_err(|_| io::Error::other("Pause state unavailable."))?;
+        let pgid = group.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "The process tree has ended.")
+        })?;
+        let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+        if unsafe { libc::kill(-pgid, signal) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(target_os = "linux")]
+        if paused && let Err(error) = confirm_stopped(pgid) {
+            let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 impl OwnedChild {
+    pub(super) fn pause_target(&self) -> io::Result<PauseTarget> {
+        Ok(PauseTarget {
+            group: self.pause.clone(),
+        })
+    }
+    fn close_pause(&self) {
+        *self.pause.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     pub(super) fn spawn(spec: &CommandSpec) -> io::Result<Self> {
         Self::spawn_with_path(spec, None)
     }
 
     pub(super) fn spawn_with_path(spec: &CommandSpec, path: Option<&OsStr>) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false, None, path)
+        Self::spawn_with_environment(spec, path.map(super::ChildEnvironment::with_path).as_ref())
+    }
+
+    pub(super) fn spawn_with_environment(
+        spec: &CommandSpec,
+        environment: Option<&super::ChildEnvironment>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_input(spec, false, None, environment)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
@@ -41,7 +137,7 @@ impl OwnedChild {
         spec: &CommandSpec,
         pipe_stdin: bool,
         output: Option<std::fs::File>,
-        path: Option<&OsStr>,
+        environment: Option<&super::ChildEnvironment>,
     ) -> io::Result<Self> {
         let mut command = Command::new(&spec.executable);
         command
@@ -57,14 +153,24 @@ impl OwnedChild {
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
-        if let Some(path) = path {
-            command.env("PATH", path);
+        if let Some(environment) = environment {
+            if let Some(path) = &environment.path {
+                command.env("PATH", path);
+            }
+            for (name, value) in &environment.variables {
+                if let Some(value) = value {
+                    command.env(name, value);
+                } else {
+                    command.env_remove(name);
+                }
+            }
         }
         // setpgid happens in the child before exec, closing the spawn/assign race.
         command.process_group(0);
         let child = command.spawn()?;
         let pgid = child.id().expect("new child has a pid") as i32;
         Ok(Self {
+            pause: Arc::new(Mutex::new(Some(pgid))),
             child,
             pgid,
             terminated: false,
@@ -142,6 +248,7 @@ impl OwnedChild {
         loop {
             if self.has_exited()? {
                 self.terminate_tree()?;
+                self.close_pause();
                 return self.child.wait().await;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -150,6 +257,7 @@ impl OwnedChild {
 
     pub(super) async fn terminate_and_wait(&mut self) -> io::Result<()> {
         self.terminate_tree()?;
+        self.close_pause();
         self.child.wait().await?;
         Ok(())
     }
@@ -158,5 +266,6 @@ impl OwnedChild {
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.terminate_tree();
+        self.close_pause();
     }
 }

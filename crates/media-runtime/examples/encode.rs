@@ -9,14 +9,20 @@ use std::{path::PathBuf, time::Duration};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(2..=12).contains(&args.len()) {
-        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [standalone|av1an] [WORKERS_1_32] [svtAv1|svtAv1FiveFish|svtAv1Hdr|x264] [LINEART_0_7] [TEXTURE_0_7] [visualQuality|filmGrain]".into());
+        return Err("Usage: encode INPUT_ABSOLUTE OUTPUT_ABSOLUTE.mkv [CRF] [PRESET] [GRAIN_0_50] [HDR10_FALLBACK_true_false] [standalone|av1an] [WORKERS_1_32] [svtAv1|svtAv1FiveFish|svtAv1Hdr|x264|x265|vp9] [LINEART_0_7] [TEXTURE_0_7] [visualQuality|filmGrain]".into());
     }
     let encoder = match args.get(8).map(String::as_str) {
         None | Some("svtAv1") => VideoEncoder::SvtAv1,
         Some("svtAv1FiveFish") => VideoEncoder::SvtAv1FiveFish,
         Some("svtAv1Hdr") => VideoEncoder::SvtAv1Hdr,
         Some("x264") => VideoEncoder::X264,
-        _ => return Err("Encoder must be svtAv1, svtAv1FiveFish, svtAv1Hdr, or x264".into()),
+        Some("x265") => VideoEncoder::X265,
+        Some("vp9") => VideoEncoder::Vp9,
+        _ => {
+            return Err(
+                "Encoder must be svtAv1, svtAv1FiveFish, svtAv1Hdr, x264, x265, or vp9".into(),
+            );
+        }
     };
     let media = probe_media(args[0].clone()).await?;
     let video = media
@@ -25,6 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|s| s.kind == "video")
         .ok_or("No video stream")?;
     let settings = EncodeSettings {
+        temporal: None,
+        parameters: Vec::new(),
+        av1an_options: None,
+        rate_control: None,
+        tone_map: None,
+        trim: None,
+        subtitles: Vec::new(),
         framing: Default::default(),
         audio: Vec::new(),
         video_stream_index: video.index,
@@ -32,6 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(
             if encoder == VideoEncoder::X264 {
                 23
+            } else if encoder == VideoEncoder::X265 {
+                28
+            } else if encoder == VideoEncoder::Vp9 {
+                32
             } else if encoder == VideoEncoder::SvtAv1FiveFish {
                 18
             } else {
@@ -43,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|v| v.parse())
             .transpose()?
             .unwrap_or(match encoder {
-                VideoEncoder::X264 => 5,
+                VideoEncoder::X264 | VideoEncoder::X265 => 5,
                 VideoEncoder::SvtAv1 => 4,
                 _ => 2,
             }),

@@ -22,7 +22,7 @@ pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
 
 pub(super) struct Launch {
     pub(super) executable: PathBuf,
-    pub(super) path: OsString,
+    pub(super) environment: supervisor::ChildEnvironment,
     #[cfg(windows)]
     image: Option<std::fs::File>,
     #[cfg(windows)]
@@ -32,15 +32,51 @@ pub(super) struct Launch {
 }
 
 impl Launch {
-    pub(super) fn prepare(av1an: &Path, encoder: &Path, work: &Path) -> Result<Self, AppError> {
+    pub(super) fn prepare(
+        av1an: &Path,
+        encoder: &Path,
+        ffmpeg: &Path,
+        ffprobe: &Path,
+        work: &Path,
+    ) -> Result<Self, AppError> {
         validate_encoder_path(encoder)?;
         let selected = encoder.parent().expect("absolute encoder parent");
         let original = av1an.parent().expect("absolute av1an parent");
-        let mut path = std::env::join_paths([selected, original])
+        let ffmpeg_parent = ffmpeg
+            .parent()
+            .filter(|_| ffmpeg.is_absolute())
+            .ok_or_else(|| {
+                files::error(
+                    "AV1AN_ENCODER_PATH_UNSUPPORTED",
+                    "The selected FFmpeg path must be absolute.",
+                    ffmpeg,
+                )
+            })?;
+        let ffprobe_parent = ffprobe
+            .parent()
+            .filter(|_| ffprobe.is_absolute())
+            .ok_or_else(|| {
+                files::error(
+                    "AV1AN_ENCODER_PATH_UNSUPPORTED",
+                    "The selected FFprobe path must be absolute.",
+                    ffprobe,
+                )
+            })?;
+        let runtime = crate::bundled_tools::av1an_runtime(av1an)
+            .map_err(|error| files::error("BUNDLED_TOOL_INVALID", error, av1an))?;
+        let mut directories = vec![selected, ffmpeg_parent, ffprobe_parent, original];
+        if let Some(directory) = &runtime {
+            directories.push(directory);
+        }
+        let mut path = std::env::join_paths(directories)
             .map_err(|e| files::error("AV1AN_ENCODER_PATH_UNSUPPORTED", e.to_string(), encoder))?;
         if let Some(inherited) = std::env::var_os("PATH") {
             path.push(if cfg!(windows) { ";" } else { ":" });
             path.push(inherited);
+        }
+        let mut environment = supervisor::ChildEnvironment::with_path(&path);
+        if let Some(directory) = &runtime {
+            environment = crate::bundled_tools::frameserver_environment(directory, &path);
         }
         #[cfg(windows)]
         {
@@ -73,7 +109,7 @@ impl Launch {
             // this file identity, including a partially copied host image.
             let mut launch = Self {
                 executable,
-                path,
+                environment,
                 image: Some(output),
                 identity,
                 staged: true,
@@ -122,7 +158,7 @@ impl Launch {
             let _ = work;
             Ok(Self {
                 executable: av1an.to_owned(),
-                path,
+                environment,
             })
         }
     }
@@ -248,6 +284,14 @@ mod tests {
             "SELECTED_ENCODER={}",
             std::fs::read_to_string(executable.parent().unwrap().join("identity")).unwrap()
         );
+        println!(
+            "CHILD_SCOPE={}",
+            std::env::var("JESSES_CHILD_SCOPE").unwrap_or_default()
+        );
+        println!(
+            "PROFILE_PRESENT={}",
+            std::env::var_os("USERPROFILE").is_some()
+        );
     }
 
     #[cfg(windows)]
@@ -271,6 +315,15 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         print!("{}", String::from_utf8_lossy(&output.stdout));
+        for name in ["ffmpeg", "ffprobe"] {
+            let output = std::process::Command::new(name)
+                .args(helper_args("lookup_encoder"))
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
     }
 
     #[cfg(windows)]
@@ -290,7 +343,8 @@ mod tests {
         let original = root.0.join("original host");
         let selected = root.0.join("selected 日本語's fork");
         let work = root.0.join("owned work");
-        for directory in [&original, &selected, &work] {
+        let media_tools = root.0.join("selected media tools");
+        for directory in [&original, &selected, &work, &media_tools] {
             std::fs::create_dir_all(directory).unwrap();
         }
         let current = std::env::current_exe().unwrap();
@@ -301,9 +355,21 @@ mod tests {
             // different volumes. Each helper owns a copy of the test image.
             std::fs::copy(&current, path).unwrap();
         }
+        for name in ["ffmpeg.exe", "ffprobe.exe"] {
+            std::fs::copy(&current, media_tools.join(name)).unwrap();
+            std::fs::copy(&current, original.join(name)).unwrap();
+        }
+        std::fs::write(media_tools.join("identity"), "selected-media-tools").unwrap();
         std::fs::write(original.join("identity"), "wrong-mainline").unwrap();
         std::fs::write(selected.join("identity"), "selected-fork").unwrap();
-        let mut launch = Launch::prepare(&av1an, &encoder, &work).unwrap();
+        let mut launch = Launch::prepare(
+            &av1an,
+            &encoder,
+            &media_tools.join("ffmpeg.exe"),
+            &media_tools.join("ffprobe.exe"),
+            &work,
+        )
+        .unwrap();
         let (_owner, cancel) = watch::channel(false);
         let capture = |executable: PathBuf| CommandSpec {
             executable,
@@ -315,7 +381,7 @@ mod tests {
             cancel.clone(),
             65536,
             Duration::from_secs(10),
-            Some(&launch.path),
+            launch.environment.path.as_deref(),
         )
         .await
         .unwrap();
@@ -331,17 +397,33 @@ mod tests {
                 .is_err()
         );
         assert!(std::fs::remove_file(&launch.executable).is_err());
-        let routed = supervisor::run_capture_with_path(
+        launch.environment.variables = vec![
+            ("JESSES_CHILD_SCOPE", Some("portable 日本語".into())),
+            ("USERPROFILE", None),
+        ];
+        let parent_profile = std::env::var_os("USERPROFILE");
+        let routed = supervisor::run_capture_with_environment(
             &capture(launch.executable.clone()),
             cancel,
             65536,
             Duration::from_secs(10),
-            Some(&launch.path),
+            Some(&launch.environment),
         )
         .await
         .unwrap();
         assert!(routed.status.success());
         let output = String::from_utf8_lossy(&routed.stdout);
+        assert_eq!(
+            output.matches("CHILD_SCOPE=portable 日本語").count(),
+            3,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("PROFILE_PRESENT=false").count(),
+            3,
+            "{output}"
+        );
+        assert_eq!(std::env::var_os("USERPROFILE"), parent_profile);
         assert!(
             output.contains("SELECTED_ENCODER=selected-fork"),
             "{output}"
@@ -350,13 +432,29 @@ mod tests {
             !output.contains("SELECTED_ENCODER=wrong-mainline"),
             "{output}"
         );
+        assert_eq!(
+            output
+                .matches("SELECTED_ENCODER=selected-media-tools")
+                .count(),
+            2,
+            "{output}"
+        );
         let staged = launch.executable.clone();
         launch.cleanup().unwrap();
         assert!(!staged.exists());
         assert!(av1an.exists());
         // A preexisting destination is never replaced or deleted on failure.
         std::fs::write(&staged, b"preserve me").unwrap();
-        assert!(Launch::prepare(&av1an, &encoder, &work).is_err());
+        assert!(
+            Launch::prepare(
+                &av1an,
+                &encoder,
+                &media_tools.join("ffmpeg.exe"),
+                &media_tools.join("ffprobe.exe"),
+                &work
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&staged).unwrap(), b"preserve me");
     }
 }

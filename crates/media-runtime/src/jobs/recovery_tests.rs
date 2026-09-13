@@ -122,10 +122,12 @@ async fn history_capacity_never_prunes_recoverable_work() {
         for index in 0..MAX_HISTORY {
             let (cancel, _) = watch::channel(true);
             state.entries.push(Entry {
+                pause: Default::default(),
                 snapshot: JobSnapshot {
                     id: format!("saved-{index}"),
                     state: JobState::Stopped,
                     request: request.source.clone(),
+                    mux_request: None,
                     encode_settings: Some(request.settings.clone()),
                     recovery: Some(fixture.recovery()),
                     progress_seconds: None,

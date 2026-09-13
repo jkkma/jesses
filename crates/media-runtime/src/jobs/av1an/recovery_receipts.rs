@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use media_core::{Av1anChunkMethod, Av1anOptions};
+
 use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor},
@@ -33,6 +35,7 @@ pub(super) struct Expected<'a> {
     pub source_fps_num: u32,
     pub source_fps_den: u32,
     /// Bytes from the separately fingerprinted, tool-created loadscript.vpy.
+    pub options: Av1anOptions,
     pub script_text: &'a str,
 }
 
@@ -50,7 +53,8 @@ pub(super) struct Receipts {
     pub completed_frames: u64,
     pub total_frames: u64,
     pub queued_chunks: usize,
-    pub script_path: PathBuf,
+    pub script_path: Option<PathBuf>,
+    pub segments: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -81,14 +85,14 @@ struct Chunk {
 #[serde(deny_unknown_fields)]
 struct TargetQuality {
     vmaf_res: String,
-    probe_res: Option<String>,
+    probe_res: Option<(u32, u32)>,
     vmaf_scaler: String,
     vmaf_filter: Option<String>,
     vmaf_threads: usize,
     model: Option<String>,
     probing_rate: u64,
     probes: u64,
-    target: Option<f64>,
+    target: Option<(f64, f64)>,
     metric: String,
     min_q: u64,
     max_q: u64,
@@ -112,6 +116,42 @@ struct ProbingStatistic {
 }
 
 impl TargetQuality {
+    fn matches_plan(&self, expected: &Expected<'_>) -> bool {
+        let Some(target) = expected.options.target_quality else {
+            return self.matches_disabled_plan(expected.chunks_directory);
+        };
+        self.vmaf_res == format!("{}x{}", target.probe_width, target.probe_height)
+            && self.probe_res
+                == Some((
+                    u32::from(target.probe_width),
+                    u32::from(target.probe_height),
+                ))
+            && self.vmaf_scaler == "bicubic"
+            && self.vmaf_filter.is_none()
+            && self.vmaf_threads == 2
+            && self.model.is_none()
+            && self.probing_rate == u64::from(target.probing_rate)
+            && self.probes == u64::from(target.probes)
+            && self.target
+                == Some((
+                    f64::from(target.minimum_score_tenths) / 10.0,
+                    f64::from(target.maximum_score_tenths) / 10.0,
+                ))
+            && self.metric == super::metrics::receipt(target.metric)
+            && self.min_q == u64::from(target.minimum_crf)
+            && self.max_q == u64::from(target.maximum_crf)
+            && self.interp_method.is_none()
+            && self.encoder == "svt_av1"
+            && self.pix_format == "YUV420P10LE"
+            && same_path(&self.temp, expected.chunks_directory)
+            && self.workers > 0
+            && self.video_params.as_deref() == Some(expected.video_params)
+            && !self.params_copied
+            && self.vspipe_args.is_empty()
+            && self.probing_vmaf_features == ["Default"]
+            && self.probing_statistic.name == "Mean"
+            && self.probing_statistic.value.is_none()
+    }
     fn matches_disabled_plan(&self, chunks: &Path) -> bool {
         self.vmaf_res == "1920x1080"
             && self.probe_res.is_none()
@@ -142,6 +182,17 @@ impl TargetQuality {
 #[derive(Deserialize)]
 enum Input {
     VapourSynth(Script),
+    Video(Video),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Video {
+    path: PathBuf,
+    temp: PathBuf,
+    chunk_method: String,
+    is_proxy: bool,
+    cache_mode: String,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +299,13 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn validate_script_paths(expected: &Expected<'_>) -> Result<(), String> {
+    if super::options::plugin(expected.options).is_none() {
+        return if expected.script_text.is_empty() {
+            Ok(())
+        } else {
+            Err("An FFmpeg source must not contain an executable source script".into())
+        };
+    }
     if expected.script_text.is_empty() || expected.script_text.len() > MAX_RECEIPT_BYTES {
         return Err("The recovery source script is empty or oversized".into());
     }
@@ -256,7 +314,16 @@ fn validate_script_paths(expected: &Expected<'_>) -> Result<(), String> {
         .source
         .to_str()
         .ok_or("Recovery paths must be valid Unicode")?;
-    let cache = path_text(&expected.chunks_directory.join("split/cache.lwi"))?;
+    let extension = match expected.options.chunk_method {
+        Av1anChunkMethod::Ffms2 => "ffindex",
+        Av1anChunkMethod::Bestsource => "bsindex",
+        _ => "lwi",
+    };
+    let cache = path_text(
+        &expected
+            .chunks_directory
+            .join(format!("split/cache.{extension}")),
+    )?;
     if [source, cache.as_str()]
         .iter()
         .any(|path| path.contains(['"', '\n', '\r']))
@@ -268,7 +335,13 @@ fn validate_script_paths(expected: &Expected<'_>) -> Result<(), String> {
     }
     for (prefix, wanted) in [
         ("source =", format!("source = r\"{source}\"")),
-        ("chunk_method =", "chunk_method = \"lsmash\"".into()),
+        (
+            "chunk_method =",
+            format!(
+                "chunk_method = \"{}\"",
+                super::options::chunk_method(expected.options)
+            ),
+        ),
         ("cache_mode =", "cache_mode = \"temp\"".into()),
         ("cache_file =", format!("cache_file = r\"{cache}\"")),
     ] {
@@ -294,6 +367,8 @@ fn validate_script_template(script: &str) -> Result<(), String> {
         .map(|line| {
             if line.starts_with("source =") {
                 "source = <SOURCE>\n"
+            } else if line.starts_with("chunk_method =") {
+                "chunk_method = \"lsmash\"\n"
             } else if line.starts_with("cache_file =") {
                 "cache_file = <CACHE>\n"
             } else {
@@ -335,7 +410,9 @@ pub(super) fn validate(
     expected: &Expected<'_>,
 ) -> Result<Receipts, String> {
     validate_script_paths(expected)?;
-    validate_script_template(expected.script_text)?;
+    if super::options::plugin(expected.options).is_some() {
+        validate_script_template(expected.script_text)?;
+    }
     validate_receipt_shapes(chunks_bytes, scenes_bytes, done_bytes, expected)
 }
 
@@ -364,7 +441,12 @@ fn validate_receipt_shapes(
         || scenes.frames != expected.total_frames
         || done.frames != expected.total_frames
         || !scene_coverage(&scenes.scenes, expected.total_frames, None)
-        || !scene_coverage(&scenes.split_scenes, expected.total_frames, Some(240))
+        || !scene_coverage(
+            &scenes.split_scenes,
+            expected.total_frames,
+            (expected.options.maximum_chunk_frames > 0)
+                .then_some(u64::from(expected.options.maximum_chunk_frames)),
+        )
         || chunks.len() != scenes.split_scenes.len()
     {
         return Err("Recovery scenes and chunks do not cover the validated source exactly".into());
@@ -372,17 +454,16 @@ fn validate_receipt_shapes(
     let script_path = expected.chunks_directory.join("split/loadscript.vpy");
     let source_fps = f64::from(expected.source_fps_num) / f64::from(expected.source_fps_den);
     chunks.sort_by_key(|chunk| chunk.index);
+    let mut segments = Vec::<PathBuf>::new();
+    let mut segment_offset = 0;
     for (index, (chunk, scene)) in chunks.iter().zip(&scenes.split_scenes).enumerate() {
-        let Input::VapourSynth(input) = &chunk.input;
         let quality = &chunk.target_quality;
         if chunk.index != index
-            || chunk.start_frame != scene.start_frame
-            || chunk.end_frame != scene.end_frame
+            || (expected.options.chunk_method != Av1anChunkMethod::Hybrid
+                && (chunk.start_frame != scene.start_frame || chunk.end_frame != scene.end_frame))
+            || chunk.end_frame.checked_sub(chunk.start_frame)
+                != Some(scene.end_frame - scene.start_frame)
             || !same_path(&chunk.temp, expected.chunks_directory)
-            || !same_path(&input.path, &script_path)
-            || input.script_text != expected.script_text
-            || !input.vspipe_args.is_empty()
-            || input.is_proxy
             || chunk.proxy.is_some()
             || chunk.proxy_cmd.is_some()
             || chunk.output_ext != "ivf"
@@ -391,31 +472,118 @@ fn validate_receipt_shapes(
             || chunk.video_params != expected.video_params
             || chunk.noise_size != (None, None)
             || chunk.ignore_frame_mismatch
-            || chunk.per_shot_target_quality_cq.is_some()
+            || chunk.per_shot_target_quality_cq.is_some_and(|quality| {
+                !matches!(
+                    expected.options.chunk_method,
+                    Av1anChunkMethod::Select | Av1anChunkMethod::Hybrid
+                ) || expected.options.target_quality.is_none_or(|target| {
+                    !quality.is_finite()
+                        || quality < f64::from(target.minimum_crf)
+                        || quality > f64::from(target.maximum_crf)
+                })
+            })
             || !chunk.frame_rate.is_finite()
             || (chunk.frame_rate - source_fps).abs() > source_fps.abs() * f64::EPSILON * 2.0
-            || !quality.matches_disabled_plan(expected.chunks_directory)
+            || !quality.matches_plan(expected)
         {
             return Err(format!(
                 "Recovery chunk {index} does not match the immutable encoding plan"
             ));
         }
         let argv = &chunk.source_cmd;
-        if argv.len() != 9
-            || argv[0] != "vspipe"
-            || !same_path(Path::new(&argv[1]), &script_path)
-            || argv[2] != "-c"
-            || argv[3] != "y4m"
-            || argv[4] != "-"
-            || argv[5] != "-s"
-            || argv[6] != chunk.start_frame.to_string().as_str()
-            || argv[7] != "-e"
-            || argv[8] != (chunk.end_frame - 1).to_string().as_str()
-        {
+        let valid_source = match &chunk.input {
+            Input::VapourSynth(input) => {
+                super::options::plugin(expected.options).is_some()
+                    && same_path(&input.path, &script_path)
+                    && input.script_text == expected.script_text
+                    && input.vspipe_args.is_empty()
+                    && !input.is_proxy
+                    && argv.len() == 9
+                    && argv[0] == "vspipe"
+                    && same_path(Path::new(&argv[1]), &script_path)
+                    && argv[2] == "-c"
+                    && argv[3] == "y4m"
+                    && argv[4] == "-"
+                    && argv[5] == "-s"
+                    && argv[6] == chunk.start_frame.to_string().as_str()
+                    && argv[7] == "-e"
+                    && argv[8] == (chunk.end_frame - 1).to_string().as_str()
+            }
+            Input::Video(input) => {
+                let input_valid = if expected.options.chunk_method == Av1anChunkMethod::Hybrid {
+                    if segments
+                        .last()
+                        .is_none_or(|path| !same_path(path, &input.path))
+                    {
+                        if chunk.start_frame != 0 {
+                            return Err("Hybrid segment does not start at its first frame".into());
+                        }
+                        let name = format!("{:05}.mkv", segments.len());
+                        if !same_path(
+                            &input.path,
+                            &expected.chunks_directory.join("split").join(name),
+                        ) && !(segments.is_empty()
+                            && same_path(
+                                &input.path,
+                                &expected.chunks_directory.join("split/0.mkv"),
+                            ))
+                        {
+                            return Err(
+                                "Hybrid source segment is outside its exact owned path".into()
+                            );
+                        }
+                        segments.push(input.path.clone());
+                        segment_offset = scene.start_frame;
+                    }
+                    chunk.start_frame.checked_add(segment_offset) == Some(scene.start_frame)
+                        && chunk.end_frame.checked_add(segment_offset) == Some(scene.end_frame)
+                } else {
+                    expected.options.chunk_method == Av1anChunkMethod::Select
+                        && same_path(&input.path, expected.source)
+                };
+                let wanted: Vec<OsString> =
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i"]
+                        .into_iter()
+                        .map(OsString::from)
+                        .chain(std::iter::once(input.path.as_os_str().to_owned()))
+                        .chain(
+                            [
+                                "-vf".to_owned(),
+                                format!(
+                                    r"select=between(n\,{}\,{}),setpts=PTS-STARTPTS",
+                                    chunk.start_frame,
+                                    chunk.end_frame - 1
+                                ),
+                                "-pix_fmt".into(),
+                                "yuv420p10le".into(),
+                                "-strict".into(),
+                                "-1".into(),
+                                "-fps_mode".into(),
+                                "passthrough".into(),
+                                "-f".into(),
+                                "yuv4mpegpipe".into(),
+                                "-".into(),
+                            ]
+                            .into_iter()
+                            .map(OsString::from),
+                        )
+                        .collect();
+                input_valid
+                    && same_path(&input.temp, expected.chunks_directory)
+                    && input.chunk_method == "Select"
+                    && input.cache_mode == "TEMP"
+                    && !input.is_proxy
+                    && *argv == wanted
+            }
+        };
+        if !valid_source {
             return Err(format!(
-                "Recovery chunk {index} has an unexpected source command"
+                "Recovery chunk {index} has an unexpected source command or reader"
             ));
         }
+    }
+    if segments.len() > 1 && segments[0].file_name().is_some_and(|name| name == "0.mkv") {
+        return Err("Hybrid segmented paths mix incompatible naming modes".into());
     }
     let mut completed = Vec::new();
     let mut completed_frames = 0u64;
@@ -445,7 +613,10 @@ fn validate_receipt_shapes(
         completed_frames,
         total_frames: expected.total_frames,
         queued_chunks: chunks.len(),
-        script_path,
+        segments,
+        script_path: super::options::plugin(expected.options)
+            .is_some()
+            .then_some(script_path),
     })
 }
 
@@ -508,6 +679,7 @@ video.set_output()
 
     struct Fixture {
         source: PathBuf,
+        options: Av1anOptions,
         directory: PathBuf,
         script: String,
         params: Vec<String>,
@@ -542,6 +714,7 @@ video.set_output()
             let done = json!({"frames":48,"done":{"00000":{"frames":24,"size_bytes":4096}},"audio_done":true});
             Self {
                 source,
+                options: Av1anOptions::default(),
                 directory,
                 script,
                 params,
@@ -561,6 +734,7 @@ video.set_output()
                 source_fps_num: 24,
                 source_fps_den: 1,
                 script_text: &self.script,
+                options: self.options,
             }
         }
         fn validate(&self) -> Result<Receipts, String> {
@@ -574,6 +748,98 @@ video.set_output()
     }
 
     #[test]
+    fn configured_readers_and_quality_receipts_remain_immutable() {
+        use media_core::Av1anTargetQuality;
+        for (method, name, extension) in [
+            (Av1anChunkMethod::Ffms2, "ffms2", "ffindex"),
+            (Av1anChunkMethod::Bestsource, "bestsource", "bsindex"),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.options.chunk_method = method;
+            fixture.script = fixture
+                .script
+                .replace(
+                    "chunk_method = \"lsmash\"",
+                    &format!("chunk_method = \"{name}\""),
+                )
+                .replace("cache.lwi", &format!("cache.{extension}"));
+            for chunk in fixture.queue.as_array_mut().unwrap() {
+                chunk["input"]["VapourSynth"]["script_text"] = json!(fixture.script);
+            }
+            fixture.validate().unwrap();
+            fixture.options.chunk_method = Av1anChunkMethod::Lsmash;
+            assert!(fixture.validate().is_err());
+        }
+        let mut fixture = Fixture::new();
+        fixture.options.maximum_chunk_frames = 24;
+        fixture.options.target_quality = Some(Av1anTargetQuality {
+            metric: Default::default(),
+            minimum_score_tenths: 930,
+            maximum_score_tenths: 960,
+            minimum_crf: 18,
+            maximum_crf: 44,
+            probes: 3,
+            probing_rate: 2,
+            probe_width: 640,
+            probe_height: 360,
+        });
+        for chunk in fixture.queue.as_array_mut().unwrap() {
+            let quality = &mut chunk["target_quality"];
+            for (key, value) in [
+                ("vmaf_res", json!("640x360")),
+                ("probe_res", json!([640, 360])),
+                ("vmaf_threads", json!(2)),
+                ("probing_rate", json!(2)),
+                ("probes", json!(3)),
+                ("target", json!([93.0, 96.0])),
+                ("min_q", json!(18)),
+                ("max_q", json!(44)),
+                ("video_params", json!(fixture.params)),
+                ("probing_statistic", json!({"name":"Mean", "value":null})),
+            ] {
+                quality[key] = value;
+            }
+        }
+        fixture.validate().unwrap();
+        let original = fixture.queue.clone();
+        for (key, value) in [
+            ("probe_res", json!([1280, 720])),
+            ("video_params", json!(["--crf", "5"])),
+            ("target", json!([91.0, 96.0])),
+            ("params_copied", json!(true)),
+            ("vmaf_filter", json!("crop=12:12")),
+            ("vmaf_threads", json!(9)),
+        ] {
+            fixture.queue[0]["target_quality"][key] = value;
+            assert!(fixture.validate().is_err(), "modified {key}");
+            fixture.queue = original.clone();
+        }
+        for metric in [
+            media_core::Av1anTargetMetric::Ssimulacra2,
+            media_core::Av1anTargetMetric::Butteraugli,
+            media_core::Av1anTargetMetric::Xpsnr,
+        ] {
+            fixture.options.target_quality.as_mut().unwrap().metric = metric;
+            assert!(
+                fixture.validate().is_err(),
+                "VMAF receipt cannot satisfy a different metric"
+            );
+            for chunk in fixture.queue.as_array_mut().unwrap() {
+                chunk["target_quality"]["metric"] = json!(super::super::metrics::receipt(metric));
+            }
+            fixture.validate().unwrap();
+            fixture.queue = original.clone();
+        }
+        fixture.options.target_quality.as_mut().unwrap().metric =
+            media_core::Av1anTargetMetric::Vmaf;
+        fixture.options.maximum_chunk_frames = 12;
+        assert!(
+            fixture.validate().is_err(),
+            "configured maximum must constrain receipt coverage"
+        );
+    }
+
+    #[test]
     fn validates_exact_frame_coverage_and_completed_chunk_identity() {
         let fixture = Fixture::new();
         let receipts = fixture.validate().unwrap();
@@ -582,7 +848,7 @@ video.set_output()
         assert_eq!(receipts.queued_chunks, 2);
         assert_eq!(
             receipts.script_path,
-            fixture.directory.join("split/loadscript.vpy")
+            Some(fixture.directory.join("split/loadscript.vpy"))
         );
         assert_eq!(
             receipts.completed,
