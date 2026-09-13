@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-analyze-bitrate"
+description = "Enables the analyze_bitrate command without any pre-configured scope."
+commands.allow = ["analyze_bitrate"]
+
+[[permission]]
+identifier = "deny-analyze-bitrate"
+description = "Denies the analyze_bitrate command without any pre-configured scope."
+commands.deny = ["analyze_bitrate"]

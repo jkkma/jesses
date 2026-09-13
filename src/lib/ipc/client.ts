@@ -2,19 +2,184 @@ import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import type {
+  AnalysisReport,
+  AnalysisExportFormat,
+  AutoCropRequest,
+  AutoCropResult,
+  BitrateRequest,
+  BitrateResult,
+  QualityRequest,
+  QualityResult,
+  LoudnessRequest,
+  LoudnessResult,
   BatchEncodePreview,
   BatchEncodeRequest,
   EncodeRequest,
+  EncodeBackend,
+  VideoEncoder,
+  EncoderParameterCatalog,
+  EncoderParameterPreset,
+  EncoderParameterPresetKey,
+  EncodeCommandPlan,
   FolderScanRequest,
   FolderScanResult,
+  FramePreviewRequest,
+  FramePreviewResult,
   JobSnapshot,
   MediaFile,
+  MuxRequest,
   RemuxRequest,
   ToolInfo,
+  UserPreferences,
+  SavePreferencesRequest,
+  PreferenceImportPreview,
 } from './generated';
+
+export async function exportAnalysis(
+  report: AnalysisReport,
+  format: AnalysisExportFormat,
+): Promise<string | null> {
+  requireDesktop();
+  const outputPath = await save({
+    title: 'Export analysis',
+    defaultPath: `${report.kind}-analysis.${format}`,
+    filters: [{ name: format === 'csv' ? 'CSV data' : 'SVG chart', extensions: [format] }],
+  });
+  if (outputPath === null) return null;
+  return invoke<string>('export_analysis', { request: { outputPath, format, report } });
+}
+
+export async function getParameterPresets(): Promise<EncoderParameterPreset[]> {
+  requireDesktop();
+  return invoke('get_parameter_presets');
+}
+export async function saveParameterPreset(
+  request: EncoderParameterPreset,
+): Promise<EncoderParameterPreset[]> {
+  requireDesktop();
+  return invoke('save_parameter_preset', { request });
+}
+export async function removeParameterPreset(
+  request: EncoderParameterPresetKey,
+): Promise<EncoderParameterPreset[]> {
+  requireDesktop();
+  return invoke('remove_parameter_preset', { request });
+}
+export async function getPreferences(): Promise<UserPreferences> {
+  requireDesktop();
+  return invoke('get_preferences');
+}
+export async function savePreferences(request: SavePreferencesRequest): Promise<UserPreferences> {
+  requireDesktop();
+  return invoke('save_preferences', { request });
+}
+export async function rememberRecentMedia(paths: string[]): Promise<UserPreferences> {
+  requireDesktop();
+  return invoke('remember_recent_media', { paths });
+}
+export async function previewPreferenceImport(path: string): Promise<PreferenceImportPreview> {
+  requireDesktop();
+  return invoke('preview_preference_import', { path });
+}
+export async function recentPathIsFolder(path: string): Promise<boolean> {
+  requireDesktop();
+  return invoke('recent_path_is_folder', { path });
+}
+export async function choosePreferenceImport(): Promise<string | null> {
+  requireDesktop();
+  return open({
+    multiple: false,
+    directory: false,
+    title: 'Review saved general preferences',
+    filters: [{ name: 'JSON preferences', extensions: ['json'] }],
+  });
+}
+
+export async function getStorageLocations(): Promise<[string, string][]> {
+  requireDesktop();
+  return invoke<[string, string][]>('get_storage_locations');
+}
+
+async function analyzeSource<T>(
+  command: string,
+  request: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  requireDesktop();
+  if (signal?.aborted) throw new DOMException('Source inspection was canceled.', 'AbortError');
+  const id = await invoke<string>('begin_media_analysis');
+  const cancel = () => {
+    void invoke('cancel_media_analysis', { id }).catch(() => {});
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
+  try {
+    if (signal?.aborted) throw new DOMException('Source inspection was canceled.', 'AbortError');
+    const result = await invoke<T>(command, { id, request });
+    if (signal?.aborted) throw new DOMException('Source inspection was canceled.', 'AbortError');
+    return result;
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    cancel();
+  }
+}
+
+export function previewFrame(
+  request: FramePreviewRequest,
+  signal?: AbortSignal,
+): Promise<FramePreviewResult> {
+  return analyzeSource('preview_frame', request, signal);
+}
+
+export function detectCrop(
+  request: AutoCropRequest,
+  signal?: AbortSignal,
+): Promise<AutoCropResult> {
+  return analyzeSource('detect_crop', request, signal);
+}
+
+export function getEncoderParameters(
+  encoder: VideoEncoder,
+  backend: EncodeBackend,
+  signal?: AbortSignal,
+): Promise<EncoderParameterCatalog> {
+  return analyzeSource('get_encoder_parameters', { encoder, backend }, signal);
+}
+
+export function previewEncodePlan(
+  request: EncodeRequest,
+  signal?: AbortSignal,
+): Promise<EncodeCommandPlan> {
+  return analyzeSource('preview_encode_plan', request, signal);
+}
 
 export function isDesktop(): boolean {
   return isTauri();
+}
+
+export async function setJobPaused(id: string, paused: boolean): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('set_job_paused', { id, paused });
+}
+
+export function analyzeQuality(
+  request: QualityRequest,
+  signal?: AbortSignal,
+): Promise<QualityResult> {
+  return analyzeSource('analyze_quality', request, signal);
+}
+
+export function analyzeBitrate(
+  request: BitrateRequest,
+  signal?: AbortSignal,
+): Promise<BitrateResult> {
+  return analyzeSource('analyze_bitrate', request, signal);
+}
+
+export function measureLoudness(
+  request: LoudnessRequest,
+  signal?: AbortSignal,
+): Promise<LoudnessResult> {
+  return analyzeSource('measure_loudness', request, signal);
 }
 
 function requireDesktop() {
@@ -107,7 +272,7 @@ export async function chooseRemuxDestination(defaultPath: string): Promise<strin
   return save({
     title: 'Save remuxed media',
     defaultPath,
-    filters: [{ name: 'Matroska', extensions: ['mkv'] }],
+    filters: [{ name: 'Media containers', extensions: ['mkv', 'mp4', 'mov', 'webm'] }],
   });
 }
 
@@ -116,12 +281,17 @@ export async function startRemux(request: RemuxRequest): Promise<JobSnapshot> {
   return invoke<JobSnapshot>('start_remux', { request });
 }
 
+export async function startMux(request: MuxRequest): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('start_mux', { request });
+}
+
 export async function chooseEncodeDestination(defaultPath: string): Promise<string | null> {
   requireDesktop();
   return save({
     title: 'Save encoded video',
     defaultPath,
-    filters: [{ name: 'Matroska', extensions: ['mkv'] }],
+    filters: [{ name: 'Media containers', extensions: ['mkv', 'mp4', 'mov', 'webm'] }],
   });
 }
 

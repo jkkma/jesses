@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
+    preferences,
+    loadPreferences,
+    updatePreferences,
+    rememberMedia,
+  } from '$lib/preferences.svelte';
+  import {
     ArrowRight,
     Check,
     ChevronDown,
@@ -42,6 +48,7 @@
     subscribeDrop,
     subscribeJobs,
     startRemux,
+    startMux,
     startEncode,
     enqueueEncode,
     enqueueEncodeBatch,
@@ -49,11 +56,14 @@
     cancelJob,
     stopJob as stopAndKeepProgress,
     resumeJob,
+    setJobPaused,
+    recentPathIsFolder,
   } from '$lib/ipc/client';
   import type {
     EncodeRequest,
     JobSnapshot,
     RemuxRequest,
+    MuxRequest,
     MediaFile,
     ToolInfo,
   } from '$lib/ipc/generated';
@@ -81,7 +91,11 @@
         return { id: tool, name };
       }),
       { id: 'av1an', name: 'av1an' },
-    ].map((tool) => ({ ...tool, available: false, path: null, version: null, detail: null })),
+    ]
+      .filter(
+        (tool, index, entries) => entries.findIndex((entry) => entry.id === tool.id) === index,
+      )
+      .map((tool) => ({ ...tool, available: false, path: null, version: null, detail: null })),
   );
   let toolsLoading = $state(desktop);
   let toolsChecked = $state(false);
@@ -89,6 +103,26 @@
   let importing = $state(false);
   let importingName = $state('');
   let recursiveImport = $state(false);
+  let recursiveTouched = false;
+  let preferencesInitialized = false;
+  let recentSelection = $state('');
+  $effect(() => {
+    const loaded = preferences.loaded;
+    const recursive = preferences.value.general.recursiveImport;
+    if (loaded) {
+      if (preferencesInitialized || !recursiveTouched) recursiveImport = recursive;
+      preferencesInitialized = true;
+    }
+  });
+  function changeRecursive(event: Event) {
+    recursiveImport = (event.currentTarget as HTMLInputElement).checked;
+    recursiveTouched = true;
+    if (preferences.loaded)
+      void updatePreferences({
+        general: { ...preferences.value.general, recursiveImport },
+        recentPaths: null,
+      }).catch((error) => (preferences.error = errorMessage(error)));
+  }
   let importNotice = $state<string | null>(null);
   let importGeneration = 0;
   let importQueue: string[] = [];
@@ -138,6 +172,13 @@
     addLog('Remux job submitted.');
   }
 
+  async function submitMux(request: MuxRequest) {
+    const job = await startMux(request);
+    // A channel snapshot may arrive before the command reply. Never regress it.
+    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
+    addLog('Multi-source remux job submitted.');
+  }
+
   async function stopJob(id: string) {
     const job = await cancelJob(id);
     jobs = jobs.map((entry) => (entry.id === id && !terminalJob(entry.state) ? job : entry));
@@ -158,6 +199,12 @@
       jobs = [snapshot, ...jobs.filter((entry) => entry.id !== id)];
     }
     addLog('Saved job submitted for resume.');
+  }
+  async function pauseLiveJob(id: string, paused: boolean) {
+    const before = jobs.find((entry) => entry.id === id);
+    const snapshot = await setJobPaused(id, paused);
+    jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
+    addLog(paused ? 'Paused live av1an workers.' : 'Continued live av1an workers.');
   }
   async function submitEncode(request: EncodeRequest) {
     const job = await startEncode(request);
@@ -258,7 +305,8 @@
     addLog('Stopped importing; pending files and late results are discarded.');
   }
 
-  async function drainImport(generation: number) {
+  async function drainImport(generation: number, folder?: string) {
+    const completed: string[] = [];
     try {
       while (generation === importGeneration && importQueue.length) {
         const path = importQueue.shift()!;
@@ -267,11 +315,12 @@
         try {
           const media = await probeMedia(path);
           if (generation !== importGeneration) return;
+          completed.push(media.path);
           if (!files.some((file) => file.id === media.id)) {
             files = [...files, media];
-            selectedId = media.id;
             addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
           }
+          selectedId = media.id;
         } catch (error) {
           if (generation !== importGeneration) return;
           const message = errorMessage(error);
@@ -281,6 +330,8 @@
       }
     } finally {
       finishImport(generation);
+      if (completed.length || folder)
+        await rememberMedia([...(folder ? [folder] : []), ...completed.slice(0, 15)]);
     }
   }
 
@@ -322,21 +373,55 @@
     try {
       const path = await chooseMediaFolder();
       if (generation !== importGeneration || !path) return;
-      importingName = `Scanning ${fileName(path)}`;
-      const scan = await scanMediaFolder({ path, recursive });
-      if (generation !== importGeneration) return;
-      importErrors = scan.errors.map((error) => ({
-        name: error.path ?? 'Folder scan',
-        message: error.message,
-      }));
-      importNotice = `${scan.paths.length} media files found. ${scan.skippedCount} entries skipped.${scan.truncated ? ' Scan truncated: the 500-file or 10,000-entry limit was reached. Add a smaller folder to find the remaining files.' : ''}`;
-      queueImportPaths(scan.paths);
-      await drainImport(generation);
+      await importFolder(path, recursive, generation);
     } catch (error) {
       if (generation !== importGeneration) return;
       const message = errorMessage(error);
       importErrors = [...importErrors, { name: 'Folder import', message }];
       addLog(`Could not import folder: ${message}`, 'error');
+    } finally {
+      finishImport(generation);
+    }
+  }
+
+  async function importFolder(path: string, recursive: boolean, generation: number) {
+    importingName = `Scanning ${fileName(path)}`;
+    const scan = await scanMediaFolder({ path, recursive });
+    if (generation !== importGeneration) return;
+    importErrors = scan.errors.map((error) => ({
+      name: error.path ?? 'Folder scan',
+      message: error.message,
+    }));
+    importNotice = `${scan.paths.length} media files found. ${scan.skippedCount} entries skipped.${scan.truncated ? ' Scan truncated: the 500-file or 10,000-entry limit was reached. Add a smaller folder to find the remaining files.' : ''}`;
+    queueImportPaths(scan.paths);
+    await drainImport(generation, path);
+  }
+
+  async function openRecent() {
+    if (!desktop || importing || !recentSelection) return;
+    const path = recentSelection;
+    const generation = beginImport();
+    importingName = fileName(path);
+    try {
+      const folder = await recentPathIsFolder(path);
+      if (generation !== importGeneration) return;
+      if (folder) await importFolder(path, recursiveImport, generation);
+      else {
+        const existing = files.find((file) => file.path === path);
+        if (existing) {
+          selectedId = existing.id;
+          await rememberMedia([existing.path]);
+          return;
+        }
+        queueImportPaths([path]);
+        await drainImport(generation);
+      }
+    } catch (error) {
+      if (generation === importGeneration) {
+        const message = errorMessage(error);
+        importErrors = [...importErrors, { name: fileName(path), message }];
+        addLog(message, 'error');
+      }
     } finally {
       finishImport(generation);
     }
@@ -434,6 +519,7 @@
     let disposed = false;
     let unlisten: (() => void) | undefined;
     if (desktop) {
+      void loadPreferences();
       void refreshTools();
       void connectJobs();
       void subscribeDrop((paths) => {
@@ -596,7 +682,8 @@
           <label
             ><input
               type="checkbox"
-              bind:checked={recursiveImport}
+              checked={recursiveImport}
+              onchange={changeRecursive}
               disabled={!desktop || importing}
             /> Include subfolders</label
           >
@@ -604,6 +691,19 @@
           {#if importing}<Button variant="outline" onclick={stopImport}>Stop import</Button>{/if}
         </div>
         {#if importNotice}<div class="notice" role="status"><p>{importNotice}</p></div>{/if}
+        {#if preferences.loaded && preferences.value.recentPaths.length}
+          <div class="recent-media">
+            <label for="recent-media-path">Recent media</label>
+            <select id="recent-media-path" bind:value={recentSelection} disabled={importing}>
+              <option value="">Choose a file or folder</option>
+              {#each preferences.value.recentPaths as path}<option value={path}>{path}</option
+                >{/each}
+            </select>
+            <Button variant="outline" onclick={openRecent} disabled={importing || !recentSelection}
+              >Open recent</Button
+            >
+          </div>
+        {/if}
         {#if importErrors.length}
           <div class="notice error-notice import-errors" role="alert">
             <CircleAlert size={17} aria-hidden="true" />
@@ -813,11 +913,13 @@
     <div hidden={view !== 'remux'}>
       <Remux
         file={selectedFile}
+        {files}
         {tools}
         {jobs}
         connected={jobsConnected}
         onfiles={() => (view = 'files')}
         onstart={submitRemux}
+        onmux={submitMux}
       />
     </div>
     <div hidden={!(view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux')}>
@@ -828,6 +930,7 @@
         onstop={stopQueue}
         onkeep={keepJobProgress}
         onresume={resumeSavedJob}
+        onpause={pauseLiveJob}
       />
     </div>
   </main>
@@ -884,6 +987,21 @@
 </div>
 
 <style>
+  .recent-media {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .recent-media select {
+    flex: 1;
+    min-width: 160px;
+    max-width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    background: var(--background);
+  }
   .folder-import-options {
     display: flex;
     align-items: center;

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-export-analysis"
+description = "Enables the export_analysis command without any pre-configured scope."
+commands.allow = ["export_analysis"]
+
+[[permission]]
+identifier = "deny-export-analysis"
+description = "Denies the export_analysis command without any pre-configured scope."
+commands.deny = ["export_analysis"]

@@ -191,6 +191,8 @@ async function desktopMock(
                     settings: {
                       videoStreamIndex: input.videoStreamIndex,
                       crf: request.crf,
+                      ...(request.av1anOptions ? { av1anOptions: request.av1anOptions } : {}),
+                      ...(request.rateControl ? { rateControl: request.rateControl } : {}),
                       preset: request.preset,
                       backend: request.backend,
                       encoder: request.encoder,
@@ -202,6 +204,8 @@ async function desktopMock(
                       hdrTune: request.hdrTune,
                       framing: input.framing,
                       audio: input.audio,
+                      ...(input.trim ? { trim: input.trim } : {}),
+                      ...(input.toneMap ? { toneMap: input.toneMap } : {}),
                     },
                   },
                   error: null,
@@ -442,7 +446,7 @@ test('crop resize and borders batch rejects invalid per-file values before reque
   expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
 });
 
-test('crop resize and border batch drafts restore per encoder and standalone workflow with av1an defaults', async ({
+test('crop resize and border batch drafts restore per encoder and workflow with independent av1an framing', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -462,8 +466,8 @@ test('crop resize and border batch drafts restore per encoder and standalone wor
   await first.getByLabel('Add black borders', { exact: true }).check();
   await first.getByLabel('Border left (pixels)', { exact: true }).fill('40');
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveCount(0);
-  await expect(first.getByLabel('Add black borders', { exact: true })).toHaveCount(0);
+  await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(first.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   const chunked = (await calls(page, 'preview_encode_batch'))[0].payload
     .request as BatchEncodeRequest;
@@ -701,6 +705,7 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
     hdrTune: 'visualQuality',
   };
   expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toEqual({
+    outputContainer: 'matroska',
     outputDirectory: 'C:\\exports',
     ...settings,
     inputs: [
@@ -809,6 +814,14 @@ test('x264 batch encoder switches restore source choices and common settings whi
   await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
   await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).toBeChecked();
   await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
+  // Restoring a previously deselected source keeps its controls lazy; open it
+  // before inspecting the saved per-workflow stream choices.
+  await workspace
+    .locator('article.episode')
+    .filter({ hasText: 'Episode 1.mkv' })
+    .locator('summary')
+    .first()
+    .click();
   await expect(
     workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
   ).not.toBeChecked();
@@ -855,7 +868,7 @@ test('x264 batch keeps HDR failures visible while queueing only reviewed SDR req
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(
     workspace.getByText(
-      'HDR is not supported by x264. Deselect this source or choose SVT-AV1-HDR.',
+      "x264 needs SDR video. Open this episode's settings and enable explicit HDR-to-SDR tone mapping, or choose an SVT build for compatible HDR10 output.",
       {
         exact: true,
       },
@@ -1012,6 +1025,7 @@ test('batch defaults preserve original per-file stream indices and keep attachme
   );
   expect((await calls(page, 'preview_encode_batch'))[0].payload).toEqual({
     request: {
+      outputContainer: 'matroska',
       outputDirectory: 'C:\\exports',
       crf: 27,
       preset: 2,
@@ -1182,9 +1196,31 @@ test('a batch selects at most 100 imported episodes and the minimum-width layout
   await page.goto('/');
   await page.getByRole('button', { name: 'Add folder', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Episode 101.mkv', exact: true })).toBeVisible();
+  // Hidden Batch does not mount hundreds of closed episode control trees.
+  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(0);
   await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: /^Select /, checked: true })).toHaveCount(100);
   await expect(page.getByLabel('Select Episode 101.mkv', { exact: true })).toBeDisabled();
+  const first = page.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+  const toggle = first.locator('summary').first();
+  await toggle.click();
+  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(1);
+  await first.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
+  await toggle.click();
+  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const request = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(request.inputs).toHaveLength(100);
+  expect(request.inputs[0].framing.crop.left).toBe(20);
+  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
+  await toggle.click();
+  await expect(first.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('20');
+  // Expanding display-only controls does not invalidate the reviewed request.
+  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
+  await toggle.click();
+
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: test.info().outputPath('minimum-width.png'), fullPage: true });
 });
@@ -1409,7 +1445,7 @@ for (const edit of ['codec', 'bitrate', 'channels', 'selection'] as const) {
   });
 }
 
-test('batch audio drafts are isolated by encoder and workflow, with av1an using copy', async ({
+test('batch audio drafts are isolated by encoder and workflow, with av1an conversion', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -1426,11 +1462,12 @@ test('batch audio drafts are isolated by encoder and workflow, with av1an using 
   await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
   await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(workspace.getByLabel('Audio codec', { exact: true })).toHaveCount(0);
+  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   const preview = (await calls(page, 'preview_encode_batch'))[0].payload
     .request as BatchEncodeRequest;
-  expect(preview.inputs.every((input) => input.audio.length === 0)).toBe(true);
+  expect(preview.inputs.map((input) => input.audio[0].codec)).toEqual(['aac', 'copy']);
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
   await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
   await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
@@ -1458,4 +1495,217 @@ test('batch invalid audio blocks preview only for selected source tracks', async
     .request as BatchEncodeRequest;
   expect(request.inputs[0].audio).toEqual([]);
   expect(request.inputs[0].streamIndices).toEqual([2, 8, 11]);
+});
+
+test('batch queues reviewed FLAC and MP3 settings independently per file', async ({ page }) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
+  const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
+  await first.locator('summary').click();
+  await second.locator('summary').click();
+  await first.getByLabel('Audio codec', { exact: true }).selectOption('flac');
+  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveCount(0);
+  await second.getByLabel('Audio codec', { exact: true }).selectOption('mp3');
+  await second.getByLabel('Audio bitrate', { exact: true }).selectOption('192');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(preview.inputs.map((input) => input.audio[0].codec)).toEqual(['flac', 'mp3']);
+  expect(preview.inputs.map((input) => input.audio[0].bitrateKbps)).toEqual([128, 192]);
+  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued.map((request) => request.settings.audio)).toEqual(
+    preview.inputs.map((input) => input.audio),
+  );
+});
+
+for (const encoder of ['x265', 'vp9'] as const) {
+  test(`${encoder} batch uses encoder quality limits and snapshots reviewed codec requests`, async ({
+    page,
+  }) => {
+    await desktopMock(page);
+    await openBatch(page);
+    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
+    const quality = workspace.getByLabel('CRF', { exact: true });
+    await expect(quality).toHaveValue(encoder === 'x265' ? '28' : '32');
+    await expect(workspace.getByLabel('Preset', { exact: true }).locator('option')).toHaveCount(
+      encoder === 'x265' ? 10 : 6,
+    );
+    await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
+    const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+    await quality.fill(encoder === 'x265' ? '52' : '64');
+    await expect(preview).toBeDisabled();
+    await quality.fill('30');
+    await preview.click();
+    const reviewed = page.getByRole('region', { name: 'Batch output preview' });
+    await expect(reviewed).toContainText(`Episode 1_${encoder}.mkv`);
+    await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+    const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload as {
+      requests: EncodeRequest[];
+    };
+    expect(queued.requests).toHaveLength(2);
+    for (const request of queued.requests)
+      expect(request.settings).toMatchObject({
+        encoder,
+        crf: 30,
+        backend: 'standalone',
+        filmGrain: 0,
+        hdr10Fallback: false,
+      });
+  });
+}
+
+test('frame trim batch keeps per-source intervals and invalidates reviewed output after edits', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace
+    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
+    .first()
+    .click();
+  await workspace.getByLabel('Trim video interval', { exact: true }).first().check();
+  await workspace.getByLabel('Start frame', { exact: true }).fill('12');
+  await workspace.getByLabel('End frame (excluded)', { exact: true }).fill('36');
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  await expect(preview).toBeDisabled();
+  await workspace.getByLabel('Audio codec', { exact: true }).first().selectOption('flac');
+  await preview.click();
+  const request = (await calls(page, 'preview_encode_batch'))[0].payload as {
+    request: BatchEncodeRequest;
+  };
+  expect(request.request.inputs[0].trim).toEqual({ startFrame: 12, endFrameExclusive: 36 });
+  expect(request.request.inputs[1].trim).toBeUndefined();
+  const reviewed = page.getByRole('region', { name: 'Batch output preview' });
+  await expect(reviewed).toContainText('2 ready / 2 reviewed');
+  await workspace.getByLabel('End frame (excluded)', { exact: true }).fill('48');
+  await expect(
+    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeDisabled();
+  await preview.click();
+  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload as {
+    requests: EncodeRequest[];
+  };
+  expect(queued.requests[0].settings.trim).toEqual({ startFrame: 12, endFrameExclusive: 48 });
+  expect(queued.requests[1].settings.trim).toBeUndefined();
+});
+
+test('rate control batch propagates file-size targets and invalidates the reviewed request', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
+  await workspace.getByLabel('Target file size (MiB)', { exact: true }).fill('700');
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  await preview.click();
+  const submitted = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(submitted.rateControl).toEqual({ mode: 'targetSize', targetSizeMib: 700 });
+  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
+  await expect(reviewed).toContainText('Target 700 MiB');
+  await workspace.getByLabel('Target file size (MiB)', { exact: true }).fill('800');
+  await expect(
+    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeDisabled();
+  await preview.click();
+  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued).toHaveLength(2);
+  expect(queued.map((request) => request.settings.rateControl)).toEqual(
+    Array(2).fill({ mode: 'targetSize', targetSizeMib: 800 }),
+  );
+});
+
+test('tone mapping batch keeps per-file HDR choices and invalidates its reviewed request', async ({
+  page,
+}) => {
+  const files = [
+    {
+      ...episodes[0],
+      streams: episodes[0].streams.map((stream) =>
+        stream.kind === 'video'
+          ? {
+              ...stream,
+              pixelFormat: 'yuv420p10le',
+              bitDepth: 10,
+              colorPrimaries: 'bt2020',
+              colorTransfer: 'arib-std-b67',
+              colorSpace: 'bt2020nc',
+              colorRange: 'tv',
+              hdrFormat: 'HLG',
+            }
+          : stream,
+      ),
+    },
+    episodes[1],
+  ];
+  await desktopMock(page, { files });
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace
+    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
+    .first()
+    .click();
+  await workspace.getByLabel('HDR / HLG to SDR', { exact: true }).first().check();
+  await workspace.getByLabel('Signal peak (nits)', { exact: true }).fill('1200');
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  await preview.click();
+  const submitted = (
+    (await calls(page, 'preview_encode_batch'))[0].payload as { request: BatchEncodeRequest }
+  ).request;
+  expect(submitted.inputs[0].toneMap).toEqual({ sourcePeakNits: 1200, hdr10BaseLayer: false });
+  expect(submitted.inputs[1].toneMap).toBeUndefined();
+  const reviewed = page.getByRole('region', { name: 'Batch output preview' });
+  await expect(reviewed).toContainText('Hable 1200 → 100 nits');
+  await workspace.getByLabel('Signal peak (nits)', { exact: true }).fill('1000');
+  await expect(
+    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeDisabled();
+  await preview.click();
+  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued[0].settings.toneMap).toEqual({ sourcePeakNits: 1000, hdr10BaseLayer: false });
+  expect(queued[1].settings.toneMap).toBeUndefined();
+});
+
+test('av1an scene batch settings invalidate review and preserve queued target parameters', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  await preview.click();
+  const first = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(first.av1anOptions).toMatchObject({
+    chunkMethod: 'bestsource',
+    targetQuality: { minimumScoreTenths: 940 },
+  });
+  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
+  await workspace.getByLabel('Chunk order', { exact: true }).selectOption('sequential');
+  await expect(
+    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
+  ).toBeDisabled();
+  await preview.click();
+  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
+  const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
+    .requests as EncodeRequest[];
+  expect(requests).toHaveLength(2);
+  for (const request of requests)
+    expect(request.settings.av1anOptions).toMatchObject({
+      chunkMethod: 'bestsource',
+      chunkOrder: 'sequential',
+      targetQuality: { minimumScoreTenths: 940 },
+    });
 });

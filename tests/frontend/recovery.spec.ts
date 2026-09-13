@@ -176,6 +176,15 @@ async function desktopMock(
             publish(jobs.map((entry) => (entry.id === job.id ? canceled : entry)));
             return canceled;
           }
+          if (command === 'set_job_paused') {
+            const job = jobs.find((entry) => entry.id === payload.id)!;
+            const next = {
+              ...job,
+              state: payload.paused ? ('paused' as const) : ('running' as const),
+            };
+            publish(jobs.map((entry) => (entry.id === job.id ? next : entry)));
+            return next;
+          }
           if (command === 'cancel_all_jobs') {
             const next = jobs.map((job) => ({
               ...job,
@@ -197,6 +206,29 @@ async function openJobs(page: Page) {
   await page.goto('/');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
 }
+
+test('live pause keeps cancellation and saved-progress stop available and continues in place', async ({
+  page,
+}) => {
+  await desktopMock(page, { jobs: [savedJob('running')] });
+  await openJobs(page);
+  await page.getByRole('button', { name: 'Pause encoding', exact: true }).click();
+  await expect(page.getByText('Workers are paused.', { exact: false })).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Stop and keep progress', exact: true }),
+  ).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Continue encoding', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Continue encoding', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Pause encoding', exact: true })).toBeEnabled();
+  expect((await calls(page, 'set_job_paused')).map((call) => call.payload)).toEqual([
+    { id: 'saved-encode', paused: true },
+    { id: 'saved-encode', paused: false },
+  ]);
+  await page.getByRole('button', { name: 'Pause encoding', exact: true }).click();
+  await currentJob(page).getByRole('button', { name: 'Cancel job', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Continue encoding', exact: true })).toHaveCount(0);
+  expect(await calls(page, 'resume_job')).toHaveLength(0);
+});
 const currentJob = (page: Page) =>
   page.getByRole('region', { name: 'Current encode job', exact: true });
 const historyJob = (page: Page, id: string) =>

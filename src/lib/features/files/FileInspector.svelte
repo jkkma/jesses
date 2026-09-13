@@ -1,6 +1,8 @@
 <script lang="ts">
   import { AudioLines, Captions, CircleHelp, FileSearch, Film, Info } from '@lucide/svelte';
   import type { MediaFile } from '$lib/ipc/generated';
+  import MediaAnalysis from './MediaAnalysis.svelte';
+  import QualityAnalysis from './QualityAnalysis.svelte';
   import {
     displayCodec,
     formatBytes,
@@ -51,6 +53,8 @@
           >{file.format ?? 'Unknown'}</strong
         >
       </div>
+      <MediaAnalysis {file} {sample} />
+      <QualityAnalysis {file} {sample} />
       <div class="section-heading track-heading">
         <span class="eyebrow">Streams</span><span class="count-label"
           >{file.streams.length.toString().padStart(2, '0')}</span

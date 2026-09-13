@@ -5,7 +5,7 @@ export const terminalJob = (state: string): boolean =>
 
 export const canKeepProgress = (job: JobSnapshot): boolean =>
   job.encodeSettings?.backend === 'av1an' &&
-  ['preparing', 'running', 'finalizing'].includes(job.state);
+  ['preparing', 'running', 'paused', 'finalizing'].includes(job.state);
 
 export const canResumeJob = (job: JobSnapshot): boolean =>
   job.encodeSettings?.backend === 'av1an' &&

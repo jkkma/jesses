@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remember-recent-media"
+description = "Enables the remember_recent_media command without any pre-configured scope."
+commands.allow = ["remember_recent_media"]
+
+[[permission]]
+identifier = "deny-remember-recent-media"
+description = "Denies the remember_recent_media command without any pre-configured scope."
+commands.deny = ["remember_recent_media"]

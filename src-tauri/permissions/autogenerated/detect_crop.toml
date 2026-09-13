@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detect-crop"
+description = "Enables the detect_crop command without any pre-configured scope."
+commands.allow = ["detect_crop"]
+
+[[permission]]
+identifier = "deny-detect-crop"
+description = "Denies the detect_crop command without any pre-configured scope."
+commands.deny = ["detect_crop"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-encoder-parameters"
+description = "Enables the get_encoder_parameters command without any pre-configured scope."
+commands.allow = ["get_encoder_parameters"]
+
+[[permission]]
+identifier = "deny-get-encoder-parameters"
+description = "Denies the get_encoder_parameters command without any pre-configured scope."
+commands.deny = ["get_encoder_parameters"]

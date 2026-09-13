@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-parameter-preset"
+description = "Enables the save_parameter_preset command without any pre-configured scope."
+commands.allow = ["save_parameter_preset"]
+
+[[permission]]
+identifier = "deny-save-parameter-preset"
+description = "Denies the save_parameter_preset command without any pre-configured scope."
+commands.deny = ["save_parameter_preset"]

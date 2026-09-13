@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-recent-path-is-folder"
+description = "Enables the recent_path_is_folder command without any pre-configured scope."
+commands.allow = ["recent_path_is_folder"]
+
+[[permission]]
+identifier = "deny-recent-path-is-folder"
+description = "Denies the recent_path_is_folder command without any pre-configured scope."
+commands.deny = ["recent_path_is_folder"]

@@ -1,10 +1,10 @@
 <script lang="ts">
   import { Square } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
-  import { errorMessage, formatDuration } from './format';
+  import { errorMessage, fileName, formatDuration } from './format';
   import { ProgressEstimator, type ProgressEstimate } from './progress-estimate';
-  import type { JobSnapshot } from '$lib/ipc/generated';
-  import { encodeSummary } from './encoder-options';
+  import type { JobSnapshot, MuxRequest } from '$lib/ipc/generated';
+  import { encodeSummary, encoderOptions } from './encoder-options';
   import { canKeepProgress, canResumeJob, savedProgressSummary, terminalJob } from './job-state';
 
   let {
@@ -14,6 +14,7 @@
     onstop,
     onkeep,
     onresume,
+    onpause,
   }: {
     job: JobSnapshot | undefined;
     jobs: JobSnapshot[];
@@ -21,10 +22,11 @@
     onstop: () => Promise<void>;
     onkeep: (id: string) => Promise<void>;
     onresume: (id: string) => Promise<void>;
+    onpause: (id: string, paused: boolean) => Promise<void>;
   } = $props();
   let errors = $state<Record<string, string>>({});
   let queueError = $state<string | null>(null);
-  let actions = $state<Record<string, 'cancel' | 'keep' | 'resume' | undefined>>({});
+  let actions = $state<Record<string, 'cancel' | 'keep' | 'resume' | 'pause' | undefined>>({});
   let stopping = $state(false);
   const pending = $derived(jobs.filter((entry) => !terminalJob(entry.state)));
   const history = $derived(
@@ -109,9 +111,39 @@
       stopping = false;
     }
   }
+  async function pause(entry: JobSnapshot) {
+    if (actions[entry.id] || stopping) return;
+    actions = { ...actions, [entry.id]: 'pause' };
+    const nextErrors = { ...errors };
+    delete nextErrors[entry.id];
+    errors = nextErrors;
+    try {
+      await onpause(entry.id, entry.state !== 'paused');
+    } catch (cause) {
+      errors = { ...errors, [entry.id]: errorMessage(cause) };
+    } finally {
+      actions = { ...actions, [entry.id]: undefined };
+    }
+  }
 </script>
 
 {#snippet recoveryControls(entry: JobSnapshot)}
+  {#if entry.encodeSettings?.backend === 'av1an' && ['running', 'paused'].includes(entry.state)}
+    <Button
+      variant="outline"
+      disabled={!!actions[entry.id] || stopping}
+      onclick={() => pause(entry)}
+      >{actions[entry.id] === 'pause'
+        ? 'Updating workers…'
+        : entry.state === 'paused'
+          ? 'Continue encoding'
+          : 'Pause encoding'}</Button
+    >
+    {#if entry.state === 'paused'}<p class="small-muted" role="status">
+        Workers are paused. Memory and open files remain in use. Continue, cancel, or stop and keep
+        progress.
+      </p>{/if}
+  {/if}
   {#if entry.state === 'stopping'}
     <p class="small-muted" role="status">Stopping and saving progress…</p>
   {:else if entry.state === 'stopped' && !entry.recovery}
@@ -140,6 +172,39 @@
   {/if}
 {/snippet}
 
+{#snippet muxSettings(request: MuxRequest)}
+  <p class="small-muted">
+    {request.sources.length} sources · {request.tracks.length} selected tracks
+  </p>
+  {#each request.sources as source (source.id)}
+    <p class="small-muted job-path">Source: {source.inputPath}</p>
+  {/each}
+  {#each request.tracks as track, position}
+    <p class="small-muted job-path">
+      Track {position + 1}: {fileName(
+        request.sources.find((source) => source.id === track.sourceId)?.inputPath ?? track.sourceId,
+      )} · #{track.streamIndex}{track.title != null
+        ? ` · Title: ${track.title || '(cleared)'}`
+        : ''}{track.language != null
+        ? ` · Language: ${track.language || '(cleared)'}`
+        : ''}{track.default != null
+        ? ` · Default: ${track.default ? 'yes' : 'no'}`
+        : ''}{track.forced != null ? ` · Forced: ${track.forced ? 'yes' : 'no'}` : ''}
+    </p>
+  {/each}
+  <p class="small-muted job-path">
+    Metadata: {fileName(
+      request.sources.find((source) => source.id === request.metadataSourceId)?.inputPath ??
+        request.metadataSourceId,
+    )} · Chapters: {request.chaptersSourceId
+      ? fileName(
+          request.sources.find((source) => source.id === request.chaptersSourceId)?.inputPath ??
+            request.chaptersSourceId,
+        )
+      : 'none'}
+  </p>
+{/snippet}
+
 {#if job}
   <section
     class="panel job-panel"
@@ -148,15 +213,16 @@
     <div class="section-heading">
       <span class="eyebrow"
         >{job.encodeSettings
-          ? job.encodeSettings.encoder === 'x264'
-            ? 'H.264 encode'
-            : 'AV1 encode'
+          ? `${encoderOptions(job.encodeSettings.encoder).codec} encode`
           : 'Remux'} · Job status</span
       >
       <strong role="status">{job.state.charAt(0).toUpperCase() + job.state.slice(1)}</strong>
     </div>
     <div class="job-body">
       <p class="job-path">{job.request.outputPath}</p>
+      {#if job.muxRequest}<details>
+          <summary>Saved track settings</summary>{@render muxSettings(job.muxRequest)}
+        </details>{/if}
       {#if job.encodeSettings}<p class="small-muted">
           {encodeSummary(job.encodeSettings)}
         </p>{/if}
@@ -170,7 +236,7 @@
           minutes.
         </p>
       {/if}
-      {#if job.state === 'running' || validationPhase}
+      {#if job.state === 'running' || job.state === 'paused' || validationPhase}
         {#if duration !== null && progress !== null}
           <progress aria-label={progressLabel} max={duration} value={progress}></progress>
         {:else}
@@ -264,9 +330,7 @@
           <div class="queue-description">
             <strong
               >{entry.encodeSettings
-                ? entry.encodeSettings.encoder === 'x264'
-                  ? 'H.264 encode'
-                  : 'AV1 encode'
+                ? `${encoderOptions(entry.encodeSettings.encoder).codec} encode`
                 : 'Remux'} · {entry.state.charAt(0).toUpperCase() + entry.state.slice(1)}</strong
             >
             <p class="job-path">{entry.request.outputPath}</p>
@@ -278,8 +342,14 @@
             <div class="history-recovery">{@render recoveryControls(entry)}</div>
             <details>
               <summary>Saved settings and log</summary>
-              <p class="small-muted job-path">Source: {entry.request.inputPath}</p>
-              <p class="small-muted">Selected streams: {entry.request.streamIndices.join(', ')}</p>
+              {#if entry.muxRequest}
+                {@render muxSettings(entry.muxRequest)}
+              {:else}
+                <p class="small-muted job-path">Source: {entry.request.inputPath}</p>
+                <p class="small-muted">
+                  Selected streams: {entry.request.streamIndices.join(', ')}
+                </p>
+              {/if}
               {#if entry.encodeSettings}<p class="small-muted">
                   {encodeSummary(entry.encodeSettings)}
                 </p>{/if}

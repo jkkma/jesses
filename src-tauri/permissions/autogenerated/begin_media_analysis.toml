@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-begin-media-analysis"
+description = "Enables the begin_media_analysis command without any pre-configured scope."
+commands.allow = ["begin_media_analysis"]
+
+[[permission]]
+identifier = "deny-begin-media-analysis"
+description = "Denies the begin_media_analysis command without any pre-configured scope."
+commands.deny = ["begin_media_analysis"]

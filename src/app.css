@@ -1,4 +1,5 @@
-@import 'tailwindcss';
+/* Only application sources define utilities; media builds and test edits do not. */
+@import 'tailwindcss' source('./');
 
 :root {
   font-family:

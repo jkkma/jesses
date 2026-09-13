@@ -10,6 +10,15 @@ import type {
 
 const inputPath = 'C:\\media\\café & 東京.mkv';
 const outputPath = 'C:\\exports\\café & 東京 AV1.mkv';
+const av1anDefaults = {
+  chunkMethod: 'lsmash',
+  chunkOrder: 'longToShort',
+  maximumChunkFrames: 240,
+  minimumSceneFrames: 24,
+  sceneDetection: 'standard',
+  sceneDownscaleHeight: 360,
+  splitMethod: 'sceneDetection',
+} as const;
 const baseStream: MediaStream = {
   index: 0,
   kind: 'video',
@@ -189,6 +198,18 @@ async function desktopMock(
           calls.push({ command, payload });
           await wait(command);
           if (command === 'get_capabilities') return capabilities;
+          if (command === 'begin_media_analysis') return `analysis-${++callbackId}`;
+          if (command === 'cancel_media_analysis') return;
+          if (command === 'measure_loudness')
+            return {
+              integratedLufs: -20.1,
+              truePeakDbfs: -4.2,
+              loudnessRangeLu: 5.5,
+              suggestedGainTenthsDb: -29,
+              targetLimitedByPeak: false,
+              sourceFingerprint: 'a'.repeat(64),
+              message: 'Review the flat gain before applying it.',
+            };
           if (command === 'plugin:dialog|open') return [selectedMedia.path];
           if (command === 'plugin:dialog|save') {
             if (pickerFailure) throw pickerFailure;
@@ -477,7 +498,7 @@ test('crop and resize invalid edits block both commands and selected video chang
   expect(await calls(page, 'enqueue_encode')).toHaveLength(0);
 });
 
-test('crop resize and border drafts survive source, encoder and workflow switches while av1an sends defaults', async ({
+test('crop resize and border drafts survive source, encoder and workflow switches with independent av1an framing', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -518,14 +539,17 @@ test('crop resize and border drafts survive source, encoder and workflow switche
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const av1an = av1anWorkspace(page);
-  await expect(av1an.getByLabel('Crop top (pixels)', { exact: true })).toHaveCount(0);
-  await expect(av1an.getByLabel('Add black borders', { exact: true })).toHaveCount(0);
+  await expect(av1an.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
+  await expect(av1an.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
+  await av1an.getByLabel('Crop top (pixels)', { exact: true }).fill('6');
+  await av1an.getByLabel('Add black borders', { exact: true }).check();
+  await av1an.getByLabel('Border left (pixels)', { exact: true }).fill('8');
   await av1an.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
   expect(queued.request.settings.framing).toEqual({
-    crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    crop: { top: 6, right: 0, bottom: 0, left: 0 },
     resizeWidth: null,
-    borders: { top: 0, right: 0, bottom: 0, left: 0 },
+    borders: { top: 0, right: 0, bottom: 0, left: 8 },
   });
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('4');
@@ -607,6 +631,19 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
     const first = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
     expect(first.request.settings).toEqual({
+      ...(tab === 'av1an'
+        ? {
+            av1anOptions: {
+              chunkMethod: 'lsmash',
+              chunkOrder: 'longToShort',
+              maximumChunkFrames: 240,
+              minimumSceneFrames: 24,
+              sceneDetection: 'standard',
+              sceneDownscaleHeight: 360,
+              splitMethod: 'sceneDetection',
+            },
+          }
+        : {}),
       backend: tab === 'av1an' ? 'av1an' : 'standalone',
       encoder: 'svtAv1FiveFish',
       videoStreamIndex: 0,
@@ -621,10 +658,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
         resizeWidth: null,
         borders: { top: 0, right: 0, bottom: 0, left: 0 },
       },
-      audio:
-        tab === 'av1an'
-          ? []
-          : [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+      audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       filmGrain: 8,
       hdr10Fallback: false,
     });
@@ -643,6 +677,19 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
     const second = (await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest };
     expect(second.request.settings).toEqual({
+      ...(tab === 'av1an'
+        ? {
+            av1anOptions: {
+              chunkMethod: 'lsmash',
+              chunkOrder: 'longToShort',
+              maximumChunkFrames: 240,
+              minimumSceneFrames: 24,
+              sceneDetection: 'standard',
+              sceneDownscaleHeight: 360,
+              splitMethod: 'sceneDetection',
+            },
+          }
+        : {}),
       backend: tab === 'av1an' ? 'av1an' : 'standalone',
       encoder: 'svtAv1Hdr',
       videoStreamIndex: 0,
@@ -657,10 +704,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
         resizeWidth: null,
         borders: { top: 0, right: 0, bottom: 0, left: 0 },
       },
-      audio:
-        tab === 'av1an'
-          ? []
-          : [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
+      audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
       filmGrain: 0,
       hdr10Fallback: true,
     });
@@ -1139,6 +1183,81 @@ async function openEncode(page: Page, tab: 'Quick Convert' | 'av1an' = 'Quick Co
   await expect(page.getByRole('heading', { name: media.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: tab, exact: true }).click();
 }
+
+test('loudness stays read-only until explicit apply and freezes measured gain in a job', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('flac');
+  const loudness = quick.getByRole('group', {
+    name: 'Loudness and gain for stream #3',
+    exact: true,
+  });
+  expect(await calls(page, 'measure_loudness')).toHaveLength(0);
+  await loudness.getByRole('button', { name: 'Measure loudness', exact: false }).click();
+  await loudness.getByRole('button', { name: 'Measure audio track', exact: true }).click();
+  await expect(loudness).toContainText('Suggested gain: -2.9 dB');
+  await expect(loudness.getByLabel('Audio gain (dB)', { exact: true })).toHaveValue('0');
+  expect((await calls(page, 'measure_loudness'))[0].payload).toMatchObject({
+    request: {
+      inputPath,
+      streamIndex: 3,
+      channels: 'preserve',
+      targetLufs: -23,
+      peakLimitDbfs: -1,
+    },
+  });
+  await loudness.getByRole('button', { name: 'Apply measured gain', exact: true }).click();
+  await expect(loudness.getByLabel('Audio gain (dB)', { exact: true })).toHaveValue('-2.9');
+  await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'start_encode')).length).toBe(1);
+  const submitted = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
+  expect(submitted.request.settings.audio[0].gain).toEqual({
+    tenthsDb: -29,
+    sourceFingerprint: 'a'.repeat(64),
+  });
+});
+
+test('loudness cancellation discards a late result and channel changes clear measured gain', async ({
+  page,
+}) => {
+  await desktopMock(page, { held: ['measure_loudness'] });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  const loudness = quick.getByRole('group', {
+    name: 'Loudness and gain for stream #3',
+    exact: true,
+  });
+  await loudness.getByRole('button', { name: 'Measure loudness', exact: false }).click();
+  await loudness.getByRole('button', { name: 'Measure audio track', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'measure_loudness')).length).toBe(1);
+  await loudness.getByRole('button', { name: 'Cancel measurement', exact: true }).click();
+  await release(page, 'measure_loudness');
+  await expect
+    .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
+    .toBeGreaterThan(0);
+  await expect(
+    loudness.getByRole('button', { name: 'Apply measured gain', exact: true }),
+  ).toHaveCount(0);
+  await loudness.getByRole('button', { name: 'Measure audio track', exact: true }).click();
+  await loudness.getByRole('button', { name: 'Apply measured gain', exact: true }).click();
+  await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+  await expect(loudness.getByLabel('Audio gain (dB)', { exact: true })).toHaveValue('0');
+  await expect(
+    loudness.getByRole('button', { name: 'Apply measured gain', exact: true }),
+  ).toHaveCount(0);
+  await loudness.getByLabel('Audio gain (dB)', { exact: true }).fill('25');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await loudness.getByLabel('Audio gain (dB)', { exact: true }).fill('-6.1');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('copy');
+  await expect(loudness.getByLabel('Audio gain (dB)', { exact: true })).toHaveCount(0);
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await expect(loudness.getByLabel('Audio gain (dB)', { exact: true })).toHaveValue('0');
+});
 async function calls(page: Page, command: string) {
   return page.evaluate(
     (name) =>
@@ -1195,7 +1314,7 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
   );
   await expect(
     quickWorkspace(page).getByText(
-      'Choose Copy source, Opus, or AAC for each selected audio track. Subtitles and attachments are copied.',
+      'Choose actions for selected audio and subtitle tracks. Attachments are copied.',
     ),
   ).toBeVisible();
   await page.getByRole('button', { name: 'Start encode', exact: true }).click();
@@ -1713,6 +1832,7 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
   await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const submitted = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
   expect(submitted.request.settings).toEqual({
+    av1anOptions: av1anDefaults,
     videoStreamIndex: 0,
     crf: 30,
     preset: 2,
@@ -1729,7 +1849,7 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
       resizeWidth: null,
       borders: { top: 0, right: 0, bottom: 0, left: 0 },
     },
-    audio: [],
+    audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
   });
   await page.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveCount(0);
@@ -1949,6 +2069,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
   expect(queued.request).toEqual({
     source: { inputPath, outputPath: av1anOutput, streamIndices: [0, 3, 9] },
     settings: {
+      av1anOptions: av1anDefaults,
       videoStreamIndex: 0,
       crf: 22,
       preset: 2,
@@ -1965,7 +2086,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
         resizeWidth: null,
         borders: { top: 0, right: 0, bottom: 0, left: 0 },
       },
-      audio: [],
+      audio: [{ streamIndex: 3, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
     },
   });
   const current = page.getByRole('region', { name: 'Current encode job' });
@@ -2185,7 +2306,7 @@ test('audio bitrate validation applies only to included converted tracks and res
   await expect(quick.getByLabel('Audio channels', { exact: true })).toHaveCount(0);
 });
 
-test('audio drafts are isolated by source and video encoder while av1an stays copy-only', async ({
+test('audio drafts are isolated by source and video encoder and workflow with av1an conversion', async ({
   page,
 }) => {
   await desktopMock(page);
@@ -2199,10 +2320,14 @@ test('audio drafts are isolated by source and video encoder while av1an stays co
   await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const chunked = av1anWorkspace(page);
-  await expect(chunked.getByLabel('Audio codec', { exact: true })).toHaveCount(0);
+  await expect(chunked.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await chunked.getByLabel('Audio codec', { exact: true }).selectOption('opus');
+  await chunked.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
   await chunked.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
-  expect(queued.request.settings.audio).toEqual([]);
+  expect(queued.request.settings.audio).toEqual([
+    { streamIndex: 3, codec: 'opus', bitrateKbps: 128, channels: 'stereo' },
+  ]);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
   await expect(quick.getByLabel('Audio channels', { exact: true })).toHaveValue('mono');
@@ -2307,4 +2432,343 @@ test('Opus mono bitrate respects the encoder limit while stereo allows higher ra
   await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
   await expect(bitrate).toHaveValue('256');
   await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+});
+
+for (const tab of ['Quick Convert', 'av1an'] as const) {
+  for (const codec of ['flac', 'mp3', 'vorbis', 'eac3'] as const) {
+    test(`${tab} queues explicit ${codec} audio settings`, async ({ page }) => {
+      await desktopMock(page);
+      await openEncode(page);
+      if (tab === 'av1an') await page.getByRole('button', { name: 'av1an', exact: true }).click();
+      const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+      await workspace.getByLabel('Audio codec', { exact: true }).selectOption(codec);
+      await workspace.getByLabel('Audio channels', { exact: true }).selectOption('mono');
+      if (codec === 'flac') {
+        await expect(workspace.getByLabel('Audio bitrate', { exact: true })).toHaveCount(0);
+        await expect(workspace).toContainText(
+          'Floating-point and higher-depth sources are converted to 24-bit.',
+        );
+      } else if (codec === 'mp3') {
+        await workspace.getByLabel('Audio bitrate', { exact: true }).selectOption('192');
+      } else {
+        await workspace.getByLabel('Audio bitrate', { exact: true }).fill('192');
+      }
+      await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+      const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+      expect(queued.request.settings.audio).toEqual([
+        { streamIndex: 3, codec, bitrateKbps: codec === 'flac' ? 128 : 192, channels: 'mono' },
+      ]);
+    });
+  }
+}
+
+test('audio layout restrictions require an explicit downmix without changing the source', async ({
+  page,
+}) => {
+  const source = {
+    ...media,
+    streams: media.streams.map((stream) =>
+      stream.kind === 'audio'
+        ? { ...stream, channels: 6, channelLayout: '5.1', sampleRate: 48000 }
+        : stream,
+    ),
+  };
+  await desktopMock(page, { media: source });
+  await openEncode(page);
+  const workspace = quickWorkspace(page);
+  await workspace.getByLabel('Audio codec', { exact: true }).selectOption('eac3');
+  await expect(workspace).toContainText(
+    'E-AC-3 cannot preserve 5.1. Choose mono, stereo, or another codec.',
+  );
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await workspace.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
+  await workspace.getByLabel('Audio codec', { exact: true }).selectOption('mp3');
+  await workspace.getByLabel('Audio channels', { exact: true }).selectOption('preserve');
+  await expect(workspace).toContainText('MP3 supports mono or stereo. Choose an explicit downmix.');
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await expect(workspace.getByText('Source:', { exact: false })).toContainText('6 channels');
+});
+
+for (const encoder of ['x265', 'vp9'] as const) {
+  test(`${encoder} uses FFmpeg with independent defaults and immutable source-depth queue settings`, async ({
+    page,
+  }) => {
+    await desktopMock(page, { missing: 'x264' });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    const selector = quick.getByLabel('Video encoder', { exact: true });
+    await selector.selectOption(encoder);
+    const quality = quick.getByLabel('Quality', { exact: true });
+    await expect(quality).toHaveValue(encoder === 'x265' ? '28' : '32');
+    await expect(quick.getByLabel('Encoder preset', { exact: true }).locator('option')).toHaveCount(
+      encoder === 'x265' ? 10 : 6,
+    );
+    await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
+    await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
+    const start = quick.getByRole('button', { name: 'Start encode', exact: true });
+    for (const invalid of ['-1', encoder === 'x265' ? '52' : '64', '22.5', '']) {
+      await quality.fill(invalid);
+      await expect(start).toBeDisabled();
+    }
+    await quality.fill('31');
+    await selector.selectOption('svtAv1Hdr');
+    await selector.selectOption(encoder);
+    await expect(quality).toHaveValue('31');
+    await start.click();
+    const started = (await calls(page, 'start_encode'))[0].payload as { request: EncodeRequest };
+    expect(started.request.settings).toMatchObject({
+      encoder,
+      crf: 31,
+      preset: encoder === 'x265' ? 5 : 2,
+      backend: 'standalone',
+      filmGrain: 0,
+      hdr10Fallback: false,
+    });
+    expect(started.request.source.outputPath).toBe(inputPath.replace(/\.mkv$/, `_${encoder}.mkv`));
+    await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
+      `FFmpeg ${encoder === 'x265' ? 'x265 · HEVC' : 'VP9 · VP9'} · Source bit depth`,
+    );
+    await page.getByRole('button', { name: 'av1an', exact: true }).click();
+    await expect(
+      av1anWorkspace(page)
+        .getByLabel('SVT-AV1 build', { exact: true })
+        .locator(`option[value="${encoder}"]`),
+    ).toHaveCount(0);
+  });
+  test(`${encoder} rejects known HDR without implying a depth conversion`, async ({ page }) => {
+    await desktopMock(page, {
+      media: {
+        ...media,
+        streams: media.streams.map((stream) =>
+          stream.kind === 'video'
+            ? { ...stream, hdrFormat: 'HDR10', colorTransfer: 'smpte2084' }
+            : stream,
+        ),
+      },
+    });
+    await openEncode(page);
+    const quick = quickWorkspace(page);
+    await quick.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
+    await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+    await expect(quick).toContainText(
+      `${encoder === 'x265' ? 'x265' : 'VP9'} supports SDR sources only.`,
+    );
+  });
+}
+
+test('frame trim validates boundaries and copied audio, restores drafts and keeps queued interval immutable', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Trim video interval', { exact: true }).check();
+  await quick.getByLabel('Start frame', { exact: true }).fill('120');
+  await quick.getByLabel('End frame (excluded)', { exact: true }).fill('360');
+  const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await expect(quick).toContainText(
+    'Choose an audio conversion for each included audio track when trimming.',
+  );
+  await quick.getByLabel('Audio codec', { exact: true }).selectOption('flac');
+  await expect(queue).toBeEnabled();
+  for (const invalid of ['119', '120', '120.5', '']) {
+    await quick.getByLabel('End frame (excluded)', { exact: true }).fill(invalid);
+    await expect(queue).toBeDisabled();
+  }
+  await quick.getByLabel('End frame (excluded)', { exact: true }).fill('360');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
+  await expect(quick.getByLabel('Trim video interval', { exact: true })).not.toBeChecked();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
+  await expect(quick.getByLabel('Start frame', { exact: true })).toHaveValue('120');
+  await queue.click();
+  const queued = (await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest };
+  expect(queued.request.settings.trim).toEqual({ startFrame: 120, endFrameExclusive: 360 });
+  await quick.getByLabel('Start frame', { exact: true }).fill('240');
+  expect(
+    ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request
+      .settings.trim,
+  ).toEqual({ startFrame: 120, endFrameExclusive: 360 });
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1anWorkspace(page).getByLabel('Trim video interval', { exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test('rate control validates bitrate and target size, restores encoder drafts and preserves queued settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
+  await quick.getByLabel('Rate control', { exact: true }).selectOption('bitrate');
+  await expect(quick.getByLabel('Quality', { exact: true })).toHaveCount(0);
+  for (const value of ['', '0', '100001', '250.5']) {
+    await quick.getByLabel('Video bitrate (kb/s)', { exact: true }).fill(value);
+    await expect(queue).toBeDisabled();
+  }
+  await quick.getByLabel('Video bitrate (kb/s)', { exact: true }).fill('1500');
+  await quick.getByLabel('Two passes', { exact: true }).uncheck();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('vp9');
+  await expect(quick.getByLabel('Rate control', { exact: true })).toHaveValue('quality');
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
+  await expect(quick.getByLabel('Video bitrate (kb/s)', { exact: true })).toHaveValue('1500');
+  await expect(quick.getByLabel('Two passes', { exact: true })).not.toBeChecked();
+  await queue.click();
+  const first = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(first.settings.rateControl).toEqual({
+    mode: 'bitrate',
+    bitrateKbps: 1500,
+    twoPass: false,
+  });
+  await quick.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
+  for (const value of ['', '0', '1.5', '1048577']) {
+    await quick.getByLabel('Target file size (MiB)', { exact: true }).fill(value);
+    await expect(queue).toBeDisabled();
+  }
+  await quick.getByLabel('Target file size (MiB)', { exact: true }).fill('700');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  expect(
+    ((await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest }).request
+      .settings.rateControl,
+  ).toEqual({ mode: 'targetSize', targetSizeMib: 700 });
+  expect(
+    ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request,
+  ).toEqual(first);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1anWorkspace(page).getByLabel('Rate control', { exact: true })).toHaveCount(0);
+});
+
+test('tone mapping requires explicit HDR rendering, validates peak and retains queued settings', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    media: {
+      ...media,
+      streams: media.streams.map((stream) =>
+        stream.kind === 'video'
+          ? {
+              ...stream,
+              pixelFormat: 'yuv420p10le',
+              bitDepth: 10,
+              colorPrimaries: 'bt2020',
+              colorTransfer: 'smpte2084',
+              colorSpace: 'bt2020nc',
+              colorRange: 'tv',
+              hdrFormat: 'HDR10',
+            }
+          : stream,
+      ),
+    },
+  });
+  await openEncode(page);
+  const quick = quickWorkspace(page);
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
+  const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await quick.getByLabel('HDR / HLG to SDR', { exact: true }).check();
+  await expect(queue).toBeEnabled();
+  for (const peak of ['0', '99', '10001', '1000.5', '']) {
+    await quick.getByLabel('Signal peak (nits)', { exact: true }).fill(peak);
+    await expect(queue).toBeDisabled();
+  }
+  await quick.getByLabel('Signal peak (nits)', { exact: true }).fill('2000');
+  await quick
+    .getByLabel('Use the compatible HDR10 base layer for Dolby Vision / HDR10+', { exact: true })
+    .check();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('vp9');
+  await expect(quick.getByLabel('HDR / HLG to SDR', { exact: true })).not.toBeChecked();
+  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
+  await expect(quick.getByLabel('Signal peak (nits)', { exact: true })).toHaveValue('2000');
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.toneMap).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true });
+  await quick.getByLabel('Signal peak (nits)', { exact: true }).fill('1000');
+  expect(
+    ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request
+      .settings.toneMap,
+  ).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true });
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(av1anWorkspace(page).getByLabel('HDR / HLG to SDR', { exact: true })).toHaveCount(0);
+});
+
+test('av1an scene and VMAF controls validate, restore drafts and freeze queued settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const workspace = av1anWorkspace(page);
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('ffms2');
+  await workspace.getByLabel('Split method', { exact: true }).selectOption('fixedChunks');
+  await workspace.getByLabel('Maximum chunk frames (0 disables)', { exact: true }).fill('120');
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  await expect(workspace.getByLabel('Quality', { exact: true })).toHaveCount(0);
+  await workspace.getByLabel('Minimum VMAF score', { exact: true }).fill('99');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Minimum VMAF score', { exact: true }).fill('93.5');
+  await workspace.getByLabel('Probes per chunk', { exact: true }).fill('11');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Probes per chunk', { exact: true }).fill('3');
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anOptions).toMatchObject({
+    chunkMethod: 'ffms2',
+    splitMethod: 'fixedChunks',
+    maximumChunkFrames: 120,
+    targetQuality: { minimumScoreTenths: 935, maximumScoreTenths: 960, probes: 3 },
+  });
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
+  expect(request.settings.av1anOptions?.chunkMethod).toBe('ffms2');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quickWorkspace(page).getByLabel('Source reader', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('bestsource');
+});
+
+test('av1an perceptual metric direction and reader dependencies keep immutable queued settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const workspace = av1anWorkspace(page);
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  await workspace.getByLabel('Target metric', { exact: true }).selectOption('butteraugli');
+  await expect(
+    workspace.getByText('Lower scores mean fewer visible differences.', { exact: false }),
+  ).toBeVisible();
+  await expect(workspace.getByLabel('Minimum Butteraugli INF score', { exact: true })).toHaveValue(
+    '0.8',
+  );
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('select');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Target metric', { exact: true }).selectOption('xpsnr');
+  await expect(queue).toBeEnabled();
+  await workspace.getByLabel('Probe every N frames', { exact: true }).fill('2');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('lsmash');
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anOptions?.targetQuality).toMatchObject({
+    metric: 'xpsnr',
+    minimumScoreTenths: 300,
+    maximumScoreTenths: 350,
+    probingRate: 2,
+  });
+  await workspace.getByLabel('Target metric', { exact: true }).selectOption('ssimulacra2');
+  expect(request.settings.av1anOptions?.targetQuality?.metric).toBe('xpsnr');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(workspace.getByLabel('Target metric', { exact: true })).toHaveValue('ssimulacra2');
 });

@@ -1,30 +1,47 @@
 <script lang="ts">
+  import ContainerOptions from '$lib/components/shared/ContainerOptions.svelte';
+  import {
+    destinationContainer,
+    containerDestination,
+  } from '$lib/components/shared/container-options';
   import { ArrowDown, ArrowUp, ArrowRight, FolderOutput, Play, CircleAlert } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { chooseRemuxDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
-  import type { JobSnapshot, MediaFile, RemuxRequest, ToolInfo } from '$lib/ipc/generated';
+  import type {
+    JobSnapshot,
+    MediaFile,
+    MuxRequest,
+    RemuxRequest,
+    ToolInfo,
+  } from '$lib/ipc/generated';
+  import MultiSourceMux from './MultiSourceMux.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
   let {
     file,
+    files,
     tools,
     jobs,
     connected,
     onfiles,
     onstart,
+    onmux,
   }: {
     file: MediaFile | undefined;
+    files: MediaFile[];
     tools: ToolInfo[];
     jobs: JobSnapshot[];
     connected: boolean;
     onfiles: () => void;
     onstart: (request: RemuxRequest) => Promise<void>;
+    onmux: (request: MuxRequest) => Promise<void>;
   } = $props();
   let destination = $state('');
   let order = $state<number[]>([]);
   let included = $state<number[]>([]);
   let error = $state<string | null>(null);
   let submitting = $state(false);
+  let combine = $state(false);
   const desktop = isDesktop();
   const active = $derived(jobs.find((job) => !terminalJob(job.state)));
   const toolsReady = $derived(
@@ -43,7 +60,9 @@
   );
   $effect(() => {
     const source = file;
-    const indices = source?.streams.map((stream) => stream.index) ?? [];
+    const indices =
+      source?.streams.filter((stream) => stream.kind !== 'data').map((stream) => stream.index) ??
+      [];
     order = indices;
     included = [...indices];
     destination =
@@ -93,15 +112,30 @@
     <div>
       <span class="eyebrow">Copy selected streams</span>
       <h1>Remux</h1>
-      <p>Save your video, audio, and subtitles in a new Matroska file without re-encoding.</p>
+      <p>
+        Save your video, audio, and subtitles in a new container. Video and audio are copied;
+        incompatible text subtitles are converted.
+      </p>
     </div>
-    <span class="status-label">Matroska · .mkv</span>
+    <span class="status-label">MKV · MP4 · MOV · WebM</span>
   </div>
   {#if error}<div class="notice error-notice" role="alert">
       <CircleAlert size={16} />
       <p>{error}</p>
     </div>{/if}
-  <div class="remux-grid">
+  <label class="combine-option"
+    ><input type="checkbox" bind:checked={combine} disabled={!!active || submitting} />Combine
+    tracks from multiple files</label
+  >
+  <div hidden={!combine}>
+    <MultiSourceMux
+      {files}
+      primaryId={file?.id}
+      disabled={!desktop || !connected || !toolsReady || !!active}
+      onstart={onmux}
+    />
+  </div>
+  <div class="remux-grid" class:mode-hidden={combine}>
     <section class="panel remux-streams" aria-label="Streams to copy">
       <div class="section-heading">
         <span class="eyebrow">Source streams</span><button
@@ -172,7 +206,12 @@
             id="remux-destination"
             bind:value={destination}
             disabled={!desktop || !!active || submitting}
-            placeholder="Choose a new .mkv file"
+            placeholder="Choose a new media file"
+          />
+          <ContainerOptions
+            value={destinationContainer(destination)}
+            onchange={(value) => (destination = containerDestination(destination, value))}
+            disabled={!!active || submitting}
           />
         </div>
         <Button
@@ -197,6 +236,21 @@
 </section>
 
 <style>
+  .combine-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 20px;
+    font-size: 13px;
+  }
+  .combine-option input {
+    width: 16px;
+    height: 16px;
+    accent-color: #ad5326;
+  }
+  .mode-hidden {
+    display: none !important;
+  }
   .remux-workspace {
     min-width: 0;
   }

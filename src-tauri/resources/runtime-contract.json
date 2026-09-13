@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "product": "jesses",
+  "toolDistribution": "manifest",
+  "toolManifest": "resources/tools/manifest.json",
+  "toolManifestAbsent": "All media tools are external when no tool manifest is packaged.",
+  "portableStorage": {
+    "marker": "jesses.portable",
+    "version": "1",
+    "directory": "jesses-data",
+    "history": "data/jobs",
+    "logs": "logs/jobs"
+  },
+  "platforms": {
+    "x86_64-pc-windows-msvc": {
+      "runtime": "Microsoft Edge WebView2 Runtime",
+      "installerRuntimeStrategy": "Download and install WebView2 when absent; internet access is required.",
+      "portableRuntimeStrategy": "WebView2 must already be installed. The portable archive does not contain the runtime.",
+      "artifacts": ["nsis", "portableZip"]
+    },
+    "x86_64-unknown-linux-gnu": {
+      "runtime": "WebKitGTK 4.1 and GTK 3; packaged on Ubuntu 24.04",
+      "artifacts": ["appimage", "deb"]
+    }
+  },
+  "tools": [
+    {
+      "id": "ffmpeg",
+      "executable": "ffmpeg",
+      "versionArgument": "-version",
+      "upstream": "https://ffmpeg.org/",
+      "usage": "Media decoding, muxing and filtering. AAC/Opus jobs additionally check codec-delay support in FFmpeg and FFprobe."
+    },
+    {
+      "id": "ffprobe",
+      "executable": "ffprobe",
+      "versionArgument": "-version",
+      "upstream": "https://ffmpeg.org/",
+      "usage": "Media inspection and source/output validation."
+    },
+    {
+      "id": "svt-av1",
+      "executable": "SvtAv1EncApp",
+      "versionArgument": "--version",
+      "upstream": "https://gitlab.com/AOMediaCodec/SVT-AV1",
+      "usage": "Mainline standalone AV1 encoding."
+    },
+    {
+      "id": "svt-av1-5fish",
+      "executable": "SvtAv1EncApp-5fish",
+      "versionArgument": "--version",
+      "upstream": "https://github.com/5fish/SVT-AV1",
+      "usage": "Anime AV1 encoding; may also use the explicitly configured or managed fork installation."
+    },
+    {
+      "id": "svt-av1-hdr",
+      "executable": "SvtAv1EncApp-HDR",
+      "versionArgument": "--version",
+      "upstream": "https://github.com/juliobbv-p/svt-av1-hdr",
+      "usage": "Default AV1 encoder; may also use the explicitly configured or managed fork installation."
+    },
+    {
+      "id": "x264",
+      "executable": "x264",
+      "versionArgument": "--version",
+      "upstream": "https://www.videolan.org/developers/x264.html",
+      "usage": "Standalone H.264 encoding."
+    },
+    {
+      "id": "av1an",
+      "executable": "av1an",
+      "versionArgument": "--version",
+      "upstream": "https://github.com/rust-av/Av1an",
+      "usage": "Chunked AV1 encoding; VapourSynth, L-SMASH Works and a compatible selected encoder are also required."
+    }
+  ],
+  "qualification": "Packaging and resource checks do not establish clean-machine operation, tool availability, or full media workflow qualification."
+}

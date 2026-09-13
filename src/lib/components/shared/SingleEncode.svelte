@@ -1,5 +1,30 @@
 <script lang="ts">
+  import AdvancedEncoderOptions from './AdvancedEncoderOptions.svelte';
+  import CommandPlanPreview from './CommandPlanPreview.svelte';
+  import { parameterError } from './encoder-parameters';
+  import type { EncoderParameter } from '$lib/ipc/generated';
+  import Av1anOptionsControl from './Av1anOptions.svelte';
+  import {
+    defaultAv1an,
+    copyAv1an,
+    selectedAv1an,
+    av1anError,
+    type Av1anDraft,
+  } from './av1an-options';
+  import TemporalOptions from './TemporalOptions.svelte';
+  import {
+    defaultTemporal,
+    temporalError,
+    selectedTemporal,
+    type TemporalDraft,
+  } from './temporal-options';
+  import ContainerOptions from '$lib/components/shared/ContainerOptions.svelte';
+  import {
+    destinationContainer,
+    containerDestination,
+  } from '$lib/components/shared/container-options';
   import { untrack } from 'svelte';
+  import { preferredDestination } from '$lib/preferences.svelte';
   import {
     ArrowRight,
     AudioLines,
@@ -14,11 +39,36 @@
   import { errorMessage } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from './AudioOptions.svelte';
+  import SubtitleOptions from './SubtitleOptions.svelte';
+  import {
+    defaultSubtitles,
+    selectedSubtitles,
+    subtitleError,
+    subtitleSummary,
+  } from './subtitle-options';
+  import type { SubtitleTrackSettings } from '$lib/ipc/generated';
   import { terminalJob } from './job-state';
   import FramingOptions from './FramingOptions.svelte';
+  import TrimOptions from './TrimOptions.svelte';
+  import ToneMapOptions from './ToneMapOptions.svelte';
+  import RateControlOptions from './RateControlOptions.svelte';
+  import {
+    defaultRate,
+    selectedRate,
+    validRate,
+    rateSummary,
+    type RateDraft,
+  } from './rate-control-options';
+  import {
+    defaultToneMap,
+    selectedToneMap,
+    toneMapError,
+    type ToneMapDraft,
+  } from './tone-map-options';
+  import { defaultTrim, selectedTrim, trimError, type TrimDraft } from './trim-options';
+  import SourcePreview from './SourcePreview.svelte';
   import {
     copyFramingDraft,
-    defaultFraming,
     defaultFramingDraft,
     framingDimensions,
     framingSummary,
@@ -75,6 +125,9 @@
   } = $props();
   let videoIndex = $state<number | undefined>();
   let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
+  let parameters = $state<EncoderParameter[]>([]);
+  let rate = $state(defaultRate());
+  let av1an = $state(defaultAv1an());
   let crf = $state<number | undefined>(30);
   let preset = $state(2);
   let workers = $state<number | undefined>(2);
@@ -85,12 +138,29 @@
   let hdrTune = $state<HdrTune>('filmGrain');
   let included = $state<number[]>([]);
   let audio = $state<AudioTrackDraft[]>([]);
+  let subtitles = $state<SubtitleTrackSettings[]>([]);
   let framing = $state(defaultFramingDraft());
+  let trim = $state(defaultTrim());
+  let toneMap = $state(defaultToneMap());
   let destination = $state('');
   let error = $state<string | null>(null);
   let submitting = $state(false);
+  let temporal = $state(defaultTemporal());
+  const outputFrameRateLabel = $derived(
+    temporal.changeRate
+      ? temporalError(temporal, 'standalone')
+        ? 'Check output frame rate'
+        : `${temporal.numerator}/${temporal.denominator} fps output`
+      : temporal.deinterlace === 'bob'
+        ? 'Double source frame rate (BWDIF bob)'
+        : 'Source frame rate',
+  );
   type Draft = {
+    parameters: EncoderParameter[];
+    temporal: TemporalDraft;
     videoIndex: number | undefined;
+    rate: RateDraft;
+    av1an: Av1anDraft;
     crf: number | undefined;
     preset: number;
     workers: number | undefined;
@@ -101,7 +171,10 @@
     hdrTune: HdrTune;
     included: number[];
     audio: AudioTrackDraft[];
+    subtitles: SubtitleTrackSettings[];
     framing: FramingDraft;
+    trim: TrimDraft;
+    toneMap: ToneMapDraft;
     destination: string;
   };
   // Each fixed workflow instance owns its source drafts. Navigation keeps both
@@ -119,13 +192,31 @@
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
   const framingResult = $derived(framingDimensions(framing, selectedVideo));
   const framingValid = $derived(validFramingDraft(framing, selectedVideo));
-  const hdrUnsupported = $derived(encoder === 'x264' && knownHdr(selectedVideo));
+  const toneMapIssue = $derived(
+    toneMapError(toneMap, backend, selectedVideo, isSvtEncoder(encoder) && hdr10Fallback),
+  );
+  const trimIssue = $derived(trimError(trim, backend, audio, included, file?.streams ?? []));
+  const subtitleIssue = $derived(
+    subtitleError(
+      subtitles,
+      included,
+      file?.streams ?? [],
+      backend,
+      selectedVideo,
+      toneMap.enabled,
+    ),
+  );
+  const hdrUnsupported = $derived(
+    !isSvtEncoder(encoder) && knownHdr(selectedVideo) && !toneMap.enabled,
+  );
   const depthLabel = $derived(
-    isSvtEncoder(encoder)
-      ? '10-bit'
-      : sourceBitDepth(selectedVideo)
-        ? `${sourceBitDepth(selectedVideo)}-bit source`
-        : 'Source bit depth',
+    toneMap.enabled
+      ? '10-bit SDR output'
+      : isSvtEncoder(encoder)
+        ? '10-bit'
+        : sourceBitDepth(selectedVideo)
+          ? `${sourceBitDepth(selectedVideo)}-bit source`
+          : 'Source bit depth',
   );
   const selectedVideoSupported = $derived(
     videos.some((stream) => stream.index === videoIndex) &&
@@ -142,14 +233,18 @@
   const validSettings = $derived(
     (!chunked || isSvtEncoder(encoder)) &&
       validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
-      typeof crf === 'number' &&
-      Number.isInteger(crf) &&
-      crf >= options.crfMin &&
-      crf <= options.crfMax &&
+      validRate(rate) &&
+      (!chunked || !av1anError(av1an, knownHdr(selectedVideo))) &&
+      ((chunked && av1an.targetEnabled) ||
+        rate.mode !== 'quality' ||
+        (typeof crf === 'number' &&
+          Number.isInteger(crf) &&
+          crf >= options.crfMin &&
+          crf <= options.crfMax)) &&
       Number.isInteger(preset) &&
       preset >= 0 &&
       preset < options.presets.length &&
-      (encoder === 'x264' ||
+      (!isSvtEncoder(encoder) ||
         (typeof filmGrain === 'number' &&
           Number.isInteger(filmGrain) &&
           filmGrain >= 0 &&
@@ -167,8 +262,13 @@
       selectedVideoSupported &&
       !hdrUnsupported &&
       validSettings &&
-      (chunked || framingValid) &&
-      (chunked || validAudio(audio, included, file?.streams ?? [])) &&
+      !parameterError(parameters, null, encoder) &&
+      framingValid &&
+      !trimIssue &&
+      !temporalError(temporal, backend) &&
+      !toneMapIssue &&
+      !subtitleIssue &&
+      validAudio(audio, included, file?.streams ?? []) &&
       !!destination.trim(),
   );
   const canStart = $derived(canQueue && !active);
@@ -176,6 +276,9 @@
   function reset(source: MediaFile | undefined) {
     ++draftGeneration;
     videoIndex = source?.streams.find((stream) => stream.kind === 'video')?.index;
+    parameters = [];
+    rate = defaultRate();
+    av1an = defaultAv1an();
     crf = options.defaultCrf;
     preset = options.defaultPreset;
     workers = 2;
@@ -185,13 +288,21 @@
     texturePsyBias = options.defaultTexturePsyBias;
     hdrTune = options.defaultHdrTune;
     included =
-      source?.streams.filter((stream) => stream.kind !== 'video').map((stream) => stream.index) ??
-      [];
+      source?.streams
+        .filter((stream) => !['video', 'data'].includes(stream.kind))
+        .map((stream) => stream.index) ?? [];
     audio = defaultAudio(source?.streams ?? []);
+    subtitles = defaultSubtitles(source?.streams ?? []);
     framing = defaultFramingDraft();
+    trim = defaultTrim();
+    toneMap = defaultToneMap();
+    temporal = defaultTemporal(source?.streams.find((stream) => stream.index === videoIndex));
     destination =
       source && !source.id.startsWith('jesses-synthetic')
-        ? source.path.replace(/\.[^./\\]+$/, '') + (chunked ? options.av1anSuffix : options.suffix)
+        ? preferredDestination(
+            source.path.replace(/\.[^./\\]+$/, '') +
+              (chunked ? options.av1anSuffix : options.suffix),
+          )
         : '';
     error = null;
   }
@@ -202,7 +313,10 @@
       ++draftGeneration;
       if (draftIdentity !== null) {
         drafts.set(draftIdentity, {
+          parameters: parameters.map((value) => ({ ...value })),
           videoIndex,
+          rate: { ...rate },
+          av1an: copyAv1an(av1an),
           crf,
           preset,
           workers,
@@ -213,7 +327,11 @@
           hdrTune,
           included: [...included],
           audio: audio.map((track) => ({ ...track })),
+          subtitles: subtitles.map((track) => ({ ...track })),
           framing: copyFramingDraft(framing),
+          trim: { ...trim },
+          toneMap: { ...toneMap },
+          temporal: { ...temporal },
           destination,
         });
       }
@@ -233,7 +351,14 @@
         } = draft);
         included = [...draft.included];
         audio = draft.audio.map((track) => ({ ...track }));
+        subtitles = draft.subtitles.map((track) => ({ ...track }));
         framing = copyFramingDraft(draft.framing);
+        trim = { ...draft.trim };
+        toneMap = { ...draft.toneMap };
+        temporal = { ...draft.temporal };
+        parameters = draft.parameters.map((value) => ({ ...value }));
+        rate = { ...draft.rate };
+        av1an = copyAv1an(draft.av1an);
         error = null;
       } else {
         reset(source);
@@ -264,45 +389,62 @@
       if (isCurrentDraft(generation, identity)) error = errorMessage(cause);
     }
   }
+  function currentRequest(): EncodeRequest | undefined {
+    if (!file || videoIndex === undefined) return undefined;
+    const copies = copiedStreams
+      .filter((stream) => included.includes(stream.index))
+      .sort((a, b) => Number(a.kind === 'attachment') - Number(b.kind === 'attachment'));
+    return {
+      source: {
+        inputPath: file.path,
+        outputPath: destination.trim(),
+        streamIndices: [videoIndex, ...copies.map((stream) => stream.index)],
+      },
+      settings: {
+        ...(parameters.length ? { parameters: parameters.map((value) => ({ ...value })) } : {}),
+        ...(selectedTemporal(temporal) ? { temporal: selectedTemporal(temporal) } : {}),
+        videoStreamIndex: videoIndex,
+        ...(chunked ? { av1anOptions: selectedAv1an(av1an) } : {}),
+        ...(rate.mode !== 'quality' ? { rateControl: selectedRate(rate) } : {}),
+        crf:
+          rate.mode === 'quality' && !(chunked && av1an.targetEnabled) ? crf! : options.defaultCrf,
+        preset,
+        backend,
+        encoder,
+        workers: backend === 'av1an' ? workers! : 2,
+        filmGrain: isSvtEncoder(encoder) ? filmGrain! : 0,
+        hdr10Fallback: isSvtEncoder(encoder) ? hdr10Fallback : false,
+        lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
+        texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
+        hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
+        audio: selectedAudio(audio, included),
+        ...(selectedSubtitles(subtitles, included).length
+          ? { subtitles: selectedSubtitles(subtitles, included) }
+          : {}),
+        framing: selectedFraming(framing),
+        ...(trim.enabled ? { trim: selectedTrim(trim) } : {}),
+        ...(toneMap.enabled ? { toneMap: selectedToneMap(toneMap) } : {}),
+      },
+    };
+  }
+  const commandRequest = $derived(canQueue ? currentRequest() : undefined);
   async function start(queue = false) {
     if (
       !(queue ? canQueue : canStart) ||
       !file ||
       videoIndex === undefined ||
-      crf === undefined ||
+      (rate.mode === 'quality' && crf === undefined) ||
       (isSvtEncoder(encoder) && filmGrain === undefined)
     )
       return;
+    const request = currentRequest();
+    if (!request) return;
     submitting = true;
     error = null;
     const generation = draftGeneration;
     const identity = draftIdentity;
     try {
-      const copies = copiedStreams
-        .filter((stream) => included.includes(stream.index))
-        .sort((a, b) => Number(a.kind === 'attachment') - Number(b.kind === 'attachment'));
-      await (queue ? onqueue : onstart)({
-        source: {
-          inputPath: file.path,
-          outputPath: destination.trim(),
-          streamIndices: [videoIndex, ...copies.map((stream) => stream.index)],
-        },
-        settings: {
-          videoStreamIndex: videoIndex,
-          crf,
-          preset,
-          backend,
-          encoder,
-          workers: backend === 'av1an' ? workers! : 2,
-          filmGrain: encoder === 'x264' ? 0 : filmGrain!,
-          hdr10Fallback: encoder === 'x264' ? false : hdr10Fallback,
-          lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
-          texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
-          hdrTune: encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
-          audio: chunked ? [] : selectedAudio(audio, included),
-          framing: chunked ? defaultFraming() : selectedFraming(framing),
-        },
-      });
+      await (queue ? onqueue : onstart)(request);
     } catch (cause) {
       if (isCurrentDraft(generation, identity)) error = errorMessage(cause);
     } finally {
@@ -326,24 +468,31 @@
       <p>
         {chunked
           ? 'Detect scenes and encode AV1 chunks in parallel with your selected SVT-AV1 build.'
-          : 'Start with SVT-AV1-HDR, choose 5fish for anime, or use standard SVT-AV1 or x264.'}
+          : 'Start with SVT-AV1-HDR, choose 5fish for anime, or use standard SVT-AV1, x264, x265, or VP9.'}
       </p>
     </div>
     <span class="status-label"
-      >{chunked ? `av1an / ${options.name}` : `Standalone ${options.name}`} · {depthLabel}</span
+      >{chunked
+        ? `av1an / ${options.name}`
+        : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name}`} · {depthLabel}</span
     >
   </div>
   <div class="notice convert-notice">
     <Info size={16} aria-hidden="true" />
+    {#if encoder === 'x265' || encoder === 'vp9'}<p>
+        FFmpeg {encoder === 'x265' ? 'libx265' : 'libvpx-vp9'} encodes tagged SDR at the source's 8-bit
+        or 10-bit depth. HDR sources require explicit tone mapping to SDR. The runtime checks that FFmpeg
+        includes the selected library and pixel format before encoding.
+      </p>{/if}
     {#if encoder === 'x264'}<p>
         Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
         The source's 8-bit or 10-bit depth is retained when supported by the installed x264 build.
-        HDR and interlacing are not supported. Source compatibility and encoder depth support are
-        checked before encoding.
-      </p>{:else}<p>
+        HDR sources require tone mapping to SDR, and interlacing requires explicit deinterlacing.
+        Source compatibility and encoder depth support are checked before encoding.
+      </p>{:else if isSvtEncoder(encoder)}<p>
         Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
-        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Rotation and interlacing are
-        not supported. Source compatibility is checked before encoding.
+        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Standalone jobs can explicitly
+        deinterlace. Rotation is not supported. Source compatibility is checked before encoding.
       </p>{/if}
   </div>
   {#if error}<div class="notice error-notice" role="alert">
@@ -392,26 +541,42 @@
             <p>
               {chunked
                 ? 'av1an encodes the first video track only.'
-                : `Standalone ${options.name} executable · ${depthLabel} ${options.codec} · Source frame rate`}
+                : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name} · ${depthLabel} ${options.codec} · ${outputFrameRateLabel}`}
             </p>
           </div>
-          <div class="field">
-            <label for={`${idPrefix}-quality`}>Quality</label>
-            <div class="input-unit">
-              <input
-                id={`${idPrefix}-quality`}
-                type="number"
-                min={options.crfMin}
-                max={options.crfMax}
-                step="1"
-                bind:value={crf}
-                {disabled}
-              /><span>CRF</span>
+          {#if chunked}<Av1anOptionsControl
+              {idPrefix}
+              draft={av1an}
+              {disabled}
+              hdr={knownHdr(selectedVideo)}
+              framed={!!framingSummary(selectedFraming(framing))}
+              onchange={(value) => (av1an = value)}
+            />{/if}
+          {#if !chunked}<RateControlOptions
+              {idPrefix}
+              draft={rate}
+              {disabled}
+              onchange={(value) => (rate = value)}
+            />{/if}
+          {#if rate.mode === 'quality' && !(chunked && av1an.targetEnabled)}
+            <div class="field">
+              <label for={`${idPrefix}-quality`}>Quality</label>
+              <div class="input-unit">
+                <input
+                  id={`${idPrefix}-quality`}
+                  type="number"
+                  min={options.crfMin}
+                  max={options.crfMax}
+                  step="1"
+                  bind:value={crf}
+                  {disabled}
+                /><span>CRF</span>
+              </div>
+              <p>
+                {options.crfMin}–{options.crfMax} · Lower values retain more detail
+              </p>
             </div>
-            <p>
-              {options.crfMin}–{options.crfMax} · Lower values retain more detail
-            </p>
-          </div>
+          {/if}
           <div class="field">
             <label for={`${idPrefix}-preset`}>Encoder preset</label>
             <select id={`${idPrefix}-preset`} bind:value={preset} {disabled}
@@ -433,31 +598,62 @@
             bind:texturePsyBias
             bind:hdrTune
           />
-          {#if !chunked}
-            <div class="full-width">
-              <FramingOptions
-                {idPrefix}
-                draft={framing}
-                stream={selectedVideo}
+          <div class="full-width">
+            <AdvancedEncoderOptions
+              {encoder}
+              {backend}
+              value={parameters}
+              {disabled}
+              onchange={(value) => (parameters = value)}
+            />
+            <TemporalOptions
+              value={temporal}
+              video={selectedVideo}
+              {backend}
+              {disabled}
+              onchange={(value) => (temporal = value)}
+            />
+            {#if !chunked}<ToneMapOptions
+                draft={toneMap}
                 {disabled}
-                onchange={(next) => (framing = next)}
+                error={toneMapIssue}
+                onchange={(next) => (toneMap = next)}
+              /><TrimOptions
+                {idPrefix}
+                draft={trim}
+                {disabled}
+                error={trimIssue}
+                onchange={(next) => (trim = next)}
+              />{/if}
+            <FramingOptions
+              {idPrefix}
+              draft={framing}
+              stream={selectedVideo}
+              {disabled}
+              onchange={(next) => (framing = next)}
+            />
+            {#if file && typeof videoIndex === 'number'}
+              <SourcePreview
+                {file}
+                videoStreamIndex={videoIndex}
+                crop={selectedFraming(framing).crop}
+                disabled={disabled || !desktop}
+                onapply={(crop) => (framing = { ...framing, crop: { ...crop } })}
               />
-            </div>
-          {/if}
+            {/if}
+          </div>
         </div>
       </section>
       <section class="panel settings-panel">
         <div class="section-heading">
           <span class="heading-with-icon"
             ><AudioLines size={16} aria-hidden="true" /><span class="eyebrow"
-              >{chunked ? 'Copy source tracks' : 'Audio & source tracks'}</span
+              >Audio & source tracks</span
             ></span
           >
         </div>
         <p class="copy-note">
-          {chunked
-            ? 'Selected audio, subtitles, and attachments are copied without encoding. Audio keeps its source codec and channels.'
-            : 'Choose Copy source, Opus, or AAC for each selected audio track. Subtitles and attachments are copied.'}
+          Choose actions for selected audio and subtitle tracks. Attachments are copied.
         </p>
         <div class="copy-streams">
           {#each copiedStreams as stream (stream.index)}
@@ -477,10 +673,11 @@
                 ></span
               >
             </label>
-            {#if !chunked && stream.kind === 'audio' && included.includes(stream.index)}
+            {#if stream.kind === 'audio' && included.includes(stream.index)}
               {@const settings = audio.find((track) => track.streamIndex === stream.index)}
               {#if settings}
                 <AudioOptions
+                  inputPath={file!.path}
                   {idPrefix}
                   {stream}
                   {settings}
@@ -492,6 +689,22 @@
                   }}
                 />
               {/if}
+            {/if}
+            {#if stream.kind === 'subtitle' && included.includes(stream.index)}
+              {@const settings = subtitles.find((track) => track.streamIndex === stream.index)}
+              {#if settings}<SubtitleOptions
+                  toneMapped={toneMap.enabled}
+                  {idPrefix}
+                  {stream}
+                  {settings}
+                  {backend}
+                  video={selectedVideo}
+                  {disabled}
+                  onchange={(next) =>
+                    (subtitles = subtitles.map((track) =>
+                      track.streamIndex === next.streamIndex ? next : track,
+                    ))}
+                />{/if}
             {/if}
           {:else}<p class="small-muted">No additional tracks to copy.</p>{/each}
         </div>
@@ -518,39 +731,50 @@
             id={`${idPrefix}-destination`}
             bind:value={destination}
             {disabled}
-            placeholder="Choose a new .mkv file"
+            placeholder="Choose a new media file"
           />
         </div>
         <Button variant="outline" onclick={chooseOutput} {disabled}
           >Choose encode destination</Button
         >
-        <p class="small-muted">Matroska (.mkv). Existing files are never replaced.</p>
+        <ContainerOptions
+          value={destinationContainer(destination)}
+          onchange={(value) => (destination = containerDestination(destination, value))}
+          {disabled}
+        />
         <div class="output-summary">
           <Clapperboard size={15} aria-hidden="true" />
           <p>
             <strong>{depthLabel} {options.codec}</strong><span
               >{backend === 'av1an'
                 ? `av1an / ${options.name} · ${workers ?? '—'} workers`
-                : `Standalone ${options.name}`} · CRF
-              {crf ?? '—'} · Preset {presetLabel(encoder, preset)}{forkSettingsSummary({
+                : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name}`}
+              · {rateSummary(selectedRate(rate), crf)} · Preset {presetLabel(
+                encoder,
+                preset,
+              )}{forkSettingsSummary({
                 encoder,
                 lineartPsyBias,
                 texturePsyBias,
                 hdrTune,
-              })}{isSvtEncoder(encoder) ? ` · Grain ${filmGrain ?? '—'}` : ''} · MKV</span
+              })}{isSvtEncoder(encoder) ? ` · Grain ${filmGrain ?? '—'}` : ''} · {{
+                matroska: 'MKV',
+                mp4: 'MP4',
+                mov: 'MOV',
+                webm: 'WebM',
+              }[destinationContainer(destination)]}</span
             >
             <span
-              >{chunked
-                ? 'Audio copied when selected'
-                : audioSummary(audio.filter((track) => included.includes(track.streamIndex)))}</span
+              >{audioSummary(audio.filter((track) => included.includes(track.streamIndex)))}</span
             >
-            {#if !chunked}
-              <span
-                >{framingResult.error
-                  ? 'Check crop, resize and border values'
-                  : framingSummary(selectedFraming(framing))}</span
-              >
-            {/if}
+            {#if selectedSubtitles(subtitles, included).length}<span
+                >{subtitleSummary(selectedSubtitles(subtitles, included))}</span
+              >{/if}
+            <span
+              >{framingResult.error
+                ? 'Check crop, resize and border values'
+                : framingSummary(selectedFraming(framing))}</span
+            >
           </p>
         </div>
         <Button class="start-encode" onclick={() => start()} disabled={!canStart}
@@ -559,6 +783,7 @@
         <Button variant="outline" onclick={() => start(true)} disabled={!canQueue}
           >Add to queue</Button
         >
+        <CommandPlanPreview request={commandRequest} {disabled} />
         <p class="small-muted">
           Queue encodes with different sources or destinations. Jobs run one at a time.
         </p>
@@ -576,7 +801,10 @@
             av1an requires the first video track. Use Quick Convert for another video track.
           </p>
         {:else if hdrUnsupported}<p class="disabled-reason">
-            x264 supports SDR sources only. Choose SVT-AV1-HDR for compatible HDR10 video.
+            {options.name} supports SDR sources only. Choose SVT-AV1-HDR for compatible HDR10 video.
+          </p>
+        {:else if !validRate(rate)}<p class="disabled-reason">
+            Enter a valid whole-number bitrate or target size above.
           </p>
         {:else if !validSettings}<p class="disabled-reason">
             Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
@@ -585,13 +813,13 @@
               ? '; lineart and texture bias 0–7'
               : ''}{chunked ? '; parallel chunks 1–32' : ''}.
           </p>
-        {:else if !chunked && !framingValid}<p class="disabled-reason">
+        {:else if !framingValid}<p class="disabled-reason">
             {framingResult.error}
           </p>
-        {:else if !chunked && !validAudio(audio, included, file?.streams ?? [])}<p
-            class="disabled-reason"
-          >
-            Check the bitrate range shown for each selected audio track. Use whole numbers.
+        {:else if subtitleIssue}<p class="disabled-reason" role="alert">{subtitleIssue}</p>
+        {:else if !validAudio(audio, included, file?.streams ?? [])}<p class="disabled-reason">
+            Check the selected audio codec, channels, and bitrate. Any compatibility issue is shown
+            beside its track.
           </p>
         {:else if active}<p class="disabled-reason">
             A job is active. Add this encode to the queue to run it next.

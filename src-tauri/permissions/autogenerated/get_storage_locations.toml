@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-storage-locations"
+description = "Enables the get_storage_locations command without any pre-configured scope."
+commands.allow = ["get_storage_locations"]
+
+[[permission]]
+identifier = "deny-get-storage-locations"
+description = "Denies the get_storage_locations command without any pre-configured scope."
+commands.deny = ["get_storage_locations"]

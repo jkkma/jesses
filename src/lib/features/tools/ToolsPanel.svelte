@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import {
     Check,
     CircleAlert,
@@ -10,7 +11,10 @@
     Wrench,
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
+  import PreferencesPanel from './PreferencesPanel.svelte';
   import type { ToolInfo } from '$lib/ipc/generated';
+  import { getStorageLocations } from '$lib/ipc/client';
+  import { errorMessage } from '$lib/components/shared/format';
   let {
     tools,
     desktop,
@@ -27,6 +31,23 @@
     onrefresh: () => void;
   } = $props();
   const available = $derived(tools.filter((tool) => tool.available).length);
+  let locations = $state<[string, string][]>([]);
+  let storageError = $state<string | null>(null);
+  onMount(() => {
+    let active = true;
+    if (desktop) {
+      void getStorageLocations()
+        .then((result) => {
+          if (active) locations = result;
+        })
+        .catch((error) => {
+          if (active) storageError = errorMessage(error);
+        });
+    }
+    return () => {
+      active = false;
+    };
+  });
 </script>
 
 <section class="tools-workspace" aria-label="Tools and settings">
@@ -123,6 +144,30 @@
       >
     </div>
   </section>
+  {#if desktop}
+    <PreferencesPanel />
+    <section class="panel storage-panel" aria-label="Application storage">
+      <div class="section-heading"><span class="eyebrow">Application storage</span></div>
+      {#if storageError}<p class="storage-error" role="alert">{storageError}</p>
+      {:else if !locations.length}<p class="small-muted storage-error">
+          Reading application locations…
+        </p>
+      {:else}
+        <dl class="storage-locations">
+          {#each locations as [label, value] (label)}
+            <div>
+              <dt>{label}</dt>
+              <dd class="mono">{value}</dd>
+            </div>
+          {/each}
+        </dl>
+      {/if}
+      <div class="panel-footnote">
+        Portable packages keep preferences, history and logs beside the app. Installed copies use
+        your profile folders.
+      </div>
+    </section>
+  {/if}
   <section class="panel about-panel">
     <div>
       <div class="brand-wordmark">jesses<span class="version-tag">0.1.0</span></div>
@@ -134,3 +179,34 @@
     >
   </section>
 </section>
+
+<style>
+  .storage-locations {
+    margin: 0;
+    padding: 1.25rem;
+    display: grid;
+    gap: 1rem;
+  }
+  .storage-locations div {
+    display: grid;
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
+    gap: 1rem;
+  }
+  .storage-locations dt {
+    font-size: 0.8rem;
+  }
+  .storage-locations dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.75rem;
+  }
+  .storage-error {
+    padding: 1.25rem;
+  }
+  @media (max-width: 800px) {
+    .storage-locations div {
+      grid-template-columns: 1fr;
+      gap: 0.3rem;
+    }
+  }
+</style>

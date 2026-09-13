@@ -1,6 +1,8 @@
 use media_core::{
-    AppError, BatchEncodePreview, BatchEncodeRequest, EncodeRequest, FolderScanRequest,
-    FolderScanResult, JobSnapshot, MediaFile, RemuxRequest, ToolInfo,
+    AppError, AutoCropRequest, AutoCropResult, BatchEncodePreview, BatchEncodeRequest,
+    BitrateRequest, BitrateResult, EncodeRequest, FolderScanRequest, FolderScanResult,
+    FramePreviewRequest, FramePreviewResult, JobSnapshot, LoudnessRequest, LoudnessResult,
+    MediaFile, RemuxRequest, ToolInfo,
 };
 use media_runtime::jobs::JobManager;
 use std::sync::{
@@ -10,9 +12,184 @@ use std::sync::{
 use std::time::Duration;
 use tauri::{Manager, State, ipc::Channel};
 
+mod analysis;
+mod paths;
+
+#[tauri::command]
+async fn export_analysis(request: media_core::AnalysisExportRequest) -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(move || media_runtime::jobs::export_analysis(request))
+        .await
+        .map_err(|e| AppError::new("ANALYSIS_EXPORT_FAILED", e.to_string(), None))?
+}
+
+type Preferences = Arc<media_runtime::preferences::PreferencesStore>;
+async fn with_preferences<T: Send + 'static>(
+    store: Preferences,
+    action: impl FnOnce(&media_runtime::preferences::PreferencesStore) -> Result<T, AppError>
+    + Send
+    + 'static,
+) -> Result<T, AppError> {
+    tauri::async_runtime::spawn_blocking(move || action(&store))
+        .await
+        .map_err(|e| AppError::new("PREFERENCES_FAILED", e.to_string(), None))?
+}
+#[tauri::command]
+async fn get_preferences(
+    store: State<'_, Preferences>,
+) -> Result<media_core::UserPreferences, AppError> {
+    with_preferences(store.inner().clone(), |store| store.get()).await
+}
+#[tauri::command]
+async fn save_preferences(
+    request: media_core::SavePreferencesRequest,
+    store: State<'_, Preferences>,
+) -> Result<media_core::UserPreferences, AppError> {
+    with_preferences(store.inner().clone(), move |store| store.save(request)).await
+}
+#[tauri::command]
+async fn get_parameter_presets(
+    store: State<'_, Preferences>,
+) -> Result<Vec<media_core::EncoderParameterPreset>, AppError> {
+    with_preferences(store.inner().clone(), |store| store.parameter_presets()).await
+}
+#[tauri::command]
+async fn save_parameter_preset(
+    request: media_core::EncoderParameterPreset,
+    store: State<'_, Preferences>,
+) -> Result<Vec<media_core::EncoderParameterPreset>, AppError> {
+    with_preferences(store.inner().clone(), move |store| {
+        store.save_parameter_preset(request)
+    })
+    .await
+}
+#[tauri::command]
+async fn remove_parameter_preset(
+    request: media_core::EncoderParameterPresetKey,
+    store: State<'_, Preferences>,
+) -> Result<Vec<media_core::EncoderParameterPreset>, AppError> {
+    with_preferences(store.inner().clone(), move |store| {
+        store.remove_parameter_preset(request)
+    })
+    .await
+}
+#[tauri::command]
+async fn remember_recent_media(
+    paths: Vec<String>,
+    store: State<'_, Preferences>,
+) -> Result<media_core::UserPreferences, AppError> {
+    with_preferences(store.inner().clone(), move |store| store.remember(paths)).await
+}
+#[tauri::command]
+async fn preview_preference_import(
+    path: String,
+    store: State<'_, Preferences>,
+) -> Result<media_core::PreferenceImportPreview, AppError> {
+    with_preferences(store.inner().clone(), move |store| {
+        store.preview_import(path.into())
+    })
+    .await
+}
+#[tauri::command]
+async fn recent_path_is_folder(path: String) -> Result<bool, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        media_runtime::preferences::recent_path_is_folder(path)
+    })
+    .await
+    .map_err(|e| AppError::new("RECENT_MEDIA_UNAVAILABLE", e.to_string(), None))?
+}
+
+#[tauri::command]
+fn get_storage_locations(paths: State<'_, paths::AppPaths>) -> Vec<(String, String)> {
+    vec![
+        ("Storage mode".into(), paths.mode.as_str().into()),
+        (
+            "Application resources".into(),
+            paths.resource_dir.display().to_string(),
+        ),
+        ("Preferences".into(), paths.config_dir.display().to_string()),
+        (
+            "Job history".into(),
+            paths.history_dir().display().to_string(),
+        ),
+        ("Cache".into(), paths.cache_dir.display().to_string()),
+        ("Job logs".into(), paths.job_log_dir().display().to_string()),
+    ]
+}
+
+#[tauri::command]
+fn begin_media_analysis(tasks: State<'_, analysis::AnalysisTasks>) -> Result<String, AppError> {
+    tasks.begin()
+}
+
+#[tauri::command]
+fn cancel_media_analysis(id: String, tasks: State<'_, analysis::AnalysisTasks>) {
+    tasks.cancel(&id);
+}
+
+#[tauri::command]
+async fn preview_frame(
+    id: String,
+    request: FramePreviewRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<FramePreviewResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::preview_frame(request, running.cancel.clone()).await
+}
+
+#[tauri::command]
+async fn detect_crop(
+    id: String,
+    request: AutoCropRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<AutoCropResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::detect_crop(request, running.cancel.clone()).await
+}
+
+#[tauri::command]
+async fn get_encoder_parameters(
+    id: String,
+    request: media_core::EncoderParameterQuery,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::EncoderParameterCatalog, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::get_encoder_parameters(request.encoder, request.backend, running.cancel.clone())
+        .await
+}
+
+#[tauri::command]
+async fn preview_encode_plan(
+    id: String,
+    request: EncodeRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::EncodeCommandPlan, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::preview_encode_plan(request, running.cancel.clone()).await
+}
+
 struct Jobs {
     manager: Arc<JobManager>,
     subscription: Arc<AtomicU64>,
+}
+
+#[tauri::command]
+async fn analyze_quality(
+    id: String,
+    request: media_core::QualityRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::QualityResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::analyze_quality(request, running.cancel.clone()).await
+}
+
+#[tauri::command]
+async fn analyze_bitrate(
+    id: String,
+    request: BitrateRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<BitrateResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::analyze_bitrate(request, running.cancel.clone()).await
 }
 
 #[tauri::command]
@@ -21,6 +198,33 @@ async fn start_remux(
     jobs: State<'_, Jobs>,
 ) -> Result<JobSnapshot, AppError> {
     jobs.manager.start_remux(request).await
+}
+
+#[tauri::command]
+async fn set_job_paused(
+    id: String,
+    paused: bool,
+    jobs: State<'_, Jobs>,
+) -> Result<JobSnapshot, AppError> {
+    jobs.manager.set_job_paused(id, paused).await
+}
+
+#[tauri::command]
+async fn measure_loudness(
+    id: String,
+    request: LoudnessRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<LoudnessResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::measure_loudness(request, running.cancel.clone()).await
+}
+
+#[tauri::command]
+async fn start_mux(
+    request: media_core::MuxRequest,
+    jobs: State<'_, Jobs>,
+) -> Result<JobSnapshot, AppError> {
+    jobs.manager.start_mux(request).await
 }
 
 #[tauri::command]
@@ -126,8 +330,33 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let log_dir = app.path().app_log_dir()?.join("jobs");
-            let history_dir = app.path().app_data_dir()?.join("jobs");
+            let executable = std::env::current_exe()?;
+            #[cfg(target_os = "linux")]
+            let executable = {
+                let appimage = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from);
+                let appdir = std::env::var_os("APPDIR").map(std::path::PathBuf::from);
+                paths::launcher_path(&executable, appimage.as_deref(), appdir.as_deref())?
+            };
+            let paths = paths::AppPaths::resolve(
+                &executable,
+                paths::InstalledPaths {
+                    resource_dir: app.path().resource_dir()?,
+                    config_dir: app.path().app_config_dir()?,
+                    data_dir: app.path().app_data_dir()?,
+                    cache_dir: app.path().app_cache_dir()?,
+                    log_dir: app.path().app_log_dir()?,
+                },
+            )?;
+            paths.prepare()?;
+            media_runtime::configure_bundled_tools(paths.resource_dir.clone())
+                .map_err(std::io::Error::other)?;
+            let log_dir = paths.job_log_dir();
+            let history_dir = paths.history_dir();
+            app.manage(Arc::new(
+                media_runtime::preferences::PreferencesStore::open(paths.config_dir.clone()),
+            ));
+            app.manage(paths);
+            app.manage(analysis::AnalysisTasks::default());
             app.manage(Jobs {
                 manager: Arc::new(tauri::async_runtime::block_on(JobManager::open(
                     log_dir,
@@ -138,9 +367,30 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            export_analysis,
+            get_preferences,
+            get_parameter_presets,
+            save_parameter_preset,
+            remove_parameter_preset,
+            save_preferences,
+            remember_recent_media,
+            preview_preference_import,
+            recent_path_is_folder,
+            get_storage_locations,
+            begin_media_analysis,
+            cancel_media_analysis,
+            preview_frame,
+            detect_crop,
+            get_encoder_parameters,
+            preview_encode_plan,
+            analyze_bitrate,
+            analyze_quality,
+            set_job_paused,
+            measure_loudness,
             probe_media,
             get_capabilities,
             start_remux,
+            start_mux,
             start_encode,
             enqueue_encode,
             scan_media_folder,
@@ -169,7 +419,8 @@ pub fn run() {
                     let manager = Arc::clone(&app.state::<Jobs>().manager);
                     let exiting = Arc::clone(&exiting);
                     tauri::async_runtime::spawn(async move {
-                        manager.shutdown().await;
+                        let analyses = app.state::<analysis::AnalysisTasks>();
+                        tokio::join!(manager.shutdown(), analyses.shutdown());
                         exiting.store(2, Ordering::SeqCst);
                         app.exit(code.unwrap_or(0));
                     });

@@ -310,7 +310,9 @@ test('choosing another source rebuilds the draft from its original stream indice
   await expect(page.getByRole('heading', { name: nextMedia.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Remux', exact: true }).click();
   await expect(page.getByLabel('Include stream #2', { exact: true })).toBeChecked();
-  await expect(page.getByRole('checkbox')).toHaveCount(1);
+  await expect(
+    page.getByRole('region', { name: 'Streams to copy' }).getByRole('checkbox'),
+  ).toHaveCount(1);
   await expect(page.getByLabel('Destination', { exact: true })).toHaveValue(
     'C:\\media\\audio-only_remux.mkv',
   );
