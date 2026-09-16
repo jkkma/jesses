@@ -242,6 +242,7 @@ struct Entry {
     identity: Identity,
     // Keeping the original object open prevents Unix from reusing its inode
     // for a same-name replacement before cleanup checks the pathname.
+    #[cfg(unix)]
     identity_guard: Option<File>,
 }
 
@@ -303,12 +304,14 @@ impl Directory {
             .map_err(|cause| error(cause.to_string(), &path))?;
         let identity =
             Identity::from_file(&file).map_err(|cause| error(cause.to_string(), &path))?;
+        #[cfg(unix)]
         let identity_guard = file
             .try_clone()
             .map_err(|cause| error(cause.to_string(), &path))?;
         self.entries.push(Entry {
             path,
             identity,
+            #[cfg(unix)]
             identity_guard: Some(identity_guard),
         });
         Ok(file)
@@ -396,8 +399,8 @@ impl Drop for Directory {
             if entry.identity.matches_path(&entry.path, false) {
                 let _ = fs::remove_file(&entry.path);
             }
-            // On Windows, a deletion may finish only after the last handle is
-            // closed. Release each guard before removing the owned directory.
+            #[cfg(unix)]
+            // Release each guard before removing the owned directory.
             entry.identity_guard.take();
         }
         if !self.identity.matches_path(&self.path, true) {
