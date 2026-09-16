@@ -138,7 +138,8 @@ video budget. It reserves another 1% plus 64 KiB for video/container overhead.
 Targets are approximate: content and encoder decisions can undershoot or exceed
 them, and final container conversion can change overhead. Actual bytes and the
 difference are recorded in job history. Every pass starts a fresh decoder and
-encoder, and cancellation removes owned pass outputs and statistics. Omitted
+encoder, and cancellation removes partial outputs and transient pass statistics.
+Completed phase checkpoints remain available for explicit Resume. Omitted
 rate settings retain CRF behavior in old jobs. av1an supports CRF and per-chunk perceptual quality targets.
 See [rate-control qualification](tests/fixtures/rate-control-validation.md).
 

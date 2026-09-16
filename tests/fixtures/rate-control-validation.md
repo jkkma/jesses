@@ -5,6 +5,13 @@ all six video encoders: x264, FFmpeg libx265, FFmpeg libvpx-vp9, mainline SVT-AV
 SVT-AV1 5fish, and SVT-AV1-HDR. Existing jobs omit `rateControl` and retain CRF.
 av1an retains its existing CRF workflow.
 
+The September 16 integration update preserves completed standalone phase
+checkpoints on cancellation. Partial outputs and transient pass statistics are
+removed; canceling during pass two can retain only the verified first-pass
+checkpoint for explicit Resume. The cancellation gate now checks its exact
+job-bound workspace and complete statistics. The September 13 receipts below
+predate durable standalone recovery and describe the earlier cleanup behavior.
+
 ## Request and execution
 
 `rateControl` is either `{mode:"bitrate",bitrateKbps,twoPass}` or

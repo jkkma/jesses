@@ -77,6 +77,11 @@ job-bound directory after an exclusive lock and strict request/settings/layout
 check; execution still performs the full source, tool, plan and artifact checks.
 Unknown, replaced or modified workspace entries are preserved and reject cleanup.
 
+**Cancel job** and **Stop queue** also retain completed phase checkpoints for
+explicit **Resume**. They remove partial output and transient pass statistics;
+canceling before the first checkpoint leaves no saved progress. A retained
+checkpoint is bound to the job and must pass the same validation before reuse.
+
 The Windows real-media qualification stopped a two-pass direct x265 job after
 `PassOneComplete`, reopened persisted history in a separate process, resumed pass
 two, and produced 48 decoded HEVC frames at exactly 2997/125 fps. The recovery

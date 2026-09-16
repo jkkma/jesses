@@ -1,11 +1,13 @@
 //! Native rate-control gates use fresh synthetic sources and owned destinations.
-use media_core::VideoRateControl;
+use media_core::{StandaloneRecoveryPhase, VideoRateControl};
 use media_runtime::{
     EncodeRequest, EncodeSettings, JobManager, JobState, RemuxRequest, VideoEncoder,
     supervisor::{CommandSpec, run_capture},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -145,6 +147,31 @@ async fn inspect(path: &Path) -> Value {
         .await,
     )
     .unwrap()
+}
+
+fn verify_recovery_stamp(stamp: &Value) -> PathBuf {
+    let path = PathBuf::from(stamp["path"].as_str().expect("recovery stamp path"));
+    let data = std::fs::read(&path).unwrap();
+    assert_eq!(
+        stamp["length"].as_u64(),
+        Some(data.len() as u64),
+        "recovery stamp length: {}",
+        path.display()
+    );
+    assert_eq!(
+        stamp["sha256"].as_str(),
+        Some(format!("{:x}", Sha256::digest(&data)).as_str()),
+        "recovery stamp hash: {}",
+        path.display()
+    );
+    assert!(
+        stamp["identity"]
+            .as_array()
+            .is_some_and(|identity| !identity.is_empty()),
+        "recovery stamp identity: {}",
+        path.display()
+    );
+    path
 }
 
 #[tokio::test]
@@ -379,7 +406,7 @@ async fn target_size_measures_flac_and_trimmed_duration_and_rejects_impossible_c
 
 #[tokio::test]
 #[ignore = "requires installed native FFmpeg libvpx"]
-async fn cancel_each_pass_reaps_both_tools_and_removes_owned_statistics() {
+async fn cancel_each_pass_reaps_tools_and_retains_only_verified_phase_recovery() {
     let fixture = Fixture::new();
     let input = source_seconds(&fixture, "60").await;
     let original = std::fs::read(&input).unwrap();
@@ -441,13 +468,120 @@ async fn cancel_each_pass_reaps_both_tools_and_removes_owned_statistics() {
         .await
         .unwrap();
         manager.cancel_job(job.id.clone()).await.unwrap();
-        assert_eq!(wait(&manager, &job.id).await.state, JobState::Canceled);
+        let canceled = wait(&manager, &job.id).await;
+        assert_eq!(canceled.state, JobState::Canceled, "{canceled:#?}");
         assert!(!path.exists());
+        let mut leftovers = std::fs::read_dir(&fixture.0)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".jesses-"))
+            .map(|entry| entry.path().canonicalize().unwrap())
+            .collect::<Vec<_>>();
+        leftovers.sort();
+        let transient_stats = fixture.0.join(format!(".jesses-{}-passes", job.id));
         assert!(
-            !std::fs::read_dir(&fixture.0)
+            !transient_stats.exists(),
+            "Canceling pass {pass} retained transient statistics: {canceled:#?}"
+        );
+        if pass == 1 {
+            assert!(canceled.standalone_recovery.is_none(), "{canceled:#?}");
+            assert!(
+                leftovers.is_empty(),
+                "Canceling pass one retained unverified work: {leftovers:?}: {canceled:#?}"
+            );
+            continue;
+        }
+
+        // Pass one is a complete, hash-bound recovery phase. Canceling pass two
+        // keeps that resumable checkpoint while deleting its transient encoder
+        // statistics and every partial pass-two output.
+        let recovery = canceled
+            .standalone_recovery
+            .as_ref()
+            .expect("pass two cancellation retains verified pass one");
+        assert_eq!(recovery.phase, StandaloneRecoveryPhase::PassOneComplete);
+        assert_eq!(recovery.completed_frames, 0);
+        assert_eq!(recovery.total_frames, 60 * 24);
+        let workspace = fixture
+            .0
+            .canonicalize()
+            .unwrap()
+            .join(format!(".jesses-{}.standalone", job.id));
+        assert_eq!(Path::new(&recovery.workspace), workspace);
+        assert_eq!(leftovers, vec![workspace.clone()]);
+
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(workspace.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["version"], json!(1));
+        assert_eq!(manifest["id"], json!(job.id));
+        assert_eq!(manifest["phase"], json!("passOneComplete"));
+        assert_eq!(manifest["two_pass"], json!(true));
+        assert_eq!(manifest["total_frames"], json!(recovery.total_frames));
+        assert_eq!(
+            manifest["request"],
+            serde_json::to_value(&canceled.request).unwrap()
+        );
+        assert_eq!(
+            manifest["settings"],
+            serde_json::to_value(canceled.encode_settings.as_ref().unwrap()).unwrap()
+        );
+        assert!(manifest["directory"].as_array().is_some());
+        assert!(
+            manifest["plan"]
+                .as_array()
+                .is_some_and(|plan| !plan.is_empty())
+        );
+        assert!(manifest["video"].is_null());
+        assert!(manifest["timed_video"].is_null());
+        assert!(manifest["final_stage"].is_null());
+
+        let source_stamp = verify_recovery_stamp(&manifest["source"]);
+        assert_eq!(source_stamp, input.canonicalize().unwrap());
+        for tool_stamp in manifest["tools"].as_array().expect("tool receipts") {
+            verify_recovery_stamp(tool_stamp);
+        }
+        let stats = manifest["stats"].as_array().expect("pass one receipts");
+        assert!(!stats.is_empty());
+        assert!(manifest["stats_directory"].as_array().is_some());
+        let stats_paths = stats.iter().map(verify_recovery_stamp).collect::<Vec<_>>();
+        let stats_directory = stats_paths[0].parent().unwrap().to_owned();
+        assert_eq!(stats_directory.parent(), Some(workspace.as_path()));
+        assert!(
+            stats_directory
+                .file_name()
                 .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains(".jesses-"))
+                .to_string_lossy()
+                .starts_with("uncommitted-stats-")
+        );
+        assert!(stats_paths.iter().all(|path| {
+            path.parent() == Some(stats_directory.as_path())
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("jesses.stats")
+        }));
+        let recorded_stats = stats_paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        let actual_stats = std::fs::read_dir(&stats_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_stats, recorded_stats);
+        let root_entries = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            root_entries,
+            BTreeSet::from([
+                "manifest.json".into(),
+                "workspace.lock".into(),
+                stats_directory.file_name().unwrap().to_owned(),
+            ])
         );
     }
     assert_eq!(std::fs::read(input).unwrap(), original);
