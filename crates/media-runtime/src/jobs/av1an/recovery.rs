@@ -175,11 +175,17 @@ fn with_owned_output<T>(
         .map_err(|e| error(destination, e.to_string()))?;
     let owned = file_identity(&output).map_err(|e| error(destination, e.to_string()))?;
     let result = operation(&mut output);
-    drop(output);
     if result.is_err() {
         // Remove only the exact create-new file. If its pathname was replaced,
         // fail closed and preserve the replacement.
-        let _ = remove_tree(destination, &owned, None);
+        #[cfg(unix)]
+        let guard = Some(output);
+        #[cfg(not(unix))]
+        let guard = {
+            drop(output);
+            None
+        };
+        let _ = remove_tree(destination, &owned, guard);
     }
     result
 }
@@ -1172,13 +1178,10 @@ fn remove_tree(
     ) -> Result<(), AppError> {
         let metadata = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
         let directory = metadata.is_dir();
-        let guard = if directory {
-            Some(match guard {
-                Some(guard) => guard,
-                None => directory_guard(path)?,
-            })
-        } else {
-            None
+        let guard = match guard {
+            Some(guard) => Some(guard),
+            None if directory => Some(directory_guard(path)?),
+            None => None,
         };
         if identity(path)? != *expected {
             return Err(error(
@@ -1217,15 +1220,16 @@ fn remove_tree(
     }
     children.extend(receipts);
     children.push(root_entry);
-    for mut entry in children {
+    for entry in children {
         if identity(root)? != *expected || identity(&entry.path)? != entry.identity {
             return Err(error(&entry.path, "Recovery entry changed during cleanup."));
         }
-        // Ancestor directory guards stay alive throughout child removal. Only
-        // release this entry's guard immediately before deleting its exact ID.
-        drop(entry.guard.take());
         #[cfg(windows)]
         {
+            let mut entry = entry;
+            // Windows requires closing a directory handle before deleting its
+            // exact ID. Ancestor directory guards remain live.
+            drop(entry.guard.take());
             let _ = entry.directory;
             let id = &entry.identity.0;
             files::windows_delete_owned(&entry.path, (id[0] as u32, id[1] as u32, id[2] as u32))
@@ -1233,12 +1237,14 @@ fn remove_tree(
         }
         #[cfg(not(windows))]
         {
+            // Keep any supplied identity guard live through the unlink.
             if entry.directory {
                 fs::remove_dir(&entry.path)
             } else {
                 fs::remove_file(&entry.path)
             }
             .map_err(|e| error(&entry.path, e.to_string()))?;
+            drop(entry.guard);
         }
     }
     Ok(())
@@ -1715,24 +1721,39 @@ mod tests {
         let fixture = Fixture::new();
         let destination = fixture.0.join("prepared.mkv");
         let (_, cancel) = watch::channel(true);
-        let result: Result<(), AppError> = with_owned_output(&destination, |_output| {
+        let result: Result<(), AppError> = with_owned_output(&destination, |output| {
+            output.write_all(b"partial").unwrap();
             check_cancel(&cancel)?;
             Ok(())
         });
         assert_eq!(result.unwrap_err().code, "JOB_CANCELED");
         assert!(!destination.exists());
 
-        let owned_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .unwrap();
-        let owned = file_identity(&owned_file).unwrap();
-        drop(owned_file);
-        fs::remove_file(&destination).unwrap();
-        fs::write(&destination, b"replacement").unwrap();
-        assert!(remove_tree(&destination, &owned, None).is_err());
-        assert_eq!(fs::read(destination).unwrap(), b"replacement");
+        #[cfg(unix)]
+        {
+            let result: Result<(), AppError> = with_owned_output(&destination, |output| {
+                output.write_all(b"owned").unwrap();
+                fs::remove_file(&destination).unwrap();
+                fs::write(&destination, b"replacement").unwrap();
+                Err(error(&destination, "forced prepared-copy failure"))
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(destination).unwrap(), b"replacement");
+        }
+        #[cfg(windows)]
+        {
+            let owned_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .unwrap();
+            let owned = file_identity(&owned_file).unwrap();
+            drop(owned_file);
+            fs::remove_file(&destination).unwrap();
+            fs::write(&destination, b"replacement").unwrap();
+            assert!(remove_tree(&destination, &owned, None).is_err());
+            assert_eq!(fs::read(destination).unwrap(), b"replacement");
+        }
     }
 
     #[test]
