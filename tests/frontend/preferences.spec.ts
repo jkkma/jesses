@@ -106,6 +106,13 @@ async function setup(page: Page) {
             ignoredKeyCount: 12,
             warnings: [],
           };
+        if (command === 'get_completion_status')
+          return {
+            options: { notify: false, finishAction: 'none' },
+            armedJobs: 0,
+            secondsRemaining: null,
+            error: null,
+          };
         throw new Error(`Unexpected command ${command}`);
       },
     };

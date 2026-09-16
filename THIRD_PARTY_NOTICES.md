@@ -58,6 +58,12 @@ are compiled locally with only Windows system DLL imports; the scorer delivery
 and merged av1an receipt retain their source, build and payload hashes. See
 `scripts/package-av1an-scorers-lock.json` for exact component identities.
 
+The optional per-user Windows GPU scorer is Vship 5.1.1's prebuilt x64 Vulkan
+plugin under the MIT license. Its binary and complete tagged source archive are
+hash-pinned by `scripts/vship-windows-lock.json`; the installer retains the
+archive and upstream license beside the managed binary before activating it in
+one selected portable VapourSynth runtime.
+
 The Linux package recipe compiles standalone x264 and mainline SVT-AV1 from the
 same pinned sources and retains their notices. Ordinary glibc/compiler shared
 libraries are declared system dependencies. Linux native build qualification

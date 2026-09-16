@@ -16,6 +16,84 @@ use serde_json::{Value, json};
 
 struct Fixture(PathBuf);
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone x264"]
+async fn lossless_ultrafast_preserves_pixels_when_the_video_start_header_is_absent() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("lossless-source.mkv");
+    let destination = fixture.0.join("lossless-output.mkv");
+    output(command("ffmpeg").args([
+        "-v", "error", "-n", "-f", "lavfi", "-i", "testsrc2=s=128x72:r=24:d=0.167", "-frames:v", "4", "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-pix_fmt", "yuv420p10le", "-chroma_sample_location", "left", "-c:v", "ffv1", "-level", "3",
+    ]).arg(&input)).await;
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let started = manager
+        .start_encode(EncodeRequest {
+            source: RemuxRequest {
+                input_path: input.to_string_lossy().into_owned(),
+                output_path: destination.to_string_lossy().into_owned(),
+                stream_indices: vec![0],
+            },
+            settings: EncodeSettings {
+                encoder: VideoEncoder::X264,
+                preset: 0,
+                lossless: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let snapshot = manager
+                .list_jobs()
+                .await
+                .into_iter()
+                .find(|job| job.id == started.id)
+                .unwrap();
+            if snapshot.state.is_terminal() {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed.state, JobState::Succeeded, "{completed:?}");
+    assert!(
+        completed
+            .logs
+            .iter()
+            .any(|line| line.contains("Verified lossless decoded pixel"))
+    );
+    let mut hashes = Vec::new();
+    for path in [&input, &destination] {
+        hashes.push(
+            output(
+                command("ffmpeg")
+                    .args(["-v", "error", "-xerror", "-i"])
+                    .arg(path)
+                    .args([
+                        "-map",
+                        "0:v:0",
+                        "-pix_fmt",
+                        "yuv420p10le",
+                        "-c:v",
+                        "rawvideo",
+                        "-f",
+                        "hash",
+                        "-hash",
+                        "sha256",
+                        "-",
+                    ]),
+            )
+            .await,
+        );
+    }
+    assert_eq!(hashes[0], hashes[1]);
+}
 impl Fixture {
     fn new() -> Self {
         let nonce = SystemTime::now()
@@ -457,6 +535,9 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             inputs: vec![input.clone(), input.clone()],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             backend: EncodeBackend::Standalone,
@@ -540,6 +621,9 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             inputs: vec![BatchEncodeInput {
                 temporal: None,
                 tone_map: None,

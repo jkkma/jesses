@@ -242,6 +242,7 @@ async fn real_plan_reuses_native_argv_with_literal_paths_and_never_publishes() {
     request.settings.trim = Some(media_core::VideoTrim {
         start_frame: 12,
         end_frame_exclusive: 36,
+        time: None,
     });
     request.settings.rate_control = Some(media_core::VideoRateControl::Bitrate {
         bitrate_kbps: 250,

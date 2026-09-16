@@ -11,6 +11,11 @@ pub struct FramePreviewRequest {
     pub input_path: String,
     pub video_stream_index: u32,
     pub position_seconds: f64,
+    /// Inspector images may honor rotation and pixel aspect ratio. Crop previews
+    /// retain coded coordinates when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_orientation: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

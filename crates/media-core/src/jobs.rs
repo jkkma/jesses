@@ -51,6 +51,19 @@ pub struct EncodeSettings {
     pub video_stream_index: u32,
     pub crf: u8,
     pub preset: u8,
+    /// Explicit codec lossless mode. Omission keeps historical lossy behavior.
+    #[serde(default)]
+    pub lossless: bool,
+    /// SVT CRF in quarter-step units (4 = 1.00, 280 = 70.00).
+    /// Omission keeps the legacy integer `crf` field authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub svt_crf_quarter_steps: Option<u16>,
+    /// SVT preset override including research presets below zero.
+    /// Omission keeps the legacy non-negative `preset` field authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub svt_preset: Option<i8>,
     /// AV1 grain synthesis strength; zero leaves synthesis disabled.
     #[serde(default)]
     pub film_grain: u8,
@@ -84,6 +97,9 @@ impl Default for EncodeSettings {
             video_stream_index: 0,
             crf: 30,
             preset: 4,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             film_grain: 0,
             lineart_psy_bias: 0,
             texture_psy_bias: 0,
@@ -181,9 +197,23 @@ pub enum VideoRateControl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoTimeTrim {
+    pub start_milliseconds: u32,
+    pub end_milliseconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct VideoTrim {
+    #[serde(default)]
     pub start_frame: u32,
+    #[serde(default)]
     pub end_frame_exclusive: u32,
+    /// Presence selects time boundaries; omission preserves historical frame
+    /// interval jobs and their serialized representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub time: Option<VideoTimeTrim>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -236,6 +266,11 @@ pub enum VideoEncoder {
     X264,
     X265,
     Vp9,
+    AomAv1,
+    X265Standalone,
+    VpxStandalone,
+    H264Nvenc,
+    HevcNvenc,
 }
 
 impl VideoEncoder {
@@ -251,11 +286,19 @@ impl VideoEncoder {
             Self::X264 => "x264",
             Self::X265 => "x265",
             Self::Vp9 => "VP9",
+            Self::AomAv1 => "AOM AV1",
+            Self::X265Standalone => "x265 standalone",
+            Self::VpxStandalone => "VPX VP9",
+            Self::H264Nvenc => "NVIDIA NVENC H.264",
+            Self::HevcNvenc => "NVIDIA NVENC HEVC",
         }
     }
 
     pub fn is_ffmpeg(self) -> bool {
-        matches!(self, Self::X265 | Self::Vp9)
+        matches!(
+            self,
+            Self::X265 | Self::Vp9 | Self::H264Nvenc | Self::HevcNvenc
+        )
     }
 }
 
@@ -323,6 +366,31 @@ pub struct Av1anRecovery {
     pub total_frames: u64,
 }
 
+/// Fully verified whole-phase checkpoints for the standalone encoder pipeline.
+/// A checkpoint never claims partial-frame continuation: an interrupted phase
+/// is rerun from its last completed boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum StandaloneRecoveryPhase {
+    PassOneComplete,
+    VideoComplete,
+    TimingWrapComplete,
+    Finalizing,
+}
+
+/// Display information and a workspace locator; the runtime manifest remains
+/// the authority for source, tool, settings, plan and artifact identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct StandaloneRecovery {
+    pub workspace: String,
+    pub phase: StandaloneRecoveryPhase,
+    #[ts(type = "number")]
+    pub completed_frames: u64,
+    #[ts(type = "number")]
+    pub total_frames: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSnapshot {
@@ -338,6 +406,9 @@ pub struct JobSnapshot {
     pub encode_settings: Option<EncodeSettings>,
     #[serde(default)]
     pub recovery: Option<Av1anRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub standalone_recovery: Option<StandaloneRecovery>,
     pub progress_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub logs: Vec<String>,
@@ -361,6 +432,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.recovery, None);
+        assert_eq!(snapshot.standalone_recovery, None);
         assert_eq!(snapshot.mux_request, None);
         assert!(
             serde_json::to_value(&snapshot)
@@ -372,6 +444,18 @@ mod tests {
         snapshot.recovery = Some(Av1anRecovery {
             workspace: "owned-work".into(),
             phase: RecoveryPhase::Finalizing,
+            completed_frames: 240,
+            total_frames: 240,
+        });
+        assert_eq!(
+            serde_json::from_value::<JobSnapshot>(serde_json::to_value(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
+        snapshot.recovery = None;
+        snapshot.standalone_recovery = Some(StandaloneRecovery {
+            workspace: "owned-standalone-work".into(),
+            phase: StandaloneRecoveryPhase::TimingWrapComplete,
             completed_frames: 240,
             total_frames: 240,
         });

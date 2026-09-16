@@ -80,6 +80,8 @@ pub(super) async fn build(
     settings: &EncodeSettings,
     selected: &[&metadata::Stream],
     trim: Option<&super::super::trim::Prepared>,
+    source_interval: Option<(u32, u32)>,
+    qtgmc: Option<&super::super::qtgmc::Prepared>,
     subtitles: &super::super::subtitles::Prepared,
     audio_filters: &std::collections::BTreeMap<u32, String>,
     rate: Option<&super::super::rate_control::Rate>,
@@ -89,8 +91,14 @@ pub(super) async fn build(
 ) -> Result<(), AppError> {
     check_cancel(cancel)?;
     let temporary = Temporary::create(output, &format!("{id}-plan-mux"))?;
-    let video = if settings.encoder.is_svt() {
+    let video = if settings.encoder.is_svt()
+        || matches!(
+            settings.encoder,
+            VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
+        ) {
         Temporary::create_ivf(output, &format!("{id}-plan-video"))?
+    } else if settings.encoder == VideoEncoder::X265Standalone {
+        Temporary::create_extension(output, &format!("{id}-plan-video"), "hevc")?
     } else {
         Temporary::create(output, &format!("{id}-plan-video"))?
     };
@@ -102,19 +110,74 @@ pub(super) async fn build(
         "Arguments are separate native argv values; the application never evaluates them through a shell. This preview's temporary files are removed before it returns. Execution creates fresh owned paths and repeats validation.".into(),
         "Validation probes and font/subtitle preparation are additional supervised steps. After encoding, every output frame, audio timeline, selected track and metadata is checked before atomic no-overwrite publication.".into(),
     ];
+    if settings.lossless {
+        preview.notes.push("Before publication, execution compares the complete decoded pixel stream with the processed encoder input. A mismatch fails the job even when the encoder reports lossless coding; try another preset or encoder.".into());
+    }
     preview.stages.push(stage("Source frame validation",CommandSpec{executable:ffprobe.to_owned(),args:frame_scan_args(&source.path,plan.video_index,std::thread::available_parallelism().map_or(1,usize::from).min(8)),cwd:None},vec!["Already completed for this preview, including source cadence and per-frame color/field validation.".into()]));
+    if let Some(qtgmc) = qtgmc {
+        preview.stages.push(stage(
+            "QTGMC frameserver",
+            qtgmc.producer.clone(),
+            vec!["VSPipe decodes the validated source interval, applies QTGMC once, and sends Y4M through an OS pipe. Its generated script and source index live in a private owned workspace.".into()],
+        ));
+        preview.stages.push(stage(
+            "QTGMC lossless intermediate",
+            qtgmc.consumer.clone(),
+            vec![format!(
+                "FFmpeg applies the remaining cadence, tone, framing and aspect transforms and writes a verified FFV1 intermediate to {}. Every encoder pass reuses this exact file.",
+                qtgmc.video.path.display()
+            )],
+        ));
+    }
     if settings.backend == media_core::EncodeBackend::Av1an {
         let executable = discover("av1an", cancel).await?;
         let work = super::super::rate_control::Stats::create(output, &format!("{id}-plan-av1an"))?;
         let log = work.path.join("av1an.log");
+        let prepared = if qtgmc.is_none() && plan.requires_av1an_preprocess() {
+            if subtitles.bitmap_index().is_some() {
+                return Err(AppError::new(
+                    "AV1AN_PREPROCESS_SUBTITLE_UNSUPPORTED",
+                    "av1an cannot burn a bitmap subtitle while preparing its verified lossless processed source. Copy the subtitle track or use standalone encoding.",
+                    None,
+                ));
+            }
+            let prepared = super::super::av1an_preprocess::Prepared::build(
+                &source.path,
+                output,
+                id,
+                plan,
+                ffmpeg,
+                source_interval,
+                subtitles.text_filter(),
+                cancel,
+            )
+            .await?;
+            preview.stages.push(stage(
+                "Av1an lossless processed source",
+                prepared.producer.clone(),
+                vec![format!("FFmpeg sends FFV1 Matroska through stdout to the reserved file {}. Execution verifies every decoded frame, timestamp, pixel format, color and sample aspect, then fingerprints the complete decoded pixels before recovery admission.", prepared.video.path.display())],
+            ));
+            Some(prepared)
+        } else {
+            None
+        };
+        let uses_prepared = qtgmc.is_some() || prepared.is_some();
+        let av1an_input = if uses_prepared {
+            preview.notes.push("Execution copies the verified lossless source to prepared.mkv in the owned recovery workspace. Scene detection, chunks and quality references read this same source; original selected audio, subtitles, metadata and attachments remain the final mux source. The copy and decoded checks are internal supervised work, not shell commands.".into());
+            work.path.join("prepared.mkv")
+        } else {
+            source.path.clone()
+        };
+        let source_filter = (!uses_prepared).then(|| plan.decoder_filter()).flatten();
         let arguments = super::super::av1an::arguments(
-            &source.path,
+            &av1an_input,
             &video.path,
             &work.path,
             &log,
             plan,
             settings,
             false,
+            source_filter.as_deref(),
         );
         preview.stages.push(stage("Av1an scene/chunk encoding",CommandSpec{executable,args:arguments,cwd:Some(work.path.clone())},vec![format!("The selected child encoder is {}. Execution stages its managed launcher and compatible dependency environment before starting av1an.",encoder.display()),"Chunk commands and quality probes are generated by av1an from this same validated video-parameter vector. Installed plugin/engine checks run again at execution.".into()]));
     } else {
@@ -123,16 +186,26 @@ pub(super) async fn build(
             .then(|| super::super::rate_control::Stats::create(output, &format!("{id}-plan-stats")))
             .transpose()?;
         for pass in 1..=if two_pass { 2 } else { 1 } {
-            let producer = CommandSpec {
+            let mut producer = CommandSpec {
                 executable: ffmpeg.to_owned(),
-                args: decoder_args_with_subtitles(
-                    &source.path,
-                    plan,
-                    subtitles.text_filter(),
-                    subtitles.bitmap_index(),
-                ),
-                cwd: subtitles.decoder_cwd().map(Path::to_path_buf),
+                args: if let Some(qtgmc) = qtgmc {
+                    decoder_args_preprocessed(&qtgmc.video.path, plan)
+                } else {
+                    decoder_args_with_subtitles(
+                        &source.path,
+                        plan,
+                        subtitles.text_filter(),
+                        subtitles.bitmap_index(),
+                    )
+                },
+                cwd: if qtgmc.is_some() {
+                    None
+                } else {
+                    subtitles.decoder_cwd().map(Path::to_path_buf)
+                },
             };
+            let raw_aom_input =
+                aom_vpx::configure_producer_output(&mut producer.args, plan, settings);
             let mut args = consumer_arguments(plan, settings);
             if let Some(rate) = rate {
                 rate.arguments(&mut args, settings.encoder, pass);
@@ -146,8 +219,13 @@ pub(super) async fn build(
                 format!("Pass {pass}: source decoder"),
                 producer,
                 vec![
-                    "A fresh producer sends Y4M to the following encoder through an OS pipe."
-                        .into(),
+                    if raw_aom_input {
+                        "A fresh producer sends headerless 10-bit I420 to AOM through an OS pipe. Geometry, cadence, depth, and chroma placement are explicit encoder arguments."
+                            .into()
+                    } else {
+                        "A fresh producer sends Y4M to the following encoder through an OS pipe."
+                            .into()
+                    },
                 ],
             ));
             preview.stages.push(stage(
@@ -170,9 +248,29 @@ pub(super) async fn build(
             ));
         }
     }
+    let wrapped_video = if matches!(
+        settings.encoder,
+        VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
+    ) {
+        let timed = Temporary::create(output, &format!("{id}-plan-timed"))?;
+        let executable = discover("mkvmerge", cancel).await?;
+        preview.stages.push(stage(
+            "Standalone rational timing wrapper",
+            CommandSpec {
+                executable,
+                args: x265::mkvmerge_arguments(&video.path, &timed.path, plan),
+                cwd: None,
+            },
+            vec!["mkvmerge assigns the validated rational cadence to the standalone video intermediate, including HEVC presentation order and VP9 IVF rate normalization, before the common selected-track mux.".into()],
+        ));
+        Some(timed)
+    } else {
+        None
+    };
+    let mux_video = wrapped_video.as_ref().unwrap_or(&video);
     let mut args = mux_args(
         &source.path,
-        &video.path,
+        &mux_video.path,
         &temporary.path,
         selected,
         plan,

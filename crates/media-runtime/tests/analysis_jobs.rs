@@ -165,6 +165,7 @@ async fn preview_and_crop_use_the_selected_stream_and_preserve_the_source() {
     let before_metadata = std::fs::metadata(&source).unwrap();
     let (_owner, cancel) = tokio::sync::watch::channel(false);
     let request = FramePreviewRequest {
+        display_orientation: None,
         input_path: source.to_string_lossy().into_owned(),
         video_stream_index: 1,
         position_seconds: 0.2,
@@ -258,6 +259,7 @@ async fn hdr_display_preview_is_tone_mapped_and_black_samples_do_not_propose_a_c
     let preview = preview_frame(
         FramePreviewRequest {
             input_path: hdr.to_string_lossy().into_owned(),
+            display_orientation: None,
             video_stream_index: 0,
             position_seconds: 0.2,
         },
@@ -323,4 +325,87 @@ async fn active_analysis_cancellation_returns_promptly_and_releases_source_handl
     // Windows will refuse this while the read-only source guard or owned tool
     // still has the source open. The fixture file is safe to rename on all OSes.
     std::fs::rename(&source, directory.0.join("released.mkv")).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn inspector_thumbnail_honors_rotation_and_sar_without_changing_coded_crop_coordinates() {
+    let directory = Fixture::new();
+    let original = directory.0.join("anamorphic.mp4");
+    let rotated = directory.0.join("rotated.mp4");
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=1",
+        "-vf",
+        "setsar=2/1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "0",
+    ]);
+    command.push(original.as_os_str().to_owned());
+    ffmpeg(command).await;
+    let mut command = args(&["-v", "error", "-display_rotation:v:0", "90", "-i"]);
+    command.push(original.as_os_str().to_owned());
+    command.extend(args(&["-c", "copy"]));
+    command.push(rotated.as_os_str().to_owned());
+    ffmpeg(command).await;
+    let before = Sha256::digest(std::fs::read(&rotated).unwrap());
+    let source = media_runtime::probe_media(rotated.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        source.streams[0].sample_aspect_ratio.as_deref(),
+        Some("2:1")
+    );
+    assert_eq!(source.streams[0].rotation_degrees.as_deref(), Some("90"));
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let request = FramePreviewRequest {
+        input_path: rotated.to_string_lossy().into_owned(),
+        video_stream_index: 0,
+        position_seconds: 0.0,
+        display_orientation: Some(true),
+    };
+    let preview = preview_frame(request.clone(), cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!((preview.width, preview.height), (112, 384));
+    assert_eq!((preview.source_width, preview.source_height), (192, 112));
+    let actual = preview_pixels(&directory.0.join("display.png"), &preview.image_data_url).await;
+    // The reference lets FFmpeg read the display matrix itself; the app builds
+    // an explicit transform while keeping autorotation disabled for crop work.
+    let mut reference = args(&["-v", "error", "-i"]);
+    reference.push(rotated.as_os_str().to_owned());
+    reference.extend(args(&[
+        "-vf",
+        "scale=112:384:flags=lanczos,format=rgb24,setsar=1",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]));
+    assert_eq!(
+        Sha256::digest(actual),
+        Sha256::digest(ffmpeg(reference).await)
+    );
+    let coded = preview_frame(
+        FramePreviewRequest {
+            display_orientation: None,
+            ..request
+        },
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!((coded.width, coded.height), (192, 112));
+    assert_eq!(Sha256::digest(std::fs::read(&rotated).unwrap()), before);
 }

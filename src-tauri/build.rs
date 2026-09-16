@@ -1,6 +1,14 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "run_utility",
+            "inspect_utility_capabilities",
+            "inspect_saved_job",
+            "export_saved_job",
+            "run_image_job",
+            "set_completion_options",
+            "get_completion_status",
+            "cancel_finish_action",
             "export_analysis",
             "get_preferences",
             "get_parameter_presets",

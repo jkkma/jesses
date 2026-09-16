@@ -154,10 +154,10 @@ impl Cadence {
         self.plan.validate_fields(frame, self.encoded)?;
         if frame.width != Some(width)
             || frame.height != Some(height)
-            || frame.sample_aspect_ratio.as_deref() != Some("1:1")
+            || frame.sample_aspect_ratio.as_deref() != Some(self.plan.frame_sar(self.encoded))
         {
             return Err(unsupported(
-                "Changing frame dimensions or non-square pixel aspect ratios are not supported.",
+                "Decoded frame dimensions or sample aspect ratio differ from the processing plan.",
             ));
         }
         let normalize_chroma = |value: Option<&str>| match value {

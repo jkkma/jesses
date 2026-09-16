@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-finish-action"
+description = "Enables the cancel_finish_action command without any pre-configured scope."
+commands.allow = ["cancel_finish_action"]
+
+[[permission]]
+identifier = "deny-cancel-finish-action"
+description = "Denies the cancel_finish_action command without any pre-configured scope."
+commands.deny = ["cancel_finish_action"]

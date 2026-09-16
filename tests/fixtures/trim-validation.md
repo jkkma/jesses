@@ -7,7 +7,9 @@ source build; the added CI invocation has not yet run on this uncommitted head.
 ## Contract
 
 `EncodeSettings.trim` and per-file `BatchEncodeInput.trim` are optional. An
-interval uses zero-based `startFrame` and exclusive `endFrameExclusive`. Omitted
+interval uses zero-based `startFrame` and exclusive `endFrameExclusive`, or
+start/end milliseconds mapped to the first constant-rate frame at or after each
+boundary with checked integer arithmetic. Omitted
 fields preserve old full-source jobs and histories. The runtime scans every
 original source frame before resolving the interval against its validated frame
 rate and exact count. It does not weaken full-source CFR, color, depth or geometry
@@ -33,7 +35,10 @@ intersected and rebased. Subtitle text is re-exported and compared after muxing,
 and selected font attachments retain their hashes. Assets have owned create-new
 paths and are removed on completion, failure or cancellation.
 
-Copy audio, bitmap subtitles and av1an intervals are explicitly unsupported.
+Copy audio and bitmap subtitles are explicitly unsupported. av1an renders the
+selected video interval into a validated lossless source before scene detection;
+the original source remains the authority for trimmed audio, subtitles, chapters
+and metadata during final muxing.
 ASS animation, karaoke or effects intersected by a boundary are rejected because
 clipping a cue changes its relative effect clock. Timed WebVTT inline markup and
 unsupported metadata blocks are rejected. A surviving overlap shorter than its

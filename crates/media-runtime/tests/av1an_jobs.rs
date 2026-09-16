@@ -284,6 +284,70 @@ async fn av1an_preserves_frame_rate_color_audio_and_immutable_request() {
 }
 
 #[tokio::test]
+#[ignore = "requires corrected av1an, libvmaf, FFmpeg, FFprobe, SVT-AV1, VapourSynth and L-SMASH"]
+async fn av1an_target_probe_and_final_chunks_share_temporal_and_aspect_processing() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("processed target source.mkv");
+    let output = fixture.0.join("processed target output.mkv");
+    synthesize(&input, "320x180", 96).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &output, 12);
+    request.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+    request.settings.temporal = Some(media_core::TemporalSettings {
+        frame_rate: Some(media_core::FrameRate {
+            numerator: 12,
+            denominator: 1,
+        }),
+        aspect_ratio: Some(media_core::AspectRatioSettings {
+            kind: media_core::AspectRatioKind::Sample,
+            numerator: 4,
+            denominator: 3,
+        }),
+        ..Default::default()
+    });
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 240,
+        scene_downscale_height: None,
+        target_quality: Some(media_core::Av1anTargetQuality {
+            metric: media_core::Av1anTargetMetric::Vmaf,
+            minimum_score_tenths: 0,
+            maximum_score_tenths: 1_000,
+            minimum_crf: 30,
+            maximum_crf: 34,
+            probes: 1,
+            probing_rate: 1,
+            probe_width: 320,
+            probe_height: 180,
+        }),
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(request).await.unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    if finished.state != JobState::Succeeded {
+        manager.shutdown().await;
+        panic!("processed av1an failed: {finished:#?}");
+    }
+    let inspected = probe(&output).await;
+    let video = inspected["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["nb_read_frames"], "48");
+    assert_eq!(video["r_frame_rate"], "12/1");
+    assert_eq!(video["sample_aspect_ratio"], "4:3");
+    assert!(finished.logs.iter().any(|line| {
+        line.contains("probe encodes and reference scoring read the same verified lossless")
+    }));
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, SVT-AV1, VapourSynth and L-SMASH on PATH"]
 async fn canceling_running_av1an_stops_workers_and_releases_output_handles() {
     let fixture = Fixture::new();

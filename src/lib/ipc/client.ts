@@ -2,6 +2,14 @@ import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import type {
+  ImageRequest,
+  ImageResult,
+  UtilityRequest,
+  UtilityResult,
+  UtilityCapabilities,
+  CompletionOptions,
+  CompletionStatus,
+  SavedJobInspection,
   AnalysisReport,
   AnalysisExportFormat,
   AutoCropRequest,
@@ -34,6 +42,66 @@ import type {
   SavePreferencesRequest,
   PreferenceImportPreview,
 } from './generated';
+
+export function runImageJob(request: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
+  return analyzeSource('run_image_job', request, signal);
+}
+export function runUtility(request: UtilityRequest, signal?: AbortSignal): Promise<UtilityResult> {
+  return analyzeSource('run_utility', request, signal);
+}
+export function inspectUtilityCapabilities(signal?: AbortSignal): Promise<UtilityCapabilities> {
+  return analyzeSource('inspect_utility_capabilities', {}, signal);
+}
+export async function chooseImages(): Promise<string[]> {
+  requireDesktop();
+  const result = await open({
+    multiple: true,
+    directory: false,
+    title: 'Choose images in sequence',
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp'] }],
+  });
+  return result === null ? [] : Array.isArray(result) ? result : [result];
+}
+export async function chooseUtilityDestination(
+  defaultPath: string,
+  extensions: string[],
+): Promise<string | null> {
+  requireDesktop();
+  return save({ title: 'Save new output', defaultPath, filters: [{ name: 'Output', extensions }] });
+}
+export async function chooseUtilityFile(
+  title: string,
+  extensions: string[],
+): Promise<string | null> {
+  requireDesktop();
+  const result = await open({
+    title,
+    multiple: false,
+    directory: false,
+    filters: [{ name: 'Input', extensions }],
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+export async function getCompletionStatus(): Promise<CompletionStatus> {
+  requireDesktop();
+  return invoke('get_completion_status');
+}
+export async function setCompletionOptions(options: CompletionOptions): Promise<CompletionStatus> {
+  requireDesktop();
+  return invoke('set_completion_options', { options });
+}
+export async function cancelFinishAction(): Promise<CompletionStatus> {
+  requireDesktop();
+  return invoke('cancel_finish_action');
+}
+export async function inspectSavedJob(path: string): Promise<SavedJobInspection> {
+  requireDesktop();
+  return invoke('inspect_saved_job', { path });
+}
+export async function exportSavedJob(path: string, request: EncodeRequest): Promise<string> {
+  requireDesktop();
+  return invoke('export_saved_job', { path, request });
+}
 
 export async function exportAnalysis(
   report: AnalysisReport,

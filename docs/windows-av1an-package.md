@@ -95,8 +95,31 @@ result. Package workflows also check discovery from extracted installer resource
 
 The base frameserver includes L-SMASH. The CPU extension provides SSIMULACRA2,
 sampled XPSNR and Julek Butteraugli; its native gates evaluate actual frames and
-compare the complete runtime inventory before and after execution. GPU VShip,
-FFMS2 and BestSource remain optional external components. Consult a package's
-manifest and capability result before selecting an optional source reader or
-metric. A successful development-machine test with external plugins does not
-qualify their absence from a package.
+compare the complete runtime inventory before and after execution. FFMS2 and
+BestSource remain optional external readers. The manifest-verified package
+reports both absent and the app rejects either selection before encoding. A
+separate compatible external runtime passed both readers through fixed-chunk
+stop, reopen and resume; that result does not add them to the packaged inventory.
+
+On Windows, `scripts/install-vship.ps1` can stage the pinned Vship 5.1.1 x64
+Vulkan plugin, its complete source archive and license in the application's
+per-user tools directory. It first invokes the plugin directly through the
+selected private VSPipe runtime and requires finite SSIMULACRA2 and Butteraugli
+results. `-Activate` copies that verified binary into only that portable
+runtime's private plugin folder and confirms av1an discovers
+`com.lumen.vship`; it does not register VapourSynth or modify a system Python
+installation. A missing Vulkan loader, ABI mismatch, unsupported GPU, changed
+hash or failed metric leaves the CPU vszip/Julek scorer path intact and reports
+the capability failure explicitly. Run it from a source checkout for an
+external portable runtime:
+
+```powershell
+pwsh -File scripts/install-vship.ps1 -PortableRuntime <external-portable-vapoursynth-dir> -Activate
+```
+
+The installer refuses reparse targets, destination escapes, existing different
+plugins and manifest-verified application bundles. Adding an unlisted DLL to a
+bundle would invalidate its source-complete runtime manifest, so bundled builds
+retain their packaged CPU scorers unless Vship is added by the package recipe
+and manifest itself. Consult a package's manifest and capability result before
+selecting an optional reader or metric.

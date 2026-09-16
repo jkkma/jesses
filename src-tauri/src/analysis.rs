@@ -35,6 +35,13 @@ fn failure(code: &str, message: &str) -> AppError {
 }
 
 impl AnalysisTasks {
+    pub fn is_running(&self) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|task| task.started || task.created.elapsed() < Duration::from_secs(30))
+    }
     pub fn begin(&self) -> Result<String, AppError> {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.retain(|_, task| task.started || task.created.elapsed() < Duration::from_secs(30));
@@ -137,6 +144,21 @@ impl Drop for RunningAnalysis<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_tickets_defer_completion_until_canceled_or_finished() {
+        let tasks = AnalysisTasks::default();
+        assert!(!tasks.is_running());
+        let id = tasks.begin().unwrap();
+        assert!(tasks.is_running());
+        tasks.cancel(&id);
+        assert!(!tasks.is_running());
+        let id = tasks.begin().unwrap();
+        let running = tasks.run(&id).unwrap();
+        assert!(tasks.is_running());
+        drop(running);
+        assert!(!tasks.is_running());
+    }
 
     #[test]
     fn cancel_before_command_prevents_late_start() {

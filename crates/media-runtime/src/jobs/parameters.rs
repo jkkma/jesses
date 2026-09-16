@@ -99,6 +99,67 @@ fn specs(encoder: VideoEncoder) -> Vec<Spec> {
                 1,
             ),
         ],
+        VideoEncoder::X265Standalone => vec![
+            item("ref", "Reference frames", "--ref", 1, 6),
+            item(
+                "bframes",
+                "Maximum consecutive B-frames",
+                "--bframes",
+                0,
+                16,
+            ),
+            item("b-adapt", "B-frame adaptation", "--b-adapt", 0, 2),
+            item("aq-mode", "Adaptive quantization mode", "--aq-mode", 0, 4),
+            item("sao", "Sample adaptive offset (0 off, 1 on)", "--sao", 0, 1),
+            item(
+                "cutree",
+                "CU-tree rate control (0 off, 1 on)",
+                "--cutree",
+                0,
+                1,
+            ),
+        ],
+        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => vec![
+            item("aq-mode", "Adaptive quantization mode", "--aq-mode", 0, 4),
+            item(
+                "lag-in-frames",
+                "Lookahead frames",
+                "--lag-in-frames",
+                0,
+                25,
+            ),
+            item(
+                "auto-alt-ref",
+                "Alternate reference frames",
+                "--auto-alt-ref",
+                0,
+                1,
+            ),
+        ],
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => vec![
+            item("bf", "B-frames", "-bf", 0, 4),
+            item(
+                "rc-lookahead",
+                "Rate-control lookahead",
+                "-rc-lookahead",
+                0,
+                32,
+            ),
+            item(
+                "spatial-aq",
+                "Spatial adaptive quantization",
+                "-spatial-aq",
+                0,
+                1,
+            ),
+            item(
+                "temporal-aq",
+                "Temporal adaptive quantization",
+                "-temporal-aq",
+                0,
+                1,
+            ),
+        ],
     }
 }
 
@@ -296,10 +357,11 @@ pub(crate) async fn catalog(
         &CommandSpec {
             executable: path.clone(),
             args: vec![
-                if encoder.is_ffmpeg() {
-                    "-version"
-                } else {
-                    "--version"
+                match encoder {
+                    VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => "--help",
+                    VideoEncoder::X265Standalone => "--fullhelp",
+                    encoder if encoder.is_ffmpeg() => "-version",
+                    _ => "--version",
                 }
                 .into(),
             ],
@@ -326,10 +388,12 @@ pub(crate) async fn catalog(
             "-h".into(),
             format!(
                 "encoder={}",
-                if encoder == VideoEncoder::X265 {
-                    "libx265"
-                } else {
-                    "libvpx-vp9"
+                match encoder {
+                    VideoEncoder::X265 => "libx265",
+                    VideoEncoder::Vp9 => "libvpx-vp9",
+                    VideoEncoder::H264Nvenc => "h264_nvenc",
+                    VideoEncoder::HevcNvenc => "hevc_nvenc",
+                    _ => unreachable!("FFmpeg encoder"),
                 }
             )
             .into(),

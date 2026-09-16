@@ -23,10 +23,16 @@
       onchange({ ...draft, mode: event.currentTarget.value as RateDraft['mode'] })}
   >
     <option value="quality">Constant quality (CRF)</option>
+    <option value="lossless">Lossless</option>
     <option value="bitrate">Video bitrate</option>
     <option value="targetSize">Target file size</option>
   </select>
-  {#if draft.mode === 'bitrate'}
+  {#if draft.mode === 'lossless'}
+    <p>
+      Preserves the frames after your selected filters. Output is usually much larger. The installed
+      encoder must support lossless mode, and every decoded pixel is verified before saving.
+    </p>
+  {:else if draft.mode === 'bitrate'}
     <label for={`${idPrefix}-video-bitrate`}>Video bitrate (kb/s)</label>
     <input
       id={`${idPrefix}-video-bitrate`}

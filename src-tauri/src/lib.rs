@@ -13,10 +13,82 @@ use std::time::Duration;
 use tauri::{Manager, State, ipc::Channel};
 
 mod analysis;
+mod completion;
 mod paths;
 
 #[tauri::command]
-async fn export_analysis(request: media_core::AnalysisExportRequest) -> Result<String, AppError> {
+async fn run_utility(
+    id: String,
+    request: media_core::UtilityRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::UtilityResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::run_utility(request, running.cancel.clone()).await
+}
+#[tauri::command]
+async fn inspect_utility_capabilities(
+    id: String,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::UtilityCapabilities, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::inspect_utility_capabilities(running.cancel.clone()).await
+}
+#[tauri::command]
+async fn inspect_saved_job(path: String) -> Result<media_core::SavedJobInspection, AppError> {
+    tauri::async_runtime::spawn_blocking(move || media_runtime::inspect_saved_job(path))
+        .await
+        .map_err(|e| AppError::new("SAVED_JOB_UNREADABLE", e.to_string(), None))?
+}
+#[tauri::command]
+async fn export_saved_job(
+    path: String,
+    request: EncodeRequest,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<String, AppError> {
+    let _admission = monitor.admit_work().await?;
+    tauri::async_runtime::spawn_blocking(move || media_runtime::export_saved_job(path, request))
+        .await
+        .map_err(|e| AppError::new("SAVED_JOB_WRITE_FAILED", e.to_string(), None))?
+}
+
+#[tauri::command]
+async fn run_image_job(
+    id: String,
+    request: media_core::ImageRequest,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<media_core::ImageResult, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::jobs::run_image_job(request, running.cancel.clone()).await
+}
+#[tauri::command]
+async fn set_completion_options(
+    options: media_core::CompletionOptions,
+    jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<media_core::CompletionStatus, AppError> {
+    let _admission = monitor.admit_work().await?;
+    monitor.configure(options, &jobs.manager.list_jobs().await)
+}
+#[tauri::command]
+fn get_completion_status(
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> media_core::CompletionStatus {
+    monitor.status()
+}
+#[tauri::command]
+fn cancel_finish_action(
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> media_core::CompletionStatus {
+    monitor.cancel();
+    monitor.status()
+}
+
+#[tauri::command]
+async fn export_analysis(
+    request: media_core::AnalysisExportRequest,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<String, AppError> {
+    let _admission = monitor.admit_work().await?;
     tauri::async_runtime::spawn_blocking(move || media_runtime::jobs::export_analysis(request))
         .await
         .map_err(|e| AppError::new("ANALYSIS_EXPORT_FAILED", e.to_string(), None))?
@@ -117,7 +189,11 @@ fn get_storage_locations(paths: State<'_, paths::AppPaths>) -> Vec<(String, Stri
 }
 
 #[tauri::command]
-fn begin_media_analysis(tasks: State<'_, analysis::AnalysisTasks>) -> Result<String, AppError> {
+async fn begin_media_analysis(
+    tasks: State<'_, analysis::AnalysisTasks>,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<String, AppError> {
+    let _admission = monitor.admit_work().await?;
     tasks.begin()
 }
 
@@ -196,7 +272,9 @@ async fn analyze_bitrate(
 async fn start_remux(
     request: RemuxRequest,
     jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<JobSnapshot, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.start_remux(request).await
 }
 
@@ -223,7 +301,9 @@ async fn measure_loudness(
 async fn start_mux(
     request: media_core::MuxRequest,
     jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<JobSnapshot, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.start_mux(request).await
 }
 
@@ -231,7 +311,9 @@ async fn start_mux(
 async fn start_encode(
     request: EncodeRequest,
     jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<JobSnapshot, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.start_encode(request).await
 }
 
@@ -239,7 +321,9 @@ async fn start_encode(
 async fn enqueue_encode(
     request: EncodeRequest,
     jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<JobSnapshot, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.enqueue_encode(request).await
 }
 
@@ -260,7 +344,9 @@ async fn preview_encode_batch(
 async fn enqueue_encode_batch(
     requests: Vec<EncodeRequest>,
     jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<Vec<JobSnapshot>, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.enqueue_encode_batch(requests).await
 }
 
@@ -280,7 +366,12 @@ async fn stop_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppE
 }
 
 #[tauri::command]
-async fn resume_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
+async fn resume_job(
+    id: String,
+    jobs: State<'_, Jobs>,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<JobSnapshot, AppError> {
+    let _admission = monitor.admit_work().await?;
     jobs.manager.resume_job(id).await
 }
 
@@ -329,6 +420,7 @@ pub fn run() {
     let exiting = Arc::new(AtomicU8::new(0));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let executable = std::env::current_exe()?;
             #[cfg(target_os = "linux")]
@@ -357,6 +449,7 @@ pub fn run() {
             ));
             app.manage(paths);
             app.manage(analysis::AnalysisTasks::default());
+            app.manage(completion::CompletionMonitor::default());
             app.manage(Jobs {
                 manager: Arc::new(tauri::async_runtime::block_on(JobManager::open(
                     log_dir,
@@ -364,9 +457,18 @@ pub fn run() {
                 ))),
                 subscription: Arc::new(AtomicU64::new(0)),
             });
+            completion::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            run_utility,
+            inspect_utility_capabilities,
+            inspect_saved_job,
+            export_saved_job,
+            run_image_job,
+            set_completion_options,
+            get_completion_status,
+            cancel_finish_action,
             export_analysis,
             get_preferences,
             get_parameter_presets,

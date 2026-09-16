@@ -13,6 +13,7 @@ const savedJob = (
     streamIndices: [0],
   },
   encodeSettings: {
+    lossless: false,
     backend: 'av1an',
     encoder: 'svtAv1Hdr',
     videoStreamIndex: 0,
@@ -42,6 +43,22 @@ const savedJob = (
   logs: [],
   error: null,
   logPath: null,
+});
+
+const standaloneJob = (
+  phase: NonNullable<JobSnapshot['standaloneRecovery']>['phase'] = 'videoComplete',
+  state: JobSnapshot['state'] = 'stopped',
+  id = `standalone-${phase}`,
+): JobSnapshot => ({
+  ...savedJob(state, id),
+  encodeSettings: { ...savedJob().encodeSettings!, backend: 'standalone' },
+  recovery: null,
+  standaloneRecovery: {
+    workspace: `C:\\work\\${id}`,
+    phase,
+    completedFrames: phase === 'passOneComplete' ? 0 : 480,
+    totalFrames: 480,
+  },
 });
 
 const editorMedia: MediaFile = {
@@ -115,6 +132,13 @@ async function desktopMock(
         unregisterCallback: () => {},
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           if (command === 'get_capabilities')
             return [
               'ffmpeg',
@@ -172,7 +196,12 @@ async function desktopMock(
           }
           if (command === 'cancel_job') {
             const job = jobs.find((entry) => entry.id === payload.id)!;
-            const canceled = { ...job, state: 'canceled' as const, recovery: null };
+            const canceled = {
+              ...job,
+              state: 'canceled' as const,
+              recovery: null,
+              standaloneRecovery: null,
+            };
             publish(jobs.map((entry) => (entry.id === job.id ? canceled : entry)));
             return canceled;
           }
@@ -190,6 +219,7 @@ async function desktopMock(
               ...job,
               state: 'canceled' as const,
               recovery: null,
+              standaloneRecovery: null,
             }));
             publish(next);
             return next;
@@ -287,6 +317,55 @@ for (const phase of ['preparing', 'running', 'finalizing'] as const) {
   });
 }
 
+test('standalone encoding can stop at verified phase boundaries and resume the same job', async ({
+  page,
+}) => {
+  const active = standaloneJob('passOneComplete', 'running', 'standalone-active');
+  active.standaloneRecovery = null;
+  await desktopMock(page, { jobs: [active] });
+  await openJobs(page);
+  await expect(currentJob(page)).toContainText(
+    'Keeps only a fully verified pass, video, timing, or final-mux boundary',
+  );
+  await currentJob(page)
+    .getByRole('button', { name: 'Stop and keep progress', exact: true })
+    .click();
+  expect(await calls(page, 'stop_job')).toEqual([
+    { command: 'stop_job', payload: { id: active.id } },
+  ]);
+  const stopped = standaloneJob('passOneComplete', 'stopped', active.id);
+  await emit(page, [stopped]);
+  await expect(currentJob(page)).toContainText('Pass one statistics are verified and saved');
+  await currentJob(page).getByRole('button', { name: 'Resume', exact: true }).click();
+  expect(await calls(page, 'resume_job')).toEqual([
+    { command: 'resume_job', payload: { id: active.id } },
+  ]);
+});
+
+test('standalone recovery explains each verified phase without claiming mid-phase continuation', async ({
+  page,
+}) => {
+  const snapshots = [
+    standaloneJob('passOneComplete'),
+    standaloneJob('videoComplete'),
+    standaloneJob('timingWrapComplete'),
+    standaloneJob('finalizing'),
+  ];
+  await desktopMock(page, { jobs: snapshots });
+  await openJobs(page);
+  await expect(currentJob(page)).toContainText('Pass one statistics are verified and saved');
+  await expect(historyJob(page, 'standalone-videoComplete')).toContainText(
+    'All 480 frames are verified and saved',
+  );
+  await expect(historyJob(page, 'standalone-timingWrapComplete')).toContainText(
+    'exact-timing video wrapper is verified and saved',
+  );
+  await expect(historyJob(page, 'standalone-finalizing')).toContainText(
+    'completed Matroska stage is verified and saved',
+  );
+  await expect(page.getByText('continues with this job', { exact: false })).toHaveCount(0);
+});
+
 test('recovery controls stay hidden for unsupported and unrecoverable snapshots', async ({
   page,
 }) => {
@@ -296,10 +375,6 @@ test('recovery controls stay hidden for unsupported and unrecoverable snapshots'
   standalone.encodeSettings!.backend = 'standalone';
   const snapshots: JobSnapshot[] = [
     { ...savedJob('running', 'remux'), encodeSettings: null },
-    {
-      ...savedJob('running', 'standalone-active'),
-      encodeSettings: { ...savedJob().encodeSettings!, backend: 'standalone' },
-    },
     savedJob('succeeded', 'succeeded'),
     savedJob('queued', 'queued'),
     savedJob('canceling', 'canceling'),

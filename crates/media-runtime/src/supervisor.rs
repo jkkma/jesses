@@ -467,6 +467,7 @@ pub async fn run_pipeline(
         log_path,
         time_limit,
         None,
+        None,
     )
     .await
 }
@@ -494,10 +495,39 @@ pub async fn run_pipeline_to_file(
         log_path,
         time_limit,
         Some(output),
+        None,
     )
     .await
 }
 
+/// File-output pipeline with environment changes scoped to the producer only.
+/// This is used by frameservers whose DLL/plugin lookup must not leak into the
+/// encoder or the parent process.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pipeline_to_file_with_producer_environment(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    output: std::fs::File,
+    producer_environment: &ChildEnvironment,
+) -> Result<PipelineResult, SupervisorError> {
+    run_pipeline_inner(
+        producer_spec,
+        consumer_spec,
+        cancel,
+        events,
+        log_path,
+        time_limit,
+        Some(output),
+        Some(producer_environment),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_inner(
     producer_spec: &CommandSpec,
     consumer_spec: &CommandSpec,
@@ -506,6 +536,7 @@ async fn run_pipeline_inner(
     log_path: &Path,
     time_limit: Duration,
     output: Option<std::fs::File>,
+    producer_environment: Option<&ChildEnvironment>,
 ) -> Result<PipelineResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
@@ -518,16 +549,17 @@ async fn run_pipeline_inner(
     } else {
         platform::OwnedChild::spawn_with_stdin(consumer_spec)?
     };
-    let mut producer = match platform::OwnedChild::spawn(producer_spec) {
-        Ok(child) => child,
-        Err(error) => {
-            consumer
-                .terminate_and_wait()
-                .await
-                .map_err(SupervisorError::Cleanup)?;
-            return Err(SupervisorError::Io(error));
-        }
-    };
+    let mut producer =
+        match platform::OwnedChild::spawn_with_environment(producer_spec, producer_environment) {
+            Ok(child) => child,
+            Err(error) => {
+                consumer
+                    .terminate_and_wait()
+                    .await
+                    .map_err(SupervisorError::Cleanup)?;
+                return Err(SupervisorError::Io(error));
+            }
+        };
     let (producer_stdout, producer_stderr) = producer.take_pipes();
     let consumer_stdin = consumer.take_stdin();
     let (consumer_stdout, consumer_stderr) = consumer.take_output_pipes();

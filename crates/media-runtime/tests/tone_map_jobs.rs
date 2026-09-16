@@ -432,16 +432,13 @@ async fn pq_and_hlg_map_to_sdr_before_framing_without_stale_hdr_metadata() {
 
 #[tokio::test]
 #[ignore = "requires FFmpeg and VP9"]
-async fn tone_mapping_rejects_sdr_unqualified_hdr_and_av1an_without_output() {
+async fn tone_mapping_rejects_sdr_and_invalid_peak_without_output() {
     let fixture = Fixture::new();
     let input = fixture.0.join("SDR source.mkv");
     synthesize(&input, 8, false, false, "320x180", 48, ("bt709", "left")).await;
-    for case in ["SDR", "av1an", "bad-peak"] {
+    for case in ["SDR", "bad-peak"] {
         let destination = fixture.0.join(format!("{case}.mkv"));
         let mut request = mapped_request(&input, &destination, VideoEncoder::Vp9);
-        if case == "av1an" {
-            request.settings.backend = EncodeBackend::Av1an;
-        }
         if case == "bad-peak" {
             request.settings.tone_map.as_mut().unwrap().source_peak_nits = 0;
         }

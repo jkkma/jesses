@@ -23,6 +23,7 @@
     defaultRate,
     selectedRate,
     validRate,
+    rateEncoderError,
     rateSummary,
     type RateDraft,
   } from '$lib/components/shared/rate-control-options';
@@ -271,10 +272,12 @@
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
+  const rateIssue = $derived(rateEncoderError(rate, encoder));
   const validSettings = $derived(
     (backend !== 'av1an' || isSvtEncoder(encoder)) &&
       validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
       validRate(rate) &&
+      !rateIssue &&
       (backend !== 'av1an' ||
         !av1anError(
           av1an,
@@ -285,12 +288,13 @@
       ((backend === 'av1an' && av1an.targetEnabled) ||
         rate.mode !== 'quality' ||
         (typeof crf === 'number' &&
-          Number.isInteger(crf) &&
+          Number.isFinite(crf) &&
+          (!isSvtEncoder(encoder) || Number.isInteger(crf * 4)) &&
+          (isSvtEncoder(encoder) || Number.isInteger(crf)) &&
           crf >= options.crfMin &&
           crf <= options.crfMax)) &&
       Number.isInteger(preset) &&
-      preset >= 0 &&
-      preset < options.presets.length &&
+      options.presets.some((choice) => choice.value === preset) &&
       (!isSvtEncoder(encoder) ||
         (typeof filmGrain === 'number' &&
           Number.isInteger(filmGrain) &&
@@ -482,12 +486,19 @@
       outputDirectory: outputDirectory.trim(),
       outputContainer,
       ...(backend === 'av1an' ? { av1anOptions: selectedAv1an(av1an) } : {}),
-      ...(rate.mode !== 'quality' ? { rateControl: selectedRate(rate) } : {}),
+      ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
+        ? { rateControl: selectedRate(rate) }
+        : {}),
       crf:
         rate.mode === 'quality' && !(backend === 'av1an' && av1an.targetEnabled)
-          ? crf!
-          : options.defaultCrf,
-      preset,
+          ? Math.round(crf!)
+          : Math.round(options.defaultCrf),
+      preset: Math.max(0, preset),
+      lossless: rate.mode === 'lossless',
+      ...(isSvtEncoder(encoder) && rate.mode === 'quality'
+        ? { svtCrfQuarterSteps: Math.round(crf! * 4) }
+        : {}),
+      ...(isSvtEncoder(encoder) ? { svtPreset: preset } : {}),
       backend,
       encoder,
       workers: backend === 'av1an' ? workers! : 2,
@@ -867,7 +878,7 @@
               draft={rate}
               disabled={submitting}
               onchange={(value) => (rate = value)}
-            />{/if}
+            />{#if rateIssue}<p role="alert">{rateIssue}</p>{/if}{/if}
           {#if rate.mode === 'quality' && !(backend === 'av1an' && av1an.targetEnabled)}
             <div class="field">
               <label for="batch-crf">CRF</label><input
@@ -875,7 +886,7 @@
                 type="number"
                 min={options.crfMin}
                 max={options.crfMax}
-                step="1"
+                step={isSvtEncoder(encoder) ? '0.25' : '1'}
                 bind:value={crf}
                 disabled={submitting}
               />
@@ -953,8 +964,9 @@
           </p>{:else if !validRate(rate)}<p class="disabled-reason">
             Enter a valid whole-number bitrate or target size above.
           </p>{:else if !validSettings}<p class="disabled-reason">
-            Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
-              .length - 1}{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder === 'svtAv1FiveFish'
+            Use {isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF {options.crfMin}–{options.crfMax},
+            a listed preset{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder ===
+            'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
           </p>{:else if !validFraming}<p class="disabled-reason">
@@ -991,9 +1003,13 @@
                 ><td
                   >{#if item.error}<span class="preview-error">{item.error.message}</span
                     >{:else if item.request}<span>Ready</span><small class="preview-audio"
-                      >{rateSummary(item.request.settings.rateControl, item.request.settings.crf)} · {audioSummary(
-                        item.request.settings.audio,
-                      )}</small
+                      >{rateSummary(
+                        item.request.settings.rateControl,
+                        item.request.settings.svtCrfQuarterSteps === undefined
+                          ? item.request.settings.crf
+                          : item.request.settings.svtCrfQuarterSteps / 4,
+                        item.request.settings.lossless,
+                      )} · {audioSummary(item.request.settings.audio)}</small
                     ><small class="preview-audio"
                       >{framingSummary(item.request.settings.framing)}{trimSummary(
                         item.request.settings.trim,

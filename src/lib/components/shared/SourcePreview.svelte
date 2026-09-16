@@ -191,7 +191,8 @@
   {#if expanded}
     <div class="preview-content">
       <p class="small-muted">
-        Inspect the source before resize and borders. The outline shows
+        Inspect coded source pixels before rotation, display aspect correction, resize and borders.
+        The outline shows
         {proposal?.crop ? 'the proposed crop' : 'your current crop'}.
       </p>
       {#if preview}

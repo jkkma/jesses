@@ -116,6 +116,7 @@ impl Geometry {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn filter(
         &self,
         matrix: u8,

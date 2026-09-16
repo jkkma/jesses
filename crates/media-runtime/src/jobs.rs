@@ -3,23 +3,30 @@
 
 mod audio;
 mod av1an;
+mod av1an_preprocess;
 #[cfg(test)]
 mod batch_tests;
+mod cadence;
 mod container;
 mod encode;
 pub use encode::preview_encode_plan;
 mod encode_plan;
 pub(crate) mod files;
 mod history;
+mod images;
+pub use images::run_image_job;
+mod lossless;
 mod metadata;
 mod mux;
 pub(crate) mod parameters;
+mod qtgmc;
 mod rate_control;
 #[cfg(test)]
 mod real_tests;
 #[cfg(test)]
 mod recovery_tests;
 mod reports;
+mod standalone_recovery;
 mod subtitles;
 pub use reports::export_analysis;
 mod trim;
@@ -134,16 +141,57 @@ impl JobManager {
                 manager.history = Some(history);
                 let mut state = manager.state.lock().await;
                 for mut snapshot in snapshots {
+                    if let Some(settings) = snapshot.encode_settings.as_ref()
+                        && settings.backend == media_core::EncodeBackend::Standalone
+                    {
+                        let id = snapshot.id.clone();
+                        let request = snapshot.request.clone();
+                        let settings = settings.clone();
+                        let saved = snapshot.standalone_recovery.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            standalone_recovery::discover_locator(
+                                &id,
+                                &request,
+                                &settings,
+                                saved.as_ref(),
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some(discovered)))
+                                if snapshot.standalone_recovery.as_ref() != Some(&discovered) =>
+                            {
+                                snapshot.standalone_recovery = Some(discovered);
+                                append_log(
+                                    &mut snapshot,
+                                    "A complete standalone encoder phase was recovered from its job-bound durable manifest. Resume will reverify source content, tools, settings, the processing plan, and every artifact before execution."
+                                        .into(),
+                                );
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => append_log(
+                                &mut snapshot,
+                                format!(
+                                    "Standalone recovery was not admitted during restore: {}",
+                                    error.message
+                                ),
+                            ),
+                            Err(cause) => append_log(
+                                &mut snapshot,
+                                format!("Standalone recovery inspection did not complete: {cause}"),
+                            ),
+                        }
+                    }
                     if !snapshot.state.is_terminal() {
                         snapshot.state = JobState::Interrupted;
                         snapshot.error = Some(AppError::new(
                             "JOB_INTERRUPTED",
-                            "The previous session ended before completion was recorded. Saved av1an work can be resumed after verification; no processes were restarted or old files deleted.",
+                            "The previous session ended before completion was recorded. Saved encoder work can be resumed after verification; no processes were restarted or old files deleted.",
                             Some(snapshot.request.output_path.clone()),
                         ));
                         append_log(
                             &mut snapshot,
-                            "Interrupted job restored for review. Resume is available only for verified saved av1an work and must be requested explicitly."
+                            "Interrupted job restored for review. Resume is available only for verified saved work and must be requested explicitly."
                                 .into(),
                         );
                     }
@@ -226,6 +274,9 @@ impl JobManager {
             video_stream_index: 0,
             crf: request.crf,
             preset: request.preset,
+            lossless: request.lossless,
+            svt_crf_quarter_steps: request.svt_crf_quarter_steps,
+            svt_preset: request.svt_preset,
             film_grain: request.film_grain,
             lineart_psy_bias: request.lineart_psy_bias,
             texture_psy_bias: request.texture_psy_bias,
@@ -415,6 +466,7 @@ impl JobManager {
             .filter(|(_, entry)| {
                 entry.snapshot.state.is_terminal()
                     && entry.snapshot.recovery.is_none()
+                    && entry.snapshot.standalone_recovery.is_none()
                     && entry.task.as_ref().is_none_or(|task| task.is_finished())
             })
             .take(remove_count)
@@ -446,6 +498,7 @@ impl JobManager {
                 mux_request: None,
                 encode_settings: Some(request.settings),
                 recovery: None,
+                standalone_recovery: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec!["Media job admitted with an atomic batch.".into()],
@@ -575,6 +628,7 @@ impl JobManager {
                 .position(|e| {
                     e.snapshot.state.is_terminal()
                         && e.snapshot.recovery.is_none()
+                        && e.snapshot.standalone_recovery.is_none()
                         && e.task.as_ref().is_none_or(|task| task.is_finished())
                 })
                 .ok_or_else(|| {
@@ -603,6 +657,7 @@ impl JobManager {
             mux_request,
             encode_settings,
             recovery: None,
+            standalone_recovery: None,
             progress_seconds: None,
             duration_seconds: None,
             logs: vec!["Media job queued.".into()],
@@ -775,7 +830,7 @@ impl JobManager {
         Ok(snapshot)
     }
 
-    /// Stops the owned worker tree while retaining av1an recovery artifacts.
+    /// Stops the owned worker tree while retaining verified recovery artifacts.
     pub async fn stop_job(&self, id: String) -> Result<JobSnapshot, AppError> {
         let mut state = self.state.lock().await;
         if let Some(error) = &state.storage_error {
@@ -793,15 +848,10 @@ impl JobManager {
             .iter_mut()
             .find(|entry| entry.snapshot.id == id)
             .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None))?;
-        if entry
-            .snapshot
-            .encode_settings
-            .as_ref()
-            .is_none_or(|settings| settings.backend != media_core::EncodeBackend::Av1an)
-        {
+        if entry.snapshot.encode_settings.is_none() {
             return Err(AppError::new(
                 "JOB_STOP_UNAVAILABLE",
-                "Only av1an jobs can keep encoded progress for resume.",
+                "Only encoding jobs can keep verified progress for resume.",
                 None,
             ));
         }
@@ -815,7 +865,7 @@ impl JobManager {
             entry.snapshot.state = JobState::Stopping;
             append_log(
                 &mut entry.snapshot,
-                "Stop requested; waiting for owned processes to exit and keeping av1an progress."
+                "Stop requested; waiting for owned processes to exit and keeping the latest verified phase boundary."
                     .into(),
             );
         }
@@ -847,18 +897,25 @@ impl JobManager {
                 .ok_or_else(|| {
                     AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None)
                 })?;
+            let backend = entry
+                .snapshot
+                .encode_settings
+                .as_ref()
+                .map(|settings| settings.backend);
+            let has_recovery = match backend {
+                Some(media_core::EncodeBackend::Av1an) => entry.snapshot.recovery.is_some(),
+                Some(media_core::EncodeBackend::Standalone) => {
+                    entry.snapshot.standalone_recovery.is_some()
+                }
+                None => false,
+            };
             if !entry.snapshot.state.is_terminal()
                 || entry.snapshot.state == JobState::Succeeded
-                || entry.snapshot.recovery.is_none()
-                || entry
-                    .snapshot
-                    .encode_settings
-                    .as_ref()
-                    .is_none_or(|settings| settings.backend != media_core::EncodeBackend::Av1an)
+                || !has_recovery
             {
                 return Err(AppError::new(
                     "JOB_RESUME_UNAVAILABLE",
-                    "This job has no stopped av1an progress available to resume.",
+                    "This job has no verified encoder phase available to resume.",
                     None,
                 ));
             }
@@ -871,7 +928,31 @@ impl JobManager {
             }
             (entry.snapshot.clone(), state.submission_epoch)
         };
-        self.validate_recovery(&id).await?;
+        if original.recovery.is_some() {
+            self.validate_recovery(&id).await?;
+        } else {
+            let snapshot = original.clone();
+            tokio::task::spawn_blocking(move || {
+                let locator = snapshot.standalone_recovery.as_ref().ok_or_else(|| {
+                    AppError::new(
+                        "RECOVERY_INVALID",
+                        "This job has no saved standalone recovery workspace.",
+                        None,
+                    )
+                })?;
+                let settings = snapshot.encode_settings.as_ref().ok_or_else(|| {
+                    AppError::new("RECOVERY_INVALID", "This is not an encoding job.", None)
+                })?;
+                standalone_recovery::validate_locator(
+                    &snapshot.id,
+                    &snapshot.request,
+                    settings,
+                    locator,
+                )
+            })
+            .await
+            .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))??;
+        }
         let mut state = self.state.lock().await;
         if let Some(error) = &state.storage_error {
             return Err(error.clone());
@@ -921,7 +1002,7 @@ impl JobManager {
         entry.snapshot.progress_seconds = None;
         entry.cancel = cancel;
         entry.task = None;
-        append_log(&mut entry.snapshot, "Resume requested with the original saved settings; source, tools and completed chunks will be verified before reuse.".into());
+        append_log(&mut entry.snapshot, "Resume requested with the original saved settings; source, tools and completed phase artifacts will be verified before reuse.".into());
         let snapshot = entry.snapshot.clone();
         state.entries.push(entry);
         if let Err(error) = self.persist(&mut state).await {
@@ -1005,9 +1086,11 @@ impl JobManager {
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             let before = entry.snapshot.state;
             let recovery_before = entry.snapshot.recovery.clone();
+            let standalone_before = entry.snapshot.standalone_recovery.clone();
             update(&mut entry.snapshot);
             if entry.snapshot.state != before
                 || entry.snapshot.recovery != recovery_before
+                || entry.snapshot.standalone_recovery != standalone_before
                 || entry.snapshot.state.is_terminal()
             {
                 let _ = self.persist(&mut state).await;
@@ -1093,8 +1176,8 @@ impl JobManager {
                 };
                 append_log(snapshot, error.message.clone());
                 if snapshot.state == JobState::Stopped {
-                    append_log(snapshot, if snapshot.recovery.is_some() {
-                        "Stopped. Saved av1an progress is available for explicit resume.".into()
+                    append_log(snapshot, if snapshot.recovery.is_some() || snapshot.standalone_recovery.is_some() {
+                        "Stopped. Saved verified encoder progress is available for explicit resume.".into()
                     } else {
                         "Stopped before resumable work was created; start a new job to encode this source.".into()
                     });
@@ -1500,9 +1583,12 @@ async fn probe(
     })?;
     // A Matroska subtitle header may report the container start rather than the
     // first cue. Compare actual packet starts so remuxing cannot create a false
-    // synchronization failure or conceal a real cue offset.
+    // synchronization failure or conceal a real cue offset. Some valid H.264
+    // streams omit the start header entirely; require an actual packet timestamp
+    // in that case rather than assuming zero or rejecting a valid timeline.
     for stream in &mut document.streams {
-        if stream.codec_type.as_deref() == Some("subtitle")
+        if (stream.codec_type.as_deref() == Some("subtitle")
+            || (stream.codec_type.as_deref() == Some("video") && stream.start_time.is_none()))
             && selected.is_none_or(|indices| indices.contains(&stream.index))
             && stream
                 .nb_read_packets
@@ -1511,13 +1597,13 @@ async fn probe(
                 .is_some_and(|n| n > 0)
         {
             stream.packet_start_time =
-                Some(subtitle_packet_start(executable, path, stream.index, cancel).await?);
+                Some(first_packet_start(executable, path, stream.index, cancel).await?);
         }
     }
     Ok(document)
 }
 
-async fn subtitle_packet_start(
+async fn first_packet_start(
     executable: &Path,
     path: &Path,
     index: u32,
@@ -1581,11 +1667,11 @@ async fn subtitle_packet_start(
     if !result.status.success() || !result.stderr.is_empty() || start.is_none() {
         return Err(files::error(
             "PROBE_INVALID_RESPONSE",
-            "The first subtitle packet timestamp could not be validated.",
+            "The first selected packet timestamp could not be validated.",
             path,
         ));
     }
-    Ok(start.expect("validated subtitle timestamp"))
+    Ok(start.expect("validated packet timestamp"))
 }
 
 fn remux_arguments(input: &Path, output: &Path, selected: &[&metadata::Stream]) -> Vec<OsString> {
@@ -1911,6 +1997,7 @@ mod tests {
                     encode_settings: Some(settings.clone()),
                     mux_request: None,
                     recovery: None,
+                    standalone_recovery: None,
                     progress_seconds: Some(1.0),
                     duration_seconds: Some(5.0),
                     logs: vec!["Started with saved settings".into()],

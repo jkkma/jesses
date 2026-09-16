@@ -129,13 +129,14 @@ jobs:
           export JESSES_SVT_AV1="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1/SvtAv1EncApp$suffix"
           export JESSES_SVT_AV1_5FISH="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-5fish/SvtAv1EncApp$suffix"
           export JESSES_SVT_AV1_HDR="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-hdr/SvtAv1EncApp$suffix"
-          cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --locked -- --ignored --test-threads=1
-          cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1
+          cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --test image_jobs --locked -- --ignored --test-threads=1
+          # QTGMC is qualified with an external runtime; it is not in this bundle.
+          cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip qtgmc
       - name: Qualify portable av1an with external tools and conflicting runtimes unavailable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          foreach ($testSuite in @('av1an_jobs', 'av1an_recovery')) {
+          foreach ($testSuite in @('av1an_jobs', 'av1an_recovery', 'command_preview_jobs')) {
             $messages = cargo test -p media-runtime --test $testSuite --no-run --locked --message-format=json | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0) { throw 'The portable av1an test runner failed to build.' }
             $runner = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq $testSuite -and $_.executable })

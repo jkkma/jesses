@@ -16,6 +16,10 @@ pub use quality::analyze_quality;
 pub mod jobs;
 mod probe;
 mod process;
+mod utilities;
+pub use utilities::{inspect_utility_capabilities, run_utility};
+mod saved_jobs;
+pub use saved_jobs::{export_saved_job, inspect_saved_job};
 pub mod supervisor;
 
 pub use analysis::{detect_crop, preview_frame};

@@ -440,6 +440,7 @@ async fn source_frame_trim_precedes_bob_and_keeps_the_selected_fields() {
     req.settings.trim = Some(media_core::VideoTrim {
         start_frame: 12,
         end_frame_exclusive: 36,
+        time: None,
     });
     let manager = JobManager::new(directory.0.join("logs"));
     let job = manager.start_encode(req).await.unwrap();
@@ -467,5 +468,268 @@ async fn source_frame_trim_precedes_bob_and_keeps_the_selected_fields() {
             }
         }
     }
+    assert_eq!(before, Sha256::digest(std::fs::read(&input).unwrap()));
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone x264"]
+async fn exact_duplicate_cadence_repair_characterizes_and_restores_padded_capture() {
+    let directory = Fixture::new();
+    let base = directory.0.join("base-24.mkv");
+    let mut cmd = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=2",
+        "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-c:v",
+        "ffv1",
+        "-chroma_sample_location",
+        "left",
+        "-level",
+        "3",
+    ]);
+    cmd.push(base.as_os_str().to_owned());
+    tool("ffmpeg", cmd).await;
+    let padded = directory.0.join("padded-60.mkv");
+    let mut cmd = args(&["-v", "error", "-i"]);
+    cmd.push(base.as_os_str().to_owned());
+    cmd.extend(args(&[
+        "-vf",
+        "fps=60",
+        "-c:v",
+        "ffv1",
+        "-chroma_sample_location",
+        "left",
+        "-level",
+        "3",
+    ]));
+    cmd.push(padded.as_os_str().to_owned());
+    tool("ffmpeg", cmd).await;
+    let before = Sha256::digest(std::fs::read(&padded).unwrap());
+    let output = directory.0.join("restored-24.mkv");
+    let mut req = request(
+        &padded,
+        &output,
+        media_core::TemporalSettings {
+            cadence_repair: Some(media_core::CadenceRepairSettings {
+                kind: media_core::CadenceRepairKind::ExactDuplicates,
+                field_order: media_core::FieldOrder::TopFirst,
+                combed_fallback: false,
+            }),
+            frame_rate: Some(media_core::FrameRate {
+                numerator: 24,
+                denominator: 1,
+            }),
+            ..Default::default()
+        },
+    );
+    req.settings.lossless = true;
+    let manager = JobManager::new(directory.0.join("logs"));
+    let job = manager.start_encode(req).await.unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+    assert!(job.logs.iter().any(|line| {
+        line.contains("120 decoded frames")
+            && line.contains("48 unique")
+            && line.contains("repeat-length transitions")
+    }));
+    assert_eq!(raw(&output).await, raw(&base).await);
+    assert_eq!(before, Sha256::digest(std::fs::read(&padded).unwrap()));
+
+    let rejected = directory.0.join("unpadded-rejected.mkv");
+    let mut req = request(
+        &base,
+        &rejected,
+        media_core::TemporalSettings {
+            cadence_repair: Some(media_core::CadenceRepairSettings {
+                kind: media_core::CadenceRepairKind::ExactDuplicates,
+                field_order: media_core::FieldOrder::TopFirst,
+                combed_fallback: false,
+            }),
+            frame_rate: Some(media_core::FrameRate {
+                numerator: 12,
+                denominator: 1,
+            }),
+            ..Default::default()
+        },
+    );
+    req.settings.lossless = true;
+    let job = manager.start_encode(req).await.unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.error.unwrap().code, "CADENCE_REPAIR_UNSUPPORTED");
+    assert!(!rejected.exists());
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, standalone x264, av1an, SVT-AV1 and the managed QTGMC runtime"]
+async fn qtgmc_bob_runs_through_verified_lossless_preparation_and_final_encode() {
+    let directory = Fixture::new();
+    let input = source(&directory.0, false).await;
+    let before = Sha256::digest(std::fs::read(&input).unwrap());
+    let output = directory.0.join("qtgmc-bob.mkv");
+    let mut req = request(
+        &input,
+        &output,
+        media_core::TemporalSettings {
+            qtgmc: Some(media_core::QtgmcSettings {
+                mode: media_core::DeinterlaceMode::Bob,
+                field_order: media_core::FieldOrder::TopFirst,
+                preset: media_core::QtgmcPreset::Fast,
+            }),
+            ..Default::default()
+        },
+    );
+    req.settings.lossless = true;
+    let manager = JobManager::new(directory.0.join("logs"));
+    let job = manager.start_encode(req).await.unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+    assert_eq!(raw(&output).await.len(), 96 * 192 * 112 * 3 / 2);
+    assert!(
+        job.logs
+            .iter()
+            .any(|line| line.contains("QTGMC uses one owned FFV1 intermediate"))
+    );
+
+    let av1an_output = directory.0.join("qtgmc-bob-av1an.mkv");
+    let mut chunked = request(
+        &input,
+        &av1an_output,
+        media_core::TemporalSettings {
+            qtgmc: Some(media_core::QtgmcSettings {
+                mode: media_core::DeinterlaceMode::Bob,
+                field_order: media_core::FieldOrder::TopFirst,
+                preset: media_core::QtgmcPreset::Fast,
+            }),
+            ..Default::default()
+        },
+    );
+    chunked.settings.backend = media_core::EncodeBackend::Av1an;
+    chunked.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+    chunked.settings.lossless = false;
+    chunked.settings.crf = 34;
+    chunked.settings.preset = 12;
+    chunked.settings.workers = 1;
+    chunked.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 240,
+        ..Default::default()
+    });
+    let job = manager.start_encode(chunked).await.unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+    assert_eq!(raw(&av1an_output).await.len(), 96 * 192 * 112 * 3 / 2);
+    assert!(
+        job.logs
+            .iter()
+            .any(|line| line.contains("QTGMC uses one owned FFV1 intermediate"))
+    );
+    assert!(
+        job.logs
+            .iter()
+            .any(|line| line.contains("av1an selected encoder"))
+    );
+    assert_eq!(before, Sha256::digest(std::fs::read(&input).unwrap()));
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone x264"]
+async fn time_trim_maps_to_exact_frames_and_display_ratio_sets_final_sar() {
+    let directory = Fixture::new();
+    let input = directory.0.join("timed-aspect-source.mkv");
+    let mut cmd = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=2",
+        "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-c:v",
+        "ffv1",
+        "-chroma_sample_location",
+        "left",
+        "-level",
+        "3",
+    ]);
+    cmd.push(input.as_os_str().to_owned());
+    tool("ffmpeg", cmd).await;
+    let source_raw = raw(&input).await;
+    let before = Sha256::digest(std::fs::read(&input).unwrap());
+    let output = directory.0.join("timed-aspect-output.mkv");
+    let mut req = request(
+        &input,
+        &output,
+        media_core::TemporalSettings {
+            aspect_ratio: Some(media_core::AspectRatioSettings {
+                kind: media_core::AspectRatioKind::Display,
+                numerator: 4,
+                denominator: 3,
+            }),
+            ..Default::default()
+        },
+    );
+    req.settings.lossless = true;
+    req.settings.trim = Some(media_core::VideoTrim {
+        start_frame: 0,
+        end_frame_exclusive: 0,
+        time: Some(media_core::VideoTimeTrim {
+            start_milliseconds: 250,
+            end_milliseconds: 1_250,
+        }),
+    });
+    let manager = JobManager::new(directory.0.join("logs"));
+    let job = manager.start_encode(req).await.unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+    let stride = 192 * 112 * 3 / 2;
+    assert_eq!(raw(&output).await, source_raw[6 * stride..30 * stride]);
+    let mut cmd = args(&[
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=sample_aspect_ratio,display_aspect_ratio,nb_read_frames",
+        "-count_frames",
+        "-of",
+        "json",
+        "-i",
+    ]);
+    cmd.push(output.as_os_str().to_owned());
+    let value: serde_json::Value = serde_json::from_slice(&tool("ffprobe", cmd).await).unwrap();
+    assert_eq!(value["streams"][0]["sample_aspect_ratio"], "7:9");
+    assert_eq!(value["streams"][0]["display_aspect_ratio"], "4:3");
+    assert_eq!(value["streams"][0]["nb_read_frames"], "24");
     assert_eq!(before, Sha256::digest(std::fs::read(&input).unwrap()));
 }

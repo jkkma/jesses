@@ -192,6 +192,13 @@ async function mock(page: Page, corruptPresets = false) {
             }));
             return command === 'enqueue_encode_batch' ? jobs : jobs[0];
           }
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           throw new Error(`Unexpected command: ${command}`);
         },
       };

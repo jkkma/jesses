@@ -1,6 +1,8 @@
 //! Admission and persistence checks independent of installed media tools.
 use super::*;
-use media_core::{Av1anRecovery, EncodeBackend, RecoveryPhase};
+use media_core::{
+    Av1anRecovery, EncodeBackend, RecoveryPhase, StandaloneRecovery, StandaloneRecoveryPhase,
+};
 
 struct Fixture(PathBuf);
 
@@ -34,6 +36,19 @@ impl Fixture {
             workspace: self.0.join("retained-work").to_string_lossy().into(),
             phase: RecoveryPhase::Encoding,
             completed_frames: 120,
+            total_frames: 480,
+        }
+    }
+
+    fn standalone_recovery(&self) -> StandaloneRecovery {
+        StandaloneRecovery {
+            workspace: self
+                .0
+                .join("retained-standalone-work")
+                .to_string_lossy()
+                .into(),
+            phase: StandaloneRecoveryPhase::PassOneComplete,
+            completed_frames: 0,
             total_frames: 480,
         }
     }
@@ -113,6 +128,39 @@ async fn recovery_checkpoint_is_durable_without_a_phase_transition() {
 }
 
 #[tokio::test]
+async fn standalone_checkpoint_is_durable_and_stop_is_admitted() {
+    let fixture = Fixture::new();
+    let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    manager.ready().await.unwrap();
+    let slot = manager.execution.lock().await;
+    let mut request = fixture.request();
+    request.settings.backend = EncodeBackend::Standalone;
+    let job = manager.enqueue_encode(request).await.unwrap();
+    let recovery = fixture.standalone_recovery();
+    manager
+        .change(&job.id, |snapshot| {
+            snapshot.standalone_recovery = Some(recovery.clone())
+        })
+        .await;
+    assert_eq!(
+        manager.stop_job(job.id.clone()).await.unwrap().state,
+        JobState::Stopping
+    );
+    drop(slot);
+    manager.shutdown().await;
+    drop(manager);
+
+    let reopened = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    reopened.ready().await.unwrap();
+    let before = reopened.list_jobs().await.remove(0);
+    assert_eq!(before.state, JobState::Stopped);
+    assert_eq!(before.standalone_recovery, Some(recovery));
+    assert!(reopened.resume_job(before.id.clone()).await.is_err());
+    assert_eq!(reopened.list_jobs().await[0], before);
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
 async fn history_capacity_never_prunes_recoverable_work() {
     let fixture = Fixture::new();
     let manager = JobManager::new(fixture.0.join("logs"));
@@ -121,6 +169,13 @@ async fn history_capacity_never_prunes_recoverable_work() {
         let mut state = manager.state.lock().await;
         for index in 0..MAX_HISTORY {
             let (cancel, _) = watch::channel(true);
+            let standalone = index % 2 == 1;
+            let mut settings = request.settings.clone();
+            settings.backend = if standalone {
+                EncodeBackend::Standalone
+            } else {
+                EncodeBackend::Av1an
+            };
             state.entries.push(Entry {
                 pause: Default::default(),
                 snapshot: JobSnapshot {
@@ -128,8 +183,9 @@ async fn history_capacity_never_prunes_recoverable_work() {
                     state: JobState::Stopped,
                     request: request.source.clone(),
                     mux_request: None,
-                    encode_settings: Some(request.settings.clone()),
-                    recovery: Some(fixture.recovery()),
+                    encode_settings: Some(settings),
+                    recovery: (!standalone).then(|| fixture.recovery()),
+                    standalone_recovery: standalone.then(|| fixture.standalone_recovery()),
                     progress_seconds: None,
                     duration_seconds: None,
                     logs: vec![],
@@ -151,7 +207,7 @@ async fn history_capacity_never_prunes_recoverable_work() {
 }
 
 #[tokio::test]
-async fn stop_is_not_available_for_remux_or_standalone_encoding() {
+async fn stop_is_not_available_for_remux() {
     let fixture = Fixture::new();
     let manager = JobManager::new(fixture.0.join("logs"));
     let slot = manager.execution.lock().await;

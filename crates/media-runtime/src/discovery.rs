@@ -16,7 +16,7 @@ struct ToolSpec {
     version_arg: &'static str,
 }
 
-const TOOLS: [ToolSpec; 7] = [
+const TOOLS: [ToolSpec; 11] = [
     ToolSpec {
         id: "ffmpeg",
         name: "FFmpeg",
@@ -59,6 +59,32 @@ const TOOLS: [ToolSpec; 7] = [
         executables: &["SvtAv1EncApp-HDR"],
         version_arg: "--version",
     },
+    ToolSpec {
+        id: "aomenc",
+        name: "AOM AV1 encoder",
+        executables: &["aomenc"],
+        // aomenc deliberately has no version switch; help identifies the CLI
+        // and is also the capability surface checked again at job startup.
+        version_arg: "--help",
+    },
+    ToolSpec {
+        id: "vpxenc",
+        name: "VPX encoder",
+        executables: &["vpxenc"],
+        version_arg: "--help",
+    },
+    ToolSpec {
+        id: "x265",
+        name: "x265 standalone",
+        executables: &["x265"],
+        version_arg: "--version",
+    },
+    ToolSpec {
+        id: "mkvmerge",
+        name: "MKVToolNix mkvmerge",
+        executables: &["mkvmerge"],
+        version_arg: "--version",
+    },
 ];
 
 fn tool_encoder(id: &str) -> Option<VideoEncoder> {
@@ -67,6 +93,9 @@ fn tool_encoder(id: &str) -> Option<VideoEncoder> {
         "svt-av1-5fish" => Some(VideoEncoder::SvtAv1FiveFish),
         "svt-av1-hdr" => Some(VideoEncoder::SvtAv1Hdr),
         "x264" => Some(VideoEncoder::X264),
+        "aomenc" => Some(VideoEncoder::AomAv1),
+        "vpxenc" => Some(VideoEncoder::VpxStandalone),
+        "x265" => Some(VideoEncoder::X265Standalone),
         _ => None,
     }
 }
@@ -137,7 +166,13 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
             let names = match encoder {
                 VideoEncoder::SvtAv1 => ["SvtAv1EncApp", "svtav1encapp"].as_slice(),
                 VideoEncoder::X264 => ["x264"].as_slice(),
-                VideoEncoder::X265 | VideoEncoder::Vp9 => ["ffmpeg"].as_slice(),
+                VideoEncoder::X265
+                | VideoEncoder::Vp9
+                | VideoEncoder::H264Nvenc
+                | VideoEncoder::HevcNvenc => ["ffmpeg"].as_slice(),
+                VideoEncoder::AomAv1 => ["aomenc"].as_slice(),
+                VideoEncoder::X265Standalone => ["x265"].as_slice(),
+                VideoEncoder::VpxStandalone => ["vpxenc"].as_slice(),
                 _ => unreachable!("forks handled above"),
             };
             find_configured_executable(
@@ -163,7 +198,13 @@ fn encoder_tool_id(encoder: VideoEncoder) -> &'static str {
         VideoEncoder::SvtAv1FiveFish => "svt-av1-5fish",
         VideoEncoder::SvtAv1Hdr => "svt-av1-hdr",
         VideoEncoder::X264 => "x264",
-        VideoEncoder::X265 | VideoEncoder::Vp9 => "ffmpeg",
+        VideoEncoder::X265
+        | VideoEncoder::Vp9
+        | VideoEncoder::H264Nvenc
+        | VideoEncoder::HevcNvenc => "ffmpeg",
+        VideoEncoder::AomAv1 => "aomenc",
+        VideoEncoder::X265Standalone => "x265",
+        VideoEncoder::VpxStandalone => "vpxenc",
     }
 }
 
@@ -217,14 +258,17 @@ pub(crate) fn validate_video_encoder_version(
         .lines()
         .map(str::trim)
         .find(|line| {
-            line.to_ascii_lowercase()
-                .starts_with(if encoder == VideoEncoder::X264 {
-                    "x264 "
-                } else if encoder.is_ffmpeg() {
-                    "ffmpeg version "
-                } else {
-                    "svt-av1"
-                })
+            let lower = line.to_ascii_lowercase();
+            match encoder {
+                VideoEncoder::X264 => lower.starts_with("x264 "),
+                VideoEncoder::X265Standalone => lower.starts_with("x265 "),
+                VideoEncoder::AomAv1 => lower.contains("aomenc") || lower.contains("aom codec"),
+                VideoEncoder::VpxStandalone => {
+                    lower.contains("vpxenc") || lower.contains("vpx codec")
+                }
+                encoder if encoder.is_ffmpeg() => lower.starts_with("ffmpeg version "),
+                _ => lower.starts_with("svt-av1"),
+            }
         })
         .ok_or_else(|| {
             "The executable did not report the requested encoder identity.".to_owned()
@@ -242,7 +286,13 @@ pub(crate) fn validate_video_encoder_version(
         VideoEncoder::SvtAv1FiveFish => five_fish && !hdr,
         VideoEncoder::SvtAv1Hdr => hdr && !five_fish,
         VideoEncoder::X264 => lower.starts_with("x264 "),
-        VideoEncoder::X265 | VideoEncoder::Vp9 => lower.starts_with("ffmpeg version "),
+        VideoEncoder::X265Standalone => lower.starts_with("x265 "),
+        VideoEncoder::AomAv1 => lower.contains("aomenc") || lower.contains("aom codec"),
+        VideoEncoder::VpxStandalone => lower.contains("vpxenc") || lower.contains("vpx codec"),
+        VideoEncoder::X265
+        | VideoEncoder::Vp9
+        | VideoEncoder::H264Nvenc
+        | VideoEncoder::HevcNvenc => lower.starts_with("ffmpeg version "),
     };
     if matches {
         Ok(())
@@ -462,7 +512,7 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
     match crate::process::run_tool_with_environment(
         &executable,
         &[OsString::from(spec.version_arg)],
-        Duration::from_secs(5),
+        Duration::from_secs(if spec.id == "av1an" { 30 } else { 5 }),
         64 * 1024,
         environment.as_ref(),
     )
@@ -504,7 +554,7 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
 /// Checks all known tools concurrently; missing optional tools remain
 /// explicit capability results and do not prevent media inspection.
 pub async fn get_capabilities() -> Vec<ToolInfo> {
-    let (ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr) = tokio::join!(
+    let (ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge) = tokio::join!(
         discover(TOOLS[0]),
         discover(TOOLS[1]),
         discover(TOOLS[2]),
@@ -512,8 +562,14 @@ pub async fn get_capabilities() -> Vec<ToolInfo> {
         discover(TOOLS[4]),
         discover(TOOLS[5]),
         discover(TOOLS[6]),
+        discover(TOOLS[7]),
+        discover(TOOLS[8]),
+        discover(TOOLS[9]),
+        discover(TOOLS[10]),
     );
-    vec![ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr]
+    vec![
+        ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge,
+    ]
 }
 
 #[cfg(test)]

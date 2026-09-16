@@ -1,16 +1,18 @@
 # Frame processing validation
 
-Quick Convert and each Batch input have explicit BWDIF deinterlacing, rational
-output frame rate, and resize-kernel settings. Existing requests preserve their
-progressive source rate and Lanczos resize behavior. Each workflow and source
-keeps an independent draft; queued requests are immutable.
+Quick Convert, av1an and each Batch input have explicit BWDIF or QTGMC
+deinterlacing, inverse-telecine or guarded exact-duplicate cadence repair,
+rational output frame rate, SAR/DAR, and resize-kernel settings. Existing
+requests preserve their progressive source rate, square-pixel output and
+Lanczos resize behavior. Each workflow and source keeps an independent draft;
+queued requests are immutable.
 
 The complete source is decoded and checked before processing. BWDIF requires
 uniformly interlaced frames with the selected top-first or bottom-first order.
 The source header is advisory; every decoded frame must agree. Unknown field
 order, mixed progressive/interlaced material, changing dimensions/SAR, variable
 cadence and timestamp gaps fail before an output is published. Output frames
-must be progressive, square-pixel and retain the expected color properties.
+must be progressive, retain the planned SAR/DAR and expected color properties.
 
 The filter order is source-frame trim, BWDIF, optional duplicate/drop frame-rate
 conversion, tone mapping, then the existing bitmap/crop/resize/text/border order.
@@ -22,20 +24,33 @@ through 120 fps. This can differ from the unchanged audio end by at most half
 an output frame. Frame counts use checked integer arithmetic.
 
 Frame-rate conversion duplicates or drops existing images. It does not change
-playback speed, interpolate motion, repair telecine/cadence, or relax source
-timestamp validation. BWDIF is a separate algorithm from QTGMC; this work does
-not qualify QTGMC, Detelecine or cadence-repair workflows. Deinterlacing and rate
-conversion require standalone encoding until av1an's probes and chunks can be
-qualified with the same temporal processing. Resize-kernel selection also works
-with the existing av1an geometry path; only standalone kernels were exercised
-by the new actual-tool gate.
+playback speed, interpolate motion, or relax source timestamp validation. BWDIF,
+QTGMC, inverse telecine and exact-duplicate repair remain distinct workflows.
+The duplicate scan reports repeated-run lengths and adjacent length transitions;
+it does not label those transitions as true cadence switches. With av1an, trim
+and timeline-changing processing run once into a verified FFV1 source. Scene
+detection, chunk encoding and target references read that same source, and
+recovery binds its decoded-frame identity.
 
 Nearest neighbor, bilinear, bicubic and Lanczos apply when the framing width
 changes. Original source dimensions remain separate from processed dimensions.
-Non-square source pixels still receive the existing actionable constraint;
-arbitrary SAR/DAR conversion is not included in this slice.
+SAR and DAR requests use exact reduced rational arithmetic after framing and are
+checked on the final stream and every decoded frame.
 
 ## Automated evidence
+
+The 2026-09-15 expansion added real QTGMC, cadence-repair, aspect and av1an
+processing gates. A synthetic 96-frame 24 fps source was rendered once to a
+verified FFV1 source at 12 fps with SAR 4:3, then encoded through corrected
+av1an with a VMAF target. The final output decoded to exactly 48 progressive
+frames at 12 fps and SAR 4:3; probe references and final chunks read the same
+prepared source. Repeated preparation produced the same complete decoded-frame
+identity, while a wrong expected count failed. Source bytes remained unchanged.
+
+The external compatible runtime passed FFMS2 and BestSource fixed-chunk
+stop/reopen/resume in one 108.04-second gate. The manifest-verified Windows
+bundle correctly reported those optional plugins absent and rejected the
+selection; only the external runtime is qualified for those two readers.
 
 On Windows with FFmpeg/FFprobe 9.0.1 and standalone x264:
 

@@ -56,6 +56,7 @@
     defaultRate,
     selectedRate,
     validRate,
+    rateEncoderError,
     rateSummary,
     type RateDraft,
   } from './rate-control-options';
@@ -206,6 +207,7 @@
       toneMap.enabled,
     ),
   );
+  const rateIssue = $derived(rateEncoderError(rate, encoder));
   const hdrUnsupported = $derived(
     !isSvtEncoder(encoder) && knownHdr(selectedVideo) && !toneMap.enabled,
   );
@@ -234,16 +236,18 @@
     (!chunked || isSvtEncoder(encoder)) &&
       validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
       validRate(rate) &&
+      !rateIssue &&
       (!chunked || !av1anError(av1an, knownHdr(selectedVideo))) &&
       ((chunked && av1an.targetEnabled) ||
         rate.mode !== 'quality' ||
         (typeof crf === 'number' &&
-          Number.isInteger(crf) &&
+          Number.isFinite(crf) &&
+          (!isSvtEncoder(encoder) || Number.isInteger(crf * 4)) &&
+          (isSvtEncoder(encoder) || Number.isInteger(crf)) &&
           crf >= options.crfMin &&
           crf <= options.crfMax)) &&
       Number.isInteger(preset) &&
-      preset >= 0 &&
-      preset < options.presets.length &&
+      options.presets.some((choice) => choice.value === preset) &&
       (!isSvtEncoder(encoder) ||
         (typeof filmGrain === 'number' &&
           Number.isInteger(filmGrain) &&
@@ -405,10 +409,19 @@
         ...(selectedTemporal(temporal) ? { temporal: selectedTemporal(temporal) } : {}),
         videoStreamIndex: videoIndex,
         ...(chunked ? { av1anOptions: selectedAv1an(av1an) } : {}),
-        ...(rate.mode !== 'quality' ? { rateControl: selectedRate(rate) } : {}),
+        ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
+          ? { rateControl: selectedRate(rate) }
+          : {}),
         crf:
-          rate.mode === 'quality' && !(chunked && av1an.targetEnabled) ? crf! : options.defaultCrf,
-        preset,
+          rate.mode === 'quality' && !(chunked && av1an.targetEnabled)
+            ? Math.round(crf!)
+            : Math.round(options.defaultCrf),
+        preset: Math.max(0, preset),
+        lossless: rate.mode === 'lossless',
+        ...(isSvtEncoder(encoder) && rate.mode === 'quality'
+          ? { svtCrfQuarterSteps: Math.round(crf! * 4) }
+          : {}),
+        ...(isSvtEncoder(encoder) ? { svtPreset: preset } : {}),
         backend,
         encoder,
         workers: backend === 'av1an' ? workers! : 2,
@@ -541,7 +554,7 @@
             <p>
               {chunked
                 ? 'av1an encodes the first video track only.'
-                : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name} · ${depthLabel} ${options.codec} · ${outputFrameRateLabel}`}
+                : `${['x265', 'vp9', 'h264Nvenc', 'hevcNvenc'].includes(encoder) ? 'FFmpeg' : 'Standalone'} ${options.name} · ${depthLabel} ${options.codec} · ${outputFrameRateLabel}`}
             </p>
           </div>
           {#if chunked}<Av1anOptionsControl
@@ -557,7 +570,7 @@
               draft={rate}
               {disabled}
               onchange={(value) => (rate = value)}
-            />{/if}
+            />{#if rateIssue}<p role="alert">{rateIssue}</p>{/if}{/if}
           {#if rate.mode === 'quality' && !(chunked && av1an.targetEnabled)}
             <div class="field">
               <label for={`${idPrefix}-quality`}>Quality</label>
@@ -567,7 +580,7 @@
                   type="number"
                   min={options.crfMin}
                   max={options.crfMax}
-                  step="1"
+                  step={isSvtEncoder(encoder) ? '0.25' : '1'}
                   bind:value={crf}
                   {disabled}
                 /><span>CRF</span>
@@ -748,8 +761,8 @@
             <strong>{depthLabel} {options.codec}</strong><span
               >{backend === 'av1an'
                 ? `av1an / ${options.name} · ${workers ?? '—'} workers`
-                : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name}`}
-              · {rateSummary(selectedRate(rate), crf)} · Preset {presetLabel(
+                : `${['x265', 'vp9', 'h264Nvenc', 'hevcNvenc'].includes(encoder) ? 'FFmpeg' : 'Standalone'} ${options.name}`}
+              · {rateSummary(selectedRate(rate), crf, rate.mode === 'lossless')} · Preset {presetLabel(
                 encoder,
                 preset,
               )}{forkSettingsSummary({
@@ -807,8 +820,8 @@
             Enter a valid whole-number bitrate or target size above.
           </p>
         {:else if !validSettings}<p class="disabled-reason">
-            Use whole numbers: CRF {options.crfMin}–{options.crfMax}, preset 0–{options.presets
-              .length - 1}{isSvtEncoder(encoder) ? ', and grain 0–50' : ''}{encoder ===
+            Use {isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF {options.crfMin}–{options.crfMax},
+            a listed preset{isSvtEncoder(encoder) ? ', and grain 0–50' : ''}{encoder ===
             'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
               : ''}{chunked ? '; parallel chunks 1–32' : ''}.

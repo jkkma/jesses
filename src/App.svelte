@@ -37,6 +37,9 @@
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
+  import CompletionPanel from '$lib/features/tools/CompletionPanel.svelte';
+  import Utilities from '$lib/features/utilities/Utilities.svelte';
+  import SavedJobs from '$lib/features/utilities/SavedJobs.svelte';
   import { encoderChoices, encoderOptions } from '$lib/components/shared/encoder-options';
   import {
     chooseMediaFiles,
@@ -75,7 +78,7 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools';
+  type View = 'files' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
@@ -209,14 +212,12 @@
   async function submitEncode(request: EncodeRequest) {
     const job = await startEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog(`${request.settings.encoder === 'x264' ? 'H.264 / x264' : 'AV1'} encode job submitted.`);
+    addLog(`${encoderOptions(request.settings.encoder).name} encode job submitted.`);
   }
   async function queueEncode(request: EncodeRequest) {
     const job = await enqueueEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog(
-      `${request.settings.encoder === 'x264' ? 'H.264 / x264' : 'AV1'} encode added to the queue.`,
-    );
+    addLog(`${encoderOptions(request.settings.encoder).name} encode added to the queue.`);
   }
   async function queueBatch(requests: EncodeRequest[]) {
     const submitted = await enqueueEncodeBatch(requests);
@@ -631,6 +632,12 @@
         onclick={() => (view = 'tools')}
         ><Wrench size={16} aria-hidden="true" />Tools & settings</button
       >
+      <button
+        type="button"
+        class:active={view === 'utilities'}
+        aria-current={view === 'utilities' ? 'page' : undefined}
+        onclick={() => (view = 'utilities')}>Utilities</button
+      >
     </nav>
     <span class="workspace-label">LOCAL WORKSPACE<span class="square-mark"></span></span>
   </div>
@@ -881,6 +888,7 @@
     {/if}
     <div hidden={view !== 'convert'}>
       <QuickConvert
+        {files}
         file={selectedFile}
         {tools}
         {jobs}
@@ -892,6 +900,7 @@
     </div>
     <div hidden={view !== 'av1an'}>
       <Av1an
+        {files}
         file={selectedFile}
         {tools}
         {jobs}
@@ -922,6 +931,12 @@
         onmux={submitMux}
       />
     </div>
+    <div hidden={view !== 'utilities'}>
+      <Utilities {files} onimport={(paths) => void importPaths(paths)} /><SavedJobs
+        {jobs}
+        onqueue={queueEncode}
+      />
+    </div>
     <div hidden={!(view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux')}>
       <JobStatus
         job={currentJob}
@@ -933,6 +948,12 @@
         onpause={pauseLiveJob}
       />
     </div>
+    <CompletionPanel
+      settingsVisible={view === 'convert' ||
+        view === 'av1an' ||
+        view === 'batch' ||
+        view === 'remux'}
+    />
   </main>
 
   <section class="log-panel" class:expanded={logOpen} aria-label="Activity log">

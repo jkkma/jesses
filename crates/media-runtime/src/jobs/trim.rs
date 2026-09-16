@@ -1,6 +1,6 @@
 //! Frame intervals are derived only after the full source has passed its CFR
 //! scan. Output validation then compares the exact selected interval.
-use media_core::{AppError, AudioCodec, EncodeBackend, EncodeSettings, VideoTrim};
+use media_core::{AppError, AudioCodec, EncodeSettings, VideoTrim};
 
 use super::files::Temporary;
 use super::metadata::{Document, Stream};
@@ -21,14 +21,15 @@ fn unsupported(message: impl Into<String>) -> AppError {
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     if let Some(trim) = settings.trim {
-        if trim.end_frame_exclusive <= trim.start_frame {
+        if let Some(time) = trim.time {
+            if time.end_milliseconds <= time.start_milliseconds {
+                return Err(unsupported(
+                    "The trim end time must be greater than its zero-based start time; the end time is excluded.",
+                ));
+            }
+        } else if trim.end_frame_exclusive <= trim.start_frame {
             return Err(unsupported(
                 "The trim end frame must be greater than its zero-based start frame; the end frame is excluded.",
-            ));
-        }
-        if settings.backend != EncodeBackend::Standalone {
-            return Err(unsupported(
-                "Frame intervals currently require standalone encoding. av1an chunks cannot apply a source interval independently.",
             ));
         }
     }
@@ -74,6 +75,8 @@ pub(super) fn validate_selection(
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Interval {
     pub frames: usize,
+    pub source_start_frame: usize,
+    pub source_end_frame: usize,
     pub start: f64,
     pub end: f64,
 }
@@ -85,6 +88,44 @@ impl Interval {
         fps_num: u32,
         fps_den: u32,
     ) -> Result<Self, AppError> {
+        if fps_num == 0 || fps_den == 0 {
+            return Err(unsupported("The validated source frame rate is invalid."));
+        }
+        if let Some(time) = trim.time {
+            let scale = u128::from(fps_den) * 1_000;
+            let frame_at_or_after = |milliseconds: u32| {
+                let numerator = u128::from(milliseconds) * u128::from(fps_num);
+                numerator.div_ceil(scale)
+            };
+            let start_frame = frame_at_or_after(time.start_milliseconds);
+            let end_frame = frame_at_or_after(time.end_milliseconds);
+            let source_frames_u128 = source_frames as u128;
+            let end_within_source = u128::from(time.end_milliseconds) * u128::from(fps_num)
+                <= source_frames_u128 * scale;
+            if time.end_milliseconds <= time.start_milliseconds
+                || end_frame <= start_frame
+                || end_frame > source_frames_u128
+                || !end_within_source
+            {
+                return Err(unsupported(format!(
+                    "The selected time interval [{:.3}, {:.3}) seconds exceeds the {:.3}-second validated source or selects no complete frame.",
+                    time.start_milliseconds as f64 / 1_000.0,
+                    time.end_milliseconds as f64 / 1_000.0,
+                    source_frames as f64 * f64::from(fps_den) / f64::from(fps_num),
+                )));
+            }
+            return Ok(Self {
+                frames: usize::try_from(end_frame - start_frame).map_err(|_| {
+                    unsupported("The selected time interval contains too many frames.")
+                })?,
+                source_start_frame: usize::try_from(start_frame)
+                    .map_err(|_| unsupported("The selected start frame is too large."))?,
+                source_end_frame: usize::try_from(end_frame)
+                    .map_err(|_| unsupported("The selected end frame is too large."))?,
+                start: time.start_milliseconds as f64 / 1_000.0,
+                end: time.end_milliseconds as f64 / 1_000.0,
+            });
+        }
         if trim.end_frame_exclusive <= trim.start_frame
             || u64::from(trim.end_frame_exclusive) > source_frames as u64
         {
@@ -96,6 +137,8 @@ impl Interval {
         let seconds = |frames: u32| f64::from(frames) * f64::from(fps_den) / f64::from(fps_num);
         Ok(Self {
             frames: (trim.end_frame_exclusive - trim.start_frame) as usize,
+            source_start_frame: trim.start_frame as usize,
+            source_end_frame: trim.end_frame_exclusive as usize,
             start: seconds(trim.start_frame),
             end: seconds(trim.end_frame_exclusive),
         })
@@ -357,5 +400,55 @@ impl Prepared {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use media_core::VideoTimeTrim;
+
+    #[test]
+    fn time_interval_uses_ffmpeg_timestamp_boundaries() {
+        let interval = Interval::build(
+            VideoTrim {
+                start_frame: 0,
+                end_frame_exclusive: 0,
+                time: Some(VideoTimeTrim {
+                    start_milliseconds: 500,
+                    end_milliseconds: 1_001,
+                }),
+            },
+            240,
+            24_000,
+            1_001,
+        )
+        .unwrap();
+        assert_eq!(interval.frames, 12);
+        assert_eq!(interval.start, 0.5);
+        assert_eq!(interval.end, 1.001);
+    }
+
+    #[test]
+    fn time_interval_rejects_empty_frame_selection_and_past_end() {
+        let empty = VideoTrim {
+            start_frame: 0,
+            end_frame_exclusive: 0,
+            time: Some(VideoTimeTrim {
+                start_milliseconds: 1,
+                end_milliseconds: 2,
+            }),
+        };
+        assert!(Interval::build(empty, 24, 24, 1).is_err());
+
+        let past_end = VideoTrim {
+            start_frame: 0,
+            end_frame_exclusive: 0,
+            time: Some(VideoTimeTrim {
+                start_milliseconds: 900,
+                end_milliseconds: 1_001,
+            }),
+        };
+        assert!(Interval::build(past_end, 24, 24, 1).is_err());
     }
 }

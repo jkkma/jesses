@@ -298,6 +298,7 @@ async fn quick_encode_trim_to_mp4_and_convert_imported_mp4_text_back_to_matroska
             trim: Some(media_core::VideoTrim {
                 start_frame: 12,
                 end_frame_exclusive: 36,
+                time: None,
             }),
             ..Default::default()
         },

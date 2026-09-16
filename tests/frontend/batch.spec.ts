@@ -93,6 +93,13 @@ async function desktopMock(
         unregisterCallback: () => {},
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           if (command === 'get_capabilities')
             return [
               'ffmpeg',
@@ -102,6 +109,10 @@ async function desktopMock(
               'svt-av1-hdr',
               'av1an',
               'x264',
+              'aomenc',
+              'vpxenc',
+              'x265',
+              'mkvmerge',
             ].map((id) => ({
               id,
               name: id,
@@ -178,6 +189,11 @@ async function desktopMock(
                     x264: '_x264.mkv',
                     x265: '_x265.mkv',
                     vp9: '_vp9.mkv',
+                    aomAv1: '_aom_av1.mkv',
+                    x265Standalone: '_x265_standalone.mkv',
+                    vpxStandalone: '_vpx.mkv',
+                    h264Nvenc: '_h264_nvenc.mkv',
+                    hevcNvenc: '_hevc_nvenc.mkv',
                   }[request.encoder];
                 return {
                   inputPath: input.inputPath,
@@ -194,6 +210,11 @@ async function desktopMock(
                       ...(request.av1anOptions ? { av1anOptions: request.av1anOptions } : {}),
                       ...(request.rateControl ? { rateControl: request.rateControl } : {}),
                       preset: request.preset,
+                      lossless: request.lossless,
+                      ...(request.svtCrfQuarterSteps === undefined
+                        ? {}
+                        : { svtCrfQuarterSteps: request.svtCrfQuarterSteps }),
+                      ...(request.svtPreset === undefined ? {} : { svtPreset: request.svtPreset }),
                       backend: request.backend,
                       encoder: request.encoder,
                       workers: request.workers,
@@ -695,6 +716,7 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
   const settings = {
     crf: 23,
     preset: 5,
+    lossless: false,
     backend: 'standalone',
     encoder: 'x264',
     workers: 2,
@@ -1029,6 +1051,9 @@ test('batch defaults preserve original per-file stream indices and keep attachme
       outputDirectory: 'C:\\exports',
       crf: 27,
       preset: 2,
+      lossless: false,
+      svtCrfQuarterSteps: 108,
+      svtPreset: 2,
       backend: 'standalone',
       encoder: 'svtAv1Hdr',
       workers: 2,
@@ -1255,7 +1280,7 @@ test('invalid CRF, empty destination, and empty selection block otherwise availa
   await expect(preview).toBeEnabled();
   await page.getByLabel('CRF', { exact: true }).fill('0');
   await expect(preview).toBeDisabled();
-  await page.getByLabel('CRF', { exact: true }).fill('25.5');
+  await page.getByLabel('CRF', { exact: true }).fill('25.2');
   await expect(preview).toBeDisabled();
   await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
   await expect(preview).toBeEnabled();
@@ -1557,6 +1582,48 @@ for (const encoder of ['x265', 'vp9'] as const) {
       });
   });
 }
+
+test('batch exposes direct encoders and blocks unsupported NVENC two-pass and target-size requests', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const encoder = workspace.getByLabel('Video encoder', { exact: true });
+  await expect(encoder.locator('option[value="aomAv1"]')).toHaveText('AOM · AV1 (standalone)');
+  await expect(encoder.locator('option[value="vpxStandalone"]')).toHaveText(
+    'VP9 · vpxenc (standalone)',
+  );
+  await expect(encoder.locator('option[value="x265Standalone"]')).toHaveText(
+    'x265 · HEVC (standalone)',
+  );
+  await encoder.selectOption('x265Standalone');
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const request = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(request).toMatchObject({
+    encoder: 'x265Standalone',
+    backend: 'standalone',
+    lossless: false,
+  });
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    'Episode 1_x265_standalone.mkv',
+  );
+
+  await encoder.selectOption('hevcNvenc');
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('bitrate');
+  await expect(workspace).toContainText('NVENC bitrate mode is one pass');
+  await expect(
+    workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+  ).toBeDisabled();
+  await workspace.getByLabel('Two passes', { exact: true }).uncheck();
+  await expect(workspace.getByRole('button', { name: 'Preview batch', exact: true })).toBeEnabled();
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
+  await expect(workspace).toContainText('NVENC does not support target-size mode');
+  await expect(
+    workspace.getByRole('button', { name: 'Preview batch', exact: true }),
+  ).toBeDisabled();
+});
 
 test('frame trim batch keeps per-source intervals and invalidates reviewed output after edits', async ({
   page,

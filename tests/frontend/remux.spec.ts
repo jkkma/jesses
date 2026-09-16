@@ -156,6 +156,13 @@ async function desktopMock(
             ]);
             return canceling;
           }
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           throw new Error(`Unexpected IPC command: ${command}`);
         },
       };

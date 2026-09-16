@@ -66,6 +66,14 @@ pub struct BatchEncodeRequest {
     pub crf: u8,
     pub preset: u8,
     #[serde(default)]
+    pub lossless: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub svt_crf_quarter_steps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub svt_preset: Option<i8>,
+    #[serde(default)]
     pub film_grain: u8,
     #[serde(default)]
     pub lineart_psy_bias: u8,

@@ -296,32 +296,6 @@ async fn inspect(
             &source.path,
         ));
     }
-    let rotated = stream.tags.iter().any(|(key, value)| {
-        key.eq_ignore_ascii_case("rotate")
-            && value
-                .parse::<f64>()
-                .map_or(true, |n| !n.is_finite() || n.abs() > 0.01)
-    }) || stream
-        .side_data_list
-        .iter()
-        .filter_map(|item| item.get("rotation"))
-        .any(|value| {
-            value
-                .as_f64()
-                .is_none_or(|n| !n.is_finite() || n.abs() > 0.01)
-        });
-    if rotated
-        || !matches!(
-            stream.sample_aspect_ratio.as_deref(),
-            None | Some("N/A" | "0:1" | "1:1")
-        )
-    {
-        return Err(error(
-            "ANALYSIS_INPUT_UNSUPPORTED",
-            "Source previews and automatic crop currently require unrotated, square-pixel video.",
-            &source.path,
-        ));
-    }
     let duration = seconds(stream.duration.as_deref()).or_else(|| {
         seconds(
             document
@@ -351,6 +325,10 @@ fn decoder_args(input: &Input, position: f64, verbose: bool) -> Vec<OsString> {
         "-err_detect",
         "explode",
         "-noautorotate",
+        // The transform is applied explicitly for display thumbnails. Do not
+        // copy the matrix into PNG EXIF and rotate the image a second time.
+        "-display_rotation:v",
+        "0",
         "-threads",
         "2",
         "-filter_threads",
@@ -369,7 +347,11 @@ fn decoder_args(input: &Input, position: f64, verbose: bool) -> Vec<OsString> {
         "-map".into(),
         format!("0:{}", input.stream.index).into(),
     ]);
-    args.extend(["-an", "-sn", "-dn"].into_iter().map(OsString::from));
+    args.extend(
+        ["-an", "-sn", "-dn", "-map_metadata", "-1"]
+            .into_iter()
+            .map(OsString::from),
+    );
     args
 }
 
@@ -379,6 +361,60 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
         .min(1.0);
     let rounded = |value: u32| ((f64::from(value) * scale / 2.0).floor() as u32 * 2).max(2);
     (rounded(width), rounded(height))
+}
+
+/// Display thumbnails honor the source display matrix and SAR. Editing previews
+/// intentionally keep coded coordinates so a crop never targets rotated pixels.
+fn display_geometry(input: &Input) -> Result<(u32, u32, &'static str), AppError> {
+    let rotation = input
+        .stream
+        .side_data_list
+        .iter()
+        .filter_map(|v| v.get("rotation"))
+        .find_map(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
+        .or_else(|| {
+            input
+                .stream
+                .tags
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("rotate"))?
+                .1
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0.0);
+    let angle = rotation.rem_euclid(360.0);
+    let quarter = (angle / 90.0).round();
+    if !angle.is_finite() || (angle - quarter * 90.0).abs() > 0.01 {
+        return Err(error(
+            "ANALYSIS_INPUT_UNSUPPORTED",
+            "Display previews support rotations in 90-degree steps. Use the coded source preview for other display matrices.",
+            &input.source.path,
+        ));
+    }
+    let sar = match input.stream.sample_aspect_ratio.as_deref() {
+        None | Some("N/A" | "0:1") => 1.0,
+        Some(value) => value
+            .split_once(':')
+            .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 100.0)
+            .ok_or_else(|| {
+                error(
+                    "ANALYSIS_INPUT_UNSUPPORTED",
+                    "The source pixel aspect ratio is invalid.",
+                    &input.source.path,
+                )
+            })?,
+    };
+    let width = (f64::from(input.width) * sar).round().max(2.0) as u32;
+    let (width, height, rotation_filter) = match quarter as u32 % 4 {
+        1 => (input.height, width, "transpose=cclock,"),
+        2 => (width, input.height, "hflip,vflip,"),
+        3 => (input.height, width, "transpose=clock,"),
+        _ => (width, input.height, ""),
+    };
+    let (width, height) = preview_size(width, height);
+    Ok((width, height, rotation_filter))
 }
 
 fn preview_filter(input: &Input, width: u32, height: u32) -> Result<(String, bool), AppError> {
@@ -438,10 +474,15 @@ pub async fn preview_frame(
             &input.source.path,
         ));
     }
-    let (width, height) = preview_size(input.width, input.height);
+    let (width, height, orientation) = if request.display_orientation == Some(true) {
+        display_geometry(&input)?
+    } else {
+        let (w, h) = preview_size(input.width, input.height);
+        (w, h, "")
+    };
     let (filter, tone_mapped) = preview_filter(&input, width, height)?;
     let mut args = decoder_args(&input, request.position_seconds, false);
-    args.extend(["-vf".into(), filter.into()]);
+    args.extend(["-vf".into(), format!("{orientation}{filter}").into()]);
     args.extend(
         [
             "-frames:v",
@@ -704,6 +745,7 @@ mod tests {
         let (_owner, cancel) = watch::channel(true);
         let error = preview_frame(
             FramePreviewRequest {
+                display_orientation: None,
                 input_path: "missing".into(),
                 video_stream_index: 0,
                 position_seconds: 0.0,

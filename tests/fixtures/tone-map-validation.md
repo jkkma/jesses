@@ -1,6 +1,6 @@
 # Explicit HDR and HLG to SDR
 
-Qualified on Windows on 2026-09-13. Quick Convert and each standalone batch file
+Qualified on Windows on 2026-09-13. Quick Convert, av1an and each batch file
 can opt into `toneMap: { sourcePeakNits, hdr10BaseLayer }`. Omission preserves old
 jobs, drafts and the existing SDR/HDR10-preservation behavior. The signal peak
 must be an integer from 100 through 10000 nits. Output is Hable-rendered BT.709,
@@ -22,8 +22,10 @@ Dynamic HDR requires the separate `hdr10BaseLayer` choice. It uses the existing
 qualified Dolby Vision profile 7/compatibility 6 or profile 8/compatibility 1
 HDR10 base layer and discards dynamic/enhancement information. Other Dolby
 profiles, ambiguous profiles, unknown rendering side data, and HLG with HDR10
-base-layer fallback are rejected. av1an tone mapping remains explicitly disabled
-pending separate chunk/recovery qualification.
+base-layer fallback are rejected. av1an applies the same rendering to final
+chunks and quality references. Timeline-changing jobs render it once into a
+verified lossless source used by scene detection as well; recovery binds the
+filter or decoded result together with the original media identity.
 
 The filter linearizes HDR using zimg and `npl=100`, converts BT.2020 primaries to
 BT.709 in floating-point RGB, and applies Hable with the explicit signal peak
@@ -61,7 +63,7 @@ four gates in 12.85 seconds:
   without source HDR metadata, retaining the exact count.
 - Neutral PQ and HLG patches compare independently calculated transfer/Hable
   output to lossless x264 decoded samples, within three 10-bit code values.
-- SDR input, unsupported backend and invalid signal peaks cannot publish output.
+- SDR input and invalid signal peaks cannot publish output.
 
 The actual subtitle bitmap gate also passed both SDR and PQ-tone-map variants in
 2.87 seconds. White PGS graphics remain white and retain their intended placement

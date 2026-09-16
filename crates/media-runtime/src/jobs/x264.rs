@@ -45,7 +45,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         "--range".into(),
         range.into(),
         "--sar".into(),
-        "1:1".into(),
+        plan.output_sar().into(),
         "--colorprim".into(),
         color(plan.primaries).into(),
         "--transfer".into(),
@@ -60,8 +60,6 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
             _ => unreachable!("validated x264 chroma placement"),
         }
         .into(),
-        "--crf".into(),
-        settings.crf.to_string(),
         "--preset".into(),
         PRESETS[usize::from(settings.preset)].into(),
         "-o".into(),
@@ -71,6 +69,14 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     .into_iter()
     .map(OsString::from)
     .collect();
+    args.splice(
+        args.len() - 3..args.len() - 3,
+        if settings.lossless {
+            vec!["--qp".into(), "0".into()]
+        } else {
+            vec!["--crf".into(), settings.crf.to_string().into()]
+        },
+    );
     args.splice(
         args.len() - 3..args.len() - 3,
         super::super::parameters::arguments(settings),

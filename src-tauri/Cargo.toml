@@ -17,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde_json.workspace = true
 media-core = { path = "../crates/media-core" }
 media-runtime = { path = "../crates/media-runtime" }
 tokio.workspace = true

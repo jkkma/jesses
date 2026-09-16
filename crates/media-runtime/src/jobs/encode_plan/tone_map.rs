@@ -1,5 +1,5 @@
 //! Explicit linear-light HDR/HLG rendering, with a separate SDR output contract.
-use media_core::{AppError, EncodeBackend, EncodeSettings, ToneMapSettings};
+use media_core::{AppError, EncodeSettings, ToneMapSettings};
 use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::sync::watch;
 
@@ -7,17 +7,12 @@ use super::{Stream, unsupported};
 use crate::supervisor::{self, CommandSpec};
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
-    if let Some(tone) = settings.tone_map {
-        if settings.backend != EncodeBackend::Standalone {
-            return Err(unsupported(
-                "HDR-to-SDR tone mapping currently requires standalone encoding.",
-            ));
-        }
-        if !(100..=10_000).contains(&tone.source_peak_nits) || settings.hdr10_fallback {
-            return Err(unsupported(
-                "Tone mapping requires a signal peak from 100 to 10000 nits. Use its separate HDR10 base-layer option instead of HDR10 output fallback.",
-            ));
-        }
+    if let Some(tone) = settings.tone_map
+        && (!(100..=10_000).contains(&tone.source_peak_nits) || settings.hdr10_fallback)
+    {
+        return Err(unsupported(
+            "Tone mapping requires a signal peak from 100 to 10000 nits. Use its separate HDR10 base-layer option instead of HDR10 output fallback.",
+        ));
     }
     Ok(())
 }

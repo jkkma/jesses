@@ -7,7 +7,7 @@ mod options;
 pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
-pub(super) use recovery::Recovery;
+pub(super) use recovery::{PreparedSource, Recovery};
 
 pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
     launcher::validate_encoder_path(encoder)
@@ -29,6 +29,7 @@ pub(super) fn validate_input(document: &Document, plan: &Plan) -> Result<(), App
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn arguments(
     input: &Path,
     output: &Path,
@@ -37,6 +38,7 @@ pub(super) fn arguments(
     plan: &Plan,
     settings: &EncodeSettings,
     resume: bool,
+    source_filter: Option<&str>,
 ) -> Vec<OsString> {
     // Only planner-owned scalars enter av1an's nested encoder argument string.
     // User paths are always separate native arguments, never shell text.
@@ -82,10 +84,19 @@ pub(super) fn arguments(
     if resume {
         args.push("--resume".into());
     }
-    if let Some(filter) = plan.framing_filter() {
+    if let Some(filter) = source_filter {
         // The generated filter contains only planner-owned labels, integers,
         // and fixed FFmpeg options. Paths never enter av1an's nested parser.
         args.extend(["--ffmpeg".into(), format!("-vf {filter}").into()]);
+        if settings
+            .av1an_options
+            .is_some_and(|options| options.target_quality.is_some())
+        {
+            // Target probes encode through --ffmpeg. Score the reference after
+            // the same deterministic processing so the search and final chunk
+            // compare corresponding pixels, timing, color and geometry.
+            args.extend(["--vmaf-filter".into(), filter.into()]);
+        }
     }
     for (key, value) in [
         ("-i", input.as_os_str().to_owned()),
@@ -134,6 +145,7 @@ impl JobManager {
             ));
         }
         let work = recovery.root.clone();
+        let source_filter = recovery.source_filter()?;
         // A crashed staged host remains in its owned attempt directory. Never
         // replace it or let it shadow the encoder selected for this attempt.
         let launch_directory = work.join(format!(
@@ -218,7 +230,8 @@ impl JobManager {
             append_log(snapshot, format!("av1an: {} parallel workers; {} source chunks, {:?} splitting, maximum {} frames (0 means unlimited). Workspace: {}", settings.workers, options::chunk_method(configured), configured.split_method, configured.maximum_chunk_frames, work.display()));
             if let Some(target) = configured.target_quality {
                 append_log(snapshot, format!("{} target {:.1}–{:.1}, mean score at {}×{}, CRF {}–{}, at most {} probes, sampling every {} frame(s). A search may finish outside the requested score range when its bounds/probes are exhausted.", metrics::label(target.metric), f64::from(target.minimum_score_tenths)/10.0, f64::from(target.maximum_score_tenths)/10.0, target.probe_width, target.probe_height, target.minimum_crf, target.maximum_crf, target.probes, target.probing_rate));
-                if plan.framing_filter().is_some() { append_log(snapshot, "Quality target warning: av1an probes encode and score unfiltered source frames. Crop, resize, and borders run in the final chunk pipeline and are not included in this target search; final output quality may differ. Reference-only filters are deliberately not applied to an unfiltered probe.".into()); }
+                if source_filter.is_some() { append_log(snapshot, "Quality target: probe encodes and reference scoring use the same validated trim, temporal, tone-map, framing, and aspect-ratio filter chain as final chunks.".into()); }
+                else { append_log(snapshot, "Quality target: probe encodes and reference scoring read the same verified lossless processed source as final chunks.".into()); }
                 if target.probing_rate > 1 { append_log(snapshot, "Quality target warning: sampled-frame scores may differ from scoring every frame; the target is not a full-output quality measurement.".into()); }
             }
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
@@ -276,6 +289,7 @@ impl JobManager {
                     plan,
                     settings,
                     recovery.resume_chunks,
+                    source_filter.as_deref(),
                 ),
                 cwd: Some(work.clone()),
             },
@@ -488,6 +502,7 @@ mod tests {
             &plan,
             &settings,
             false,
+            plan.decoder_filter().as_deref(),
         );
         assert!(
             args.windows(2)
@@ -505,6 +520,33 @@ mod tests {
             .unwrap();
         assert!(params.contains("--film-grain 8 --film-grain-denoise 0"));
         assert!(params.contains("--fps-num 24000 --fps-denom 1001"));
+
+        let filtered = arguments(
+            input,
+            Path::new("/out/owned.ivf"),
+            Path::new("/out/work"),
+            Path::new("/logs/job.log"),
+            &plan,
+            &settings,
+            false,
+            Some("bwdif=mode=send_frame"),
+        );
+        assert!(
+            filtered
+                .windows(2)
+                .any(|pair| { pair[0] == "--ffmpeg" && pair[1] == "-vf bwdif=mode=send_frame" })
+        );
+        let prepared = arguments(
+            input,
+            Path::new("/out/owned.ivf"),
+            Path::new("/out/work"),
+            Path::new("/logs/job.log"),
+            &plan,
+            &settings,
+            false,
+            None,
+        );
+        assert!(!prepared.iter().any(|value| value == "--ffmpeg"));
         assert!(!params.contains("movie"));
         assert!(
             !args

@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 mod analysis;
+mod images;
+mod saved_jobs;
+pub use saved_jobs::SavedJobInspection;
+mod completion;
+pub use completion::{CompletionOptions, CompletionStatus, FinishAction};
+mod utilities;
+pub use images::{ImageOutput, ImageRequest, ImageResult};
+pub use utilities::{
+    ColorMetadataTransferRequest, ConcatRequest, CrfLadderRequest, CrfLadderResult, CrfLadderRung,
+    GrainRequest, GrainSource, GrainTableResult, KeyframeCutRequest, LadderEncoder, LadderMetric,
+    SubtitleOcrRequest, SubtitleOcrResult, UtilityArtifact, UtilityCapabilities, UtilityDependency,
+    UtilityRequest, UtilityResult,
+};
 mod av1an;
 pub use av1an::{
     Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSceneDetection, Av1anSplitMethod,
@@ -42,12 +55,15 @@ pub use encoder_parameters::{
 pub use jobs::{
     AudioChannels, AudioCodec, AudioGain, AudioTrackSettings, Av1anRecovery, BorderSettings,
     CropSettings, EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState,
-    RecoveryPhase, RemuxRequest, VideoEncoder, VideoFraming, VideoRateControl, VideoTrim,
+    RecoveryPhase, RemuxRequest, StandaloneRecovery, StandaloneRecoveryPhase, VideoEncoder,
+    VideoFraming, VideoRateControl, VideoTimeTrim, VideoTrim,
 };
 pub use mux::{MuxRequest, MuxSource, MuxTrack};
 pub use subtitles::{SubtitleMode, SubtitleTrackSettings};
 pub use temporal::{
-    DeinterlaceMode, DeinterlaceSettings, FieldOrder, FrameRate, ResizeFilter, TemporalSettings,
+    AspectRatioKind, AspectRatioSettings, CadenceRepairKind, CadenceRepairSettings,
+    DeinterlaceMode, DeinterlaceSettings, FieldOrder, FrameRate, QtgmcPreset, QtgmcSettings,
+    ResizeFilter, TemporalSettings,
 };
 pub use tone_map::ToneMapSettings;
 
@@ -85,6 +101,16 @@ pub struct MediaStream {
     pub codec: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sample_aspect_ratio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_aspect_ratio: Option<String>,
+    /// Reported display-matrix rotation, in degrees as finite decimal text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rotation_degrees: Option<String>,
     /// Original rational frame rate, for example `24000/1001`.
     pub frame_rate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +178,39 @@ impl AppError {
 pub fn typescript_contracts() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
+        SavedJobInspection::decl(&config),
+        StandaloneRecovery::decl(&config),
+        StandaloneRecoveryPhase::decl(&config),
+        QtgmcSettings::decl(&config),
+        QtgmcPreset::decl(&config),
+        CadenceRepairSettings::decl(&config),
+        CadenceRepairKind::decl(&config),
+        AspectRatioKind::decl(&config),
+        AspectRatioSettings::decl(&config),
+        FinishAction::decl(&config),
+        CompletionOptions::decl(&config),
+        CompletionStatus::decl(&config),
+        ImageOutput::decl(&config),
+        ImageRequest::decl(&config),
+        ImageResult::decl(&config),
+        UtilityRequest::decl(&config),
+        UtilityResult::decl(&config),
+        UtilityCapabilities::decl(&config),
+        UtilityDependency::decl(&config),
+        KeyframeCutRequest::decl(&config),
+        ConcatRequest::decl(&config),
+        ColorMetadataTransferRequest::decl(&config),
+        SubtitleOcrRequest::decl(&config),
+        GrainRequest::decl(&config),
+        GrainSource::decl(&config),
+        LadderEncoder::decl(&config),
+        LadderMetric::decl(&config),
+        CrfLadderRequest::decl(&config),
+        UtilityArtifact::decl(&config),
+        SubtitleOcrResult::decl(&config),
+        GrainTableResult::decl(&config),
+        CrfLadderResult::decl(&config),
+        CrfLadderRung::decl(&config),
         ToolInfo::decl(&config),
         GeneralPreferences::decl(&config),
         UserPreferences::decl(&config),
@@ -211,6 +270,7 @@ pub fn typescript_contracts() -> String {
         BorderSettings::decl(&config),
         VideoFraming::decl(&config),
         VideoTrim::decl(&config),
+        VideoTimeTrim::decl(&config),
         EncoderParameter::decl(&config),
         EncoderParameterQuery::decl(&config),
         EncoderParameterSpec::decl(&config),

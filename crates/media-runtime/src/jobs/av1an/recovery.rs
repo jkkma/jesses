@@ -21,6 +21,20 @@ fn error(path: &Path, message: impl Into<String>) -> AppError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity(Vec<u64>);
 
+fn file_identity(file: &File) -> std::io::Result<Identity> {
+    #[cfg(windows)]
+    {
+        let (a, b, c) = files::windows_file_id(file)?;
+        Ok(Identity(vec![u64::from(a), u64::from(b), u64::from(c)]))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Identity(vec![metadata.dev(), metadata.ino()]))
+    }
+}
+
 fn identity(path: &Path) -> Result<Identity, AppError> {
     let metadata = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
     if metadata.file_type().is_symlink() {
@@ -40,8 +54,7 @@ fn identity(path: &Path) -> Result<Identity, AppError> {
             .custom_flags(0x02000000)
             .open(path)
             .map_err(|e| error(path, e.to_string()))?;
-        let (a, b, c) = files::windows_file_id(&file).map_err(|e| error(path, e.to_string()))?;
-        Ok(Identity(vec![u64::from(a), u64::from(b), u64::from(c)]))
+        file_identity(&file).map_err(|e| error(path, e.to_string()))
     }
     #[cfg(unix)]
     {
@@ -73,7 +86,7 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
         return Err(error(path, "Expected a regular recovery file."));
     }
     let mut hasher = Sha256::new();
-    let mut bytes = [0u8; 1024 * 1024];
+    let mut bytes = vec![0u8; 1024 * 1024];
     let mut length = 0;
     loop {
         if let Some(cancel) = cancel {
@@ -105,6 +118,70 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
         length,
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+fn copy_prepared(
+    source: &Path,
+    destination: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Stamp, AppError> {
+    // `Temporary` retains a writable identity guard until this handoff. A
+    // second `Source` guard would deny that already-open handle on Windows, so
+    // verify the file immediately before and after the bounded copy instead.
+    let before = digest(source, Some(cancel))?;
+    let mut input = File::open(source).map_err(|e| error(source, e.to_string()))?;
+    with_owned_output(destination, |output| {
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            check_cancel(cancel)?;
+            let read = input
+                .read(&mut buffer)
+                .map_err(|e| error(source, e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|e| error(destination, e.to_string()))?;
+        }
+        output
+            .sync_all()
+            .map_err(|e| error(destination, e.to_string()))?;
+        if digest(source, Some(cancel))? != before {
+            return Err(error(
+                source,
+                "The prepared source changed while it was copied into recovery.",
+            ));
+        }
+        let copied = digest(destination, Some(cancel))?;
+        if copied.length != before.length || copied.sha256 != before.sha256 {
+            return Err(error(
+                destination,
+                "The durable prepared source differs from its verified input.",
+            ));
+        }
+        Ok(copied)
+    })
+}
+
+fn with_owned_output<T>(
+    destination: &Path,
+    operation: impl FnOnce(&mut File) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|e| error(destination, e.to_string()))?;
+    let owned = file_identity(&output).map_err(|e| error(destination, e.to_string()))?;
+    let result = operation(&mut output);
+    drop(output);
+    if result.is_err() {
+        // Remove only the exact create-new file. If its pathname was replaced,
+        // fail closed and preserve the replacement.
+        let _ = remove_tree(destination, &owned, None);
+    }
+    result
 }
 
 fn bytes(path: &Path) -> Result<Vec<u8>, AppError> {
@@ -158,12 +235,25 @@ struct Manifest {
     directory: Identity,
     request: RemuxRequest,
     settings: EncodeSettings,
+    /// The source av1an reads. A frame-changing preprocessing workflow copies
+    /// its verified lossless output to a stable path inside this workspace.
     source: Stamp,
+    /// The immutable user source remains the authority for the request and the
+    /// final audio/metadata mux when av1an reads a prepared video instead.
+    #[serde(default)]
+    original_source: Option<Stamp>,
+    /// Decoded-pixel identity of a freshly regenerated prepared source. This
+    /// prevents old chunks from surviving a plugin/filter output change while
+    /// remaining independent of Matroska IDs and path spelling.
+    #[serde(default)]
+    prepared_identity: Option<String>,
     tools: Vec<Stamp>,
     params: Vec<String>,
     fps_num: u32,
     fps_den: u32,
     total_frames: u64,
+    #[serde(default)]
+    source_filter: Option<String>,
     phase: RecoveryPhase,
     av1an_version: Option<String>,
     queue: Option<Stamp>,
@@ -225,6 +315,22 @@ fn load(
 }
 
 fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
+    if manifest.prepared_identity.is_some() {
+        if manifest.source.path != root.join("prepared.mkv")
+            || manifest.original_source.is_none()
+            || manifest.source_filter.is_some()
+        {
+            return Err(error(
+                root,
+                "The prepared recovery source is outside its owned stable path or has inconsistent identity fields.",
+            ));
+        }
+    } else if manifest.original_source.is_some() {
+        return Err(error(
+            root,
+            "An original-source recovery stamp is present without a prepared source.",
+        ));
+    }
     let expected = [
         ("chunks/chunks.json", manifest.queue.as_ref()),
         ("chunks/scenes.json", manifest.scenes.as_ref()),
@@ -339,6 +445,8 @@ struct Workspace {
     segments_verified: bool,
     // Protect tools from modification during the resumed job on Windows.
     _tools: Vec<Source>,
+    // Keep the exact source admitted into av1an immutable for the whole run.
+    _source: Option<Source>,
     chunks: Vec<Source>,
     directory_guard: Option<File>,
     lock: Option<File>,
@@ -350,6 +458,32 @@ pub(in crate::jobs) struct Recovery {
     pub(in crate::jobs) finalizing: bool,
     pub(in crate::jobs) resume_chunks: bool,
     inner: Arc<StdMutex<Workspace>>,
+}
+
+/// A freshly regenerated, fully validated lossless video source. Recovery
+/// copies it under the durable workspace before av1an writes any receipts.
+pub(in crate::jobs) struct PreparedSource {
+    pub path: PathBuf,
+    pub decoded_identity: String,
+}
+
+fn source_matches_attempt(
+    manifest: &Manifest,
+    root: &Path,
+    original_source: &Stamp,
+    prepared: Option<&PreparedSource>,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<bool, AppError> {
+    if let Some(prepared) = prepared {
+        Ok(manifest.original_source.as_ref() == Some(original_source)
+            && manifest.prepared_identity.as_deref() == Some(prepared.decoded_identity.as_str())
+            && manifest.source.path == root.join("prepared.mkv")
+            && digest(&manifest.source.path, cancel)? == manifest.source)
+    } else {
+        Ok(manifest.source == *original_source
+            && manifest.original_source.is_none()
+            && manifest.prepared_identity.is_none())
+    }
 }
 
 impl Workspace {
@@ -424,6 +558,7 @@ impl Workspace {
                 source_fps_den: self.source_rate.1,
                 script_text,
                 options,
+                source_filter: self.manifest.source_filter.as_deref(),
             },
         )
         .map_err(|e| error(&chunks, e))
@@ -648,19 +783,27 @@ impl Workspace {
 }
 
 impl Recovery {
+    pub(in crate::jobs) fn source_filter(&self) -> Result<Option<String>, AppError> {
+        self.inner
+            .lock()
+            .map(|workspace| workspace.manifest.source_filter.clone())
+            .map_err(|_| AppError::new("RECOVERY_INVALID", "Recovery state lock failed.", None))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::jobs) async fn prepare(
         id: &str,
         request: &RemuxRequest,
         settings: &EncodeSettings,
         source: &Path,
+        prepared: Option<PreparedSource>,
         tools: Vec<PathBuf>,
         plan: &Plan,
         source_rate: (u32, u32),
         frame_count: usize,
         locator: Option<Av1anRecovery>,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<(Self, Temporary), AppError> {
+    ) -> Result<(Self, Temporary, PathBuf), AppError> {
         let (id, request, settings, source, cancel) = (
             id.to_owned(),
             request.clone(),
@@ -673,29 +816,110 @@ impl Recovery {
             .map(|v| v.into_string().expect("encoder ASCII params"))
             .collect::<Vec<_>>();
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
+        let source_filter = prepared.is_none().then(|| plan.decoder_filter()).flatten();
         tokio::task::spawn_blocking(move || {
-            let source_stamp=digest(&source,Some(&cancel))?;
-            let tool_guards=tools.iter().map(|path|Source::open(path)).collect::<Result<Vec<_>,_>>()?;
-            let tool_stamps=tool_guards.iter().map(|tool|digest(&tool.path,Some(&cancel))).collect::<Result<Vec<_>,_>>()?;
-            let (root,manifest,intermediate)=if let Some(locator)=locator {
-                let (root,manifest)=load(&id,&request,&settings,&locator)?;
-                if manifest.source != source_stamp || manifest.tools != tool_stamps || manifest.params != params || manifest.fps_num != fps_num || manifest.fps_den != fps_den || manifest.total_frames != frame_count as u64 {
-                    return Err(error(&root,"Source content, selected tools, encoder parameters, or frame timing changed; this job cannot reuse old chunks."));
+            let original_source = digest(&source, Some(&cancel))?;
+            let tool_guards = tools
+                .iter()
+                .map(|path| Source::open(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tool_stamps = tool_guards
+                .iter()
+                .map(|tool| digest(&tool.path, Some(&cancel)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (root, manifest, intermediate) = if let Some(locator) = locator {
+                let (root, manifest) = load(&id, &request, &settings, &locator)?;
+                let source_matches = source_matches_attempt(
+                    &manifest,
+                    &root,
+                    &original_source,
+                    prepared.as_ref(),
+                    Some(&cancel),
+                )?;
+                if !source_matches
+                    || manifest.tools != tool_stamps
+                    || manifest.params != params
+                    || manifest.fps_num != fps_num
+                    || manifest.fps_den != fps_den
+                    || manifest.total_frames != frame_count as u64
+                    || manifest.source_filter != source_filter
+                {
+                    return Err(error(
+                        &root,
+                        "Source content, prepared decoded pixels, selected tools, encoder parameters, or frame timing changed; this job cannot reuse old chunks.",
+                    ));
                 }
-                if identity(&root.join("video.ivf"))? != manifest.intermediate { return Err(error(&root,"The durable video intermediate was replaced.")); }
-                let intermediate=Temporary::durable(&root.join("video.ivf"),true)?;
-                (root,manifest,intermediate)
+                if identity(&root.join("video.ivf"))? != manifest.intermediate {
+                    return Err(error(&root, "The durable video intermediate was replaced."));
+                }
+                let intermediate = Temporary::durable(&root.join("video.ivf"), true)?;
+                (root, manifest, intermediate)
             } else {
-                let root=root_for(&id,&request)?;
-                fs::create_dir(&root).map_err(|e|error(&root,e.to_string()))?;
-                let intermediate=Temporary::durable(&root.join("video.ivf"),false)?;
-                let manifest=Manifest { version:1,id, directory:identity(&root)?, request,settings, source:source_stamp, tools:tool_stamps,params,fps_num,fps_den,total_frames:frame_count as u64,
-                    phase:RecoveryPhase::Encoding,av1an_version:None,queue:None,scenes:None,script:None,segments:Vec::new(),completed:BTreeMap::new(),intermediate:identity(&intermediate.path)?,final_video:None };
-                (root,manifest,intermediate)
+                let root = root_for(&id, &request)?;
+                fs::create_dir(&root).map_err(|e| error(&root, e.to_string()))?;
+                let intermediate = Temporary::durable(&root.join("video.ivf"), false)?;
+                let (source_stamp, saved_original, prepared_identity) =
+                    if let Some(prepared) = &prepared {
+                        (
+                            copy_prepared(&prepared.path, &root.join("prepared.mkv"), &cancel)?,
+                            Some(original_source),
+                            Some(prepared.decoded_identity.clone()),
+                        )
+                    } else {
+                        (original_source, None, None)
+                    };
+                let manifest = Manifest {
+                    version: 1,
+                    id,
+                    directory: identity(&root)?,
+                    request,
+                    settings,
+                    source: source_stamp,
+                    original_source: saved_original,
+                    prepared_identity,
+                    tools: tool_stamps,
+                    params,
+                    fps_num,
+                    fps_den,
+                    total_frames: frame_count as u64,
+                    source_filter,
+                    phase: RecoveryPhase::Encoding,
+                    av1an_version: None,
+                    queue: None,
+                    scenes: None,
+                    script: None,
+                    segments: Vec::new(),
+                    completed: BTreeMap::new(),
+                    intermediate: identity(&intermediate.path)?,
+                    final_video: None,
+                };
+                (root, manifest, intermediate)
             };
-            let (directory_guard,lock)=lock_workspace(&root)?;
-            let chunk_guards=manifest.completed.values().map(|chunk| &chunk.file.path).chain(manifest.segments.iter().map(|stamp| &stamp.path)).map(|path|Source::open(path)).collect::<Result<Vec<_>,_>>()?;
-            let workspace=Workspace{root:root.clone(),manifest,source_rate,segments_verified:false,_tools:tool_guards,chunks:chunk_guards,directory_guard:Some(directory_guard),lock:Some(lock)};
+            let input = manifest.source.path.clone();
+            let source_guard = Source::open(&input)?;
+            let (directory_guard, lock) = lock_workspace(&root)?;
+            let chunk_guards = manifest
+                .completed
+                .values()
+                .map(|chunk| &chunk.file.path)
+                .chain(manifest.segments.iter().map(|stamp| &stamp.path))
+                .map(|path| Source::open(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let workspace = Workspace {
+                root: root.clone(),
+                manifest,
+                source_rate: if prepared.is_some() {
+                    (fps_num, fps_den)
+                } else {
+                    source_rate
+                },
+                segments_verified: false,
+                _tools: tool_guards,
+                _source: Some(source_guard),
+                chunks: chunk_guards,
+                directory_guard: Some(directory_guard),
+                lock: Some(lock),
+            };
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
             let resume_chunks=workspace.manifest.queue.is_some();
@@ -715,7 +939,7 @@ impl Recovery {
                 intermediate.clone_file()?.set_len(0).map_err(|e|error(&intermediate.path,e.to_string()))?;
             }
             workspace.save()?;
-            Ok((Self {root,finalizing,resume_chunks,inner:Arc::new(StdMutex::new(workspace))},intermediate))
+            Ok((Self {root,finalizing,resume_chunks,inner:Arc::new(StdMutex::new(workspace))},intermediate,input))
         }).await.map_err(|e|AppError::new("RECOVERY_INVALID",e.to_string(),None))?
     }
 
@@ -918,6 +1142,7 @@ impl Recovery {
         self.with(|w| {
             w.verify_owner()?;
             w.chunks.clear();
+            drop(w._source.take());
             drop(w.lock.take());
             remove_tree(&w.root, &w.manifest.directory, w.directory_guard.take())
         })
@@ -1092,11 +1317,14 @@ mod tests {
                 request,
                 settings,
                 source: digest(&source, None).unwrap(),
+                original_source: None,
+                prepared_identity: None,
                 tools: vec![],
                 params: vec![],
                 fps_num: 24,
                 fps_den: 1,
                 total_frames: 48,
+                source_filter: None,
                 phase: RecoveryPhase::Encoding,
                 av1an_version: None,
                 queue: None,
@@ -1114,6 +1342,7 @@ mod tests {
                 source_rate: (24, 1),
                 segments_verified: false,
                 _tools: vec![],
+                _source: Some(Source::open(&source).unwrap()),
                 chunks: vec![],
                 directory_guard: Some(directory),
                 lock: Some(lock),
@@ -1162,6 +1391,64 @@ mod tests {
         );
         drop(workspace);
         drop(intermediate);
+    }
+
+    #[test]
+    fn prepared_source_reuse_requires_owned_file_original_and_decoded_identity() {
+        let fixture = Fixture::new();
+        let (mut workspace, _intermediate) = fixture.workspace();
+        let original = workspace.manifest.source.clone();
+        let prepared_path = workspace.root.join("prepared.mkv");
+        fs::write(&prepared_path, b"verified decoded source").unwrap();
+        workspace.manifest.source = digest(&prepared_path, None).unwrap();
+        workspace.manifest.original_source = Some(original.clone());
+        workspace.manifest.prepared_identity = Some("sha256:pixels;frames:48".into());
+        workspace.manifest.source_filter = None;
+        let prepared = PreparedSource {
+            path: fixture.0.join("fresh-attempt.mkv"),
+            decoded_identity: "sha256:pixels;frames:48".into(),
+        };
+        validate_layout(&workspace.root, &workspace.manifest).unwrap();
+        assert!(
+            source_matches_attempt(
+                &workspace.manifest,
+                &workspace.root,
+                &original,
+                Some(&prepared),
+                None,
+            )
+            .unwrap()
+        );
+
+        let changed = PreparedSource {
+            path: prepared.path.clone(),
+            decoded_identity: "sha256:changed;frames:48".into(),
+        };
+        assert!(
+            !source_matches_attempt(
+                &workspace.manifest,
+                &workspace.root,
+                &original,
+                Some(&changed),
+                None,
+            )
+            .unwrap()
+        );
+        let saved = workspace.manifest.source.clone();
+        fs::write(&prepared_path, b"tampered decoded source").unwrap();
+        assert!(
+            !source_matches_attempt(
+                &workspace.manifest,
+                &workspace.root,
+                &original,
+                Some(&prepared),
+                None,
+            )
+            .unwrap()
+        );
+        workspace.manifest.source = saved;
+        workspace.manifest.source.path = fixture.0.join("foreign-prepared.mkv");
+        assert!(validate_layout(&workspace.root, &workspace.manifest).is_err());
     }
 
     #[test]
@@ -1421,6 +1708,31 @@ mod tests {
         assert!(remove_tree(&workspace.root, &expected, None).is_err());
         assert_eq!(fs::read(foreign).unwrap(), b"retain");
         assert!(retained.join("video.ivf").exists());
+    }
+
+    #[test]
+    fn prepared_copy_cancellation_removes_only_its_owned_destination() {
+        let fixture = Fixture::new();
+        let destination = fixture.0.join("prepared.mkv");
+        let (_, cancel) = watch::channel(true);
+        let result: Result<(), AppError> = with_owned_output(&destination, |_output| {
+            check_cancel(&cancel)?;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "JOB_CANCELED");
+        assert!(!destination.exists());
+
+        let owned_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .unwrap();
+        let owned = file_identity(&owned_file).unwrap();
+        drop(owned_file);
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"replacement").unwrap();
+        assert!(remove_tree(&destination, &owned, None).is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"replacement");
     }
 
     #[test]

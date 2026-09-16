@@ -293,6 +293,7 @@ mod tests {
                 mux_request: Some(request.clone()),
                 encode_settings: None,
                 recovery: None,
+                standalone_recovery: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec![],

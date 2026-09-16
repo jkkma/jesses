@@ -205,7 +205,7 @@ pub(super) fn ensure_absent(output: &Path) -> Result<(), AppError> {
     }
 }
 
-pub(super) struct Temporary {
+pub(crate) struct Temporary {
     pub path: PathBuf,
     file: Option<File>,
     preserve: bool,
@@ -224,7 +224,7 @@ impl Temporary {
         Self::create_extension(output, id, "ivf")
     }
 
-    pub(super) fn create_extension(
+    pub(crate) fn create_extension(
         output: &Path,
         id: &str,
         extension: &str,
@@ -353,6 +353,56 @@ impl Temporary {
             .expect("owned temporary handle")
             .try_clone()
             .map_err(|e| error("OUTPUT_UNREADABLE", e.to_string(), &self.path))
+    }
+
+    /// Releases the reservation handle only while a supervised tool that cannot
+    /// inherit stdout must write this exact already-created path. The stored file
+    /// identity remains authoritative and must be rebound immediately afterward.
+    pub(crate) fn close_for_path_writer(&mut self) -> Result<(), AppError> {
+        self.verify_identity()?;
+        self.file.take();
+        Ok(())
+    }
+
+    /// Rebinds the reservation after a path-writing tool exits and rejects any
+    /// delete/recreate swap that occurred while the original handle was closed.
+    pub(crate) fn reopen_after_path_writer(&mut self) -> Result<(), AppError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(1 | 2);
+        }
+        let file = options
+            .open(&self.path)
+            .map_err(|e| error("OUTPUT_CHANGED", e.to_string(), &self.path))?;
+        #[cfg(windows)]
+        if windows_file_id(&file).map_err(|e| error("OUTPUT_CHANGED", e.to_string(), &self.path))?
+            != self.windows_identity
+        {
+            return Err(error(
+                "OUTPUT_CHANGED",
+                "The path-writing tool replaced the reserved temporary output.",
+                &self.path,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file
+                .metadata()
+                .map_err(|e| error("OUTPUT_CHANGED", e.to_string(), &self.path))?;
+            if (metadata.dev(), metadata.ino()) != self.identity {
+                return Err(error(
+                    "OUTPUT_CHANGED",
+                    "The path-writing tool replaced the reserved temporary output.",
+                    &self.path,
+                ));
+            }
+        }
+        self.file = Some(file);
+        Ok(())
     }
 
     fn verify_identity(&self) -> Result<(), AppError> {

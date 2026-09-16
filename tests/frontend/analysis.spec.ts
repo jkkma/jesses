@@ -175,6 +175,13 @@ async function mock(page: Page) {
               logPath: null,
             };
           }
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           throw new Error(`Unexpected command: ${command}`);
         },
       };
@@ -340,4 +347,35 @@ test('applying detected batch crop invalidates a ready preview and preserves ear
   const submitted = await calls(page, 'enqueue_encode_batch');
   expect(submitted[0].payload.requests).toEqual(original);
   expect((submitted[1].payload.requests as EncodeRequest[])[0].settings.framing.crop.top).toBe(16);
+});
+
+test('inspector thumbnails request display orientation and discard stale scrub results', async ({
+  page,
+}) => {
+  await mock(page);
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  const thumbnail = page.getByRole('region', { name: 'Video thumbnail', exact: true });
+  await control(page, 'hold', 'preview_frame');
+  await thumbnail.getByRole('button', { name: 'Video thumbnail & scrubbing', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(1);
+  await thumbnail.getByLabel('Thumbnail video stream', { exact: true }).selectOption('4');
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(2);
+  await control(page, 'release', 'preview_frame', 1);
+  await expect(thumbnail).toContainText('HDR shown as SDR.');
+  await control(page, 'release', 'preview_frame', 0);
+  await expect(thumbnail).toContainText('HDR shown as SDR.');
+  expect((await calls(page, 'preview_frame'))[1].payload.request).toMatchObject({
+    videoStreamIndex: 4,
+    displayOrientation: true,
+  });
+  expect((await calls(page, 'cancel_media_analysis')).length).toBeGreaterThan(0);
+  await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).fill('5');
+  await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).press('Tab');
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(3);
+  expect((await calls(page, 'preview_frame'))[2].payload.request).toMatchObject({
+    positionSeconds: 5,
+  });
 });

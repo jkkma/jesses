@@ -146,6 +146,36 @@
   </section>
   {#if desktop}
     <PreferencesPanel />
+    <section class="panel scorer-panel" aria-label="Optional Vulkan quality scorer">
+      <div class="section-heading">
+        <span class="heading-with-icon"
+          ><Wrench size={15} aria-hidden="true" /><span class="eyebrow"
+            >Optional Vulkan quality scorer</span
+          ></span
+        >
+      </div>
+      <div class="scorer-content">
+        <p>
+          Vship can accelerate av1an SSIMULACRA2 and Butteraugli probes in an external portable
+          VapourSynth runtime. From a source checkout, run:
+        </p>
+        <code class="setup-command mono"
+          >pwsh -File scripts/install-vship.ps1 -PortableRuntime
+          &lt;external-portable-vapoursynth-dir&gt; -Activate</code
+        >
+        <p class="small-muted">
+          The installer verifies pinned hashes, the x64 VapourSynth ABI, and real finite metric
+          results on the current GPU before activation. Manifest-verified application bundles keep
+          their packaged CPU vszip and Julek scorers and are not modified by this installer.
+        </p>
+        <a
+          href="https://github.com/jkkma/jesses/blob/main/docs/windows-av1an-package.md"
+          target="_blank"
+          rel="noreferrer"
+          class="text-button">Open setup guide<ExternalLink size={13} aria-hidden="true" /></a
+        >
+      </div>
+    </section>
     <section class="panel storage-panel" aria-label="Application storage">
       <div class="section-heading"><span class="eyebrow">Application storage</span></div>
       {#if storageError}<p class="storage-error" role="alert">{storageError}</p>
@@ -202,6 +232,23 @@
   }
   .storage-error {
     padding: 1.25rem;
+  }
+  .scorer-content {
+    padding: 1.25rem;
+    display: grid;
+    gap: 0.8rem;
+  }
+  .scorer-content p {
+    margin: 0;
+  }
+  .setup-command {
+    display: block;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--muted);
+    overflow-wrap: anywhere;
+    user-select: all;
   }
   @media (max-width: 800px) {
     .storage-locations div {

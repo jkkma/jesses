@@ -33,12 +33,33 @@ Unsigned packages and bundled media tools are being qualified. This is a
 development build; final combined artifacts and cross-platform release checks
 remain in progress.
 
+## Media utilities and source inspection
+
+The **Utilities** tab provides lossless keyframe cuts and concat, color metadata
+transfer, subtitle OCR, AV1 grain tools and sampled CRF ladders. Dependencies are
+checked before execution and outputs use new destinations. See
+[media utilities](docs/media-utilities.md) for supported formats, optional tools
+and validation limits.
+
+[Images and sequences](docs/images.md) supports explicitly ordered still-image
+imports and PNG/JPEG/GIF exports. The Files inspector adds cancellable thumbnails
+with display rotation and pixel aspect ratio. Quick Convert and av1an can keep
+an [encoding source selected independently](docs/source-selection-and-previews.md)
+while another file is inspected.
+
+[Notifications and finish actions](docs/completion-actions.md) are session-only.
+An explicitly armed close/shutdown action requires a successful queue and an
+abortable 60-second countdown that remains visible across tabs. Saved requests
+can be exported and inspected without executing foreign command strings.
+
 ## Encode a file
 
 Add a local file in Files, open Quick Convert, choose the video and copied tracks,
 and select a new destination and compatible container. The default SVT-AV1-HDR build starts at CRF 30,
-preset 2, and Film grain retention tune. Mainline SVT-AV1 starts at CRF 30 and preset 4;
-CRF 1–63 and presets 0–13 are accepted. The output video is 10-bit AV1.
+preset 2, and Film grain retention tune. Mainline SVT-AV1 starts at CRF 30 and preset 4.
+The ordinary SVT range remains CRF 1–63 and presets 0–13. Quarter-step CRF through
+70 and research presets down to -3 are accepted only when the selected installed
+build advertises them. The output video is 10-bit AV1.
 FFmpeg, FFprobe and the selected encoder must be available through the configured
 tool paths, a verified bundle or PATH. See the setup instructions below and
 [package documentation](docs/packaging.md). The selected tool and its version
@@ -58,16 +79,19 @@ SVT-AV1-HDR starts at CRF 30, preset 2, and **Film grain retention** (`--tune 5`
 [HDR project's tuning guidance](https://github.com/juliobbv-p/svt-av1-hdr).
 Grain retention tunes the encoding of source texture; optional grain synthesis is
 a separate control and remains off by default. Selecting either fork does not
-grant permission to discard dynamic HDR metadata. Jesses currently exposes integer
-CRF 1–63 and presets 0–13 for all three SVT builds; the forks' extended CRF and
-research preset ranges are not exposed yet.
+grant permission to discard dynamic HDR metadata. Extended and fractional SVT
+controls are gated by the exact build's help; unsupported values fail before the
+source is encoded.
 
 See [SVT fork setup and validation](docs/svt-forks.md) for pinned tool installation,
 custom executable paths, and the checks covering both workflows.
-SVT-AV1 remains the primary workflow. x265 HEVC and VP9 run through FFmpeg; separate
-`aomenc`, `vpxenc`, and `x265` executable drivers remain deferred.
-See the [standalone driver implementation plan](docs/standalone-encoders.md) for
-the remaining architecture and qualification gates.
+SVT-AV1 remains the primary workflow. Existing x265 HEVC and VP9 choices keep their
+FFmpeg library routes. Separate **AOM AV1**, **VPX VP9**, and **x265 HEVC** choices
+run their installed encoder executables directly. The VPX and x265 routes use
+mkvmerge to assign the exact planned rational cadence before the selected-track
+mux; persisted FFmpeg jobs are never redirected to these tools. See
+[standalone encoder drivers](docs/standalone-encoders.md) and the
+[feature-extension validation record](docs/feature-extension-validation.md).
 
 Choose **x264 · H.264** in Quick Convert for direct x264 encoding, or choose x264
 with the standalone workflow in Batch encode. It defaults to CRF 23 and the
@@ -76,8 +100,11 @@ installed executable must advertise Y4M input, Matroska output, and the source's
 8-bit or 10-bit depth. Source depth, range, dimensions, cadence, and SDR color are
 retained; x264 currently requires explicit left, center, or top-left chroma
 placement. HDR input needs the explicit HDR/HLG to SDR option. Film grain synthesis
-and HDR10 fallback are rejected for x264. CRF 0 does not promise lossless 10-bit output; a separate lossless mode is
-not implemented. Existing SVT-AV1 settings and saved jobs remain readable.
+and HDR10 fallback are rejected for x264. **Lossless** is a separate mode and uses
+the encoder's explicit lossless setting rather than treating CRF 0 as a promise.
+Before publication, Jesses decodes and compares every output pixel with the exact
+post-filter frames supplied to the encoder. Existing SVT-AV1 settings and saved
+jobs remain readable.
 
 x264 writes a timed Matroska intermediate through the supervised pipeline before
 selected tracks are muxed into the chosen compatible output container. This preserves B-frame
@@ -90,16 +117,19 @@ encode. x265 defaults to CRF 28 / medium, with CRF 0–51 and ten named presets.
 VP9 defaults to CRF 32 / speed 2, with CRF 0–63 and speeds 0–5 using constant
 quality and the good deadline. Both preserve tagged SDR 8-bit or 10-bit 4:2:0,
 full/limited range, and explicit left/center/top-left chroma. HDR input needs the
-explicit HDR/HLG to SDR option; HDR output, SVT grain synthesis, av1an, and a separate
-lossless mode are unavailable for these two encoders. FFmpeg must advertise
+explicit HDR/HLG to SDR option; HDR output, SVT grain synthesis, and av1an are
+unavailable for these two encoders. Dedicated lossless mode is available when the
+installed library advertises it and passes complete decoded-pixel comparison. FFmpeg must advertise
 the selected library and pixel format; missing support never triggers automatic
 depth conversion. The supervised pipeline writes a timed Matroska intermediate,
 then applies framing/audio settings and validates the complete decoded output.
 See [x265 and VP9 qualification](tests/fixtures/ffmpeg-video-validation.md),
 including a verified 480-frame excerpt from real 720p media.
 
-Standalone Quick Convert and Batch encode offer **Constant quality**, **Video
-bitrate**, or **Target file size** for all six encoders. Video bitrate is a whole
+Standalone Quick Convert and Batch encode offer **Constant quality**, **Lossless**,
+**Video bitrate**, or **Target file size** where the selected encoder supports that
+mode. Lossless disables quality and bitrate controls and must pass complete decoded
+pixel equality after all selected processing. Video bitrate is a whole
 number from 1 to 100000 decimal kb/s, with optional two-pass allocation. Target
 size is a whole number from 1 to 1048576 MiB per file and always uses two passes.
 It measures the selected audio, subtitles, attachments, and their container
@@ -112,8 +142,16 @@ encoder, and cancellation removes owned pass outputs and statistics. Omitted
 rate settings retain CRF behavior in old jobs. av1an supports CRF and per-chunk perceptual quality targets.
 See [rate-control qualification](tests/fixtures/rate-control-validation.md).
 
+**H.264 NVENC** and **HEVC NVENC** use FFmpeg's NVIDIA encoders. Admission executes
+a bounded one-frame initialization with the selected depth and mode, so a missing
+or incompatible NVIDIA GPU or driver produces an actionable capability error
+before source encoding. The Windows qualification host has an AMD GPU; its negative
+hardware rejection is evidence for the gate, not a positive NVENC output claim.
+
 Encoding supports validated constant-frame-rate SDR video with
-explicit color metadata, square pixels, and 4:2:0 8-bit or 10-bit input. SVT-AV1 HDR10 uses
+explicit color metadata and 4:2:0 8-bit or 10-bit input. Square pixels remain the
+default; an explicit output SAR or DAR converts non-square source geometry without
+resampling it. SVT-AV1 HDR10 uses
 limited-range 10-bit BT.2020/PQ with validated mastering metadata. It rejects
 unsupported HDR formats, variable frame rates, rotation, unsupported chroma placement, and nonzero
 video/container start times. Dimensions must be even, from 64 through 8192 pixels,
@@ -137,7 +175,8 @@ pixels. Cropping happens before resizing (Lanczos by default); output height fol
 cropped aspect ratio and rounds to the nearest even pixel, with halfway values
 rounded upward. The form displays source, cropped, and output dimensions.
 Cropped and output dimensions must stay between 64 and 8192 pixels. A larger
-explicit width enlarges the picture; pixels remain square. These controls keep
+explicit width enlarges the picture. Pixels remain square unless an output SAR or
+DAR is selected after framing. These controls keep
 the original duration and selected tracks, and retain supported SDR or HDR10
 color metadata. Choosing the HDR encoder leaves dynamic-HDR fallback off.
 
@@ -158,17 +197,33 @@ Nearest neighbor, bilinear and bicubic kernels are also available.
 See the [crop and resize validation record](tests/fixtures/framing-validation.md).
 See the [black border validation record](tests/fixtures/borders-validation.md).
 
-**Frame processing:** Standalone Quick Convert and Batch encode offer BWDIF with
-explicit field order, either one output frame per source frame or one per field.
-An optional rational output rate duplicates or drops pictures while retaining
-playback speed and the audio/subtitle timeline. Trim precedes deinterlacing and
-rate conversion. Every source frame must have consistent timing and field order;
-mixed material and unknown field order fail explicitly. QTGMC, telecine/cadence
-repair and arbitrary SAR/DAR conversion remain pending. See the
+**Frame processing:** BWDIF offers single-rate or bob deinterlacing for known
+top-field-first or bottom-field-first sources. QTGMC offers single-rate or bob
+reconstruction through a capability-checked private
+VapourSynth, L-SMASH and havsfunc runtime. Inverse telecine uses field matching and
+fixed 5:4 decimation, with an optional combed-frame BWDIF fallback. Progressive
+padded captures can remove only byte-exact decoded duplicate frames after a
+streaming SHA-256 scan reports repeated-run lengths and adjacent length transitions; the repair
+is admitted only when its unique-frame count exactly preserves duration at the
+selected lower constant rate. Lossy near-duplicates are not removed, while genuine
+identical static pictures cannot be distinguished from padding, so this mode is for
+known padded captures. An optional rational output rate duplicates or drops
+pictures while retaining playback speed and the audio/subtitle timeline. Trim
+precedes reconstruction and rate conversion. Every source frame must have
+consistent timing and the selected field workflow must match decoded field flags;
+mixed or unknown material fails explicitly. The selected BWDIF, telecine,
+duplicate-removal and rate filters run on bounded synthetic frames before encoding.
+Custom SAR or DAR metadata is applied after crop, resize and borders. See the
 [frame processing validation record](tests/fixtures/temporal-validation.md).
+For av1an, trim and any processing that changes frame count or timing first produce
+one fully decoded, metadata-checked FFV1 source. Scene detection, all chunks and
+quality references read that same source. Recovery binds its complete decoded-frame
+identity, so an old chunk set cannot survive a changed QTGMC/plugin/filter result.
 
-**Frame intervals:** Standalone Quick Convert and Batch encode can select a
-zero-based start frame and an exclusive end frame. The complete source still
+**Frame intervals:** Quick Convert, av1an and Batch encode can select either a
+zero-based start frame/exclusive end frame or start/end times in milliseconds. Time
+boundaries map to the exact constant-rate frame interval without accumulating
+floating-point drift. The complete source still
 passes the original frame and timing checks before the interval is applied.
 Output starts at zero and retains exactly the selected video pictures. Every
 selected audio track requires explicit conversion; boundaries follow its decoded
@@ -176,7 +231,7 @@ sample clock, including codec delay and final padding. Selected ASS, SubRip and
 WebVTT cues and chapters are intersected with the interval and rebased; selected
 text tracks remain present even when they contain no surviving cues. Fonts retain
 their original bytes. A boundary that cuts an animated ASS cue is rejected,
-as are timed WebVTT markup, bitmap subtitles and av1an intervals. Saved jobs
+as are timed WebVTT markup and bitmap subtitles. Saved jobs
 without an interval continue to process the complete source. A gain calculated
 from a loudness measurement uses the complete source track, including when the
 job trims it. See the [trim validation record](tests/fixtures/trim-validation.md).
@@ -249,7 +304,10 @@ L-SMASH Works, FFMS2 and BestSource require their respective VapourSynth plugin.
 FFmpeg select and hybrid readers require the corrected source-built av1an;
 older generators fail exact frame-count checks. All paths require FFmpeg,
 FFprobe and the selected SVT build. Jesses checks actual engine capabilities
-and selected plugin availability. av1an currently encodes the first video track only; standalone encoders
+and selected plugin availability. The manifest-verified Windows bundle currently
+ships L-SMASH and reports FFMS2/BestSource unavailable; both optional readers have
+passed a separate compatible external-runtime stop/reopen/resume gate, which is
+not a claim that they ship in the bundle. av1an currently encodes the first video track only; standalone encoders
 can encode another selected video track. Jobs remain sequential; workers run
 chunks within the active job. More workers require more CPU and memory.
 
@@ -280,6 +338,16 @@ reuses the validated intermediate. A completed output is never overwritten.
 Cancel and Stop queue also retain available av1an recovery work. Stopping before
 recovery preparation finishes may leave no saved progress to resume.
 
+Standalone executable encoders retain only complete, verified phase boundaries:
+first-pass statistics, encoded video, an exact-cadence timing wrapper, or the final
+validated mux stage. They never claim mid-frame continuation. Each durable receipt
+binds the canonical job/output directory, source bytes, tool identities, settings,
+processing plan, timing and artifact bytes. A stopped or interrupted job can be
+resumed explicitly after restart; Jesses rechecks every binding and adopts a newer
+complete manifest if a crash occurred between committing the phase and saving job
+history. Unknown or changed workspace entries reject cleanup and preserve the tree
+for review. Successful publication removes the owned recovery workspace.
+
 Saved source commands and target probe parameters must match the immutable plan.
 Qualified VapourSynth source templates are checked byte-for-byte after validated
 path/cache/reader substitution. Hybrid source segments also undergo complete
@@ -300,13 +368,16 @@ require a VapourSynth source reader. Every-frame XPSNR uses the selected FFmpeg;
 sampled XPSNR needs vszip R7 or newer and a VapourSynth reader. Actual scorer
 checks run in the same selected child environment before encoding. Windows
 packaging builds CPU vszip and Julek from pinned sources alongside the portable
-frameserver. L-SMASH-only scoring requires the corrected software-probe engine;
+frameserver. A separate managed installer can activate the pinned Vulkan Vship
+plugin only after real SSIMULACRA2 and Butteraugli checks; incompatible GPU,
+Vulkan, or VapourSynth combinations keep the CPU scorer available.
+L-SMASH-only scoring requires the corrected software-probe engine;
 missing dependencies or older incompatible engines produce an explicit error.
 VMAF and every-frame XPSNR also require the corrected FFmpeg metric engine, which
-preserves the Y4M reference pixels during color-matrix negotiation.
-Probes preserve
-the selected SVT build, preset and advanced parameters but score the source before
-final crop, resize and borders; the interface and log explain that limitation.
+preserves the Y4M reference pixels during color-matrix negotiation. Probes
+preserve the selected SVT build, preset and advanced parameters. Probe references
+and final chunks use the same validated temporal, tone-map, crop, resize, border
+and aspect-ratio filter chain.
 Targeting requires SDR; preserved HDR keeps CRF control. Old saved targets with
 no metric field retain VMAF.
 
@@ -324,14 +395,17 @@ HDR10 fallback** is off by default. Turning it on explicitly permits discarding
 Dolby Vision enhancement data and HDR10+ dynamic metadata in favor of an HDR10
 base layer. Supported Dolby Vision input is HEVC profile 7/compatibility 6 or
 profile 8/compatibility 1; profile 5 and unrecognized profiles fail explicitly.
-**HDR / HLG to SDR** is an explicit standalone option in Quick Convert and each
-batch file. It accepts tagged limited-range 10-bit 4:2:0 BT.2020 PQ or HLG, uses
+**HDR / HLG to SDR** is an explicit option in Quick Convert, av1an and each batch
+file. It accepts tagged limited-range 10-bit 4:2:0 BT.2020 PQ or HLG, uses
 Hable with a chosen signal peak (100–10000 nits), and produces 100-nit BT.709
 limited-range 10-bit SDR. HLG uses the 1000-nit reference display transfer.
 Tone mapping precedes subtitles and borders and removes source HDR metadata.
 Compatible dynamic-HDR base layers require its separate opt-in; unselected
 rendering retains the existing HDR10 workflow. All source and output frame
-checks remain. av1an tone mapping awaits chunk/recovery qualification. See the
+checks remain. av1an quality probes and final chunks receive the same validated
+tone-map processing through either the shared filter chain or a verified prepared
+source; recovery binds the corresponding filter or decoded identity before saved
+work is reused. See the
 [tone-map validation record](tests/fixtures/tone-map-validation.md).
 
 Files shows reported pixel format, bit depth,
@@ -408,9 +482,9 @@ Cancel stops the owned process trees and removes temporary output. Closing the
 app cancels and awaits active and queued jobs. The desktop app saves up to 100 job
 records under its platform data directory. Jobs left unfinished after a crash are
 shown as **Interrupted** on restart; they never resume automatically or signal old
-process IDs. Eligible av1an jobs show **Resume** after a saved recovery workspace
-was created. Old jobs without recovery records and standalone jobs require a new
-encode. Recoverable jobs stay in history until successful completion rather than
+process IDs. Eligible av1an and standalone executable jobs show **Resume** after a
+complete verified recovery phase was created. Old jobs without recovery records
+require a new encode. Recoverable jobs stay in history until successful completion rather than
 being evicted when new jobs arrive. Job settings are retained for history; they
 do not become defaults for new jobs.
 
@@ -494,6 +568,20 @@ cargo test -p media-runtime --test av1an_recovery --locked -- --ignored --test-t
 cargo run -p media-runtime --example encode -- /path/to/video.mkv /path/to/encoded.mkv 30 4 0 false av1an 2
 ```
 
+QTGMC gates intentionally fail when havsfunc or any required plugin is missing;
+they are excluded from generic FFmpeg-only CI. With a compatible QTGMC runtime
+configured beside av1an or with native VSPipe on PATH, run:
+
+```sh
+cargo test -p media-runtime --lib qtgmc_installed_runtime_executes_real_frames -- --ignored --nocapture
+cargo test -p media-runtime --test temporal_jobs qtgmc -- --ignored --nocapture --test-threads=1
+```
+
+FFMS2 and BestSource are likewise optional. A runtime that reports either plugin
+as found can qualify its actual recovery route with
+`configured_source_readers_and_fixed_chunks_stop_reopen_and_resume`; an absent
+plugin is an explicit dependency failure rather than a skipped success.
+
 The encode example's optional arguments are CRF, preset, grain strength, explicit
 HDR10 fallback (`true`/`false`), workflow (`standalone`/`av1an`), worker count, and
 encoder (`svtAv1`/`svtAv1FiveFish`/`svtAv1Hdr`/`x264`/`x265`/`vp9`). The old `svtAv1` workflow name remains accepted by the
@@ -533,8 +621,8 @@ directly with argument arrays, bounded output, and timeouts. Job supervision use
 atomic Job Object assignment on Windows 10+ and process groups on Unix. Unix tools
 must not deliberately detach from their process group. Binary pipelines use
 bounded buffers and owned file handles, require success from both stages, and
-stop both trees on failure. Standalone encode resume and cross-platform native UI
-qualification remain future gates.
+stop both trees on failure. Cross-platform native UI qualification remains a future
+gate.
 
 The activity panel retains at most 200 entries in memory. Only its open/closed
 state persists; source lists and media metadata are session-only.

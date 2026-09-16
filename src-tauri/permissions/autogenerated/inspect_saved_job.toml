@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-saved-job"
+description = "Enables the inspect_saved_job command without any pre-configured scope."
+commands.allow = ["inspect_saved_job"]
+
+[[permission]]
+identifier = "deny-inspect-saved-job"
+description = "Denies the inspect_saved_job command without any pre-configured scope."
+commands.deny = ["inspect_saved_job"]

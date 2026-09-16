@@ -43,8 +43,8 @@ pub(super) struct Stream {
     pub time_base: Option<String>,
     pub start_time: Option<String>,
     pub color_space: Option<String>,
-    // Subtitle stream headers can inherit the container's start even when the
-    // first cue is later. Filled from a bounded packet probe, never JSON headers.
+    // Subtitle headers may inherit the wrong start and some video headers omit
+    // it. Filled from a bounded actual-packet probe, never guessed from headers.
     #[serde(skip)]
     pub packet_start_time: Option<f64>,
     pub color_transfer: Option<String>,

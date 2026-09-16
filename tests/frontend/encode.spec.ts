@@ -83,6 +83,10 @@ const tools: ToolInfo[] = [
   'svt-av1-hdr',
   'av1an',
   'x264',
+  'aomenc',
+  'vpxenc',
+  'x265',
+  'mkvmerge',
 ].map((id) => ({
   id,
   name: id,
@@ -103,6 +107,7 @@ const snapshot = (state: JobSnapshot['state'] = 'running'): JobSnapshot => ({
   state,
   request: { inputPath, outputPath, streamIndices: [0, 3, 7, 9] },
   encodeSettings: {
+    lossless: false,
     videoStreamIndex: 0,
     crf: 30,
     preset: 2,
@@ -197,6 +202,13 @@ async function desktopMock(
         invoke: async (command: string, payload: Record<string, unknown> = {}) => {
           calls.push({ command, payload });
           await wait(command);
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           if (command === 'get_capabilities') return capabilities;
           if (command === 'begin_media_analysis') return `analysis-${++callbackId}`;
           if (command === 'cancel_media_analysis') return;
@@ -577,15 +589,15 @@ const x264PresetNames = [
   'placebo',
 ];
 
-test('tool discovery shows all seven tools as pending before the native reply', async ({
+test('tool discovery shows all configured encoder tools as pending before the native reply', async ({
   page,
 }) => {
   await desktopMock(page, { held: ['get_capabilities'], missing: 'svt-av1-hdr' });
   await page.goto('/');
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   const workspace = page.getByRole('region', { name: 'Tools and settings', exact: true });
-  await expect(workspace.getByRole('row')).toHaveCount(8);
-  await expect(workspace.getByText('Checking…', { exact: true })).toHaveCount(7);
+  await expect(workspace.getByRole('row')).toHaveCount(11);
+  await expect(workspace.getByText('Checking…', { exact: true })).toHaveCount(10);
   await expect(workspace.getByText('Not found', { exact: true })).toHaveCount(0);
   await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
     'SVT-AV1 5fish',
@@ -594,7 +606,7 @@ test('tool discovery shows all seven tools as pending before the native reply', 
     'SVT-AV1-HDR',
   );
   await release(page, 'get_capabilities');
-  await expect(workspace).toContainText('6 / 7 available');
+  await expect(workspace).toContainText('10 / 11 available');
   await expect(workspace.getByText('Checking…', { exact: true })).toHaveCount(0);
   await expect(workspace.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText(
     'Not found',
@@ -650,6 +662,9 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       workers: 2,
       crf: 18,
       preset: 2,
+      lossless: false,
+      svtCrfQuarterSteps: 72,
+      svtPreset: 2,
       lineartPsyBias: 6,
       texturePsyBias: 3,
       hdrTune: 'visualQuality',
@@ -696,6 +711,9 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       workers: 2,
       crf: 30,
       preset: 2,
+      lossless: false,
+      svtCrfQuarterSteps: 120,
+      svtPreset: 2,
       lineartPsyBias: 0,
       texturePsyBias: 0,
       hdrTune: 'visualQuality',
@@ -924,6 +942,7 @@ test('x264 uses its own defaults, preset names, validation, copied tracks, and i
       videoStreamIndex: 4,
       crf: 23,
       preset: 5,
+      lossless: false,
       backend: 'standalone',
       encoder: 'x264',
       workers: 2,
@@ -1330,6 +1349,9 @@ test('encode submits the selected video, quality, preset, copied tracks, and nat
               videoStreamIndex: 4,
               crf: 28,
               preset: 6,
+              lossless: false,
+              svtCrfQuarterSteps: 112,
+              svtPreset: 6,
               backend: 'standalone',
               encoder: 'svtAv1Hdr',
               workers: 2,
@@ -1401,7 +1423,7 @@ test('invalid quality, blank output, and audio-only sources cannot start an enco
 }) => {
   await desktopMock(page);
   await openEncode(page);
-  for (const invalid of ['0', '64', '2.5', '']) {
+  for (const invalid of ['0', '71', '2.2', '']) {
     await quickWorkspace(page).getByLabel('Quality', { exact: true }).fill(invalid);
     await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   }
@@ -1694,6 +1716,9 @@ test('encodes can be queued for different sources while another job is running',
               videoStreamIndex: 0,
               crf: 30,
               preset: 2,
+              lossless: false,
+              svtCrfQuarterSteps: 120,
+              svtPreset: 2,
               backend: 'standalone',
               encoder: 'svtAv1Hdr',
               workers: 2,
@@ -1725,6 +1750,9 @@ test('encodes can be queued for different sources while another job is running',
               videoStreamIndex: 12,
               crf: 30,
               preset: 2,
+              lossless: false,
+              svtCrfQuarterSteps: 120,
+              svtPreset: 2,
               backend: 'standalone',
               encoder: 'svtAv1Hdr',
               workers: 2,
@@ -1836,6 +1864,9 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
     videoStreamIndex: 0,
     crf: 30,
     preset: 2,
+    lossless: false,
+    svtCrfQuarterSteps: 120,
+    svtPreset: 2,
     backend: 'av1an',
     encoder: 'svtAv1Hdr',
     workers: 3,
@@ -2073,6 +2104,9 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
       videoStreamIndex: 0,
       crf: 22,
       preset: 2,
+      lossless: false,
+      svtCrfQuarterSteps: 88,
+      svtPreset: 2,
       backend: 'av1an',
       encoder: 'svtAv1Hdr',
       workers: 3,
@@ -2772,3 +2806,127 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(workspace.getByLabel('Target metric', { exact: true })).toHaveValue('ssimulacra2');
 });
+
+test('extended SVT quality and dedicated lossless mode freeze their explicit wire settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const workspace = quickWorkspace(page);
+  const encoder = workspace.getByLabel('Video encoder', { exact: true });
+  await encoder.selectOption('svtAv1');
+  await workspace.getByLabel('Quality', { exact: true }).fill('64.25');
+  await workspace.getByLabel('Encoder preset', { exact: true }).selectOption('-3');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const extended = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(extended.settings).toMatchObject({
+    encoder: 'svtAv1',
+    crf: 64,
+    preset: 0,
+    lossless: false,
+    svtCrfQuarterSteps: 257,
+    svtPreset: -3,
+  });
+  await encoder.selectOption('aomAv1');
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('lossless');
+  await expect(workspace).toContainText('dedicated lossless mode');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const lossless = ((await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest })
+    .request;
+  expect(lossless.settings).toMatchObject({
+    encoder: 'aomAv1',
+    backend: 'standalone',
+    lossless: true,
+  });
+  expect(lossless.settings.svtCrfQuarterSteps).toBeUndefined();
+  expect(lossless.settings.rateControl).toBeUndefined();
+});
+
+test('standalone binary routes and NVENC expose distinct names, tools, suffixes and rate gates', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page);
+  const workspace = quickWorkspace(page);
+  const encoder = workspace.getByLabel('Video encoder', { exact: true });
+  const cases = [
+    ['aomAv1', 'Standalone AOM · Source bit depth AV1', '_aom_av1.mkv'],
+    ['vpxStandalone', 'Standalone VP9 · Source bit depth VP9', '_vpx.mkv'],
+    ['x265Standalone', 'Standalone x265 · Source bit depth HEVC', '_x265_standalone.mkv'],
+  ] as const;
+  for (const [value, label, suffix] of cases) {
+    await encoder.selectOption(value);
+    await expect(workspace).toContainText(label);
+    await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+      inputPath.replace(/\.mkv$/, suffix),
+    );
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  }
+  const submitted = (await calls(page, 'enqueue_encode')).map(
+    (call) => (call.payload as { request: EncodeRequest }).request.settings.encoder,
+  );
+  expect(submitted).toEqual(['aomAv1', 'vpxStandalone', 'x265Standalone']);
+
+  await encoder.selectOption('h264Nvenc');
+  await expect(workspace).toContainText('FFmpeg NVIDIA NVENC H.264 · Source bit depth H.264');
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('bitrate');
+  await expect(workspace).toContainText('NVENC bitrate mode is one pass');
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await workspace.getByLabel('Two passes', { exact: true }).uncheck();
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
+  await expect(workspace).toContainText('NVENC does not support target-size mode');
+  await workspace.getByLabel('Rate control', { exact: true }).selectOption('quality');
+  await encoder.selectOption('hevcNvenc');
+  await expect(workspace).toContainText('FFmpeg NVIDIA NVENC HEVC · Source bit depth HEVC');
+});
+
+for (const tab of ['Quick Convert', 'av1an'] as const) {
+  test(`${tab} binds video metadata to the mapped source and blocks removed sources`, async ({
+    page,
+  }) => {
+    await desktopMock(page);
+    await openEncode(page, tab);
+    const mapping = page.getByRole('region', {
+      name: tab === 'av1an' ? 'AV1AN source mapping' : 'Quick Convert source mapping',
+      exact: true,
+    });
+    await mapping.getByLabel('Encoding source', { exact: true }).selectOption(media.id);
+    const next: MediaFile = {
+      ...media,
+      id: 'mapped-other',
+      path: 'C:\\media\\other.mkv',
+      name: 'other.mkv',
+      streams: [{ ...baseStream, index: 11, width: 720, height: 480 }],
+    };
+    await importAnotherSource(page, next);
+    await page.getByRole('button', { name: tab, exact: true }).click();
+    const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    await expect(workspace.getByLabel('Video dimensions', { exact: true })).toContainText(
+      '320 × 180',
+    );
+    await expect(workspace.getByLabel('Video stream', { exact: true })).toHaveValue('0');
+    await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+      .request;
+    expect(request.source.inputPath).toBe(inputPath);
+    expect(request.source.streamIndices).toEqual([0, 3, 7, 9]);
+    expect(request.settings.videoStreamIndex).toBe(0);
+    await page
+      .getByRole('navigation', { name: 'Workspace' })
+      .getByRole('button', { name: /^Files/ })
+      .click();
+    await page.getByRole('button', { name: `Remove ${media.name}`, exact: true }).click();
+    await page.getByRole('button', { name: tab, exact: true }).click();
+    await expect(mapping).toContainText('The chosen source was removed.');
+    await expect(
+      workspace.getByRole('button', { name: 'Add to queue', exact: true }),
+    ).toBeDisabled();
+    await mapping.getByLabel('Encoding source', { exact: true }).selectOption('');
+    await expect(workspace.getByLabel('Video stream', { exact: true })).toHaveValue('11');
+    await expect(workspace.getByLabel('Video dimensions', { exact: true })).toContainText(
+      '720 × 480',
+    );
+  });
+}

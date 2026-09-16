@@ -117,10 +117,15 @@ pub(super) fn preflight(
             settings.filter(|settings| settings.video_stream_index == stream.index)
         {
             match settings.encoder {
-                media_core::VideoEncoder::X264 => "h264",
-                media_core::VideoEncoder::X265 => "hevc",
-                media_core::VideoEncoder::Vp9 => "vp9",
-                _ => "av1",
+                media_core::VideoEncoder::X264 | media_core::VideoEncoder::H264Nvenc => "h264",
+                media_core::VideoEncoder::X265
+                | media_core::VideoEncoder::X265Standalone
+                | media_core::VideoEncoder::HevcNvenc => "hevc",
+                media_core::VideoEncoder::Vp9 | media_core::VideoEncoder::VpxStandalone => "vp9",
+                media_core::VideoEncoder::SvtAv1
+                | media_core::VideoEncoder::SvtAv1FiveFish
+                | media_core::VideoEncoder::SvtAv1Hdr
+                | media_core::VideoEncoder::AomAv1 => "av1",
             }
         } else if let Some(track) = settings.and_then(|settings| {
             settings.audio.iter().find(|track| {

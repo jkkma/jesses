@@ -222,6 +222,7 @@ pub(super) async fn capabilities(
             "--probing-stat",
             "--probe-video-params",
             "--vmaf-threads",
+            "--vmaf-filter",
         ]);
     }
     if !help.status.success()
@@ -295,6 +296,23 @@ mod tests {
             .unwrap_err()
             .contains("L-SMASH")
         );
+        for (method, identifier, label) in [
+            (Av1anChunkMethod::Ffms2, "com.vapoursynth.ffms2", "FFMS2"),
+            (
+                Av1anChunkMethod::Bestsource,
+                "com.vapoursynth.bestsource",
+                "BestSource",
+            ),
+        ] {
+            let mut reader = options;
+            reader.chunk_method = method;
+            let version = format!(
+                "ffmpeg9-passthrough-v1\nffmpeg-metric-matrix-v1\n{identifier} : Not found"
+            );
+            let error = validate_plugin(&version, reader).unwrap_err();
+            assert!(error.contains(label));
+            assert!(error.contains(identifier));
+        }
         settings
             .av1an_options
             .as_mut()

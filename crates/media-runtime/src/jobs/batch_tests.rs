@@ -608,6 +608,9 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![
                 selected.clone(),
@@ -677,6 +680,9 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             encoder: media_core::VideoEncoder::SvtAv1,
             inputs: vec![BatchEncodeInput {
                 temporal: None,

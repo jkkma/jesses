@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-utility"
+description = "Enables the run_utility command without any pre-configured scope."
+commands.allow = ["run_utility"]
+
+[[permission]]
+identifier = "deny-run-utility"
+description = "Denies the run_utility command without any pre-configured scope."
+commands.deny = ["run_utility"]

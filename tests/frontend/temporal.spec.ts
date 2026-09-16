@@ -127,6 +127,13 @@ async function mock(page: Page) {
             }));
             return command === 'enqueue_encode_batch' ? jobs : jobs[0];
           }
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           throw new Error(`Unexpected command: ${command}`);
         },
       };
@@ -153,7 +160,7 @@ test('frame controls retain workflow drafts and submit explicit rational process
   await mock(page);
   const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
   await expect(quick.getByText(/ · Source frame rate$/)).toBeVisible();
-  await quick.getByLabel('Deinterlacing', { exact: true }).selectOption('bob');
+  await quick.getByLabel('Source reconstruction', { exact: true }).selectOption('bob');
   await expect(quick.getByText(/ · Double source frame rate \(BWDIF bob\)$/)).toBeVisible();
   await expect(quick.getByLabel('Source field order', { exact: true })).toHaveValue('bottomFirst');
   await quick.getByLabel('Set output frame rate', { exact: true }).check();
@@ -166,12 +173,12 @@ test('frame controls retain workflow drafts and submit explicit rational process
   await quick.getByLabel('Resize filter', { exact: true }).selectOption('bicubic');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const chunked = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await expect(chunked.getByLabel('Deinterlacing', { exact: true })).toBeDisabled();
-  await expect(chunked.getByLabel('Deinterlacing', { exact: true })).toHaveValue('off');
-  await expect(chunked.getByLabel('Set output frame rate', { exact: true })).toBeDisabled();
+  await expect(chunked.getByLabel('Source reconstruction', { exact: true })).toBeEnabled();
+  await expect(chunked.getByLabel('Source reconstruction', { exact: true })).toHaveValue('off');
+  await expect(chunked.getByLabel('Set output frame rate', { exact: true })).toBeEnabled();
   await expect(chunked.getByLabel('Resize filter', { exact: true })).toHaveValue('lanczos');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(quick.getByLabel('Deinterlacing', { exact: true })).toHaveValue('bob');
+  await expect(quick.getByLabel('Source reconstruction', { exact: true })).toHaveValue('bob');
   await expect(quick.getByText(/ · 30000\/1001 fps output$/)).toBeVisible();
   await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
   const request = (await calls(page, 'start_encode'))[0].payload.request as EncodeRequest;
@@ -200,7 +207,7 @@ test('batch frame processing invalidates review and preserves previously queued 
   await preview.click();
   const episode = batch.locator('article.episode').first();
   await episode.locator('summary').click();
-  await episode.getByLabel('Deinterlacing', { exact: true }).selectOption('frame');
+  await episode.getByLabel('Source reconstruction', { exact: true }).selectOption('frame');
   await expect(queue).toBeDisabled();
   await episode.getByLabel('Source field order', { exact: true }).selectOption('topFirst');
   await episode.getByLabel('Resize filter', { exact: true }).selectOption('bilinear');
@@ -211,5 +218,48 @@ test('batch frame processing invalidates review and preserves previously queued 
   expect((submitted[1].payload.requests as EncodeRequest[])[0].settings.temporal).toEqual({
     deinterlace: { mode: 'frame', fieldOrder: 'topFirst' },
     resizeFilter: 'bilinear',
+  });
+});
+
+test('padded capture requires an intended rate and serializes guarded cadence repair', async ({
+  page,
+}) => {
+  await mock(page);
+  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
+  await quick.getByLabel('Source reconstruction', { exact: true }).selectOption('exactDuplicates');
+  await expect(quick.getByText(/requires the intended constant output frame rate/)).toBeVisible();
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
+  await quick.getByLabel('Set output frame rate', { exact: true }).check();
+  await quick.getByLabel('FPS numerator', { exact: true }).fill('12');
+  await quick.getByLabel('FPS denominator', { exact: true }).fill('1');
+  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+  await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
+  const request = (await calls(page, 'start_encode'))[0].payload.request as EncodeRequest;
+  expect(request.settings.temporal).toEqual({
+    cadenceRepair: {
+      kind: 'exactDuplicates',
+      fieldOrder: 'bottomFirst',
+      combedFallback: false,
+    },
+    frameRate: { numerator: 12, denominator: 1 },
+    resizeFilter: 'lanczos',
+  });
+});
+
+test('av1an accepts managed QTGMC and submits its explicit preparation settings', async ({
+  page,
+}) => {
+  await mock(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const chunked = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await chunked.getByLabel('Source reconstruction', { exact: true }).selectOption('qtgmcBob');
+  await chunked.getByLabel('QTGMC preset', { exact: true }).selectOption('medium');
+  await expect(chunked.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
+  await chunked.getByRole('button', { name: 'Start encode', exact: true }).click();
+  const request = (await calls(page, 'start_encode'))[0].payload.request as EncodeRequest;
+  expect(request.settings.backend).toBe('av1an');
+  expect(request.settings.temporal).toEqual({
+    qtgmc: { mode: 'bob', fieldOrder: 'bottomFirst', preset: 'medium' },
+    resizeFilter: 'lanczos',
   });
 });

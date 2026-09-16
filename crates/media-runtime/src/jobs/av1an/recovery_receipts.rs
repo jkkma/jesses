@@ -37,6 +37,7 @@ pub(super) struct Expected<'a> {
     /// Bytes from the separately fingerprinted, tool-created loadscript.vpy.
     pub options: Av1anOptions,
     pub script_text: &'a str,
+    pub source_filter: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +128,7 @@ impl TargetQuality {
                     u32::from(target.probe_height),
                 ))
             && self.vmaf_scaler == "bicubic"
-            && self.vmaf_filter.is_none()
+            && self.vmaf_filter.as_deref() == expected.source_filter
             && self.vmaf_threads == 2
             && self.model.is_none()
             && self.probing_rate == u64::from(target.probing_rate)
@@ -735,6 +736,7 @@ video.set_output()
                 source_fps_den: 1,
                 script_text: &self.script,
                 options: self.options,
+                source_filter: None,
             }
         }
         fn validate(&self) -> Result<Receipts, String> {

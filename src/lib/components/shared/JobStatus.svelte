@@ -146,7 +146,7 @@
   {/if}
   {#if entry.state === 'stopping'}
     <p class="small-muted" role="status">Stopping and saving progress…</p>
-  {:else if entry.state === 'stopped' && !entry.recovery}
+  {:else if entry.state === 'stopped' && !entry.recovery && !entry.standaloneRecovery}
     <p class="small-muted">Stopped before progress was saved. Start a new encode to try again.</p>
   {:else if canResumeJob(entry)}
     <div class="saved-progress">
@@ -161,7 +161,11 @@
       onclick={() => runAction(entry.id, 'keep')}
       >{actions[entry.id] === 'keep' ? 'Saving progress…' : 'Stop and keep progress'}</Button
     >
-    <p class="small-muted">Keep completed chunks and resume this job later.</p>
+    <p class="small-muted">
+      {entry.encodeSettings?.backend === 'standalone'
+        ? 'Keeps only a fully verified pass, video, timing, or final-mux boundary. An interrupted phase reruns from its start.'
+        : 'Keep completed chunks and resume this job later.'}
+    </p>
   {:else if canResumeJob(entry)}
     <Button
       variant="outline"

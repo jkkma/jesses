@@ -3,6 +3,7 @@ use serde::Deserialize;
 
 use super::metadata::{Document, Stream};
 
+mod aspect;
 mod framing;
 mod hdr;
 mod temporal;
@@ -22,6 +23,9 @@ pub(super) struct Plan {
     pub width: u32,
     pub height: u32,
     geometry: framing::Geometry,
+    aspect: Option<aspect::Transform>,
+    source_sar: String,
+    output_sar: String,
     pub fps_num: u32,
     pub fps_den: u32,
     pub cadence_reconciled: bool,
@@ -61,21 +65,51 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
             None,
         ));
     }
+    if !settings.encoder.is_svt()
+        && (settings.svt_crf_quarter_steps.is_some() || settings.svt_preset.is_some())
+    {
+        return Err(AppError::new(
+            "ENCODE_SETTINGS_INVALID",
+            "Fractional/extended CRF and research presets belong to SVT encoders. Reset settings that belong to another encoder.",
+            None,
+        ));
+    }
+    let standalone = settings.backend == EncodeBackend::Standalone;
     let valid = match settings.encoder {
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-            (1..=63).contains(&settings.crf) && settings.preset <= 13 && settings.film_grain <= 50
+            settings.svt_crf_quarter_steps.map_or_else(
+                || (1..=63).contains(&settings.crf),
+                |value| (4..=280).contains(&value),
+            ) && settings
+                .svt_preset
+                .map_or(settings.preset <= 13, |value| (-3..=13).contains(&value))
+                && settings.film_grain <= 50
         }
-        VideoEncoder::X264 | VideoEncoder::X265 => {
-            settings.backend == EncodeBackend::Standalone
+        VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::X265Standalone => {
+            standalone
                 && settings.crf <= 51
                 && settings.preset <= 9
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
         }
         VideoEncoder::Vp9 => {
-            settings.backend == EncodeBackend::Standalone
+            standalone
                 && settings.crf <= 63
                 && settings.preset <= 5
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+            standalone
+                && settings.crf <= 63
+                && settings.preset <= 8
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+            standalone
+                && settings.crf <= 51
+                && settings.preset <= 6
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
         }
@@ -85,13 +119,19 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
             "ENCODE_SETTINGS_INVALID",
             match settings.encoder {
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-                    "Use CRF 1–63, an SVT preset from 0–13, film grain synthesis from 0–50, and 1–32 workers."
+                    "Use SVT CRF 1–70 in 0.25 steps, an advertised preset from -3–13, film grain synthesis from 0–50, and 1–32 workers."
                 }
-                VideoEncoder::X264 | VideoEncoder::X265 => {
+                VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::X265Standalone => {
                     "x264 and x265 require standalone mode, CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
                 VideoEncoder::Vp9 => {
                     "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, HDR10 fallback off, and 1–32 workers."
+                }
+                VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+                    "Standalone AOM/VPX require CRF 0–63, speed preset 0–8, grain 0, HDR10 fallback off, and 1–32 workers."
+                }
+                VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+                    "NVENC requires standalone mode, quality 0–51, preset P1–P7, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
             },
             None,
@@ -151,22 +191,27 @@ impl Plan {
                 "Encoding supports 8-bit or 10-bit planar 4:2:0 video only.",
             ));
         }
-        if settings
-            .temporal
-            .and_then(|temporal| temporal.deinterlace)
-            .is_none()
-            && !matches!(
-                video.field_order.as_deref(),
-                None | Some("progressive" | "unknown")
-            )
-        {
+        if settings.temporal.is_none_or(|temporal| {
+            temporal.deinterlace.is_none()
+                && temporal.qtgmc.is_none()
+                && temporal.cadence_repair.is_none()
+        }) && !matches!(
+            video.field_order.as_deref(),
+            None | Some("progressive" | "unknown")
+        ) {
             return Err(unsupported(
-                "Interlaced video requires explicit BWDIF deinterlacing and the matching TFF/BFF source field order.",
+                "Interlaced video requires explicit BWDIF, QTGMC, or inverse telecine processing and the matching TFF/BFF source field order.",
             ));
         }
-        if video.sample_aspect_ratio.as_deref() != Some("1:1") {
+        let source_sar = aspect::parse_source(video.sample_aspect_ratio.as_deref())?;
+        if source_sar != "1:1"
+            && settings
+                .temporal
+                .and_then(|temporal| temporal.aspect_ratio)
+                .is_none()
+        {
             return Err(unsupported(
-                "Encoding requires explicit square pixels (sample aspect ratio 1:1).",
+                "A non-square source requires an explicit output SAR or DAR conversion.",
             ));
         }
         let is_hdr10 = video.color_primaries.as_deref() == Some("bt2020")
@@ -176,7 +221,7 @@ impl Plan {
             && video.color_range.as_deref() == Some("tv");
         if is_hdr10 && !settings.encoder.is_svt() && tone_map.is_none() {
             return Err(unsupported(
-                "x264, x265, and VP9 currently support SDR only. Select SVT-AV1 for HDR10 output; no automatic tone mapping or HDR metadata removal is performed.",
+                "The selected non-SVT encoder currently supports SDR output only. Select SVT-AV1 for HDR10 output or enable explicit HDR/HLG-to-SDR tone mapping.",
             ));
         }
         let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg) {
@@ -235,6 +280,12 @@ impl Plan {
         geometry.resize_filter = settings
             .temporal
             .map_or_default(|temporal| temporal.resize_filter);
+        let aspect = settings
+            .temporal
+            .and_then(|temporal| temporal.aspect_ratio)
+            .map(|aspect| aspect::Transform::build(aspect, geometry.width, geometry.height))
+            .transpose()?;
+        let output_sar = aspect.map_or_else(|| "1:1".into(), aspect::Transform::sar);
         let (fps_num, fps_den) = rational(video.avg_frame_rate.as_deref())
             .or_else(|| rational(video.r_frame_rate.as_deref()))
             .ok_or_else(|| unsupported("The source has no usable rational frame rate."))?;
@@ -276,6 +327,9 @@ impl Plan {
             width: geometry.width,
             height: geometry.height,
             geometry,
+            aspect,
+            source_sar,
+            output_sar,
             fps_num,
             fps_den,
             cadence_reconciled: false,
@@ -336,13 +390,115 @@ impl Plan {
         f64::from(self.fps_den) / f64::from(self.fps_num)
     }
 
-    pub fn framing_filter(&self) -> Option<String> {
-        self.geometry.filter(
+    pub fn output_sar(&self) -> &str {
+        &self.output_sar
+    }
+
+    pub fn requires_qtgmc(&self) -> bool {
+        self.temporal
+            .as_ref()
+            .is_some_and(temporal::Transform::requires_qtgmc)
+    }
+
+    /// av1an derives its scene/chunk frame count before applying `--ffmpeg`.
+    /// Timeline-changing filters therefore run once into a verified lossless
+    /// source which all scene, chunk and quality-reference readers share.
+    pub fn requires_av1an_preprocess(&self) -> bool {
+        self.trim.is_some()
+            || self
+                .temporal
+                .as_ref()
+                .is_some_and(temporal::Transform::changes_av1an_source_timeline)
+    }
+
+    pub fn qtgmc_settings(&self) -> Option<media_core::QtgmcSettings> {
+        self.temporal
+            .as_ref()
+            .and_then(temporal::Transform::qtgmc_settings)
+    }
+
+    pub fn requires_exact_duplicate_scan(&self) -> bool {
+        self.temporal
+            .as_ref()
+            .is_some_and(temporal::Transform::requires_exact_duplicate_scan)
+    }
+
+    pub fn set_exact_duplicate_count(
+        &mut self,
+        source_frames: usize,
+        unique_frames: usize,
+    ) -> Result<(), AppError> {
+        let source_rate = media_core::FrameRate {
+            numerator: self.fps_num,
+            denominator: self.fps_den,
+        };
+        self.temporal
+            .as_mut()
+            .ok_or_else(|| {
+                AppError::new(
+                    "TEMPORAL_SETTINGS_INVALID",
+                    "Duplicate cadence repair is not active.",
+                    None,
+                )
+            })?
+            .set_exact_duplicate_count(source_frames, unique_frames, source_rate)
+    }
+
+    pub fn post_qtgmc_filter_with_text(&self, text: Option<&str>) -> Option<String> {
+        let mut filters = Vec::new();
+        if let Some(filter) = self
+            .temporal
+            .as_ref()
+            .and_then(temporal::Transform::post_qtgmc_filter)
+        {
+            filters.push(filter);
+        }
+        if let Some(tone) = &self.tone_map {
+            filters.push(tone.filter());
+        }
+        if let Some(framing) = self.geometry.filter_with_text(
             self.matrix,
             self.full_range,
             self.chroma,
             self.output_pixel_format,
-        )
+            text,
+        ) {
+            filters.push(framing);
+        }
+        let primaries = match self.primaries {
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            9 => "bt2020",
+            _ => unreachable!("validated output primaries"),
+        };
+        let transfer = match self.transfer {
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            16 => "smpte2084",
+            18 => "arib-std-b67",
+            _ => unreachable!("validated output transfer"),
+        };
+        let matrix = match self.matrix {
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            9 => "bt2020nc",
+            _ => unreachable!("validated output matrix"),
+        };
+        filters.push(format!(
+            "setparams=field_mode=prog:range={}:color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}",
+            if self.full_range { "pc" } else { "tv" }
+        ));
+        if let Some(aspect) = self.aspect {
+            filters.push(aspect.filter());
+        } else {
+            // VSPipe's Y4M output does not carry source SAR. Re-establish the
+            // plan's square-pixel default on the owned QTGMC intermediate.
+            filters.push("setsar=1/1:max=65535".into());
+        }
+        (!filters.is_empty()).then(|| filters.join(","))
     }
 
     pub fn decoder_filter(&self) -> Option<String> {
@@ -363,16 +519,30 @@ impl Plan {
         ) {
             filters.push(framing);
         }
+        if let Some(aspect) = self.aspect {
+            filters.push(aspect.filter());
+        }
         (!filters.is_empty()).then(|| filters.join(","))
     }
 
     pub fn decoder_prefix(&self) -> Option<String> {
         let mut filters = Vec::new();
         if let Some(trim) = self.trim {
-            filters.push(format!(
-                "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
-                trim.start_frame, trim.end_frame_exclusive
-            ));
+            if let Some(time) = trim.time {
+                let seconds = |milliseconds: u32| {
+                    format!("{}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
+                };
+                filters.push(format!(
+                    "trim=start={}:end={},setpts=PTS-STARTPTS",
+                    seconds(time.start_milliseconds),
+                    seconds(time.end_milliseconds)
+                ));
+            } else {
+                filters.push(format!(
+                    "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
+                    trim.start_frame, trim.end_frame_exclusive
+                ));
+            }
         }
         if let Some(temporal) = &self.temporal
             && let Some(filter) = temporal.filter()
@@ -386,13 +556,20 @@ impl Plan {
     }
 
     pub fn geometry_filter_with_text(&self, text: Option<&str>) -> Option<String> {
-        self.geometry.filter_with_text(
+        let mut filters = Vec::new();
+        if let Some(filter) = self.geometry.filter_with_text(
             self.matrix,
             self.full_range,
             self.chroma,
             self.output_pixel_format,
             text,
-        )
+        ) {
+            filters.push(filter);
+        }
+        if let Some(aspect) = self.aspect {
+            filters.push(aspect.filter());
+        }
+        (!filters.is_empty()).then(|| filters.join(","))
     }
 
     pub async fn check_tone_map_tools(
@@ -402,6 +579,17 @@ impl Plan {
     ) -> Result<(), AppError> {
         if let Some(tone) = &self.tone_map {
             tone.check_tools(ffmpeg, cancel).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn check_temporal_tools(
+        &self,
+        ffmpeg: &std::path::Path,
+        cancel: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if let Some(temporal) = &self.temporal {
+            temporal.check_tools(ffmpeg, cancel).await?;
         }
         Ok(())
     }
@@ -433,12 +621,21 @@ impl Plan {
         }
     }
 
+    fn frame_sar(&self, encoded: bool) -> &str {
+        if encoded {
+            &self.output_sar
+        } else {
+            &self.source_sar
+        }
+    }
+
     pub fn output_codec(&self) -> &'static str {
         match self.encoder {
             VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "av1",
-            VideoEncoder::X264 => "h264",
-            VideoEncoder::X265 => "hevc",
-            VideoEncoder::Vp9 => "vp9",
+            VideoEncoder::AomAv1 => "av1",
+            VideoEncoder::X264 | VideoEncoder::H264Nvenc => "h264",
+            VideoEncoder::X265 | VideoEncoder::X265Standalone | VideoEncoder::HevcNvenc => "hevc",
+            VideoEncoder::Vp9 | VideoEncoder::VpxStandalone => "vp9",
         }
     }
 
@@ -614,10 +811,10 @@ impl Plan {
             self.validate_fields(frame, encoded)?;
             if frame.width != Some(width)
                 || frame.height != Some(height)
-                || frame.sample_aspect_ratio.as_deref() != Some("1:1")
+                || frame.sample_aspect_ratio.as_deref() != Some(self.frame_sar(encoded))
             {
                 return Err(unsupported(
-                    "Changing frame dimensions or non-square pixel aspect ratios are not supported.",
+                    "Decoded frame dimensions or sample aspect ratio differ from the processing plan.",
                 ));
             }
             let normalize_chroma = |value: Option<&str>| match value {
@@ -688,10 +885,51 @@ impl Plan {
         source: &Stream,
         output: &Stream,
     ) -> Result<(), AppError> {
+        self.validate_encoded_stream_fields(source, output, false)
+    }
+
+    /// An elementary VP9/IVF checkpoint cannot represent display aspect,
+    /// chroma location, color primaries, or transfer characteristics. The
+    /// final Matroska stage writes and strictly validates those plan fields.
+    /// At this phase, absent container-level values are accepted while an
+    /// explicitly wrong value still rejects the checkpoint.
+    pub fn validate_elementary_checkpoint(
+        &self,
+        source: &Stream,
+        output: &Stream,
+    ) -> Result<(), AppError> {
+        self.validate_encoded_stream_fields(source, output, self.output_codec() == "vp9")
+    }
+
+    fn validate_encoded_stream_fields(
+        &self,
+        source: &Stream,
+        output: &Stream,
+        allow_absent_vp9_container_fields: bool,
+    ) -> Result<(), AppError> {
+        let expected_primaries = if self.is_tone_mapped() {
+            Some("bt709")
+        } else {
+            source.color_primaries.as_deref()
+        };
+        let expected_transfer = if self.is_tone_mapped() {
+            Some("bt709")
+        } else {
+            source.color_transfer.as_deref()
+        };
+        let optional_container_field_matches = |actual: Option<&str>, expected: Option<&str>| {
+            actual == expected || (allow_absent_vp9_container_fields && actual.is_none())
+        };
         let chroma_matches = match self.chroma {
-            "left" => output.chroma_location.as_deref() == Some("left"),
-            "topleft" => output.chroma_location.as_deref() == Some("topleft"),
-            "center" => output.chroma_location.as_deref() == Some("center"),
+            "left" => {
+                optional_container_field_matches(output.chroma_location.as_deref(), Some("left"))
+            }
+            "topleft" => {
+                optional_container_field_matches(output.chroma_location.as_deref(), Some("topleft"))
+            }
+            "center" => {
+                optional_container_field_matches(output.chroma_location.as_deref(), Some("center"))
+            }
             _ => matches!(
                 output.chroma_location.as_deref(),
                 None | Some("unspecified" | "unknown")
@@ -701,16 +939,31 @@ impl Plan {
             || !self.matches_output_format(output.pix_fmt.as_deref())
             || output.width != Some(self.width)
             || output.height != Some(self.height)
-            || output.sample_aspect_ratio.as_deref() != Some("1:1")
+            || !optional_container_field_matches(
+                output.sample_aspect_ratio.as_deref(),
+                Some(self.output_sar.as_str()),
+            )
             || if self.is_tone_mapped() {
                 output.color_space.as_deref() != Some("bt709")
-                    || output.color_transfer.as_deref() != Some("bt709")
-                    || output.color_primaries.as_deref() != Some("bt709")
+                    || !optional_container_field_matches(
+                        output.color_transfer.as_deref(),
+                        expected_transfer,
+                    )
+                    || !optional_container_field_matches(
+                        output.color_primaries.as_deref(),
+                        expected_primaries,
+                    )
                     || output.color_range.as_deref() != Some("tv")
             } else {
                 source.color_space != output.color_space
-                    || source.color_transfer != output.color_transfer
-                    || source.color_primaries != output.color_primaries
+                    || !optional_container_field_matches(
+                        output.color_transfer.as_deref(),
+                        expected_transfer,
+                    )
+                    || !optional_container_field_matches(
+                        output.color_primaries.as_deref(),
+                        expected_primaries,
+                    )
                     || source.color_range != output.color_range
             }
             || !chroma_matches
@@ -757,6 +1010,36 @@ pub(super) struct Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vp9_elementary_checkpoint_allows_only_absent_container_color_fields() {
+        let mut source = source();
+        source.streams[0].chroma_location = Some("left".into());
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::VpxStandalone,
+            ..Default::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        let mut checkpoint = source.streams[0].clone();
+        checkpoint.codec_name = Some("vp9".into());
+        checkpoint.sample_aspect_ratio = None;
+        checkpoint.chroma_location = None;
+        checkpoint.color_primaries = None;
+        checkpoint.color_transfer = None;
+
+        plan.validate_elementary_checkpoint(&source.streams[0], &checkpoint)
+            .unwrap();
+        assert!(
+            plan.validate_encoded_stream(&source.streams[0], &checkpoint)
+                .is_err()
+        );
+
+        checkpoint.color_primaries = Some("bt470bg".into());
+        assert!(
+            plan.validate_elementary_checkpoint(&source.streams[0], &checkpoint)
+                .is_err()
+        );
+    }
 
     #[test]
     fn framing_validates_original_source_frames_and_transformed_output_frames_separately() {
@@ -1345,7 +1628,7 @@ mod tests {
         );
         let (hdr, _) = hdr_source_and_frames();
         let error = Plan::build(&hdr, &hdr.selected(&[0]).unwrap(), &x264_settings()).unwrap_err();
-        assert!(error.message.contains("SDR only"));
+        assert!(error.message.contains("SDR output only"));
     }
 
     #[test]

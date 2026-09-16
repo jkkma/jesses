@@ -4,15 +4,27 @@ export const terminalJob = (state: string): boolean =>
   ['succeeded', 'failed', 'canceled', 'interrupted', 'stopped'].includes(state);
 
 export const canKeepProgress = (job: JobSnapshot): boolean =>
-  job.encodeSettings?.backend === 'av1an' &&
-  ['preparing', 'running', 'paused', 'finalizing'].includes(job.state);
+  !!job.encodeSettings && ['preparing', 'running', 'paused', 'finalizing'].includes(job.state);
 
 export const canResumeJob = (job: JobSnapshot): boolean =>
-  job.encodeSettings?.backend === 'av1an' &&
-  !!job.recovery &&
+  ((job.encodeSettings?.backend === 'av1an' && !!job.recovery) ||
+    (job.encodeSettings?.backend === 'standalone' && !!job.standaloneRecovery)) &&
   ['stopped', 'interrupted', 'failed', 'canceled'].includes(job.state);
 
 export function savedProgressSummary(job: JobSnapshot): string {
+  const standalone = job.standaloneRecovery;
+  if (job.encodeSettings?.backend === 'standalone' && standalone) {
+    switch (standalone.phase) {
+      case 'passOneComplete':
+        return 'Pass one statistics are verified and saved. Resume starts a fresh decoder and runs pass two.';
+      case 'videoComplete':
+        return `All ${standalone.totalFrames.toLocaleString()} frames are verified and saved. Resume continues with timing and final muxing.`;
+      case 'timingWrapComplete':
+        return 'The exact-timing video wrapper is verified and saved. Resume continues with final muxing.';
+      case 'finalizing':
+        return 'The completed Matroska stage is verified and saved. Resume continues with final container publication.';
+    }
+  }
   const recovery = job.recovery;
   if (!recovery) return '';
   if (recovery.phase === 'finalizing')

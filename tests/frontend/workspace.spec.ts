@@ -94,6 +94,13 @@ async function desktopMock(page: Page, paths: string[], media = fixture) {
               throw { code: 'probe_failed', message: 'Invalid media fixture.' };
             return media;
           }
+          if (command === 'get_completion_status')
+            return {
+              options: { notify: false, finishAction: 'none' },
+              armedJobs: 0,
+              secondsRemaining: null,
+              error: null,
+            };
           throw new Error(`Unexpected IPC command: ${command}`);
         },
       };

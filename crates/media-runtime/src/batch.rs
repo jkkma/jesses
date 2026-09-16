@@ -362,6 +362,11 @@ fn proposed_output(
             VideoEncoder::X264 => "x264",
             VideoEncoder::X265 => "x265",
             VideoEncoder::Vp9 => "vp9",
+            VideoEncoder::AomAv1 => "aom",
+            VideoEncoder::X265Standalone => "x265_standalone",
+            VideoEncoder::VpxStandalone => "vpx",
+            VideoEncoder::H264Nvenc => "h264_nvenc",
+            VideoEncoder::HevcNvenc => "hevc_nvenc",
         };
         let extension = container.extension();
         let candidate = directory.join(format!("{stem}_{codec}{suffix}.{extension}"));
@@ -431,6 +436,9 @@ pub(crate) async fn preview(
             video_stream_index: input.video_stream_index,
             crf: request.crf,
             preset: request.preset,
+            lossless: request.lossless,
+            svt_crf_quarter_steps: request.svt_crf_quarter_steps,
+            svt_preset: request.svt_preset,
             film_grain: request.film_grain,
             lineart_psy_bias: request.lineart_psy_bias,
             texture_psy_bias: request.texture_psy_bias,
@@ -710,6 +718,9 @@ mod tests {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             inputs: vec![BatchEncodeInput {
                 temporal: None,
                 tone_map: None,
@@ -823,6 +834,9 @@ mod tests {
                 av1an_options: None,
                 output_container: None,
                 rate_control: None,
+                lossless: false,
+                svt_crf_quarter_steps: None,
+                svt_preset: None,
                 inputs: vec![
                     BatchEncodeInput {
                         temporal: None,

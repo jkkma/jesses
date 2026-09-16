@@ -29,6 +29,8 @@ struct ProbeStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    sample_aspect_ratio: Option<String>,
+    display_aspect_ratio: Option<String>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     field_order: Option<String>,
@@ -205,6 +207,15 @@ pub(crate) fn parse_probe(
             };
             let (static_metadata, dynamic_formats) = hdr_headers(&stream.side_data_list);
             let tags = stream.tags.unwrap_or_default();
+            let rotation_degrees = stream
+                .side_data_list
+                .iter()
+                .filter_map(|data| data.get("rotation"))
+                .find_map(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
+                .or_else(|| tag(&tags, "rotate")?.parse::<f64>().ok())
+                .filter(|n| n.is_finite())
+                .map(|n| n.to_string());
+            let aspect = |v: Option<String>| v.filter(|s| positive_rational(&s.replace(':', "/")));
             let frame_rate = stream
                 .avg_frame_rate
                 .filter(|value| positive_rational(value))
@@ -215,6 +226,9 @@ pub(crate) fn parse_probe(
                 codec: nonempty(stream.codec_name),
                 width: stream.width,
                 height: stream.height,
+                sample_aspect_ratio: aspect(stream.sample_aspect_ratio),
+                display_aspect_ratio: aspect(stream.display_aspect_ratio),
+                rotation_degrees,
                 frame_rate,
                 field_order: nonempty(stream.field_order),
                 sample_rate: sample_rate(stream.sample_rate.as_ref()),
@@ -393,6 +407,23 @@ mod tests {
         assert_eq!(parsed.streams[1].title.as_deref(), Some("Original mix"));
         assert_eq!(parsed.streams[2].width, None);
         assert_eq!(parsed.size_bytes, "9007199254740993");
+    }
+
+    #[test]
+    fn display_metadata_keeps_rationals_and_prefers_the_matrix_rotation() {
+        let parsed = parse_probe(br#"{"streams":[{"index":3,"codec_type":"video","sample_aspect_ratio":"8:9","display_aspect_ratio":"4:3","side_data_list":[{"rotation":90}],"tags":{"rotate":"180"}},{"index":4,"codec_type":"video","sample_aspect_ratio":"0:1","tags":{"rotate":"-90"}}]}"#,
+            "source.mp4".into(), "source.mp4".into(), 10).unwrap();
+        assert_eq!(
+            parsed.streams[0].sample_aspect_ratio.as_deref(),
+            Some("8:9")
+        );
+        assert_eq!(
+            parsed.streams[0].display_aspect_ratio.as_deref(),
+            Some("4:3")
+        );
+        assert_eq!(parsed.streams[0].rotation_degrees.as_deref(), Some("90"));
+        assert_eq!(parsed.streams[1].sample_aspect_ratio, None);
+        assert_eq!(parsed.streams[1].rotation_degrees.as_deref(), Some("-90"));
     }
 
     #[test]

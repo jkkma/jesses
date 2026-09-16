@@ -688,6 +688,9 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
             av1an_options: None,
             output_container: None,
             rate_control: None,
+            lossless: false,
+            svt_crf_quarter_steps: None,
+            svt_preset: None,
             inputs: vec![
                 base.clone(),
                 BatchEncodeInput {

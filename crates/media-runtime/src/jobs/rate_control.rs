@@ -12,12 +12,31 @@ fn invalid(message: &str) -> AppError {
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
+    if settings.lossless && settings.rate_control.is_some() {
+        return Err(invalid(
+            "Lossless mode cannot be combined with bitrate or target-size rate control.",
+        ));
+    }
     let Some(control) = settings.rate_control else {
         return Ok(());
     };
     if settings.backend != EncodeBackend::Standalone {
         return Err(invalid(
             "Bitrate and target size currently require standalone encoding.",
+        ));
+    }
+    if matches!(
+        settings.encoder,
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+    ) && !matches!(
+        control,
+        VideoRateControl::Bitrate {
+            two_pass: false,
+            ..
+        }
+    ) {
+        return Err(invalid(
+            "NVENC supports one-pass video bitrate in this workflow. Two-pass bitrate and target size require a software encoder with external pass statistics.",
         ));
     }
     match control {
@@ -164,6 +183,44 @@ impl Rate {
                     }
                 }
             }
+            VideoEncoder::X265Standalone => {
+                remove_pair(args, "--crf");
+                add.extend(["--bitrate".into(), self.kbps.to_string().into()]);
+                if self.two_pass {
+                    add.extend([
+                        "--pass".into(),
+                        pass.to_string().into(),
+                        "--stats".into(),
+                        "jesses.stats".into(),
+                    ]);
+                }
+            }
+            VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+                for option in [
+                    "--cq-level=",
+                    "--end-usage=",
+                    "--target-bitrate=",
+                    "--passes=",
+                ] {
+                    args.retain(|argument| !argument.to_string_lossy().starts_with(option));
+                }
+                add.extend([
+                    "--end-usage=vbr".into(),
+                    format!("--target-bitrate={}", self.kbps).into(),
+                    format!("--passes={}", if self.two_pass { 2 } else { 1 }).into(),
+                ]);
+                if self.two_pass {
+                    add.extend([format!("--pass={pass}").into(), "--fpf=jesses.stats".into()]);
+                }
+            }
+            VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+                remove_pair(args, "-cq");
+                remove_pair(args, "-b:v");
+                add.extend([
+                    "-b:v".into(),
+                    (u64::from(self.kbps) * 1000).to_string().into(),
+                ]);
+            }
             VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                 remove_pair(args, "--crf");
                 remove_pair(args, "--passes");
@@ -198,6 +255,7 @@ impl Rate {
 
 pub(super) struct Stats {
     pub path: PathBuf,
+    preserve: bool,
     #[cfg(unix)]
     identity: (u64, u64),
     #[cfg(windows)]
@@ -210,8 +268,28 @@ impl Stats {
             .parent()
             .expect("output parent")
             .join(format!(".jesses-{id}-passes"));
-        fs::create_dir(&path)
-            .map_err(|e| files::error("OUTPUT_CREATE_FAILED", e.to_string(), &path))?;
+        Self::open_at(path, false, false)
+    }
+
+    pub fn durable(path: &Path, existing: bool) -> Result<Self, AppError> {
+        Self::open_at(path.to_owned(), existing, true)
+    }
+
+    fn open_at(path: PathBuf, existing: bool, preserve: bool) -> Result<Self, AppError> {
+        if existing {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|e| files::error("OUTPUT_CREATE_FAILED", e.to_string(), &path))?;
+            if !metadata.is_dir() {
+                return Err(files::error(
+                    "OUTPUT_CHANGED",
+                    "The durable pass-statistics path is not a directory.",
+                    &path,
+                ));
+            }
+        } else {
+            fs::create_dir(&path)
+                .map_err(|e| files::error("OUTPUT_CREATE_FAILED", e.to_string(), &path))?;
+        }
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt;
@@ -231,6 +309,7 @@ impl Stats {
         };
         Ok(Self {
             path,
+            preserve,
             #[cfg(unix)]
             identity,
             #[cfg(windows)]
@@ -295,6 +374,9 @@ impl Stats {
 
 impl Drop for Stats {
     fn drop(&mut self) {
+        if self.preserve {
+            return;
+        }
         if self.check().is_err() {
             return;
         }

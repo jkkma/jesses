@@ -269,6 +269,7 @@ async fn target_size_measures_flac_and_trimmed_duration_and_rejects_impossible_c
                 trim: Some(media_core::VideoTrim {
                     start_frame: 24,
                     end_frame_exclusive: 264,
+                    time: None,
                 }),
                 audio: vec![media_core::AudioTrackSettings {
                     stream_index: 1,

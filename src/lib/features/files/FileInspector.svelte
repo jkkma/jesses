@@ -2,6 +2,7 @@
   import { AudioLines, Captions, CircleHelp, FileSearch, Film, Info } from '@lucide/svelte';
   import type { MediaFile } from '$lib/ipc/generated';
   import MediaAnalysis from './MediaAnalysis.svelte';
+  import MediaThumbnail from './MediaThumbnail.svelte';
   import QualityAnalysis from './QualityAnalysis.svelte';
   import {
     displayCodec,
@@ -53,6 +54,7 @@
           >{file.format ?? 'Unknown'}</strong
         >
       </div>
+      <MediaThumbnail {file} {sample} />
       <MediaAnalysis {file} {sample} />
       <QualityAnalysis {file} {sample} />
       <div class="section-heading track-heading">
@@ -104,6 +106,26 @@
               </p>{/if}
             {#if stream.kind === 'video'}
               <dl class="video-color" aria-label={`Video metadata for stream ${stream.index}`}>
+                <div>
+                  <dt>Pixel aspect</dt>
+                  <dd>{stream.sampleAspectRatio ?? 'Not reported'}</dd>
+                </div>
+                <div>
+                  <dt>Display aspect</dt>
+                  <dd>{stream.displayAspectRatio ?? 'Not reported'}</dd>
+                </div>
+                <div>
+                  <dt>Rotation</dt>
+                  <dd>
+                    {stream.rotationDegrees === undefined
+                      ? 'Not reported'
+                      : `${stream.rotationDegrees}°`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Frame rate</dt>
+                  <dd>{stream.frameRate ?? 'Not reported'}</dd>
+                </div>
                 <div>
                   <dt>Pixel format</dt>
                   <dd>

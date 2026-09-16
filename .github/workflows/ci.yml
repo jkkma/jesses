@@ -63,7 +63,8 @@ jobs:
       - name: Verify actual FFmpeg, FFprobe, and standalone SVT-AV1 integration
         if: runner.os == 'Linux'
         run: |
-          cargo test -p media-runtime --lib --locked -- --include-ignored
+          # QTGMC needs a separately qualified VapourSynth/plugin installation.
+          cargo test -p media-runtime --lib --locked -- --include-ignored --skip qtgmc
           cargo test -p media-runtime --test real_tools --locked -- --include-ignored
       - name: Verify standalone x264 integration
         if: runner.os == 'Linux'
@@ -106,7 +107,11 @@ jobs:
         run: cargo test -p media-runtime --test container_jobs --locked -- --ignored
       - name: Verify field order, bob timing, rational frame rate and resize kernels
         if: runner.os == 'Linux'
-        run: cargo test -p media-runtime --test temporal_jobs --locked -- --ignored
+        # The optional QTGMC runtime is not installed on this runner.
+        run: cargo test -p media-runtime --test temporal_jobs --locked -- --ignored --skip qtgmc
+      - name: Verify image sequence ordering, image and GIF output, and cancellation
+        if: runner.os == 'Linux'
+        run: cargo test -p media-runtime --test image_jobs --locked -- --ignored --test-threads=1
       - name: Verify source previews, HDR display, automatic crop and cancellation
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test analysis_jobs --locked -- --include-ignored --test-threads=1
