@@ -2830,7 +2830,7 @@ test('extended SVT quality and dedicated lossless mode freeze their explicit wir
   });
   await encoder.selectOption('aomAv1');
   await workspace.getByLabel('Rate control', { exact: true }).selectOption('lossless');
-  await expect(workspace).toContainText('dedicated lossless mode');
+  await expect(workspace).toContainText('every decoded pixel is verified before saving');
   await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
   const lossless = ((await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest })
     .request;

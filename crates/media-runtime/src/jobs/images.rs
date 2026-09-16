@@ -211,6 +211,10 @@ impl Identity {
 }
 
 fn open_identity(path: &Path, directory: bool) -> Result<Identity, std::io::Error> {
+    Identity::from_file(&open_identity_guard(path, directory)?)
+}
+
+fn open_identity_guard(path: &Path, directory: bool) -> Result<File, std::io::Error> {
     #[cfg(unix)]
     let file = {
         let _ = directory;
@@ -230,12 +234,15 @@ fn open_identity(path: &Path, directory: bool) -> Result<Identity, std::io::Erro
         }
         options.open(path)?
     };
-    Identity::from_file(&file)
+    Ok(file)
 }
 
 struct Entry {
     path: PathBuf,
     identity: Identity,
+    // Keeping the original object open prevents Unix from reusing its inode
+    // for a same-name replacement before cleanup checks the pathname.
+    identity_guard: Option<File>,
 }
 
 /// Holds a fresh directory reservation and removes only entries whose file
@@ -243,6 +250,8 @@ struct Entry {
 struct Directory {
     path: PathBuf,
     identity: Identity,
+    #[cfg(unix)]
+    identity_guard: Option<File>,
     entries: Vec<Entry>,
     published: bool,
 }
@@ -250,10 +259,19 @@ impl Directory {
     fn new(parent: &Path) -> Result<Self, AppError> {
         let path = parent.join(format!(".jesses-{}", id()));
         fs::create_dir(&path).map_err(|e| error(e.to_string(), &path))?;
+        #[cfg(unix)]
+        let identity_guard =
+            open_identity_guard(&path, true).map_err(|e| error(e.to_string(), &path))?;
+        #[cfg(unix)]
+        let identity =
+            Identity::from_file(&identity_guard).map_err(|e| error(e.to_string(), &path))?;
+        #[cfg(windows)]
         let identity = open_identity(&path, true).map_err(|e| error(e.to_string(), &path))?;
         Ok(Self {
             path,
             identity,
+            #[cfg(unix)]
+            identity_guard: Some(identity_guard),
             entries: Vec::new(),
             published: false,
         })
@@ -285,7 +303,14 @@ impl Directory {
             .map_err(|cause| error(cause.to_string(), &path))?;
         let identity =
             Identity::from_file(&file).map_err(|cause| error(cause.to_string(), &path))?;
-        self.entries.push(Entry { path, identity });
+        let identity_guard = file
+            .try_clone()
+            .map_err(|cause| error(cause.to_string(), &path))?;
+        self.entries.push(Entry {
+            path,
+            identity,
+            identity_guard: Some(identity_guard),
+        });
         Ok(file)
     }
 
@@ -367,14 +392,19 @@ impl Drop for Directory {
             return;
         }
         // No recursive delete: foreign, unexpected, or replaced entries are retained.
-        for entry in &self.entries {
+        for entry in &mut self.entries {
             if entry.identity.matches_path(&entry.path, false) {
                 let _ = fs::remove_file(&entry.path);
             }
+            // On Windows, a deletion may finish only after the last handle is
+            // closed. Release each guard before removing the owned directory.
+            entry.identity_guard.take();
         }
         if !self.identity.matches_path(&self.path, true) {
             return;
         }
+        #[cfg(unix)]
+        self.identity_guard.take();
         let _ = fs::remove_dir(&self.path);
     }
 }
