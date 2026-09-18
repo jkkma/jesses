@@ -21,9 +21,9 @@
   aria-label={`${props.backend === 'av1an' ? 'AV1AN' : 'Quick Convert'} source mapping`}
 >
   <div class="source-field">
-    <label for={id}>Encoding source</label>
+    <label for={id}>Source for this encode</label>
     <select {id} bind:value={sourceId}>
-      <option value="">Follow the Files selection</option>
+      <option value="">Use the current media selection</option>
       {#each files as entry (entry.id)}
         <option value={entry.id}>{entry.name}</option>
       {/each}
@@ -37,7 +37,7 @@
       Video, copied tracks, geometry and color settings use {source?.name}. You can inspect other
       files without changing this source.
     {:else}
-      Choose a file here to keep it as the encoding source while inspecting other files.
+      Use this when you want to inspect another file without changing the file you will encode.
     {/if}
   </p>
 </section>

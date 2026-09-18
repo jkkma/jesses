@@ -110,11 +110,11 @@
 <section class="remux-workspace" aria-label="Remux workspace">
   <div class="view-intro">
     <div>
-      <span class="eyebrow">Copy selected streams</span>
+      <span class="eyebrow">Repackage without re-encoding</span>
       <h1>Remux</h1>
       <p>
-        Save your video, audio, and subtitles in a new container. Video and audio are copied;
-        incompatible text subtitles are converted.
+        Change the container or track order while keeping the encoded video and audio. Incompatible
+        text subtitles are converted.
       </p>
     </div>
     <span class="status-label">MKV · MP4 · MOV · WebM</span>

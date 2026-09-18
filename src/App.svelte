@@ -236,6 +236,10 @@
   const totalSize = $derived(files.reduce((total, file) => total + Number(file.sizeBytes), 0));
   const hasSample = $derived(files.some((file) => file.id === sampleId));
   const availableTools = $derived(tools.filter((tool) => tool.available).length);
+  const sourceRequired = $derived(
+    ((view === 'convert' || view === 'av1an' || view === 'remux') && !selectedFile) ||
+      ((view === 'batch' || view === 'utilities') && files.length === 0),
+  );
 
   function addLog(message: string, level: LogEntry['level'] = 'info') {
     logs = [
@@ -441,10 +445,10 @@
     addLog('Source list cleared.');
   }
 
-  function loadSample() {
+  function loadSample(nextView: View = 'files') {
     if (files.some((file) => file.id === sampleId)) {
       selectedId = sampleId;
-      view = 'files';
+      view = nextView;
       return;
     }
     const baseStream = {
@@ -495,7 +499,7 @@
     };
     files = [...files, sample];
     selectedId = sample.id;
-    view = 'files';
+    view = nextView;
     addLog('Loaded synthetic interface sample. No media file was read.');
   }
 
@@ -590,11 +594,12 @@
   </header>
 
   <div class="workspace-nav">
-    <nav aria-label="Workspace">
+    <nav aria-label="Workspace workflows">
       <button
         type="button"
         class:active={view === 'files'}
         aria-current={view === 'files' ? 'page' : undefined}
+        title="Start here: add and inspect source media"
         onclick={() => (view = 'files')}
         ><Files size={16} aria-hidden="true" />Files<span class="nav-count"
           >{files.length.toString().padStart(2, '0')}</span
@@ -604,6 +609,7 @@
         type="button"
         class:active={view === 'convert'}
         aria-current={view === 'convert' ? 'page' : undefined}
+        title="Encode one source with guided settings"
         onclick={() => (view = 'convert')}
         ><SlidersHorizontal size={16} aria-hidden="true" />Quick Convert</button
       >
@@ -611,24 +617,28 @@
         type="button"
         class:active={view === 'av1an'}
         aria-current={view === 'av1an' ? 'page' : undefined}
+        title="Scene-based AV1 encoding with parallel chunks"
         onclick={() => (view = 'av1an')}>av1an</button
       >
       <button
         type="button"
         class:active={view === 'batch'}
         aria-current={view === 'batch' ? 'page' : undefined}
+        title="Apply one encoding recipe to multiple sources"
         onclick={() => (view = 'batch')}>Batch encode</button
       >
       <button
         type="button"
         class:active={view === 'remux'}
         aria-current={view === 'remux' ? 'page' : undefined}
+        title="Repackage streams without re-encoding"
         onclick={() => (view = 'remux')}>Remux</button
       >
       <button
         type="button"
         class:active={view === 'tools'}
         aria-current={view === 'tools' ? 'page' : undefined}
+        title="Check installed tools and change app defaults"
         onclick={() => (view = 'tools')}
         ><Wrench size={16} aria-hidden="true" />Tools & settings</button
       >
@@ -636,6 +646,7 @@
         type="button"
         class:active={view === 'utilities'}
         aria-current={view === 'utilities' ? 'page' : undefined}
+        title="Run focused media tasks such as cuts, joins, OCR, and analysis"
         onclick={() => (view = 'utilities')}>Utilities</button
       >
     </nav>
@@ -649,11 +660,37 @@
         <p>
           <strong>Browser preview.</strong> Open the desktop app to add local media and detect tools.
         </p>
-        <button type="button" class="text-button" onclick={loadSample}
+        <button type="button" class="text-button" onclick={() => loadSample(view)}
           ><FlaskConical size={13} aria-hidden="true" />{hasSample
             ? 'View sample'
             : 'Load sample'}</button
         >
+      </div>
+    {/if}
+
+    {#if sourceRequired}
+      <div class="source-required notice" role="region" aria-label="Choose a media source">
+        <Files size={18} aria-hidden="true" />
+        <div class="source-required-copy">
+          <strong
+            >{desktop
+              ? 'Choose media to begin.'
+              : 'Try the sample to explore this workflow.'}</strong
+          >
+          <p>
+            {desktop
+              ? 'Add a file or folder from Files. Your source stays unchanged while you review the workflow.'
+              : 'The browser preview cannot read local files, but the sample shows where each setting belongs.'}
+          </p>
+        </div>
+        <div class="source-required-actions">
+          <Button variant="outline" onclick={() => (view = 'files')}
+            ><Files size={14} aria-hidden="true" />Open Files</Button
+          >
+          {#if !desktop}<Button onclick={() => loadSample(view)}
+              ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
+            >{/if}
+        </div>
       </div>
     {/if}
 
@@ -666,7 +703,7 @@
                 >{files.length.toString().padStart(2, '0')}</span
               >
             </h1>
-            <p>Inspect your media. Start with a source.</p>
+            <p>Add media once, then inspect it or choose a workflow.</p>
           </div>
           <div class="toolbar-actions">
             <Button variant="outline" onclick={addFolder} disabled={!desktop || importing}
@@ -826,18 +863,23 @@
                       ? 'Drop files anywhere in this window, or choose them from your computer.'
                       : 'Add a video or audio file to explore its format, details, and individual streams.'}
                 </p>
-                <Button
-                  onclick={addFiles}
-                  disabled={!desktop || importing}
-                  title={!desktop
-                    ? 'Local files require the jesses desktop app'
-                    : 'Choose media files'}
-                  >{#if importing}<LoaderCircle
-                      size={15}
-                      class="spinning"
-                      aria-hidden="true"
-                    />Reading file{:else}<FolderOpen size={15} aria-hidden="true" />Add files{/if}</Button
-                >
+                <div class="empty-actions">
+                  <Button
+                    onclick={addFiles}
+                    disabled={!desktop || importing}
+                    title={!desktop
+                      ? 'Local files require the jesses desktop app'
+                      : 'Choose media files'}
+                    >{#if importing}<LoaderCircle
+                        size={15}
+                        class="spinning"
+                        aria-hidden="true"
+                      />Reading file{:else}<FolderOpen size={15} aria-hidden="true" />Add files{/if}</Button
+                  >
+                  {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
+                      ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
+                    >{/if}
+                </div>
                 <span class="empty-shortcut"
                   >{desktop ? 'or press Ctrl + O' : 'Available in the desktop app'}</span
                 >
@@ -1039,6 +1081,45 @@
   .folder-import-options input {
     accent-color: #ad5326;
   }
+  .source-required {
+    align-items: center;
+    margin: 0 0 18px;
+    background: var(--accent);
+    border-color: var(--border);
+  }
+  .source-required > :global(svg) {
+    flex: 0 0 auto;
+    color: var(--jesses-rust-text);
+  }
+  .source-required-copy {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+  .source-required-copy strong {
+    display: block;
+    font-size: 12px;
+  }
+  .source-required-copy p {
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+  .source-required-actions {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .empty-actions {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 24px;
+  }
+  .library-empty .empty-actions :global([data-slot='button']) {
+    margin-top: 0;
+  }
   :global(.workspace-nav nav) {
     flex-wrap: wrap;
   }
@@ -1053,6 +1134,11 @@
   @media (max-width: 1000px) {
     :global(.workspace-label) {
       display: none;
+    }
+  }
+  @media (max-width: 850px) {
+    .source-required-actions {
+      flex-basis: 100%;
     }
   }
 </style>

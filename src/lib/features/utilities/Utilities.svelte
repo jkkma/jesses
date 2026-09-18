@@ -220,10 +220,11 @@
 <section class="utilities" aria-label="Media utilities">
   <header>
     <div>
+      <span class="eyebrow">Focused media tasks</span>
       <h1>Media utilities</h1>
       <p>
-        Inspect, transform and compare local media. Outputs are checked before saving to a new
-        destination.
+        Cut, join, inspect, or compare local media without opening a full encode workflow. Outputs
+        are checked before saving to a new destination.
       </p>
     </div>
     <button type="button" onclick={inspect} disabled={checking || pending || !isDesktop()}

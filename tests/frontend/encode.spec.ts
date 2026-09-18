@@ -2892,7 +2892,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       name: tab === 'av1an' ? 'AV1AN source mapping' : 'Quick Convert source mapping',
       exact: true,
     });
-    await mapping.getByLabel('Encoding source', { exact: true }).selectOption(media.id);
+    await mapping.getByLabel('Source for this encode', { exact: true }).selectOption(media.id);
     const next: MediaFile = {
       ...media,
       id: 'mapped-other',
@@ -2923,7 +2923,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await expect(
       workspace.getByRole('button', { name: 'Add to queue', exact: true }),
     ).toBeDisabled();
-    await mapping.getByLabel('Encoding source', { exact: true }).selectOption('');
+    await mapping.getByLabel('Source for this encode', { exact: true }).selectOption('');
     await expect(workspace.getByLabel('Video stream', { exact: true })).toHaveValue('11');
     await expect(workspace.getByLabel('Video dimensions', { exact: true })).toContainText(
       '720 × 480',

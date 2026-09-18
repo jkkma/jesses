@@ -137,6 +137,23 @@ test('browser preview starts empty, identifies sample data, and keeps encoding u
   await expect(page.getByRole('heading', { name: 'Your media starts here.' })).toBeVisible();
 });
 
+test('workflow pages explain the first step and keep the sample in context', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(
+    page.getByRole('region', { name: 'Choose a media source', exact: true }),
+  ).toContainText('Try the sample to explore this workflow.');
+  await expect(page.getByRole('button', { name: 'Open Files', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Try sample', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Quick Convert', exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('combobox', { name: 'Source for this encode', exact: true }),
+  ).toHaveValue('');
+  await expect(
+    page.getByRole('combobox', { name: 'Source for this encode', exact: true }).locator('option'),
+  ).toHaveCount(2);
+});
+
 test('desktop import retains good files through errors, deduplicates, and exposes source stream indices', async ({
   page,
 }) => {

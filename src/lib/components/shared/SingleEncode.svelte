@@ -480,8 +480,8 @@
       <h1>{chunked ? 'av1an' : 'Quick Convert'}</h1>
       <p>
         {chunked
-          ? 'Detect scenes and encode AV1 chunks in parallel with your selected SVT-AV1 build.'
-          : 'Start with SVT-AV1-HDR, choose 5fish for anime, or use standard SVT-AV1, x264, x265, or VP9.'}
+          ? 'Scene-based AV1 encoding with av1an. Use this when you want scene detection and parallel chunks.'
+          : 'Encode one source at a time. Pick an encoder, review the output, then start the job.'}
       </p>
     </div>
     <span class="status-label"

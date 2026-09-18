@@ -582,9 +582,11 @@
 <section class="batch-workspace" aria-label="Batch encode workspace">
   <div class="view-intro">
     <div>
-      <span class="eyebrow">Folder workflow</span>
+      <span class="eyebrow">Encode multiple sources</span>
       <h1>Batch encode</h1>
-      <p>Review your episodes, choose common settings, then queue the ready files together.</p>
+      <p>
+        Apply one recipe to several sources. Review each file, then queue the ready files together.
+      </p>
     </div>
     <span class="status-label"
       >{options.name} · {isSvtEncoder(encoder)

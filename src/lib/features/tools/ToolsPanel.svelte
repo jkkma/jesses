@@ -53,9 +53,9 @@
 <section class="tools-workspace" aria-label="Tools and settings">
   <div class="view-intro">
     <div>
-      <span class="eyebrow">Application settings</span>
+      <span class="eyebrow">Installed tools & app settings</span>
       <h1>Tools & environment</h1>
-      <p>Check the media tools available to jesses.</p>
+      <p>Check what jesses can use, then set defaults for future jobs.</p>
     </div>
     <Button variant="outline" onclick={onrefresh} disabled={!desktop || loading}
       ><RefreshCw size={14} class={loading ? 'spinning' : ''} aria-hidden="true" />Check again</Button
