@@ -41,7 +41,12 @@ def patch_source(source, archive_path, patch_path):
     before = '"{}-unstable (rev {}) ({})\n'
     if version.count(before) != 1:
         raise ValueError("The pinned av1an version banner changed.")
-    changed[paths[1]] = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + ']\n')
+    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + ']\n')
+    before = "            vmaf_filter: self.vmaf_filter.clone(),\n"
+    after = before + "            ffmpeg_filter_args: vec![],\n"
+    if version.count(before) != 1:
+        raise ValueError("The pinned CLI target-quality initializer changed.")
+    changed[paths[1]] = version.replace(before, after)
     encoder = original[paths[2]]
     before = """        custom_video_params: Option<Vec<String>>,
     ) -> (Option<Vec<String>>, Vec<Cow<'static, str>>) {

@@ -63,14 +63,22 @@ tests cover archive traversal/duplicates/links, empty Git directories, tampered
 cache retention, exact source/license hashes, refusing an existing build directory,
 compiler/shell environment isolation, and rejection of unbundled dynamic codecs.
 
-The complete font/rendering/VMAF/Meson closure has a source verification receipt.
-The seven cross-platform safety tests passed. Font-pixel and built-in VMAF smoke
-commands also passed on installed Windows FFmpeg; this checks the commands, not
-the Linux build. Native Linux build and pixel/model gates require workflow execution.
+The complete font/rendering/VMAF/Meson closure has a source verification receipt,
+and the ten Linux package-recipe tests pass. In the hosted Ubuntu 24.04 job for
+commit `c84d6c2974f22843ed9752ab9133ab567d99fbe8`, the complete pinned library
+closure compiled and FFmpeg/FFprobe linked. Their native dependency checks,
+identity checks, short x264/x265/libvpx/audio encodes, tone-map conversion, VMAF
+model run and libass pixel check passed. The retained workflow artifact contains
+the corresponding build logs. See [the exact hosted run](https://github.com/jkkma/jesses/actions/runs/35465543648).
 
-These checks do not compile or run Linux binaries. Native Linux compilation,
-codec fixture results and final AppImage/DEB resource discovery remain separate
-workflow qualification. macOS remains deferred.
+That run then stopped while staging a separate pinned SVT-AV1-HDR source archive:
+GitHub had canonicalized the repository-name casing, which changed the archive's
+single root directory and byte checksum while leaving its complete Git tree
+unchanged. The source lock now uses the canonical URL and verified archive hash.
+The staging fix still needs a hosted retry. The media-runtime fixture gates,
+AppImage/DEB build and resource discovery did not run, and the job produced no
+installable package. Native GUI operation, clean-machine installation, other Linux
+distributions, signing and release readiness remain unverified. macOS remains deferred.
 
 ## Linux standalone x264 and mainline SVT-AV1
 
@@ -122,8 +130,10 @@ The cross-platform `--verify-only` option validates the pinned source archives,
 local Git revision and source notices without producing executables. On
 2026-09-13 that check passed for both source archives. Three integrity tests passed
 for clean build environments, complete shared delivery inventories and preservation
-of an existing build directory. The exact 8-/10-bit smoke command sequence also
-passed against already-built Windows tools; that is command validation only.
-**Linux compilation, native standalone smoke, packaging and GUI execution remain
-pending a Linux build host.** The script never labels source-only verification as
-a completed Linux build.
+of an existing build directory.
+
+The hosted Ubuntu 24.04 run linked above compiled both standalone encoders, passed
+their native identity and dependency checks, and completed the eight-frame 8-bit
+and 10-bit encode/decode checks. The source-staging failure occurred afterward.
+Packaging, installer-resource discovery, native GUI execution and clean-machine
+installation remain pending a successful hosted retry.
