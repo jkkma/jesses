@@ -1287,16 +1287,20 @@ impl JobManager {
 mod tests {
     use super::*;
 
+    // Concurrent Windows fixtures can observe the same clock timestamp.
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "jesses-recovery-receipts-{}-{}",
+                "jesses-recovery-receipts-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
             Self(path)
