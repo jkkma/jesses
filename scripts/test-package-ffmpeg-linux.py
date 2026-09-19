@@ -2,8 +2,10 @@
 
 import hashlib
 import importlib.util
+from contextlib import redirect_stderr
 import io
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -32,6 +34,29 @@ def archive(path, files, links=()):
 
 
 class SourceBuildTests(unittest.TestCase):
+    def test_failed_command_surfaces_bounded_build_log_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder = BUILD.Builder(root / "build", root / "cache", 1)
+            stderr = io.StringIO()
+            with self.assertRaises(subprocess.CalledProcessError), redirect_stderr(stderr):
+                builder.run([sys.executable, "-c", "import sys; print('native compiler failure'); sys.exit(3)"])
+            diagnostic = stderr.getvalue()
+            self.assertIn("Build command failed", diagnostic)
+            self.assertIn("native compiler failure", diagnostic)
+            self.assertTrue((root / "build/build.log").is_file())
+
+    def test_failed_captured_command_surfaces_captured_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder = BUILD.Builder(root / "build", root / "cache", 1)
+            stderr = io.StringIO()
+            with self.assertRaises(subprocess.CalledProcessError), redirect_stderr(stderr):
+                builder.run([sys.executable, "-c", "import sys; print('captured probe failure'); sys.exit(4)"], capture=True)
+            diagnostic = stderr.getvalue()
+            self.assertIn("Last 1 captured output lines", diagnostic)
+            self.assertIn("captured probe failure", diagnostic)
+
     def test_build_environment_excludes_host_shell_and_compiler_overrides(self):
         overrides = {name: "unexpected-host-input" for name in ["BASH_ENV", "ENV", "MFLAGS", "MAKEFLAGS", "CC", "CFLAGS", "LDFLAGS", "PKG_CONFIG", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "LD_PRELOAD", "CMAKE_TOOLCHAIN_FILE", "GIT_CONFIG_PARAMETERS", "GIT_TEMPLATE_DIR"]}
         with tempfile.TemporaryDirectory() as temporary, patch.dict(BUILD.os.environ, overrides):
@@ -61,6 +86,21 @@ class SourceBuildTests(unittest.TestCase):
             self.assertEqual((extracted / "doc/util.h").read_bytes(), b"header")
             self.assertFalse((extracted / "doc/util.h").is_symlink())
             self.assertEqual((extracted / "COPYING").read_bytes(), b"License text")
+
+    def test_extraction_preserves_generated_file_mtimes_independent_of_member_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.tar.gz"
+            with tarfile.open(source, "w:gz") as bundle:
+                for name, content, mtime in [("source/configure", b"generated", 1_700_000_200), ("source/configure.ac", b"input", 1_700_000_100)]:
+                    member = tarfile.TarInfo(name)
+                    member.size = len(content)
+                    member.mtime = mtime
+                    bundle.addfile(member, io.BytesIO(content))
+            extracted = BUILD.extract(source, root / "extracted", "source")
+            self.assertEqual(int((extracted / "configure").stat().st_mtime), 1_700_000_200)
+            self.assertEqual(int((extracted / "configure.ac").stat().st_mtime), 1_700_000_100)
+            self.assertGreater((extracted / "configure").stat().st_mtime, (extracted / "configure.ac").stat().st_mtime)
 
     def test_archive_traversal_duplicate_members_and_escaping_links_fail(self):
         cases = [

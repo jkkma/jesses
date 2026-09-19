@@ -11,6 +11,15 @@ on:
         options:
           - release
           - debug
+      platform:
+        description: Platform to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - linux
 
 permissions:
   contents: read
@@ -20,13 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis"}]' || inputs.platform == 'linux' && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}]') }}
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/package-build
@@ -174,6 +177,8 @@ jobs:
           path: |
             ${{ runner.temp }}/jesses-portable-*.json
             ${{ runner.temp }}/jesses-portable-*.log
+            ${{ runner.temp }}/jesses-ffmpeg/build.log
+            ${{ runner.temp }}/jesses-standalone-linux/**/build.log
           if-no-files-found: ignore
           retention-days: 14
       - uses: actions/upload-artifact@v4

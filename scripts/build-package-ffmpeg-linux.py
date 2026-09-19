@@ -102,7 +102,7 @@ def extract(archive: Path, destination: Path, root: str) -> Path:
             if path.parts[0] != root or not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
                 raise ValueError(f"Unexpected source archive member: {member.name}")
             if member.isdir():
-                directories.append(path)
+                directories.append((path, member.mtime))
                 continue
             if path.as_posix() in files:
                 raise ValueError("The source archive repeats a file path.")
@@ -112,8 +112,8 @@ def extract(archive: Path, destination: Path, root: str) -> Path:
                 target = relative(linked)
                 if target.parts[0] != root:
                     raise ValueError("A source archive link escapes its root.")
-                links.append((path, target))
-        for path in directories:
+                links.append((path, target, member.mtime))
+        for path, _ in directories:
             (destination / path).mkdir(parents=True, exist_ok=True)
         for name, member in files.items():
             if not member.isfile():
@@ -123,13 +123,17 @@ def extract(archive: Path, destination: Path, root: str) -> Path:
             with bundle.extractfile(member) as source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
-        for path, linked in links:
+            os.utime(target, (member.mtime, member.mtime))
+        for path, linked, mtime in links:
             source = files.get(linked.as_posix())
             if source is None or not source.isfile():
                 raise ValueError("A source archive link must identify a regular member.")
             target = destination / path
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(destination / linked, target)
+            os.utime(target, (mtime, mtime))
+        for path, mtime in directories:
+            os.utime(destination / path, (mtime, mtime))
     result = destination / root
     if not result.is_dir():
         raise ValueError("The expected source directory is absent.")
@@ -187,10 +191,26 @@ class Builder:
         args = [str(arg) for arg in args]
         cwd = cwd or self.directory
         self.commands.append({"argv": args, "cwd": str(cwd), "stdin": input_text})
-        with (self.directory / "build.log").open("a", encoding="utf-8") as log:
-            log.write(json.dumps(self.commands[-1]) + "\n")
-            log.flush()
-            result = subprocess.run(args, cwd=cwd, env=self.env, input=input_text, text=True, stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT, timeout=timeout, check=True)
+        log_path = self.directory / "build.log"
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(json.dumps(self.commands[-1]) + "\n")
+                log.flush()
+                result = subprocess.run(args, cwd=cwd, env=self.env, input=input_text, text=True, stdout=subprocess.PIPE if capture else log, stderr=subprocess.STDOUT, timeout=timeout, check=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = lines[-100:]
+            print(f"Build command failed: {json.dumps(args)}", file=sys.stderr)
+            print(f"Last {len(tail)} lines of {log_path}:", file=sys.stderr)
+            print("\n".join(tail), file=sys.stderr)
+            captured = getattr(error, "stdout", None)
+            if captured:
+                if isinstance(captured, bytes):
+                    captured = captured.decode(errors="replace")
+                captured_tail = captured.splitlines()[-100:]
+                print(f"Last {len(captured_tail)} captured output lines:", file=sys.stderr)
+                print("\n".join(captured_tail), file=sys.stderr)
+            raise
         return result.stdout if capture else None
 
     def source(self, item: dict) -> Path:
