@@ -180,8 +180,9 @@
       {:else}Requires the selected FFmpeg with a working libvmaf v0.6.1 model.{/if}
     </p>
     {#if framed}<p>
-        Probes use the source before crop, resize, and borders. These framing changes are excluded
-        from the quality decision.
+        VMAF probes and their reference use the same crop, resize, borders, and frame processing as
+        the encode. Other metrics require an unfiltered source or a separately prepared lossless
+        source with those changes already applied.
       </p>{/if}
     {#if draft.target.probingRate > 1}<p>
         Sampling scores only every {draft.target.probingRate} frames.
