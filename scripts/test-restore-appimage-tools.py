@@ -55,6 +55,7 @@ class AppImageRestoreTests(unittest.TestCase):
         self.appimage.chmod(0o755)
         self.plugin = self.root / "linuxdeploy-plugin-appimage-x86_64.AppImage"
         self.plugin.write_bytes(b"plugin fixture")
+        self.plugin.chmod(0o755)
 
     def test_restores_exact_tree_runs_full_verifier_and_retains_original_image(self):
         work = self.root / "repair"
