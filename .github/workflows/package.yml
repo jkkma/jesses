@@ -155,6 +155,9 @@ jobs:
         run: |
           build_args=()
           if [ "$PACKAGE_PROFILE" = debug ]; then build_args+=(--debug); fi
+          # linuxdeploy otherwise strips every ELF in the AppDir, including the
+          # checksum-bound bundled tools verified by the extracted-package gate.
+          if [ "$RUNNER_OS" = Linux ]; then export NO_STRIP=1; fi
           pnpm tauri build --target "$PACKAGE_TARGET" --bundles "$PACKAGE_BUNDLES" --config "$RUNNER_TEMP/jesses-bundled-tools/tauri-tools.conf.json" "${build_args[@]}"
       - name: Assemble archives, resource manifests and checksums
         shell: bash
