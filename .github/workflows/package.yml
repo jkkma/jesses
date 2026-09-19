@@ -195,6 +195,18 @@ jobs:
             ${{ runner.temp }}/jesses-appimage-repair/original/*.AppImage
           if-no-files-found: ignore
           retention-days: 14
+      - name: Retain unqualified Linux bundles after a failed gate
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jesses-${{ matrix.target }}-${{ inputs.profile }}-unqualified
+          path: |
+            ${{ runner.temp }}/jesses-packages/*.AppImage
+            ${{ runner.temp }}/jesses-packages/*.deb
+            ${{ runner.temp }}/jesses-packages/*.json
+            ${{ runner.temp }}/jesses-packages/SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: jesses-${{ matrix.target }}-${{ inputs.profile }}-unsigned

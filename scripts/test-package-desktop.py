@@ -15,6 +15,12 @@ spec = importlib.util.spec_from_file_location("desktop_package", Path(__file__).
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 
+verifier_spec = importlib.util.spec_from_file_location(
+    "bundle_resource_verifier", Path(__file__).with_name("verify-bundle-resources.py")
+)
+verifier = importlib.util.module_from_spec(verifier_spec)
+verifier_spec.loader.exec_module(verifier)
+
 
 class PackageTests(unittest.TestCase):
     def setUp(self):
@@ -131,6 +137,55 @@ class PackageTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     package.verify(bundled)
                 path.write_bytes(original)
+
+    def test_same_stem_appimage_and_deb_use_distinct_extraction_directories(self):
+        packages = self.root / "native-packages"
+        packages.mkdir()
+        artifacts = []
+        for extension in (".AppImage", ".deb"):
+            artifact = packages / f"jesses_0.1.0_amd64{extension}"
+            artifact.write_bytes(f"synthetic {extension} fixture".encode())
+            artifacts.append({"path": artifact.name, "sha256": package.digest(artifact)})
+        (packages / "artifact-manifest.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "product": "jesses",
+            "target": "x86_64-unknown-linux-gnu",
+            "artifacts": artifacts,
+        }), encoding="utf-8")
+        destination = self.root / "extracted-native-packages"
+
+        def populate_resources(root):
+            tools = root / "resources/tools"
+            tools.mkdir(parents=True)
+            (tools / "manifest.json").write_text(json.dumps({"schemaVersion": 1, "tools": []}), encoding="utf-8")
+            for name in ("runtime-contract.json", "LICENSE", "THIRD_PARTY_NOTICES.md"):
+                (root / "resources" / name).write_text("fixture", encoding="utf-8")
+            notice = root / "resources/licenses/shadcn-svelte-MIT.txt"
+            notice.parent.mkdir()
+            notice.write_text("fixture", encoding="utf-8")
+
+        def run(command, **options):
+            if "--appimage-extract" in command:
+                populate_resources(Path(options["cwd"]) / "squashfs-root/usr/lib/jesses")
+            elif command[0] == "dpkg-deb":
+                populate_resources(Path(command[-1]) / "usr/lib/jesses")
+
+        arguments = [
+            "verify-bundle-resources.py",
+            "--packages", str(packages),
+            "--probe", str(self.executable),
+            "--destination", str(destination),
+        ]
+        with patch.object(verifier.subprocess, "run", side_effect=run), patch.object(sys, "argv", arguments), patch("builtins.print"):
+            verifier.main()
+
+        self.assertTrue((destination / "jesses_0.1.0_amd64.AppImage").is_dir())
+        self.assertTrue((destination / "jesses_0.1.0_amd64.deb").is_dir())
+        report = json.loads((packages / "bundle-resource-qualification.json").read_text(encoding="utf-8"))
+        self.assertEqual([entry["artifact"] for entry in report["artifacts"]], [
+            "jesses_0.1.0_amd64.AppImage",
+            "jesses_0.1.0_amd64.deb",
+        ])
 
 
 if __name__ == "__main__":

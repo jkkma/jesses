@@ -90,10 +90,18 @@ runs the full resource verifier, retains the pre-restoration AppImage for diagno
 and rebuilds only the unsigned AppImage filesystem with the `appimagetool` embedded
 in Tauri's cached output plugin. It does not perform a second dependency-deployment
 scan. The existing final gate still extracts both AppImage and DEB bundles, verifies
-every recorded resource hash, and checks native bundled-tool discovery. This repair
-still needs a terminal hosted retry. Native GUI operation, clean-machine installation,
-other Linux distributions, signing and release readiness remain unverified. macOS
-remains deferred.
+every recorded resource hash, and checks native bundled-tool discovery.
+
+[Run 35470721115](https://github.com/jkkma/jesses/actions/runs/35470721115) at
+`8dc218d` passed restoration, repacking, and extracted AppImage checks for FFmpeg,
+FFprobe and the standalone encoders. It then exposed a verifier directory collision:
+AppImage and DEB filenames with the same stem selected the same extraction folder.
+The verifier now keeps the full filename, including its format extension, and a
+regression exercises both formats together. Both extracted artifacts must pass
+before the workflow publishes qualified unsigned packages. Failed Linux bundles
+are retained separately as unqualified diagnostic artifacts for seven days.
+Native GUI operation, clean-machine installation, other Linux distributions,
+signing and release readiness remain separate gates. macOS remains deferred.
 
 ## Linux standalone x264 and mainline SVT-AV1
 
@@ -151,5 +159,6 @@ The hosted Ubuntu 24.04 runs linked above compiled both standalone encoders, pas
 their native identity and dependency checks, and completed the eight-frame 8-bit
 and 10-bit encode/decode checks. The later run also passed source staging, bundled
 discovery and real-file media-runtime gates before the final extracted AppImage
-resource mismatch. Final installer-resource discovery, native GUI execution and
-clean-machine installation remain pending a successful hosted retry.
+resource mismatch. The subsequent run passed extracted AppImage discovery before
+the verifier directory collision described above. Native GUI execution and
+clean-machine installation remain separate from these package checks.

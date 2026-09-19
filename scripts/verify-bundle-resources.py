@@ -70,7 +70,7 @@ def main():
         package.regular_file(artifact)
         if package.digest(artifact) != record["sha256"]:
             raise ValueError(f"The installer checksum changed: {artifact.name}")
-        extracted = destination / artifact.stem
+        extracted = destination / artifact.name
         extracted.mkdir()
         if extension == ".exe":
             extractor = shutil.which("7z")
