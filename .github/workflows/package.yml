@@ -62,6 +62,7 @@ jobs:
       - run: python scripts/test-package-standalone.py
       - run: python scripts/test-package-standalone-linux.py
       - run: python scripts/test-package-av1an.py
+      - run: python scripts/test-package-av1an-scorers.py
       - run: python scripts/test-package-ffmpeg-linux.py
       - run: pnpm format:check
       - run: pnpm check

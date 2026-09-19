@@ -53,6 +53,14 @@ def unpack_jxl(archive, destination):
     return destination / roots.pop()
 
 
+def unpack_sources(archives, destination):
+    return {
+        key: unpack_jxl(path, destination / (key + "-source")) if key == "libjxl" else support.unpack(path, destination / (key + "-source"))
+        for key, path in archives.items()
+        if key not in {"zigSource", "zigBuild", "cmakeBuild"}
+    }
+
+
 def build_zip(destination, sources, zig, env):
     source = sources["vszip"]
     manifest = source / "build.zig.zon"
@@ -152,7 +160,7 @@ def main():
     cache = args.cache.absolute()
     cache.mkdir(parents=True, exist_ok=True)
     archives = {key: stager.download(r["url"], r["sha256"], cache) for key, r in lock["inputs"].items()}
-    sources = {key: unpack_jxl(path, destination / (key + "-source")) if key == "libjxl" else support.unpack(path, destination / (key + "-source"), single_root=key != "skcms") for key, path in archives.items() if key not in {"zigSource", "zigBuild", "cmakeBuild"}}
+    sources = unpack_sources(archives, destination)
     supplied_headers = args.vapoursynth_source.resolve(strict=True) / "include"
     if support.inventory(supplied_headers) != support.inventory(sources["vapoursynth"] / "include"):
         raise ValueError("The supplied VapourSynth headers differ from the pinned R79 source.")

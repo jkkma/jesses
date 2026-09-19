@@ -30,8 +30,9 @@
       "path": "highway.tar.gz"
     },
     "skcms": {
-      "url": "https://skia.googlesource.com/skcms/+archive/b25b07b4b07990811de121c0356155b2ba0f4318.tar.gz",
-      "sha256": "84630d9fbd3bfd834b9687369a4a2d914def8c06033e6ebee7e4103bff9e726b",
+      "revision": "b25b07b4b07990811de121c0356155b2ba0f4318",
+      "url": "https://codeload.github.com/google/skcms/tar.gz/b25b07b4b07990811de121c0356155b2ba0f4318",
+      "sha256": "cc1d9c9730363a44761713b3a37037e334dda6a274fac81055da9db6f0a5fbc0",
       "path": "skcms.tar.gz"
     },
     "vszip": {
