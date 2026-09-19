@@ -148,7 +148,7 @@ class SourceBuildTests(unittest.TestCase):
     def test_dynamic_codec_or_temporary_dependencies_fail(self):
         prefix = Path("/tmp/jesses-build/prefix")
         system = "linux-vdso.so.1 (0x0001)\nlibc.so.6 => /lib/libc.so.6 (0x0002)\n/lib64/ld-linux-x86-64.so.2 (0x0003)\n"
-        BUILD.validate_dependencies(system + "libstdc++.so.6 => /lib/libstdc++.so.6 (0x0004)\n", prefix)
+        BUILD.validate_dependencies(system + "libmvec.so.1 => /lib/libmvec.so.1 (0x0004)\nlibstdc++.so.6 => /lib/libstdc++.so.6 (0x0005)\n", prefix)
         for unexpected in ["", "not a dynamic executable\n", system + "libx265.so.217 => /lib/libx265.so.217\n", system + "libz.so.1 => not found\n", system.replace("/lib/libc", str(prefix) + "/lib/libc")]:
             with self.subTest(text=unexpected), self.assertRaises(ValueError):
                 BUILD.validate_dependencies(unexpected, prefix)

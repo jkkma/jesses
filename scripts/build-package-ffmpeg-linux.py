@@ -41,7 +41,7 @@ CONFIGURE = [
 # runtime dependencies; none may resolve inside the temporary build prefix.
 SYSTEM_LIBRARIES = re.compile(
     r"^(?:linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|"
-    r"libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6)$"
+    r"libmvec\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6)$"
 )
 
 
