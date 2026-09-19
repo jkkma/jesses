@@ -389,15 +389,23 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(
-            validate_plugin(
-                "target-probe-filter-v1\ncom.julek.vszip : Found",
-                target,
-                true,
-            )
-            .unwrap_err()
-            .contains("qualified only for VMAF")
-        );
+        for metric in [
+            Av1anTargetMetric::Ssimulacra2,
+            Av1anTargetMetric::Butteraugli,
+            Av1anTargetMetric::Xpsnr,
+        ] {
+            let filtered = Av1anTargetQuality { metric, ..target };
+            assert!(
+                validate_plugin(
+                    "target-probe-filter-v1\nffmpeg9-passthrough-v1\nffmpeg-metric-matrix-v1\njulek-butteraugli-v1\nlsmash-software-probes-v1\ncom.julek.vszip : Found\ncom.julek.plugin : Found\nsystems.innocent.lsmas : Found",
+                    filtered,
+                    true,
+                )
+                .unwrap_err()
+                .contains("qualified only for VMAF"),
+                "direct-filter {metric:?} must fail before an incomparable reference is scored"
+            );
+        }
         let mut settings = EncodeSettings {
             backend: media_core::EncodeBackend::Av1an,
             av1an_options: Some(media_core::Av1anOptions {

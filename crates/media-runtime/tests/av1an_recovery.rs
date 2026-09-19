@@ -930,7 +930,10 @@ async fn additional_perceptual_targets_stop_reopen_resume_with_advanced_paramete
         );
         qualify_options(
             VideoEncoder::SvtAv1FiveFish,
-            true,
+            // Non-VMAF reference readers cannot apply direct filters. Qualify
+            // their scoring/recovery with an unfiltered source; direct-filter
+            // rejection is covered separately by the dependency tests.
+            false,
             Some(Av1anOptions {
                 chunk_method: if metric == Av1anTargetMetric::Xpsnr && probing_rate == 1 {
                     Av1anChunkMethod::Select
