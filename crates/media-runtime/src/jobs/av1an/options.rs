@@ -71,9 +71,13 @@ pub(super) fn plugin(options: Av1anOptions) -> Option<(&'static str, &'static st
     }
 }
 
-pub(super) fn validate_plugin(version: &str, options: Av1anOptions) -> Result<(), String> {
+pub(super) fn validate_plugin(
+    version: &str,
+    options: Av1anOptions,
+    requires_probe_filter: bool,
+) -> Result<(), String> {
     if let Some(target) = options.target_quality {
-        metrics::validate_plugin(version, target)?;
+        metrics::validate_plugin(version, target, requires_probe_filter)?;
     }
     if (matches!(
         options.chunk_method,
@@ -274,16 +278,27 @@ mod tests {
         });
         let options = settings.av1an_options.unwrap();
         let supported_version = concat!(
+            "target-probe-filter-v1\n",
             "ffmpeg9-passthrough-v1\n",
             "ffmpeg-metric-matrix-v1\n",
             "lsmash-software-probes-v1\n",
             "systems.innocent.lsmas : Found",
         );
-        validate_plugin(supported_version, options).unwrap();
-        for missing_fix in ["ffmpeg9-passthrough-v1", "ffmpeg-metric-matrix-v1"] {
+        validate_plugin(supported_version, options, true).unwrap();
+        validate_plugin(
+            &supported_version.replace("target-probe-filter-v1", ""),
+            options,
+            false,
+        )
+        .unwrap();
+        for missing_fix in [
+            "target-probe-filter-v1",
+            "ffmpeg9-passthrough-v1",
+            "ffmpeg-metric-matrix-v1",
+        ] {
             let version = supported_version.replace(missing_fix, "");
             assert!(
-                validate_plugin(&version, options)
+                validate_plugin(&version, options, true)
                     .unwrap_err()
                     .contains(missing_fix)
             );
@@ -291,7 +306,8 @@ mod tests {
         assert!(
             validate_plugin(
                 &supported_version.replace("lsmas : Found", "lsmas : Not found"),
-                options
+                options,
+                true,
             )
             .unwrap_err()
             .contains("L-SMASH")
@@ -307,9 +323,9 @@ mod tests {
             let mut reader = options;
             reader.chunk_method = method;
             let version = format!(
-                "ffmpeg9-passthrough-v1\nffmpeg-metric-matrix-v1\n{identifier} : Not found"
+                "target-probe-filter-v1\nffmpeg9-passthrough-v1\nffmpeg-metric-matrix-v1\n{identifier} : Not found"
             );
-            let error = validate_plugin(&version, reader).unwrap_err();
+            let error = validate_plugin(&version, reader, true).unwrap_err();
             assert!(error.contains(label));
             assert!(error.contains(identifier));
         }

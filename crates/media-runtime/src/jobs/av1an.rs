@@ -205,7 +205,7 @@ impl JobManager {
             String::from_utf8_lossy(&version.stderr)
         );
         let configured = settings.av1an_options.unwrap_or_default();
-        options::validate_plugin(&version_text, configured)
+        options::validate_plugin(&version_text, configured, source_filter.is_some())
             .map_err(|message| files::error("AV1AN_DEPENDENCY_MISSING", message, executable))?;
         options::capabilities(
             &launch.executable,
@@ -536,6 +536,54 @@ mod tests {
                 .windows(2)
                 .any(|pair| { pair[0] == "--ffmpeg" && pair[1] == "-vf bwdif=mode=send_frame" })
         );
+        let targeted_settings = EncodeSettings {
+            av1an_options: Some(media_core::Av1anOptions {
+                target_quality: Some(media_core::Av1anTargetQuality {
+                    metric: media_core::Av1anTargetMetric::Vmaf,
+                    minimum_score_tenths: 930,
+                    maximum_score_tenths: 950,
+                    minimum_crf: 15,
+                    maximum_crf: 50,
+                    probes: 4,
+                    probing_rate: 1,
+                    probe_width: 1920,
+                    probe_height: 1080,
+                }),
+                ..Default::default()
+            }),
+            ..settings.clone()
+        };
+        let targeted = arguments(
+            input,
+            Path::new("/out/owned.ivf"),
+            Path::new("/out/work"),
+            Path::new("/logs/job.log"),
+            &plan,
+            &targeted_settings,
+            false,
+            Some("bwdif=mode=send_frame"),
+        );
+        assert_eq!(
+            targeted.iter().filter(|value| *value == "--ffmpeg").count(),
+            1
+        );
+        assert_eq!(
+            targeted
+                .iter()
+                .filter(|value| *value == "--vmaf-filter")
+                .count(),
+            1
+        );
+        assert!(
+            targeted
+                .windows(2)
+                .any(|pair| { pair[0] == "--ffmpeg" && pair[1] == "-vf bwdif=mode=send_frame" })
+        );
+        assert!(
+            targeted
+                .windows(2)
+                .any(|pair| { pair[0] == "--vmaf-filter" && pair[1] == "bwdif=mode=send_frame" })
+        );
         let prepared = arguments(
             input,
             Path::new("/out/owned.ivf"),
@@ -547,6 +595,21 @@ mod tests {
             None,
         );
         assert!(!prepared.iter().any(|value| value == "--ffmpeg"));
+        let targeted_prepared = arguments(
+            input,
+            Path::new("/out/owned.ivf"),
+            Path::new("/out/work"),
+            Path::new("/logs/job.log"),
+            &plan,
+            &targeted_settings,
+            false,
+            None,
+        );
+        assert!(
+            !targeted_prepared
+                .iter()
+                .any(|value| value == "--ffmpeg" || value == "--vmaf-filter")
+        );
         assert!(!params.contains("movie"));
         assert!(
             !args

@@ -67,7 +67,7 @@ def stage(directory, tools_root, target, inventory):
         raise ValueError("The portable frameserver's required runtime files are missing.")
     result = subprocess.run([str(directory / receipt["tool"]["path"]), "--version"], env=runtime_environment(directory), capture_output=True, text=True, check=True, timeout=30)
     version = result.stdout + result.stderr
-    if version.splitlines()[0] != receipt["tool"]["version"] or "[ffmpeg9-passthrough-v1]" not in version or "systems.innocent.lsmas : Found" not in version:
+    if version.splitlines()[0] != receipt["tool"]["version"] or "[ffmpeg9-passthrough-v1]" not in version or "[target-probe-filter-v1]" not in version or "systems.innocent.lsmas : Found" not in version:
         raise ValueError("The portable av1an identity or decoder availability changed.")
     if actual != {record["path"]: record["sha256"] for record in inventory(directory)}:
         raise ValueError("Av1an execution changed its delivery payload.")
@@ -90,7 +90,7 @@ def qualify(directory, scratch, ffmpeg):
         result = subprocess.run([str(directory / "av1an.exe"), "--version"], cwd=scratch, env=env, capture_output=True, text=True, check=True, timeout=30)
         version = result.stdout + result.stderr
         log.write(version)
-        if "[ffmpeg9-passthrough-v1]" not in version or "systems.innocent.lsmas : Not found" in version or "systems.innocent.lsmas" not in version:
+        if "[ffmpeg9-passthrough-v1]" not in version or "[target-probe-filter-v1]" not in version or "systems.innocent.lsmas : Not found" in version or "systems.innocent.lsmas" not in version:
             raise ValueError("The final av1an runtime lacks its compatibility patch or decoder plugin.")
     if before != support.inventory(directory):
         raise ValueError("Running the portable frameserver changed its installed payload.")

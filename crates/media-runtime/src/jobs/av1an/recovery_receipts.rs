@@ -89,6 +89,8 @@ struct TargetQuality {
     probe_res: Option<(u32, u32)>,
     vmaf_scaler: String,
     vmaf_filter: Option<String>,
+    #[serde(default)]
+    ffmpeg_filter_args: Vec<String>,
     vmaf_threads: usize,
     model: Option<String>,
     probing_rate: u64,
@@ -129,6 +131,7 @@ impl TargetQuality {
                 ))
             && self.vmaf_scaler == "bicubic"
             && self.vmaf_filter.as_deref() == expected.source_filter
+            && self.matches_ffmpeg_filter(expected.source_filter)
             && self.vmaf_threads == 2
             && self.model.is_none()
             && self.probing_rate == u64::from(target.probing_rate)
@@ -158,6 +161,7 @@ impl TargetQuality {
             && self.probe_res.is_none()
             && self.vmaf_scaler == "bicubic"
             && self.vmaf_filter.is_none()
+            && self.ffmpeg_filter_args.is_empty()
             && self.vmaf_threads > 0
             && self.model.is_none()
             && self.probing_rate == 1
@@ -177,6 +181,13 @@ impl TargetQuality {
             && self.probing_vmaf_features == ["Default"]
             && self.probing_statistic.name == "Automatic"
             && self.probing_statistic.value.is_none()
+    }
+    fn matches_ffmpeg_filter(&self, filter: Option<&str>) -> bool {
+        match (filter, self.ffmpeg_filter_args.as_slice()) {
+            (Some(expected), [option, graph]) => option == "-vf" && graph == expected,
+            (None, []) => true,
+            _ => false,
+        }
     }
 }
 
@@ -687,6 +698,7 @@ video.set_output()
         queue: Value,
         scenes: Value,
         done: Value,
+        source_filter: Option<String>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -709,7 +721,7 @@ video.set_output()
                 let start = index * 24;
                 let end = start + 24;
                 let args: Vec<OsString> = vec!["vspipe".into(),script_path.clone().into_os_string(),"-c".into(),"y4m".into(),"-".into(),"-s".into(),start.to_string().into(),"-e".into(),(end-1).to_string().into()];
-                json!({"temp":directory,"index":index,"input":{"VapourSynth":{"path":script_path,"vspipe_args":[],"script_text":script,"is_proxy":false}},"proxy":null,"source_cmd":args,"proxy_cmd":null,"output_ext":"ivf","start_frame":start,"end_frame":end,"frame_rate":24.0,"passes":1,"video_params":params,"encoder":"svt_av1","noise_size":[null,null],"target_quality":{"vmaf_res":"1920x1080","probe_res":null,"vmaf_scaler":"bicubic","vmaf_filter":null,"vmaf_threads":1,"model":null,"probing_rate":1,"probes":4,"target":null,"metric":"VMAF","min_q":15,"max_q":50,"interp_method":null,"encoder":"svt_av1","pix_format":"YUV420P10LE","temp":directory,"workers":1,"video_params":null,"params_copied":false,"vspipe_args":[],"probing_vmaf_features":["Default"],"probing_statistic":{"name":"Automatic","value":null}},"per_shot_target_quality_cq":null,"ignore_frame_mismatch":false})
+                json!({"temp":directory,"index":index,"input":{"VapourSynth":{"path":script_path,"vspipe_args":[],"script_text":script,"is_proxy":false}},"proxy":null,"source_cmd":args,"proxy_cmd":null,"output_ext":"ivf","start_frame":start,"end_frame":end,"frame_rate":24.0,"passes":1,"video_params":params,"encoder":"svt_av1","noise_size":[null,null],"target_quality":{"vmaf_res":"1920x1080","probe_res":null,"vmaf_scaler":"bicubic","vmaf_filter":null,"ffmpeg_filter_args":[],"vmaf_threads":1,"model":null,"probing_rate":1,"probes":4,"target":null,"metric":"VMAF","min_q":15,"max_q":50,"interp_method":null,"encoder":"svt_av1","pix_format":"YUV420P10LE","temp":directory,"workers":1,"video_params":null,"params_copied":false,"vspipe_args":[],"probing_vmaf_features":["Default"],"probing_statistic":{"name":"Automatic","value":null}},"per_shot_target_quality_cq":null,"ignore_frame_mismatch":false})
             }).collect::<Vec<_>>());
             let scenes = json!({"frames":48,"scenes":[{"start_frame":0,"end_frame":48,"zone_overrides":null}],"split_scenes":[{"start_frame":0,"end_frame":24,"zone_overrides":null},{"start_frame":24,"end_frame":48,"zone_overrides":null}]});
             let done = json!({"frames":48,"done":{"00000":{"frames":24,"size_bytes":4096}},"audio_done":true});
@@ -722,6 +734,7 @@ video.set_output()
                 queue,
                 scenes,
                 done,
+                source_filter: None,
             }
         }
         fn expected(&self) -> Expected<'_> {
@@ -736,7 +749,7 @@ video.set_output()
                 source_fps_den: 1,
                 script_text: &self.script,
                 options: self.options,
-                source_filter: None,
+                source_filter: self.source_filter.as_deref(),
             }
         }
         fn validate(&self) -> Result<Receipts, String> {
@@ -747,6 +760,63 @@ video.set_output()
                 &self.expected(),
             )
         }
+    }
+
+    #[test]
+    fn legacy_probe_filter_receipts_are_accepted_only_when_no_filter_is_expected() {
+        use media_core::Av1anTargetQuality;
+
+        let target = Av1anTargetQuality {
+            metric: Default::default(),
+            minimum_score_tenths: 930,
+            maximum_score_tenths: 960,
+            minimum_crf: 18,
+            maximum_crf: 44,
+            probes: 3,
+            probing_rate: 2,
+            probe_width: 640,
+            probe_height: 360,
+        };
+        let configure_legacy = |fixture: &mut Fixture, filter: Option<&str>| {
+            fixture.options.target_quality = Some(target);
+            fixture.source_filter = filter.map(str::to_owned);
+            let params = fixture.params.clone();
+            for chunk in fixture.queue.as_array_mut().unwrap() {
+                let quality = &mut chunk["target_quality"];
+                for (key, value) in [
+                    ("vmaf_res", json!("640x360")),
+                    ("probe_res", json!([640, 360])),
+                    ("vmaf_filter", json!(filter)),
+                    ("vmaf_threads", json!(2)),
+                    ("probing_rate", json!(2)),
+                    ("probes", json!(3)),
+                    ("target", json!([93.0, 96.0])),
+                    ("min_q", json!(18)),
+                    ("max_q", json!(44)),
+                    ("video_params", json!(params)),
+                    ("probing_statistic", json!({"name":"Mean", "value":null})),
+                ] {
+                    quality[key] = value;
+                }
+                quality
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ffmpeg_filter_args");
+            }
+        };
+
+        let mut unfiltered = Fixture::new();
+        configure_legacy(&mut unfiltered, None);
+        unfiltered.validate().unwrap();
+
+        let mut filtered = Fixture::new();
+        let graph = "crop=184:112:68:34";
+        configure_legacy(&mut filtered, Some(graph));
+        assert!(filtered.validate().is_err());
+        for chunk in filtered.queue.as_array_mut().unwrap() {
+            chunk["target_quality"]["ffmpeg_filter_args"] = json!(["-vf", graph]);
+        }
+        filtered.validate().unwrap();
     }
 
     #[test]
@@ -810,6 +880,7 @@ video.set_output()
             ("target", json!([91.0, 96.0])),
             ("params_copied", json!(true)),
             ("vmaf_filter", json!("crop=12:12")),
+            ("ffmpeg_filter_args", json!(["-vf", "crop=12:12"])),
             ("vmaf_threads", json!(9)),
         ] {
             fixture.queue[0]["target_quality"][key] = value;

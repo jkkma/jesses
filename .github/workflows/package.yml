@@ -180,6 +180,11 @@ jobs:
             ${{ runner.temp }}/jesses-portable-*.log
             ${{ runner.temp }}/jesses-ffmpeg/build.log
             ${{ runner.temp }}/jesses-standalone-linux/**/build.log
+            ${{ runner.temp }}/jesses-x264/build.log
+            ${{ runner.temp }}/jesses-svt/build.log
+            ${{ runner.temp }}/jesses-av1an/**/*.log
+            ${{ runner.temp }}/jesses-scorers/*.log
+            ${{ runner.temp }}/jesses-av1an-scorers/**/*.log
           if-no-files-found: ignore
           retention-days: 14
       - uses: actions/upload-artifact@v4

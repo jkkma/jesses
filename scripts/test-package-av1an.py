@@ -68,7 +68,7 @@ class StagingTests(unittest.TestCase):
         shared = [{"base": base, "path": f"sources/{base}.tar.zst", "sha256": "a" * 64} for base in sorted(delivery.SHARED_BASES)]
         media = self.tools / "ffmpeg/build-provenance.json"
         media.write_text(json.dumps({"additionalSources": shared, "licenses": [], "buildInputs": []}))
-        self.version = "av1an 0.5.2 [ffmpeg9-passthrough-v1] [julek-butteraugli-v1]"
+        self.version = "av1an 0.5.2 [ffmpeg9-passthrough-v1] [julek-butteraugli-v1] [target-probe-filter-v1]"
         def record(name):
             path = self.directory / name
             path.parent.mkdir(parents=True, exist_ok=True)

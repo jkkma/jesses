@@ -44,7 +44,17 @@ fn found(version: &str, identifier: &str) -> bool {
     })
 }
 
-pub(super) fn validate_plugin(version: &str, target: Av1anTargetQuality) -> Result<(), String> {
+pub(super) fn validate_plugin(
+    version: &str,
+    target: Av1anTargetQuality,
+    requires_probe_filter: bool,
+) -> Result<(), String> {
+    if requires_probe_filter && !version.contains("target-probe-filter-v1") {
+        return Err("Quality targeting requires av1an with the target-probe-filter-v1 compatibility fix. Older engines omit final-chunk FFmpeg transforms from probe encodes, so transformed references can be scored against different pixels or geometry.".into());
+    }
+    if requires_probe_filter && target.metric != Av1anTargetMetric::Vmaf {
+        return Err("Quality targeting with direct crop, scale, borders, tone-map, or frame-mode deinterlace transforms is currently qualified only for VMAF. Use VMAF, remove those transforms, or first create a lossless transformed source and target that file without another transform.".into());
+    }
     if (target.metric == Av1anTargetMetric::Vmaf
         || (target.metric == Av1anTargetMetric::Xpsnr && target.probing_rate == 1))
         && !version.contains("ffmpeg-metric-matrix-v1")
@@ -313,25 +323,48 @@ mod tests {
             probe_height: 1080,
         };
         assert!(
-            validate_plugin("com.julek.plugin : Found", target)
-                .unwrap_err()
-                .contains("julek-butteraugli-v1")
+            validate_plugin(
+                "target-probe-filter-v1\ncom.julek.plugin : Found",
+                target,
+                false,
+            )
+            .unwrap_err()
+            .contains("julek-butteraugli-v1")
         );
-        validate_plugin("julek-butteraugli-v1\ncom.julek.plugin : Found", target).unwrap();
+        validate_plugin(
+            "target-probe-filter-v1\njulek-butteraugli-v1\ncom.julek.plugin : Found",
+            target,
+            false,
+        )
+        .unwrap();
         target.metric = Av1anTargetMetric::Ssimulacra2;
-        assert!(validate_plugin("com.julek.vszip : Not found", target).is_err());
-        validate_plugin("com.julek.vszip : Found", target).unwrap();
         assert!(
             validate_plugin(
-                "com.julek.vszip : Found\nsystems.innocent.lsmas : Found",
-                target
+                "target-probe-filter-v1\ncom.julek.vszip : Not found",
+                target,
+                false,
+            )
+            .is_err()
+        );
+        validate_plugin(
+            "target-probe-filter-v1\ncom.julek.vszip : Found",
+            target,
+            false,
+        )
+        .unwrap();
+        assert!(
+            validate_plugin(
+                "target-probe-filter-v1\ncom.julek.vszip : Found\nsystems.innocent.lsmas : Found",
+                target,
+                false,
             )
             .unwrap_err()
             .contains("lsmash-software-probes-v1")
         );
         validate_plugin(
-            "lsmash-software-probes-v1\ncom.julek.vszip : Found\nsystems.innocent.lsmas : Found",
+            "target-probe-filter-v1\nlsmash-software-probes-v1\ncom.julek.vszip : Found\nsystems.innocent.lsmas : Found",
             target,
+            false,
         )
         .unwrap();
         for metric in [Av1anTargetMetric::Vmaf, Av1anTargetMetric::Xpsnr] {
@@ -341,12 +374,30 @@ mod tests {
                 ..target
             };
             assert!(
-                validate_plugin("ffmpeg9-passthrough-v1", checked)
-                    .unwrap_err()
-                    .contains("ffmpeg-metric-matrix-v1")
+                validate_plugin(
+                    "target-probe-filter-v1\nffmpeg9-passthrough-v1",
+                    checked,
+                    false,
+                )
+                .unwrap_err()
+                .contains("ffmpeg-metric-matrix-v1")
             );
-            validate_plugin("ffmpeg-metric-matrix-v1", checked).unwrap();
+            validate_plugin(
+                "target-probe-filter-v1\nffmpeg-metric-matrix-v1",
+                checked,
+                false,
+            )
+            .unwrap();
         }
+        assert!(
+            validate_plugin(
+                "target-probe-filter-v1\ncom.julek.vszip : Found",
+                target,
+                true,
+            )
+            .unwrap_err()
+            .contains("qualified only for VMAF")
+        );
         let mut settings = EncodeSettings {
             backend: media_core::EncodeBackend::Av1an,
             av1an_options: Some(media_core::Av1anOptions {

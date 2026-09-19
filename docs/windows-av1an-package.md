@@ -33,6 +33,17 @@ these behaviors. These are explicit
 patches to the pinned source; the engine is not represented as an unchanged
 upstream release.
 
+The `target-probe-filter-v1` patch also applies the final chunk's FFmpeg input
+filters to quality probe encodes. This keeps cropped and resized probes aligned
+with their VMAF scoring references. Both paths apply transforms before sampling,
+so temporal filters retain the surrounding frames they need. The scoring-only
+reference filter remains separate. Probe filter arguments are retained in the recovery queue and checked
+before resuming. Older queues remain compatible when no input filter is needed;
+filtered quality-target jobs require an engine carrying the new marker.
+Direct filtered targeting currently supports VMAF only; other metrics reject
+that combination because their upstream reference readers omit the transforms.
+Unfiltered sources and already prepared sources retain the other metric paths.
+
 ## Build
 
 Use Python 3.14 or later, Rust 1.98.1 for native Windows x64, and Visual Studio's
