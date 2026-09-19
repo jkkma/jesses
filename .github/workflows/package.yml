@@ -64,6 +64,7 @@ jobs:
       - run: python scripts/test-package-av1an.py
       - run: python scripts/test-package-av1an-scorers.py
       - run: python scripts/test-package-ffmpeg-linux.py
+      - run: python scripts/test-restore-appimage-tools.py
       - run: pnpm format:check
       - run: pnpm check
       - run: cargo test -p jesses --lib --locked paths::tests
@@ -155,10 +156,11 @@ jobs:
         run: |
           build_args=()
           if [ "$PACKAGE_PROFILE" = debug ]; then build_args+=(--debug); fi
-          # linuxdeploy otherwise strips every ELF in the AppDir, including the
-          # checksum-bound bundled tools verified by the extracted-package gate.
-          if [ "$RUNNER_OS" = Linux ]; then export NO_STRIP=1; fi
           pnpm tauri build --target "$PACKAGE_TARGET" --bundles "$PACKAGE_BUNDLES" --config "$RUNNER_TEMP/jesses-bundled-tools/tauri-tools.conf.json" "${build_args[@]}"
+      - name: Restore verified tools after Linux dependency deployment
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/restore-appimage-tools.py --build-directory "$CARGO_TARGET_DIR/$PACKAGE_TARGET/$PACKAGE_PROFILE" --tool-resources "$RUNNER_TEMP/jesses-bundled-tools/resources/tools" --appimage-plugin "$HOME/.cache/tauri/linuxdeploy-plugin-appimage.AppImage" --work-directory "$RUNNER_TEMP/jesses-appimage-repair"
       - name: Assemble archives, resource manifests and checksums
         shell: bash
         run: python scripts/package-desktop.py collect --build-directory "$CARGO_TARGET_DIR/$PACKAGE_TARGET/$PACKAGE_PROFILE" --destination "$RUNNER_TEMP/jesses-packages" --target "$PACKAGE_TARGET" --profile "$PACKAGE_PROFILE" --tool-resources "$RUNNER_TEMP/jesses-bundled-tools/resources/tools"
@@ -188,6 +190,9 @@ jobs:
             ${{ runner.temp }}/jesses-av1an/**/*.log
             ${{ runner.temp }}/jesses-scorers/*.log
             ${{ runner.temp }}/jesses-av1an-scorers/**/*.log
+            ${{ runner.temp }}/jesses-appimage-repair/restoration.json
+            ${{ runner.temp }}/jesses-appimage-repair/*.log
+            ${{ runner.temp }}/jesses-appimage-repair/original/*.AppImage
           if-no-files-found: ignore
           retention-days: 14
       - uses: actions/upload-artifact@v4

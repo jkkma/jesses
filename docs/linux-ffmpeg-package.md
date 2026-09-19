@@ -75,10 +75,25 @@ That run then stopped while staging a separate pinned SVT-AV1-HDR source archive
 GitHub had canonicalized the repository-name casing, which changed the archive's
 single root directory and byte checksum while leaving its complete Git tree
 unchanged. The source lock now uses the canonical URL and verified archive hash.
-The staging fix still needs a hosted retry. The media-runtime fixture gates,
-AppImage/DEB build and resource discovery did not run, and the job produced no
-installable package. Native GUI operation, clean-machine installation, other Linux
-distributions, signing and release readiness remain unverified. macOS remains deferred.
+
+A later [exact-head run](https://github.com/jkkma/jesses/actions/runs/35467171544)
+for commit `d034a0d646b5dcc250ebcb77db7adb342a478251` repeated the native FFmpeg and
+standalone-encoder gates, passed complete source staging and bundled discovery,
+and passed the real-file media-runtime suite. It built both unsigned AppImage and
+DEB bundles. The final extracted-package gate then rejected the AppImage because
+linuxdeploy had rewritten a checksum-bound bundled ELF while recursively processing
+Tauri's `usr/lib` resource tree. The failed run uploaded its native build evidence,
+but no installable package artifact.
+
+The workflow now restores the exact verified tool tree into Tauri's retained AppDir,
+runs the full resource verifier, retains the pre-restoration AppImage for diagnosis,
+and rebuilds only the unsigned AppImage filesystem with the `appimagetool` embedded
+in Tauri's cached output plugin. It does not perform a second dependency-deployment
+scan. The existing final gate still extracts both AppImage and DEB bundles, verifies
+every recorded resource hash, and checks native bundled-tool discovery. This repair
+still needs a terminal hosted retry. Native GUI operation, clean-machine installation,
+other Linux distributions, signing and release readiness remain unverified. macOS
+remains deferred.
 
 ## Linux standalone x264 and mainline SVT-AV1
 
@@ -132,8 +147,9 @@ local Git revision and source notices without producing executables. On
 for clean build environments, complete shared delivery inventories and preservation
 of an existing build directory.
 
-The hosted Ubuntu 24.04 run linked above compiled both standalone encoders, passed
+The hosted Ubuntu 24.04 runs linked above compiled both standalone encoders, passed
 their native identity and dependency checks, and completed the eight-frame 8-bit
-and 10-bit encode/decode checks. The source-staging failure occurred afterward.
-Packaging, installer-resource discovery, native GUI execution and clean-machine
-installation remain pending a successful hosted retry.
+and 10-bit encode/decode checks. The later run also passed source staging, bundled
+discovery and real-file media-runtime gates before the final extracted AppImage
+resource mismatch. Final installer-resource discovery, native GUI execution and
+clean-machine installation remain pending a successful hosted retry.
