@@ -10,6 +10,21 @@ pub(super) fn error(code: &str, message: impl Into<String>, path: &Path) -> AppE
     AppError::new(code, message, Some(path.to_string_lossy().into_owned()))
 }
 
+/// Owns an already acquired workspace lock without cloning its ownership.
+pub(super) struct WorkspaceLock(pub(super) File);
+
+#[cfg(unix)]
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // A concurrent fork can retain the same open file description until
+        // exec applies CLOEXEC. Closing this descriptor alone would leave the
+        // workspace locked by that child after the recovery owner has gone.
+        // SAFETY: the uniquely owned file remains open throughout this call.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Fingerprint {
     length: u64,

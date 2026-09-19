@@ -1,6 +1,7 @@
 //! Durable receipts for an explicitly resumed av1an job. A history locator is
 //! never sufficient authority to run saved commands or remove a directory.
 use super::*;
+use crate::jobs::files::WorkspaceLock;
 use media_core::{Av1anRecovery, RecoveryPhase};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -414,7 +415,7 @@ fn directory_guard(root: &Path) -> Result<File, AppError> {
     Ok(directory)
 }
 
-fn lock_workspace(root: &Path) -> Result<(File, File), AppError> {
+fn lock_workspace(root: &Path) -> Result<(File, WorkspaceLock), AppError> {
     let directory = directory_guard(root)?;
     let lock_path = root.join("workspace.lock");
     let mut options = OpenOptions::new();
@@ -430,7 +431,7 @@ fn lock_workspace(root: &Path) -> Result<(File, File), AppError> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: lock owns a live file descriptor; the lock lasts until it closes.
+        // SAFETY: lock owns a live file descriptor; WorkspaceLock releases it.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(error(
                 &lock_path,
@@ -438,7 +439,7 @@ fn lock_workspace(root: &Path) -> Result<(File, File), AppError> {
             ));
         }
     }
-    Ok((directory, lock))
+    Ok((directory, WorkspaceLock(lock)))
 }
 
 struct Workspace {
@@ -455,7 +456,7 @@ struct Workspace {
     _source: Option<Source>,
     chunks: Vec<Source>,
     directory_guard: Option<File>,
-    lock: Option<File>,
+    lock: Option<WorkspaceLock>,
 }
 
 #[derive(Clone)]
@@ -1365,6 +1366,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn last_recovery_owner_unlocks_even_with_an_inherited_descriptor() {
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let inherited = workspace.lock.as_ref().unwrap().0.try_clone().unwrap();
+        let recovery = Recovery {
+            root: root.clone(),
+            finalizing: false,
+            resume_chunks: false,
+            inner: Arc::new(StdMutex::new(workspace)),
+        };
+        let writer = recovery.clone();
+        drop(recovery);
+        assert!(lock_workspace(&root).is_err());
+        drop(writer);
+        let (_directory, reopened) = lock_workspace(&root).unwrap();
+        drop(inherited);
+        assert!(lock_workspace(&root).is_err());
+        drop(reopened);
+        assert!(lock_workspace(&root).is_ok());
+        drop(intermediate);
     }
 
     #[test]

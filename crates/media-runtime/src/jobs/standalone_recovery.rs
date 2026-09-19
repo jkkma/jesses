@@ -3,7 +3,7 @@
 //! last artifact whose complete bytes and decoded structure were verified.
 use super::{
     check_cancel,
-    files::{self, Source, Temporary},
+    files::{self, Source, Temporary, WorkspaceLock},
     rate_control::Stats,
 };
 use media_core::{
@@ -282,7 +282,7 @@ pub(super) struct Recovery {
     manifest: Option<Manifest>,
     _tool_guards: Vec<Source>,
     directory_guard: Option<File>,
-    lock: Option<File>,
+    lock: Option<WorkspaceLock>,
 }
 
 fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
@@ -318,7 +318,7 @@ fn directory_guard(root: &Path) -> Result<File, AppError> {
         .map_err(|cause| error(root, cause.to_string()))
 }
 
-fn lock_workspace(root: &Path) -> Result<(File, File), AppError> {
+fn lock_workspace(root: &Path) -> Result<(File, WorkspaceLock), AppError> {
     let directory = directory_guard(root)?;
     let path = root.join("workspace.lock");
     let mut options = OpenOptions::new();
@@ -338,7 +338,7 @@ fn lock_workspace(root: &Path) -> Result<(File, File), AppError> {
             return Err(error(&path, "The recovery workspace is already in use."));
         }
     }
-    Ok((directory, lock))
+    Ok((directory, WorkspaceLock(lock)))
 }
 
 fn phase_at_least(phase: StandaloneRecoveryPhase, expected: StandaloneRecoveryPhase) -> bool {
@@ -874,15 +874,16 @@ impl Recovery {
 fn remove_owned_contents(
     root: &Path,
     manifest: &Manifest,
-    lock_guard: &mut Option<File>,
+    lock_guard: &mut Option<WorkspaceLock>,
 ) -> Result<(), AppError> {
     use std::collections::BTreeMap;
     let manifest_path = root.join("manifest.json");
     let lock_path = root.join("workspace.lock");
     let lock_identity = file_identity(
-        lock_guard
+        &lock_guard
             .as_ref()
-            .ok_or_else(|| error(&lock_path, "Missing recovery workspace lock guard."))?,
+            .ok_or_else(|| error(&lock_path, "Missing recovery workspace lock guard."))?
+            .0,
     )?;
     let mut expected_files = BTreeMap::from([
         (manifest_path.clone(), identity(&manifest_path)?),
@@ -927,15 +928,17 @@ fn remove_owned_contents(
                     "Recovery cleanup found a link; the workspace was preserved.",
                 ));
             }
-            let found =
-                if path == lock_path {
-                    validate_lock_entry(&path)?;
-                    file_identity(lock_guard.as_ref().ok_or_else(|| {
-                        error(&lock_path, "Missing recovery workspace lock guard.")
-                    })?)?
-                } else {
-                    identity(&path)?
-                };
+            let found = if path == lock_path {
+                validate_lock_entry(&path)?;
+                file_identity(
+                    &lock_guard
+                        .as_ref()
+                        .ok_or_else(|| error(&lock_path, "Missing recovery workspace lock guard."))?
+                        .0,
+                )?
+            } else {
+                identity(&path)?
+            };
             if metadata.is_dir() {
                 pending.push(path.clone());
                 actual_directories.insert(path, found);
@@ -1319,6 +1322,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(latest.phase, StandaloneRecoveryPhase::TimingWrapComplete);
+        // dup and fork share an open file description. Keep that description
+        // alive to deterministically exercise discovery during a child spawn.
+        #[cfg(unix)]
+        let inherited = recovery.lock.as_ref().unwrap().0.try_clone().unwrap();
+        assert!(lock_workspace(&recovery.root).is_err());
         drop(recovery);
 
         let discovered = discover_locator("job-1", &request, &settings, None)
@@ -1351,6 +1359,9 @@ mod tests {
             prepared.recovery.phase(),
             Some(StandaloneRecoveryPhase::TimingWrapComplete)
         );
+        #[cfg(unix)]
+        drop(inherited);
+        assert!(lock_workspace(&prepared.recovery.root).is_err());
         drop(prepared.video);
         drop(prepared.timed_video);
         drop(prepared.final_stage);
