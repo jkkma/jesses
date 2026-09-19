@@ -33,5 +33,5 @@ A native x265 encode of frames [2880,3360) retained 882,883 stereo samples per
 channel in 24-bit FLAC. Independently decoded source samples multiplied by the
 gain and quantized through the documented s32-to-FLAC24 path match every output
 integer sample exactly. Evidence and the verifier are retained under
-`Videos/Jesses-complete-native-20260913/native-trim-*`. Linux runtime and the
-final release artifact remain separate qualifications.
+`Videos/Jesses-complete-native-20260913/native-trim-*`. The final Windows release
+artifact remains a separate qualification; Linux runtime qualification is deferred.

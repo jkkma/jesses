@@ -78,8 +78,9 @@ On Windows with FFmpeg/FFprobe 9.0.1 and standalone x264:
 - All-target Clippy with warnings denied passes. `pnpm check` reports zero errors
   and warnings. Controls use explicit accessible labels and a fieldset legend.
 
-The Linux CI workflow includes the actual-tool gate. These local results do not
-claim a Linux execution or native desktop UI qualification.
+The Linux CI lane at this checkpoint included the actual-tool gate. These local
+results do not claim a Linux execution or native desktop UI qualification. Linux
+native qualification is now deferred.
 
 ## Original-media evidence
 
@@ -121,5 +122,6 @@ logs are retained under `Videos/Jesses-final-native-20260913`; the output hash i
 The nearby video summary now displays the configured rational output rate,
 an invalid-rate hint, or doubled source rate for BWDIF bob as appropriate. Four
 focused container/temporal browser cases pass after this display correction;
-Svelte reports zero errors and warnings. Native deinterlacing and Linux/final
+Svelte reports zero errors and warnings. Native deinterlacing and final Windows
 package qualification remain separate from this native frame-rate conversion.
+Linux packaging is deferred.

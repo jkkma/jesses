@@ -105,4 +105,4 @@ The latter include active-worker cancellation. The streaming tests cover an
 80 MiB lossless process stream, a greater-than-78 MiB frame document, backpressure,
 parser/decoder failures, late metadata changes, cancellation, timeout, and dropped
 future cleanup. Build, typecheck, formatting, Clippy with warnings denied, and
-IPC contract checks passed. Linux native runtime qualification remains pending.
+IPC contract checks passed. Linux native runtime qualification is deferred.

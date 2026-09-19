@@ -31,8 +31,8 @@ jobs:
         include:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+          # Linux native qualification is deferred. The guarded steps below are
+          # retained so the lane can be restored deliberately in the future.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

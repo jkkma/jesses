@@ -38,7 +38,8 @@ error and retained the entry. Reopening an already loaded valid file correctly
 avoided a duplicate, but kept the previously selected inspector source; the
 working source now selects the requested existing entry. Evidence includes `native-preferences-import-review.png`,
 `native-recent-missing.png`, and the before/after preference records in the same
-Videos evidence directory. Linux and final-artifact qualification remain pending.
+Videos evidence directory. Final Windows artifact qualification remains pending;
+Linux qualification is deferred.
 
 The subsequent native portable build rechecked the existing-entry correction:
 with two sources already loaded, Open recent switched to the requested existing
@@ -49,5 +50,5 @@ Rust-owned preference record across process restart, separately from transient
 media drafts. Both native application processes closed normally. Evidence:
 `native-existing-recent-selection.png` and `native-preset-restart-applied.png`
 under `Videos/Jesses-final-native-20260913`. These checks supersede the earlier
-pending existing-entry recheck; final package/clean-machine and Linux gates
-remain open.
+pending existing-entry recheck; final Windows package and clean-machine gates
+remain open. Linux qualification is deferred.

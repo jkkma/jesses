@@ -26,8 +26,8 @@ source fingerprints. The SVG was rendered at1200x720 and inspected for clipping,
 legible units and the full interval. Files and receipt remain under
 `Videos/Jesses-complete-native-20260913/real-quality-vmaf.*` and
 `analysis-export-verification.json`. The native bitrate export controls are
-qualified below; native quality export and Linux/final package qualification
-remain separate checks.
+qualified below; native quality export and final Windows package qualification
+remain separate checks. Linux package work is deferred.
 
 An additional independent FFprobe packet scan agrees with every one of the
 original episode's 1,421 bitrate windows: 34,047 packets and 707,309,398 payload

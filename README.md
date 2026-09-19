@@ -29,9 +29,9 @@ supports configurable chunk readers and quality targets, live pause/continue,
 and durable stop/resume. Encoding forms offer source previews and automatic crop
 proposals; Files offers bitrate charts and matched-interval quality analysis. Audio controls offer measured
 loudness and explicit flat gain. General preferences and recent media persist.
-Unsigned packages and bundled media tools are being qualified. This is a
-development build; final combined artifacts and cross-platform release checks
-remain in progress.
+Unsigned Windows packages and bundled media tools are being qualified. This is a
+development build; final Windows artifacts, signing and clean-machine checks
+remain in progress. Linux and macOS native support are deferred.
 
 ## Media utilities and source inspection
 
@@ -603,9 +603,11 @@ Build a native executable with embedded frontend assets:
 pnpm tauri build --debug --no-bundle
 ```
 
-Native CI targets Windows x64 and Linux x64. macOS support is deferred. Local
-unsigned Windows artifact checks are recorded in the [packaging documentation](docs/packaging.md);
-final artifact, signing, clean-machine and Linux runtime qualification remain separate gates.
+Native CI targets Windows x64. Linux and macOS native support are deferred. The
+frontend job uses an Ubuntu browser/build host, which does not establish Linux
+product support. Local unsigned Windows artifact checks are recorded in the
+[packaging documentation](docs/packaging.md); final artifact, signing and
+clean-machine qualification remain separate gates.
 
 ## Development layout
 
@@ -622,8 +624,7 @@ directly with argument arrays, bounded output, and timeouts. Job supervision use
 atomic Job Object assignment on Windows 10+ and process groups on Unix. Unix tools
 must not deliberately detach from their process group. Binary pipelines use
 bounded buffers and owned file handles, require success from both stages, and
-stop both trees on failure. Cross-platform native UI qualification remains a future
-gate.
+stop both trees on failure. Linux and macOS native UI qualification are deferred.
 
 The activity panel retains at most 200 entries in memory. Only its open/closed
 state persists; source lists and media metadata are session-only.

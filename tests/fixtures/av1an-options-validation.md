@@ -149,7 +149,7 @@ separate pipeline and is not covered by this engine defect.
 
 The Windows runs above use selected source-built FFmpeg/FFprobe and an explicit
 external VapourSynth installation. The separate portable checks below exercise
-the bundled frameserver. Linux execution remains a separate release gate.
+the bundled frameserver. Linux execution is deferred.
 
 The additional metric engine is the immutable build whose SHA256 is
 `83d506d737f46341ceec04d78787210fc793fbaad2b099af0bbbfd16a6dbe874`.

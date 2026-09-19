@@ -124,7 +124,8 @@ Four focused container/temporal browser cases pass, including av1an's shared
 container summary, rational/invalid/bob rate labels, workflow draft restoration
 and Batch request immutability. Svelte diagnostics remain clean. This subsequent
 display correction awaits the final rebuilt package's native check; these
-results do not claim Linux or clean-machine package qualification.
+results do not claim clean-machine package qualification. Linux qualification is
+deferred.
 
 The same native portable build was then closed normally and restarted. Opening
 its persisted recent source, choosing x264 and applying the persisted parameter

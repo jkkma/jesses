@@ -50,8 +50,9 @@ chain is assembled from validated numbers. See the primary
   filtered reference, checking crop offsets and filter order.
 - Clippy with warnings denied, Rust formatting, generated contracts, Svelte
   checking, and the embedded-frontend Windows desktop build passed.
-- Linux CI includes the framing gate after installation of the pinned SVT
-  forks. The qualification results below were recorded locally.
+- The Linux CI lane at this checkpoint included the framing gate after installation
+  of the pinned SVT forks. Linux native qualification is now deferred. The results
+  below were recorded locally.
 
 ## Real media
 

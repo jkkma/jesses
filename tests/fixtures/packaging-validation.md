@@ -142,10 +142,10 @@ environment changes reach the grandchildren without changing the parent.
 ## Remaining evidence boundaries
 
 Linux media and standalone source archives, licenses, local x264 Git identity and
-build-invariant checks passed on this Windows host. The workflow includes actual
-Linux compilation, native media tests and extracted AppImage/DEB resource checks.
-Those gates have not run here; cross-platform source checks do not establish a
-Linux executable or desktop pass. Linux portable av1an remains separate work.
+build-invariant checks passed on this Windows host. The retained Linux workflow
+path includes compilation, native media tests and extracted AppImage/DEB resource
+checks. Those gates had not run here; cross-platform source checks did not
+establish a Linux executable or desktop pass. Linux packaging is now deferred.
 
 Earlier unsigned Windows installer/ZIP native app smoke evidence applies to
 those exact older artifacts. Final source snapshots, hashes and extracted-resource

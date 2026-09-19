@@ -127,7 +127,8 @@ verification again passed all 236 frames, 27 streams, copied packets and fonts,
 border samples and timestamp checks. Both outputs and native job snapshots are
 retained in the same evidence directory. This completes native Quick Convert and
 Batch border interaction/output qualification for this Windows executable;
-packaged clean-machine and Linux native desktop checks remain separate gates.
+packaged clean-machine checks remain a separate gate. Linux native desktop
+qualification is deferred.
 
 #### Earlier helper failures
 
@@ -152,5 +153,6 @@ implementation and real-tool recovery tests. Automatic crop, trim, frame-rate co
 non-square-pixel sources, arbitrary resize aspect ratios and colored borders
 remain pending. x264 retains its existing SDR-only support. HDR10 tests use the
 existing supported SVT path; selecting borders does not enable dynamic-HDR
-fallback. Linux has the same opt-in framing gate in CI; local Windows checks do
-not establish a Linux runtime result or clean-machine packaging qualification.
+fallback. The Linux CI lane at this checkpoint had the same opt-in framing gate;
+local Windows checks did not establish a Linux runtime result or clean-machine
+packaging qualification. Linux native qualification is now deferred.

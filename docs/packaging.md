@@ -1,8 +1,8 @@
 # Desktop packages and data locations
 
 The manual **Unsigned desktop packages** workflow builds a Windows x64 installer
-and portable ZIP, plus Linux x64 AppImage and DEB packages. It uploads artifacts
-to that workflow run and does not publish a release. macOS remains deferred.
+and portable ZIP. It uploads artifacts to that workflow run and does not publish
+a release. Linux and macOS packaging are deferred.
 
 The Windows installer uses zlib compression. Most source payloads are already
 compressed archives; zlib keeps complete-source package iteration practical
@@ -25,11 +25,11 @@ VMAF is built with its default models embedded. The build requires the pinned
 model generator and rejects a library that silently omits those models. Windows
 subtitle rendering uses the operating system's DirectWrite font provider.
 
-The [Linux FFmpeg build](linux-ffmpeg-package.md) compiles the same media pair
-and static codec libraries from pinned sources, with the ordinary Linux C/C++
-runtime supplied by the target system. Its recipe includes native dependency
-and media gates. Source extraction and license checks run on Windows too; they
-do not establish a Linux compilation or execution pass.
+The retained [Linux FFmpeg build](linux-ffmpeg-package.md) compiles the same media
+pair and static codec libraries from pinned sources, with the ordinary Linux
+C/C++ runtime supplied by the target system. Its recipe and historical receipts
+remain available for future work, but the current packaging workflow does not run
+the Linux lane and they are not Windows release blockers.
 
 Windows package builds additionally compile standalone x264 from the pinned
 complete Git source already retained with FFmpeg. The standalone command supports
@@ -44,10 +44,10 @@ Windows builds include a [portable av1an frameserver](windows-av1an-package.md):
 the pinned engine, VapourSynth R79, L-SMASH and private CPython runtime, with
 complete sources, license notices, build receipts and per-child environment
 selection. The workflow adds source-built vszip and Julek CPU scorers in a
-separate verified merge. Linux also has separate standalone x264/mainline SVT source recipes
-and native package gates, described in the Linux build document. Their source
-verification passed locally; Linux compilation and execution remain unverified.
-Linux av1an packaging is still separate work.
+separate verified merge. Linux also has retained standalone x264/mainline SVT
+source recipes and historical native package evidence, described in the Linux
+build document. Linux packaging, including av1an, is deferred and is not part of
+the active Windows release gate.
 Install the remaining tools described in
 [standalone encoders](standalone-encoders.md) and
 [SVT forks](svt-forks.md), then check **Tools & settings**.
@@ -64,8 +64,8 @@ The Windows installer uses a per-user installation and downloads the WebView2
 bootstrapper if the runtime is missing. That first installation requires internet
 access. The portable ZIP requires an already installed WebView2 runtime. An offline
 runtime bundle, signing and clean-machine installation trials remain open gates.
-Linux packages are built on Ubuntu 24.04; other distributions and older system
-libraries need separate native qualification.
+Any future Linux reactivation will require fresh native and clean-machine
+qualification for the intended distributions and system libraries.
 
 ## Storage
 
@@ -131,10 +131,12 @@ x265 pkg-config override selects GCC's static unwinder consistently. It does not
 modify the upstream codec binary or source. Input pinning provides repeatable
 build inputs; byte-for-byte reproducibility across hosts remains a separate gate.
 
-For Linux, use `--target x86_64-unknown-linux-gnu --bundles appimage,deb` and the
-corresponding target directory. Every packaging destination must be new: scripts
-do not overwrite existing artifacts. If multiple old installers exist in the
-build's bundle directory, collection refuses the ambiguous result.
+The retained Linux recipes use `--target x86_64-unknown-linux-gnu --bundles
+appimage,deb` and the corresponding target directory. They are documented for
+future reactivation and are not run by the current workflow. Every packaging
+destination must be new: scripts do not overwrite existing artifacts. If multiple
+old installers exist in the build's bundle directory, collection refuses the
+ambiguous result.
 
 `collect` copies installers and license/dependency records, produces the Windows
 portable ZIP, and records SHA-256 hashes in `SHA256SUMS` and JSON manifests.
@@ -160,9 +162,9 @@ python scripts/qualify-package-tools.py --probe target/debug/examples/package_to
 python scripts/verify-bundle-resources.py --packages target/unsigned-windows-package --probe target/debug/examples/package_tools.exe --destination target/extracted-windows-package --require-media
 ```
 
-Omit `--require-media` for an intentionally fork-only package. On Linux the probe
-filename has no `.exe` suffix, and the artifact verifier extracts both AppImage
-and DEB payloads before checking their native tool discovery.
+Omit `--require-media` for an intentionally fork-only package. In the retained
+Linux path the probe filename has no `.exe` suffix, and the artifact verifier
+extracts both AppImage and DEB payloads before checking their native tool discovery.
 Use `--require-tool x264 --require-tool svt-av1` with both verification commands
 for the Windows package.
 

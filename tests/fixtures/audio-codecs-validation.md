@@ -66,8 +66,9 @@ All 11 actual-tool audio tests passed in 48.59 seconds, including the original
 AAC/Opus conversion, timing, cancellation, and batch regression gates. All five
 audio unit tests passed.
 
-Linux CI's pinned FFmpeg build now explicitly enables libmp3lame and libvorbis;
-its cache identity includes the compiler and codec development packages. Local
-Windows results do not establish Linux runtime, native desktop interaction,
+The Linux CI lane at this checkpoint explicitly enabled libmp3lame and libvorbis;
+its cache identity included the compiler and codec development packages. Local
+Windows results did not establish Linux runtime, native desktop interaction,
 full-episode conversion, or clean-machine package qualification for these new
-codecs. Loudness normalization is outside this change.
+codecs. Linux native qualification is now deferred. Loudness normalization is
+outside this change.

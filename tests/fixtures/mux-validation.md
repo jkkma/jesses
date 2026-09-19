@@ -59,9 +59,10 @@ receipts remain readable; inconsistent new receipts are retained and block admis
 - `cargo clippy -p media-runtime --all-targets --locked -- -D warnings` and
   `cargo check -p jesses --locked` passed.
 
-Linux CI runs the actual mux job and comparator gates after installing the verified
-FFmpeg tool pair. A successful run of that workflow is separate evidence; adding the
-gate does not establish it passed remotely.
+The Linux CI lane at this checkpoint ran the actual mux job and comparator gates
+after installing the verified FFmpeg tool pair. A successful run of that workflow
+is separate evidence; adding the gate does not establish it passed remotely.
+Linux native qualification is now deferred.
 
 Native Windows combined-source remux also passed on frozen executable
 `49c84b2425f90efa7842acc5d297fd2dd4c23458550d575a5843e1e744fb6777`.

@@ -65,7 +65,7 @@ Add `--av1an-build target/package-av1an/delivery` when staging bundled tools.
 The stager requires the exact shared FFmpeg receipt and verifies every runtime,
 source, build and license file before invoking the engine. Binary input pinning
 and source retention do not establish byte-identical builds across compilers or
-hosts; native Linux av1an packaging remains a separate qualification task.
+hosts; native Linux av1an packaging is deferred.
 
 The Windows workflow additionally builds the CPU scorer pair with
 `package-av1an-scorers.py` and merges it into a fresh delivery with

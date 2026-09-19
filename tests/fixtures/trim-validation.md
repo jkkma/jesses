@@ -1,8 +1,9 @@
 # Frame interval validation
 
 Qualified on Windows on 2026-09-13 with actual FFmpeg/FFprobe and standalone
-x264, x265 and VP9. Linux CI runs the same opt-in gate against its pinned FFmpeg
-source build; the added CI invocation has not yet run on this uncommitted head.
+x264, x265 and VP9. The Linux CI lane at this checkpoint was configured to run the
+same opt-in gate against its pinned FFmpeg source build; that added invocation had
+not yet run on the uncommitted head. Linux native qualification is now deferred.
 
 ## Contract
 

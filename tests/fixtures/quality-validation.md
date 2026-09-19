@@ -39,5 +39,5 @@ the native candidate picker and explicit frame controls. Its displayed VMAF
 97.100 and final-frame119 score97.354 match the retained numeric result after
 display rounding. Keyboard End reached that final point. Evidence is retained
 under `Videos/Jesses-complete-native-20260913/native-vmaf-*`.
-Linux runtime and final release qualification remain separate gates. HDR scoring
-and additional metric plugins are not enabled.
+Final Windows release qualification remains a separate gate. Linux runtime
+qualification is deferred. HDR scoring and additional metric plugins are not enabled.

@@ -67,7 +67,7 @@ one selected portable VapourSynth runtime.
 The Linux package recipe compiles standalone x264 and mainline SVT-AV1 from the
 same pinned sources and retains their notices. Ordinary glibc/compiler shared
 libraries are declared system dependencies. Linux native build qualification
-remains pending; av1an remains external on that platform.
+and av1an packaging are deferred.
 Builds without the optional
 tools manifest distribute no media executables. The manifest is the inventory of
 what a particular package actually contains.

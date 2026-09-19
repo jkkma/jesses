@@ -74,10 +74,11 @@ pnpm exec playwright test tests/frontend/analysis.spec.ts
 ```
 
 Svelte checking, Rust formatting and runtime Clippy with warnings denied passed.
-Linux CI runs the same actual-tool gate with its pinned FFmpeg build; libzimg is
-included in that build and its dependency fingerprint. Remote CI results remain
-a separate qualification gate. The additional native Windows evidence is recorded
-at the beginning of this document.
+The Linux CI lane at this checkpoint ran the same actual-tool gate with its pinned
+FFmpeg build; libzimg was included in that build and its dependency fingerprint.
+Remote CI results were a separate qualification gate. Linux native qualification
+is now deferred. The additional native Windows evidence is recorded at the
+beginning of this document.
 
 Frame previews are for inspecting framing, not color-critical mastering or
 frame-accurate trim selection. Rotation/SAR handling, full rendered-filter

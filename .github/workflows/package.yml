@@ -11,15 +11,6 @@ on:
         options:
           - release
           - debug
-      platform:
-        description: Platform to build
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - windows
-          - linux
 
 permissions:
   contents: read
@@ -29,7 +20,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis"}]' || inputs.platform == 'linux' && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}]') }}
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          # Linux packaging is deferred. The guarded steps below remain for a
+          # deliberate future reactivation of the Linux matrix lane.
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/package-build
@@ -60,11 +56,17 @@ jobs:
       - run: python scripts/test-package-desktop.py
       - run: python scripts/test-package-toolchain.py
       - run: python scripts/test-package-standalone.py
-      - run: python scripts/test-package-standalone-linux.py
+      - name: Verify Linux standalone package recipes
+        if: runner.os == 'Linux'
+        run: python scripts/test-package-standalone-linux.py
       - run: python scripts/test-package-av1an.py
       - run: python scripts/test-package-av1an-scorers.py
-      - run: python scripts/test-package-ffmpeg-linux.py
-      - run: python scripts/test-restore-appimage-tools.py
+      - name: Verify Linux FFmpeg package recipes
+        if: runner.os == 'Linux'
+        run: python scripts/test-package-ffmpeg-linux.py
+      - name: Verify Linux AppImage restoration
+        if: runner.os == 'Linux'
+        run: python scripts/test-restore-appimage-tools.py
       - run: pnpm format:check
       - run: pnpm check
       - run: cargo test -p jesses --lib --locked paths::tests

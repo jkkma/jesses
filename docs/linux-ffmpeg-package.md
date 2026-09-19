@@ -1,5 +1,12 @@
 # Linux FFmpeg package build
 
+Linux native support and packaging are deferred alongside macOS. The recipes,
+locked sources and receipts in this document are retained as historical evidence
+and a possible basis for future work. The current CI and packaging workflows do
+not run Linux native lanes, and this retained material is not an active Windows
+qualification or release blocker. Any reactivation requires fresh native,
+artifact and clean-machine qualification.
+
 `scripts/build-package-ffmpeg-linux.py` builds FFmpeg and FFprobe 9.0.1 for Linux
 x86-64. It compiles the linked codec, display-conversion and compression libraries
 from the exact source archives in `scripts/package-ffmpeg-linux-lock.json`.
@@ -24,8 +31,8 @@ the delivery receipt is written. A real VMAF v0.6.1 model run detects missing
 embedded model data, and an original geometric font tests actual libass rendering.
 FreeType includes compressed and PNG font support. Fontconfig uses standard Linux
 font/configuration paths; an isolated staged install does not write to `/etc`.
-The packaging workflow also runs media-runtime
-fixture gates using the newly built pair.
+The historical packaging lane also ran media-runtime fixture gates using the
+newly built pair.
 
 ## Build and retained sources
 
@@ -98,10 +105,11 @@ FFprobe and the standalone encoders. It then exposed a verifier directory collis
 AppImage and DEB filenames with the same stem selected the same extraction folder.
 The verifier now keeps the full filename, including its format extension, and a
 regression exercises both formats together. Both extracted artifacts must pass
-before the workflow publishes qualified unsigned packages. Failed Linux bundles
-are retained separately as unqualified diagnostic artifacts for seven days.
+before that lane can publish qualified unsigned packages. Failed Linux bundles
+were retained separately as unqualified diagnostic artifacts for seven days.
 Native GUI operation, clean-machine installation, other Linux distributions,
-signing and release readiness remain separate gates. macOS remains deferred.
+signing and release readiness were not established by those runs. Linux and
+macOS are now deferred.
 
 ## Linux standalone x264 and mainline SVT-AV1
 
@@ -120,8 +128,8 @@ are `target/package-standalone-linux/x264/delivery` and
 `target/package-standalone-linux/svt-av1/delivery`, accepted by the stager's existing
 `--x264-build` and `--svt-build` options. The driver requires the same Linux x86-64
 GCC/G++, binutils, make, nasm, CMake, Ninja and Git toolchain as the media build;
-it does not install packages or run a package manager. The workflow uses its
-pinned runner image and records the installed build-tool versions. This retains
+it does not install packages or run a package manager. The deferred workflow path
+uses a pinned runner image and records the installed build-tool versions. This retains
 exact codec sources and recipes, without claiming byte-identical binaries across
 different compiler or system-runtime versions.
 
