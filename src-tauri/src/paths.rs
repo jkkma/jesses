@@ -66,6 +66,143 @@ fn redirected(metadata: &fs::Metadata) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn expected_scoop_persist_root(executable_parent: &Path) -> Option<PathBuf> {
+    let app_directory = executable_parent.parent()?;
+    if !app_directory
+        .file_name()?
+        .to_string_lossy()
+        .eq_ignore_ascii_case("jesses")
+    {
+        return None;
+    }
+    let apps_directory = app_directory.parent()?;
+    if !apps_directory
+        .file_name()?
+        .to_string_lossy()
+        .eq_ignore_ascii_case("apps")
+    {
+        return None;
+    }
+    Some(
+        apps_directory
+            .parent()?
+            .join("persist")
+            .join("jesses")
+            .join(PORTABLE_DIRECTORY),
+    )
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(windows)]
+fn require_ordinary_scoop_directory(path: &Path, description: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Cannot inspect Scoop's {description} {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if !metadata.is_dir() || redirected(&metadata) {
+        return Err(invalid(format!(
+            "Scoop's {description} must be an ordinary directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_scoop_persist_root(executable_parent: &Path, root: &Path) -> io::Result<PathBuf> {
+    let Some(expected) = expected_scoop_persist_root(executable_parent) else {
+        return Err(invalid(format!(
+            "Portable data may use a directory junction only for Scoop's managed persist location: {}",
+            root.display()
+        )));
+    };
+    let persist_app = expected
+        .parent()
+        .ok_or_else(|| invalid("Scoop's persist app directory has no parent."))?;
+    let persist = persist_app
+        .parent()
+        .ok_or_else(|| invalid("Scoop's persist directory has no parent."))?;
+    let scoop_root = persist
+        .parent()
+        .ok_or_else(|| invalid("Scoop's root directory has no parent."))?;
+    for (path, description) in [
+        (scoop_root, "root directory"),
+        (&scoop_root.join("apps"), "apps directory"),
+        (&scoop_root.join("apps/jesses"), "Jesses app directory"),
+        (persist, "persist directory"),
+        (persist_app, "Jesses persist directory"),
+        (&expected, "expected persist location"),
+    ] {
+        require_ordinary_scoop_directory(path, description)?;
+    }
+    let resolved = root.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Cannot resolve Scoop's persisted portable data {}: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    let expected = expected.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Cannot resolve Scoop's expected persist location {}: {error}",
+                expected.display()
+            ),
+        )
+    })?;
+    let managed_expected = scoop_root
+        .canonicalize()?
+        .join("persist/jesses")
+        .join(PORTABLE_DIRECTORY);
+    let metadata = fs::symlink_metadata(&resolved)?;
+    if !metadata.is_dir()
+        || redirected(&metadata)
+        || !same_windows_path(&resolved, &expected)
+        || !same_windows_path(&expected, &managed_expected)
+    {
+        return Err(invalid(format!(
+            "Portable data junction {} must resolve to Scoop's ordinary managed directory {}.",
+            root.display(),
+            expected.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn resolve_portable_root(executable_parent: &Path) -> io::Result<PathBuf> {
+    let root = executable_parent.join(PORTABLE_DIRECTORY);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if redirected(&metadata) => {
+            #[cfg(windows)]
+            {
+                resolve_scoop_persist_root(executable_parent, &root)
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(root)
+            }
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(root),
+        Ok(_) => Ok(root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(root),
+        Err(error) => Err(error),
+    }
+}
+
 /// An APPIMAGE variable inherited from another application must not change this
 /// application's history location. Honor it only when this executable is inside
 /// the corresponding APPDIR mount. No paths are created or modified here.
@@ -143,7 +280,7 @@ impl AppPaths {
                     marker.display()
                 )));
             }
-            let root = parent.join(PORTABLE_DIRECTORY);
+            let root = resolve_portable_root(parent)?;
             return Ok(Self {
                 mode: StorageMode::Portable,
                 resource_dir: installed.resource_dir,
@@ -173,6 +310,14 @@ impl AppPaths {
         self.log_dir.join("jobs")
     }
 
+    /// Portable browser state follows the same explicitly selected storage root.
+    /// Installed mode keeps Tauri's existing platform-default WebView profile.
+    pub fn webview_data_dir(&self) -> Option<PathBuf> {
+        self.portable_root
+            .as_ref()
+            .map(|_| self.cache_dir.join("webview"))
+    }
+
     /// Create and check only the chosen mutable locations. An unwritable portable
     /// directory is an error, never permission to use a different history store.
     pub fn prepare(&self) -> io::Result<()> {
@@ -191,6 +336,10 @@ impl AppPaths {
                 fs::create_dir_all(directory)?;
             }
             check_writable(directory)?;
+        }
+        if let Some(directory) = self.webview_data_dir() {
+            ensure_portable_directory(&directory)?;
+            check_writable(&directory)?;
         }
         Ok(())
     }
@@ -289,6 +438,7 @@ mod tests {
         fs::write(history.join("history.json"), b"existing history").unwrap();
         let paths = AppPaths::resolve(&fixture.executable(), fixture.defaults()).unwrap();
         assert_eq!(paths.mode, StorageMode::Installed);
+        assert_eq!(paths.webview_data_dir(), None);
         assert_eq!(paths.history_dir(), history);
         assert_eq!(paths.job_log_dir(), fixture.defaults().log_dir.join("jobs"));
         paths.prepare().unwrap();
@@ -312,6 +462,10 @@ mod tests {
             paths.data_dir,
             fixture.0.join("application/jesses-data/data")
         );
+        assert_eq!(
+            paths.webview_data_dir(),
+            Some(fixture.0.join("application/jesses-data/cache/webview"))
+        );
         assert!(!paths.data_dir.exists(), "resolution alone does not write");
         paths.prepare().unwrap();
         assert!(
@@ -322,18 +476,16 @@ mod tests {
             fs::read(installed.join("history.json")).unwrap(),
             b"installed"
         );
-        for directory in [
-            &paths.config_dir,
-            &paths.data_dir,
-            &paths.cache_dir,
-            &paths.log_dir,
-        ] {
+        for directory in [&paths.config_dir, &paths.data_dir, &paths.log_dir] {
             assert_eq!(
                 fs::read_dir(directory).unwrap().count(),
                 0,
                 "write probes are removed"
             );
         }
+        let webview = paths.webview_data_dir().unwrap();
+        assert_eq!(fs::read_dir(&paths.cache_dir).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(webview).unwrap().count(), 0);
     }
 
     #[test]
@@ -422,5 +574,211 @@ mod tests {
         let paths = AppPaths::resolve(&fixture.executable(), fixture.defaults()).unwrap();
         assert!(paths.prepare().is_err());
         assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+
+        let command = format!("mklink /J \"{}\" \"{}\"", link.display(), target.display());
+        let mut process = std::process::Command::new("cmd.exe");
+        process.args(["/d", "/c"]);
+        process.raw_arg(command);
+        let status = process.status().unwrap();
+        assert!(status.success(), "could not create test directory junction");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoop_versions_share_only_the_expected_persisted_portable_root() {
+        let fixture = Fixture::new();
+        let scoop = fixture.0.join("scoop");
+        let app = scoop.join("apps/jesses");
+        let first = app.join("0.1.0");
+        let second = app.join("0.1.1");
+        let persisted = scoop.join("persist/jesses/jesses-data");
+        for directory in [&first, &second, &persisted] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for directory in [&first, &second] {
+            fs::write(directory.join(PORTABLE_MARKER), b"1\n").unwrap();
+            create_junction(&directory.join(PORTABLE_DIRECTORY), &persisted);
+        }
+
+        let legacy_history = fixture.0.join("legacy-profile/data/jobs");
+        fs::create_dir_all(&legacy_history).unwrap();
+        fs::write(
+            legacy_history.join("jobs.json"),
+            b"legacy installed history",
+        )
+        .unwrap();
+        let installed = InstalledPaths {
+            resource_dir: first.clone(),
+            config_dir: fixture.0.join("legacy-profile/config"),
+            data_dir: fixture.0.join("legacy-profile/data"),
+            cache_dir: fixture.0.join("legacy-profile/cache"),
+            log_dir: fixture.0.join("legacy-profile/logs"),
+        };
+
+        let first_paths = AppPaths::resolve(&first.join("jesses.exe"), installed.clone()).unwrap();
+        first_paths.prepare().unwrap();
+        fs::create_dir_all(first_paths.history_dir()).unwrap();
+        fs::write(
+            first_paths.history_dir().join("jobs.json"),
+            b"scoop history",
+        )
+        .unwrap();
+
+        let second_paths =
+            AppPaths::resolve(&second.join("jesses.exe"), installed.clone()).unwrap();
+        second_paths.prepare().unwrap();
+        assert_eq!(first_paths.config_dir, second_paths.config_dir);
+        assert_eq!(first_paths.data_dir, second_paths.data_dir);
+        assert_eq!(first_paths.cache_dir, second_paths.cache_dir);
+        assert_eq!(first_paths.log_dir, second_paths.log_dir);
+        assert_eq!(
+            first_paths.webview_data_dir(),
+            Some(persisted.canonicalize().unwrap().join("cache/webview"))
+        );
+        assert_eq!(
+            fs::read(second_paths.history_dir().join("jobs.json")).unwrap(),
+            b"scoop history"
+        );
+        assert_eq!(
+            fs::read(legacy_history.join("jobs.json")).unwrap(),
+            b"legacy installed history"
+        );
+        for directory in [
+            &second_paths.config_dir,
+            &second_paths.data_dir,
+            &second_paths.cache_dir,
+            &second_paths.log_dir,
+        ] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.is_dir());
+            assert!(!redirected(&metadata));
+        }
+        let webview = second_paths.webview_data_dir().unwrap();
+        let metadata = fs::symlink_metadata(webview).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!redirected(&metadata));
+
+        for directory in [&first, &second] {
+            fs::remove_dir(directory.join(PORTABLE_DIRECTORY)).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_data_junction_outside_scoop_persist_is_rejected_without_writes() {
+        let fixture = Fixture::new();
+        let version = fixture.0.join("scoop/apps/jesses/0.1.0");
+        let outside = fixture.0.join("outside");
+        fs::create_dir_all(&version).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(version.join(PORTABLE_MARKER), b"1\n").unwrap();
+        create_junction(&version.join(PORTABLE_DIRECTORY), &outside);
+
+        let result = AppPaths::resolve(&version.join("jesses.exe"), fixture.defaults());
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_dir(version.join(PORTABLE_DIRECTORY)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoop_persist_root_does_not_allow_redirected_storage_children() {
+        let fixture = Fixture::new();
+        let scoop = fixture.0.join("scoop");
+        let version = scoop.join("apps/jesses/0.1.0");
+        let persisted = scoop.join("persist/jesses/jesses-data");
+        let outside = fixture.0.join("outside");
+        for directory in [&version, &persisted, &outside] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(version.join(PORTABLE_MARKER), b"1\n").unwrap();
+        create_junction(&version.join(PORTABLE_DIRECTORY), &persisted);
+        create_junction(&persisted.join("data"), &outside);
+
+        let paths = AppPaths::resolve(&version.join("jesses.exe"), fixture.defaults()).unwrap();
+        assert!(paths.prepare().is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_dir(persisted.join("data")).unwrap();
+        fs::remove_dir(version.join(PORTABLE_DIRECTORY)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoop_persist_target_itself_must_not_be_redirected() {
+        let fixture = Fixture::new();
+        let scoop = fixture.0.join("scoop");
+        let version = scoop.join("apps/jesses/0.1.0");
+        let persist_parent = scoop.join("persist/jesses");
+        let persisted = persist_parent.join(PORTABLE_DIRECTORY);
+        let outside = fixture.0.join("outside");
+        for directory in [&version, &persist_parent, &outside] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(version.join(PORTABLE_MARKER), b"1\n").unwrap();
+        create_junction(&persisted, &outside);
+        create_junction(&version.join(PORTABLE_DIRECTORY), &persisted);
+
+        let result = AppPaths::resolve(&version.join("jesses.exe"), fixture.defaults());
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_dir(version.join(PORTABLE_DIRECTORY)).unwrap();
+        fs::remove_dir(persisted).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoop_persist_ancestor_must_not_be_redirected() {
+        let fixture = Fixture::new();
+        let scoop = fixture.0.join("scoop");
+        let version = scoop.join("apps/jesses/0.1.0");
+        let redirected_persist = scoop.join("persist");
+        let outside = fixture.0.join("outside-persist");
+        let persisted = outside.join("jesses/jesses-data");
+        fs::create_dir_all(&version).unwrap();
+        fs::create_dir_all(&persisted).unwrap();
+        fs::write(version.join(PORTABLE_MARKER), b"1\n").unwrap();
+        create_junction(&redirected_persist, &outside);
+        create_junction(&version.join(PORTABLE_DIRECTORY), &persisted);
+
+        let result = AppPaths::resolve(&version.join("jesses.exe"), fixture.defaults());
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&persisted).unwrap().count(), 0);
+
+        fs::remove_dir(version.join(PORTABLE_DIRECTORY)).unwrap();
+        fs::remove_dir(redirected_persist).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_webview_directory_must_not_be_redirected() {
+        let fixture = Fixture::new();
+        let scoop = fixture.0.join("scoop");
+        let version = scoop.join("apps/jesses/0.1.0");
+        let persisted = scoop.join("persist/jesses/jesses-data");
+        let outside = fixture.0.join("outside");
+        for directory in [&version, &persisted, &outside] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for directory in ["config", "data", "cache", "logs"] {
+            fs::create_dir(persisted.join(directory)).unwrap();
+        }
+        fs::write(version.join(PORTABLE_MARKER), b"1\n").unwrap();
+        create_junction(&version.join(PORTABLE_DIRECTORY), &persisted);
+        create_junction(&persisted.join("cache/webview"), &outside);
+
+        let paths = AppPaths::resolve(&version.join("jesses.exe"), fixture.defaults()).unwrap();
+        assert!(paths.prepare().is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_dir(persisted.join("cache/webview")).unwrap();
+        fs::remove_dir(version.join(PORTABLE_DIRECTORY)).unwrap();
     }
 }

@@ -10,9 +10,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
+from urllib.parse import urlsplit
 import zipfile
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -167,26 +169,97 @@ def verify(directory: Path) -> dict:
     return manifest
 
 
+def verify_portable_archive(archive_path: Path) -> dict:
+    regular_file(archive_path)
+    with zipfile.ZipFile(archive_path) as bundle:
+        members = bundle.infolist()
+        actual = {}
+        actual_casefolded = {}
+        for member in members:
+            name = member.filename
+            relative_path(name)
+            if member.is_dir() or stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError(f"Portable archives may contain only ordinary files: {name}")
+            folded = name.casefold()
+            if name in actual:
+                raise ValueError(f"Duplicate portable archive entry: {name}")
+            if folded in actual_casefolded:
+                raise ValueError(
+                    f"Case-colliding portable archive entries: {actual_casefolded[folded]} and {name}"
+                )
+            actual[name] = member
+            actual_casefolded[folded] = name
+
+        manifest_member = actual.get(MANIFEST)
+        if manifest_member is None:
+            raise ValueError("The portable archive has no package manifest.")
+        if manifest_member.file_size > 16 * 1024 * 1024:
+            raise ValueError("The portable archive package manifest is unreasonably large.")
+        package_manifest = json.loads(bundle.read(manifest_member))
+        if (
+            package_manifest.get("schemaVersion") != 1
+            or package_manifest.get("product") != "jesses"
+            or package_manifest.get("target") != "x86_64-pc-windows-msvc"
+            or package_manifest.get("storage") != "portable"
+        ):
+            raise ValueError("Scoop requires a Jesses Windows x64 portable package.")
+
+        expected = {}
+        expected_casefolded = {}
+        for entry in package_manifest["files"]:
+            name = entry["path"]
+            relative_path(name)
+            folded = name.casefold()
+            if name == MANIFEST or name in expected:
+                raise ValueError(f"Duplicate or reserved package manifest entry: {name}")
+            if folded in expected_casefolded:
+                raise ValueError(
+                    f"Case-colliding package manifest entries: {expected_casefolded[folded]} and {name}"
+                )
+            expected[name] = entry
+            expected_casefolded[folded] = name
+        if set(actual) != set(expected) | {MANIFEST}:
+            raise ValueError("Portable archive contents differ from package-manifest.json.")
+        if not {"jesses.exe", "jesses.portable"}.issubset(expected):
+            raise ValueError("The portable archive is missing its executable or storage marker.")
+        if any(
+            folded == "jesses-data" or folded.startswith("jesses-data/")
+            for folded in expected_casefolded
+        ):
+            raise ValueError("User data must never be included in a portable archive.")
+
+        for name, entry in expected.items():
+            member = actual[name]
+            if member.file_size != entry["size"]:
+                raise ValueError(f"Portable archive size mismatch: {name}")
+            digest_value = hashlib.sha256()
+            size = 0
+            with bundle.open(member) as source:
+                while block := source.read(1024 * 1024):
+                    digest_value.update(block)
+                    size += len(block)
+            if size != entry["size"] or digest_value.hexdigest() != entry["sha256"]:
+                raise ValueError(f"Portable archive payload hash mismatch: {name}")
+        if bundle.read(actual["jesses.portable"]) != b"1\n":
+            raise ValueError("The portable archive has an invalid storage marker.")
+    return package_manifest
+
+
 def archive(directory: Path, output: Path) -> None:
     verify(directory)
     with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
         for path in sorted(directory.rglob("*")):
             if path.is_file():
                 bundle.write(path, path.relative_to(directory).as_posix())
-    # Verify stored content directly, without unsafe archive extraction.
-    with zipfile.ZipFile(output) as bundle:
-        if bundle.testzip() is not None:
-            raise ValueError("The portable ZIP failed its CRC check.")
-        for name in bundle.namelist():
-            relative_path(name)
-            if hashlib.sha256(bundle.read(name)).hexdigest() != digest(directory / relative_path(name)):
-                raise ValueError(f"Archive content mismatch: {name}")
+    verify_portable_archive(output)
 
 
 def collect(build_directory: Path, destination: Path, target: str, profile: str, tool_resources: Path | None = None) -> None:
     _, version = configuration()
     destination.mkdir(parents=True, exist_ok=False)
-    extensions = {"nsis": "*.exe"} if target == "x86_64-pc-windows-msvc" else {"appimage": "*.AppImage", "deb": "*.deb"}
+    # Windows distribution is the portable ZIP used by Scoop. Old NSIS output
+    # in a reused build directory must never become a release artifact.
+    extensions = {} if target == "x86_64-pc-windows-msvc" else {"appimage": "*.AppImage", "deb": "*.deb"}
     for kind, pattern in extensions.items():
         candidates = sorted((build_directory / "bundle" / kind).glob(pattern))
         if len(candidates) != 1:
@@ -229,6 +302,28 @@ def diagnostics(directory: Path, sanitized_path: bool) -> dict:
             "qualification": contract["qualification"]}
 
 
+def scoop_manifest(archive_path: Path, url: str, destination: Path) -> None:
+    location = urlsplit(url)
+    local_test = location.scheme == "http" and location.hostname in {"127.0.0.1", "localhost", "::1"}
+    if (location.scheme != "https" and not local_test) or not location.hostname or location.username or location.password:
+        raise ValueError("Use an HTTPS release URL, or a loopback HTTP URL for local qualification.")
+    package_manifest = verify_portable_archive(archive_path)
+    write_json(destination, {
+        "version": package_manifest["version"],
+        "description": "Desktop media encoding, muxing, and analysis.",
+        "homepage": "https://github.com/jkkma/jesses",
+        "license": "GPL-3.0-only",
+        "architecture": {"64bit": {"url": url, "hash": digest(archive_path)}},
+        "bin": "jesses.exe",
+        "persist": "jesses-data",
+        "notes": [
+            "Requires the Microsoft Edge WebView2 runtime already available on the machine.",
+            "Preferences, history, recovery metadata and browser state are kept in jesses-data and persist across Scoop updates and ordinary uninstall.",
+            "Keep source media and recovery workspace paths unchanged while a job is saved for resume.",
+        ],
+    })
+
+
 def find_on_path(executable: str, search_path: str) -> str | None:
     # Never let a Windows CWD lookup or a relative PATH entry supply a tool.
     for entry in search_path.split(os.pathsep):
@@ -265,6 +360,10 @@ def main() -> None:
     diagnose = subcommands.add_parser("diagnostics")
     diagnose.add_argument("directory", type=Path)
     diagnose.add_argument("--sanitized-path", action="store_true")
+    scoop = subcommands.add_parser("scoop")
+    scoop.add_argument("--archive", type=Path, required=True)
+    scoop.add_argument("--url", required=True)
+    scoop.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "assemble":
         result = assemble(args.executable, args.destination, args.target, args.profile, args.portable, args.tool_resources)
@@ -278,6 +377,9 @@ def main() -> None:
     elif args.command == "collect":
         collect(args.build_directory, args.destination, args.target, args.profile, args.tool_resources)
         print(f"Collected unsigned artifacts: {args.destination}")
+    elif args.command == "scoop":
+        scoop_manifest(args.archive, args.url, args.destination)
+        print(f"Wrote Scoop manifest: {args.destination}")
     else:
         print(json.dumps(diagnostics(args.directory, args.sanitized_path), indent=2))
 

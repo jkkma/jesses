@@ -1,4 +1,4 @@
-name: Unsigned desktop packages
+name: Portable Windows package
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ jobs:
         include:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-            bundles: nsis
           # Linux packaging is deferred. The guarded steps below remain for a
           # deliberate future reactivation of the Linux matrix lane.
     runs-on: ${{ matrix.os }}
@@ -54,6 +53,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf libfuse2 nasm yasm cmake meson ninja-build autoconf automake libtool pkg-config patch git xxd gperf
       - run: pnpm install --frozen-lockfile
       - run: python scripts/test-package-desktop.py
+      - name: Verify isolated Scoop qualification helpers
+        if: runner.os == 'Windows'
+        run: python scripts/test-qualify-scoop.py
       - run: python scripts/test-package-toolchain.py
       - run: python scripts/test-package-standalone.py
       - name: Verify Linux standalone package recipes
@@ -153,12 +155,17 @@ jobs:
             python @gateArguments
             if ($LASTEXITCODE -ne 0) { throw 'The packaged av1an native gate failed.' }
           }
-      - name: Build unsigned native bundles
+      - name: Build portable application
         shell: bash
         run: |
           build_args=()
           if [ "$PACKAGE_PROFILE" = debug ]; then build_args+=(--debug); fi
-          pnpm tauri build --target "$PACKAGE_TARGET" --bundles "$PACKAGE_BUNDLES" --config "$RUNNER_TEMP/jesses-bundled-tools/tauri-tools.conf.json" "${build_args[@]}"
+          if [ "$RUNNER_OS" = Windows ]; then
+            build_args+=(--no-bundle)
+          else
+            build_args+=(--bundles "$PACKAGE_BUNDLES")
+          fi
+          pnpm tauri build --target "$PACKAGE_TARGET" --config "$RUNNER_TEMP/jesses-bundled-tools/tauri-tools.conf.json" "${build_args[@]}"
       - name: Restore verified tools after Linux dependency deployment
         if: runner.os == 'Linux'
         shell: bash
@@ -170,7 +177,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: python scripts/package-desktop.py diagnostics "$RUNNER_TEMP/jesses-packages/portable" --sanitized-path
-      - name: Verify native tool discovery from actual installer resources
+      - name: Verify native tool discovery from extracted package resources
         shell: bash
         run: |
           suffix=""
@@ -213,7 +220,6 @@ jobs:
         with:
           name: jesses-${{ matrix.target }}-${{ inputs.profile }}-unsigned
           path: |
-            ${{ runner.temp }}/jesses-packages/*.exe
             ${{ runner.temp }}/jesses-packages/*.zip
             ${{ runner.temp }}/jesses-packages/*.AppImage
             ${{ runner.temp }}/jesses-packages/*.deb

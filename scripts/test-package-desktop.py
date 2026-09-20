@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import warnings
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -51,6 +52,122 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             package.assemble(self.executable, self.destination, "x86_64-pc-windows-msvc", "debug", True)
         self.assertEqual((self.destination / package.MANIFEST).read_bytes(), original)
+
+    def test_scoop_manifest_binds_portable_archive_and_persists_one_data_directory(self):
+        archive = self.root / "portable.zip"
+        package.archive(self.destination, archive)
+        destination = self.root / "jesses.json"
+        package.scoop_manifest(archive, "https://example.test/releases/portable.zip", destination)
+        manifest = json.loads(destination.read_text())
+        self.assertEqual(manifest["architecture"]["64bit"]["hash"], package.digest(archive))
+        self.assertEqual(manifest["persist"], "jesses-data")
+        self.assertEqual(manifest["bin"], "jesses.exe")
+        self.assertNotIn("installer", manifest)
+        self.assertNotIn("uninstaller", manifest)
+        with self.assertRaises(ValueError):
+            package.scoop_manifest(archive, "http://example.test/portable.zip", self.root / "invalid.json")
+        with self.assertRaises(FileExistsError):
+            package.scoop_manifest(archive, "https://example.test/releases/portable.zip", destination)
+
+    def test_scoop_manifest_rejects_unverified_archive_contents(self):
+        valid = self.root / "valid-portable.zip"
+        package.archive(self.destination, valid)
+
+        def rewrite(name, transform):
+            candidate = self.root / name
+            with zipfile.ZipFile(valid) as source, zipfile.ZipFile(candidate, "w") as output:
+                for member in source.infolist():
+                    output.writestr(member, transform(member.filename, source.read(member)))
+            return candidate
+
+        invalid = [
+            rewrite(
+                "tampered-payload.zip",
+                lambda name, content: content + b"tampered" if name == "jesses.exe" else content,
+            ),
+            rewrite("extra-inventory.zip", lambda _name, content: content),
+        ]
+        with zipfile.ZipFile(invalid[-1], "a") as output:
+            output.writestr("unexpected.bin", b"unexpected")
+
+        user_data = self.root / "case-variant-user-data.zip"
+        payload = b"must not ship"
+        with zipfile.ZipFile(valid) as source, zipfile.ZipFile(user_data, "w") as output:
+            manifest = json.loads(source.read(package.MANIFEST))
+            manifest["files"].append(
+                {
+                    "path": "JESSES-DATA/private.json",
+                    "size": len(payload),
+                    "sha256": package.hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            for member in source.infolist():
+                content = source.read(member)
+                if member.filename == package.MANIFEST:
+                    content = json.dumps(manifest).encode("utf-8")
+                output.writestr(member, content)
+            output.writestr("JESSES-DATA/private.json", payload)
+        invalid.append(user_data)
+
+        for index, entries in enumerate(
+            [
+                [("../escaped.exe", b"unsafe")],
+                [("same.exe", b"first"), ("same.exe", b"second")],
+                [("jesses.exe", b"first"), ("JESSES.exe", b"second")],
+            ]
+        ):
+            candidate = self.root / f"invalid-names-{index}.zip"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(candidate, "w") as output:
+                    for name, content in entries:
+                        output.writestr(name, content)
+            invalid.append(candidate)
+
+        for index, candidate in enumerate(invalid):
+            destination = self.root / f"rejected-{index}.json"
+            with self.subTest(candidate=candidate.name), self.assertRaises(ValueError):
+                package.scoop_manifest(
+                    candidate,
+                    "https://example.test/releases/portable.zip",
+                    destination,
+                )
+            self.assertFalse(destination.exists())
+
+    def test_windows_collection_requires_only_executable_and_ignores_stale_nsis(self):
+        build = self.root / "build"
+        build.mkdir()
+        (build / "jesses.exe").write_bytes(self.executable.read_bytes())
+        stale = build / "bundle/nsis"
+        stale.mkdir(parents=True)
+        (stale / "old-setup.exe").write_bytes(b"stale installer")
+        output = self.root / "collected"
+        with patch.object(package, "source_revision", return_value={}):
+            package.collect(build, output, "x86_64-pc-windows-msvc", "release")
+        manifest = json.loads((output / "artifact-manifest.json").read_text())
+        self.assertFalse(any(item["path"].endswith(".exe") for item in manifest["artifacts"]))
+        archives = list(output.glob("*.zip"))
+        self.assertEqual(len(archives), 1)
+        extracted = self.root / "extracted-zip"
+        extracted.mkdir()
+        verifier.extract_portable(archives[0], extracted)
+        self.assertEqual(package.verify(extracted)["storage"], "portable")
+        self.assertEqual((extracted / "jesses.exe").read_bytes(), self.executable.read_bytes())
+
+    def test_zip_extraction_rejects_traversal_duplicates_and_redirected_entries(self):
+        for index, names in enumerate([["../escaped.exe"], ["same.exe", "same.exe"], ["link.exe"]]):
+            archive = self.root / f"invalid-{index}.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                for name in names:
+                    entry = zipfile.ZipInfo(name)
+                    if name == "link.exe":
+                        entry.external_attr = 0o120777 << 16
+                    bundle.writestr(entry, b"invalid")
+            destination = self.root / f"invalid-{index}"
+            destination.mkdir()
+            with self.assertRaises((ValueError, FileExistsError)):
+                verifier.extract_portable(archive, destination)
+        self.assertFalse((self.root / "escaped.exe").exists())
 
     def test_modified_missing_and_extra_resources_are_detected(self):
         resource = self.destination / "resources/runtime-contract.json"

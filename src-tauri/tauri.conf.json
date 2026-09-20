@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "jesses",
         "width": 1280,
         "height": 850,
@@ -28,7 +29,7 @@
     }
   },
   "bundle": {
-    "active": true,
+    "active": false,
     "targets": "all",
     "shortDescription": "Desktop media encoding, muxing, and analysis",
     "copyright": "Created by jkkma",
@@ -41,10 +42,6 @@
       "../LICENSE": "resources/LICENSE",
       "../THIRD_PARTY_NOTICES.md": "resources/THIRD_PARTY_NOTICES.md",
       "../licenses/shadcn-svelte-MIT.txt": "resources/licenses/shadcn-svelte-MIT.txt"
-    },
-    "windows": {
-      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
-      "nsis": { "installMode": "currentUser", "compression": "zlib" }
     },
     "linux": {
       "deb": { "recommends": ["ffmpeg"] }

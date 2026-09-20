@@ -1,22 +1,47 @@
-"""Extract native installers without installing them and verify their tool resources.
+"""Extract distribution archives and verify their bundled tool resources.
 
-This checks actual NSIS/AppImage/DEB payloads. It does not establish an interactive
-installation, clean-machine compatibility, or the desktop window's operation.
+This checks the Windows portable ZIP and retained Linux AppImage/DEB payloads.
+It does not establish Scoop persistence, clean-machine compatibility, or the
+desktop window's operation.
 """
 
 import argparse
 import importlib.util
 import json
 from pathlib import Path
-import shutil
+import stat
 import subprocess
 import sys
+import zipfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("package", ROOT / "scripts/package-desktop.py")
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+
+
+def extract_portable(artifact, destination):
+    # Validate all names before writing. Exclusive creation rejects duplicate or
+    # case-colliding members instead of silently replacing an earlier payload.
+    with zipfile.ZipFile(artifact) as archive:
+        members = archive.infolist()
+        for member in members:
+            package.relative_path(member.filename)
+            if stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError("Portable archives must not contain symbolic links.")
+        for member in members:
+            path = destination / package.relative_path(member.filename)
+            if member.is_dir():
+                path.mkdir(parents=True, exist_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, path.open("xb") as output:
+                while block := source.read(1024 * 1024):
+                    output.write(block)
+    manifest = package.verify(destination)
+    if manifest["storage"] != "portable":
+        raise ValueError("The Windows archive must select portable storage.")
 
 
 def verify_resources(resources):
@@ -62,27 +87,23 @@ def main():
     for record in manifest["artifacts"]:
         relative = package.relative_path(record["path"])
         if len(relative.parts) != 1:
-            raise ValueError("An installer artifact must be a direct package-directory file.")
+            raise ValueError("A distribution artifact must be a direct package-directory file.")
         artifact = packages / relative
         extension = artifact.suffix.lower()
-        if extension not in {".exe", ".appimage", ".deb"}:
+        expected_extensions = {".zip"} if manifest["target"] == "x86_64-pc-windows-msvc" else {".appimage", ".deb"}
+        if extension not in expected_extensions:
             continue
         package.regular_file(artifact)
         if package.digest(artifact) != record["sha256"]:
-            raise ValueError(f"The installer checksum changed: {artifact.name}")
+            raise ValueError(f"The distribution checksum changed: {artifact.name}")
         extracted = destination / artifact.name
         extracted.mkdir()
-        if extension == ".exe":
-            extractor = shutil.which("7z")
-            if not extractor:
-                raise ValueError("7-Zip is required to inspect the NSIS payload without installing it.")
-            command = [extractor, "x", "-y", f"-o{extracted}", str(artifact)]
-        elif extension == ".deb":
-            command = ["dpkg-deb", "-x", str(artifact), str(extracted)]
+        if extension == ".zip":
+            extract_portable(artifact, extracted)
         else:
-            command = [str(artifact), "--appimage-extract"]
-        with (extracted / "extraction.log").open("x", encoding="utf-8") as output:
-            subprocess.run(command, cwd=extracted, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=600)
+            command = ["dpkg-deb", "-x", str(artifact), str(extracted)] if extension == ".deb" else [str(artifact), "--appimage-extract"]
+            with (extracted / "extraction.log").open("x", encoding="utf-8") as output:
+                subprocess.run(command, cwd=extracted, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=600)
         candidates = list(extracted.rglob("resources/tools/manifest.json"))
         if len(candidates) != 1:
             raise ValueError(f"Expected exactly one tool resource root inside {artifact.name}.")
@@ -98,7 +119,7 @@ def main():
     expected_count = 1 if manifest["target"] == "x86_64-pc-windows-msvc" else 2
     if len(receipts) != expected_count:
         raise ValueError("The platform artifact set was incomplete.")
-    report = {"schemaVersion": 1, "target": manifest["target"], "artifacts": receipts, "qualification": "Native tool discovery from extracted installer resources with external tools unavailable; interactive installation and clean-machine operation are separate gates."}
+    report = {"schemaVersion": 1, "target": manifest["target"], "artifacts": receipts, "qualification": "Native tool discovery from extracted distribution resources with external tools unavailable; Scoop persistence, native workflows and clean-machine operation are separate gates."}
     (packages / "bundle-resource-qualification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
 

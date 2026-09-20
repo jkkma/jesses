@@ -422,6 +422,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            let main_window = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .cloned()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the main window configuration is missing",
+                    )
+                })?;
             let executable = std::env::current_exe()?;
             #[cfg(target_os = "linux")]
             let executable = {
@@ -444,6 +457,7 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             let log_dir = paths.job_log_dir();
             let history_dir = paths.history_dir();
+            let webview_data_dir = paths.webview_data_dir();
             app.manage(Arc::new(
                 media_runtime::preferences::PreferencesStore::open(paths.config_dir.clone()),
             ));
@@ -457,6 +471,12 @@ pub fn run() {
                 ))),
                 subscription: Arc::new(AtomicU64::new(0)),
             });
+            let mut main_window =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?;
+            if let Some(data_directory) = webview_data_dir {
+                main_window = main_window.data_directory(data_directory);
+            }
+            main_window.build()?;
             completion::start(app.handle().clone());
             Ok(())
         })

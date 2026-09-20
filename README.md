@@ -29,8 +29,9 @@ supports configurable chunk readers and quality targets, live pause/continue,
 and durable stop/resume. Encoding forms offer source previews and automatic crop
 proposals; Files offers bitrate charts and matched-interval quality analysis. Audio controls offer measured
 loudness and explicit flat gain. General preferences and recent media persist.
-Unsigned Windows packages and bundled media tools are being qualified. This is a
-development build; final Windows artifacts, signing and clean-machine checks
+Windows distribution is a portable ZIP, installed and updated through Scoop.
+Portable packages and bundled media tools are being qualified. This is a
+development build; final Windows artifacts, Scoop persistence and clean-machine checks
 remain in progress. Linux and macOS native support are deferred.
 
 ## Media utilities and source inspection
@@ -606,7 +607,7 @@ pnpm tauri build --debug --no-bundle
 Native CI targets Windows x64. Linux and macOS native support are deferred. The
 frontend job uses an Ubuntu browser/build host, which does not establish Linux
 product support. Local unsigned Windows artifact checks are recorded in the
-[packaging documentation](docs/packaging.md); final artifact, signing and
+[packaging documentation](docs/packaging.md); final artifact, Scoop lifecycle and
 clean-machine qualification remain separate gates.
 
 ## Development layout

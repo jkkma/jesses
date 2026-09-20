@@ -1,12 +1,9 @@
-# Desktop packages and data locations
+# Portable packages, Scoop and data locations
 
-The manual **Unsigned desktop packages** workflow builds a Windows x64 installer
-and portable ZIP. It uploads artifacts to that workflow run and does not publish
-a release. Linux and macOS packaging are deferred.
-
-The Windows installer uses zlib compression. Most source payloads are already
-compressed archives; zlib keeps complete-source package iteration practical
-while retaining the same verified installer contents.
+The manual **Portable Windows package** workflow builds the Windows x64 portable
+ZIP used by Scoop. It uploads artifacts to that workflow run and does not publish
+a release. Windows distribution does not use an NSIS installer. Linux and macOS
+packaging are deferred.
 
 The workflow includes the pinned SVT-AV1 5fish and SVT-AV1-HDR binaries, their
 matching complete source archives and license/patent notices. These upstream
@@ -60,31 +57,68 @@ the permitted PATH fallback for tools that are not bundled. A corrupt bundled
 entry fails explicitly. No PATH mutation or alternate encoder substitution is
 performed. The selected tool is validated again before each media job.
 
-The Windows installer uses a per-user installation and downloads the WebView2
-bootstrapper if the runtime is missing. That first installation requires internet
-access. The portable ZIP requires an already installed WebView2 runtime. An offline
-runtime bundle, signing and clean-machine installation trials remain open gates.
+The portable application requires an already installed WebView2 runtime. It does
+not install a runtime or register an uninstaller. Release qualification must cover
+the exact ZIP, Scoop launch/update/uninstall behavior, preserved data and operation on a
+clean machine with the documented dependencies available.
 Any future Linux reactivation will require fresh native and clean-machine
 qualification for the intended distributions and system libraries.
 
 ## Storage
 
-An ordinary installed executable preserves the existing platform data directory
-and its `jobs` history subdirectory. Logs remain under the platform log directory.
+Development and older unmarked builds preserve the existing platform data
+directory and its `jobs` history subdirectory. Their logs remain under the platform log directory.
 Application resources are never used as writable storage.
 
 The Windows portable ZIP contains a regular `jesses.portable` file with `1` as its
 version. Its presence beside the executable selects `jesses-data` in that same
 directory, with separate `config`, `data`, `cache` and `logs` subdirectories. Saved
-jobs go to `jesses-data/data/jobs`; job logs go to `jesses-data/logs/jobs`. Place the
-portable folder somewhere writable. An invalid marker, redirected data directory
-or write failure is reported; the app does not silently switch to another history
-store. Portable mode never imports or changes installed history.
+jobs go to `jesses-data/data/jobs`; job logs go to `jesses-data/logs/jobs`. Browser
+state is kept under the portable cache. Scoop persists the complete `jesses-data`
+directory using its normal directory junction. The app resolves that root once
+and validates its writable subdirectories. An invalid marker, redirected child
+directory or write failure is reported; it does not silently switch to another
+history store. Portable mode never imports or changes preexisting profile history.
 
 Keep the complete `jesses-data` directory when moving a portable installation.
 Recovery records retain absolute source/output paths, which are validated before
 resume. Do not move source media or saved recovery workspaces while a job is kept
 for resume. Cache cleanup must not delete `data` or job recovery folders.
+
+## Scoop manifest
+
+Generate the manifest from the exact verified archive and its immutable HTTPS
+release URL after choosing the release asset location:
+
+```sh
+python scripts/package-desktop.py scoop --archive target/unsigned-windows-package/jesses_0.1.0_x86_64-pc-windows-msvc_release_portable.zip --url https://github.com/jkkma/jesses/releases/download/v0.1.0/jesses_0.1.0_x86_64-pc-windows-msvc_release_portable.zip --destination target/jesses.json
+```
+
+This command records the ZIP's SHA-256 and version, exposes `jesses.exe`, and sets
+`persist` to `jesses-data`. The example URL is not a published-release claim.
+Local acceptance can use a loopback HTTP URL instead. Do not persist individual
+preference/history files: atomic replacement would break Scoop's file hard links.
+Ordinary `scoop uninstall jesses` retains persisted data; Scoop's explicit purge
+option removes it. Release qualification must test update, reset and ordinary
+uninstall/reinstall against disposable data before publishing the manifest.
+
+On Windows, `scripts/qualify-scoop.py` runs that lifecycle in a new disposable
+Scoop root. Run `prepare --root <absolute-evidence-folder>/scoop --archive <zip>`,
+then `install --root <same-root>`. Launch the generated Jesses shim and complete a
+native media job. Close Jesses before running `finish --root <same-root>`.
+The helper retains logs and content hashes, and checks that the user's Scoop
+configuration, buckets, PATH and existing Jesses profile are unchanged. It uses a
+copy of Scoop with environment writes confined to the child process, so it tests
+the shim and filesystem lifecycle without qualifying user PATH registration.
+Both test version labels use the supplied archive; this checks data persistence
+and relocation, not compatibility between two distinct release binaries.
+
+If review produces a rebuilt candidate, run
+`final-update --root <same-root> --archive <final-zip>` after `finish`. This updates
+through Scoop to a third test label and writes a separate receipt while preserving
+the original lifecycle evidence. Launch the new shim target and verify restored
+history and a native media job separately; the update receipt alone proves archive
+installation and persisted bytes, not successful application startup or encoding.
 
 ## Local packaging
 
@@ -93,6 +127,7 @@ Run the packaging invariant checks first:
 
 ```sh
 python scripts/test-package-desktop.py
+python scripts/test-qualify-scoop.py
 python scripts/test-package-toolchain.py
 python scripts/test-package-av1an.py
 cargo test -p jesses --lib --locked paths::tests
@@ -102,7 +137,7 @@ Build the platform bundle from a fresh target output. For Windows:
 
 ```sh
 python scripts/stage-bundled-tools.py --destination target/packaged-tools --target x86_64-pc-windows-msvc
-pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config target/packaged-tools/tauri-tools.conf.json
+pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle --config target/packaged-tools/tauri-tools.conf.json
 python scripts/package-desktop.py collect --build-directory target/x86_64-pc-windows-msvc/release --destination target/unsigned-windows-package --target x86_64-pc-windows-msvc --profile release --tool-resources target/packaged-tools/resources/tools
 ```
 
@@ -134,12 +169,13 @@ build inputs; byte-for-byte reproducibility across hosts remains a separate gate
 The retained Linux recipes use `--target x86_64-unknown-linux-gnu --bundles
 appimage,deb` and the corresponding target directory. They are documented for
 future reactivation and are not run by the current workflow. Every packaging
-destination must be new: scripts do not overwrite existing artifacts. If multiple
-old installers exist in the build's bundle directory, collection refuses the
-ambiguous result.
+destination must be new: scripts do not overwrite existing artifacts. Windows
+collection only needs the built executable and verified tools; stale installer
+files in the build directory are ignored.
 
-`collect` copies installers and license/dependency records, produces the Windows
-portable ZIP, and records SHA-256 hashes in `SHA256SUMS` and JSON manifests.
+`collect` copies license/dependency records, produces the Windows portable ZIP,
+and records SHA-256 hashes in `SHA256SUMS` and JSON manifests. The retained Linux
+path collects its native bundles only when deliberately reactivated.
 The manifest records the packaging checkout and whether it had local changes;
 the binary hash identifies the supplied executable. This is not an attestation
 that an independently supplied binary was built from that checkout.
@@ -154,7 +190,7 @@ python scripts/package-desktop.py diagnostics target/unsigned-windows-package/po
 The native tool probe exercises bundled discovery with external tool overrides,
 managed installations and the ordinary tool search path removed. After building
 the probe, verify both the staging directory and the resources extracted from the
-actual installer. Extraction does not install the application.
+actual portable ZIP. Extraction does not register or install the application.
 
 ```sh
 cargo build -p media-runtime --example package_tools --locked
@@ -174,4 +210,4 @@ reports the bundled inventory and dependencies visible on a restricted PATH. It 
 not launch the native app, inspect its managed encoder installs, install tools,
 touch job history, or establish clean-machine/runtime qualification. Complete
 release qualification still requires native import, media output, cancellation,
-recovery and platform resource discovery from the final installed artifacts.
+recovery and resource discovery through Scoop using the final portable artifacts.

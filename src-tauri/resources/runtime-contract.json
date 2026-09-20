@@ -14,9 +14,9 @@
   "platforms": {
     "x86_64-pc-windows-msvc": {
       "runtime": "Microsoft Edge WebView2 Runtime",
-      "installerRuntimeStrategy": "Download and install WebView2 when absent; internet access is required.",
       "portableRuntimeStrategy": "WebView2 must already be installed. The portable archive does not contain the runtime.",
-      "artifacts": ["nsis", "portableZip"]
+      "distribution": "Portable ZIP installed and updated through Scoop; persist the complete jesses-data directory.",
+      "artifacts": ["portableZip"]
     },
     "x86_64-unknown-linux-gnu": {
       "runtime": "WebKitGTK 4.1 and GTK 3; packaged on Ubuntu 24.04",
