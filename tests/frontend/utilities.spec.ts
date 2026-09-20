@@ -172,6 +172,7 @@ test('keyframe cut submits the reviewed source interval and shows validation', a
 });
 test('image sequence uses reviewed order instead of sorting source names', async ({ page }) => {
   await setup(page);
+  await page.getByText('Images and sequences', { exact: true }).click();
   const region = page.getByRole('region', { name: 'Images and sequences', exact: true });
   await region.getByRole('button', { name: 'Choose images', exact: true }).click();
   await region.getByRole('button', { name: 'Move image 2 up', exact: true }).click();

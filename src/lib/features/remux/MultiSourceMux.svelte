@@ -181,7 +181,7 @@
 </script>
 
 <section class="mux-workspace" aria-label="Combine source tracks">
-  <div class="panel mux-panel">
+  <div class="panel mux-panel source-panel">
     <h2>Source files</h2>
     <p class="small-muted">
       Choose imported files, then arrange the tracks below. Sources stay read-only.
@@ -223,102 +223,108 @@
     </div>
   </div>
 
-  <div class="panel mux-panel">
+  <div class="panel mux-panel track-panel">
     <h2>Output track order</h2>
     <p class="small-muted">
       Unchanged fields preserve source metadata. Clear a title or language to remove it. Attachments
       follow media tracks.
     </p>
-    {#each tracks as track, position (track.key)}
-      {@const label = `${sourceName(track.sourceId)} #${track.stream.index}`}
-      <div class="track" aria-label={`Track ${label}`}>
-        <div class="track-heading">
-          <label
-            ><input
-              type="checkbox"
-              aria-label={`Include ${label}`}
-              bind:checked={track.included}
-              disabled={locked}
-            /><span
-              ><strong>{sourceName(track.sourceId)} · #{track.stream.index}</strong><small
-                >{track.stream.kind} · {track.stream.codec ?? 'Unknown codec'}</small
-              ></span
-            ></label
-          >
-          <div class="track-order">
-            <button
-              class="icon-button"
-              aria-label={`Move ${label} up`}
-              disabled={locked || !canMove(position, -1)}
-              onclick={() => move(position, -1)}><ArrowUp size={14} /></button
-            ><button
-              class="icon-button"
-              aria-label={`Move ${label} down`}
-              disabled={locked || !canMove(position, 1)}
-              onclick={() => move(position, 1)}><ArrowDown size={14} /></button
+    <div class="tracks">
+      {#each tracks as track, position (track.key)}
+        {@const label = `${sourceName(track.sourceId)} #${track.stream.index}`}
+        <div class="track" aria-label={`Track ${label}`}>
+          <div class="track-heading">
+            <label
+              ><input
+                type="checkbox"
+                aria-label={`Include ${label}`}
+                bind:checked={track.included}
+                disabled={locked}
+              /><span
+                ><strong>{sourceName(track.sourceId)} · #{track.stream.index}</strong><small
+                  >{track.stream.kind} · {track.stream.codec ?? 'Unknown codec'}</small
+                ></span
+              ></label
             >
+            <div class="track-order">
+              <button
+                class="icon-button"
+                aria-label={`Move ${label} up`}
+                disabled={locked || !canMove(position, -1)}
+                onclick={() => move(position, -1)}><ArrowUp size={14} /></button
+              ><button
+                class="icon-button"
+                aria-label={`Move ${label} down`}
+                disabled={locked || !canMove(position, 1)}
+                onclick={() => move(position, 1)}><ArrowDown size={14} /></button
+              >
+            </div>
           </div>
-        </div>
-        <div class="track-fields">
-          <div class="field">
-            <label for={`mux-title-${position}`}>Title</label><input
-              id={`mux-title-${position}`}
-              aria-label={`Title for ${label}`}
-              bind:value={track.title}
-              disabled={locked || !track.included}
-            />
-          </div>
-          {#if track.stream.kind !== 'attachment'}
+          <div class="track-fields">
             <div class="field">
-              <label for={`mux-language-${position}`}>Language</label><input
-                id={`mux-language-${position}`}
-                aria-label={`Language for ${label}`}
-                bind:value={track.language}
+              <label for={`mux-title-${position}`}>Title</label><input
+                id={`mux-title-${position}`}
+                aria-label={`Title for ${label}`}
+                bind:value={track.title}
                 disabled={locked || !track.included}
-                placeholder="eng"
               />
             </div>
-            <div class="field">
-              <label for={`mux-default-${position}`}>Default</label><select
-                id={`mux-default-${position}`}
-                aria-label={`Default for ${label}`}
-                bind:value={track.defaultFlag}
-                disabled={locked || !track.included}
-                ><option value="">Preserve</option><option value="yes">Yes</option><option
-                  value="no">No</option
-                ></select
-              >
-            </div>
-            <div class="field">
-              <label for={`mux-forced-${position}`}>Forced</label><select
-                id={`mux-forced-${position}`}
-                aria-label={`Forced for ${label}`}
-                bind:value={track.forcedFlag}
-                disabled={locked || !track.included}
-                ><option value="">Preserve</option><option value="yes">Yes</option><option
-                  value="no">No</option
-                ></select
-              >
-            </div>
-          {/if}
+            {#if track.stream.kind !== 'attachment'}
+              <div class="field">
+                <label for={`mux-language-${position}`}>Language</label><input
+                  id={`mux-language-${position}`}
+                  aria-label={`Language for ${label}`}
+                  bind:value={track.language}
+                  disabled={locked || !track.included}
+                  placeholder="eng"
+                />
+              </div>
+              <div class="field">
+                <label for={`mux-default-${position}`}>Default</label><select
+                  id={`mux-default-${position}`}
+                  aria-label={`Default for ${label}`}
+                  bind:value={track.defaultFlag}
+                  disabled={locked || !track.included}
+                  ><option value="">Preserve</option><option value="yes">Yes</option><option
+                    value="no">No</option
+                  ></select
+                >
+              </div>
+              <div class="field">
+                <label for={`mux-forced-${position}`}>Forced</label><select
+                  id={`mux-forced-${position}`}
+                  aria-label={`Forced for ${label}`}
+                  bind:value={track.forcedFlag}
+                  disabled={locked || !track.included}
+                  ><option value="">Preserve</option><option value="yes">Yes</option><option
+                    value="no">No</option
+                  ></select
+                >
+              </div>
+            {/if}
+          </div>
         </div>
-      </div>
-    {/each}
+      {/each}
+    </div>
   </div>
 
-  <div class="panel mux-panel">
-    <div class="field">
-      <label for="mux-destination">Combined destination</label><input
-        id="mux-destination"
-        bind:value={destination}
-        disabled={locked}
-        placeholder="Choose a new media file"
-      />
-      <ContainerOptions
-        value={destinationContainer(destination)}
-        onchange={(value) => (destination = containerDestination(destination, value))}
-        disabled={locked}
-      />
+  <div class="panel mux-panel destination-panel">
+    <div class="destination-fields">
+      <div class="field">
+        <label for="mux-destination">Combined destination</label><input
+          id="mux-destination"
+          bind:value={destination}
+          disabled={locked}
+          placeholder="Choose a new media file"
+        />
+      </div>
+      <div class="container-choice">
+        <ContainerOptions
+          value={destinationContainer(destination)}
+          onchange={(value) => (destination = containerDestination(destination, value))}
+          disabled={locked}
+        />
+      </div>
     </div>
     <p class="small-muted">
       Existing files are never replaced. Packet payloads, timing, track metadata, and chapters are
@@ -339,14 +345,28 @@
 <style>
   .mux-workspace {
     display: grid;
-    gap: 20px;
+    grid-template-columns: minmax(18rem, 0.78fr) minmax(0, 1.35fr);
+    grid-template-areas:
+      'sources tracks'
+      'destination tracks';
+    gap: 16px;
+    align-items: start;
     min-width: 0;
   }
   .mux-panel {
-    padding: 20px;
+    padding: 14px;
     min-width: 0;
     display: grid;
-    gap: 14px;
+    gap: 12px;
+  }
+  .source-panel {
+    grid-area: sources;
+  }
+  .track-panel {
+    grid-area: tracks;
+  }
+  .destination-panel {
+    grid-area: destination;
   }
   h2 {
     font-size: 15px;
@@ -354,7 +374,10 @@
   }
   .sources {
     display: grid;
-    gap: 12px;
+    gap: 8px;
+    max-height: min(190px, 28vh);
+    padding-right: 4px;
+    overflow-y: auto;
   }
   .sources label,
   .track-heading label {
@@ -385,11 +408,16 @@
   .owners {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 14px;
+    gap: 10px;
+  }
+  .tracks {
+    max-height: min(610px, 68vh);
+    padding-right: 4px;
+    overflow-y: auto;
   }
   .track {
     border-top: 1px solid var(--border);
-    padding-top: 14px;
+    padding: 10px 0;
     min-width: 0;
   }
   .track-heading {
@@ -397,7 +425,7 @@
     justify-content: space-between;
     gap: 10px;
     align-items: center;
-    margin-bottom: 12px;
+    margin-bottom: 9px;
   }
   .track-order,
   .actions {
@@ -410,8 +438,8 @@
   }
   .track-fields {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr));
-    gap: 12px;
+    grid-template-columns: minmax(10rem, 2fr) minmax(7rem, 0.8fr) repeat(2, minmax(6rem, 0.65fr));
+    gap: 10px;
   }
   .field {
     min-width: 0;
@@ -421,7 +449,26 @@
     width: 100%;
     min-width: 0;
   }
-  @media (max-width: 850px) {
+  .destination-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+    gap: 10px;
+    align-items: start;
+  }
+  .container-choice {
+    min-width: 0;
+  }
+  @media (max-width: 1000px) {
+    .mux-workspace {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas:
+        'sources'
+        'tracks'
+        'destination';
+    }
+    .tracks {
+      max-height: min(430px, 54vh);
+    }
     .owners,
     .track-fields {
       grid-template-columns: repeat(2, minmax(0, 1fr));

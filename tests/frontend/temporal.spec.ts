@@ -159,6 +159,7 @@ test('frame controls retain workflow drafts and submit explicit rational process
 }) => {
   await mock(page);
   const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
+  await quick.getByText('Frame processing', { exact: true }).click();
   await expect(quick.getByText(/ · Source frame rate$/)).toBeVisible();
   await quick.getByLabel('Source reconstruction', { exact: true }).selectOption('bob');
   await expect(quick.getByText(/ · Double source frame rate \(BWDIF bob\)$/)).toBeVisible();
@@ -173,6 +174,7 @@ test('frame controls retain workflow drafts and submit explicit rational process
   await quick.getByLabel('Resize filter', { exact: true }).selectOption('bicubic');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const chunked = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await chunked.getByText('Frame processing', { exact: true }).click();
   await expect(chunked.getByLabel('Source reconstruction', { exact: true })).toBeEnabled();
   await expect(chunked.getByLabel('Source reconstruction', { exact: true })).toHaveValue('off');
   await expect(chunked.getByLabel('Set output frame rate', { exact: true })).toBeEnabled();
@@ -206,7 +208,8 @@ test('batch frame processing invalidates review and preserves previously queued 
   await batch.getByLabel('Select captions.mkv', { exact: true }).check();
   await preview.click();
   const episode = batch.locator('article.episode').first();
-  await episode.locator('summary').click();
+  await episode.locator('.episode-tracks > summary').click();
+  await episode.getByText('Frame processing', { exact: true }).click();
   await episode.getByLabel('Source reconstruction', { exact: true }).selectOption('frame');
   await expect(queue).toBeDisabled();
   await episode.getByLabel('Source field order', { exact: true }).selectOption('topFirst');
@@ -226,8 +229,11 @@ test('padded capture requires an intended rate and serializes guarded cadence re
 }) => {
   await mock(page);
   const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
+  await quick.getByText('Frame processing', { exact: true }).click();
   await quick.getByLabel('Source reconstruction', { exact: true }).selectOption('exactDuplicates');
-  await expect(quick.getByText(/requires the intended constant output frame rate/)).toBeVisible();
+  await expect(quick.getByRole('alert')).toContainText(
+    'requires the intended constant output frame rate',
+  );
   await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   await quick.getByLabel('Set output frame rate', { exact: true }).check();
   await quick.getByLabel('FPS numerator', { exact: true }).fill('12');
@@ -252,6 +258,7 @@ test('av1an accepts managed QTGMC and submits its explicit preparation settings'
   await mock(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const chunked = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await chunked.getByText('Frame processing', { exact: true }).click();
   await chunked.getByLabel('Source reconstruction', { exact: true }).selectOption('qtgmcBob');
   await chunked.getByLabel('QTGMC preset', { exact: true }).selectOption('medium');
   await expect(chunked.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();

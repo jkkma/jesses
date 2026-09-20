@@ -146,14 +146,15 @@
   </section>
   {#if desktop}
     <PreferencesPanel />
-    <section class="panel scorer-panel" aria-label="Optional Vulkan quality scorer">
-      <div class="section-heading">
+    <details class="panel optional-panel scorer-panel">
+      <summary class="section-heading">
         <span class="heading-with-icon"
           ><Wrench size={15} aria-hidden="true" /><span class="eyebrow"
             >Optional Vulkan quality scorer</span
           ></span
         >
-      </div>
+        <span class="small-muted">Advanced setup</span>
+      </summary>
       <div class="scorer-content">
         <p>
           Vship can accelerate av1an SSIMULACRA2 and Butteraugli probes in an external portable
@@ -175,9 +176,13 @@
           class="text-button">Open setup guide<ExternalLink size={13} aria-hidden="true" /></a
         >
       </div>
-    </section>
-    <section class="panel storage-panel" aria-label="Application storage">
-      <div class="section-heading"><span class="eyebrow">Application storage</span></div>
+    </details>
+    <details class="panel optional-panel storage-panel" open={storageError !== null}>
+      <summary class="section-heading"
+        ><span class="eyebrow">Application storage</span><span class="small-muted"
+          >Paths & portability</span
+        ></summary
+      >
       {#if storageError}<p class="storage-error" role="alert">{storageError}</p>
       {:else if !locations.length}<p class="small-muted storage-error">
           Reading application locations…
@@ -196,7 +201,7 @@
         Portable packages keep preferences, history and logs beside the app. Installed copies use
         your profile folders.
       </div>
-    </section>
+    </details>
   {/if}
   <section class="panel about-panel">
     <div>
@@ -213,14 +218,14 @@
 <style>
   .storage-locations {
     margin: 0;
-    padding: 1.25rem;
+    padding: 14px;
     display: grid;
-    gap: 1rem;
+    gap: 10px;
   }
   .storage-locations div {
     display: grid;
     grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
-    gap: 1rem;
+    gap: 12px;
   }
   .storage-locations dt {
     font-size: 0.8rem;
@@ -231,12 +236,12 @@
     font-size: 0.75rem;
   }
   .storage-error {
-    padding: 1.25rem;
+    padding: 14px;
   }
   .scorer-content {
-    padding: 1.25rem;
+    padding: 14px;
     display: grid;
-    gap: 0.8rem;
+    gap: 10px;
   }
   .scorer-content p {
     margin: 0;
@@ -250,10 +255,50 @@
     overflow-wrap: anywhere;
     user-select: all;
   }
+  .optional-panel {
+    margin-top: 12px;
+  }
+  .optional-panel > summary {
+    cursor: pointer;
+    list-style-position: inside;
+  }
+  .optional-panel > summary::after {
+    content: '›';
+    margin-left: auto;
+    transition: transform 100ms ease;
+  }
+  .optional-panel[open] > summary::after {
+    transform: rotate(90deg);
+  }
+  .optional-panel[open] > summary {
+    border-bottom: 1px solid var(--rule);
+  }
+  .optional-panel:not([open]) > summary {
+    border-bottom: 0;
+  }
+  .tools-table td {
+    padding-block: 10px;
+  }
+  .tool-path,
+  .tool-detail {
+    margin-top: 3px;
+  }
+  .about-panel {
+    margin-top: 12px;
+    padding: 14px 17px;
+  }
+  .about-panel p {
+    margin-top: 6px;
+  }
   @media (max-width: 800px) {
     .storage-locations div {
       grid-template-columns: 1fr;
       gap: 0.3rem;
+    }
+    .optional-panel > summary {
+      height: auto;
+      min-height: 43px;
+      padding-block: 10px;
     }
   }
 </style>

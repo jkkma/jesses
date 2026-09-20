@@ -1070,7 +1070,7 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 14px;
-    margin: 0 0 16px;
+    margin: 0 0 10px;
   }
   .folder-import-options label {
     display: flex;
@@ -1083,7 +1083,7 @@
   }
   .source-required {
     align-items: center;
-    margin: 0 0 18px;
+    margin: 8px 0;
     background: var(--accent);
     border-color: var(--border);
   }
@@ -1124,7 +1124,7 @@
     flex-wrap: wrap;
   }
   :global(.workspace-nav) {
-    min-height: 49px;
+    min-height: 44px;
     height: auto;
   }
   :global(.toolbar-actions) {

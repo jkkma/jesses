@@ -170,9 +170,9 @@
 
 <style>
   .preferences-body {
-    padding: 20px;
+    padding: 14px;
     display: grid;
-    gap: 12px;
+    gap: 10px;
     min-width: 0;
   }
   .folder-row,
@@ -183,15 +183,16 @@
   }
   .folder-row input {
     flex: 1;
-    min-width: 160px;
+    min-width: min(100%, 16rem);
   }
   .checkbox-row {
     display: flex;
     align-items: center;
     gap: 8px;
+    width: fit-content;
   }
   .import-preview {
-    padding: 16px;
+    padding: 12px;
     border: 1px solid var(--border);
     overflow-wrap: anywhere;
   }
@@ -211,5 +212,13 @@
   input:focus-visible {
     outline: 2px solid var(--primary);
     outline-offset: 2px;
+  }
+  @media (max-width: 800px) {
+    .folder-row {
+      align-items: stretch;
+    }
+    .folder-row input {
+      flex-basis: 100%;
+    }
   }
 </style>

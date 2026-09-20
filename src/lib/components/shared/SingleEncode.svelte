@@ -23,7 +23,7 @@
     destinationContainer,
     containerDestination,
   } from '$lib/components/shared/container-options';
-  import { untrack } from 'svelte';
+  import { untrack, type Snippet } from 'svelte';
   import { preferredDestination } from '$lib/preferences.svelte';
   import {
     ArrowRight,
@@ -114,6 +114,7 @@
     onfiles,
     onstart,
     onqueue,
+    sourcePicker,
   }: {
     backend: EncodeBackend;
     file: MediaFile | undefined;
@@ -123,6 +124,7 @@
     onfiles: () => void;
     onstart: (request: EncodeRequest) => Promise<void>;
     onqueue: (request: EncodeRequest) => Promise<void>;
+    sourcePicker?: Snippet;
   } = $props();
   let videoIndex = $state<number | undefined>();
   let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
@@ -484,14 +486,17 @@
           : 'Encode one source at a time. Pick an encoder, review the output, then start the job.'}
       </p>
     </div>
-    <span class="status-label"
-      >{chunked
-        ? `av1an / ${options.name}`
-        : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name}`} · {depthLabel}</span
-    >
+    {#if sourcePicker}
+      {@render sourcePicker()}
+    {:else}<span class="status-label"
+        >{chunked
+          ? `av1an / ${options.name}`
+          : `${encoder === 'x265' || encoder === 'vp9' ? 'FFmpeg' : 'Standalone'} ${options.name}`} ·
+        {depthLabel}</span
+      >{/if}
   </div>
-  <div class="notice convert-notice">
-    <Info size={16} aria-hidden="true" />
+  <details class="compatibility-note">
+    <summary>Source compatibility</summary>
     {#if encoder === 'x265' || encoder === 'vp9'}<p>
         FFmpeg {encoder === 'x265' ? 'libx265' : 'libvpx-vp9'} encodes tagged SDR at the source's 8-bit
         or 10-bit depth. HDR sources require explicit tone mapping to SDR. The runtime checks that FFmpeg
@@ -507,7 +512,7 @@
         pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Standalone jobs can explicitly
         deinterlace. Rotation is not supported. Source compatibility is checked before encoding.
       </p>{/if}
-  </div>
+  </details>
   {#if error}<div class="notice error-notice" role="alert">
       <Info size={16} aria-hidden="true" />
       <p>{error}</p>
@@ -524,38 +529,43 @@
           >
         </div>
         <div class="setting-fields">
-          <div class="field full-width">
-            <label for={`${idPrefix}-encoder`}>{chunked ? 'SVT-AV1 build' : 'Video encoder'}</label>
-            <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
-              {#each encoderChoices.filter((choice) => !chunked || isSvtEncoder(choice.value)) as choice}
-                <option value={choice.value}>{choice.label}</option>
-              {/each}
-            </select>
-            <p>Each encoder keeps its own settings and output destination for this source.</p>
-          </div>
-          <div class="field full-width">
-            <label for={`${idPrefix}-video-stream`}>Video stream</label>
-            <select
-              id={`${idPrefix}-video-stream`}
-              bind:value={videoIndex}
-              disabled={disabled || !videos.length}
-            >
-              {#each videos as stream (stream.index)}<option
-                  value={stream.index}
-                  disabled={chunked && stream.index !== videos[0]?.index}
-                  >#{stream.index} · {stream.codec ?? 'Unknown codec'}{stream.title
-                    ? ` · ${stream.title}`
-                    : ''}{chunked && stream.index !== videos[0]?.index
-                    ? ' · Not supported by av1an'
-                    : ''}</option
-                >{/each}
-              {#if !videos.length}<option value={undefined}>No video stream available</option>{/if}
-            </select>
-            <p>
-              {chunked
-                ? 'av1an encodes the first video track only.'
-                : `${['x265', 'vp9', 'h264Nvenc', 'hevcNvenc'].includes(encoder) ? 'FFmpeg' : 'Standalone'} ${options.name} · ${depthLabel} ${options.codec} · ${outputFrameRateLabel}`}
-            </p>
+          <div class="source-fields full-width">
+            <div class="field">
+              <label for={`${idPrefix}-encoder`}
+                >{chunked ? 'SVT-AV1 build' : 'Video encoder'}</label
+              >
+              <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
+                {#each encoderChoices.filter((choice) => !chunked || isSvtEncoder(choice.value)) as choice}
+                  <option value={choice.value}>{choice.label}</option>
+                {/each}
+              </select>
+              <p>Each encoder keeps its own settings and output destination for this source.</p>
+            </div>
+            <div class="field">
+              <label for={`${idPrefix}-video-stream`}>Video stream</label>
+              <select
+                id={`${idPrefix}-video-stream`}
+                bind:value={videoIndex}
+                disabled={disabled || !videos.length}
+              >
+                {#each videos as stream (stream.index)}<option
+                    value={stream.index}
+                    disabled={chunked && stream.index !== videos[0]?.index}
+                    >#{stream.index} · {stream.codec ?? 'Unknown codec'}{stream.title
+                      ? ` · ${stream.title}`
+                      : ''}{chunked && stream.index !== videos[0]?.index
+                      ? ' · Not supported by av1an'
+                      : ''}</option
+                  >{/each}
+                {#if !videos.length}<option value={undefined}>No video stream available</option
+                  >{/if}
+              </select>
+              <p>
+                {chunked
+                  ? 'av1an encodes the first video track only.'
+                  : `${['x265', 'vp9', 'h264Nvenc', 'hevcNvenc'].includes(encoder) ? 'FFmpeg' : 'Standalone'} ${options.name} · ${depthLabel} ${options.codec} · ${outputFrameRateLabel}`}
+              </p>
+            </div>
           </div>
           {#if chunked}<Av1anOptionsControl
               {idPrefix}
@@ -592,7 +602,7 @@
           {/if}
           <div class="field">
             <label for={`${idPrefix}-preset`}>Encoder preset</label>
-            <select id={`${idPrefix}-preset`} bind:value={preset} {disabled}
+            <select class="compact-select" id={`${idPrefix}-preset`} bind:value={preset} {disabled}
               >{#each options.presets as choice}<option value={choice.value}>{choice.label}</option
                 >{/each}</select
             >
@@ -611,7 +621,7 @@
             bind:texturePsyBias
             bind:hdrTune
           />
-          <div class="full-width">
+          <div class="video-adjustments full-width">
             <AdvancedEncoderOptions
               {encoder}
               {backend}
@@ -670,55 +680,58 @@
         </p>
         <div class="copy-streams">
           {#each copiedStreams as stream (stream.index)}
-            <label class="copy-stream"
-              ><input
-                type="checkbox"
-                aria-label={`${stream.kind === 'audio' ? 'Include audio' : 'Copy'} stream #${stream.index}`}
-                checked={included.includes(stream.index)}
-                {disabled}
-                onchange={() => toggle(stream.index)}
-              />
-              <span
-                ><strong>#{stream.index} · {stream.kind} · {stream.codec ?? 'Unknown codec'}</strong
-                ><small
-                  >{[stream.title, stream.language].filter(Boolean).join(' · ') ||
-                    'No track title'}</small
-                ></span
-              >
-            </label>
-            {#if stream.kind === 'audio' && included.includes(stream.index)}
-              {@const settings = audio.find((track) => track.streamIndex === stream.index)}
-              {#if settings}
-                <AudioOptions
-                  inputPath={file!.path}
-                  {idPrefix}
-                  {stream}
-                  {settings}
+            <div class="source-track">
+              <label class="copy-stream"
+                ><input
+                  type="checkbox"
+                  aria-label={`${stream.kind === 'audio' ? 'Include audio' : 'Copy'} stream #${stream.index}`}
+                  checked={included.includes(stream.index)}
                   {disabled}
-                  onchange={(next) => {
-                    audio = audio.map((track) =>
-                      track.streamIndex === next.streamIndex ? next : track,
-                    );
-                  }}
+                  onchange={() => toggle(stream.index)}
                 />
+                <span
+                  ><strong
+                    >#{stream.index} · {stream.kind} · {stream.codec ?? 'Unknown codec'}</strong
+                  ><small
+                    >{[stream.title, stream.language].filter(Boolean).join(' · ') ||
+                      'No track title'}</small
+                  ></span
+                >
+              </label>
+              {#if stream.kind === 'audio' && included.includes(stream.index)}
+                {@const settings = audio.find((track) => track.streamIndex === stream.index)}
+                {#if settings}
+                  <AudioOptions
+                    inputPath={file!.path}
+                    {idPrefix}
+                    {stream}
+                    {settings}
+                    {disabled}
+                    onchange={(next) => {
+                      audio = audio.map((track) =>
+                        track.streamIndex === next.streamIndex ? next : track,
+                      );
+                    }}
+                  />
+                {/if}
               {/if}
-            {/if}
-            {#if stream.kind === 'subtitle' && included.includes(stream.index)}
-              {@const settings = subtitles.find((track) => track.streamIndex === stream.index)}
-              {#if settings}<SubtitleOptions
-                  toneMapped={toneMap.enabled}
-                  {idPrefix}
-                  {stream}
-                  {settings}
-                  {backend}
-                  video={selectedVideo}
-                  {disabled}
-                  onchange={(next) =>
-                    (subtitles = subtitles.map((track) =>
-                      track.streamIndex === next.streamIndex ? next : track,
-                    ))}
-                />{/if}
-            {/if}
+              {#if stream.kind === 'subtitle' && included.includes(stream.index)}
+                {@const settings = subtitles.find((track) => track.streamIndex === stream.index)}
+                {#if settings}<SubtitleOptions
+                    toneMapped={toneMap.enabled}
+                    {idPrefix}
+                    {stream}
+                    {settings}
+                    {backend}
+                    video={selectedVideo}
+                    {disabled}
+                    onchange={(next) =>
+                      (subtitles = subtitles.map((track) =>
+                        track.streamIndex === next.streamIndex ? next : track,
+                      ))}
+                  />{/if}
+              {/if}
+            </div>
           {:else}<p class="small-muted">No additional tracks to copy.</p>{/each}
         </div>
       </section>
@@ -740,21 +753,37 @@
           >
         </div>
         <div class="field">
-          <label for={`${idPrefix}-destination`}>Encode destination</label><input
-            id={`${idPrefix}-destination`}
-            bind:value={destination}
-            {disabled}
-            placeholder="Choose a new media file"
-          />
+          <label for={`${idPrefix}-destination`}>Encode destination</label>
+          <div class="destination-control">
+            <input
+              id={`${idPrefix}-destination`}
+              bind:value={destination}
+              {disabled}
+              placeholder="Choose a new media file"
+            />
+            <Button
+              variant="outline"
+              onclick={chooseOutput}
+              {disabled}
+              aria-label="Choose encode destination">Browse…</Button
+            >
+          </div>
         </div>
-        <Button variant="outline" onclick={chooseOutput} {disabled}
-          >Choose encode destination</Button
-        >
         <ContainerOptions
           value={destinationContainer(destination)}
           onchange={(value) => (destination = containerDestination(destination, value))}
           {disabled}
         />
+        <div class="encode-actions">
+          <Button class="start-encode" onclick={() => start()} disabled={!canStart}
+            ><Play size={14} aria-hidden="true" />{submitting
+              ? 'Starting…'
+              : 'Start encode'}</Button
+          >
+          <Button variant="outline" onclick={() => start(true)} disabled={!canQueue}
+            >Add to queue</Button
+          >
+        </div>
         <div class="output-summary">
           <Clapperboard size={15} aria-hidden="true" />
           <p>
@@ -790,12 +819,6 @@
             >
           </p>
         </div>
-        <Button class="start-encode" onclick={() => start()} disabled={!canStart}
-          ><Play size={14} aria-hidden="true" />{submitting ? 'Starting…' : 'Start encode'}</Button
-        >
-        <Button variant="outline" onclick={() => start(true)} disabled={!canQueue}
-          >Add to queue</Button
-        >
         <CommandPlanPreview request={commandRequest} {disabled} />
         <p class="small-muted">
           Queue encodes with different sources or destinations. Jobs run one at a time.
@@ -843,20 +866,87 @@
 </section>
 
 <style>
+  .compatibility-note {
+    margin-bottom: 12px;
+    color: var(--muted-foreground);
+    font-size: 11px;
+  }
+  .compatibility-note summary {
+    cursor: pointer;
+    width: fit-content;
+    padding: 4px 0;
+  }
+  .compatibility-note p {
+    max-width: 110ch;
+    margin-top: 6px;
+  }
+  .source-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px 16px;
+  }
+  .video-adjustments {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 28rem), 1fr));
+    align-items: start;
+    gap: 8px;
+    min-width: 0;
+  }
+  .video-adjustments > :global(*) {
+    min-width: 0;
+    margin: 0;
+  }
+  .video-adjustments > :global(details[open]),
+  .video-adjustments > :global(:has(input:checked)),
+  .video-adjustments > :global(:has(button[aria-expanded='true'])) {
+    grid-column: 1 / -1;
+  }
+  .video-adjustments > :global(.trim-options) {
+    padding: 11px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .output-panel {
+    position: sticky;
+    top: 12px;
+    min-width: 0;
+  }
+  .encode-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .destination-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .destination-control input {
+    min-width: 0;
+    flex: 1;
+  }
   .copy-note {
-    padding: 16px 20px 0;
+    padding: 10px 14px 0;
     font-size: 12px;
   }
   .copy-streams {
-    padding: 12px 20px 20px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+    align-items: start;
+    gap: 8px 16px;
+    padding: 6px 14px 14px;
     max-height: 360px;
     overflow-y: auto;
+  }
+  .source-track {
+    min-width: 0;
   }
   .copy-stream {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 12px 0;
+    gap: 8px;
+    padding: 8px 0;
     border-bottom: 1px solid var(--border);
   }
   .copy-stream input {
@@ -874,14 +964,30 @@
     display: block;
   }
   .copy-stream strong {
-    font-size: 13px;
+    font-size: 12px;
   }
   .copy-stream small {
     font-size: 11px;
-    margin-top: 4px;
+    margin-top: 2px;
   }
   .output-source strong {
     overflow-wrap: anywhere;
+  }
+  .output-source {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 3px 8px;
+    align-items: center;
+  }
+  .output-source .eyebrow {
+    grid-column: 1 / -1;
+  }
+  .output-source strong,
+  .output-source .text-button {
+    margin-top: 0;
+  }
+  .output-source .text-button {
+    font-size: 10px;
   }
   .text-button:disabled {
     opacity: 0.5;

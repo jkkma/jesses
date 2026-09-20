@@ -224,6 +224,7 @@ test('source analysis stays lazy and detected crop needs explicit application', 
   await mock(page);
   expect(await calls(page, 'preview_frame')).toHaveLength(0);
   const quick = workspace(page);
+  await quick.getByText('Crop, resize & borders', { exact: true }).click();
   await quick.getByLabel('Crop top (pixels)', { exact: true }).fill('8');
   await quick.getByText('Source preview & automatic crop', { exact: true }).click();
   await expect(quick.getByRole('img')).toBeVisible();
@@ -329,7 +330,7 @@ test('applying detected batch crop invalidates a ready preview and preserves ear
   await previewBatch.click();
   await expect(queue).toBeEnabled();
   const episode = batch.locator('article.episode').first();
-  await episode.locator('summary').click();
+  await episode.locator('.episode-tracks > summary').click();
   await episode.getByText('Source preview & automatic crop', { exact: true }).click();
   await expect(episode.getByRole('img')).toBeVisible();
   await episode.getByRole('button', { name: 'Detect black borders', exact: true }).click();

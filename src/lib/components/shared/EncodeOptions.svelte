@@ -30,7 +30,7 @@
 </script>
 
 {#if allowBackendSelection}
-  <div class="field full-width">
+  <div class="field encode-field">
     <label for={`${idPrefix}-backend`}>Encode backend</label>
     <select id={`${idPrefix}-backend`} bind:value={backend} {disabled}>
       <option value="standalone">Standalone encoder</option>
@@ -53,7 +53,7 @@
       Jobs never resume automatically.
     </p>
   </div>
-  <div class="field full-width">
+  <div class="field encode-field">
     <label for={`${idPrefix}-workers`}>Parallel chunks</label>
     <input
       id={`${idPrefix}-workers`}
@@ -96,7 +96,7 @@
   </div>
 {/if}
 {#if encoder === 'svtAv1Hdr'}
-  <div class="field full-width">
+  <div class="field encode-field">
     <label for={`${idPrefix}-hdr-tune`}>HDR tune</label>
     <select id={`${idPrefix}-hdr-tune`} bind:value={hdrTune} {disabled}>
       <option value="filmGrain">Film grain</option>
@@ -108,41 +108,55 @@
     </p>
   </div>
 {/if}
-{#if isSvtEncoder(encoder)}<div class="field full-width">
-    <label for={`${idPrefix}-grain`}>Film grain synthesis</label>
-    <input
-      id={`${idPrefix}-grain`}
-      type="number"
-      min="0"
-      max="50"
-      step="1"
-      bind:value={filmGrain}
-      {disabled}
-    />
-    <p>
-      0 keeps synthesis off and encodes source texture. 1–50 adds synthesized grain with encoder
-      denoising disabled. This does not exactly restore the original grain.
-    </p>
-  </div>
-  <div class="field full-width">
-    <label class="fallback-choice" for={`${idPrefix}-hdr-fallback`}>
+{#if isSvtEncoder(encoder)}<div class="grain-settings full-width">
+    <div class="field encode-field">
+      <label for={`${idPrefix}-grain`}>Film grain synthesis</label>
       <input
-        id={`${idPrefix}-hdr-fallback`}
-        type="checkbox"
-        bind:checked={hdr10Fallback}
+        id={`${idPrefix}-grain`}
+        type="number"
+        min="0"
+        max="50"
+        step="1"
+        bind:value={filmGrain}
         {disabled}
       />
-      <span>Allow HDR10 fallback</span>
-    </label>
-    <p>
-      Preserve static HDR in HDR10 output. Checking this explicitly allows Dolby Vision and HDR10+
-      dynamic metadata to be discarded when a compatible HDR10 base is available. Unsupported HDR
-      sources are rejected.
-    </p>
+      <p>
+        0 keeps synthesis off and encodes source texture. 1–50 adds synthesized grain with encoder
+        denoising disabled. This does not exactly restore the original grain.
+      </p>
+    </div>
+    <div class="field">
+      <label class="fallback-choice" for={`${idPrefix}-hdr-fallback`}>
+        <input
+          id={`${idPrefix}-hdr-fallback`}
+          type="checkbox"
+          bind:checked={hdr10Fallback}
+          {disabled}
+        />
+        <span>Allow HDR10 fallback</span>
+      </label>
+      <p>
+        Preserve static HDR in HDR10 output. Checking this explicitly allows Dolby Vision and HDR10+
+        dynamic metadata to be discarded when a compatible HDR10 base is available. Unsupported HDR
+        sources are rejected.
+      </p>
+    </div>
   </div>
 {/if}
 
 <style>
+  .grain-settings {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    gap: 12px 16px;
+    align-items: start;
+  }
+  .encode-field select {
+    width: min(100%, 19rem);
+  }
+  .encode-field input[type='number'] {
+    width: min(100%, 9rem);
+  }
   .av1an-details p + p {
     margin-top: 10px;
   }

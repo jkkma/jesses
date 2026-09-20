@@ -836,9 +836,71 @@
         <span class="heading-with-icon"
           ><FolderOutput size={16} aria-hidden="true" /><span class="eyebrow">Common settings</span
           ></span
+        ><button class="text-button" type="button" disabled={submitting} onclick={resetSettings}
+          >Reset batch settings</button
         >
       </div>
       <div class="batch-settings-content">
+        <div class="batch-output-fields">
+          <div class="field">
+            <label for="batch-output">Output folder</label><input
+              id="batch-output"
+              oninput={() => (outputDirectoryTouched = true)}
+              bind:value={outputDirectory}
+              disabled={!desktop || submitting}
+              placeholder="Choose an existing output folder"
+            />
+          </div>
+          <div class="container-choice">
+            <ContainerOptions
+              value={outputContainer}
+              onchange={(value) => (outputContainer = value)}
+              disabled={submitting}
+            />
+          </div>
+        </div>
+        <div class="batch-output-actions">
+          <Button
+            variant="outline"
+            onclick={chooseOutput}
+            disabled={!desktop || submitting || choosingOutput}>Choose output folder</Button
+          ><Button onclick={previewBatch} disabled={!canPreview}
+            >{#if previewing}<LoaderCircle size={14} class="spinning" aria-hidden="true" />Preparing
+              preview…{:else}Preview batch{/if}</Button
+          >
+        </div>
+        <p class="small-muted output-guidance">
+          Each source gets a new filename in the selected container. The preview avoids existing
+          names; files are never replaced. Names are checked again when queued.
+        </p>
+        {#if !desktop}<p class="disabled-reason">
+            Batch encoding requires the desktop app.
+          </p>{:else if !toolsReady}<p class="disabled-reason">
+            Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
+              ? ', and av1an'
+              : ''}, then refresh Tools & settings.
+          </p>{:else if !validRate(rate)}<p class="disabled-reason">
+            Enter a valid whole-number bitrate or target size below.
+          </p>{:else if !validSettings}<p class="disabled-reason">
+            Use {isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF {options.crfMin}–{options.crfMax},
+            a listed preset{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder ===
+            'svtAv1FiveFish'
+              ? '; lineart and texture bias 0–7'
+              : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
+          </p>{:else if !validFraming}<p class="disabled-reason">
+            Check crop, resize and border values in each selected episode's video settings.
+          </p>{:else if subtitleIssue}<p class="disabled-reason" role="alert">
+            {subtitleIssue}
+          </p>{:else if !selectedFiles.every( (file) => validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams) )}<p
+            class="disabled-reason"
+          >
+            Check the selected audio codec, channels, and bitrate. Any compatibility issue is shown
+            beside its track.
+          </p>{:else if !selectedFiles.length}<p class="disabled-reason">
+            Select at least one episode.
+          </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">
+            Choose an output folder before previewing.
+          </p>{/if}
         <div class="setting-fields">
           {#if backend === 'standalone'}<div class="field full-width">
               <label for="batch-encoder">Video encoder</label>
@@ -900,6 +962,7 @@
           <div class="field">
             <label for="batch-preset">Preset</label><select
               id="batch-preset"
+              class="compact-select"
               bind:value={preset}
               disabled={submitting}
               >{#each options.presets as choice}<option value={choice.value}>{choice.label}</option
@@ -927,64 +990,6 @@
           disabled={submitting || !desktop}
           onchange={(value) => (parameters = value)}
         />
-        <button class="text-button" type="button" disabled={submitting} onclick={resetSettings}
-          >Reset batch settings</button
-        >
-        <div class="field">
-          <label for="batch-output">Output folder</label><input
-            id="batch-output"
-            oninput={() => (outputDirectoryTouched = true)}
-            bind:value={outputDirectory}
-            disabled={!desktop || submitting}
-            placeholder="Choose an existing output folder"
-          />
-          <ContainerOptions
-            value={outputContainer}
-            onchange={(value) => (outputContainer = value)}
-            disabled={submitting}
-          />
-        </div>
-        <Button
-          variant="outline"
-          onclick={chooseOutput}
-          disabled={!desktop || submitting || choosingOutput}>Choose output folder</Button
-        >
-        <p class="small-muted">
-          Each source gets a new filename in the selected container. The preview avoids existing
-          names; files are never replaced. Names are checked again when queued.
-        </p>
-        <Button onclick={previewBatch} disabled={!canPreview}
-          >{#if previewing}<LoaderCircle size={14} class="spinning" aria-hidden="true" />Preparing
-            preview…{:else}Preview batch{/if}</Button
-        >
-        {#if !desktop}<p class="disabled-reason">
-            Batch encoding requires the desktop app.
-          </p>{:else if !toolsReady}<p class="disabled-reason">
-            Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
-              ? ', and av1an'
-              : ''}, then refresh Tools & settings.
-          </p>{:else if !validRate(rate)}<p class="disabled-reason">
-            Enter a valid whole-number bitrate or target size above.
-          </p>{:else if !validSettings}<p class="disabled-reason">
-            Use {isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF {options.crfMin}–{options.crfMax},
-            a listed preset{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder ===
-            'svtAv1FiveFish'
-              ? '; lineart and texture bias 0–7'
-              : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
-          </p>{:else if !validFraming}<p class="disabled-reason">
-            Check crop, resize and border values in each selected episode's video settings.
-          </p>{:else if subtitleIssue}<p class="disabled-reason" role="alert">
-            {subtitleIssue}
-          </p>{:else if !selectedFiles.every( (file) => validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams) )}<p
-            class="disabled-reason"
-          >
-            Check the selected audio codec, channels, and bitrate. Any compatibility issue is shown
-            beside its track.
-          </p>{:else if !selectedFiles.length}<p class="disabled-reason">
-            Select at least one episode.
-          </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">
-            Choose an output folder before previewing.
-          </p>{/if}
       </div>
     </aside>
   </div>
@@ -1049,9 +1054,10 @@
 <style>
   .batch-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr);
+    grid-template-columns: minmax(0, 0.85fr) minmax(29rem, 1.15fr);
     gap: 20px;
     margin-top: 20px;
+    align-items: start;
   }
   .batch-sources,
   .batch-settings {
@@ -1066,7 +1072,7 @@
     padding: 16px 20px;
   }
   .episode-list {
-    max-height: 580px;
+    max-height: min(580px, 58vh);
     overflow-y: auto;
   }
   .episode {
@@ -1135,11 +1141,35 @@
   }
   .batch-settings-content {
     display: grid;
-    gap: 16px;
-    padding: 20px;
+    gap: 12px;
+    padding: 14px;
   }
   .batch-settings-content .setting-fields {
     padding: 0;
+  }
+  .batch-output-fields {
+    display: grid;
+    grid-template-columns: minmax(14rem, 1fr) minmax(12rem, 0.7fr);
+    gap: 12px;
+    align-items: start;
+  }
+  .container-choice {
+    min-width: 0;
+  }
+  .batch-output-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .batch-output-actions :global(button) {
+    flex: 1 1 12rem;
+  }
+  .output-guidance {
+    line-height: 1.45;
+  }
+  .batch-settings-content > .disabled-reason {
+    margin: 0;
+    text-align: left;
   }
   .batch-review {
     margin-top: 20px;
@@ -1192,12 +1222,27 @@
     opacity: 0.5;
     cursor: default;
   }
-  @media (max-width: 950px) {
+  @media (max-width: 1100px) {
     .batch-grid {
       grid-template-columns: 1fr;
     }
+    .batch-settings {
+      grid-row: 1;
+    }
+    .batch-sources {
+      grid-row: 2;
+    }
     .episode-list {
-      max-height: 430px;
+      max-height: min(360px, 46vh);
+    }
+  }
+  @media (max-width: 850px) {
+    .batch-output-fields {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .selection-actions,
+    .batch-submit {
+      padding: 12px 14px;
     }
   }
 </style>

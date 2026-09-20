@@ -16,58 +16,63 @@
   const missing = $derived(!!sourceId && !source);
 </script>
 
-<section
-  class="source-mapping"
-  aria-label={`${props.backend === 'av1an' ? 'AV1AN' : 'Quick Convert'} source mapping`}
->
-  <div class="source-field">
-    <label for={id}>Source for this encode</label>
-    <select {id} bind:value={sourceId}>
-      <option value="">Use the current media selection</option>
-      {#each files as entry (entry.id)}
-        <option value={entry.id}>{entry.name}</option>
-      {/each}
-      {#if missing}<option value={sourceId}>Removed source — choose a file</option>{/if}
-    </select>
-  </div>
-  <p>
-    {#if missing}
-      The chosen source was removed. Choose an encoding source to continue.
-    {:else if sourceId}
-      Video, copied tracks, geometry and color settings use {source?.name}. You can inspect other
-      files without changing this source.
-    {:else}
-      Use this when you want to inspect another file without changing the file you will encode.
-    {/if}
-  </p>
-</section>
-<SingleEncode {...props} file={source} />
+{#snippet sourcePicker()}
+  <section
+    class="source-mapping"
+    aria-label={`${props.backend === 'av1an' ? 'AV1AN' : 'Quick Convert'} source mapping`}
+  >
+    <div class="source-field">
+      <label for={id}>Source for this encode</label>
+      <select {id} bind:value={sourceId}>
+        <option value="">Use the current media selection</option>
+        {#each files as entry (entry.id)}
+          <option value={entry.id}>{entry.name}</option>
+        {/each}
+        {#if missing}<option value={sourceId}>Removed source — choose a file</option>{/if}
+      </select>
+    </div>
+    <p>
+      {#if missing}
+        The chosen source was removed. Choose an encoding source to continue.
+      {:else if sourceId}
+        Video, copied tracks, geometry and color settings use {source?.name}. You can inspect other
+        files without changing this source.
+      {:else}
+        Pin a source here to keep encoding it while you inspect other files.
+      {/if}
+    </p>
+  </section>
+{/snippet}
+<SingleEncode {...props} file={source} {sourcePicker} />
 
 <style>
   .source-mapping {
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    flex-wrap: wrap;
-    margin-bottom: 20px;
-    padding: 16px;
-    background: var(--muted);
-    border-radius: 8px;
+    display: grid;
+    gap: 4px;
+    flex: 0 1 390px;
+    min-width: 240px;
   }
   .source-field {
-    display: grid;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
     font-size: 12px;
     font-weight: 600;
     max-width: 100%;
   }
   select {
-    max-width: min(460px, 100%);
+    width: 260px;
+    max-width: 100%;
+    min-height: 34px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    background: var(--background);
+    font-size: 11px;
   }
   p {
     margin: 0;
-    flex: 1 1 240px;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--muted-foreground);
     overflow-wrap: anywhere;
   }

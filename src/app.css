@@ -170,8 +170,8 @@ svg {
   min-height: 100svh;
 }
 .app-header {
-  height: 73px;
-  padding: 0 28px;
+  height: 56px;
+  padding: 0 20px;
   display: flex;
   flex-shrink: 0;
   align-items: center;
@@ -226,12 +226,12 @@ svg {
   margin-left: 5px;
 }
 .workspace-nav {
-  height: 49px;
+  height: 44px;
   display: flex;
   flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
-  padding: 0 28px;
+  padding: 0 20px;
   border-bottom: 1px solid var(--rule);
   background: #e3dacc;
 }
@@ -292,13 +292,13 @@ main {
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 0 28px;
+  padding: 0 20px;
 }
 .preview-notice {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 11px 0;
+  padding: 7px 0;
   font-size: 11px;
   border-bottom: 1px solid var(--rule);
   color: var(--muted-foreground);
@@ -344,8 +344,8 @@ main {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  min-height: 105px;
-  padding: 23px 0 20px;
+  min-height: 78px;
+  padding: 14px 0;
 }
 h1 {
   font-size: 23px;
@@ -496,7 +496,8 @@ h1 {
   justify-content: space-between;
   gap: 12px;
   padding: 0 17px;
-  height: 43px;
+  min-height: 38px;
+  padding-block: 7px;
   border-bottom: 1px solid var(--rule);
 }
 .heading-with-icon {
@@ -894,19 +895,19 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  padding: 25px 0 20px;
+  padding: 14px 0;
 }
 .view-intro .eyebrow {
   font-size: 9px;
   color: var(--muted-foreground);
 }
 .view-intro h1 {
-  margin-top: 5px;
+  margin-top: 2px;
 }
 .view-intro p {
   font-size: 12px;
   color: var(--muted-foreground);
-  margin-top: 7px;
+  margin-top: 4px;
 }
 .status-label {
   display: flex;
@@ -919,32 +920,34 @@ h1 {
 }
 .convert-workspace,
 .tools-workspace {
-  padding-bottom: 28px;
+  padding-bottom: 14px;
 }
 .convert-notice {
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 .convert-notice p {
   font-size: 11px;
 }
 .convert-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 306px;
-  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 14px;
   align-items: start;
 }
 .convert-settings {
   display: grid;
-  gap: 18px;
+  gap: 12px;
+  min-width: 0;
 }
 .settings-panel .section-heading {
-  height: 46px;
+  min-height: 38px;
 }
 .setting-fields {
-  padding: 20px;
+  padding: 14px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px 24px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 12px 16px;
+  align-items: start;
 }
 .full-width {
   grid-column: 1 / -1;
@@ -957,7 +960,7 @@ h1 {
 .field label {
   font-size: 11px;
   font-weight: 600;
-  margin-bottom: 7px;
+  margin-bottom: 5px;
 }
 .field input,
 .field select {
@@ -971,6 +974,23 @@ h1 {
   font-size: 11px;
   opacity: 1;
 }
+.field input[type='number'] {
+  width: 9rem;
+  max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.field select {
+  max-width: 26rem;
+}
+.field select.compact-select {
+  width: 9rem;
+  max-width: 100%;
+}
+.field input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
 .field input:disabled,
 .field select:disabled {
   cursor: not-allowed;
@@ -983,6 +1003,8 @@ h1 {
 }
 .input-unit {
   position: relative;
+  width: 9rem;
+  max-width: 100%;
 }
 .input-unit input {
   padding-right: 42px;
@@ -999,15 +1021,15 @@ h1 {
   grid-template-columns: 1fr 1fr 1fr;
 }
 .output-content {
-  padding: 20px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 12px;
 }
 .output-source {
   display: flex;
   flex-direction: column;
-  padding-bottom: 17px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--rule);
 }
 .output-source .eyebrow {
@@ -1028,7 +1050,7 @@ h1 {
   gap: 10px;
   align-items: center;
   border-block: 1px solid var(--rule);
-  padding: 15px 0;
+  padding: 10px 0;
   color: var(--muted-foreground);
 }
 .output-summary p {
@@ -1045,14 +1067,13 @@ h1 {
   font-size: 10px;
 }
 .start-encode {
-  width: 100%;
   height: 36px;
 }
 .disabled-reason {
-  text-align: center;
+  text-align: left;
   font-size: 10px;
   color: var(--muted-foreground);
-  margin-top: -12px;
+  margin-top: 0;
 }
 .tools-workspace .error-notice {
   margin-bottom: 15px;
@@ -1311,14 +1332,14 @@ h1 {
 
 @media (min-width: 1500px) {
   main {
-    padding-inline: 40px;
+    padding-inline: 28px;
   }
   .app-header,
   .workspace-nav,
   .status-bar,
   .log-bar,
   .log-entries {
-    padding-inline: 40px;
+    padding-inline: 28px;
   }
   .file-columns,
   .convert-grid {
@@ -1357,8 +1378,8 @@ h1 {
     gap: 12px;
   }
   .setting-fields {
-    padding: 17px;
-    gap: 18px;
+    padding: 12px;
+    gap: 12px;
   }
   .app-description {
     font-size: 11px;
@@ -1435,7 +1456,7 @@ h1 {
     grid-column: 1 / -1;
   }
   .setting-fields {
-    gap: 16px 12px;
+    gap: 12px;
   }
   .status-bar > span:last-child {
     display: none;

@@ -231,7 +231,7 @@
       >{checking ? 'Checking tools…' : 'Check utility tools'}</button
     >
   </header>
-  {#if capabilities}<details>
+  {#if capabilities}<details class="capabilities">
       <summary>Available utility tools and models</summary>
       <ul>
         {#each capabilities.dependencies as dependency}<li>
@@ -253,7 +253,7 @@
           ></select
         ></label
       >
-      {#if kind !== 'concat'}<label
+      {#if kind !== 'concat'}<label class="source-field"
           >Source<select bind:value={source} disabled={pending}
             ><option value="">Choose a source</option>{#each files as file}<option value={file.path}
                 >{file.name}</option
@@ -276,7 +276,7 @@
         reports the actual interval. Use Quick Convert trim for frame-exact cuts.
       </p>
       <div class="fields">
-        <label
+        <label class="compact-field"
           >Start (seconds)<input
             type="number"
             min="0"
@@ -284,7 +284,7 @@
             bind:value={start}
             disabled={pending}
           /></label
-        ><label
+        ><label class="compact-field"
           >End (seconds)<input
             type="number"
             min="0.001"
@@ -299,7 +299,7 @@
         Join files in the displayed order without re-encoding. Video/audio formats and stream
         layouts must match.
       </p>
-      <label
+      <label class="source-field standalone-field"
         >Add an imported file<select
           value=""
           onchange={(e) => add(e.currentTarget.value)}
@@ -331,7 +331,7 @@
           </li>{/each}
       </ol>
     {:else if kind === 'subtitleOcr'}
-      <label
+      <label class="compact-field standalone-field"
         >OCR languages<input
           bind:value={language}
           placeholder="eng or eng+spa"
@@ -345,7 +345,7 @@
     {/if}
     {#if kind === 'colorMetadataTransfer' || (kind === 'grain' && grainOperation === 'measure')}
       <div class="fields">
-        <label
+        <label class="source-field"
           >{kind === 'grain' ? 'Denoised reference' : 'Metadata reference'}<select
             bind:value={reference}
             disabled={pending}
@@ -385,11 +385,13 @@
               ><option value="preset">Tool preset</option></select
             ></label
           >
-          {#if grainSource === 'table'}<label
-              >Table<input bind:value={tablePath} readonly /><button
-                type="button"
-                onclick={chooseTable}
-                disabled={pending}>Choose grain table</button
+          {#if grainSource === 'table'}<label class="source-field"
+              >Table<span class="input-action"
+                ><input bind:value={tablePath} readonly /><button
+                  type="button"
+                  onclick={chooseTable}
+                  disabled={pending}>Choose grain table</button
+                ></span
               ></label
             >{:else if grainSource === 'preset'}<label
               >Preset<select bind:value={grainPreset} disabled={pending}
@@ -397,7 +399,7 @@
                 >{#each capabilities?.grainPresets ?? [] as value}<option {value}>{value}</option
                   >{/each}</select
               ></label
-            >{:else}<label
+            >{:else}<label class="compact-field"
               >ISO strength<input
                 type="number"
                 min="1"
@@ -405,7 +407,7 @@
                 bind:value={iso}
                 disabled={pending}
               /></label
-            ><label
+            ><label class="checkbox-field"
               ><input type="checkbox" bind:checked={chroma} disabled={pending} />Include chroma
               grain</label
             >{/if}
@@ -429,13 +431,16 @@
               >VP9 · libvpx-vp9</option
             ></select
           ></label
-        ><label>Preset / speed<input bind:value={preset} disabled={pending} /></label><label
+        ><label class="compact-field"
+          >Preset / speed<input bind:value={preset} disabled={pending} /></label
+        ><label
           >Pixel format<select bind:value={pixel} disabled={pending}
             ><option value="yuv420p">8-bit 4:2:0</option><option value="yuv420p10le"
               >10-bit 4:2:0</option
             ></select
           ></label
         ><label>CRF values<input bind:value={crfs} disabled={pending} /></label><label
+          class="compact-field"
           >Sample count<input
             type="number"
             min="1"
@@ -443,7 +448,7 @@
             bind:value={samples}
             disabled={pending}
           /></label
-        ><label
+        ><label class="compact-field"
           >Seconds per sample<input
             type="number"
             min="0.1"
@@ -457,7 +462,7 @@
             ><option value="none">Size and speed only</option><option value="ssim">SSIM</option
             ><option value="psnr">PSNR</option><option value="vmaf">VMAF</option></select
           ></label
-        >{#if metric !== 'none'}<label
+        >{#if metric !== 'none'}<label class="threshold-field"
             >Recommendation threshold<input
               bind:value={threshold}
               placeholder="Use metric default"
@@ -466,14 +471,16 @@
           >{/if}
       </div>
     {/if}
-    <button
-      class="primary-action"
-      type="button"
-      onclick={run}
-      disabled={pending || !isDesktop() || (kind === 'concat' ? order.length < 2 : !selected)}
-      >{pending ? 'Running…' : kind === 'crfLadder' ? 'Analyze ladder' : 'Run utility'}</button
-    >{#if pending}<button type="button" onclick={() => controller?.abort()}>Cancel utility</button
-      >{/if}
+    <div class="actions">
+      <button
+        class="primary-action"
+        type="button"
+        onclick={run}
+        disabled={pending || !isDesktop() || (kind === 'concat' ? order.length < 2 : !selected)}
+        >{pending ? 'Running…' : kind === 'crfLadder' ? 'Analyze ladder' : 'Run utility'}</button
+      >{#if pending}<button type="button" onclick={() => controller?.abort()}>Cancel utility</button
+        >{/if}
+    </div>
     {#if error}<p role="alert">{error}</p>{/if}
     {#if result}
       <div class="result" role="status">
@@ -518,13 +525,13 @@
 
 <style>
   .utilities {
-    padding: 1rem 0;
+    padding: 0.75rem 0;
   }
   .utility-card {
-    padding: 1.25rem;
+    padding: 14px;
     background: #e3dacc;
     border: 1px solid #c0b7aa;
-    margin: 1rem 0;
+    margin: 12px 0;
   }
   header {
     display: flex;
@@ -532,16 +539,68 @@
     justify-content: space-between;
     gap: 1rem;
   }
+  header p {
+    margin-top: 0.4rem;
+  }
+  .capabilities {
+    margin-top: 0.5rem;
+    padding: 0.65rem 0.8rem;
+    border: 1px solid #c0b7aa;
+  }
+  .capabilities summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .capabilities ul {
+    margin: 0.75rem 0;
+    padding-left: 1.2rem;
+  }
   .fields {
     display: flex;
     flex-wrap: wrap;
-    gap: 1rem;
-    margin: 1rem 0;
+    align-items: end;
+    gap: 12px;
+    margin: 12px 0;
   }
   label {
     display: flex;
     flex-direction: column;
     gap: 0.35rem;
+    min-width: 0;
+  }
+  .fields > label {
+    flex: 1 1 13rem;
+  }
+  .fields > .source-field {
+    flex-basis: 20rem;
+  }
+  .fields > .compact-field {
+    flex: 0 1 9rem;
+  }
+  .fields > .threshold-field {
+    flex-basis: 12rem;
+  }
+  .checkbox-field {
+    flex: 0 1 auto;
+    flex-direction: row;
+    align-items: center;
+    padding-block: 0.55rem;
+  }
+  .standalone-field {
+    width: min(100%, 28rem);
+    margin-block: 12px;
+  }
+  .input-action {
+    display: flex;
+    min-width: 0;
+    gap: 8px;
+  }
+  .input-action input {
+    flex: 1 1 12rem;
+    min-width: 0;
+  }
+  .input-action button {
+    flex: none;
   }
   input,
   select,
@@ -550,6 +609,13 @@
     padding: 0.5rem;
     border: 1px solid #9b8c7a;
     background: #f0eee6;
+    max-width: 100%;
+  }
+  input[type='number'] {
+    width: 9rem;
+  }
+  .compact-field input {
+    width: 9rem;
   }
   .primary-action {
     background: var(--primary);
@@ -562,7 +628,12 @@
   }
   button {
     cursor: pointer;
-    margin: 0.25rem 0.4rem 0.25rem 0;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
   }
   input[type='checkbox'] {
     width: 1rem;
@@ -593,5 +664,30 @@
   }
   li {
     margin: 0.5rem 0;
+  }
+  ol {
+    max-height: 16rem;
+    overflow: auto;
+  }
+  @media (max-width: 800px) {
+    header {
+      align-items: stretch;
+      flex-direction: column;
+    }
+    header > button {
+      align-self: flex-start;
+    }
+    .fields > label {
+      flex-basis: 12rem;
+    }
+    .fields > .compact-field {
+      flex-basis: 9rem;
+    }
+    .fields > .checkbox-field {
+      flex-basis: auto;
+    }
+    .fields > .source-field {
+      flex-basis: 100%;
+    }
   }
 </style>

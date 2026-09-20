@@ -345,6 +345,7 @@ for (const encoder of ['svtAv1Hdr', 'svtAv1FiveFish', 'svtAv1', 'x264'] as const
     await desktopMock(page);
     await openEncode(page);
     const quick = quickWorkspace(page);
+    await quick.getByText('Crop, resize & borders', { exact: true }).click();
     await quick.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
     await quick.getByLabel('Crop top (pixels)', { exact: true }).fill('2');
     await quick.getByLabel('Crop bottom (pixels)', { exact: true }).fill('2');
@@ -387,6 +388,7 @@ test('black borders toggle retains its draft and omits disabled borders from que
   await desktopMock(page);
   await openEncode(page);
   const quick = quickWorkspace(page);
+  await quick.getByText('Crop, resize & borders', { exact: true }).click();
   const toggle = quick.getByLabel('Add black borders', { exact: true });
   await toggle.check();
   await quick.getByLabel('Border top (pixels)', { exact: true }).fill('12');
@@ -416,6 +418,7 @@ test('black borders reject invalid edges and final dimensions before start or qu
   await desktopMock(page);
   await openEncode(page);
   const quick = quickWorkspace(page);
+  await quick.getByText('Crop, resize & borders', { exact: true }).click();
   const start = quick.getByRole('button', { name: 'Start encode', exact: true });
   const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
   await quick.getByLabel('Add black borders', { exact: true }).check();
@@ -476,6 +479,7 @@ test('crop and resize invalid edits block both commands and selected video chang
   });
   await openEncode(page);
   const quick = quickWorkspace(page);
+  await quick.getByText('Crop, resize & borders', { exact: true }).click();
   const start = quick.getByRole('button', { name: 'Start encode', exact: true });
   const queue = quick.getByRole('button', { name: 'Add to queue', exact: true });
   for (const edge of ['top', 'right', 'bottom', 'left']) {
@@ -517,6 +521,7 @@ test('crop resize and border drafts survive source, encoder and workflow switche
   await page.setViewportSize({ width: 760, height: 650 });
   await openEncode(page);
   const quick = quickWorkspace(page);
+  await quick.getByText('Crop, resize & borders', { exact: true }).click();
   await quick.getByLabel('Crop top (pixels)', { exact: true }).fill('4');
   await quick.getByLabel('Resize video', { exact: true }).check();
   await quick.getByLabel('Picture width (pixels)', { exact: true }).fill('160');
@@ -551,6 +556,7 @@ test('crop resize and border drafts survive source, encoder and workflow switche
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const av1an = av1anWorkspace(page);
+  await av1an.getByText('Crop, resize & borders', { exact: true }).click();
   await expect(av1an.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
   await expect(av1an.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await av1an.getByLabel('Crop top (pixels)', { exact: true }).fill('6');
@@ -912,7 +918,9 @@ test('x264 uses its own defaults, preset names, validation, copied tracks, and i
   await expect(quick.getByLabel('Encoder preset', { exact: true }).locator('option')).toHaveText(
     x264PresetNames,
   );
-  await expect(quick.getByText('Standalone x264 · 8-bit source', { exact: true })).toBeVisible();
+  await expect(
+    quick.getByText('Standalone x264 · 8-bit source H.264 · Source frame rate', { exact: true }),
+  ).toBeVisible();
   await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
     inputPath.replace(/\.mkv$/, '_x264.mkv'),
   );
@@ -1075,7 +1083,9 @@ for (const depth of [8, 10]) {
     const quick = quickWorkspace(page);
     await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
     await expect(
-      quick.getByText(`Standalone x264 · ${depth}-bit source`, { exact: true }),
+      quick.getByText(`Standalone x264 · ${depth}-bit source H.264 · Source frame rate`, {
+        exact: true,
+      }),
     ).toBeVisible();
     await expect(quick).not.toContainText('lossless');
     await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
@@ -2739,6 +2749,7 @@ test('av1an scene and VMAF controls validate, restore drafts and freeze queued s
   await openEncode(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const workspace = av1anWorkspace(page);
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
   await workspace.getByLabel('Source reader', { exact: true }).selectOption('ffms2');
   await workspace.getByLabel('Split method', { exact: true }).selectOption('fixedChunks');
@@ -2775,6 +2786,7 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
   await openEncode(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const workspace = av1anWorkspace(page);
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
   await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
   await workspace.getByLabel('Target metric', { exact: true }).selectOption('butteraugli');
@@ -2903,6 +2915,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await importAnotherSource(page, next);
     await page.getByRole('button', { name: tab, exact: true }).click();
     const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
+    await workspace.getByText('Crop, resize & borders', { exact: true }).click();
     await expect(workspace.getByLabel('Video dimensions', { exact: true })).toContainText(
       '320 × 180',
     );

@@ -123,13 +123,16 @@
 
 <style>
   .audio-options {
-    padding: 10px 0 14px 28px;
+    padding: 10px 0 12px 20px;
     border-bottom: 1px solid var(--border);
   }
   .audio-controls {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
     gap: 10px;
+  }
+  .audio-controls input[type='number'] {
+    width: min(100%, 9rem);
   }
   .audio-source,
   .audio-help {
@@ -143,9 +146,9 @@
   .audio-help {
     margin-top: 8px;
   }
-  @media (max-width: 760px) {
-    .audio-controls {
-      grid-template-columns: 1fr;
+  @media (max-width: 560px) {
+    .audio-options {
+      padding-left: 12px;
     }
   }
 </style>

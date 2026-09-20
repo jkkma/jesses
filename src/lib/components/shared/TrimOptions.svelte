@@ -123,7 +123,7 @@
 
 <style>
   .trim-options {
-    margin-top: 14px;
+    margin-top: 10px;
   }
   .choice {
     display: flex;
@@ -137,14 +137,17 @@
   }
   .trim-fields {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr));
     gap: 12px;
-    margin-top: 12px;
+    margin-top: 10px;
+  }
+  .trim-fields input {
+    width: min(100%, 9rem);
   }
   .trim-mode {
     display: flex;
     gap: 16px;
-    margin: 12px 0 0;
+    margin: 10px 0 0;
     padding: 0;
     border: 0;
   }

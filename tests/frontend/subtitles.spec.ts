@@ -211,7 +211,7 @@ test('batch subtitle edits invalidate a reviewed preview and preserve already qu
   await batch.getByLabel('Select captions.mkv', { exact: true }).check();
   await preview.click();
   const episode = batch.locator('article.episode').first();
-  await episode.locator('summary').click();
+  await episode.locator('.episode-tracks > summary').click();
   await episode
     .getByRole('group', { name: 'Subtitle settings for stream #9', exact: true })
     .getByLabel('Subtitle action', { exact: true })

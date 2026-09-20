@@ -59,11 +59,14 @@
   >
   {#if busy}<button type="button" onclick={cancel}>Cancel command preview</button>
     <p role="status">Validating the complete source and preparing the actual encoder plan…</p>{/if}
-  <p class="small-muted">
-    Preview validates the whole source and may prepare temporary subtitles or measure target-size
-    audio. It creates no final output. Argument edits are restricted to the validated advanced
-    catalog.
-  </p>
+  <details class="preview-help">
+    <summary>About command preview</summary>
+    <p class="small-muted">
+      Preview validates the whole source and may prepare temporary subtitles or measure target-size
+      audio. It creates no final output. Argument edits are restricted to the validated advanced
+      catalog.
+    </p>
+  </details>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if plan}
     <p role="status">
@@ -95,16 +98,15 @@
 <style>
   .command-preview {
     display: grid;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
     border: 1px solid var(--border);
-    padding: 12px;
-    border-radius: 8px;
+    padding: 10px;
   }
   button {
+    justify-self: start;
     border: 1px solid var(--border);
     padding: 8px;
-    border-radius: 6px;
     background: var(--background);
     color: var(--foreground);
     cursor: pointer;
@@ -136,5 +138,14 @@
   }
   details {
     min-width: 0;
+  }
+  .preview-help summary {
+    font-size: 10px;
+    font-weight: 400;
+    color: var(--muted-foreground);
+  }
+  .preview-help p {
+    margin-top: 6px;
+    font-size: 10px;
   }
 </style>

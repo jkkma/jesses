@@ -107,35 +107,40 @@
 {/if}
 <details class="completion-panel" hidden={!settingsVisible}>
   <summary>When the queue finishes</summary>
-  <p class="small-muted">
-    These choices last for this session. Finish actions require every queued job to succeed and wait
-    60 seconds. Canceling or stopping a job disarms the action.
-  </p>
-  <label
-    ><input
-      type="checkbox"
-      bind:checked={notify}
-      onchange={() => {
-        notifyDirty = true;
-      }}
-      disabled={pending}
-    /> Notify when jobs complete or fail</label
-  >
-  <label
-    >After successful completion <select
-      bind:value={action}
-      onchange={() => {
-        actionDirty = true;
-      }}
-      disabled={pending}
-      aria-label="Finish action"
-      ><option value="none">Keep jesses open</option><option value="closeApp">Close jesses</option
-      ><option value="shutdown">Shut down the computer</option></select
-    ></label
-  >
-  <button type="button" onclick={apply} disabled={pending || !isDesktop()}
-    >Apply to this queue</button
-  >
+  <div class="completion-settings">
+    <p class="small-muted">
+      These choices last for this session. Finish actions require every queued job to succeed and
+      wait 60 seconds. Canceling or stopping a job disarms the action.
+    </p>
+    <div class="completion-fields">
+      <label class="notify-field"
+        ><input
+          type="checkbox"
+          bind:checked={notify}
+          onchange={() => {
+            notifyDirty = true;
+          }}
+          disabled={pending}
+        /> Notify when jobs complete or fail</label
+      >
+      <label class="action-field"
+        >After successful completion <select
+          bind:value={action}
+          onchange={() => {
+            actionDirty = true;
+          }}
+          disabled={pending}
+          aria-label="Finish action"
+          ><option value="none">Keep jesses open</option><option value="closeApp"
+            >Close jesses</option
+          ><option value="shutdown">Shut down the computer</option></select
+        ></label
+      >
+      <button type="button" onclick={apply} disabled={pending || !isDesktop()}
+        >Apply to this queue</button
+      >
+    </div>
+  </div>
 </details>
 
 <style>
@@ -156,9 +161,8 @@
     box-shadow: 0 4px 20px #0003;
   }
   .completion-panel {
-    margin: 1rem 0;
+    margin: 12px 0;
     border: 1px solid var(--border, #c0b7aa);
-    padding: 1rem;
     background: var(--panel, #e3dacc);
   }
   .completion-error {
@@ -169,12 +173,31 @@
   summary {
     cursor: pointer;
     font-weight: 600;
+    padding: 12px 14px;
   }
-  label {
-    display: inline-flex;
+  .completion-settings {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+    border-top: 1px solid var(--border, #c0b7aa);
+  }
+  .completion-fields {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 10px 16px;
+  }
+  .completion-fields label {
+    display: flex;
     align-items: center;
     gap: 0.5rem;
-    margin: 0.6rem 1rem 0.6rem 0;
+  }
+  .action-field {
+    flex-direction: column;
+    align-items: flex-start !important;
+  }
+  .notify-field {
+    padding-block: 0.5rem;
   }
   select,
   button {
@@ -187,5 +210,14 @@
   }
   p {
     max-width: 85ch;
+  }
+  @media (max-width: 800px) {
+    .action-field {
+      flex: 1 1 16rem;
+    }
+    .action-field select {
+      max-width: 100%;
+      width: 100%;
+    }
   }
 </style>

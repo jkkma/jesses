@@ -124,10 +124,15 @@
       <p>{error}</p>
     </div>{/if}
   <label class="combine-option"
-    ><input type="checkbox" bind:checked={combine} disabled={!!active || submitting} />Combine
-    tracks from multiple files</label
+    ><input
+      type="checkbox"
+      bind:checked={combine}
+      disabled={!!active || submitting}
+      aria-controls="combined-remux-workspace"
+      aria-expanded={combine}
+    />Combine tracks from multiple files</label
   >
-  <div hidden={!combine}>
+  <div id="combined-remux-workspace" hidden={!combine}>
     <MultiSourceMux
       {files}
       primaryId={file?.id}
@@ -201,28 +206,33 @@
         >
       </div>
       <div class="remux-output-content">
-        <div class="field">
-          <label for="remux-destination">Destination</label><input
-            id="remux-destination"
-            bind:value={destination}
-            disabled={!desktop || !!active || submitting}
-            placeholder="Choose a new media file"
-          />
-          <ContainerOptions
-            value={destinationContainer(destination)}
-            onchange={(value) => (destination = containerDestination(destination, value))}
-            disabled={!!active || submitting}
-          />
+        <div class="remux-destination-fields">
+          <div class="field">
+            <label for="remux-destination">Destination</label><input
+              id="remux-destination"
+              bind:value={destination}
+              disabled={!desktop || !!active || submitting}
+              placeholder="Choose a new media file"
+            />
+          </div>
+          <div class="container-choice">
+            <ContainerOptions
+              value={destinationContainer(destination)}
+              onchange={(value) => (destination = containerDestination(destination, value))}
+              disabled={!!active || submitting}
+            />
+          </div>
         </div>
-        <Button
-          variant="outline"
-          onclick={chooseOutput}
-          disabled={!desktop || !!active || submitting}>Choose destination</Button
-        >
         <p class="small-muted">Choose a new filename. Existing files are never replaced.</p>
-        <Button onclick={start} disabled={!canStart}
-          ><Play size={14} />{submitting ? 'Starting…' : 'Start remux'}</Button
-        >
+        <div class="remux-output-actions">
+          <Button
+            variant="outline"
+            onclick={chooseOutput}
+            disabled={!desktop || !!active || submitting}>Choose destination</Button
+          ><Button onclick={start} disabled={!canStart}
+            ><Play size={14} />{submitting ? 'Starting…' : 'Start remux'}</Button
+          >
+        </div>
         {#if !desktop}<p class="disabled-reason">Remux requires the desktop app.</p>
         {:else if !connected}<p class="disabled-reason">Connecting to the job runtime…</p>
         {:else if !toolsReady}<p class="disabled-reason">
@@ -240,7 +250,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    margin: 0 0 20px;
+    margin: 0 0 14px;
     font-size: 13px;
   }
   .combine-option input {
@@ -256,19 +266,20 @@
   }
   .remux-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
-    gap: 20px;
+    grid-template-columns: minmax(0, 1.25fr) minmax(22rem, 0.75fr);
+    gap: 16px;
+    align-items: start;
   }
   .remux-streams,
   .remux-output {
     min-width: 0;
   }
   .section-heading {
-    padding: 16px 20px;
+    padding: 12px 14px;
   }
   .remux-source,
   .remux-empty {
-    padding: 16px 20px;
+    padding: 12px 14px;
     overflow-wrap: anywhere;
   }
   .remux-source p {
@@ -276,15 +287,15 @@
     font-size: 12px;
   }
   .remux-stream-list {
-    padding: 0 20px 12px;
-    max-height: 400px;
+    padding: 0 14px 8px;
+    max-height: min(360px, 46vh);
     overflow-y: auto;
   }
   .remux-stream-row {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 14px 0;
+    padding: 10px 0;
     border-top: 1px solid var(--border);
   }
   .remux-stream-row label {
@@ -320,14 +331,40 @@
     flex: 0 0 auto;
   }
   .remux-output-content {
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+    padding: 14px;
+    display: grid;
+    gap: 12px;
   }
-  @media (max-width: 850px) {
+  .remux-output {
+    position: sticky;
+    top: 12px;
+  }
+  .remux-destination-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+    gap: 12px;
+    align-items: start;
+  }
+  .container-choice {
+    min-width: 0;
+  }
+  .remux-output-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .remux-output-actions :global(button) {
+    flex: 1 1 10rem;
+  }
+  @media (max-width: 1000px) {
     .remux-grid {
       grid-template-columns: minmax(0, 1fr);
+    }
+    .remux-stream-list {
+      max-height: min(300px, 40vh);
+    }
+    .remux-output {
+      position: static;
     }
   }
 </style>

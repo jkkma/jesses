@@ -313,8 +313,10 @@ test('crop resize and borders batch preview retains each source framing and immu
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
   const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('summary').click();
-  await second.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await second.locator('.episode-tracks > summary').click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
+  await second.getByText('Crop, resize & borders', { exact: true }).click();
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Crop bottom (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Resize video', { exact: true }).check();
@@ -355,7 +357,8 @@ test('crop resize and borders batch preview retains each source framing and immu
     preview.inputs.map((input) => input.framing),
   );
   await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('0');
   await first.getByLabel('Border top (pixels)', { exact: true }).fill('0');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
@@ -373,7 +376,8 @@ for (const edit of ['crop', 'width', 'resize', 'border', 'bordersEnabled']) {
     await openBatch(page);
     const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
     const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-    await first.locator('summary').click();
+    await first.locator('.episode-tracks > summary').click();
+    await first.getByText('Crop, resize & borders', { exact: true }).click();
     await first.getByLabel('Resize video', { exact: true }).check();
     await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
     await first.getByLabel('Add black borders', { exact: true }).check();
@@ -432,7 +436,8 @@ test('crop resize and borders batch rejects invalid per-file values before reque
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
   const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
   for (const edge of ['top', 'right', 'bottom', 'left']) {
     for (const invalid of ['', '-2', '3', '2.5', '8192']) {
@@ -474,7 +479,8 @@ test('crop resize and border batch drafts restore per encoder and workflow with 
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
   await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
   await first.getByLabel('Resize video', { exact: true }).check();
   await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
@@ -841,8 +847,7 @@ test('x264 batch encoder switches restore source choices and common settings whi
   await workspace
     .locator('article.episode')
     .filter({ hasText: 'Episode 1.mkv' })
-    .locator('summary')
-    .first()
+    .locator('.episode-tracks > summary')
     .click();
   await expect(
     workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
@@ -1227,8 +1232,9 @@ test('a batch selects at most 100 imported episodes and the minimum-width layout
   await expect(page.getByRole('checkbox', { name: /^Select /, checked: true })).toHaveCount(100);
   await expect(page.getByLabel('Select Episode 101.mkv', { exact: true })).toBeDisabled();
   const first = page.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  const toggle = first.locator('summary').first();
+  const toggle = first.locator('.episode-tracks > summary');
   await toggle.click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
   await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(1);
   await first.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
   await toggle.click();
@@ -1241,6 +1247,7 @@ test('a batch selects at most 100 imported episodes and the minimum-width layout
   expect(request.inputs[0].framing.crop.left).toBe(20);
   await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
   await toggle.click();
+  await first.getByText('Crop, resize & borders', { exact: true }).click();
   await expect(first.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('20');
   // Expanding display-only controls does not invalidate the reviewed request.
   await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
@@ -1409,8 +1416,8 @@ test('batch audio converts independently per source and queues reviewed immutabl
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
   const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('summary').click();
-  await second.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await second.locator('.episode-tracks > summary').click();
   await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
   await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
   await first.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
@@ -1428,7 +1435,7 @@ test('batch audio converts independently per source and queues reviewed immutabl
     preview.inputs.map((input) => input.audio),
   );
   await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
   await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
@@ -1443,7 +1450,7 @@ for (const edit of ['codec', 'bitrate', 'channels', 'selection'] as const) {
     await openBatch(page);
     const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
     const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-    await first.locator('summary').click();
+    await first.locator('.episode-tracks > summary').click();
     await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
     await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
     await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
@@ -1477,7 +1484,7 @@ test('batch audio drafts are isolated by encoder and workflow, with av1an conver
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
   await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
   await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
@@ -1503,7 +1510,7 @@ test('batch invalid audio blocks preview only for selected source tracks', async
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
   await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
   await first.getByLabel('Audio bitrate', { exact: true }).fill('');
   const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
@@ -1511,7 +1518,7 @@ test('batch invalid audio blocks preview only for selected source tracks', async
   await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).uncheck();
   await expect(preview).toBeEnabled();
   await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).check();
-  await first.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
   await expect(preview).toBeDisabled();
   await first.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }).uncheck();
   await expect(preview).toBeEnabled();
@@ -1528,8 +1535,8 @@ test('batch queues reviewed FLAC and MP3 settings independently per file', async
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
   const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('summary').click();
-  await second.locator('summary').click();
+  await first.locator('.episode-tracks > summary').click();
+  await second.locator('.episode-tracks > summary').click();
   await first.getByLabel('Audio codec', { exact: true }).selectOption('flac');
   await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveCount(0);
   await second.getByLabel('Audio codec', { exact: true }).selectOption('mp3');
@@ -1749,6 +1756,7 @@ test('av1an scene batch settings invalidate review and preserve queued target pa
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
   await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
   const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
