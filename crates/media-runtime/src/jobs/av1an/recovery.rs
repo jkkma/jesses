@@ -72,6 +72,20 @@ struct Stamp {
     sha256: String,
 }
 
+fn tool_contents_match(saved: &[Stamp], current: &[Stamp]) -> bool {
+    saved.len() == current.len()
+        && saved
+            .iter()
+            .zip(current)
+            // Tool roles are positional: FFmpeg, FFprobe, encoder, av1an and
+            // the optional preparation producer. Scoop may copy the same
+            // package into a new version directory, changing both path and
+            // filesystem identity without changing the selected tool bytes.
+            .all(|(saved, current)| {
+                saved.length == current.length && saved.sha256 == current.sha256
+            })
+}
+
 fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
     let before = identity(path)?;
     let mut options = OpenOptions::new();
@@ -844,7 +858,7 @@ impl Recovery {
                     Some(&cancel),
                 )?;
                 if !source_matches
-                    || manifest.tools != tool_stamps
+                    || !tool_contents_match(&manifest.tools, &tool_stamps)
                     || manifest.params != params
                     || manifest.fps_num != fps_num
                     || manifest.fps_den != fps_den
@@ -1366,6 +1380,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn tool_relocation_requires_ordered_byte_identical_roles() {
+        let fixture = Fixture::new();
+        let original = fixture.0.join("original-tools");
+        let relocated = fixture.0.join("relocated-tools");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&relocated).unwrap();
+        let tools = [
+            ("ffmpeg", b"ffmpeg".as_slice()),
+            ("ffprobe", b"ffprobe".as_slice()),
+            ("encoder", b"encoder".as_slice()),
+            ("av1an", b"av1an".as_slice()),
+        ];
+        for (name, contents) in tools {
+            fs::write(original.join(name), contents).unwrap();
+            fs::copy(original.join(name), relocated.join(name)).unwrap();
+        }
+        let stamps = |root: &Path| {
+            tools
+                .iter()
+                .map(|(name, _)| digest(&root.join(name), None).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let saved = stamps(&original);
+        let mut current = stamps(&relocated);
+        assert!(saved.iter().zip(&current).all(
+            |(saved, current)| saved.path != current.path && saved.identity != current.identity
+        ));
+        assert!(tool_contents_match(&saved, &current));
+        assert!(saved != current, "ordinary recovery stamps remain strict");
+
+        fs::write(relocated.join("ffmpeg"), b"ffmpeh").unwrap();
+        current[0] = digest(&relocated.join("ffmpeg"), None).unwrap();
+        assert_eq!(saved[0].length, current[0].length);
+        assert!(!tool_contents_match(&saved, &current));
+
+        fs::copy(original.join("ffmpeg"), relocated.join("ffmpeg")).unwrap();
+        current = stamps(&relocated);
+        current.swap(0, 1);
+        assert!(!tool_contents_match(&saved, &current));
+        current.swap(0, 1);
+        current.pop();
+        assert!(!tool_contents_match(&saved, &current));
     }
 
     #[test]
