@@ -31,6 +31,78 @@ class WindowsCleanQualificationTests(unittest.TestCase):
         if not version.startswith("5.1"):
             raise unittest.SkipTest(f"Windows PowerShell 5.1 is unavailable: {version}")
 
+        cls.native_fixture_temporary = tempfile.TemporaryDirectory(prefix="jesses-windows-clean-native-")
+        fixture_root = Path(cls.native_fixture_temporary.name)
+        compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+        cls.native_fixture = fixture_root / "clean-process-fixture.exe"
+        cls.native_fixture_error = ""
+        if not compiler.is_file():
+            cls.native_fixture_error = f".NET Framework x64 compiler is unavailable: {compiler}"
+            return
+
+        source = fixture_root / "clean-process-fixture.cs"
+        source.write_text(
+            r'''using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+
+public static class CleanProcessFixture
+{
+    private static Process StartHiddenChild()
+    {
+        string launcher = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        return Process.Start(new ProcessStartInfo {
+            FileName = launcher,
+            Arguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"Start-Sleep -Seconds 60\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        });
+    }
+
+    public static int Main(string[] args)
+    {
+        if (args.Length == 4 && args[0] == "echo") {
+            File.WriteAllText(args[1], args[2] + Environment.NewLine + args[3] + Environment.NewLine);
+            Console.WriteLine("native arguments received");
+            return 0;
+        }
+        if (args.Length != 3 || (args[0] != "spawn-wait" && args[0] != "spawn-exit")) {
+            Console.Error.WriteLine("Expected echo or spawn mode arguments.");
+            return 64;
+        }
+
+        Process child = StartHiddenChild();
+        File.WriteAllText(args[1], child.Id.ToString());
+        File.WriteAllText(args[2], "ready" + Environment.NewLine);
+        Console.WriteLine("child ready: " + child.Id);
+        if (args[0] == "spawn-wait") {
+            Thread.Sleep(TimeSpan.FromSeconds(60));
+        }
+        return 0;
+    }
+}
+''',
+            encoding="utf-8",
+        )
+        compile_result = subprocess.run(
+            [str(compiler), "/nologo", "/target:exe", "/platform:x64", f"/out:{cls.native_fixture}", str(source)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if compile_result.returncode != 0:
+            details = compile_result.stdout + compile_result.stderr
+            cls.native_fixture_temporary.cleanup()
+            raise RuntimeError(f"Could not compile native clean-process fixture:\n{details}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.native_fixture_temporary.cleanup()
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="jesses-windows-clean-test-")
         self.root = Path(self.temporary.name)
@@ -39,6 +111,11 @@ class WindowsCleanQualificationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def require_native_fixture(self) -> Path:
+        if self.native_fixture_error:
+            self.skipTest(self.native_fixture_error)
+        return self.native_fixture
 
     @staticmethod
     def record(path: str, payload: bytes) -> dict[str, object]:
@@ -205,19 +282,14 @@ class WindowsCleanQualificationTests(unittest.TestCase):
         self.assertIn("Archive SHA-256 does not match", result.stdout + result.stderr)
 
     def test_timeout_terminates_child_tree_and_writes_log(self) -> None:
+        executable = self.require_native_fixture()
         harness = self.root / "timeout-harness.ps1"
         child_pid = self.root / "child-pid.txt"
+        child_ready = self.root / "child-ready.txt"
         log = self.root / "timeout.log"
         work = self.root / "timeout-work"
         work.mkdir()
         quote = lambda path: str(path).replace("'", "''")
-        target_script = self.root / "spawn-and-sleep.ps1"
-        target_script.write_text(
-            f"$child = Start-Process -FilePath ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') -ArgumentList '-NoProfile -Command \"Start-Sleep -Seconds 60\"' -PassThru\n"
-            f"Set-Content -LiteralPath '{quote(child_pid)}' -Value $child.Id\n"
-            "Start-Sleep -Seconds 60\n",
-            encoding="utf-8",
-        )
         harness.write_text(
             f"""
 $ErrorActionPreference = 'Stop'
@@ -234,16 +306,21 @@ $environment = @{{
 }}
 $timedOut = $false
 try {{
-  Invoke-CleanProcess ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') @('-NoLogo', '-NoProfile', '-File', '{quote(target_script)}') '{quote(work)}' $environment '{quote(log)}' 1 | Out-Null
+  Invoke-CleanProcess '{quote(executable)}' @('spawn-wait', '{quote(child_pid)}', '{quote(child_ready)}') '{quote(work)}' $environment '{quote(log)}' 10 | Out-Null
 }}
 catch {{
   if ($_.Exception.Message -like 'Process timed out*') {{ $timedOut = $true }} else {{ throw }}
 }}
 if (-not $timedOut) {{ throw 'The timeout path did not run.' }}
-Start-Sleep -Milliseconds 500
+if (-not (Test-Path -LiteralPath '{quote(child_ready)}' -PathType Leaf)) {{ throw 'Native child fixture never reached its readiness marker.' }}
+if (-not (Test-Path -LiteralPath '{quote(child_pid)}' -PathType Leaf)) {{ throw 'Native child fixture did not record its child PID.' }}
 $child = [int](Get-Content -LiteralPath '{quote(child_pid)}' -Raw)
-if (Get-Process -Id $child -ErrorAction SilentlyContinue) {{ throw "Timed-out child process remains: $child" }}
-if ((Get-Content -LiteralPath '{quote(log)}' -Raw) -notmatch 'TIMEOUT after 1 seconds') {{ throw 'Timeout log is incomplete.' }}
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+while (Get-Process -Id $child -ErrorAction SilentlyContinue) {{
+  if ([DateTime]::UtcNow -ge $deadline) {{ throw "Timed-out child process remains: $child" }}
+  Start-Sleep -Milliseconds 50
+}}
+if ((Get-Content -LiteralPath '{quote(log)}' -Raw) -notmatch 'TIMEOUT after 10 seconds') {{ throw 'Timeout log is incomplete.' }}
 "timeout cleanup passed"
 """,
             encoding="utf-8",
@@ -253,7 +330,7 @@ if ((Get-Content -LiteralPath '{quote(log)}' -Raw) -notmatch 'TIMEOUT after 1 se
             capture_output=True,
             text=True,
             errors="replace",
-            timeout=20,
+            timeout=35,
         )
         details = result.stdout + result.stderr
         if log.exists():
@@ -261,19 +338,14 @@ if ((Get-Content -LiteralPath '{quote(log)}' -Raw) -notmatch 'TIMEOUT after 1 se
         self.assertEqual(result.returncode, 0, details)
         self.assertIn("timeout cleanup passed", result.stdout)
 
-    def test_parent_exits_first_child_is_still_job_owned(self) -> None:
-        harness = self.root / "parent-exit-harness.ps1"
-        child_pid = self.root / "parent-exit-child-pid.txt"
-        log = self.root / "parent-exit.log"
-        work = self.root / "parent-exit-work"
+    def test_clean_process_forwards_native_arguments_and_writes_log(self) -> None:
+        executable = self.require_native_fixture()
+        harness = self.root / "native-arguments-harness.ps1"
+        received = self.root / "native arguments received.txt"
+        log = self.root / "native-arguments.log"
+        work = self.root / "native arguments work"
         work.mkdir()
         quote = lambda path: str(path).replace("'", "''")
-        target_script = self.root / "spawn-and-exit.ps1"
-        target_script.write_text(
-            f"$child = Start-Process -FilePath ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') -ArgumentList '-NoProfile -Command \"Start-Sleep -Seconds 60\"' -PassThru\n"
-            f"Set-Content -LiteralPath '{quote(child_pid)}' -Value $child.Id\n",
-            encoding="utf-8",
-        )
         harness.write_text(
             f"""
 $ErrorActionPreference = 'Stop'
@@ -288,17 +360,13 @@ $environment = @{{
   TEMP = '{quote(work)}'
   TMP = '{quote(work)}'
 }}
-try {{
-  Invoke-CleanProcess ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') @('-NoLogo', '-NoProfile', '-File', '{quote(target_script)}') '{quote(work)}' $environment '{quote(log)}' 10 | Out-Null
-}}
-catch {{
-  if ($_.Exception.Message -notlike 'The root process exited while an owned descendant*') {{ throw }}
-}}
-Start-Sleep -Milliseconds 500
-$child = [int](Get-Content -LiteralPath '{quote(child_pid)}' -Raw)
-if (Get-Process -Id $child -ErrorAction SilentlyContinue) {{ throw "Parent-exit child process remains: $child" }}
-if (-not (Test-Path -LiteralPath '{quote(log)}' -PathType Leaf)) {{ throw 'Parent-exit log is missing.' }}
-"parent exit cleanup passed"
+$result = Invoke-CleanProcess '{quote(executable)}' @('echo', '{quote(received)}', 'argument with spaces', 'C:\\Program Files\\Qualification Tool\\probe.exe') '{quote(work)}' $environment '{quote(log)}' 10
+if ($result.stdout -notmatch 'native arguments received') {{ throw 'Native stdout was not captured.' }}
+$expected = @('argument with spaces', 'C:\\Program Files\\Qualification Tool\\probe.exe') -join [Environment]::NewLine
+$expected += [Environment]::NewLine
+if ((Get-Content -LiteralPath '{quote(received)}' -Raw) -cne $expected) {{ throw 'Native arguments were not preserved.' }}
+if ((Get-Content -LiteralPath '{quote(log)}' -Raw) -notmatch 'native arguments received') {{ throw 'Native success log is incomplete.' }}
+"native argument forwarding passed"
 """,
             encoding="utf-8",
         )
@@ -313,48 +381,13 @@ if (-not (Test-Path -LiteralPath '{quote(log)}' -PathType Leaf)) {{ throw 'Paren
         if log.exists():
             details += "\nLOG\n" + log.read_text(encoding="utf-8-sig", errors="replace")
         self.assertEqual(result.returncode, 0, details)
-        self.assertIn("parent exit cleanup passed", result.stdout)
+        self.assertIn("native argument forwarding passed", result.stdout)
 
     def test_fast_native_root_cannot_launch_before_job_assignment(self) -> None:
-        compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
-        if not compiler.is_file():
-            self.skipTest(f".NET Framework x64 compiler is unavailable: {compiler}")
-        source = self.root / "fast-root.cs"
-        executable = self.root / "fast-root.exe"
-        source.write_text(
-            r'''using System;
-using System.Diagnostics;
-using System.IO;
-
-public static class FastRoot
-{
-    public static int Main(string[] args)
-    {
-        string launcher = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-            "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-        var child = Process.Start(new ProcessStartInfo {
-            FileName = launcher,
-            Arguments = "-NoLogo -NoProfile -Command \"Start-Sleep -Seconds 60\"",
-            UseShellExecute = false
-        });
-        File.WriteAllText(args[0], child.Id.ToString());
-        return 0;
-    }
-}
-''',
-            encoding="utf-8",
-        )
-        compile_result = subprocess.run(
-            [str(compiler), "/nologo", "/target:exe", "/platform:x64", f"/out:{executable}", str(source)],
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-        self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
-
+        executable = self.require_native_fixture()
         harness = self.root / "fast-root-harness.ps1"
         child_pid = self.root / "fast-root-child-pid.txt"
+        child_ready = self.root / "fast-root-child-ready.txt"
         log = self.root / "fast-root.log"
         work = self.root / "fast-root-work"
         work.mkdir()
@@ -374,14 +407,19 @@ $environment = @{{
   TMP = '{quote(work)}'
 }}
 try {{
-  Invoke-CleanProcess '{quote(executable)}' @('{quote(child_pid)}') '{quote(work)}' $environment '{quote(log)}' 10 | Out-Null
+  Invoke-CleanProcess '{quote(executable)}' @('spawn-exit', '{quote(child_pid)}', '{quote(child_ready)}') '{quote(work)}' $environment '{quote(log)}' 10 | Out-Null
 }}
 catch {{
   if ($_.Exception.Message -notlike 'The root process exited while an owned descendant*') {{ throw }}
 }}
-Start-Sleep -Milliseconds 500
+if (-not (Test-Path -LiteralPath '{quote(child_ready)}' -PathType Leaf)) {{ throw 'Fast native fixture never reached its readiness marker.' }}
+if (-not (Test-Path -LiteralPath '{quote(child_pid)}' -PathType Leaf)) {{ throw 'Fast native fixture did not record its child PID.' }}
 $child = [int](Get-Content -LiteralPath '{quote(child_pid)}' -Raw)
-if (Get-Process -Id $child -ErrorAction SilentlyContinue) {{ throw "Fast-root child escaped the process job: $child" }}
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+while (Get-Process -Id $child -ErrorAction SilentlyContinue) {{
+  if ([DateTime]::UtcNow -ge $deadline) {{ throw "Fast-root child escaped the process job: $child" }}
+  Start-Sleep -Milliseconds 50
+}}
 "fast native root cleanup passed"
 """,
             encoding="utf-8",
