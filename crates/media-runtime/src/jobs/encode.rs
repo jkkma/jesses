@@ -786,6 +786,18 @@ impl JobManager {
         };
         *temporary = Some(if let Some(final_stage) = standalone_final.take() {
             final_stage
+        } else if let Some(recovery) = recovery.as_ref() {
+            // A forced host exit cannot run Temporary::drop. Keep av1an's final
+            // mux attempt inside the identity-guarded recovery workspace so a
+            // verified successful resume removes both current and crashed
+            // attempts with the workspace; never infer ownership from a name
+            // beside the user's destination.
+            Temporary::durable(
+                &recovery
+                    .root
+                    .join(format!("attempt-{attempt_id}.partial.mkv")),
+                false,
+            )?
         } else {
             Temporary::create(&output, &attempt_id)?
         });
@@ -1414,7 +1426,19 @@ impl JobManager {
         drop(standalone_timed);
         drop(durable);
         if let Some(recovery) = recovery {
-            match recovery.cleanup().await {
+            // Close and unlink the current attempt before removing its parent
+            // workspace on Windows. If its identity check fails, retain the
+            // entire workspace: inferring ownership of the replacement from
+            // its location would violate the no-clobber boundary.
+            let attempt_cleanup = match temporary.take() {
+                Some(mut attempt) => attempt.cleanup(),
+                None => Ok(()),
+            };
+            let cleanup = match attempt_cleanup {
+                Ok(()) => recovery.cleanup().await,
+                Err(error) => Err(error),
+            };
+            match cleanup {
                 Ok(()) => self.change(id, |snapshot| snapshot.recovery = None).await,
                 Err(error) => {
                     self.change(id, |snapshot| {

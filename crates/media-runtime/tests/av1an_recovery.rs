@@ -81,6 +81,10 @@ async fn output(command: &mut Command) -> Vec<u8> {
 
 const FRAMES: u64 = 720;
 async fn synthesize(path: &Path, hdr: bool) {
+    synthesize_frames(path, hdr, FRAMES).await;
+}
+
+async fn synthesize_frames(path: &Path, hdr: bool, frames: u64) {
     let attachment = path.parent().unwrap().join("retained-font.ttf");
     std::fs::write(&attachment, [b'A'; 4096]).unwrap();
     let subtitles = path.parent().unwrap().join("retained-subtitles.srt");
@@ -118,9 +122,9 @@ async fn synthesize(path: &Path, hdr: bool) {
         "-c:s",
         "srt",
         "-frames:v",
-        &FRAMES.to_string(),
+        &frames.to_string(),
         "-t",
-        "30",
+        &(frames as f64 / 24.0).to_string(),
         "-c:a",
         "pcm_s16le",
         "-color_primaries",
@@ -222,6 +226,546 @@ async fn pause_live(manager: &JobManager, id: &str) -> JobSnapshot {
     })
     .await
     .expect("av1an must expose a pausable process")
+}
+
+#[cfg(windows)]
+const CRASH_CHILD_ENV: &str = "JESSES_AV1AN_CRASH_CHILD";
+#[cfg(windows)]
+const CRASH_ROOT_ENV: &str = "JESSES_AV1AN_CRASH_ROOT";
+#[cfg(windows)]
+const CRASH_FRAMES: u64 = 2_400;
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsProcess {
+    pid: u32,
+    parent_pid: u32,
+    name: String,
+    executable_path: Option<String>,
+}
+
+#[cfg(windows)]
+fn windows_process_inventory() -> Vec<WindowsProcess> {
+    let result = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath) | ConvertTo-Json -Compress",
+        ])
+        .output()
+        .expect("Windows process inventory must launch");
+    assert!(
+        result.status.success(),
+        "Windows process inventory failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let values: Value = serde_json::from_slice(&result.stdout).unwrap();
+    values
+        .as_array()
+        .expect("PowerShell must return a process array")
+        .iter()
+        .filter_map(|value| {
+            Some(WindowsProcess {
+                pid: u32::try_from(value["ProcessId"].as_u64()?).ok()?,
+                parent_pid: u32::try_from(value["ParentProcessId"].as_u64()?).ok()?,
+                name: value["Name"].as_str()?.to_owned(),
+                executable_path: value["ExecutablePath"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn descendants(root: u32, inventory: &[WindowsProcess]) -> Vec<WindowsProcess> {
+    let mut pids = std::collections::HashSet::from([root]);
+    let mut result = Vec::new();
+    loop {
+        let mut changed = false;
+        for process in inventory {
+            if !pids.contains(&process.pid) && pids.contains(&process.parent_pid) {
+                pids.insert(process.pid);
+                result.push(process.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return result;
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ObservedWindowsProcess {
+    process: WindowsProcess,
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+fn open_live_process(process: WindowsProcess) -> Option<ObservedWindowsProcess> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    // SAFETY: the PID came from Win32 immediately before this call. A non-null
+    // result is a new owned synchronization handle, immune to PID reuse.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process.pid) };
+    (!handle.is_null()).then(|| ObservedWindowsProcess {
+        process,
+        handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+    })
+}
+
+#[cfg(windows)]
+fn process_is_running(handle: &std::os::windows::io::OwnedHandle) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+
+    // SAFETY: the handle remains owned and valid for the duration of the call.
+    unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+}
+
+#[cfg(windows)]
+async fn observe_packaged_process_tree(
+    host_pid: u32,
+    resources: &Path,
+    workspace: &Path,
+) -> Vec<ObservedWindowsProcess> {
+    let normalize = |path: &str| {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', r"\")
+            .to_lowercase()
+    };
+    let resources = normalize(&std::fs::canonicalize(resources).unwrap().to_string_lossy());
+    let workspace = normalize(&std::fs::canonicalize(workspace).unwrap().to_string_lossy());
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&resources).join("resources/tools/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let expected_hash = |id: &str| {
+        manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["id"] == id)
+            .and_then(|tool| tool["sha256"].as_str())
+            .unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let inventory = tokio::task::spawn_blocking(windows_process_inventory)
+            .await
+            .unwrap();
+        let observed: Vec<_> = descendants(host_pid, &inventory)
+            .into_iter()
+            .filter_map(open_live_process)
+            .collect();
+        let named = |name: &str| {
+            observed.iter().find(|process| {
+                process.process.name.eq_ignore_ascii_case(name)
+                    && process_is_running(&process.handle)
+            })
+        };
+        if let (Some(av1an), Some(svt)) = (named("av1an.exe"), named("SvtAv1EncApp.exe")) {
+            for (process, expected) in [
+                (av1an, expected_hash("av1an")),
+                (svt, expected_hash("svt-av1")),
+            ] {
+                let path = process
+                    .process
+                    .executable_path
+                    .as_deref()
+                    .expect("WMI must expose the package tool executable path");
+                let path = normalize(path);
+                assert!(
+                    path.starts_with(&workspace) || path.starts_with(&resources),
+                    "the verified package tool escaped its resource and recovery roots: {path}"
+                );
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
+                    expected,
+                    "the live executable differs from the packaged tool receipt: {path}"
+                );
+            }
+            return observed;
+        }
+        let last: Vec<_> = observed
+            .into_iter()
+            .map(|process| process.process)
+            .collect();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the real packaged av1an/SVT process tree must become observable; last descendants: {last:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn assert_process_tree_dead(host_pid: u32, observed: &[ObservedWindowsProcess]) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let inventory = tokio::task::spawn_blocking(windows_process_inventory)
+                .await
+                .unwrap();
+            if observed
+                .iter()
+                .all(|process| !process_is_running(&process.handle))
+                && descendants(host_pid, &inventory).is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("hard host termination must leave no live owned descendants");
+}
+
+#[cfg(windows)]
+async fn run_crash_child(root: &Path) {
+    if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+        media_runtime::configure_bundled_tools(PathBuf::from(resources))
+            .expect("the crash child uses one absolute verified resource root");
+    }
+    let input = root.join("source.mkv");
+    let destination = root.join("published.mkv");
+    let mut encode = request(&input, &destination, VideoEncoder::SvtAv1);
+    encode.settings.preset = 2;
+    let manager = JobManager::open(root.join("logs"), root.join("history")).await;
+    manager.ready().await.unwrap();
+    let submitted = manager.start_encode(encode).await.unwrap();
+    let checkpoint = wait_for(&manager, &submitted.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.completed_frames > 0)
+    })
+    .await;
+    assert!(!checkpoint.state.is_terminal(), "{checkpoint:#?}");
+    let workspace = PathBuf::from(&checkpoint.recovery.as_ref().unwrap().workspace);
+    let attempts: Vec<_> = std::fs::read_dir(&workspace)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("attempt-") && name.ends_with(".partial.mkv"))
+        })
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "one exact mux attempt must be owned by the recovery workspace"
+    );
+    let temporary = root.join("crash-ready.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&json!({
+            "id": checkpoint.id,
+            "recovery": checkpoint.recovery,
+            "attempt": attempts[0],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(temporary, root.join("crash-ready.json")).unwrap();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(windows)]
+struct CrashHost(std::process::Child);
+
+#[cfg(windows)]
+impl Drop for CrashHost {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires the packaged Windows av1an, VapourSynth/L-SMASH and SVT-AV1 tools"]
+async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() {
+    if std::env::var_os(CRASH_CHILD_ENV).is_some() {
+        let root = PathBuf::from(std::env::var_os(CRASH_ROOT_ENV).unwrap());
+        run_crash_child(&root).await;
+        unreachable!();
+    }
+
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("published.mkv");
+    synthesize_frames(&input, false, CRASH_FRAMES).await;
+    let source_bytes = std::fs::read(&input).unwrap();
+    let resources = PathBuf::from(
+        std::env::var_os("JESSES_TEST_TOOL_RESOURCES")
+            .expect("the Windows package gate must name its verified resource root"),
+    );
+
+    let executable = std::env::current_exe().unwrap();
+    let mut host = CrashHost(
+        Command::new(executable)
+            .args([
+                "--exact",
+                "windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CRASH_CHILD_ENV, "1")
+            .env(CRASH_ROOT_ENV, &fixture.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let host_pid = host.0.id();
+    let ready_path = fixture.0.join("crash-ready.json");
+    tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            if ready_path.exists() {
+                return;
+            }
+            assert!(
+                host.0.try_wait().unwrap().is_none(),
+                "the crash host exited before saving a reusable checkpoint"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the crash child must save progress within four minutes");
+    let ready: Value = serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+    let id = ready["id"].as_str().unwrap().to_owned();
+    assert!(ready["recovery"]["completedFrames"].as_u64().unwrap() > 0);
+    assert!(!destination.exists(), "a partial output was published");
+
+    let workspace = PathBuf::from(ready["recovery"]["workspace"].as_str().unwrap());
+    let crashed_attempt = PathBuf::from(ready["attempt"].as_str().unwrap());
+    assert!(
+        crashed_attempt.starts_with(&workspace),
+        "the owned attempt must remain inside its recovery workspace"
+    );
+    let observed = observe_packaged_process_tree(host_pid, &resources, &workspace).await;
+    assert!(
+        observed.iter().any(
+            |process| process.process.name.eq_ignore_ascii_case("av1an.exe")
+                && process_is_running(&process.handle)
+        ),
+        "the owned av1an leader must remain live at the hard-kill boundary"
+    );
+    let process_evidence: Vec<_> = observed
+        .iter()
+        .map(|process| {
+            format!(
+                "owned descendant before crash: pid={} parent={} name={} path={}",
+                process.process.pid,
+                process.process.parent_pid,
+                process.process.name,
+                process
+                    .process
+                    .executable_path
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+            )
+        })
+        .collect();
+
+    host.0.kill().expect("TerminateProcess must kill the host");
+    let status = host.0.wait().unwrap();
+    assert!(
+        !status.success(),
+        "the host must not perform orderly shutdown"
+    );
+    assert_process_tree_dead(host_pid, &observed).await;
+    for evidence in process_evidence {
+        eprintln!("{evidence}");
+    }
+    assert!(!destination.exists(), "a partial output was published");
+    assert!(crashed_attempt.is_file());
+    assert_eq!(std::fs::metadata(&crashed_attempt).unwrap().len(), 0);
+
+    let history = fixture.0.join("history");
+    let manager = JobManager::open(fixture.0.join("logs"), history).await;
+    manager.ready().await.unwrap();
+    let interrupted = manager
+        .list_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    assert_eq!(interrupted.state, JobState::Interrupted, "{interrupted:#?}");
+    assert!(interrupted.recovery.is_some(), "{interrupted:#?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(manager.list_jobs().await[0].state, JobState::Interrupted);
+    assert!(!destination.exists());
+
+    assert_eq!(
+        interrupted.recovery.as_ref().unwrap().workspace,
+        workspace.to_string_lossy()
+    );
+    let manifest_path = workspace.join("manifest.json");
+    let original_manifest = std::fs::read(&manifest_path).unwrap();
+    let baseline: Value = serde_json::from_slice(&original_manifest).unwrap();
+    let retained: Vec<_> = baseline["completed"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|name| RetainedFile::read(workspace.join("chunks/encode").join(format!("{name}.ivf"))))
+        .collect();
+    assert!(!retained.is_empty());
+
+    let mut changed_tool = baseline;
+    changed_tool["tools"][0]["sha256"] = json!("0".repeat(64));
+    std::fs::write(&manifest_path, serde_json::to_vec(&changed_tool).unwrap()).unwrap();
+    manager.resume_job(id.clone()).await.unwrap();
+    let rejected = wait_for(&manager, &id, |job| job.state.is_terminal()).await;
+    assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
+    assert_eq!(rejected.error.as_ref().unwrap().code, "RECOVERY_INVALID");
+    assert!(!destination.exists());
+    assert!(workspace.exists());
+    for file in &retained {
+        file.assert_unchanged();
+    }
+
+    std::fs::write(&manifest_path, &original_manifest).unwrap();
+    manager.resume_job(id.clone()).await.unwrap();
+    let terminal = wait_for(&manager, &id, |job| job.state.is_terminal()).await;
+    assert_eq!(terminal.state, JobState::Succeeded, "{terminal:#?}");
+    manager.shutdown().await;
+    let finished = manager
+        .list_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert!(finished.recovery.is_none());
+    assert!(!workspace.exists());
+    assert!(
+        !crashed_attempt.exists(),
+        "the exact pre-crash owned mux attempt survived successful recovery"
+    );
+    for file in &retained {
+        assert!(
+            !file.path.exists(),
+            "settled recovery workspace was retained"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        source_bytes,
+        "source changed"
+    );
+    assert!(destination.exists());
+    let probed: Value = serde_json::from_slice(
+        &output(
+            Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=nb_read_frames",
+                    "-of",
+                    "json",
+                ])
+                .arg(&destination),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        probed["streams"][0]["nb_read_frames"],
+        CRASH_FRAMES.to_string()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires the packaged Windows av1an, VapourSynth/L-SMASH and SVT-AV1 tools"]
+async fn windows_locked_attempt_retains_recovery_workspace_after_publication() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("published.mkv");
+    synthesize_frames(&input, false, 240).await;
+
+    let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    manager.ready().await.unwrap();
+    let submitted = manager
+        .start_encode(request(&input, &destination, VideoEncoder::SvtAv1))
+        .await
+        .unwrap();
+    let (workspace, attempt) = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let snapshot = manager
+                .list_jobs()
+                .await
+                .into_iter()
+                .find(|job| job.id == submitted.id)
+                .unwrap();
+            assert!(!snapshot.state.is_terminal(), "{snapshot:#?}");
+            if let Some(recovery) = snapshot.recovery {
+                let workspace = PathBuf::from(recovery.workspace);
+                if let Some(attempt) = std::fs::read_dir(&workspace)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("attempt-") && name.ends_with(".partial.mkv")
+                            })
+                    })
+                {
+                    break (workspace, attempt);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the recovery-scoped final attempt must be reserved while encoding");
+    let lock = OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2) // FILE_SHARE_READ | FILE_SHARE_WRITE; deny deletion.
+        .open(&attempt)
+        .unwrap();
+
+    let terminal = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(terminal.state, JobState::Succeeded, "{terminal:#?}");
+    manager.shutdown().await;
+    let settled = manager
+        .list_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.id == submitted.id)
+        .unwrap();
+    assert_eq!(settled.state, JobState::Succeeded, "{settled:#?}");
+    assert!(destination.is_file(), "verified output was not published");
+    assert_eq!(
+        settled.recovery.as_ref().unwrap().workspace,
+        workspace.to_string_lossy(),
+        "the recovery receipt was cleared after exact attempt cleanup failed"
+    );
+    assert!(workspace.is_dir());
+    assert!(attempt.is_file());
+    assert!(settled.logs.iter().any(|line| {
+        line.contains("Output succeeded; recovery files were retained")
+            && line.contains("could not be removed safely")
+    }));
+
+    drop(lock);
 }
 
 #[tokio::test]

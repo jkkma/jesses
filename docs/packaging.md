@@ -61,6 +61,12 @@ The portable application requires an already installed WebView2 runtime. It does
 not install a runtime or register an uninstaller. Release qualification must cover
 the exact ZIP, Scoop launch/update/uninstall behavior, preserved data and operation on a
 clean machine with the documented dependencies available.
+The [Windows environment qualification runner](windows-clean-qualification.md)
+checks the exact ZIP with external tools excluded, protected program resources,
+writable persisted data, and generated encode/decode cases. Its receipt distinguishes
+an existing restricted host from a freshly provisioned Windows image. Native GUI
+and Scoop lifecycle checks remain separate; see the bounded
+[Windows crash recovery qualification](../tests/fixtures/windows-crash-recovery-validation.md).
 Any future Linux reactivation will require fresh native and clean-machine
 qualification for the intended distributions and system libraries.
 
