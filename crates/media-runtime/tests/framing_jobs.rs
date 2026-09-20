@@ -701,6 +701,8 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
                 invalid_borders,
             ],
             output_directory: fixture.0.to_string_lossy().into_owned(),
+            output_name_template: None,
+            naming_date: None,
             backend: EncodeBackend::Standalone,
             encoder: VideoEncoder::SvtAv1Hdr,
             workers: 2,

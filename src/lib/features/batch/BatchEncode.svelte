@@ -146,6 +146,7 @@
   let hdrTune = $state<HdrTune>('filmGrain');
   let outputDirectory = $state('');
   let outputContainer = $state<ContainerFormat>('matroska');
+  let outputNameTemplate = $state('{name}_{codec}');
   let defaultFolderInitialized = false;
   let outputDirectoryTouched = false;
   $effect(() => {
@@ -325,6 +326,7 @@
       hdrTune,
       outputDirectory,
       outputContainer,
+      outputNameTemplate,
     }),
   );
   const currentPreview = $derived(preview?.key === draftKey ? preview.result : null);
@@ -384,6 +386,7 @@
         validAudio(drafts[file.id].audio, drafts[file.id].copies, file.streams),
       ) &&
       !!outputDirectory.trim() &&
+      !!outputNameTemplate.trim() &&
       selectedFiles.length > 0 &&
       selectedFiles.length <= 100 &&
       selectedFiles.every((file) =>
@@ -481,10 +484,14 @@
       return;
     const key = draftKey;
     const generation = ++previewGeneration;
+    const now = new Date();
+    const namingDate = `${now.getFullYear().toString().padStart(4, '0')}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
     const request: BatchEncodeRequest = {
       ...(parameters.length ? { parameters: parameters.map((value) => ({ ...value })) } : {}),
       outputDirectory: outputDirectory.trim(),
       outputContainer,
+      outputNameTemplate: outputNameTemplate.trim(),
+      namingDate,
       ...(backend === 'av1an' ? { av1anOptions: selectedAv1an(av1an) } : {}),
       ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
         ? { rateControl: selectedRate(rate) }
@@ -858,6 +865,22 @@
               disabled={submitting}
             />
           </div>
+          <div class="field batch-name-template">
+            <label for="batch-name-template">Filename template</label><input
+              id="batch-name-template"
+              bind:value={outputNameTemplate}
+              disabled={!desktop || submitting}
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="512"
+              placeholder={'{name}_{codec}'}
+            />
+            <p class="small-muted template-guidance">
+              Tokens: {'{name}'}, {'{ext}'}, {'{index}'}, {'{codec}'}, {'{crf}'},
+              {'{quality}'}, {'{preset}'}, {'{width}'}, {'{height}'}, {'{date}'}. Encoder labels and
+              quality values come from the reviewed settings.
+            </p>
+          </div>
         </div>
         <div class="batch-output-actions">
           <Button
@@ -900,6 +923,8 @@
             Select at least one episode.
           </p>{:else if !outputDirectory.trim()}<p class="disabled-reason">
             Choose an output folder before previewing.
+          </p>{:else if !outputNameTemplate.trim()}<p class="disabled-reason">
+            Enter a filename template before previewing.
           </p>{/if}
         <div class="setting-fields">
           {#if backend === 'standalone'}<div class="field full-width">
@@ -1044,7 +1069,7 @@
       >
       <p class="small-muted">
         {connected
-          ? 'Only ready rows are submitted. Each job keeps its reviewed settings and runs in order.'
+          ? 'Only ready rows are submitted. Each file keeps its reviewed settings and reports its own result. A failed file does not stop later files; Stop queue cancels the current file and every waiting file.'
           : 'Connecting to the job runtime…'}
       </p>
     </div>
@@ -1155,6 +1180,14 @@
   }
   .container-choice {
     min-width: 0;
+  }
+  .batch-name-template {
+    grid-column: 1 / -1;
+  }
+  .template-guidance {
+    margin-top: 6px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
   }
   .batch-output-actions {
     display: flex;

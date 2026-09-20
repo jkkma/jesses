@@ -420,7 +420,12 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, crf: number, preset: number, lossless: boolean, svtCrfQuarterSteps?: number, svtPreset?: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
+export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
+/**
+ * Local calendar date captured once when the batch preview is requested.
+ * It is required only when the filename template contains `{date}`.
+ */
+namingDate?: string, crf: number, preset: number, lossless: boolean, svtCrfQuarterSteps?: number, svtPreset?: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 

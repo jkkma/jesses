@@ -222,6 +222,115 @@ async fn failed_batch_history_write_never_admits_or_spawns_items() {
 }
 
 #[tokio::test]
+async fn batch_reports_each_failure_and_continues_to_the_next_item() {
+    let fixture = Fixture::new();
+    let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    let slot = manager.execution.lock().await;
+    let first_source = fixture.0.join("first-source.mkv");
+    let second_source = fixture.0.join("second-source.mkv");
+    fs::write(&first_source, b"first source").unwrap();
+    fs::write(&second_source, b"second source").unwrap();
+    let mut first = fixture.request(0);
+    first.source.input_path = first_source.to_string_lossy().into_owned();
+    let mut second = fixture.request(1);
+    second.source.input_path = second_source.to_string_lossy().into_owned();
+    let admitted = manager
+        .admit_encode_batch(vec![first, second])
+        .await
+        .unwrap();
+
+    // Both requests are already durably admitted. Give each a distinct,
+    // deterministic execution failure that occurs before tool discovery.
+    fs::remove_file(&first_source).unwrap();
+    fs::write(fixture.0.join("output-1.mkv"), b"existing destination").unwrap();
+    drop(slot);
+
+    let jobs = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let jobs = manager.list_jobs().await;
+            if jobs.iter().all(|job| job.state.is_terminal()) {
+                break jobs;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both failed batch items must reach a reported terminal state");
+    let first = jobs
+        .iter()
+        .find(|job| job.id == admitted[0].id)
+        .expect("first admitted result");
+    let second = jobs
+        .iter()
+        .find(|job| job.id == admitted[1].id)
+        .expect("second admitted result");
+    assert_eq!(first.state, JobState::Failed);
+    assert_eq!(first.error.as_ref().unwrap().code, "FILE_UNREADABLE");
+    assert_eq!(second.state, JobState::Failed);
+    assert_eq!(second.error.as_ref().unwrap().code, "OUTPUT_EXISTS");
+    for job in [first, second] {
+        assert!(
+            job.logs
+                .iter()
+                .any(|line| line.contains("Inspecting selected streams")),
+            "every admitted item must execute and report its own result: {job:#?}"
+        );
+    }
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("history/jobs.json")).unwrap()).unwrap();
+    let persisted = persisted["jobs"].as_array().unwrap();
+    assert!(admitted.iter().all(|job| persisted.iter().any(|saved| {
+        saved["id"] == job.id && saved["state"] == "failed" && saved["error"].is_object()
+    })));
+    assert!(!fixture.0.join("output-0.mkv").exists());
+    assert_eq!(
+        fs::read(fixture.0.join("output-1.mkv")).unwrap(),
+        b"existing destination"
+    );
+    assert_eq!(fs::read(second_source).unwrap(), b"second source");
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_queue_cancels_every_batch_item_waiting_between_files() {
+    let fixture = Fixture::new();
+    let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    let slot = manager.execution.lock().await;
+    let admitted = manager
+        .admit_encode_batch((0..3).map(|index| fixture.request(index)).collect())
+        .await
+        .unwrap();
+    let stopped = manager.cancel_all_jobs().await.unwrap();
+    assert_eq!(stopped.len(), admitted.len());
+    tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+        .await
+        .expect("waiting batch workers must stop without acquiring the execution slot");
+    let jobs = manager.list_jobs().await;
+    assert_eq!(jobs.len(), admitted.len());
+    for admitted in admitted {
+        let result = jobs
+            .iter()
+            .find(|job| job.id == admitted.id)
+            .expect("one result per stopped batch item");
+        assert_eq!(result.state, JobState::Canceled);
+        assert!(
+            result
+                .logs
+                .iter()
+                .any(|line| line.contains("Queued job stopped before starting"))
+        );
+        assert!(
+            !result
+                .logs
+                .iter()
+                .any(|line| line.contains("Inspecting selected streams"))
+        );
+        assert!(!Path::new(&result.request.output_path).exists());
+    }
+    drop(slot);
+}
+
+#[tokio::test]
 async fn stop_invalidates_a_batch_preflight_but_allows_later_submissions() {
     let fixture = Fixture::new();
     let manager = JobManager::new(fixture.0.join("logs"));
@@ -623,6 +732,8 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
                 },
             ],
             output_directory: fixture.0.to_string_lossy().into_owned(),
+            output_name_template: None,
+            naming_date: None,
             crf: 30,
             preset: 12,
             film_grain: 0,
@@ -696,6 +807,8 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
                 video_stream_index: 0,
             }],
             output_directory: fixture.0.to_string_lossy().into_owned(),
+            output_name_template: None,
+            naming_date: None,
             crf: 30,
             preset: 12,
             film_grain: 0,

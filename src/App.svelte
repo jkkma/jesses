@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     preferences,
+    forgetMedia,
     loadPreferences,
     updatePreferences,
     rememberMedia,
@@ -80,6 +81,8 @@
 
   type View = 'files' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
+  type ImportEntry = { path: string; detectFolder: boolean };
+  type ImportSession = { generation: number; folders: string[]; completed: string[] };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
   let view = $state<View>('files');
@@ -128,7 +131,8 @@
   }
   let importNotice = $state<string | null>(null);
   let importGeneration = 0;
-  let importQueue: string[] = [];
+  let importSession: ImportSession | null = null;
+  let importQueue: ImportEntry[] = [];
   let activePath: string | null = null;
   let importErrors = $state<{ name: string; message: string }[]>([]);
   let logs = $state<LogEntry[]>([]);
@@ -253,6 +257,10 @@
     ];
   }
 
+  function errorCode(error: unknown) {
+    return error && typeof error === 'object' && 'code' in error ? String(error.code) : null;
+  }
+
   async function refreshTools() {
     if (!desktop) return;
     toolsLoading = true;
@@ -271,18 +279,30 @@
     }
   }
 
-  function queueImportPaths(paths: string[]) {
-    const candidates = paths.filter(
-      (path) =>
-        path !== activePath &&
-        !importQueue.includes(path) &&
-        !files.some((file) => file.path === path),
-    );
-    importQueue.push(...new Set(candidates));
+  function pathKey(path: string) {
+    const windows = path
+      .replace(/^\\\\\?\\UNC\\/i, '\\\\')
+      .replace(/^\\\\\?\\/i, '')
+      .replaceAll('/', '\\');
+    if (/^(?:[a-z]:\\|\\\\)/i.test(windows)) return windows.replace(/\\+$/, '').toLowerCase();
+    return path.replace(/\/+$/, '');
+  }
+
+  function queueImportPaths(paths: string[], detectFolders = false) {
+    const activeKey = activePath ? pathKey(activePath) : null;
+    const queued = new Set(importQueue.map((entry) => pathKey(entry.path)));
+    const loaded = new Set(files.map((file) => pathKey(file.path)));
+    for (const path of paths) {
+      const key = pathKey(path);
+      if (key === activeKey || queued.has(key) || loaded.has(key)) continue;
+      queued.add(key);
+      importQueue.push({ path, detectFolder: detectFolders });
+    }
   }
 
   function beginImport() {
     const generation = ++importGeneration;
+    importSession = { generation, folders: [], completed: [] };
     importQueue = [];
     activePath = null;
     importing = true;
@@ -294,12 +314,19 @@
 
   function finishImport(generation: number) {
     if (generation !== importGeneration) return;
+    if (
+      importSession?.generation === generation &&
+      importSession.folders.length === 0 &&
+      importSession.completed.length === 0
+    )
+      importSession = null;
     activePath = null;
     importing = false;
     importingName = '';
   }
 
   function stopImport() {
+    const recent = takeImportRecents(importGeneration);
     ++importGeneration;
     importQueue = [];
     activePath = null;
@@ -308,19 +335,41 @@
     importNotice =
       'Stopped importing. Completed files are kept. The current scan or probe may finish in the background.';
     addLog('Stopped importing; pending files and late results are discarded.');
+    if (recent.length) void rememberMedia(recent);
   }
 
-  async function drainImport(generation: number, folder?: string) {
-    const completed: string[] = [];
+  function recordImportRecent(generation: number, kind: 'folders' | 'completed', path: string) {
+    if (importSession?.generation !== generation) return;
+    if (!importSession[kind].some((existing) => pathKey(existing) === pathKey(path)))
+      importSession[kind].push(path);
+  }
+
+  function takeImportRecents(generation: number) {
+    if (importSession?.generation !== generation) return [];
+    const recent = [...importSession.folders, ...importSession.completed].slice(0, 15);
+    importSession = null;
+    return recent;
+  }
+
+  async function drainImport(generation: number) {
     try {
       while (generation === importGeneration && importQueue.length) {
-        const path = importQueue.shift()!;
+        const entry = importQueue.shift()!;
+        const path = entry.path;
         activePath = path;
         importingName = fileName(path);
         try {
+          const folder = entry.detectFolder && (await recentPathIsFolder(path));
+          if (generation !== importGeneration) return;
+          if (folder) {
+            await scanImportFolder(path, recursiveImport, generation);
+            if (generation !== importGeneration) return;
+            recordImportRecent(generation, 'folders', path);
+            continue;
+          }
           const media = await probeMedia(path);
           if (generation !== importGeneration) return;
-          completed.push(media.path);
+          recordImportRecent(generation, 'completed', media.path);
           if (!files.some((file) => file.id === media.id)) {
             files = [...files, media];
             addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
@@ -334,20 +383,20 @@
         }
       }
     } finally {
+      const recent = takeImportRecents(generation);
       finishImport(generation);
-      if (completed.length || folder)
-        await rememberMedia([...(folder ? [folder] : []), ...completed.slice(0, 15)]);
+      if (recent.length) await rememberMedia(recent);
     }
   }
 
-  async function importPaths(paths: string[]) {
+  async function importPaths(paths: string[], detectFolders = false) {
     if (!desktop || !paths.length) return;
     if (importing) {
-      queueImportPaths(paths);
+      queueImportPaths(paths, detectFolders);
       return;
     }
     const generation = beginImport();
-    queueImportPaths(paths);
+    queueImportPaths(paths, detectFolders);
     await drainImport(generation);
   }
 
@@ -390,16 +439,28 @@
   }
 
   async function importFolder(path: string, recursive: boolean, generation: number) {
+    await scanImportFolder(path, recursive, generation);
+    if (generation !== importGeneration) return;
+    recordImportRecent(generation, 'folders', path);
+    await drainImport(generation);
+  }
+
+  async function scanImportFolder(path: string, recursive: boolean, generation: number) {
     importingName = `Scanning ${fileName(path)}`;
     const scan = await scanMediaFolder({ path, recursive });
     if (generation !== importGeneration) return;
-    importErrors = scan.errors.map((error) => ({
-      name: error.path ?? 'Folder scan',
-      message: error.message,
-    }));
+    importErrors = [
+      ...importErrors,
+      ...scan.errors.map((error) => ({
+        name: error.path ?? 'Folder scan',
+        message: error.message,
+      })),
+    ];
     importNotice = `${scan.paths.length} media files found. ${scan.skippedCount} entries skipped.${scan.truncated ? ' Scan truncated: the 500-file or 10,000-entry limit was reached. Add a smaller folder to find the remaining files.' : ''}`;
     queueImportPaths(scan.paths);
-    await drainImport(generation, path);
+    addLog(
+      `Scanned ${fileName(path)}: ${scan.paths.length} media files found, ${scan.skippedCount} entries skipped.`,
+    );
   }
 
   async function openRecent() {
@@ -412,7 +473,8 @@
       if (generation !== importGeneration) return;
       if (folder) await importFolder(path, recursiveImport, generation);
       else {
-        const existing = files.find((file) => file.path === path);
+        const key = pathKey(path);
+        const existing = files.find((file) => pathKey(file.path) === key);
         if (existing) {
           selectedId = existing.id;
           await rememberMedia([existing.path]);
@@ -426,6 +488,16 @@
         const message = errorMessage(error);
         importErrors = [...importErrors, { name: fileName(path), message }];
         addLog(message, 'error');
+        if (errorCode(error) === 'RECENT_MEDIA_UNAVAILABLE') {
+          try {
+            await forgetMedia(path);
+            if (recentSelection === path) recentSelection = '';
+          } catch (forgetError) {
+            const forgetMessage = errorMessage(forgetError);
+            preferences.error = forgetMessage;
+            addLog(`Could not remove unavailable recent media: ${forgetMessage}`, 'error');
+          }
+        }
       }
     } finally {
       finishImport(generation);
@@ -528,7 +600,7 @@
       void refreshTools();
       void connectJobs();
       void subscribeDrop((paths) => {
-        void importPaths(paths);
+        void importPaths(paths, true);
       })
         .then((stop) => {
           if (disposed) stop();

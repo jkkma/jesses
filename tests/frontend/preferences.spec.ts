@@ -69,7 +69,10 @@ async function setup(page: Page) {
         }
         if (command === 'recent_path_is_folder') {
           if (String(payload.path).includes('offline'))
-            throw { message: 'The recent media is unavailable.' };
+            throw {
+              code: 'RECENT_MEDIA_UNAVAILABLE',
+              message: 'The recent media is unavailable.',
+            };
           return false;
         }
         if (command === 'probe_media')
@@ -164,7 +167,7 @@ test('preferences persist, recent media reopens, and new destinations use the sa
   );
 });
 
-test('import waits for explicit Apply and unavailable recents are retained until cleared', async ({
+test('import waits for explicit Apply and removes an unavailable recent only after open fails', async ({
   page,
 }) => {
   await setup(page);
@@ -176,19 +179,19 @@ test('import waits for explicit Apply and unavailable recents are retained until
     page
       .getByLabel('Recent media', { exact: true })
       .locator('option[value="C:\\\\offline\\\\missing.mkv"]'),
-  ).toHaveCount(1);
+  ).toHaveCount(0);
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await page.getByRole('button', { name: 'Import saved preferences', exact: true }).click();
   await expect(
     page.getByRole('heading', { name: 'Review preferences', exact: true }),
   ).toBeVisible();
-  expect(await count(page, 'save_preferences')).toBe(0);
+  expect(await count(page, 'save_preferences')).toBe(1);
   await expect(page.getByText('12 unsupported keys skipped', { exact: false })).toBeVisible();
   await page.getByRole('button', { name: 'Apply imported preferences', exact: true }).click();
   await expect(page.getByLabel('Default output folder', { exact: true })).toHaveValue(
     'D:\\imported',
   );
-  expect(await count(page, 'save_preferences')).toBe(1);
+  expect(await count(page, 'save_preferences')).toBe(2);
   await page.getByRole('button', { name: 'Clear recent media', exact: true }).click();
   await expect(page.getByText('Recent-media history cleared.', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Files 00', exact: true }).click();

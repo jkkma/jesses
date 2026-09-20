@@ -1,8 +1,8 @@
 //! Read-only folder discovery and batch proposal preparation.
 use media_core::{
-    AppError, BatchEncodeInput, BatchEncodeItem, BatchEncodePreview, BatchEncodeRequest,
-    EncodeRequest, EncodeSettings, FolderScanRequest, FolderScanResult, MediaFile, RemuxRequest,
-    VideoEncoder,
+    AppError, Av1anTargetMetric, BatchEncodeInput, BatchEncodeItem, BatchEncodePreview,
+    BatchEncodeRequest, EncodeBackend, EncodeRequest, EncodeSettings, FolderScanRequest,
+    FolderScanResult, MediaFile, RemuxRequest, VideoEncoder, VideoRateControl,
 };
 use std::{
     collections::HashSet,
@@ -14,6 +14,9 @@ use std::{
 const MAX_MEDIA: usize = 500;
 const MAX_ENTRIES: usize = 10_000;
 pub(crate) const MAX_BATCH: usize = 100;
+const MAX_NAME_TEMPLATE_BYTES: usize = 512;
+const MAX_OUTPUT_COMPONENT_BYTES: usize = 240;
+const MAX_SOURCE_STEM_BYTES: usize = 160;
 const EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "webm", "m2ts", "mts", "ts", "mpeg", "mpg", "wmv", "flv",
     "ogv", "vob", "3gp", "mxf", "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aif", "aiff",
@@ -317,59 +320,424 @@ pub(crate) fn writable_directory(path: &Path) -> Result<PathBuf, AppError> {
     Ok(canonical)
 }
 
-pub(crate) fn safe_stem(path: &Path) -> String {
-    let source = path.file_stem().unwrap_or_default().to_string_lossy();
-    // Keep room for the suffix and the owned temporary filename on filesystems
-    // whose component limit is measured in UTF-8 bytes, rather than characters.
-    let mut stem = String::new();
+fn sanitized_fragment(source: &str) -> String {
+    let mut sanitized = String::new();
     for character in source.chars() {
         let character = if character.is_control() || "<>:\"/\\|?*".contains(character) {
             '_'
         } else {
             character
         };
-        if stem.len() + character.len_utf8() > 160 {
-            break;
-        }
-        stem.push(character);
+        sanitized.push(character);
     }
-    let stem = stem.trim().trim_end_matches(['.', ' ']);
-    if stem.is_empty() {
+    sanitized
+}
+
+fn is_windows_device_name(component: &str) -> bool {
+    let device = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' '])
+        .to_ascii_uppercase();
+    matches!(
+        device.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || device
+        .strip_prefix("COM")
+        .or_else(|| device.strip_prefix("LPT"))
+        .is_some_and(|number| {
+            matches!(
+                number,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+fn safe_component(source: &str) -> String {
+    // Preserve the historical 160-byte source-stem allowance. Template
+    // suffixes are budgeted separately before the complete component is made.
+    let sanitized = sanitized_fragment(source);
+    let mut stem = sanitized
+        .get(..sanitized.floor_char_boundary(MAX_SOURCE_STEM_BYTES))
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .to_owned();
+    if is_windows_device_name(&stem) {
+        stem.insert(0, '_');
+        stem.truncate(stem.floor_char_boundary(MAX_SOURCE_STEM_BYTES));
+        stem = stem.trim_end_matches(['.', ' ']).to_owned();
+    }
+    if stem.is_empty() || matches!(stem.as_str(), "." | "..") {
         "media".into()
     } else {
-        stem.into()
+        stem
     }
 }
 
-fn proposed_output(
+fn finish_rendered_component(parts: Vec<(String, bool)>, input: &Path) -> Result<String, AppError> {
+    let fixed_bytes = parts
+        .iter()
+        .filter(|(_, source_name)| !source_name)
+        .map(|(value, _)| value.len())
+        .sum::<usize>();
+    let minimum_name_bytes = parts
+        .iter()
+        .filter(|(_, source_name)| *source_name)
+        .filter_map(|(value, _)| value.chars().next())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if fixed_bytes + minimum_name_bytes > MAX_OUTPUT_COMPONENT_BYTES {
+        return Err(error(
+            "OUTPUT_TEMPLATE_TOO_LONG",
+            format!(
+                "The filename template needs more than {MAX_OUTPUT_COMPONENT_BYTES} bytes after its tokens are expanded. Shorten its fixed text or remove tokens."
+            ),
+            input,
+        ));
+    }
+
+    let mut remaining = MAX_OUTPUT_COMPONENT_BYTES - fixed_bytes;
+    let mut remaining_minimum = minimum_name_bytes;
+    let mut output = String::with_capacity(fixed_bytes + remaining.min(MAX_SOURCE_STEM_BYTES));
+    for (value, source_name) in parts {
+        if !source_name {
+            output.push_str(&value);
+            continue;
+        }
+        let minimum = value.chars().next().map_or(0, char::len_utf8);
+        remaining_minimum -= minimum;
+        let allowance = (remaining - remaining_minimum).min(MAX_SOURCE_STEM_BYTES);
+        let boundary = value.floor_char_boundary(allowance);
+        output.push_str(&value[..boundary]);
+        remaining -= boundary;
+    }
+
+    let mut output = output.trim().trim_end_matches(['.', ' ']).to_owned();
+    if output.is_empty() || matches!(output.as_str(), "." | "..") {
+        output = "media".into();
+    }
+    if is_windows_device_name(&output) {
+        if output.len() == MAX_OUTPUT_COMPONENT_BYTES {
+            return Err(error(
+                "OUTPUT_TEMPLATE_TOO_LONG",
+                "The filename template leaves no room to make its Windows device name safe.",
+                input,
+            ));
+        }
+        output.insert(0, '_');
+    }
+    debug_assert!(output.len() <= MAX_OUTPUT_COMPONENT_BYTES);
+    Ok(output)
+}
+
+pub(crate) fn safe_stem(path: &Path) -> String {
+    safe_component(&path.file_stem().unwrap_or_default().to_string_lossy())
+}
+
+fn codec_name(encoder: VideoEncoder) -> &'static str {
+    match encoder {
+        VideoEncoder::SvtAv1 => "av1",
+        VideoEncoder::SvtAv1FiveFish => "av1_5fish",
+        VideoEncoder::SvtAv1Hdr => "av1_hdr",
+        VideoEncoder::X264 => "x264",
+        VideoEncoder::X265 => "x265",
+        VideoEncoder::Vp9 => "vp9",
+        VideoEncoder::AomAv1 => "aom",
+        VideoEncoder::X265Standalone => "x265_standalone",
+        VideoEncoder::VpxStandalone => "vpx",
+        VideoEncoder::H264Nvenc => "h264_nvenc",
+        VideoEncoder::HevcNvenc => "hevc_nvenc",
+    }
+}
+
+fn decimal_tenths(value: u16) -> String {
+    if value.is_multiple_of(10) {
+        (value / 10).to_string()
+    } else {
+        format!("{}.{:01}", value / 10, value % 10)
+    }
+}
+
+fn crf_value(request: &BatchEncodeRequest) -> Option<String> {
+    if request.lossless
+        || request.rate_control.is_some()
+        || (request.backend == EncodeBackend::Av1an
+            && request
+                .av1an_options
+                .is_some_and(|options| options.target_quality.is_some()))
+    {
+        return None;
+    }
+    match request
+        .encoder
+        .is_svt()
+        .then_some(request.svt_crf_quarter_steps)
+        .flatten()
+    {
+        Some(quarters) => {
+            let whole = quarters / 4;
+            let fraction = match quarters % 4 {
+                0 => "",
+                1 => ".25",
+                2 => ".5",
+                3 => ".75",
+                _ => unreachable!(),
+            };
+            Some(format!("{whole}{fraction}"))
+        }
+        None => Some(request.crf.to_string()),
+    }
+}
+
+fn preset_value(request: &BatchEncodeRequest) -> String {
+    const X26X_PRESETS: [&str; 10] = [
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+        "placebo",
+    ];
+    match request.encoder {
+        VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::X265Standalone => X26X_PRESETS
+            .get(usize::from(request.preset))
+            .map_or_else(|| request.preset.to_string(), |value| (*value).into()),
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+            format!("P{}", u16::from(request.preset) + 1)
+        }
+        VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => request
+            .svt_preset
+            .map_or_else(|| request.preset.to_string(), |value| value.to_string()),
+        VideoEncoder::Vp9 | VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+            request.preset.to_string()
+        }
+    }
+}
+
+fn quality_value(request: &BatchEncodeRequest) -> String {
+    if request.lossless {
+        return "lossless".into();
+    }
+    if let Some(rate_control) = request.rate_control {
+        return match rate_control {
+            VideoRateControl::Bitrate {
+                bitrate_kbps,
+                two_pass,
+            } => format!("{bitrate_kbps}kbps{}", if two_pass { "_2pass" } else { "" }),
+            VideoRateControl::TargetSize { target_size_mib } => {
+                format!("{target_size_mib}MiB")
+            }
+        };
+    }
+    if let Some(target) = request
+        .av1an_options
+        .and_then(|options| options.target_quality)
+    {
+        let metric = match target.metric {
+            Av1anTargetMetric::Vmaf => "vmaf",
+            Av1anTargetMetric::Ssimulacra2 => "ssimulacra2",
+            Av1anTargetMetric::Butteraugli => "butteraugli",
+            Av1anTargetMetric::Xpsnr => "xpsnr",
+        };
+        return format!(
+            "{metric}_{}-{}",
+            decimal_tenths(target.minimum_score_tenths),
+            decimal_tenths(target.maximum_score_tenths)
+        );
+    }
+    crf_value(request).unwrap_or_else(|| request.crf.to_string())
+}
+
+fn valid_naming_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let parse = |range: std::ops::Range<usize>| {
+        bytes[range].iter().try_fold(0_u32, |value, byte| {
+            if byte.is_ascii_digit() {
+                Some(value * 10 + u32::from(byte - b'0'))
+            } else {
+                None
+            }
+        })
+    };
+    let (Some(year), Some(month), Some(day)) = (parse(0..4), parse(5..7), parse(8..10)) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
+}
+
+fn rendered_name(
+    request: &BatchEncodeRequest,
+    media: &MediaFile,
+    video_stream_index: u32,
+    index: usize,
+    total: usize,
+) -> Result<String, AppError> {
+    let input = Path::new(&media.path);
+    let template = request
+        .output_name_template
+        .as_deref()
+        .unwrap_or("{name}_{codec}");
+    if template.len() > MAX_NAME_TEMPLATE_BYTES {
+        return Err(error(
+            "OUTPUT_TEMPLATE_TOO_LONG",
+            format!(
+                "The filename template is longer than {MAX_NAME_TEMPLATE_BYTES} bytes. Shorten it before previewing the batch."
+            ),
+            input,
+        ));
+    }
+    if template.trim().is_empty() {
+        return Err(error(
+            "OUTPUT_TEMPLATE_INVALID",
+            "Enter a filename template. Available tokens: {name}, {ext}, {index}, {codec}, {crf}, {quality}, {preset}, {width}, {height}, and {date}.",
+            input,
+        ));
+    }
+    let video = media
+        .streams
+        .iter()
+        .find(|stream| stream.kind == "video" && stream.index == video_stream_index);
+    let mut parts: Vec<(String, bool)> = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find(['{', '}']) {
+        parts.push((sanitized_fragment(&rest[..open]), false));
+        if rest.as_bytes()[open] == b'}' {
+            return Err(error(
+                "OUTPUT_TEMPLATE_INVALID",
+                "The filename template contains a closing brace without a token.",
+                input,
+            ));
+        }
+        let token_start = open + 1;
+        let Some(close_offset) = rest[token_start..].find('}') else {
+            return Err(error(
+                "OUTPUT_TEMPLATE_INVALID",
+                "The filename template contains an unfinished token.",
+                input,
+            ));
+        };
+        let close = token_start + close_offset;
+        let token = &rest[token_start..close];
+        if token.contains('{') {
+            return Err(error(
+                "OUTPUT_TEMPLATE_INVALID",
+                "The filename template contains nested braces.",
+                input,
+            ));
+        }
+        let (replacement, source_name) = match token.to_ascii_lowercase().as_str() {
+            "name" => (safe_stem(input), true),
+            "ext" => (
+                sanitized_fragment(&input.extension().unwrap_or_default().to_string_lossy()),
+                false,
+            ),
+            "index" => (
+                format!("{:0width$}", index + 1, width = total.to_string().len()),
+                false,
+            ),
+            "codec" => (codec_name(request.encoder).into(), false),
+            "crf" => (
+                crf_value(request).ok_or_else(|| {
+                    error(
+                        "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE",
+                        "{crf} is available only for constant-quality batches. Use {quality} for lossless, bitrate, target-size, or av1an target-quality batches.",
+                        input,
+                    )
+                })?,
+                false,
+            ),
+            "quality" => (quality_value(request), false),
+            "preset" => (preset_value(request), false),
+            "width" => (
+                video
+                .and_then(|stream| stream.width)
+                .map(|value| value.to_string())
+                .ok_or_else(|| {
+                    error(
+                        "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE",
+                        "{width} is unavailable because the selected video stream has no reported width.",
+                        input,
+                    )
+                })?,
+                false,
+            ),
+            "height" => (
+                video
+                .and_then(|stream| stream.height)
+                .map(|value| value.to_string())
+                .ok_or_else(|| {
+                    error(
+                        "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE",
+                        "{height} is unavailable because the selected video stream has no reported height.",
+                        input,
+                    )
+                })?,
+                false,
+            ),
+            "date" => (
+                request
+                .naming_date
+                .as_deref()
+                .filter(|value| valid_naming_date(value))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    error(
+                        "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE",
+                        "{date} requires a valid local date snapshot in YYYY-MM-DD format.",
+                        input,
+                    )
+                })?,
+                false,
+            ),
+            _ => {
+                return Err(error(
+                    "OUTPUT_TEMPLATE_INVALID",
+                    format!(
+                        "Unknown filename token {{{token}}}. Available tokens: {{name}}, {{ext}}, {{index}}, {{codec}}, {{crf}}, {{quality}}, {{preset}}, {{width}}, {{height}}, and {{date}}."
+                    ),
+                    input,
+                ));
+            }
+        };
+        parts.push((replacement, source_name));
+        rest = &rest[close + 1..];
+    }
+    parts.push((sanitized_fragment(rest), false));
+    finish_rendered_component(parts, input)
+}
+
+fn reserve_output(
     directory: &Path,
     input: &Path,
-    encoder: VideoEncoder,
+    stem: &str,
     container: media_core::ContainerFormat,
     reserved: &mut HashSet<String>,
 ) -> Result<PathBuf, AppError> {
-    let stem = safe_stem(input);
     for number in 1..=10_000 {
         let suffix = if number == 1 {
             String::new()
         } else {
             format!("_{number}")
         };
-        let codec = match encoder {
-            VideoEncoder::SvtAv1 => "av1",
-            VideoEncoder::SvtAv1FiveFish => "av1_5fish",
-            VideoEncoder::SvtAv1Hdr => "av1_hdr",
-            VideoEncoder::X264 => "x264",
-            VideoEncoder::X265 => "x265",
-            VideoEncoder::Vp9 => "vp9",
-            VideoEncoder::AomAv1 => "aom",
-            VideoEncoder::X265Standalone => "x265_standalone",
-            VideoEncoder::VpxStandalone => "vpx",
-            VideoEncoder::H264Nvenc => "h264_nvenc",
-            VideoEncoder::HevcNvenc => "hevc_nvenc",
-        };
         let extension = container.extension();
-        let candidate = directory.join(format!("{stem}_{codec}{suffix}.{extension}"));
+        let candidate = directory.join(format!("{stem}{suffix}.{extension}"));
         let key = path_key(&candidate);
         if key == path_key(input) || reserved.contains(&key) {
             continue;
@@ -388,6 +756,18 @@ fn proposed_output(
         "No available output filename was found after 10,000 alternatives.",
         directory,
     ))
+}
+
+#[cfg(test)]
+fn proposed_output(
+    directory: &Path,
+    input: &Path,
+    encoder: VideoEncoder,
+    container: media_core::ContainerFormat,
+    reserved: &mut HashSet<String>,
+) -> Result<PathBuf, AppError> {
+    let stem = format!("{}_{}", safe_stem(input), codec_name(encoder));
+    reserve_output(directory, input, &stem, container, reserved)
 }
 
 pub(crate) async fn inspect_selection(
@@ -421,8 +801,9 @@ pub(crate) async fn preview(
     let directory = tokio::task::spawn_blocking(move || writable_directory(&directory))
         .await
         .map_err(|e| AppError::new("INVALID_OUTPUT", e.to_string(), None))??;
-    let mut items = Vec::with_capacity(request.inputs.len());
-    for input in request.inputs {
+    let total = request.inputs.len();
+    let mut items = Vec::with_capacity(total);
+    for (index, input) in request.inputs.clone().into_iter().enumerate() {
         let settings = EncodeSettings {
             temporal: input.temporal,
             parameters: request.parameters.clone(),
@@ -459,27 +840,32 @@ pub(crate) async fn preview(
                 return Err(error);
             }
             Err(error) => item.error = Some(error),
-            Ok(media) => match proposed_output(
-                &directory,
-                Path::new(&media.path),
-                request.encoder,
-                request.output_container.unwrap_or_default(),
-                &mut reserved,
-            ) {
-                Err(error) => item.error = Some(error),
-                Ok(output) => {
-                    let output_path = output.to_string_lossy().into_owned();
-                    item.output_path = Some(output_path.clone());
-                    item.request = Some(EncodeRequest {
-                        source: RemuxRequest {
-                            input_path: media.path,
-                            output_path,
-                            stream_indices: input.stream_indices,
-                        },
-                        settings,
-                    });
+            Ok(media) => {
+                match rendered_name(&request, &media, input.video_stream_index, index, total)
+                    .and_then(|stem| {
+                        reserve_output(
+                            &directory,
+                            Path::new(&media.path),
+                            &stem,
+                            request.output_container.unwrap_or_default(),
+                            &mut reserved,
+                        )
+                    }) {
+                    Err(error) => item.error = Some(error),
+                    Ok(output) => {
+                        let output_path = output.to_string_lossy().into_owned();
+                        item.output_path = Some(output_path.clone());
+                        item.request = Some(EncodeRequest {
+                            source: RemuxRequest {
+                                input_path: media.path,
+                                output_path,
+                                stream_indices: input.stream_indices,
+                            },
+                            settings,
+                        });
+                    }
                 }
-            },
+            }
         }
         items.push(item);
     }
@@ -533,6 +919,234 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn naming_fixture(path: &Path) -> (BatchEncodeRequest, MediaFile) {
+        let input_path = path.to_string_lossy().into_owned();
+        (
+            BatchEncodeRequest {
+                parameters: Vec::new(),
+                av1an_options: None,
+                output_container: None,
+                rate_control: None,
+                backend: EncodeBackend::Standalone,
+                encoder: VideoEncoder::SvtAv1FiveFish,
+                workers: 2,
+                inputs: vec![BatchEncodeInput {
+                    temporal: None,
+                    tone_map: None,
+                    trim: None,
+                    subtitles: Vec::new(),
+                    framing: Default::default(),
+                    audio: Vec::new(),
+                    input_path: input_path.clone(),
+                    stream_indices: vec![3],
+                    video_stream_index: 3,
+                }],
+                output_directory: path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_string_lossy()
+                    .into_owned(),
+                output_name_template: Some("{name}_{codec}".into()),
+                naming_date: Some("2026-09-20".into()),
+                crf: 30,
+                preset: 0,
+                lossless: false,
+                svt_crf_quarter_steps: Some(121),
+                svt_preset: Some(-1),
+                film_grain: 0,
+                lineart_psy_bias: 0,
+                texture_psy_bias: 0,
+                hdr_tune: Default::default(),
+                hdr10_fallback: false,
+            },
+            MediaFile {
+                id: "naming-fixture".into(),
+                path: input_path,
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                size_bytes: "1".into(),
+                duration_seconds: Some(1.0),
+                format: None,
+                streams: vec![media_core::MediaStream {
+                    index: 3,
+                    kind: "video".into(),
+                    codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    sample_aspect_ratio: None,
+                    display_aspect_ratio: None,
+                    rotation_degrees: None,
+                    frame_rate: Some("24/1".into()),
+                    field_order: None,
+                    sample_rate: None,
+                    channels: None,
+                    channel_layout: None,
+                    language: None,
+                    title: None,
+                    pixel_format: Some("yuv420p".into()),
+                    bit_depth: Some(8),
+                    color_primaries: None,
+                    color_transfer: None,
+                    color_space: None,
+                    color_range: None,
+                    hdr_format: None,
+                    has_hdr_static_metadata: None,
+                    dynamic_hdr_formats: None,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn naming_template_renders_case_insensitive_tokens_from_reviewed_settings() {
+        let (mut request, media) = naming_fixture(Path::new("Episode One.MKV"));
+        request.output_name_template = Some(
+            "{NaMe}_{EXT}_{INDEX}_{CoDeC}_{CRF}_{quality}_{PRESET}_{width}x{height}_{DATE}".into(),
+        );
+        assert_eq!(
+            rendered_name(&request, &media, 3, 8, 100).unwrap(),
+            "Episode One_MKV_009_av1_5fish_30.25_30.25_-1_1920x1080_2026-09-20"
+        );
+
+        request.encoder = VideoEncoder::X264;
+        request.preset = 9;
+        request.svt_crf_quarter_steps = Some(7);
+        request.svt_preset = Some(-3);
+        request.output_name_template = Some("{preset}_{crf}".into());
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "placebo_30",
+            "non-SVT encoders ignore irrelevant SVT extension fields"
+        );
+
+        let long_path = format!("{}.mkv", "日本語🙂".repeat(60));
+        let (mut long_request, long_media) = naming_fixture(Path::new(&long_path));
+        let expected_stem = safe_stem(Path::new(&long_path));
+        let default_name = rendered_name(&long_request, &long_media, 3, 0, 1).unwrap();
+        assert!(default_name.ends_with("_av1_5fish"));
+        assert_eq!(
+            default_name.len() - "_av1_5fish".len(),
+            expected_stem.len(),
+            "the default keeps the historical source-stem budget before its codec suffix"
+        );
+        assert!(expected_stem.len() > 150);
+        long_request.output_name_template = Some("{name}_{index}".into());
+        let indexed = rendered_name(&long_request, &long_media, 3, 8, 100).unwrap();
+        assert!(indexed.ends_with("_009"));
+        assert_eq!(indexed.len() - "_009".len(), expected_stem.len());
+    }
+
+    #[test]
+    fn quality_token_represents_non_crf_modes_without_claiming_a_default_crf() {
+        let (mut request, media) = naming_fixture(Path::new("source.mkv"));
+        request.output_name_template = Some("{quality}".into());
+        request.lossless = true;
+        request.svt_crf_quarter_steps = None;
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "lossless"
+        );
+
+        request.lossless = false;
+        request.rate_control = Some(VideoRateControl::Bitrate {
+            bitrate_kbps: 2400,
+            two_pass: true,
+        });
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "2400kbps_2pass"
+        );
+        request.rate_control = Some(VideoRateControl::TargetSize {
+            target_size_mib: 700,
+        });
+        assert_eq!(rendered_name(&request, &media, 3, 0, 1).unwrap(), "700MiB");
+
+        request.rate_control = None;
+        request.backend = EncodeBackend::Av1an;
+        request.av1an_options = Some(media_core::Av1anOptions {
+            target_quality: Some(media_core::Av1anTargetQuality {
+                metric: Av1anTargetMetric::Ssimulacra2,
+                minimum_score_tenths: 940,
+                maximum_score_tenths: 965,
+                minimum_crf: 15,
+                maximum_crf: 50,
+                probes: 4,
+                probing_rate: 1,
+                probe_width: 1920,
+                probe_height: 1080,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "ssimulacra2_94-96.5"
+        );
+
+        request.output_name_template = Some("{crf}".into());
+        let error = rendered_name(&request, &media, 3, 0, 1).unwrap_err();
+        assert_eq!(error.code, "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE");
+        assert!(error.message.contains("Use {quality}"));
+    }
+
+    #[test]
+    fn naming_template_rejects_bad_syntax_and_sanitizes_final_components() {
+        let (mut request, media) = naming_fixture(Path::new("CON.mkv"));
+        request.output_name_template = Some("{name}".into());
+        assert_eq!(rendered_name(&request, &media, 3, 0, 1).unwrap(), "_CON");
+        assert_eq!(safe_component("con.txt"), "_con.txt");
+        assert_eq!(safe_component("CON .foo"), "_CON .foo");
+        assert_eq!(safe_component("COM1"), "_COM1");
+        assert_eq!(safe_component("COM¹.txt"), "_COM¹.txt");
+        assert_eq!(safe_component("LPT³"), "_LPT³");
+        assert_eq!(safe_component("CONIN$.txt"), "_CONIN$.txt");
+        assert_eq!(safe_component("conout$.log"), "_conout$.log");
+        assert_eq!(safe_component("COM10"), "COM10");
+        assert_eq!(safe_component("folder/name:*?"), "folder_name___");
+
+        request.output_name_template = Some("{mystery}".into());
+        let error = rendered_name(&request, &media, 3, 0, 1).unwrap_err();
+        assert_eq!(error.code, "OUTPUT_TEMPLATE_INVALID");
+        assert!(error.message.contains("Unknown filename token {mystery}"));
+
+        request.output_name_template = Some("x".repeat(MAX_NAME_TEMPLATE_BYTES + 1));
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap_err().code,
+            "OUTPUT_TEMPLATE_TOO_LONG"
+        );
+        request.output_name_template = Some("x".repeat(MAX_OUTPUT_COMPONENT_BYTES + 1));
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap_err().code,
+            "OUTPUT_TEMPLATE_TOO_LONG"
+        );
+        request.output_name_template = Some("CONOUT$.txt".into());
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "_CONOUT$.txt"
+        );
+
+        request.output_name_template = Some("{date}".into());
+        request.naming_date = Some("2026-02-29".into());
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap_err().code,
+            "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE"
+        );
+        for malformed in ["2026-0/-20", "2026-09-2x", "２０２６-09-20"] {
+            request.naming_date = Some(malformed.into());
+            assert_eq!(
+                rendered_name(&request, &media, 3, 0, 1).unwrap_err().code,
+                "OUTPUT_TEMPLATE_VALUE_UNAVAILABLE"
+            );
+        }
+        request.output_name_template = Some("{name".into());
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap_err().code,
+            "OUTPUT_TEMPLATE_INVALID"
+        );
     }
 
     #[test]
@@ -664,6 +1278,28 @@ mod tests {
         assert_eq!(fs::read(input).unwrap(), b"source");
         assert_eq!(safe_stem(Path::new("bad:name?.mp4")), "bad_name_");
         assert_eq!(safe_stem(Path::new("  ... .mp4")), "media");
+        let first_sanitized = proposed_output(
+            &directory,
+            Path::new("bad:name?.mp4"),
+            VideoEncoder::X264,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
+        let second_sanitized = proposed_output(
+            &directory,
+            Path::new("bad*name?.mov"),
+            VideoEncoder::X264,
+            media_core::ContainerFormat::Matroska,
+            &mut reserved,
+        )
+        .unwrap();
+        assert_eq!(first_sanitized.file_name().unwrap(), "bad_name__x264.mkv");
+        assert_eq!(
+            second_sanitized.file_name().unwrap(),
+            "bad_name__x264_2.mkv"
+        );
+        assert!(!first_sanitized.exists() && !second_sanitized.exists());
         let long = format!("{}.mp4", "日本語🙂".repeat(60));
         let stem = safe_stem(Path::new(&long));
         assert!(stem.len() <= 160);
@@ -733,6 +1369,8 @@ mod tests {
                 video_stream_index: 0,
             }],
             output_directory: fixture.0.to_string_lossy().into_owned(),
+            output_name_template: None,
+            naming_date: None,
             crf: 0, // Valid x264 CRF 0; the SVT default would reject it.
             preset: 5,
             film_grain: 0,
@@ -866,6 +1504,8 @@ mod tests {
                     },
                 ],
                 output_directory: fixture.0.to_string_lossy().into_owned(),
+                output_name_template: None,
+                naming_date: None,
                 crf: 30,
                 preset: 4,
                 film_grain: 0,

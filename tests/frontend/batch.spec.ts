@@ -175,26 +175,86 @@ async function desktopMock(
                       path: input.inputPath,
                     },
                   };
-                const outputPath =
-                  request.outputDirectory +
-                  '\\' +
-                  input.inputPath
-                    .split('\\')
-                    .at(-1)!
-                    .replace(/\.mkv$/, '') +
-                  {
-                    svtAv1: '_av1.mkv',
-                    svtAv1FiveFish: '_av1_5fish.mkv',
-                    svtAv1Hdr: '_av1_hdr.mkv',
-                    x264: '_x264.mkv',
-                    x265: '_x265.mkv',
-                    vp9: '_vp9.mkv',
-                    aomAv1: '_aom_av1.mkv',
-                    x265Standalone: '_x265_standalone.mkv',
-                    vpxStandalone: '_vpx.mkv',
-                    h264Nvenc: '_h264_nvenc.mkv',
-                    hevcNvenc: '_hevc_nvenc.mkv',
-                  }[request.encoder];
+                const sourceFile = input.inputPath.split('\\').at(-1)!;
+                const sourceDot = sourceFile.lastIndexOf('.');
+                const sourceName = sourceDot < 1 ? sourceFile : sourceFile.slice(0, sourceDot);
+                const sourceExtension = sourceDot < 1 ? '' : sourceFile.slice(sourceDot + 1);
+                const codec = {
+                  svtAv1: 'av1',
+                  svtAv1FiveFish: 'av1_5fish',
+                  svtAv1Hdr: 'av1_hdr',
+                  x264: 'x264',
+                  x265: 'x265',
+                  vp9: 'vp9',
+                  aomAv1: 'aom',
+                  x265Standalone: 'x265_standalone',
+                  vpxStandalone: 'vpx',
+                  h264Nvenc: 'h264_nvenc',
+                  hevcNvenc: 'hevc_nvenc',
+                }[request.encoder];
+                const quarterCrf = request.svtCrfQuarterSteps;
+                const crf =
+                  quarterCrf === undefined
+                    ? String(request.crf)
+                    : String(Math.floor(quarterCrf / 4)) + ['', '.25', '.5', '.75'][quarterCrf % 4];
+                const quality = request.lossless
+                  ? 'lossless'
+                  : request.rateControl?.mode === 'bitrate'
+                    ? `${request.rateControl.bitrateKbps}kbps${request.rateControl.twoPass ? '_2pass' : ''}`
+                    : request.rateControl?.mode === 'targetSize'
+                      ? `${request.rateControl.targetSizeMib}MiB`
+                      : crf;
+                const x26xPresets = [
+                  'ultrafast',
+                  'superfast',
+                  'veryfast',
+                  'faster',
+                  'fast',
+                  'medium',
+                  'slow',
+                  'slower',
+                  'veryslow',
+                  'placebo',
+                ];
+                const preset = ['x264', 'x265', 'x265Standalone'].includes(request.encoder)
+                  ? x26xPresets[request.preset]
+                  : request.svtPreset === undefined
+                    ? String(request.preset)
+                    : String(request.svtPreset);
+                const selectedVideo = media
+                  .get(input.inputPath)
+                  ?.streams.find(
+                    (candidate) =>
+                      candidate.kind === 'video' && candidate.index === input.videoStreamIndex,
+                  );
+                const tokens: Record<string, string> = {
+                  name: sourceName,
+                  ext: sourceExtension,
+                  index: String(request.inputs.indexOf(input) + 1).padStart(
+                    String(request.inputs.length).length,
+                    '0',
+                  ),
+                  codec,
+                  crf,
+                  quality,
+                  preset,
+                  width: String(selectedVideo?.width ?? ''),
+                  height: String(selectedVideo?.height ?? ''),
+                  date: request.namingDate ?? '',
+                };
+                const outputStem = (request.outputNameTemplate ?? '{name}_{codec}').replace(
+                  /\{([^{}]+)\}/g,
+                  (_match, token: string) => tokens[token.toLowerCase()] ?? token,
+                );
+                const extension = {
+                  matroska: 'mkv',
+                  mp4: 'mp4',
+                  webm: 'webm',
+                  mov: 'mov',
+                  mpegTs: 'ts',
+                  m2ts: 'm2ts',
+                }[request.outputContainer ?? 'matroska'];
+                const outputPath = `${request.outputDirectory}\\${outputStem}.${extension}`;
                 return {
                   inputPath: input.inputPath,
                   outputPath,
@@ -732,9 +792,14 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
     texturePsyBias: 0,
     hdrTune: 'visualQuality',
   };
-  expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toEqual({
+  const reviewedRequest = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(reviewedRequest.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  expect(reviewedRequest).toEqual({
     outputContainer: 'matroska',
     outputDirectory: 'C:\\exports',
+    outputNameTemplate: '{name}_{codec}',
+    namingDate: reviewedRequest.namingDate,
     ...settings,
     inputs: [
       {
@@ -809,6 +874,44 @@ test('x264 batch defaults and copied tracks become immutable reviewed H.264 queu
     'Standalone x264 · H.264 · Source bit depth · CRF 23 · Preset medium',
   );
   expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
+});
+
+test('filename templates preview reviewed tokens and edits invalidate the snapshot', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const template = workspace.getByLabel('Filename template', { exact: true });
+  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
+  const queue = workspace.getByRole('button', { name: 'Queue ready files', exact: true });
+  await expect(template).toHaveValue('{name}_{codec}');
+  await expect(template).toHaveAttribute('maxlength', '512');
+  await expect(workspace).toContainText(
+    'Tokens: {name}, {ext}, {index}, {codec}, {crf}, {quality}, {preset}, {width}, {height}, {date}.',
+  );
+  await preview.click();
+  await expect(queue).toBeEnabled();
+
+  await template.fill('{INDEX}_{NAME}_{quality}_{preset}_{width}x{height}_{date}');
+  await expect(queue).toBeDisabled();
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    'Review required before queueing',
+  );
+  await preview.click();
+  const request = (await calls(page, 'preview_encode_batch'))[1].payload
+    .request as BatchEncodeRequest;
+  expect(request.outputNameTemplate).toBe(
+    '{INDEX}_{NAME}_{quality}_{preset}_{width}x{height}_{date}',
+  );
+  expect(request.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    `1_Episode 1_30_2_1280x720_${request.namingDate}.mkv`,
+  );
+
+  await template.fill('');
+  await expect(preview).toBeDisabled();
+  await expect(workspace).toContainText('Enter a filename template before previewing.');
 });
 
 test('x264 batch encoder switches restore source choices and common settings while av1an stays SVT', async ({
@@ -1050,10 +1153,15 @@ test('batch defaults preserve original per-file stream indices and keep attachme
   await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
     '2 ready / 2 reviewed',
   );
-  expect((await calls(page, 'preview_encode_batch'))[0].payload).toEqual({
+  const reviewedRequest = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(reviewedRequest.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  expect({ request: reviewedRequest }).toEqual({
     request: {
       outputContainer: 'matroska',
       outputDirectory: 'C:\\exports',
+      outputNameTemplate: '{name}_{codec}',
+      namingDate: reviewedRequest.namingDate,
       crf: 27,
       preset: 2,
       lossless: false,
@@ -1118,6 +1226,9 @@ test('invalid preview rows remain visible and only ready requests enter one batc
   );
   await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
     '1 ready / 2 reviewed',
+  );
+  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
+    'A failed file does not stop later files; Stop queue cancels the current file and every waiting file.',
   );
   await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
   expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toHaveLength(1);

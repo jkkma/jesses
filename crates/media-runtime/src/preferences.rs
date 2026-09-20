@@ -53,9 +53,16 @@ fn validate_general(value: &GeneralPreferences) -> Result<(), AppError> {
 fn path_key(path: &str) -> String {
     #[cfg(windows)]
     {
-        path.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
+        let normalized = path.replace('/', "\\").to_lowercase();
+        let normalized = if let Some(unc) = normalized.strip_prefix("\\\\?\\unc\\") {
+            format!("\\\\{unc}")
+        } else {
+            normalized
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(&normalized)
+                .to_owned()
+        };
+        normalized.trim_end_matches('\\').to_owned()
     }
     #[cfg(not(windows))]
     {
@@ -417,6 +424,33 @@ mod tests {
         fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
         assert!(store.preview_import(path.clone()).is_err());
         fs::remove_file(path).unwrap();
+        fs::remove_file(dir.join("preferences.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn recent_aliases_move_to_front_and_stay_deduplicated_after_reopen() {
+        let dir = fixture();
+        let store = PreferencesStore::open(dir.clone());
+        let original = r"C:\Media\日本語.mkv";
+        let extended = r"\\?\c:\media\日本語.mkv";
+        let unc = r"\\Server\Share\Series\";
+        let extended_unc = r"\\?\UNC\server\share\series";
+        store.remember(vec![original.into(), unc.into()]).unwrap();
+        let updated = store
+            .remember(vec![
+                extended_unc.into(),
+                extended.into(),
+                "C:/MEDIA/日本語.mkv".into(),
+            ])
+            .unwrap();
+        assert_eq!(updated.recent_paths, vec![extended_unc, extended]);
+        assert_eq!(PreferencesStore::open(dir.clone()).get().unwrap(), updated);
+        // Missing or offline paths remain stored without filesystem lookups.
+        assert_eq!(
+            store.remember(vec![original.into()]).unwrap().recent_paths,
+            vec![original, extended_unc]
+        );
         fs::remove_file(dir.join("preferences.json")).unwrap();
         fs::remove_dir(dir).unwrap();
     }

@@ -15,6 +15,15 @@ export const preferences = $state<{
   loaded: false,
   error: null,
 });
+let mutationTail = Promise.resolve();
+function serializeMutation<T>(action: () => Promise<T>): Promise<T> {
+  const result = mutationTail.then(action);
+  mutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
 function receive(value: UserPreferences) {
   if (!preferences.loaded || value.revision >= preferences.value.revision)
     preferences.value = value;
@@ -29,16 +38,26 @@ export async function loadPreferences() {
   }
 }
 export async function updatePreferences(request: SavePreferencesRequest) {
-  const value = await savePreferences(request);
+  const value = await serializeMutation(() => savePreferences(request));
   receive(value);
 }
 export async function rememberMedia(paths: string[]) {
   if (!preferences.loaded) return;
   try {
-    receive(await rememberRecentMedia(paths));
+    receive(await serializeMutation(() => rememberRecentMedia(paths)));
   } catch (error) {
     preferences.error = errorMessage(error);
   }
+}
+export async function forgetMedia(path: string) {
+  if (!preferences.loaded) return;
+  const value = await serializeMutation(() =>
+    savePreferences({
+      general: { ...preferences.value.general },
+      recentPaths: preferences.value.recentPaths.filter((recent) => recent !== path),
+    }),
+  );
+  receive(value);
 }
 /** A suggestion only. Existing drafts and queued destinations stay unchanged. */
 export function preferredDestination(suggestion: string): string {

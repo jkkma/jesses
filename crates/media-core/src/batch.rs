@@ -63,6 +63,14 @@ pub struct BatchEncodeRequest {
     pub workers: u8,
     pub inputs: Vec<BatchEncodeInput>,
     pub output_directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_name_template: Option<String>,
+    /// Local calendar date captured once when the batch preview is requested.
+    /// It is required only when the filename template contains `{date}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub naming_date: Option<String>,
     pub crf: u8,
     pub preset: u8,
     #[serde(default)]
