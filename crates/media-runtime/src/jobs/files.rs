@@ -220,6 +220,39 @@ pub(super) fn ensure_absent(output: &Path) -> Result<(), AppError> {
     }
 }
 
+/// Reconstructs the only scratch pathnames used by remux and multi-source mux.
+///
+/// An interrupted process no longer owns the file handles that originally
+/// established identity, so callers may report these entries but must never
+/// delete or reuse them automatically.
+pub(super) fn interrupted_temporary_paths(id: &str, output: &Path) -> Vec<PathBuf> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Vec::new();
+    }
+    let Some(parent) = output.parent() else {
+        return Vec::new();
+    };
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_owned());
+    let mut paths = vec![parent.join(format!(".jesses-{id}.partial.mkv"))];
+    if let Some(container) = output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(media_core::ContainerFormat::from_extension)
+        .filter(|container| *container != media_core::ContainerFormat::Matroska)
+    {
+        paths.push(parent.join(format!(
+            ".jesses-{id}-container.partial.{}",
+            container.extension()
+        )));
+    }
+    paths
+}
+
 pub(crate) struct Temporary {
     pub path: PathBuf,
     file: Option<File>,

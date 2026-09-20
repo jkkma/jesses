@@ -687,12 +687,23 @@ impl Timeline {
                 > tolerance + 0.000001
             || (self.samples as f64 - output.samples as f64) / f64::from(self.rate)
                 > declared_padding + tolerance + 0.000001
+            || (self.minimum_residual - output.minimum_residual).abs() > tolerance + 0.000001
+            || (self.maximum_residual - output.maximum_residual).abs() > tolerance + 0.000001
         {
             return Err(AppError::new(
                 "AUDIO_VALIDATION_FAILED",
                 format!(
-                    "The final container changed decoded audio beyond one source time-base tick (at most 2 ms): start {} -> {}, samples {} -> {}, end {} -> {}.",
-                    self.start, output.start, self.samples, output.samples, source_end, output_end
+                    "The final container changed decoded audio beyond one source time-base tick (at most 2 ms): start {} -> {}, samples {} -> {}, end {} -> {}, residual envelope {}..{} -> {}..{}.",
+                    self.start,
+                    output.start,
+                    self.samples,
+                    output.samples,
+                    source_end,
+                    output_end,
+                    self.minimum_residual,
+                    self.maximum_residual,
+                    output.minimum_residual,
+                    output.maximum_residual,
                 ),
                 None,
             ));
@@ -774,6 +785,51 @@ pub(super) async fn scan(
     encoded: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Timeline, AppError> {
+    scan_with_tolerance(ffprobe, input, stream, encoded, None, cancel).await
+}
+
+/// The app-created Matroska stage may add one extra millisecond tick at a
+/// discontinuity that was already present in an imported AAC timeline. Admit
+/// that single bounded tick for final-container verification; repeated or
+/// accumulating gaps still fail before publication.
+pub(super) async fn scan_container_source(
+    ffprobe: &Path,
+    input: &Path,
+    stream: &metadata::Stream,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Timeline, AppError> {
+    let rate = sample_rate(stream)?;
+    let tolerance = (4.0 * continuity_tick(stream) + 1.0 / f64::from(rate)).clamp(0.002, 0.0041);
+    scan_with_tolerance(ffprobe, input, stream, false, Some(tolerance), cancel).await
+}
+
+/// Scans a copied final-container track while permitting only the continuity
+/// envelope already admitted for its imported source, plus the normal 2 ms
+/// cross-container quantization bound. `verify_container` then compares the
+/// observed source/output envelopes directly.
+pub(super) async fn scan_container_output(
+    ffprobe: &Path,
+    input: &Path,
+    stream: &metadata::Stream,
+    source: &Timeline,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Timeline, AppError> {
+    let inherited = source
+        .minimum_residual
+        .abs()
+        .max(source.maximum_residual.abs());
+    let tolerance = (inherited + 0.002001).clamp(0.002, 0.006);
+    scan_with_tolerance(ffprobe, input, stream, true, Some(tolerance), cancel).await
+}
+
+async fn scan_with_tolerance(
+    ffprobe: &Path,
+    input: &Path,
+    stream: &metadata::Stream,
+    encoded: bool,
+    tolerance: Option<f64>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Timeline, AppError> {
     let mut timeline = Timeline {
         start: 0.0,
         samples: 0,
@@ -784,20 +840,14 @@ pub(super) async fn scan(
     // timestamp, and first-frame origin separately. Bound this source-only
     // uncertainty to three ticks (at most 1 ms per tick) plus one sample.
     // Our encoder's decoded output keeps the stricter 2 ms continuity bound.
-    let tick = stream
-        .time_base
-        .as_deref()
-        .and_then(|base| base.split_once('/'))
-        .and_then(|(num, den)| Some((num.parse::<f64>().ok()?, den.parse::<f64>().ok()?)))
-        .map(|(num, den)| num / den)
-        .filter(|tick| tick.is_finite() && *tick > 0.0)
-        .unwrap_or(0.000001)
-        .min(0.001);
-    timeline.tolerance = if encoded {
-        0.002
-    } else {
-        (3.0 * tick + 1.0 / f64::from(timeline.rate)).max(0.002)
-    };
+    let tick = continuity_tick(stream);
+    timeline.tolerance = tolerance.unwrap_or_else(|| {
+        if encoded {
+            0.002
+        } else {
+            (3.0 * tick + 1.0 / f64::from(timeline.rate)).max(0.002)
+        }
+    });
     let channels = stream.channels;
     let layout = stream.channel_layout.clone();
     let mut args: Vec<OsString> = [
@@ -879,6 +929,18 @@ pub(super) async fn scan(
         ));
     }
     Ok(output.value)
+}
+
+fn continuity_tick(stream: &metadata::Stream) -> f64 {
+    stream
+        .time_base
+        .as_deref()
+        .and_then(|base| base.split_once('/'))
+        .and_then(|(num, den)| Some((num.parse::<f64>().ok()?, den.parse::<f64>().ok()?)))
+        .map(|(num, den)| num / den)
+        .filter(|tick| tick.is_finite() && *tick > 0.0)
+        .unwrap_or(0.000001)
+        .min(0.001)
 }
 
 pub(super) fn verify_timeline(
@@ -1118,6 +1180,35 @@ mod tests {
                     nb_samples: Some(960),
                     ..Default::default()
                 })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn final_container_may_inherit_but_not_expand_source_continuity_residuals() {
+        let source = Timeline {
+            start: 0.0,
+            samples: 15_877_058,
+            rate: 44_100,
+            tolerance: 0.003023,
+            minimum_residual: -0.000568,
+            maximum_residual: 0.002728,
+        };
+        let mut output = Timeline {
+            start: 0.000_011,
+            samples: source.samples,
+            rate: source.rate,
+            tolerance: 0.004729,
+            minimum_residual: -0.000567,
+            maximum_residual: 0.002721,
+        };
+        source
+            .verify_container(&output, 0.001, Some(0.023))
+            .unwrap();
+        output.maximum_residual = 0.004;
+        assert!(
+            source
+                .verify_container(&output, 0.001, Some(0.023))
                 .is_err()
         );
     }

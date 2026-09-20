@@ -1,5 +1,8 @@
 # Windows output safety validation
 
+The installed copy-workflow follow-up is recorded in
+[Windows remux and multi-source mux safety](windows-remux-mux-safety-validation.md).
+
 The 2026-09-20 Windows x64 acceptance checks use the verified portable toolset:
 FFmpeg/FFprobe 9.0.1, x264 0.165.3222 b35605a, mainline SVT-AV1 4.2.0, and the
 packaged av1an/VapourSynth runtime. Generated media, destinations and job history

@@ -493,6 +493,37 @@ struct Packet {
     hash: String,
 }
 
+fn timing_matches(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= 0.002,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn packet_duration_matches(
+    expected: Option<f64>,
+    actual: Option<f64>,
+    actual_dts: Option<f64>,
+    next_actual_dts: Option<f64>,
+    allow_aac_reshape: bool,
+) -> bool {
+    if expected.is_none() || actual.is_none() || timing_matches(expected, actual) {
+        return true;
+    }
+    // ISO BMFF stores one duration table for consecutive AAC samples. When an
+    // imported timeline contains a small gap, FFmpeg represents that gap by
+    // extending the preceding sample to the next unchanged DTS. Exact packet
+    // bytes and every PTS/DTS still have to pass the normal comparison, and the
+    // decoded-audio scan independently bounds the complete sample timeline.
+    allow_aac_reshape
+        && actual_dts
+            .zip(next_actual_dts)
+            .filter(|(current, next)| next >= current)
+            .map(|(current, next)| next - current)
+            .is_some_and(|dts_delta| timing_matches(actual, Some(dts_delta)))
+}
+
 fn packets(
     reader: &mut dyn Read,
     mut accept: impl FnMut(Packet) -> Result<(), String>,
@@ -608,6 +639,7 @@ pub(super) async fn verify_packets(
         output_index,
         cancel,
         false,
+        false,
     )
     .await
     .map(|_| ())
@@ -619,6 +651,7 @@ pub(super) async fn verify_container_packets(
     source_index: u32,
     output: &Path,
     output_index: u32,
+    allow_aac_duration_reshape: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Option<f64>, AppError> {
     compare_packets(
@@ -629,6 +662,7 @@ pub(super) async fn verify_container_packets(
         output_index,
         cancel,
         true,
+        allow_aac_duration_reshape,
     )
     .await
 }
@@ -642,6 +676,7 @@ async fn compare_packets(
     output_index: u32,
     cancel: &watch::Receiver<bool>,
     reconstruct_initial_dts: bool,
+    allow_aac_duration_reshape: bool,
 ) -> Result<Option<f64>, AppError> {
     let source_spec = packet_spec(ffprobe, source, source_index);
     let output_spec = packet_spec(ffprobe, output, output_index);
@@ -671,15 +706,11 @@ async fn compare_packets(
             let mut missing_initial_dts = 0;
             let mut source_dts_seen = false;
             let mut previous_dts = None;
+            let mut pending_duration = None;
             let count = packets(reader, |actual| {
                 let expected = receiver
                     .recv()
                     .map_err(|_| "The output contains extra packets.".to_string())?;
-                let timing = |a: Option<f64>, b: Option<f64>| match (a, b) {
-                    (Some(a), Some(b)) => (a - b).abs() <= 0.002,
-                    (None, None) => true,
-                    _ => false,
-                };
                 // Matroska omits leading decode timestamps for reordered video;
                 // MP4 must reconstruct them. Only a bounded leading prefix may
                 // gain DTS, with monotonic decode time at or before its PTS.
@@ -694,19 +725,40 @@ async fn compare_packets(
                 if reconstructed {
                     missing_initial_dts += 1;
                 }
-                previous_dts = actual.dts;
                 if expected.hash != actual.hash
                     || expected.size != actual.size
-                    || !timing(expected.pts, actual.pts)
-                    || (!reconstructed && !timing(expected.dts, actual.dts))
-                    || (expected.duration.is_some()
-                        && actual.duration.is_some()
-                        && !timing(expected.duration, actual.duration))
+                    || !timing_matches(expected.pts, actual.pts)
+                    || (!reconstructed && !timing_matches(expected.dts, actual.dts))
                 {
                     return Err("A copied packet's content or timing changed.".into());
                 }
+                if let Some((expected_duration, actual_duration, actual_dts)) =
+                    pending_duration.take()
+                    && !packet_duration_matches(
+                        expected_duration,
+                        actual_duration,
+                        actual_dts,
+                        actual.dts,
+                        allow_aac_duration_reshape,
+                    )
+                {
+                    return Err("A copied packet's duration changed unexpectedly.".into());
+                }
+                pending_duration = Some((expected.duration, actual.duration, actual.dts));
+                previous_dts = actual.dts;
                 Ok(())
             })?;
+            if let Some((expected_duration, actual_duration, actual_dts)) = pending_duration
+                && !packet_duration_matches(
+                    expected_duration,
+                    actual_duration,
+                    actual_dts,
+                    None,
+                    allow_aac_duration_reshape,
+                )
+            {
+                return Err("The final copied packet's duration changed.".into());
+            }
             if receiver.recv().is_ok() {
                 return Err("The output is missing source packets.".into());
             }
@@ -817,6 +869,38 @@ mod tests {
         );
         assert!(packets(&mut b"size=32\n".as_slice(), |_| Ok(())).is_err());
         assert!(packets(&mut vec![b'x'; 8194].as_slice(), |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn aac_duration_reshape_requires_the_next_unchanged_decode_timestamp() {
+        assert!(packet_duration_matches(
+            Some(0.023),
+            Some(0.026508),
+            Some(44.976485),
+            Some(45.002993),
+            true,
+        ));
+        assert!(!packet_duration_matches(
+            Some(0.023),
+            Some(0.026508),
+            Some(44.976485),
+            Some(44.999000),
+            true,
+        ));
+        assert!(!packet_duration_matches(
+            Some(0.023),
+            Some(0.026508),
+            Some(44.976485),
+            Some(45.002993),
+            false,
+        ));
+        assert!(!packet_duration_matches(
+            Some(0.023),
+            Some(0.026508),
+            Some(44.976485),
+            None,
+            true,
+        ));
     }
 
     #[tokio::test]

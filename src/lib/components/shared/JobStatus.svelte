@@ -289,6 +289,9 @@
           before starting a new job. Nothing resumes automatically.
         </p>{/if}
       {#if job.error}<p class="job-error" role="alert">{job.error.message}</p>{/if}
+      {#if job.error?.code === 'OUTPUT_CLEANUP_FAILED' && job.error.path}
+        <p class="job-path">Temporary file retained: {job.error.path}</p>
+      {/if}
       {#if errors[job.id]}<p class="job-error" role="alert">{errors[job.id]}</p>{/if}
       {@render recoveryControls(job)}
       {#if !terminalJob(job.state)}
@@ -339,6 +342,9 @@
             >
             <p class="job-path">{entry.request.outputPath}</p>
             {#if entry.error}<p class="job-error">{entry.error.message}</p>{/if}
+            {#if entry.error?.code === 'OUTPUT_CLEANUP_FAILED' && entry.error.path}
+              <p class="job-path">Temporary file retained: {entry.error.path}</p>
+            {/if}
             {#if entry.state === 'interrupted' && !canResumeJob(entry)}<p class="small-muted">
                 Review the previous output before starting a new job. This job will not resume.
               </p>{/if}

@@ -461,14 +461,30 @@ pub(super) async fn prepare<'a>(
                 source.index,
                 &artifact.path,
                 target.index,
+                source.codec_name.as_deref() == Some("aac"),
                 cancel,
             )
             .await?;
             if source.codec_type.as_deref() == Some("audio") {
-                let before =
-                    super::audio::scan(&ffprobe, &input.path, source, false, cancel).await?;
-                let after =
-                    super::audio::scan(&ffprobe, &artifact.path, target, true, cancel).await?;
+                let is_aac = source.codec_name.as_deref() == Some("aac");
+                let before = if is_aac {
+                    super::audio::scan_container_source(&ffprobe, &input.path, source, cancel)
+                        .await?
+                } else {
+                    super::audio::scan(&ffprobe, &input.path, source, false, cancel).await?
+                };
+                let after = if is_aac {
+                    super::audio::scan_container_output(
+                        &ffprobe,
+                        &artifact.path,
+                        target,
+                        &before,
+                        cancel,
+                    )
+                    .await?
+                } else {
+                    super::audio::scan(&ffprobe, &artifact.path, target, true, cancel).await?
+                };
                 let tick = source
                     .time_base
                     .as_deref()

@@ -182,18 +182,95 @@ impl JobManager {
                             ),
                         }
                     }
-                    if !snapshot.state.is_terminal() {
+                    let was_unfinished = !snapshot.state.is_terminal();
+                    let is_copy_job = snapshot.encode_settings.is_none();
+                    let inspect_interrupted_temporaries =
+                        is_copy_job && (was_unfinished || snapshot.state == JobState::Interrupted);
+                    let interrupted_temporary_reports = if inspect_interrupted_temporaries {
+                        files::interrupted_temporary_paths(
+                            &snapshot.id,
+                            Path::new(&snapshot.request.output_path),
+                        )
+                        .into_iter()
+                        .filter_map(|path| match std::fs::symlink_metadata(&path) {
+                            Ok(_) => Some((
+                                path.clone(),
+                                format!(
+                                    "An entry remains at this interrupted job's former temporary pathname: {}. Its identity cannot be re-established after restart, so it was preserved and will not be reused automatically.",
+                                    path.display()
+                                ),
+                            )),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => Some((
+                                path.clone(),
+                                format!(
+                                    "This interrupted job's former temporary pathname could not be checked safely and was left untouched: {} ({error}).",
+                                    path.display()
+                                ),
+                            )),
+                        })
+                        .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let copy_interrupted_message = if interrupted_temporary_reports.is_empty() {
+                        "The previous copy attempt ended before completion was recorded. Remux and multi-source mux work cannot be resumed; start a new job. No processes were restarted or old files deleted."
+                    } else {
+                        "The previous copy attempt ended before completion was recorded and cannot be resumed. One or more entries remain at former temporary pathnames; review the job log. They were preserved because ownership cannot be re-established after restart."
+                    };
+                    if was_unfinished {
                         snapshot.state = JobState::Interrupted;
                         snapshot.error = Some(AppError::new(
                             "JOB_INTERRUPTED",
-                            "The previous session ended before completion was recorded. Saved encoder work can be resumed after verification; no processes were restarted or old files deleted.",
+                            if is_copy_job {
+                                copy_interrupted_message
+                            } else if interrupted_temporary_reports.is_empty() {
+                                "The previous session ended before completion was recorded. Saved encoder work can be resumed after verification; no processes were restarted or old files deleted."
+                            } else {
+                                "The previous session ended before completion was recorded. One or more entries remain at former temporary pathnames; review the job log. They were preserved because ownership cannot be re-established after restart."
+                            },
                             Some(snapshot.request.output_path.clone()),
                         ));
                         append_log(
                             &mut snapshot,
-                            "Interrupted job restored for review. Resume is available only for verified saved work and must be requested explicitly."
-                                .into(),
+                            if is_copy_job {
+                                "Interrupted copy job restored for review. It cannot be resumed; start a new remux or multi-source mux job after reviewing any retained pathname reports."
+                                .into()
+                            } else {
+                                "Interrupted job restored for review. Resume is available only for verified saved work and must be requested explicitly."
+                                .into()
+                            },
                         );
+                    } else if is_copy_job
+                        && snapshot
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.code == "JOB_INTERRUPTED")
+                    {
+                        snapshot
+                            .error
+                            .as_mut()
+                            .expect("checked interrupted error")
+                            .message = copy_interrupted_message.into();
+                        if !snapshot.logs.iter().any(|line| {
+                            line.contains(
+                                "cannot be resumed; start a new remux or multi-source mux",
+                            )
+                        }) {
+                            append_log(
+                                &mut snapshot,
+                                "Interrupted copy job restored for review. It cannot be resumed; start a new remux or multi-source mux job after reviewing any retained pathname reports."
+                                    .into(),
+                            );
+                        }
+                    }
+                    for (path, report) in interrupted_temporary_reports {
+                        let name = path.file_name().and_then(|name| name.to_str());
+                        if !name.is_some_and(|name| {
+                            snapshot.logs.iter().any(|line| line.contains(name))
+                        }) {
+                            append_log(&mut snapshot, report);
+                        }
                     }
                     let (cancel, _) = watch::channel(true);
                     state.entries.push(Entry {
@@ -1203,7 +1280,18 @@ impl JobManager {
                 };
             }
             for error in cleanup_errors {
-                append_log(snapshot, error.message.clone());
+                append_log(
+                    snapshot,
+                    error.path.as_ref().map_or_else(
+                        || error.message.clone(),
+                        |path| {
+                            format!(
+                                "{} Retained temporary pathname: {path}",
+                                error.message
+                            )
+                        },
+                    ),
+                );
                 snapshot.error = Some(error);
                 if snapshot.state != JobState::Succeeded {
                     snapshot.state = JobState::Failed;

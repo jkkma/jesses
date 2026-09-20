@@ -439,6 +439,34 @@ test('a runtime failure is shown without reporting a successful output', async (
   await expect(page.getByText('Succeeded', { exact: true })).toHaveCount(0);
 });
 
+test('a successful remux exposes retained temporary paths in current status and history', async ({
+  page,
+}) => {
+  const retained = 'C:\\exports\\.jesses-remux-job-1-container.partial.mp4';
+  const completed: JobSnapshot = {
+    ...snapshot('succeeded'),
+    error: {
+      code: 'OUTPUT_CLEANUP_FAILED',
+      message: 'The output was saved, but a temporary file is still locked.',
+      path: retained,
+    },
+  };
+  await desktopMock(page, { jobs: [completed] });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Remux', exact: true }).click();
+  await expect(page.getByText('Succeeded', { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(`Temporary file retained: ${retained}`, { exact: true }),
+  ).toBeVisible();
+  await emitJobs(page, [{ ...snapshot('running'), id: 'remux-job-2' }, completed]);
+  await expect(page.getByText('Running', { exact: true })).toBeVisible();
+  await expect(page.getByText('Remux · Succeeded', { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(`Temporary file retained: ${retained}`, { exact: true }),
+  ).toBeVisible();
+  expect(await callsFor(page, 'cancel_job')).toEqual([]);
+});
+
 for (const operation of ['start', 'cancel'] as const) {
   test(`a late ${operation} response cannot regress a terminal channel snapshot`, async ({
     page,
