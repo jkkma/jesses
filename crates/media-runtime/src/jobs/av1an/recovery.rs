@@ -280,6 +280,8 @@ struct Manifest {
     queue: Option<Stamp>,
     scenes: Option<Stamp>,
     script: Option<Stamp>,
+    #[serde(default)]
+    reader_cache: Option<Stamp>,
     completed: BTreeMap<String, Chunk>,
     #[serde(default)]
     segments: Vec<Stamp>,
@@ -335,6 +337,47 @@ fn load(
     Ok((root, manifest))
 }
 
+fn external_reader_cache_path(
+    chunks: &Path,
+    reader: super::recovery_receipts::ReaderCache,
+) -> Result<PathBuf, AppError> {
+    let split = chunks.join("split");
+    identity(&split)?;
+    let mut found = None;
+    for entry in fs::read_dir(&split).map_err(|e| error(&split, e.to_string()))? {
+        let path = entry.map_err(|e| error(&split, e.to_string()))?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cache.ffindex") && !name.starts_with("cache.bsindex") {
+            continue;
+        }
+        let valid = match reader {
+            super::recovery_receipts::ReaderCache::Ffms2 => name == "cache.ffindex",
+            super::recovery_receipts::ReaderCache::Bestsource => name
+                .strip_prefix("cache.bsindex.")
+                .and_then(|name| name.strip_suffix(".bsindex"))
+                .is_some_and(|track| {
+                    !track.is_empty() && track.bytes().all(|byte| byte.is_ascii_digit())
+                }),
+        };
+        if !valid || !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(error(
+                &path,
+                "Unexpected external source-reader cache artifact.",
+            ));
+        }
+        identity(&path)?;
+        if found.replace(path).is_some() {
+            return Err(error(
+                &split,
+                "Multiple external source-reader caches are present.",
+            ));
+        }
+    }
+    found.ok_or_else(|| error(&split, "The external source-reader cache is missing."))
+}
+
 fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     if manifest.prepared_identity.is_some() {
         if manifest.source.path != root.join("prepared.mkv")
@@ -366,6 +409,25 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             ));
         }
     }
+    let options = manifest.settings.av1an_options.unwrap_or_default();
+    let expected_reader_cache = if manifest.queue.is_some() {
+        super::recovery_receipts::reader_cache(options.chunk_method)
+            .map(|reader| external_reader_cache_path(&root.join("chunks"), reader))
+            .transpose()?
+    } else {
+        None
+    };
+    if manifest
+        .reader_cache
+        .as_ref()
+        .zip(expected_reader_cache.as_ref())
+        .is_some_and(|(stamp, expected)| stamp.path != *expected)
+    {
+        return Err(error(
+            root,
+            "The external source-reader cache points outside its exact owned path.",
+        ));
+    }
     for (index, segment) in manifest.segments.iter().enumerate() {
         if manifest
             .settings
@@ -382,10 +444,10 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
         }
     }
     if manifest.queue.is_some() != manifest.scenes.is_some()
-        || (manifest.queue.is_some()
-            && super::options::plugin(manifest.settings.av1an_options.unwrap_or_default())
-                .is_some())
+        || (manifest.queue.is_some() && super::options::plugin(options).is_some())
             != manifest.script.is_some()
+        || (manifest.queue.is_some() && expected_reader_cache.is_some())
+            != manifest.reader_cache.is_some()
         || (manifest.queue.is_none() && !manifest.completed.is_empty())
         || (manifest.phase == RecoveryPhase::Finalizing) != manifest.final_video.is_some()
     {
@@ -637,6 +699,57 @@ impl Workspace {
                 "Unexpected saved source script for FFmpeg reader.",
             ));
         }
+        if let Some(reader) = receipts.reader_cache {
+            let path = external_reader_cache_path(&self.root.join("chunks"), reader)?;
+            if let Some(saved) = &self.manifest.reader_cache {
+                #[cfg(windows)]
+                {
+                    let canonical =
+                        fs::canonicalize(&path).map_err(|e| error(&path, e.to_string()))?;
+                    let guard = self
+                        .chunks
+                        .iter()
+                        .find(|guard| guard.path == canonical)
+                        .ok_or_else(|| {
+                            error(&path, "The external source-reader cache guard is missing.")
+                        })?;
+                    guard.verify().map_err(|_| {
+                        error(&path, "The saved external source-reader cache changed.")
+                    })?;
+                    let metadata = fs::metadata(&path).map_err(|e| error(&path, e.to_string()))?;
+                    if identity(&path)? != saved.identity || metadata.len() != saved.length {
+                        return Err(error(
+                            &path,
+                            "The saved external source-reader cache changed.",
+                        ));
+                    }
+                }
+                #[cfg(not(windows))]
+                if digest(&path, None)?.ne(saved) {
+                    return Err(error(
+                        &path,
+                        "The saved external source-reader cache changed.",
+                    ));
+                }
+            } else {
+                // Seal only a complete, readable index. On Windows this guard
+                // prevents writes, deletion and replacement for the remainder
+                // of the attempt, so periodic checkpoints need only verify its
+                // identity and metadata. Unix retains full-digest verification.
+                let guard = Source::open(&path)?;
+                let stamp = digest(&path, None)?;
+                if stamp.length == 0 {
+                    return Err(error(&path, "The external source-reader cache is empty."));
+                }
+                self.manifest.reader_cache = Some(stamp);
+                self.chunks.push(guard);
+            }
+        } else if self.manifest.reader_cache.is_some() {
+            return Err(error(
+                &self.root,
+                "Unexpected external source-reader cache for this chunk method.",
+            ));
+        }
         if self.manifest.segments.is_empty() {
             for path in &receipts.segments {
                 let guard = Source::open(path)?;
@@ -692,6 +805,7 @@ impl Workspace {
             .iter()
             .chain(self.manifest.scenes.iter())
             .chain(self.manifest.script.iter())
+            .chain(self.manifest.reader_cache.iter())
             .chain(self.manifest.segments.iter())
             .chain(self.manifest.completed.values().map(|c| &c.file))
             .chain(self.manifest.final_video.iter())
@@ -909,6 +1023,7 @@ impl Recovery {
                     queue: None,
                     scenes: None,
                     script: None,
+                    reader_cache: None,
                     segments: Vec::new(),
                     completed: BTreeMap::new(),
                     intermediate: identity(&intermediate.path)?,
@@ -924,6 +1039,7 @@ impl Recovery {
                 .values()
                 .map(|chunk| &chunk.file.path)
                 .chain(manifest.segments.iter().map(|stamp| &stamp.path))
+                .chain(manifest.reader_cache.iter().map(|stamp| &stamp.path))
                 .map(|path| Source::open(path))
                 .collect::<Result<Vec<_>, _>>()?;
             let workspace = Workspace {
@@ -980,6 +1096,15 @@ impl Recovery {
     }
     pub(in crate::jobs) async fn summary(&self) -> Result<Av1anRecovery, AppError> {
         self.with(|w| Ok(w.summary())).await
+    }
+    pub(in crate::jobs) async fn reader_cache_path(&self) -> Result<Option<PathBuf>, AppError> {
+        self.with(|w| {
+            Ok(w.manifest
+                .reader_cache
+                .as_ref()
+                .map(|stamp| stamp.path.clone()))
+        })
+        .await
     }
     pub(in crate::jobs) async fn checkpoint(
         &self,
@@ -1355,6 +1480,7 @@ mod tests {
                 queue: None,
                 scenes: None,
                 script: None,
+                reader_cache: None,
                 completed: BTreeMap::new(),
                 segments: Vec::new(),
                 intermediate: identity(&intermediate.path).unwrap(),
@@ -1762,6 +1888,77 @@ mod tests {
         fs::write(&chunk, b"released for cleanup").unwrap();
         drop(intermediate);
         drop(workspace);
+    }
+
+    #[test]
+    fn external_reader_cache_is_owned_and_fingerprinted_for_resume() {
+        for method in [
+            media_core::Av1anChunkMethod::Ffms2,
+            media_core::Av1anChunkMethod::Bestsource,
+        ] {
+            let fixture = Fixture::new();
+            let (mut workspace, intermediate) = fixture.workspace();
+            workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+                chunk_method: method,
+                ..Default::default()
+            });
+            let chunks = workspace.root.join("chunks");
+            fs::create_dir_all(chunks.join("split")).unwrap();
+            for (relative, contents) in [
+                ("chunks.json", b"queue".as_slice()),
+                ("scenes.json", b"scenes".as_slice()),
+                ("split/loadscript.vpy", b"script".as_slice()),
+            ] {
+                fs::write(chunks.join(relative), contents).unwrap();
+            }
+            workspace.manifest.queue = Some(digest(&chunks.join("chunks.json"), None).unwrap());
+            workspace.manifest.scenes = Some(digest(&chunks.join("scenes.json"), None).unwrap());
+            workspace.manifest.script =
+                Some(digest(&chunks.join("split/loadscript.vpy"), None).unwrap());
+            let reader = super::super::recovery_receipts::reader_cache(method)
+                .expect("external reader cache kind");
+            let cache =
+                chunks
+                    .join("split")
+                    .join(if method == media_core::Av1anChunkMethod::Ffms2 {
+                        "cache.ffindex"
+                    } else {
+                        "cache.bsindex.7.bsindex"
+                    });
+            fs::write(&cache, b"reader index").unwrap();
+            assert_eq!(external_reader_cache_path(&chunks, reader).unwrap(), cache);
+            let cache_stamp = digest(&cache, None).unwrap();
+            workspace.manifest.reader_cache = Some(cache_stamp.clone());
+            validate_layout(&workspace.root, &workspace.manifest).unwrap();
+            workspace.verify_saved(None).unwrap();
+
+            workspace.manifest.reader_cache = None;
+            assert!(validate_layout(&workspace.root, &workspace.manifest).is_err());
+            workspace.manifest.reader_cache = Some(cache_stamp.clone());
+
+            let extra =
+                chunks
+                    .join("split")
+                    .join(if method == media_core::Av1anChunkMethod::Ffms2 {
+                        "cache.bsindex.0.bsindex"
+                    } else {
+                        "cache.ffindex"
+                    });
+            fs::write(&extra, b"unreported reader index").unwrap();
+            assert!(external_reader_cache_path(&chunks, reader).is_err());
+            fs::remove_file(extra).unwrap();
+
+            let foreign = chunks.join("split/foreign.index");
+            fs::write(&foreign, b"foreign").unwrap();
+            workspace.manifest.reader_cache = Some(digest(&foreign, None).unwrap());
+            assert!(validate_layout(&workspace.root, &workspace.manifest).is_err());
+            workspace.manifest.reader_cache = Some(cache_stamp);
+
+            fs::write(&cache, b"changed reader index").unwrap();
+            assert!(workspace.verify_saved(None).is_err());
+            drop(intermediate);
+            drop(workspace);
+        }
     }
 
     #[test]

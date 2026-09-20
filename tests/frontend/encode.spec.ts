@@ -1845,8 +1845,8 @@ test('av1an tab settings are explicit, immutable in queued jobs, and reset safel
   await expect(
     workspace.getByLabel('Video stream', { exact: true }).getByRole('option', { name: /#4/ }),
   ).toBeDisabled();
-  await expect(workspace).toContainText('at most 240 frames');
-  await expect(workspace).toContainText('VapourSynth with the L-SMASH Works source plugin');
+  await expect(workspace).toContainText('your scene-splitting and chunk-size settings');
+  await expect(workspace).toContainText('VapourSynth with the selected source plugin');
   await expect(workspace).toContainText('inside the output folder');
   await expect(workspace).toContainText('remaining work files are retained');
   await expect(workspace).toContainText('Jobs never resume automatically');

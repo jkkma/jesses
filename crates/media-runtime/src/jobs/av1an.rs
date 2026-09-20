@@ -254,7 +254,13 @@ impl JobManager {
                     }
                     _ = interval.tick() => {
                         if let Ok(summary) = event_recovery.checkpoint(false).await {
-                            observer.change(&event_id, |snapshot| snapshot.recovery = Some(summary)).await;
+                            let reader_cache = event_recovery.reader_cache_path().await.ok().flatten();
+                            observer.change(&event_id, move |snapshot| {
+                                snapshot.recovery = Some(summary);
+                                if let Some(path) = reader_cache {
+                                    report_reader_cache(snapshot, &path);
+                                }
+                            }).await;
                         }
                         if let Some((frames, chunks)) = read_progress(&progress_path, frame_count).await
                             && frames > previous {
@@ -311,8 +317,14 @@ impl JobManager {
             .await;
         match checkpoint {
             Ok(summary) => {
-                self.change(id, |snapshot| snapshot.recovery = Some(summary))
-                    .await
+                let reader_cache = recovery.reader_cache_path().await?;
+                self.change(id, move |snapshot| {
+                    snapshot.recovery = Some(summary);
+                    if let Some(path) = reader_cache {
+                        report_reader_cache(snapshot, &path);
+                    }
+                })
+                .await
             }
             Err(error) => return Err(error),
         }
@@ -386,6 +398,23 @@ async fn read_progress(path: &Path, expected: usize) -> Option<(u64, usize)> {
         return None;
     }
     progress(&bytes, expected)
+}
+
+fn report_reader_cache(snapshot: &mut JobSnapshot, path: &Path) {
+    if snapshot
+        .logs
+        .iter()
+        .any(|line| line.starts_with("av1an external reader cache:"))
+    {
+        return;
+    }
+    append_log(
+        snapshot,
+        format!(
+            "av1an external reader cache: {} (owned by the recovery workspace; retained only while recovery is available).",
+            path.display()
+        ),
+    );
 }
 
 /// av1an's experimental IVF concatenator can write a fixed 30 fps header.

@@ -55,7 +55,22 @@ pub(super) struct Receipts {
     pub total_frames: u64,
     pub queued_chunks: usize,
     pub script_path: Option<PathBuf>,
+    pub reader_cache: Option<ReaderCache>,
     pub segments: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReaderCache {
+    Ffms2,
+    Bestsource,
+}
+
+pub(super) fn reader_cache(method: Av1anChunkMethod) -> Option<ReaderCache> {
+    match method {
+        Av1anChunkMethod::Ffms2 => Some(ReaderCache::Ffms2),
+        Av1anChunkMethod::Bestsource => Some(ReaderCache::Bestsource),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -629,6 +644,7 @@ fn validate_receipt_shapes(
         script_path: super::options::plugin(expected.options)
             .is_some()
             .then_some(script_path),
+        reader_cache: reader_cache(expected.options.chunk_method),
     })
 }
 
@@ -838,7 +854,8 @@ video.set_output()
             for chunk in fixture.queue.as_array_mut().unwrap() {
                 chunk["input"]["VapourSynth"]["script_text"] = json!(fixture.script);
             }
-            fixture.validate().unwrap();
+            let receipts = fixture.validate().unwrap();
+            assert_eq!(receipts.reader_cache, reader_cache(method));
             fixture.options.chunk_method = Av1anChunkMethod::Lsmash;
             assert!(fixture.validate().is_err());
         }

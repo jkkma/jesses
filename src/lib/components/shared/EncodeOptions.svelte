@@ -42,10 +42,10 @@
 {#if backend === 'av1an'}
   <div class="field full-width av1an-details">
     <p>
-      av1an supports the first video track only. It detects scenes and uses chunks of at most 240
-      frames. Requires FFmpeg, FFprobe, standalone {encoderOptions(encoder).name}, av1an, and
-      VapourSynth with the L-SMASH Works source plugin. Tool availability does not confirm the
-      source plugin; the runtime checks it before encoding.
+      av1an supports the first video track only and uses your scene-splitting and chunk-size
+      settings. Requires FFmpeg, FFprobe, standalone {encoderOptions(encoder).name}, and av1an.
+      L-SMASH Works, FFMS2, and BestSource also require VapourSynth with the selected source plugin.
+      The runtime checks the selected reader before encoding.
     </p>
     <p>
       Work files and caches stay in a job workspace inside the output folder. If av1an is canceled
