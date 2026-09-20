@@ -432,9 +432,11 @@ async fn live_pause_excludes_suspended_time_from_timeout() {
         "suspended time consumed the encode timeout"
     );
     control.set_paused(false).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(4), task)
+    // Allow the remaining two-second active limit plus Windows' five-second
+    // tree teardown budget, with slack for scheduling and flushing the log.
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
         .await
-        .unwrap()
+        .expect("resumed process should time out and finish cleanup")
         .unwrap();
     assert!(matches!(result, Err(SupervisorError::Timeout)));
     assert_dead(&pids).await;
