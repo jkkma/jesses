@@ -784,23 +784,27 @@ impl JobManager {
             standalone_recovery = Some(workspace);
             video
         };
-        *temporary = Some(if let Some(final_stage) = standalone_final.take() {
-            final_stage
-        } else if let Some(recovery) = recovery.as_ref() {
-            // A forced host exit cannot run Temporary::drop. Keep av1an's final
-            // mux attempt inside the identity-guarded recovery workspace so a
-            // verified successful resume removes both current and crashed
-            // attempts with the workspace; never infer ownership from a name
-            // beside the user's destination.
-            Temporary::durable(
-                &recovery
-                    .root
-                    .join(format!("attempt-{attempt_id}.partial.mkv")),
-                false,
-            )?
-        } else {
-            Temporary::create(&output, &attempt_id)?
-        });
+        // A resumed final stage is a committed recovery checkpoint, not an
+        // attempt owned by execute's unconditional cleanup. Keep its durable
+        // owner local so another cancellation releases the handle while
+        // preserving the checkpoint for the next explicit resume.
+        if standalone_final.is_none() {
+            *temporary = Some(if let Some(recovery) = recovery.as_ref() {
+                // A forced host exit cannot run Temporary::drop. Keep av1an's final
+                // mux attempt inside the identity-guarded recovery workspace so a
+                // verified successful resume removes both current and crashed
+                // attempts with the workspace; never infer ownership from a name
+                // beside the user's destination.
+                Temporary::durable(
+                    &recovery
+                        .root
+                        .join(format!("attempt-{attempt_id}.partial.mkv")),
+                    false,
+                )?
+            } else {
+                Temporary::create(&output, &attempt_id)?
+            });
+        }
         if durable.is_none() {
             scratch.push(match settings.encoder {
                 VideoEncoder::SvtAv1
@@ -822,7 +826,10 @@ impl JobManager {
                 }
             });
         }
-        let temp = temporary.as_ref().expect("owned Matroska output");
+        let temp = standalone_final
+            .as_ref()
+            .or(temporary.as_ref())
+            .expect("owned Matroska output");
         let intermediate = durable
             .as_ref()
             .or_else(|| scratch.last())
@@ -1420,10 +1427,12 @@ impl JobManager {
                 denominator: plan.fps_den,
                 frames: frame_count,
             }),
+            scratch,
         )
         .await?;
         drop(standalone_stats);
         drop(standalone_timed);
+        drop(standalone_final);
         drop(durable);
         if let Some(recovery) = recovery {
             // Close and unlink the current attempt before removing its parent
@@ -1448,16 +1457,20 @@ impl JobManager {
                                 "Output succeeded; recovery files were retained: {}",
                                 error.message
                             ),
-                        )
+                        );
+                        snapshot.error = Some(error.clone());
                     })
                     .await
                 }
             }
         }
         if let Some(recovery) = standalone_recovery {
-            // Release a resumed durable final-stage handle before removing its
-            // verified workspace. Fresh attempts used a separate scratch link.
-            drop(temporary.take());
+            // A resumed durable stage must stay in the inventory until verified
+            // workspace cleanup. Fresh attempts are separate scratch links;
+            // keep them owned by execute so a locked link is reported there.
+            if let Some(attempt) = temporary.take() {
+                scratch.push(attempt);
+            }
             match recovery.cleanup() {
                 Ok(()) => {
                     self.change(id, |snapshot| snapshot.standalone_recovery = None)
@@ -1471,7 +1484,8 @@ impl JobManager {
                                 "Output succeeded; standalone recovery files were retained: {}",
                                 error.message
                             ),
-                        )
+                        );
+                        snapshot.error = Some(error.clone());
                     })
                     .await
                 }

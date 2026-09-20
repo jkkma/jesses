@@ -284,6 +284,7 @@ impl JobManager {
         cancel: &watch::Receiver<bool>,
         log_path: &Path,
         temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         summary(request)?;
         check_cancel(cancel)?;
@@ -457,8 +458,9 @@ impl JobManager {
             )
             .await?;
         }
-        let converted = super::container::prepare(temporary, &output, id, cancel, None).await?;
-        let temporary = converted.as_ref().unwrap_or(temporary);
+        let converted =
+            super::container::prepare(temporary, &output, id, cancel, None, scratch).await?;
+        let temporary = converted.unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         for input in &inputs {

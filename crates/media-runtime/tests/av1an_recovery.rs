@@ -758,6 +758,11 @@ async fn windows_locked_attempt_retains_recovery_workspace_after_publication() {
         workspace.to_string_lossy(),
         "the recovery receipt was cleared after exact attempt cleanup failed"
     );
+    assert_eq!(
+        settled.error.as_ref().map(|error| error.code.as_str()),
+        Some("OUTPUT_CLEANUP_FAILED"),
+        "retained recovery files must have a visible cleanup diagnostic"
+    );
     assert!(workspace.is_dir());
     assert!(attempt.is_file());
     assert!(settled.logs.iter().any(|line| {

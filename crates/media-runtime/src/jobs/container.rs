@@ -376,13 +376,14 @@ fn normalize(
     Ok(converted)
 }
 
-pub(super) async fn prepare(
+pub(super) async fn prepare<'a>(
     input: &Temporary,
     output: &Path,
     id: &str,
     cancel: &watch::Receiver<bool>,
     cadence: Option<Cadence>,
-) -> Result<Option<Temporary>, AppError> {
+    scratch: &'a mut Vec<Temporary>,
+) -> Result<Option<&'a Temporary>, AppError> {
     let container = format(output)?;
     if container == ContainerFormat::Matroska {
         return Ok(None);
@@ -397,8 +398,15 @@ pub(super) async fn prepare(
         &document.streams.iter().collect::<Vec<_>>(),
         None,
     )?;
-    let artifact =
-        Temporary::create_extension(output, &format!("{id}-container"), container.extension())?;
+    // Keep ownership in the job even when conversion or validation returns an
+    // error. A deny-delete reader must produce a visible cleanup diagnostic,
+    // rather than leave a partial file behind through best-effort Drop.
+    scratch.push(Temporary::create_extension(
+        output,
+        &format!("{id}-container"),
+        container.extension(),
+    )?);
+    let artifact = scratch.last().expect("owned final container");
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: ffmpeg.clone(),

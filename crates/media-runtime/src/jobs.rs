@@ -1124,8 +1124,15 @@ impl JobManager {
         let mut temporary = None;
         let mut scratch = Vec::new();
         let result = if let Some(mapping) = snapshot.mux_request {
-            self.mux(&id, &mapping, &cancel, &log_path, &mut temporary)
-                .await
+            self.mux(
+                &id,
+                &mapping,
+                &cancel,
+                &log_path,
+                &mut temporary,
+                &mut scratch,
+            )
+            .await
         } else if let Some(settings) = snapshot.encode_settings {
             self.encode(
                 &id,
@@ -1138,8 +1145,15 @@ impl JobManager {
             )
             .await
         } else {
-            self.remux(&id, &request, &cancel, &log_path, &mut temporary)
-                .await
+            self.remux(
+                &id,
+                &request,
+                &cancel,
+                &log_path,
+                &mut temporary,
+                &mut scratch,
+            )
+            .await
         };
         let cleanup_errors: Vec<_> = temporary
             .iter_mut()
@@ -1206,6 +1220,7 @@ impl JobManager {
         cancel: &watch::Receiver<bool>,
         log_path: &Path,
         temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         check_cancel(cancel)?;
         self.phase(
@@ -1312,10 +1327,11 @@ impl JobManager {
         metadata::verify(&document, &selected, &artifact)?;
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, temp, &output, None)
+        self.finalize(id, cancel, &source, temp, &output, None, scratch)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
         id: &str,
@@ -1324,12 +1340,13 @@ impl JobManager {
         temporary: &Temporary,
         output: &Path,
         cadence: Option<container::Cadence>,
+        scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
         // accepted before this point cannot publish an output; after publication
         // the job is succeeded and cancellation is a no-op.
-        let converted = container::prepare(temporary, output, id, cancel, cadence).await?;
-        let temporary = converted.as_ref().unwrap_or(temporary);
+        let converted = container::prepare(temporary, output, id, cancel, cadence, scratch).await?;
+        let temporary = converted.unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         source.verify()?;
@@ -1874,7 +1891,15 @@ mod tests {
         let (_sender, receiver) = watch::channel(true);
         assert_eq!(
             manager
-                .finalize("id", &receiver, &source, &temporary, &output, None)
+                .finalize(
+                    "id",
+                    &receiver,
+                    &source,
+                    &temporary,
+                    &output,
+                    None,
+                    &mut Vec::new()
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1884,7 +1909,15 @@ mod tests {
         let mp4 = dir.join("output.mp4");
         assert_eq!(
             manager
-                .finalize("id", &receiver, &source, &temporary, &mp4, None)
+                .finalize(
+                    "id",
+                    &receiver,
+                    &source,
+                    &temporary,
+                    &mp4,
+                    None,
+                    &mut Vec::new()
+                )
                 .await
                 .unwrap_err()
                 .code,
