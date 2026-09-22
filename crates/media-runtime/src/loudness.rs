@@ -96,6 +96,8 @@ pub async fn measure_loudness(
         AudioChannels::Preserve => String::new(),
         AudioChannels::Mono => "aformat=channel_layouts=mono,".into(),
         AudioChannels::Stereo => "aformat=channel_layouts=stereo,".into(),
+        AudioChannels::Surround51 => "aformat=channel_layouts=5.1,".into(),
+        AudioChannels::Surround71 => "aformat=channel_layouts=7.1,".into(),
     };
     // Only the measured input values are used. The filter's processed samples
     // go to the null muxer, never to a media output or the source directory.

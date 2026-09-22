@@ -23,6 +23,12 @@ pub struct EncodeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub av1an_options: Option<crate::Av1anOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub av1an_grain: Option<crate::Av1anGrainSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, as = "Option<_>")]
+    pub av1an_filters: Vec<String>,
     /// Omission preserves constant-quality encoding and old saved jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -85,6 +91,8 @@ impl Default for EncodeSettings {
             temporal: None,
             parameters: Vec::new(),
             av1an_options: None,
+            av1an_grain: None,
+            av1an_filters: Vec::new(),
             rate_control: None,
             tone_map: None,
             trim: None,
@@ -168,6 +176,8 @@ pub enum AudioChannels {
     Preserve,
     Mono,
     Stereo,
+    Surround51,
+    Surround71,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

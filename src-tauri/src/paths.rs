@@ -390,6 +390,8 @@ fn check_writable(directory: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    static FIXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     struct Fixture(PathBuf);
 
     impl Fixture {
@@ -398,8 +400,11 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root =
-                std::env::temp_dir().join(format!("jesses-paths-{}-{nonce}", std::process::id()));
+            let sequence = FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "jesses-paths-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
             fs::create_dir(&root).unwrap();
             fs::create_dir(root.join("application")).unwrap();
             Self(root)

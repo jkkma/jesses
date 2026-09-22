@@ -11,6 +11,7 @@
     error?: string | null;
     onchange: (next: ToneMapDraft) => void;
   } = $props();
+  const id = $props.id();
 </script>
 
 <fieldset {disabled} class="tone-map-options">
@@ -22,6 +23,15 @@
     /> HDR / HLG to SDR</label
   >
   {#if draft.enabled}
+    <label for={`${id}-curve`}>Tone mapping curve</label><select
+      id={`${id}-curve`}
+      value={draft.algorithm}
+      onchange={(event) =>
+        onchange({ ...draft, algorithm: event.currentTarget.value as ToneMapDraft['algorithm'] })}
+    >
+      <option value="hable">Hable</option>
+      <option value="mobius">Mobius</option>
+    </select>
     <label
       >Signal peak (nits)<input
         type="number"
@@ -38,9 +48,9 @@
       /></label
     >
     <p>
-      Hable tone mapping to 100-nit BT.709, limited-range 10-bit SDR. The signal peak controls
-      highlight compression; 1000 nits is a starting value. HLG uses the 1000-nit reference display
-      transfer.
+      {draft.algorithm === 'mobius' ? 'Mobius' : 'Hable'} tone mapping to 100-nit BT.709, limited-range
+      10-bit SDR. The signal peak controls highlight compression; 1000 nits is a starting value. HLG uses
+      the 1000-nit reference display transfer.
     </p>
     <label class="tone-toggle"
       ><input
@@ -77,7 +87,8 @@
     align-items: center;
     gap: 8px;
   }
-  input[type='number'] {
+  input[type='number'],
+  select {
     max-width: 180px;
     border: 1px solid var(--border);
     background: var(--background);

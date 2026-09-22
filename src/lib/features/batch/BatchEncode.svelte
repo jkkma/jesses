@@ -4,11 +4,21 @@
   import { parameterError, parameterSummary } from '$lib/components/shared/encoder-parameters';
   import type { EncoderParameter } from '$lib/ipc/generated';
   import Av1anOptionsControl from '$lib/components/shared/Av1anOptions.svelte';
+  import Av1anResources from '$lib/components/shared/Av1anResources.svelte';
+  import Av1anGrain from '$lib/components/shared/Av1anGrain.svelte';
+  import Av1anFilters from '$lib/components/shared/Av1anFilters.svelte';
+  import {
+    defaultAv1anAudio,
+    readAv1anPreferences,
+    saveAv1anAudioPreference,
+    saveAv1anPreferences,
+  } from '$lib/components/shared/av1an-preferences';
   import {
     defaultAv1an,
     copyAv1an,
     selectedAv1an,
     av1anError,
+    av1anGrainConflict,
     type Av1anDraft,
   } from '$lib/components/shared/av1an-options';
   import TemporalOptions from '$lib/components/shared/TemporalOptions.svelte';
@@ -65,6 +75,7 @@
   import SourcePreview from '$lib/components/shared/SourcePreview.svelte';
   import {
     defaultFramingDraft,
+    framingDimensions,
     validFramingDraft,
     framingSummary,
     selectedFraming,
@@ -82,6 +93,7 @@
     requiredEncoderTools,
     knownHdr,
     encoderChoices,
+    isAv1anEncoder,
     isSvtEncoder,
     validForkSettings,
     type HdrTune,
@@ -89,6 +101,7 @@
   import type {
     BatchEncodePreview,
     BatchEncodeRequest,
+    Av1anGrainSettings,
     EncodeRequest,
     EncodeBackend,
     MediaFile,
@@ -131,6 +144,8 @@
   let parameters = $state<EncoderParameter[]>([]);
   let rate = $state(defaultRate());
   let av1an = $state(defaultAv1an());
+  let av1anGrain = $state<Av1anGrainSettings | undefined>();
+  let av1anFilters = $state<string[]>([]);
   let crf = $state<number | undefined>(30);
   let preset = $state(2);
   let backend = $state<EncodeBackend>('standalone');
@@ -170,6 +185,8 @@
     parameters: EncoderParameter[];
     rate: RateDraft;
     av1an: Av1anDraft;
+    av1anGrain: Av1anGrainSettings | undefined;
+    av1anFilters: string[];
     crf: number | undefined;
     preset: number;
     workers: number | undefined;
@@ -181,6 +198,8 @@
   };
   const savedSettings = new Map<string, CommonSettings>();
   const savedDrafts = new Map<string, Record<string, Draft>>();
+  const hasAv1anDraftForFile = (id: string) =>
+    [...savedDrafts].some(([workflow, saved]) => workflow.startsWith('av1an:') && !!saved[id]);
   let activeWorkflow: string | null = null;
 
   $effect(() => {
@@ -194,6 +213,8 @@
           parameters: parameters.map((value) => ({ ...value })),
           rate: { ...rate },
           av1an: copyAv1an(av1an),
+          av1anGrain: av1anGrain ? { ...av1anGrain } : undefined,
+          av1anFilters: [...av1anFilters],
           crf,
           preset,
           workers,
@@ -209,6 +230,8 @@
         parameters = priorSettings.parameters.map((value) => ({ ...value }));
         rate = { ...priorSettings.rate };
         av1an = copyAv1an(priorSettings.av1an);
+        av1anGrain = priorSettings.av1anGrain ? { ...priorSettings.av1anGrain } : undefined;
+        av1anFilters = [...priorSettings.av1anFilters];
         ({
           crf,
           preset,
@@ -219,7 +242,11 @@
           texturePsyBias,
           hdrTune,
         } = priorSettings);
-      } else resetSettings();
+      } else {
+        const previousAv1anDraft =
+          backend === 'av1an' && [...savedSettings.keys()].some((key) => key.startsWith('av1an:'));
+        resetSettings(!previousAv1anDraft, backend === 'av1an');
+      }
       activeWorkflow = currentWorkflow;
       return savedDrafts.get(currentWorkflow) ?? {};
     });
@@ -245,7 +272,10 @@
             copies: file.streams
               .filter((stream) => !['video', 'data'].includes(stream.kind))
               .map((stream) => stream.index),
-            audio: defaultAudio(file.streams),
+            audio:
+              backend === 'av1an' && !hasAv1anDraftForFile(file.id)
+                ? defaultAv1anAudio(file.streams)
+                : defaultAudio(file.streams),
             subtitles: defaultSubtitles(file.streams),
             framing: defaultFramingDraft(),
             trim: defaultTrim(),
@@ -259,6 +289,28 @@
   });
 
   const selectedFiles = $derived(files.filter((file) => drafts[file.id]?.selected));
+  const resourceSource = $derived.by(() => {
+    const videos = selectedFiles
+      .map((file) => file.streams.find((stream) => stream.index === drafts[file.id].video))
+      .filter((stream) => stream?.width && stream.height);
+    return videos.sort(
+      (left, right) =>
+        (right!.width ?? 0) * (right!.height ?? 0) - (left!.width ?? 0) * (left!.height ?? 0),
+    )[0];
+  });
+  const resourceOutput = $derived.by(() => {
+    const sizes = selectedFiles.map((file) => {
+      const draft = drafts[file.id];
+      return framingDimensions(
+        draft.framing,
+        file.streams.find((stream) => stream.index === draft.video),
+      );
+    });
+    return sizes.sort(
+      (left, right) =>
+        (right.width ?? 0) * (right.height ?? 0) - (left.width ?? 0) * (left.height ?? 0),
+    )[0];
+  });
   $effect(() => {
     const retained = new Set(selectedFiles.map((file) => file.id));
     untrack(() => {
@@ -269,23 +321,40 @@
   });
 
   const toolsReady = $derived(
-    requiredEncoderTools(backend, encoder).every((id) =>
+    requiredEncoderTools(backend, encoder, av1an.concatMethod).every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
+  const grainConflict = $derived(
+    backend === 'av1an' && isSvtEncoder(encoder)
+      ? av1anGrainConflict(parameters, filmGrain, av1anGrain)
+      : null,
+  );
   const validSettings = $derived(
-    (backend !== 'av1an' || isSvtEncoder(encoder)) &&
+    (backend !== 'av1an' || isAv1anEncoder(encoder)) &&
       validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
       validRate(rate) &&
       !rateIssue &&
       (backend !== 'av1an' ||
         !av1anError(
           av1an,
-          selectedFiles.some((file) =>
-            knownHdr(file.streams.find((stream) => stream.index === drafts[file.id].video)),
+          selectedFiles.some(
+            (file) =>
+              knownHdr(file.streams.find((stream) => stream.index === drafts[file.id].video)) &&
+              !drafts[file.id].toneMap.enabled,
           ),
+          encoder,
+          outputContainer === 'matroska',
         )) &&
+      (backend !== 'av1an' ||
+        !av1anGrain ||
+        ((av1anGrain.table === null || av1anGrain.table.length > 0) &&
+          (av1anGrain.table === null || filmGrain === 0) &&
+          Number.isInteger(av1anGrain.denoiseStrength) &&
+          av1anGrain.denoiseStrength >= 1 &&
+          av1anGrain.denoiseStrength <= 16)) &&
+      (backend !== 'av1an' || av1anFilters.length <= 16) &&
       ((backend === 'av1an' && av1an.targetEnabled) ||
         rate.mode !== 'quality' ||
         (typeof crf === 'number' &&
@@ -305,7 +374,7 @@
         (typeof workers === 'number' &&
           Number.isInteger(workers) &&
           workers >= 1 &&
-          workers <= 32)),
+          workers <= 64)),
   );
   const draftKey = $derived(
     JSON.stringify({
@@ -314,6 +383,8 @@
       parameters,
       rate,
       av1an,
+      av1anGrain,
+      av1anFilters,
       crf,
       preset,
       backend,
@@ -359,6 +430,7 @@
     desktop &&
       toolsReady &&
       validSettings &&
+      !grainConflict &&
       !parameterError(parameters, null, encoder) &&
       validFraming &&
       !subtitleIssue &&
@@ -410,19 +482,25 @@
     error = null;
   });
 
-  function resetSettings() {
+  function resetSettings(usePreferences = true, useInfrastructurePreferences = usePreferences) {
     parameters = [];
     rate = defaultRate();
-    av1an = defaultAv1an();
+    av1an = defaultAv1an(useInfrastructurePreferences && backend === 'av1an');
+    av1anGrain = undefined;
+    av1anFilters = usePreferences && backend === 'av1an' ? readAv1anPreferences().filters : [];
     crf = options.defaultCrf;
     preset = options.defaultPreset;
-    workers = 2;
+    workers =
+      useInfrastructurePreferences && backend === 'av1an' ? readAv1anPreferences().workers : 2;
     filmGrain = 0;
     hdr10Fallback = false;
     lineartPsyBias = options.defaultLineartPsyBias;
     texturePsyBias = options.defaultTexturePsyBias;
     hdrTune = options.defaultHdrTune;
   }
+  $effect(() => {
+    if (backend === 'av1an') saveAv1anPreferences(av1an, workers, av1anFilters);
+  });
 
   function updateDraft(id: string, patch: Partial<Draft>) {
     const draft = drafts[id];
@@ -492,7 +570,11 @@
       outputContainer,
       outputNameTemplate: outputNameTemplate.trim(),
       namingDate,
-      ...(backend === 'av1an' ? { av1anOptions: selectedAv1an(av1an) } : {}),
+      ...(backend === 'av1an' ? { av1anOptions: selectedAv1an(av1an, encoder) } : {}),
+      ...(backend === 'av1an' && isSvtEncoder(encoder) && av1anGrain
+        ? { av1anGrain: { ...av1anGrain } }
+        : {}),
+      ...(backend === 'av1an' && av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
       ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
         ? { rateControl: selectedRate(rate) }
         : {}),
@@ -621,9 +703,9 @@
           converted or burned into video. Sources need a validated constant frame rate, square
           pixels and 4:2:0 color. Mixed field order and cadence repair are not supported.
         </p>{:else}<p>
-          Av1an requires progressive video with a validated constant frame rate, square pixels and
-          4:2:0 color. Subtitle tracks and attachments are copied. Deinterlacing, tone mapping and
-          subtitle conversion or burn-in require standalone encoding.
+          Av1an uses the first video track and prepares selected trim, deinterlacing, and HDR-to-SDR
+          tone mapping before scene detection. Subtitle tracks and attachments are copied; subtitle
+          conversion or burn-in requires standalone encoding.
         </p>{/if}
     </div>
   </div>
@@ -792,12 +874,14 @@
                               {stream}
                               {settings}
                               disabled={submitting}
-                              onchange={(next) =>
+                              onchange={(next) => {
                                 updateDraft(file.id, {
                                   audio: draft.audio.map((track) =>
                                     track.streamIndex === next.streamIndex ? next : track,
                                   ),
-                                })}
+                                });
+                                if (backend === 'av1an') saveAv1anAudioPreference(next, stream);
+                              }}
                             />
                           {/if}
                         {/if}
@@ -824,8 +908,8 @@
                       {/each}
                     </div>
                     <p class="small-muted audio-guidance">
-                      Audio starts with Copy source. Choose a codec separately for each selected
-                      track.
+                      Audio starts with Copy source or your saved AV1AN audio defaults. Choose a
+                      codec separately for each selected track.
                     </p>
                   {/if}
                 </details>
@@ -843,8 +927,11 @@
         <span class="heading-with-icon"
           ><FolderOutput size={16} aria-hidden="true" /><span class="eyebrow">Common settings</span
           ></span
-        ><button class="text-button" type="button" disabled={submitting} onclick={resetSettings}
-          >Reset batch settings</button
+        ><button
+          class="text-button"
+          type="button"
+          disabled={submitting}
+          onclick={() => resetSettings(false)}>Reset batch settings</button
         >
       </div>
       <div class="batch-settings-content">
@@ -901,6 +988,8 @@
           </p>{:else if !toolsReady}<p class="disabled-reason">
             Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
               ? ', and av1an'
+              : ''}{backend === 'av1an' && (encoder === 'x264' || av1an.concatMethod === 'mkvmerge')
+              ? ', and mkvmerge'
               : ''}, then refresh Tools & settings.
           </p>{:else if !validRate(rate)}<p class="disabled-reason">
             Enter a valid whole-number bitrate or target size below.
@@ -909,7 +998,7 @@
             a listed preset{isSvtEncoder(encoder) ? ', grain 0–50' : ''}{encoder ===
             'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
-              : ''}{backend === 'av1an' ? ', and parallel chunks 1–32' : ''}.
+              : ''}{backend === 'av1an' ? ', and parallel chunks 1–64' : ''}.
           </p>{:else if !validFraming}<p class="disabled-reason">
             Check crop, resize and border values in each selected episode's video settings.
           </p>{:else if subtitleIssue}<p class="disabled-reason" role="alert">
@@ -939,13 +1028,13 @@
                 {/each}
               </select>
             </div>{:else}<div class="field full-width">
-              <label for="batch-svt-build">SVT-AV1 build</label>
+              <label for="batch-svt-build">Video encoder</label>
               <select
                 id="batch-svt-build"
                 bind:value={av1anEncoder}
                 disabled={submitting || !desktop}
               >
-                {#each encoderChoices.filter((choice) => isSvtEncoder(choice.value)) as choice}
+                {#each encoderChoices.filter((choice) => isAv1anEncoder(choice.value)) as choice}
                   <option value={choice.value}>{choice.label}</option>
                 {/each}
               </select>
@@ -953,12 +1042,17 @@
           {#if backend === 'av1an'}<Av1anOptionsControl
               idPrefix="batch-av1an"
               draft={av1an}
+              {encoder}
               disabled={submitting}
-              hdr={selectedFiles.some((file) =>
-                knownHdr(file.streams.find((stream) => stream.index === drafts[file.id].video)),
+              attachmentSupported={outputContainer === 'matroska'}
+              hdr={selectedFiles.some(
+                (file) =>
+                  knownHdr(file.streams.find((stream) => stream.index === drafts[file.id].video)) &&
+                  !drafts[file.id].toneMap.enabled,
               )}
               framed={selectedFiles.some(
-                (file) => !!framingSummary(selectedFraming(drafts[file.id].framing)),
+                (file) =>
+                  framingSummary(selectedFraming(drafts[file.id].framing)) !== 'Source dimensions',
               )}
               onchange={(value) => (av1an = value)}
             />{/if}
@@ -1006,7 +1100,52 @@
             bind:lineartPsyBias
             bind:texturePsyBias
             bind:hdrTune
+            grainTableSelected={backend === 'av1an' && !!av1anGrain?.table}
           />
+          {#if backend === 'av1an' && isSvtEncoder(encoder)}
+            {#key `${backend}:${encoder}`}
+              <Av1anGrain
+                value={av1anGrain}
+                disabled={submitting || !desktop}
+                onchange={(value) => {
+                  av1anGrain = value ? { ...value } : undefined;
+                  if (value?.table) filmGrain = 0;
+                }}
+              />
+            {/key}
+          {/if}
+          {#if backend === 'av1an'}
+            {#key `${backend}:${encoder}`}
+              <Av1anFilters
+                value={av1anFilters}
+                disabled={submitting || !desktop}
+                onchange={(value) => (av1anFilters = [...value])}
+              />
+            {/key}
+          {/if}
+          {#if backend === 'av1an'}<Av1anResources
+              {encoder}
+              {workers}
+              sourceWidth={resourceSource?.width}
+              sourceHeight={resourceSource?.height}
+              outputWidth={resourceOutput?.width}
+              outputHeight={resourceOutput?.height}
+              filtered={av1anFilters.length > 0 ||
+                selectedFiles.some(
+                  (file) =>
+                    framingSummary(selectedFraming(drafts[file.id].framing)) !==
+                      'Source dimensions' ||
+                    !!selectedTemporal(drafts[file.id].temporal) ||
+                    drafts[file.id].toneMap.enabled ||
+                    drafts[file.id].trim.enabled,
+                )}
+              floatFilter={selectedFiles.some((file) => drafts[file.id].toneMap.enabled)}
+              disabled={submitting || !desktop}
+              onapply={(nextWorkers, threads, slices) => {
+                workers = nextWorkers;
+                av1an = { ...av1an, encoderThreads: threads, sceneDetectionSlices: slices };
+              }}
+            />{/if}
         </div>
         <AdvancedEncoderOptions
           {encoder}
@@ -1015,6 +1154,7 @@
           disabled={submitting || !desktop}
           onchange={(value) => (parameters = value)}
         />
+        {#if grainConflict}<p class="disabled-reason" role="alert">{grainConflict}</p>{/if}
       </div>
     </aside>
   </div>

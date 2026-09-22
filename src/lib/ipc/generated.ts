@@ -254,7 +254,7 @@ export type TemporalSettings = { deinterlace?: DeinterlaceSettings,
  */
 qtgmc?: QtgmcSettings, frameRate?: FrameRate, cadenceRepair?: CadenceRepairSettings, aspectRatio?: AspectRatioSettings, resizeFilter: ResizeFilter, };
 
-export type Av1anChunkMethod = "lsmash" | "ffms2" | "bestsource" | "select" | "hybrid";
+export type Av1anChunkMethod = "lsmash" | "ffms2" | "bestsource" | "select" | "hybrid" | "segment";
 
 export type Av1anSplitMethod = "sceneDetection" | "fixedChunks";
 
@@ -262,15 +262,31 @@ export type Av1anSceneDetection = "standard" | "fast";
 
 export type Av1anChunkOrder = "longToShort" | "shortToLong" | "sequential" | "random";
 
-export type Av1anTargetMetric = "vmaf" | "ssimulacra2" | "butteraugli" | "xpsnr";
+export type Av1anConcatMethod = "ffmpeg" | "mkvmerge";
+
+export type Av1anPixelFormat = "yuv420p" | "yuv420p10le" | "yuv422p" | "yuv422p10le" | "yuv444p" | "yuv444p10le";
+
+export type Av1anResourceRequest = { encoder: VideoEncoder, sourceWidth: number, sourceHeight: number, outputWidth: number, outputHeight: number, workers: number, filtered: boolean, floatFilter: boolean, };
+
+export type Av1anResourceEstimate = { logicalProcessors: number, totalMemoryMib: number | null, availableMemoryMib: number | null, perWorkerMib: number, estimatedMemoryMib: number, suggestedWorkers: number, suggestedThreads: number, suggestedSceneSlices: number, warning: string | null, };
+
+export type Av1anTargetMetric = "vmaf" | "ssimulacra2" | "butteraugli" | "xpsnr" | "xpsnrWeighted";
 
 export type Av1anTargetQuality = { metric: Av1anTargetMetric, minimumScoreTenths: number, maximumScoreTenths: number, minimumCrf: number, maximumCrf: number, probes: number, probingRate: number, probeWidth: number, probeHeight: number, };
 
-export type Av1anOptions = { chunkMethod: Av1anChunkMethod, splitMethod: Av1anSplitMethod, sceneDetection: Av1anSceneDetection, maximumChunkFrames: number, minimumSceneFrames: number, sceneDownscaleHeight: number | null, chunkOrder: Av1anChunkOrder, targetQuality?: Av1anTargetQuality, };
+export type Av1anOptions = { chunkMethod: Av1anChunkMethod, splitMethod: Av1anSplitMethod, sceneDetection: Av1anSceneDetection, maximumChunkFrames: number, minimumSceneFrames: number, sceneDownscaleHeight: number | null, chunkOrder: Av1anChunkOrder, encoderThreads?: number, pixelFormat?: Av1anPixelFormat, maxTries?: number, sceneDetectionSlices?: number, concatMethod?: Av1anConcatMethod, attachSettings?: boolean, targetQuality?: Av1anTargetQuality, };
 
-export type ToneMapSettings = {
+export type Av1anGrainSettings = {
 /**
- * Signal peak used by Hable, relative to the fixed 100-nit SDR target.
+ * Validated table bytes are part of the immutable request, never a mutable path.
+ */
+table: string | null, denoise: boolean, denoiseStrength: number, };
+
+export type ToneMapAlgorithm = "hable" | "mobius";
+
+export type ToneMapSettings = { algorithm?: ToneMapAlgorithm,
+/**
+ * Signal peak relative to the fixed 100-nit SDR target.
  */
 sourcePeakNits: number,
 /**
@@ -304,7 +320,7 @@ streamIndex: number, mode: SubtitleMode, };
 
 export type AudioCodec = "copy" | "opus" | "aac" | "flac" | "mp3" | "vorbis" | "eac3";
 
-export type AudioChannels = "preserve" | "mono" | "stereo";
+export type AudioChannels = "preserve" | "mono" | "stereo" | "surround51" | "surround71";
 
 export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain, };
 
@@ -347,7 +363,11 @@ export type EncoderParameter = { name: string, value: string, };
 
 export type EncoderParameterQuery = { encoder: VideoEncoder, backend: EncodeBackend, };
 
-export type EncoderParameterSpec = { name: string, label: string, argument: string, minimum: number, maximum: number, };
+export type EncoderParameterSpec = { name: string, label: string, argument: string, minimum: number, maximum: number,
+/**
+ * Whole, decimal, pairWhole, pairDecimal, choice, or choiceList.
+ */
+valueKind: string, minimumValue: string, maximumValue: string, choices: Array<string>, group: string, description: string, example: string, };
 
 export type EncoderParameterCatalog = { encoder: VideoEncoder, backend: EncodeBackend, route: string, toolPath: string, toolVersion: string, parameters: Array<EncoderParameterSpec>, notes: Array<string>, };
 
@@ -355,7 +375,7 @@ export type EncodeCommandStage = { label: string, executable: string, arguments:
 
 export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
 
-export type EncodeSettings = { parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions,
+export type EncodeSettings = { parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
 /**
  * Omission preserves constant-quality encoding and old saved jobs.
  */
@@ -420,7 +440,7 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
+export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
 /**
  * Local calendar date captured once when the batch preview is requested.
  * It is required only when the filename template contains `{date}`.

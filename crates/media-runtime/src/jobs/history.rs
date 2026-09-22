@@ -12,7 +12,9 @@ use std::{
 use media_core::{AppError, JobSnapshot};
 use serde::{Deserialize, Serialize};
 
-const MAX_BYTES: u64 = 4 * 1024 * 1024;
+// A full queue can retain 100 immutable grain tables of up to 256 KiB each.
+// Allow their JSON escaping and bounded diagnostics without losing history.
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOBS: usize = 100;
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(1);
 
@@ -192,6 +194,63 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_grain_queue_survives_history_restart() {
+        use media_core::{
+            Av1anGrainSettings, EncodeBackend, EncodeSettings, JobState, RemuxRequest,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "jesses-history-grain-{}-{}",
+            std::process::id(),
+            NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut table = String::from("filmgrn1\n");
+        for frame in 0..12_000 {
+            table.push_str(&format!("E {} {} 1 2 1\n", frame * 10, (frame + 1) * 10));
+        }
+        assert!(table.len() > 200_000 && table.len() <= 262_144);
+        crate::utilities::validate_grain_table(table.as_bytes()).unwrap();
+        let settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            av1an_grain: Some(Av1anGrainSettings {
+                table: Some(table),
+                denoise: false,
+                denoise_strength: 4,
+            }),
+            ..Default::default()
+        };
+        let jobs = (0..100)
+            .map(|index| JobSnapshot {
+                id: format!("grain-{index}"),
+                state: JobState::Queued,
+                request: RemuxRequest {
+                    input_path: format!("source-{index}.mkv"),
+                    output_path: format!("output-{index}.mkv"),
+                    stream_indices: vec![0],
+                },
+                mux_request: None,
+                encode_settings: Some(settings.clone()),
+                recovery: None,
+                standalone_recovery: None,
+                progress_seconds: None,
+                duration_seconds: None,
+                logs: vec![],
+                error: None,
+                log_path: None,
+            })
+            .collect::<Vec<_>>();
+        let (history, _) = History::open(path.clone()).await.unwrap();
+        history.save(jobs.clone()).await.unwrap();
+        assert!(fs::metadata(path.join("jobs.json")).unwrap().len() > 4 * 1024 * 1024);
+        drop(history);
+        let (reopened, restored) = History::open(path.clone()).await.unwrap();
+        assert_eq!(restored, jobs);
+        drop(reopened);
+        fs::remove_file(path.join("jobs.json")).unwrap();
+        fs::remove_file(path.join("jobs.lock")).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
 
     #[tokio::test]
     async fn malformed_and_future_history_is_preserved() {

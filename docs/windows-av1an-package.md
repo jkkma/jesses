@@ -21,7 +21,7 @@ shared dav1d, libvpx, zlib and compiler-runtime sources are referenced from the
 verified FFmpeg delivery rather than duplicated in every tool directory.
 
 The retained compatibility patch resets timestamps and uses FFmpeg's passthrough
-mode for select-generated chunks. The upstream sampled quality probe already
+mode for select-generated chunks and keyframe Segment splitting. The upstream sampled quality probe already
 uses passthrough mode. The patch also corrects Julek's case-sensitive Butteraugli
 function name. L-SMASH metric probes explicitly use software decoding, avoiding
 hardware decoder failures on short AV1 probes. VMAF and every-frame XPSNR

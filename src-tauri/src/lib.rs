@@ -17,6 +17,30 @@ mod completion;
 mod paths;
 
 #[tauri::command]
+fn estimate_av1an_resources(
+    request: media_core::Av1anResourceRequest,
+) -> media_core::Av1anResourceEstimate {
+    media_runtime::estimate_av1an_resources(request)
+}
+
+#[tauri::command]
+async fn read_av1an_grain_table(path: String) -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(move || media_runtime::read_av1an_grain_table(path))
+        .await
+        .map_err(|e| AppError::new("GRAIN_TABLE_UNREADABLE", e.to_string(), None))?
+}
+
+#[tauri::command]
+async fn make_av1an_grain_preset(
+    id: String,
+    request: String,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<String, AppError> {
+    let running = tasks.run(&id)?;
+    media_runtime::make_av1an_grain_preset(request, running.cancel.clone()).await
+}
+
+#[tauri::command]
 async fn run_utility(
     id: String,
     request: media_core::UtilityRequest,
@@ -376,6 +400,14 @@ async fn resume_job(
 }
 
 #[tauri::command]
+async fn discard_av1an_recovery(
+    id: String,
+    jobs: State<'_, Jobs>,
+) -> Result<JobSnapshot, AppError> {
+    jobs.manager.discard_av1an_recovery(id).await
+}
+
+#[tauri::command]
 async fn list_jobs(jobs: State<'_, Jobs>) -> Result<Vec<JobSnapshot>, AppError> {
     jobs.manager.ready().await?;
     Ok(jobs.manager.list_jobs().await)
@@ -481,6 +513,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            estimate_av1an_resources,
+            read_av1an_grain_table,
+            make_av1an_grain_preset,
             run_utility,
             inspect_utility_capabilities,
             inspect_saved_job,
@@ -522,6 +557,7 @@ pub fn run() {
             cancel_job,
             stop_job,
             resume_job,
+            discard_av1an_recovery,
             list_jobs,
             subscribe_jobs
         ])

@@ -303,9 +303,10 @@ fn verify_inner(
                 super::audio::expected_channels(expected, track)
             }) != actual.channels
             || converted_audio.is_some_and(|track| {
-                track.channels == media_core::AudioChannels::Preserve
-                    && expected.channels.is_some_and(|channels| channels > 2)
-                    && expected.channel_layout != actual.channel_layout
+                super::audio::expected_channels(expected, track)
+                    .is_some_and(|channels| channels > 2)
+                    && super::audio::expected_layout(expected, track)
+                        != actual.channel_layout.as_deref()
             })
             || converted_audio.is_some_and(|track| {
                 track.codec == media_core::AudioCodec::Flac

@@ -4,6 +4,8 @@
 //! automatic recovery, and broader codec workflows remain future adapters.
 
 mod analysis;
+mod av1an_resources;
+pub use av1an_resources::estimate_av1an_resources;
 mod batch;
 mod bitrate;
 mod bundled_tools;
@@ -18,6 +20,7 @@ mod probe;
 mod process;
 mod utilities;
 pub use utilities::{inspect_utility_capabilities, run_utility};
+pub use utilities::{make_av1an_grain_preset, read_av1an_grain_table};
 mod saved_jobs;
 pub use saved_jobs::{export_saved_job, inspect_saved_job};
 pub mod supervisor;

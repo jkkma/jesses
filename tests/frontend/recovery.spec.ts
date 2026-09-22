@@ -94,7 +94,7 @@ async function desktopMock(
   page: Page,
   options: {
     jobs?: JobSnapshot[];
-    fail?: 'stop_job' | 'resume_job';
+    fail?: 'stop_job' | 'resume_job' | 'discard_av1an_recovery';
     late?: 'stop_job' | 'resume_job';
     held?: string[];
     replyOnly?: boolean;
@@ -192,6 +192,22 @@ async function desktopMock(
               await new Promise<void>((resolve) =>
                 waiting.set(command, [...(waiting.get(command) ?? []), resolve]),
               );
+            return reply;
+          }
+          if (command === 'discard_av1an_recovery') {
+            if (fail === command) {
+              fail = undefined;
+              throw {
+                code: 'JOB_DISCARD_UNAVAILABLE',
+                message:
+                  'Saved AV1AN work could not be removed. Check the saved files and try again.',
+                path: null,
+              };
+            }
+            const current = jobs.find((job) => job.id === payload.id)!;
+            const reply: JobSnapshot = { ...current, recovery: null };
+            if (!options.replyOnly)
+              publish(jobs.map((job) => (job.id === current.id ? reply : job)));
             return reply;
           }
           if (command === 'cancel_job') {
@@ -388,8 +404,58 @@ test('recovery controls stay hidden for unsupported and unrecoverable snapshots'
   await expect(
     page.getByRole('button', { name: 'Stop and keep progress', exact: true }),
   ).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: 'Discard saved progress', exact: true }),
+  ).toHaveCount(0);
   await expect(historyJob(page, 'empty-stop')).toContainText('Stopped before progress was saved');
   await expect(historyJob(page, 'legacy')).toContainText('This job will not resume');
+});
+
+test('discarding terminal AV1AN recovery requires confirmation and applies the returned snapshot', async ({
+  page,
+}) => {
+  const original = savedJob('stopped');
+  await desktopMock(page, { jobs: [original, savedJob('canceled', 'canceled')], replyOnly: true });
+  await openJobs(page);
+  const current = currentJob(page);
+  await expect(
+    historyJob(page, 'canceled').getByRole('button', { name: 'Discard saved progress' }),
+  ).toHaveCount(0);
+  await current.getByRole('button', { name: 'Discard saved progress', exact: true }).click();
+  await expect(current).toContainText('The source file is untouched');
+  await expect(current.getByRole('button', { name: 'Resume', exact: true })).toBeEnabled();
+  expect(await calls(page, 'discard_av1an_recovery')).toHaveLength(0);
+  await current.getByRole('button', { name: 'Keep progress', exact: true }).click();
+  await expect(current.getByRole('button', { name: 'Confirm discard', exact: true })).toHaveCount(
+    0,
+  );
+  await current.getByRole('button', { name: 'Discard saved progress', exact: true }).click();
+  await current.getByRole('button', { name: 'Confirm discard', exact: true }).click();
+  expect(await calls(page, 'discard_av1an_recovery')).toEqual([
+    { command: 'discard_av1an_recovery', payload: { id: original.id } },
+  ]);
+  await expect(current.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+  await expect(
+    current.getByRole('button', { name: 'Discard saved progress', exact: true }),
+  ).toHaveCount(0);
+  await expect(current).toContainText('Stopped before progress was saved');
+  await expect(current).toContainText(original.request.outputPath);
+});
+
+test('discard errors preserve AV1AN recovery and allow retry from history', async ({ page }) => {
+  const active = savedJob('running', 'other-active');
+  const original = savedJob('failed', 'saved-failure');
+  await desktopMock(page, { jobs: [active, original], fail: 'discard_av1an_recovery' });
+  await openJobs(page);
+  const history = historyJob(page, original.id);
+  await history.getByRole('button', { name: 'Discard saved progress', exact: true }).click();
+  await history.getByRole('button', { name: 'Confirm discard', exact: true }).click();
+  await expect(history.getByRole('alert')).toContainText('Saved AV1AN work could not be removed');
+  await expect(history.getByRole('button', { name: 'Resume', exact: true })).toBeEnabled();
+  await expect(history.getByRole('button', { name: 'Confirm discard', exact: true })).toBeEnabled();
+  await history.getByRole('button', { name: 'Confirm discard', exact: true }).click();
+  await expect(history.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
+  expect(await calls(page, 'discard_av1an_recovery')).toHaveLength(2);
 });
 
 test('interrupted, failed, canceled and stopped history jobs resume only from saved IDs', async ({
@@ -427,7 +493,7 @@ test('resume uses immutable saved settings despite a different editor draft and 
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const editor = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await editor.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+  await editor.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
   await editor.getByLabel('Quality', { exact: true }).fill('45');
   await editor.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\different.mkv');
   await expect(currentJob(page)).toContainText(

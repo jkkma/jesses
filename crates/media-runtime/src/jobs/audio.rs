@@ -157,6 +157,11 @@ pub(super) fn validate_selection(
             ));
         }
         let output_channels = expected_channels(source, track).expect("known source channel count");
+        if track.codec == AudioCodec::Eac3 && output_channels > 6 {
+            return Err(invalid(
+                "E-AC-3 conversion supports up to 5.1 channels. Choose 5.1 or another codec.",
+            ));
+        }
         let maximum_bitrate = match track.codec {
             AudioCodec::Aac => (rate * output_channels * 6 / 1000).min(512),
             AudioCodec::Opus => (output_channels * 256).min(512),
@@ -279,6 +284,22 @@ pub(super) fn expected_channels(
         AudioChannels::Preserve => source.channels,
         AudioChannels::Mono => Some(1),
         AudioChannels::Stereo => Some(2),
+        AudioChannels::Surround51 => Some(6),
+        AudioChannels::Surround71 => Some(8),
+    }
+}
+
+pub(super) fn expected_layout<'a>(
+    source: &'a metadata::Stream,
+    track: &AudioTrackSettings,
+) -> Option<&'a str> {
+    match track.channels {
+        AudioChannels::Preserve => source.channel_layout.as_deref(),
+        AudioChannels::Mono => Some("mono"),
+        AudioChannels::Stereo => Some("stereo"),
+        AudioChannels::Surround51 if track.codec == AudioCodec::Eac3 => Some("5.1(side)"),
+        AudioChannels::Surround51 => Some("5.1"),
+        AudioChannels::Surround71 => Some("7.1"),
     }
 }
 
@@ -333,6 +354,8 @@ pub(super) fn append_arguments(
         args.extend([
             format!("-ac:{position}").into(),
             expected_channels(source, track).unwrap().to_string().into(),
+            format!("-channel_layout:{position}").into(),
+            expected_layout(source, track).unwrap().into(),
         ]);
     }
 }
@@ -576,9 +599,8 @@ pub(super) async fn check_conversion_support(
         || stream.codec_name.as_deref() != Some(codec_name(track.codec))
         || stream.sample_rate != expected_rate(source, track)
         || stream.channels != expected_channels(source, track)
-        || (track.channels == AudioChannels::Preserve
-            && source.channels.is_some_and(|channels| channels > 2)
-            && stream.channel_layout != source.channel_layout)
+        || (expected_channels(source, track).is_some_and(|channels| channels > 2)
+            && stream.channel_layout.as_deref() != expected_layout(source, track))
         || (track.codec == AudioCodec::Flac && stream.bits_per_raw_sample.as_deref() != Some("24"))
     {
         return Err(fail());
@@ -1036,6 +1058,45 @@ mod tests {
         validate_settings(&settings).unwrap();
         settings.audio[0] = track(AudioCodec::Copy);
         validate_settings(&settings).unwrap();
+    }
+
+    #[test]
+    fn surround_conversion_pins_layout_and_rejects_unsupported_codecs() {
+        let document = source();
+        let selected = document.selected(&[0, 1]).unwrap();
+        for (channels, count, layout) in [
+            (AudioChannels::Surround51, 6, "5.1"),
+            (AudioChannels::Surround71, 8, "7.1"),
+        ] {
+            let mut settings = EncodeSettings {
+                audio: vec![track(AudioCodec::Opus)],
+                ..Default::default()
+            };
+            settings.audio[0].channels = channels;
+            validate_selection(&selected, &settings).unwrap();
+            assert_eq!(
+                expected_channels(&document.streams[1], &settings.audio[0]),
+                Some(count)
+            );
+            let mut args = Vec::new();
+            append_arguments(&mut args, 1, &settings.audio[0], &document.streams[1]);
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-channel_layout:1" && pair[1] == layout)
+            );
+            settings.audio[0].codec = AudioCodec::Mp3;
+            assert!(validate_selection(&selected, &settings).is_err());
+            settings.audio[0].codec = AudioCodec::Eac3;
+            if channels == AudioChannels::Surround71 {
+                assert!(validate_selection(&selected, &settings).is_err());
+            } else {
+                validate_selection(&selected, &settings).unwrap();
+                assert_eq!(
+                    expected_layout(&document.streams[1], &settings.audio[0]),
+                    Some("5.1(side)")
+                );
+            }
+        }
     }
 
     #[test]

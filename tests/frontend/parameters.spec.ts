@@ -61,6 +61,7 @@ async function mock(page: Page, corruptPresets = false) {
               'svt-av1-hdr',
               'x264',
               'av1an',
+              'mkvmerge',
             ].map((id) => ({
               id,
               name: id,
@@ -95,15 +96,113 @@ async function mock(page: Page, corruptPresets = false) {
               route: request.encoder === 'x265' ? 'FFmpeg library' : 'Standalone encoder CLI',
               toolPath: 'C:\\tools\\encoder.exe',
               toolVersion: 'qualified test build',
-              parameters: [
-                {
-                  name: 'ref',
-                  label: 'Reference frames',
-                  argument: request.encoder === 'x265' ? 'ref' : '--ref',
-                  minimum: 1,
-                  maximum: 6,
-                },
-              ],
+              parameters:
+                request.backend === 'av1an' && request.encoder === 'x264'
+                  ? [
+                      {
+                        name: 'tune',
+                        label: 'Tune',
+                        argument: '--tune',
+                        minimum: 0,
+                        maximum: 0,
+                        valueKind: 'choiceList',
+                        minimumValue: '',
+                        maximumValue: '',
+                        choices: ['film', 'grain'],
+                        group: 'Psychovisual',
+                        description: 'Source tuning',
+                        example: 'film',
+                      },
+                      {
+                        name: 'psy-rd',
+                        label: 'Psycho-visual RD',
+                        argument: '--psy-rd',
+                        minimum: 0,
+                        maximum: 10,
+                        valueKind: 'pairDecimal',
+                        minimumValue: '0',
+                        maximumValue: '10',
+                        choices: [],
+                        group: 'Psychovisual',
+                        description: 'Rate distortion and trellis tuning',
+                        example: '1.0:0.0',
+                      },
+                      {
+                        name: 'pbratio',
+                        label: 'P-to-B QP ratio',
+                        argument: '--pbratio',
+                        minimum: 1,
+                        maximum: 10,
+                        valueKind: 'decimal',
+                        minimumValue: '1',
+                        maximumValue: '10',
+                        choices: [],
+                        group: 'Rate control',
+                        description: 'B-frame quantizer ratio',
+                        example: '1.30',
+                      },
+                    ]
+                  : request.backend === 'av1an' && request.encoder.startsWith('svtAv1')
+                    ? [
+                        {
+                          name: 'aq-mode',
+                          label: 'Adaptive quantization mode',
+                          argument: '--aq-mode',
+                          minimum: 0,
+                          maximum: 2,
+                          valueKind: 'whole',
+                          minimumValue: '0',
+                          maximumValue: '2',
+                          choices: [],
+                          group: 'Quantization',
+                          description: 'Adaptive quantization',
+                          example: '2',
+                        },
+                        {
+                          name: 'complex-hvs',
+                          label: 'Complex visual model',
+                          argument: '--complex-hvs',
+                          minimum: 0,
+                          maximum: 1,
+                          valueKind: 'whole',
+                          minimumValue: '0',
+                          maximumValue: '1',
+                          choices: [],
+                          group: 'Psychovisual',
+                          description: 'Perceptual detail model',
+                          example: '1',
+                        },
+                        {
+                          name: 'noise',
+                          label: 'Noise override',
+                          argument: '--noise',
+                          minimum: 0,
+                          maximum: 200,
+                          valueKind: 'whole',
+                          minimumValue: '0',
+                          maximumValue: '200',
+                          choices: [],
+                          group: 'Film grain',
+                          description: 'Advanced grain source',
+                          example: '10',
+                        },
+                      ]
+                    : [
+                        {
+                          name: 'ref',
+                          label: 'Reference frames',
+                          argument: request.encoder === 'x265' ? 'ref' : '--ref',
+                          minimum: 1,
+                          maximum: request.encoder === 'x264' ? 16 : 6,
+                          valueKind: 'whole',
+                          minimumValue: '1',
+                          maximumValue: request.encoder === 'x264' ? '16' : '6',
+                          choices: [],
+                          group: 'General',
+                          description: 'Reference frames',
+                          example: '3',
+                        },
+                      ],
               notes: ['Speed preset first; overrides afterward.'],
             };
           }
@@ -227,7 +326,7 @@ test('qualified parameter presets stay separate across encoders and apply after 
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await quick.getByText('Advanced encoder parameters', { exact: true }).click();
   await quick.getByLabel('Override Reference frames', { exact: true }).check();
-  await quick.getByLabel('Reference frames value', { exact: true }).fill('7');
+  await quick.getByLabel('Reference frames value', { exact: true }).fill('17');
   await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   await quick.getByLabel('Reference frames value', { exact: true }).fill('3');
   await quick.getByLabel('Parameter preset name', { exact: true }).fill('Animation');
@@ -250,6 +349,80 @@ test('qualified parameter presets stay separate across encoders and apply after 
   expect(request.settings.parameters).toEqual([{ name: 'ref', value: '3' }]);
   await quick.getByLabel('Reference frames value', { exact: true }).fill('4');
   expect(request.settings.parameters).toEqual([{ name: 'ref', value: '3' }]);
+});
+
+test('AV1AN x264 exposes named tune and decimal pair overrides in the queued request', async ({
+  page,
+}) => {
+  await mock(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
+  await expect
+    .poll(async () => (await calls(page, 'get_encoder_parameters')).at(-1)?.payload.request)
+    .toEqual({
+      encoder: 'x264',
+      backend: 'av1an',
+    });
+  await workspace.getByLabel('Override Tune', { exact: true }).check();
+  await workspace.getByLabel('Tune value', { exact: true }).fill('grain');
+  await workspace.getByLabel('Override Psycho-visual RD', { exact: true }).check();
+  await workspace.getByLabel('Psycho-visual RD value', { exact: true }).fill('1.2:0.1500');
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Psycho-visual RD value', { exact: true }).fill('1.2:0.15');
+  await workspace.getByLabel('Override P-to-B QP ratio', { exact: true }).check();
+  await workspace.getByLabel('P-to-B QP ratio value', { exact: true }).fill('1.30');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
+  expect(request.settings).toMatchObject({ backend: 'av1an', encoder: 'x264' });
+  expect(request.settings.parameters).toEqual([
+    { name: 'tune', value: 'grain' },
+    { name: 'psy-rd', value: '1.2:0.15' },
+    { name: 'pbratio', value: '1.30' },
+  ]);
+});
+
+test('AV1AN SVT accepts adaptive quantization and complex visual-model overrides', async ({
+  page,
+}) => {
+  await mock(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
+  await workspace.getByLabel('Override Adaptive quantization mode', { exact: true }).check();
+  await workspace.getByLabel('Adaptive quantization mode value', { exact: true }).fill('3');
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Adaptive quantization mode value', { exact: true }).fill('2');
+  await workspace.getByLabel('Override Complex visual model', { exact: true }).check();
+  await workspace.getByLabel('Complex visual model value', { exact: true }).fill('1');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
+  expect(request.settings.parameters).toEqual([
+    { name: 'aq-mode', value: '2' },
+    { name: 'complex-hvs', value: '1' },
+  ]);
+});
+
+test('AV1AN blocks conflicting SVT grain sources before queueing', async ({ page }) => {
+  await mock(page);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
+  await workspace.getByLabel('Override Noise override', { exact: true }).check();
+  await workspace.getByLabel('Noise override value', { exact: true }).fill('10');
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await expect(workspace.getByRole('alert')).toContainText(
+    'Use one grain source: a grain table, film-grain synthesis, or the advanced noise override.',
+  );
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('0');
+  await expect(queue).toBeEnabled();
 });
 
 test('command preview cancels on edits and discards late replies before showing native argument arrays', async ({

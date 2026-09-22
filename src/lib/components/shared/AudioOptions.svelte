@@ -108,6 +108,8 @@
           <option value="preserve">Preserve source</option>
           <option value="mono">Mono</option>
           <option value="stereo">Stereo</option>
+          <option value="surround51">5.1 surround</option>
+          <option value="surround71">7.1 surround</option>
         </select>
       </div>
     {/if}
@@ -117,6 +119,11 @@
       ? `${settings.codec === 'flac' ? 'Encodes 24-bit integer PCM without a bitrate target. Floating-point and higher-depth sources are converted to 24-bit.' : `${settings.codec === 'mp3' ? 'Choose a standard bitrate.' : `32–${bitrateMax} kb/s target.`} ${settings.codec === 'opus' ? 'Opus uses 48 kHz.' : 'Retains the source sample rate.'}`} Track title, language, and default status are retained.`
       : 'Keeps the original audio without quality loss.'}
   </p>
+  {#if converting && (settings.channels === 'surround51' || settings.channels === 'surround71')}
+    <p class="audio-help">
+      Converts the speaker layout. Sources with fewer channels do not gain original surround detail.
+    </p>
+  {/if}
   {#if compatibilityError}<p class="audio-help" role="alert">{compatibilityError}</p>{/if}
   <LoudnessControl {inputPath} {settings} {disabled} {onchange} />
 </div>

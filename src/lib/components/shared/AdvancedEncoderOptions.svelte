@@ -38,10 +38,13 @@
   let presetBusy = $state(false);
   let controller: AbortController | undefined;
   let generation = 0;
-  const issue = $derived(parameterError(value, catalog));
+  const issue = $derived(parameterError(value, catalog, encoder));
   const availablePresets = $derived(
     presets.filter((preset) => preset.encoder === encoder && preset.backend === backend),
   );
+  function initialValue(spec: EncoderParameterCatalog['parameters'][number]): string {
+    return spec.example || spec.choices[0] || spec.minimumValue || String(spec.minimum);
+  }
   function message(cause: unknown): string {
     return cause instanceof Error
       ? cause.message
@@ -130,7 +133,7 @@
   function applyPreset() {
     const preset = availablePresets.find((preset) => preset.name === selectedPreset);
     if (!preset) return;
-    const issue = parameterError(preset.parameters, catalog);
+    const issue = parameterError(preset.parameters, catalog, encoder);
     if (issue) {
       error = issue;
       return;
@@ -174,9 +177,12 @@
     {#if busy}<p role="status">Checking the installed encoder catalog…</p>{:else if catalog}
       <p class="small-muted">{catalog.route}: {catalog.toolVersion}</p>
       <fieldset {disabled}>
-        <legend>Validated scalar overrides</legend>
-        {#each catalog.parameters as spec (spec.name)}
+        <legend>Validated encoder overrides</legend>
+        {#each catalog.parameters as spec, index (spec.name)}
           {@const current = value.find((value) => value.name === spec.name)}
+          {#if index === 0 || catalog.parameters[index - 1].group !== spec.group}
+            <h4>{spec.group || 'Advanced'}</h4>
+          {/if}
           <div class="parameter-row">
             <label
               ><input
@@ -184,19 +190,46 @@
                 aria-label={`Override ${spec.label}`}
                 checked={!!current}
                 onchange={(event) =>
-                  update(spec.name, event.currentTarget.checked ? String(spec.minimum) : undefined)}
+                  update(spec.name, event.currentTarget.checked ? initialValue(spec) : undefined)}
               />{spec.label}</label
             >
-            {#if current}<input
-                type="number"
-                aria-label={`${spec.label} value`}
-                value={current.value}
-                min={spec.minimum}
-                max={spec.maximum}
-                step="1"
-                oninput={(event) => update(spec.name, event.currentTarget.value)}
-              />{/if}
-            <small>{spec.argument} · {spec.minimum}–{spec.maximum}</small>
+            {#if current}
+              {#if spec.valueKind === 'choice'}
+                <select
+                  aria-label={`${spec.label} value`}
+                  value={current.value}
+                  onchange={(event) => update(spec.name, event.currentTarget.value)}
+                >
+                  {#each spec.choices as choice}<option value={choice}>{choice}</option>{/each}
+                </select>
+              {:else if spec.valueKind === 'pairWhole' || spec.valueKind === 'pairDecimal' || spec.valueKind === 'choiceList'}
+                <input
+                  type="text"
+                  aria-label={`${spec.label} value`}
+                  value={current.value}
+                  placeholder={spec.example}
+                  maxlength="32"
+                  oninput={(event) => update(spec.name, event.currentTarget.value)}
+                />
+              {:else}
+                <input
+                  type="number"
+                  aria-label={`${spec.label} value`}
+                  value={current.value}
+                  min={spec.minimumValue || spec.minimum}
+                  max={spec.maximumValue || spec.maximum}
+                  step={spec.valueKind === 'decimal' ? '0.001' : '1'}
+                  oninput={(event) => update(spec.name, event.currentTarget.value)}
+                />
+              {/if}
+            {/if}
+            <small
+              >{spec.argument} · {spec.description}{spec.valueKind === 'choiceList'
+                ? ` Choices: ${spec.choices.join(', ')}.`
+                : spec.valueKind !== 'choice'
+                  ? ` (${spec.minimumValue || spec.minimum}–${spec.maximumValue || spec.maximum})`
+                  : ''}{spec.example ? ` · e.g. ${spec.example}` : ''}</small
+            >
           </div>
         {/each}
         {#if !catalog.parameters.length}<p>
@@ -279,7 +312,7 @@
   }
   .parameter-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 80px;
+    grid-template-columns: minmax(0, 1fr) minmax(100px, 150px);
     gap: 8px;
     align-items: center;
   }
@@ -292,6 +325,10 @@
   .parameter-row small {
     grid-column: 1/-1;
     color: var(--muted-foreground);
+  }
+  fieldset h4 {
+    margin: 10px 0 0;
+    font-size: 12px;
   }
   .preset-controls label {
     display: grid;

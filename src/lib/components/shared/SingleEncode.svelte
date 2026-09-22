@@ -4,11 +4,21 @@
   import { parameterError } from './encoder-parameters';
   import type { EncoderParameter } from '$lib/ipc/generated';
   import Av1anOptionsControl from './Av1anOptions.svelte';
+  import Av1anResources from './Av1anResources.svelte';
+  import Av1anGrain from './Av1anGrain.svelte';
+  import Av1anFilters from './Av1anFilters.svelte';
+  import {
+    defaultAv1anAudio,
+    readAv1anPreferences,
+    saveAv1anAudioPreference,
+    saveAv1anPreferences,
+  } from './av1an-preferences';
   import {
     defaultAv1an,
     copyAv1an,
     selectedAv1an,
     av1anError,
+    av1anGrainConflict,
     type Av1anDraft,
   } from './av1an-options';
   import TemporalOptions from './TemporalOptions.svelte';
@@ -91,6 +101,7 @@
     sourceBitDepth,
     knownHdr,
     encoderChoices,
+    isAv1anEncoder,
     isSvtEncoder,
     validForkSettings,
     forkSettingsSummary,
@@ -99,6 +110,7 @@
   import type {
     EncodeBackend,
     EncodeRequest,
+    Av1anGrainSettings,
     JobSnapshot,
     MediaFile,
     ToolInfo,
@@ -131,6 +143,8 @@
   let parameters = $state<EncoderParameter[]>([]);
   let rate = $state(defaultRate());
   let av1an = $state(defaultAv1an());
+  let av1anGrain = $state<Av1anGrainSettings | undefined>();
+  let av1anFilters = $state<string[]>([]);
   let crf = $state<number | undefined>(30);
   let preset = $state(2);
   let workers = $state<number | undefined>(2);
@@ -164,6 +178,8 @@
     videoIndex: number | undefined;
     rate: RateDraft;
     av1an: Av1anDraft;
+    av1anGrain: Av1anGrainSettings | undefined;
+    av1anFilters: string[];
     crf: number | undefined;
     preset: number;
     workers: number | undefined;
@@ -229,17 +245,34 @@
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const usableSource = $derived(!!file && !file.id.startsWith('jesses-synthetic'));
   const toolsReady = $derived(
-    requiredEncoderTools(backend, encoder).every((id) =>
+    requiredEncoderTools(backend, encoder, av1an.concatMethod).every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
     ),
   );
   const disabled = $derived(!desktop || !usableSource || submitting);
+  const grainConflict = $derived(
+    chunked && isSvtEncoder(encoder) ? av1anGrainConflict(parameters, filmGrain, av1anGrain) : null,
+  );
   const validSettings = $derived(
-    (!chunked || isSvtEncoder(encoder)) &&
+    (!chunked || isAv1anEncoder(encoder)) &&
       validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
       validRate(rate) &&
       !rateIssue &&
-      (!chunked || !av1anError(av1an, knownHdr(selectedVideo))) &&
+      (!chunked ||
+        !av1anError(
+          av1an,
+          knownHdr(selectedVideo) && !toneMap.enabled,
+          encoder,
+          destinationContainer(destination) === 'matroska',
+        )) &&
+      (!chunked ||
+        !av1anGrain ||
+        ((av1anGrain.table === null || av1anGrain.table.length > 0) &&
+          (av1anGrain.table === null || filmGrain === 0) &&
+          Number.isInteger(av1anGrain.denoiseStrength) &&
+          av1anGrain.denoiseStrength >= 1 &&
+          av1anGrain.denoiseStrength <= 16)) &&
+      (!chunked || av1anFilters.length <= 16) &&
       ((chunked && av1an.targetEnabled) ||
         rate.mode !== 'quality' ||
         (typeof crf === 'number' &&
@@ -259,7 +292,7 @@
         (typeof workers === 'number' &&
           Number.isInteger(workers) &&
           workers >= 1 &&
-          workers <= 32)),
+          workers <= 64)),
   );
   const canQueue = $derived(
     !disabled &&
@@ -268,6 +301,7 @@
       selectedVideoSupported &&
       !hdrUnsupported &&
       validSettings &&
+      !grainConflict &&
       !parameterError(parameters, null, encoder) &&
       framingValid &&
       !trimIssue &&
@@ -279,15 +313,21 @@
   );
   const canStart = $derived(canQueue && !active);
 
-  function reset(source: MediaFile | undefined) {
+  function reset(
+    source: MediaFile | undefined,
+    usePreferences = true,
+    useInfrastructurePreferences = usePreferences,
+  ) {
     ++draftGeneration;
     videoIndex = source?.streams.find((stream) => stream.kind === 'video')?.index;
     parameters = [];
     rate = defaultRate();
-    av1an = defaultAv1an();
+    av1an = defaultAv1an(useInfrastructurePreferences);
+    av1anGrain = undefined;
+    av1anFilters = chunked && usePreferences ? readAv1anPreferences().filters : [];
     crf = options.defaultCrf;
     preset = options.defaultPreset;
-    workers = 2;
+    workers = chunked && useInfrastructurePreferences ? readAv1anPreferences().workers : 2;
     filmGrain = 0;
     hdr10Fallback = false;
     lineartPsyBias = options.defaultLineartPsyBias;
@@ -297,7 +337,10 @@
       source?.streams
         .filter((stream) => !['video', 'data'].includes(stream.kind))
         .map((stream) => stream.index) ?? [];
-    audio = defaultAudio(source?.streams ?? []);
+    audio =
+      chunked && usePreferences
+        ? defaultAv1anAudio(source?.streams ?? [])
+        : defaultAudio(source?.streams ?? []);
     subtitles = defaultSubtitles(source?.streams ?? []);
     framing = defaultFramingDraft();
     trim = defaultTrim();
@@ -323,6 +366,8 @@
           videoIndex,
           rate: { ...rate },
           av1an: copyAv1an(av1an),
+          av1anGrain: av1anGrain ? { ...av1anGrain } : undefined,
+          av1anFilters: [...av1anFilters],
           crf,
           preset,
           workers,
@@ -365,12 +410,23 @@
         parameters = draft.parameters.map((value) => ({ ...value }));
         rate = { ...draft.rate };
         av1an = copyAv1an(draft.av1an);
+        av1anGrain = draft.av1anGrain ? { ...draft.av1anGrain } : undefined;
+        av1anFilters = [...draft.av1anFilters];
         error = null;
       } else {
-        reset(source);
+        const previousDraftForSource =
+          source !== undefined &&
+          [...drafts.keys()].some((key) => {
+            const [, savedSource] = JSON.parse(key) as [VideoEncoder, MediaFile];
+            return JSON.stringify(savedSource) === JSON.stringify(source);
+          });
+        reset(source, !previousDraftForSource, chunked);
       }
       draftIdentity = identity;
     });
+  });
+  $effect(() => {
+    if (chunked && usableSource) saveAv1anPreferences(av1an, workers, av1anFilters);
   });
   function toggle(index: number) {
     included = included.includes(index)
@@ -410,7 +466,11 @@
         ...(parameters.length ? { parameters: parameters.map((value) => ({ ...value })) } : {}),
         ...(selectedTemporal(temporal) ? { temporal: selectedTemporal(temporal) } : {}),
         videoStreamIndex: videoIndex,
-        ...(chunked ? { av1anOptions: selectedAv1an(av1an) } : {}),
+        ...(chunked ? { av1anOptions: selectedAv1an(av1an, encoder) } : {}),
+        ...(chunked && isSvtEncoder(encoder) && av1anGrain
+          ? { av1anGrain: { ...av1anGrain } }
+          : {}),
+        ...(chunked && av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
         ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
           ? { rateControl: selectedRate(rate) }
           : {}),
@@ -482,7 +542,7 @@
       <h1>{chunked ? 'av1an' : 'Quick Convert'}</h1>
       <p>
         {chunked
-          ? 'Scene-based AV1 encoding with av1an. Use this when you want scene detection and parallel chunks.'
+          ? 'Scene-based encoding with av1an. Choose an encoder and run parallel chunks.'
           : 'Encode one source at a time. Pick an encoder, review the output, then start the job.'}
       </p>
     </div>
@@ -509,8 +569,9 @@
         Source compatibility and encoder depth support are checked before encoding.
       </p>{:else if isSvtEncoder(encoder)}<p>
         Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
-        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Standalone jobs can explicitly
-        deinterlace. Rotation is not supported. Source compatibility is checked before encoding.
+        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Explicit deinterlacing is
+        available when needed. Rotation is not supported. Source compatibility is checked before
+        encoding.
       </p>{/if}
   </details>
   {#if error}<div class="notice error-notice" role="alert">
@@ -524,18 +585,16 @@
           <span class="heading-with-icon"
             ><Clapperboard size={16} aria-hidden="true" /><span class="eyebrow">Video</span></span
           >
-          <button type="button" class="text-button" {disabled} onclick={() => reset(file)}
+          <button type="button" class="text-button" {disabled} onclick={() => reset(file, false)}
             ><RotateCcw size={13} aria-hidden="true" />Reset settings</button
           >
         </div>
         <div class="setting-fields">
           <div class="source-fields full-width">
             <div class="field">
-              <label for={`${idPrefix}-encoder`}
-                >{chunked ? 'SVT-AV1 build' : 'Video encoder'}</label
-              >
+              <label for={`${idPrefix}-encoder`}>Video encoder</label>
               <select id={`${idPrefix}-encoder`} bind:value={selectedEncoder} {disabled}>
-                {#each encoderChoices.filter((choice) => !chunked || isSvtEncoder(choice.value)) as choice}
+                {#each encoderChoices.filter((choice) => !chunked || isAv1anEncoder(choice.value)) as choice}
                   <option value={choice.value}>{choice.label}</option>
                 {/each}
               </select>
@@ -570,9 +629,11 @@
           {#if chunked}<Av1anOptionsControl
               {idPrefix}
               draft={av1an}
+              {encoder}
               {disabled}
-              hdr={knownHdr(selectedVideo)}
-              framed={!!framingSummary(selectedFraming(framing))}
+              attachmentSupported={destinationContainer(destination) === 'matroska'}
+              hdr={knownHdr(selectedVideo) && !toneMap.enabled}
+              framed={framingSummary(selectedFraming(framing)) !== 'Source dimensions'}
               onchange={(value) => (av1an = value)}
             />{/if}
           {#if !chunked}<RateControlOptions
@@ -620,7 +681,48 @@
             bind:lineartPsyBias
             bind:texturePsyBias
             bind:hdrTune
+            grainTableSelected={chunked && !!av1anGrain?.table}
           />
+          {#if chunked && isSvtEncoder(encoder)}
+            {#key JSON.stringify([encoder, file?.id])}
+              <Av1anGrain
+                value={av1anGrain}
+                {disabled}
+                onchange={(value) => {
+                  av1anGrain = value ? { ...value } : undefined;
+                  if (value?.table) filmGrain = 0;
+                }}
+              />
+            {/key}
+          {/if}
+          {#if chunked}
+            {#key JSON.stringify([encoder, file?.id])}
+              <Av1anFilters
+                value={av1anFilters}
+                {disabled}
+                onchange={(value) => (av1anFilters = [...value])}
+              />
+            {/key}
+          {/if}
+          {#if chunked}<Av1anResources
+              {encoder}
+              {workers}
+              sourceWidth={selectedVideo?.width}
+              sourceHeight={selectedVideo?.height}
+              outputWidth={framingResult.width}
+              outputHeight={framingResult.height}
+              filtered={framingSummary(selectedFraming(framing)) !== 'Source dimensions' ||
+                !!selectedTemporal(temporal) ||
+                toneMap.enabled ||
+                trim.enabled ||
+                av1anFilters.length > 0}
+              floatFilter={toneMap.enabled}
+              {disabled}
+              onapply={(nextWorkers, threads, slices) => {
+                workers = nextWorkers;
+                av1an = { ...av1an, encoderThreads: threads, sceneDetectionSlices: slices };
+              }}
+            />{/if}
           <div class="video-adjustments full-width">
             <AdvancedEncoderOptions
               {encoder}
@@ -629,6 +731,7 @@
               {disabled}
               onchange={(value) => (parameters = value)}
             />
+            {#if grainConflict}<p class="disabled-reason" role="alert">{grainConflict}</p>{/if}
             <TemporalOptions
               value={temporal}
               video={selectedVideo}
@@ -636,18 +739,18 @@
               {disabled}
               onchange={(value) => (temporal = value)}
             />
-            {#if !chunked}<ToneMapOptions
-                draft={toneMap}
-                {disabled}
-                error={toneMapIssue}
-                onchange={(next) => (toneMap = next)}
-              /><TrimOptions
-                {idPrefix}
-                draft={trim}
-                {disabled}
-                error={trimIssue}
-                onchange={(next) => (trim = next)}
-              />{/if}
+            <ToneMapOptions
+              draft={toneMap}
+              {disabled}
+              error={toneMapIssue}
+              onchange={(next) => (toneMap = next)}
+            /><TrimOptions
+              {idPrefix}
+              draft={trim}
+              {disabled}
+              error={trimIssue}
+              onchange={(next) => (trim = next)}
+            />
             <FramingOptions
               {idPrefix}
               draft={framing}
@@ -711,6 +814,7 @@
                       audio = audio.map((track) =>
                         track.streamIndex === next.streamIndex ? next : track,
                       );
+                      if (chunked) saveAv1anAudioPreference(next, stream);
                     }}
                   />
                 {/if}
@@ -831,6 +935,8 @@
         {:else if !toolsReady}<p class="disabled-reason">
             Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
               ? ', and av1an'
+              : ''}{chunked && (encoder === 'x264' || av1an.concatMethod === 'mkvmerge')
+              ? ', and mkvmerge'
               : ''}, then refresh Tools & settings.
           </p>
         {:else if !selectedVideoSupported}<p class="disabled-reason">
@@ -847,7 +953,7 @@
             a listed preset{isSvtEncoder(encoder) ? ', and grain 0–50' : ''}{encoder ===
             'svtAv1FiveFish'
               ? '; lineart and texture bias 0–7'
-              : ''}{chunked ? '; parallel chunks 1–32' : ''}.
+              : ''}{chunked ? '; parallel chunks 1–64' : ''}.
           </p>
         {:else if !framingValid}<p class="disabled-reason">
             {framingResult.error}

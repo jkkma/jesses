@@ -1,19 +1,21 @@
-//! av1an names SvtAv1EncApp internally. Route every child to the chosen family.
+//! av1an names each encoder internally. Route every child to the chosen binary.
 use super::*;
+use media_core::VideoEncoder;
 
-pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
+pub(super) fn validate_encoder_path(encoder: &Path, family: VideoEncoder) -> Result<(), AppError> {
+    let expected = super::encoder::binary(family);
     #[cfg(windows)]
     let canonical_name = encoder
         .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("SvtAv1EncApp.exe"));
+        .is_some_and(|name| name.eq_ignore_ascii_case(format!("{expected}.exe")));
     #[cfg(not(windows))]
-    let canonical_name = encoder
-        .file_name()
-        .is_some_and(|name| name == "SvtAv1EncApp");
+    let canonical_name = encoder.file_name().is_some_and(|name| name == expected);
     if !encoder.is_absolute() || !canonical_name {
         return Err(files::error(
             "AV1AN_ENCODER_PATH_UNSUPPORTED",
-            "av1an requires the selected encoder to be named SvtAv1EncApp in its own folder (SvtAv1EncApp.exe on Windows). Use standalone encoding for a custom executable name.",
+            format!(
+                "av1an requires the selected encoder to use its canonical child name {expected} in its own folder."
+            ),
             encoder,
         ));
     }
@@ -35,11 +37,13 @@ impl Launch {
     pub(super) fn prepare(
         av1an: &Path,
         encoder: &Path,
+        family: VideoEncoder,
         ffmpeg: &Path,
         ffprobe: &Path,
+        mkvmerge: Option<&Path>,
         work: &Path,
     ) -> Result<Self, AppError> {
-        validate_encoder_path(encoder)?;
+        validate_encoder_path(encoder, family)?;
         let selected = encoder.parent().expect("absolute encoder parent");
         let original = av1an.parent().expect("absolute av1an parent");
         let ffmpeg_parent = ffmpeg
@@ -64,7 +68,21 @@ impl Launch {
             })?;
         let runtime = crate::bundled_tools::av1an_runtime(av1an)
             .map_err(|error| files::error("BUNDLED_TOOL_INVALID", error, av1an))?;
-        let mut directories = vec![selected, ffmpeg_parent, ffprobe_parent, original];
+        let mut directories = vec![selected, ffmpeg_parent, ffprobe_parent];
+        if let Some(mkvmerge) = mkvmerge {
+            let directory = mkvmerge
+                .parent()
+                .filter(|_| mkvmerge.is_absolute())
+                .ok_or_else(|| {
+                    files::error(
+                        "AV1AN_ENCODER_PATH_UNSUPPORTED",
+                        "The selected mkvmerge path must be absolute.",
+                        mkvmerge,
+                    )
+                })?;
+            directories.push(directory);
+        }
+        directories.push(original);
         if let Some(directory) = &runtime {
             directories.push(directory);
         }
@@ -84,7 +102,7 @@ impl Launch {
             reject_system_shadow(encoder)?;
             // Rust's Windows process lookup searches the host executable folder
             // before inherited PATH. Stage an owned host image so a portable
-            // av1an installation's sibling SVT cannot silently override selection.
+            // av1an installation's sibling child cannot silently override selection.
             // The original directory remains on child PATH for its DLLs/tools.
             let source = OpenOptions::new()
                 .read(true)
@@ -206,12 +224,13 @@ fn reject_system_shadow(encoder: &Path) -> Result<(), AppError> {
                 encoder,
             ));
         }
-        let shadow = PathBuf::from(OsString::from_wide(&buffer[..length])).join("SvtAv1EncApp.exe");
+        let shadow = PathBuf::from(OsString::from_wide(&buffer[..length]))
+            .join(encoder.file_name().expect("validated encoder basename"));
         match shadow.canonicalize() {
             Ok(path) if path != selected => {
                 return Err(files::error(
                     "AV1AN_ENCODER_PATH_UNSUPPORTED",
-                    "A Windows system-directory SVT encoder would override the selected encoder. Use standalone encoding.",
+                    "A Windows system-directory encoder would override the selected encoder.",
                     &shadow,
                 ));
             }
@@ -241,10 +260,12 @@ mod tests {
         } else {
             "SvtAv1EncApp"
         };
-        assert!(validate_encoder_path(&folder.join(name)).is_ok());
+        assert!(validate_encoder_path(&folder.join(name), VideoEncoder::SvtAv1).is_ok());
         for path in [PathBuf::from(name), folder.join("SvtAv1EncApp-HDR.exe")] {
             assert_eq!(
-                validate_encoder_path(&path).unwrap_err().code,
+                validate_encoder_path(&path, VideoEncoder::SvtAv1)
+                    .unwrap_err()
+                    .code,
                 "AV1AN_ENCODER_PATH_UNSUPPORTED"
             );
         }
@@ -365,8 +386,10 @@ mod tests {
         let mut launch = Launch::prepare(
             &av1an,
             &encoder,
+            VideoEncoder::SvtAv1,
             &media_tools.join("ffmpeg.exe"),
             &media_tools.join("ffprobe.exe"),
+            None,
             &work,
         )
         .unwrap();
@@ -449,8 +472,10 @@ mod tests {
             Launch::prepare(
                 &av1an,
                 &encoder,
+                VideoEncoder::SvtAv1,
                 &media_tools.join("ffmpeg.exe"),
                 &media_tools.join("ffprobe.exe"),
+                None,
                 &work
             )
             .is_err()

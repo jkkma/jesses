@@ -10,6 +10,13 @@ mod ffmpeg_video;
 pub(super) mod frame_scan;
 #[path = "x264.rs"]
 mod x264;
+
+pub(in crate::jobs) fn standalone_x264_arguments(
+    plan: &Plan,
+    settings: &EncodeSettings,
+) -> Vec<OsString> {
+    x264::arguments(plan, settings)
+}
 #[path = "x265.rs"]
 mod x265;
 use super::*;
@@ -72,6 +79,17 @@ impl JobManager {
         .await
         .map_err(|e| AppError::new("PREFLIGHT_FAILED", e.to_string(), None))??;
         audio::validate_gain_source(&source, settings)?;
+        if settings
+            .av1an_options
+            .is_some_and(|options| options.attach_settings)
+            && container::format(&output)? != media_core::ContainerFormat::Matroska
+        {
+            return Err(AppError::new(
+                "CONTAINER_INCOMPATIBLE",
+                "Encode settings attachments require a Matroska (.mkv) destination.",
+                None,
+            ));
+        }
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
@@ -91,11 +109,13 @@ impl JobManager {
         let mkvmerge = if matches!(
             settings.encoder,
             VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
-        ) {
+        ) || (settings.backend == media_core::EncodeBackend::Av1an
+            && super::av1an::encoder::uses_mkvmerge(settings.encoder, settings))
+        {
             Some(discover("mkvmerge", cancel).await.map_err(|_| {
                 AppError::new(
                     "TOOL_MISSING",
-                    "Standalone x265 and vpxenc require mkvmerge to assign exact rational presentation timing. Install MKVToolNix and refresh Tools.",
+                    "The selected encoder or av1an concat method requires mkvmerge. Install MKVToolNix and refresh Tools.",
                     None,
                 )
             })?)
@@ -235,7 +255,7 @@ impl JobManager {
             audio_timelines.push((track, timeline));
         }
         if settings.backend == media_core::EncodeBackend::Av1an {
-            super::av1an::validate_encoder_path(&encoder)?;
+            super::av1an::validate_encoder_path(&encoder, settings)?;
             super::av1an::validate_input(&document, &plan)?;
         }
         if !settings.encoder.is_svt() {
@@ -524,7 +544,7 @@ impl JobManager {
             }
             match settings.encoder {
                 VideoEncoder::SvtAv1FiveFish => append_log(snapshot, format!("SVT-AV1 5fish: line-art bias {}, texture bias {}.", settings.lineart_psy_bias, settings.texture_psy_bias)),
-                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("SVT-AV1-HDR: {} tune.", match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)", media_core::HdrTune::FilmGrain => "film grain retention (5)" })),
+                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("SVT-AV1-HDR: {} tune.", settings.parameters.iter().find(|parameter| parameter.name == "tune").map_or_else(|| match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)".to_string(), media_core::HdrTune::FilmGrain => "film grain retention (5)".to_string() }, |parameter| format!("explicit override ({})", parameter.value)))),
                 _ => {},
             }
             if plan.is_hdr10() {
@@ -676,6 +696,9 @@ impl JobManager {
                 encoder.clone(),
                 executable.clone(),
             ];
+            if let Some(mkvmerge) = &mkvmerge {
+                tools.push(mkvmerge.clone());
+            }
             if let Some(qtgmc) = &qtgmc {
                 tools.push(qtgmc.producer.executable.clone());
             }
@@ -867,7 +890,7 @@ impl JobManager {
             if settings.backend == media_core::EncodeBackend::Av1an {
                 let recovery = recovery.as_ref().expect("av1an recovery workspace");
                 if !recovery.finalizing {
-                    self.phase(id, JobState::Running, "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected audio settings will be applied afterward.").await;
+                    self.phase(id, JobState::Running, if settings.encoder == VideoEncoder::X264 { "av1an is detecting scenes and encoding parallel x264 chunks; selected audio settings will be applied afterward." } else { "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected audio settings will be applied afterward." }).await;
                     self.encode_av1an(
                         id,
                         av1an_input.as_deref().expect("prepared av1an input"),
@@ -875,6 +898,7 @@ impl JobManager {
                         av1an_executable.as_ref().expect("av1an executable"),
                         &ffmpeg,
                         &ffprobe,
+                        mkvmerge.as_deref(),
                         recovery,
                         intermediate,
                         &plan,
@@ -1223,6 +1247,8 @@ impl JobManager {
             append_log(snapshot, "Muxing encoded video, applying selected audio settings, and preserving subtitles, metadata, chapters, and attachments.".into());
         }).await;
             let mux_log = log_path.with_extension("mux.log");
+            let settings_attachment =
+                super::encode_settings::SettingsAttachment::prepare(&temp.path, id, settings)?;
             let mut mux_arguments = mux_args(
                 &source.path,
                 &intermediate.path,
@@ -1235,6 +1261,15 @@ impl JobManager {
                 prepared.apply_mux(&mut mux_arguments, &output_selected, &audio_filters)?;
             }
             subtitle_assets.apply_mux(&mut mux_arguments, &output_selected);
+            if let Some(attachment) = &settings_attachment {
+                attachment.apply(
+                    &mut mux_arguments,
+                    output_selected
+                        .iter()
+                        .filter(|stream| stream.codec_type.as_deref() == Some("attachment"))
+                        .count(),
+                );
+            }
             let (sender, events) = mpsc::channel(256);
             let observer = self.observe_encode(id, events, None);
             let result = supervisor::run(
@@ -1265,7 +1300,10 @@ impl JobManager {
             check_cancel(cancel)?;
             temp.flush_nonempty_async().await?;
             self.phase(id,JobState::Finalizing,"Decoding the completed output to verify exact frame count and timing, then checking copied tracks and metadata.").await;
-            let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+            let mut artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+            if let Some(attachment) = &settings_attachment {
+                attachment.verify_and_remove(&mut artifact)?;
+            }
             let expected_document = subtitle_assets.expected_document(
                 prepared_trim
                     .as_ref()
@@ -1905,7 +1943,7 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         .map_or_else(|| settings.preset.to_string(), |value| value.to_string());
     let values = [
         "--input-depth".into(),
-        "10".into(),
+        plan.output_bit_depth().to_string(),
         "--crf".into(),
         svt_crf,
         "--preset".into(),
@@ -1948,14 +1986,18 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
             "--texture-psy-bias".into(),
             settings.texture_psy_bias.to_string().into(),
         ]),
-        VideoEncoder::SvtAv1Hdr => args.extend([
-            "--tune".into(),
-            match settings.hdr_tune {
-                media_core::HdrTune::VisualQuality => "0",
-                media_core::HdrTune::FilmGrain => "5",
-            }
-            .into(),
-        ]),
+        VideoEncoder::SvtAv1Hdr
+            if !settings.parameters.iter().any(|value| value.name == "tune") =>
+        {
+            args.extend([
+                "--tune".into(),
+                match settings.hdr_tune {
+                    media_core::HdrTune::VisualQuality => "0",
+                    media_core::HdrTune::FilmGrain => "5",
+                }
+                .into(),
+            ])
+        }
         _ => {}
     }
     args.extend(super::parameters::arguments(settings));
@@ -2108,7 +2150,11 @@ async fn check_encoder_capabilities(
     );
     super::parameters::check_help(encoder, settings, &help, cancel).await?;
     if settings.encoder == VideoEncoder::X264 {
-        let capabilities = x264::validate_help(&help, plan.output_bit_depth());
+        let capabilities = x264::validate_help(
+            &help,
+            plan.output_bit_depth(),
+            x264::output_csp(plan.output_pixel_format),
+        );
         if settings.lossless && !help.split_whitespace().any(|word| word == "--qp") {
             return Err(files::error(
                 "ENCODER_CAPABILITY_UNSUPPORTED",
@@ -2175,6 +2221,13 @@ async fn check_encoder_capabilities(
         return Ok(());
     }
     let mut required = vec!["--film-grain", "--film-grain-denoise"];
+    if settings
+        .av1an_grain
+        .as_ref()
+        .is_some_and(|grain| grain.table.is_some())
+    {
+        required.push("--fgs-table");
+    }
     if settings.lossless {
         required.push("--lossless");
     }

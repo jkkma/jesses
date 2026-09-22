@@ -14,6 +14,21 @@ export const audioCodecLabels = {
   eac3: 'E-AC-3',
 } as const;
 
+function outputChannels(
+  track: AudioTrackDraft,
+  stream: MediaStream | undefined,
+): number | undefined {
+  return track.channels === 'mono'
+    ? 1
+    : track.channels === 'stereo'
+      ? 2
+      : track.channels === 'surround51'
+        ? 6
+        : track.channels === 'surround71'
+          ? 8
+          : (stream?.channels ?? undefined);
+}
+
 export function audioBitrateChoices(
   track: AudioTrackDraft,
   stream: MediaStream | undefined,
@@ -29,8 +44,7 @@ export function audioCompatibilityError(
   stream: MediaStream | undefined,
 ): string | null {
   const rate = stream?.sampleRate;
-  const channels =
-    track.channels === 'mono' ? 1 : track.channels === 'stereo' ? 2 : stream?.channels;
+  const channels = outputChannels(track, stream);
   if (track.codec === 'mp3') {
     if (channels && channels > 2) return 'MP3 supports mono or stereo. Choose an explicit downmix.';
     if (rate && ![8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000].includes(rate))
@@ -38,6 +52,8 @@ export function audioCompatibilityError(
   }
   if (track.codec === 'eac3' && rate && ![32000, 44100, 48000].includes(rate))
     return 'E-AC-3 retains 32, 44.1, or 48 kHz sources. Choose another codec for this source.';
+  if (track.codec === 'eac3' && track.channels === 'surround71')
+    return 'E-AC-3 conversion supports up to 5.1 channels. Choose 5.1 or another codec.';
   if (track.codec === 'vorbis' && rate && (rate < 8000 || rate > 192000))
     return 'Vorbis supports source rates from 8 to 192 kHz in this workflow.';
   if (track.channels === 'preserve' && stream?.channelLayout) {
@@ -67,8 +83,7 @@ export function defaultAudio(streams: MediaStream[]): AudioTrackDraft[] {
 }
 
 export function audioBitrateMax(track: AudioTrackDraft, stream: MediaStream | undefined): number {
-  const channels =
-    track.channels === 'mono' ? 1 : track.channels === 'stereo' ? 2 : stream?.channels;
+  const channels = outputChannels(track, stream);
   if (track.codec === 'opus' && channels === 1) return 256;
   if (track.codec === 'mp3') return (stream?.sampleRate ?? 48000) >= 32000 ? 320 : 160;
   if (track.codec === 'eac3') return Math.floor((6144 * (stream?.sampleRate ?? 48000)) / 48000);
@@ -122,7 +137,7 @@ export function audioSummary(audio: AudioTrackDraft[] | undefined): string {
     .map((track) =>
       track.codec === 'copy'
         ? `Audio #${track.streamIndex} copied`
-        : `Audio #${track.streamIndex} → ${audioCodecLabels[track.codec]}${track.codec === 'flac' ? '' : ` ${track.bitrateKbps ?? '—'} kb/s`} · ${track.channels === 'preserve' ? 'source channels' : track.channels}${track.gain ? ` · Gain ${(track.gain.tenthsDb / 10).toFixed(1)} dB` : ''}`,
+        : `Audio #${track.streamIndex} → ${audioCodecLabels[track.codec]}${track.codec === 'flac' ? '' : ` ${track.bitrateKbps ?? '—'} kb/s`} · ${track.channels === 'preserve' ? 'source channels' : track.channels === 'surround51' ? '5.1' : track.channels === 'surround71' ? '7.1' : track.channels}${track.gain ? ` · Gain ${(track.gain.tenthsDb / 10).toFixed(1)} dB` : ''}`,
     )
     .join(' · ');
 }

@@ -65,6 +65,10 @@ impl Transform {
     }
 
     pub fn filter(&self) -> String {
+        let algorithm = match self.settings.algorithm.unwrap_or_default() {
+            media_core::ToneMapAlgorithm::Hable => "hable",
+            media_core::ToneMapAlgorithm::Mobius => "mobius",
+        };
         let transfer = if self.hlg {
             "arib-std-b67"
         } else {
@@ -78,7 +82,7 @@ impl Transform {
         // for its luma calculation; tell final zscale explicitly that the
         // samples are still linear RGB. Neutral-ramp arithmetic tests guard it.
         format!(
-            "zscale=pin=bt2020:tin={transfer}:min=bt2020nc:rin=limited:cin={}:p=bt2020:t=linear:m=gbr:r=full:npl=100:agamma=0,format=gbrpf32le,zscale=p=bt709,setparams=colorspace=bt709,tonemap=tonemap=hable:desat=2:peak={:.2},zscale=pin=bt709:tin=linear:min=gbr:rin=full:p=bt709:t=bt709:m=bt709:r=limited:c=left:dither=error_diffusion:agamma=0,format=yuv420p10le,limiter=min=64:max=940:planes=1,limiter=min=64:max=960:planes=6,sidedata=mode=delete,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+            "zscale=pin=bt2020:tin={transfer}:min=bt2020nc:rin=limited:cin={}:p=bt2020:t=linear:m=gbr:r=full:npl=100:agamma=0,format=gbrpf32le,zscale=p=bt709,setparams=colorspace=bt709,tonemap=tonemap={algorithm}:desat=2:peak={:.2},zscale=pin=bt709:tin=linear:min=gbr:rin=full:p=bt709:t=bt709:m=bt709:r=limited:c=left:dither=error_diffusion:agamma=0,format=yuv420p10le,limiter=min=64:max=940:planes=1,limiter=min=64:max=960:planes=6,sidedata=mode=delete,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
             self.chroma,
             f64::from(self.settings.source_peak_nits) / 100.0
         )

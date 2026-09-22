@@ -14,6 +14,7 @@
     lineartPsyBias = $bindable<number | undefined>(0),
     texturePsyBias = $bindable<number | undefined>(0),
     hdrTune = $bindable<HdrTune>('visualQuality'),
+    grainTableSelected = false,
   }: {
     idPrefix: string;
     disabled?: boolean;
@@ -26,6 +27,7 @@
     lineartPsyBias?: number;
     texturePsyBias?: number;
     hdrTune?: HdrTune;
+    grainTableSelected?: boolean;
   } = $props();
 </script>
 
@@ -34,9 +36,9 @@
     <label for={`${idPrefix}-backend`}>Encode backend</label>
     <select id={`${idPrefix}-backend`} bind:value={backend} {disabled}>
       <option value="standalone">Standalone encoder</option>
-      <option value="av1an">av1an · SVT-AV1 chunks</option>
+      <option value="av1an">av1an · parallel chunks</option>
     </select>
-    <p>Standalone uses the selected encoder. av1an runs the selected SVT-AV1 build in parallel.</p>
+    <p>Standalone uses the selected encoder. av1an splits the source into parallel chunks.</p>
   </div>
 {/if}
 {#if backend === 'av1an'}
@@ -59,12 +61,12 @@
       id={`${idPrefix}-workers`}
       type="number"
       min="1"
-      max="32"
+      max="64"
       step="1"
       bind:value={workers}
       {disabled}
     />
-    <p>1–32 workers · More parallel chunks use more CPU and memory.</p>
+    <p>1–64 workers · More parallel chunks use more CPU and memory.</p>
   </div>
 {/if}
 {#if encoder === 'svtAv1FiveFish'}
@@ -118,11 +120,12 @@
         max="50"
         step="1"
         bind:value={filmGrain}
-        {disabled}
+        disabled={disabled || grainTableSelected}
       />
       <p>
-        0 keeps synthesis off and encodes source texture. 1–50 adds synthesized grain with encoder
-        denoising disabled. This does not exactly restore the original grain.
+        {grainTableSelected
+          ? 'The selected grain table replaces encoder analysis strength.'
+          : '0 keeps synthesis off and encodes source texture. 1–50 adds synthesized grain with encoder denoising disabled. This does not exactly restore the original grain.'}
       </p>
     </div>
     <div class="field">

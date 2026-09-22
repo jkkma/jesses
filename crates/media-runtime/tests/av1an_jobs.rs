@@ -284,6 +284,196 @@ async fn av1an_preserves_frame_rate_color_audio_and_immutable_request() {
 }
 
 #[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, x264, VapourSynth and L-SMASH on PATH"]
+async fn av1an_x264_keeps_timing_color_audio_and_source() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("x264 source.mkv");
+    let output = fixture.0.join("x264 av1an.mkv");
+    synthesize(&input, "320x180", 96).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &output, 5);
+    request.settings.encoder = media_core::VideoEncoder::X264;
+    request.settings.crf = 23;
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(request).await.unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    if finished.state != JobState::Succeeded {
+        manager.shutdown().await;
+        panic!("av1an x264 failed: {finished:#?}");
+    }
+    let inspected = probe(&output).await;
+    let streams = inspected["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["nb_read_frames"], "96");
+    assert_eq!(video["r_frame_rate"], "24000/1001");
+    assert_eq!(video["pix_fmt"], "yuv420p10le");
+    assert_eq!(video["color_primaries"], "bt709");
+    assert_eq!(video["color_transfer"], "bt709");
+    assert_eq!(video["color_space"], "bt709");
+    assert_eq!(streams[0]["codec_name"], "pcm_s16le");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a packaged av1an with segment-ffmpeg9-v1, FFmpeg, FFprobe, x264 and mkvmerge"]
+async fn av1an_segment_reader_preserves_every_frame_and_its_source() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("segment source.mkv");
+    let output = fixture.0.join("segment output.mkv");
+    synthesize(&input, "320x180", 96).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &output, 5);
+    request.settings.encoder = media_core::VideoEncoder::X264;
+    request.settings.crf = 23;
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        chunk_method: media_core::Av1anChunkMethod::Segment,
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 24,
+        ..Default::default()
+    });
+
+    let submitted = manager.start_encode(request).await.unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    if finished.state != JobState::Succeeded {
+        manager.shutdown().await;
+        panic!("av1an Segment reader failed: {finished:#?}");
+    }
+    let inspected = probe(&output).await;
+    let streams = inspected["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["nb_read_frames"], "96");
+    assert_eq!(video["r_frame_rate"], "24000/1001");
+    assert_eq!(streams[0]["codec_name"], "pcm_s16le");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, x264, mkvmerge, VapourSynth and L-SMASH on PATH"]
+async fn av1an_x264_stops_with_verified_chunks_and_resumes_original_request() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("resume x264 source.mkv");
+    let output = fixture.0.join("resume x264 output.mkv");
+    synthesize(&input, "640x360", 288).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &output, 5);
+    request.settings.encoder = media_core::VideoEncoder::X264;
+    request.settings.crf = 23;
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(request.clone()).await.unwrap();
+    let partial = wait_for(&manager, &submitted.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|saved| saved.completed_frames >= 48)
+    })
+    .await;
+    assert_eq!(partial.state, JobState::Running, "{partial:#?}");
+    assert_eq!(
+        manager
+            .discard_av1an_recovery(submitted.id.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "JOB_DISCARD_UNAVAILABLE"
+    );
+    manager.stop_job(submitted.id.clone()).await.unwrap();
+    let stopped = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+    let saved = stopped
+        .recovery
+        .as_ref()
+        .expect("verified recovery locator");
+    assert!(saved.completed_frames >= 48 && saved.completed_frames < 288);
+    assert!(!output.exists());
+    manager.resume_job(submitted.id.clone()).await.unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert_eq!(finished.encode_settings.as_ref(), Some(&request.settings));
+    let inspected = probe(&output).await;
+    let streams = inspected["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["nb_read_frames"], "288");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, x264, mkvmerge, VapourSynth and L-SMASH on PATH"]
+async fn av1an_x264_discard_removes_only_stopped_jobs_saved_workspace() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("discard x264 source.mkv");
+    let output = fixture.0.join("discard x264 output.mkv");
+    synthesize(&input, "640x360", 288).await;
+    let original = std::fs::read(&input).unwrap();
+    let neighbor = fixture.0.join("neighbor.txt");
+    std::fs::write(&neighbor, b"preserve me").unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &output, 5);
+    request.settings.encoder = media_core::VideoEncoder::X264;
+    request.settings.crf = 23;
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(request).await.unwrap();
+    let partial = wait_for(&manager, &submitted.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|saved| saved.completed_frames >= 48)
+    })
+    .await;
+    assert_eq!(partial.state, JobState::Running, "{partial:#?}");
+    manager.stop_job(submitted.id.clone()).await.unwrap();
+    let stopped = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+    let workspace = PathBuf::from(&stopped.recovery.as_ref().unwrap().workspace);
+    assert!(workspace.exists());
+    let discarded = manager
+        .discard_av1an_recovery(submitted.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(discarded.state, JobState::Stopped);
+    assert!(discarded.recovery.is_none());
+    assert!(!workspace.exists());
+    assert_eq!(
+        manager.resume_job(submitted.id).await.unwrap_err().code,
+        "JOB_RESUME_UNAVAILABLE"
+    );
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"preserve me");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(!output.exists());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires corrected av1an, libvmaf, FFmpeg, FFprobe, SVT-AV1, VapourSynth and L-SMASH"]
 async fn av1an_target_probe_and_final_chunks_share_temporal_and_aspect_processing() {
     let fixture = Fixture::new();

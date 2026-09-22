@@ -686,6 +686,8 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
         .preview_encode_batch(BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            av1an_grain: None,
+            av1an_filters: Vec::new(),
             output_container: None,
             rate_control: None,
             lossless: false,

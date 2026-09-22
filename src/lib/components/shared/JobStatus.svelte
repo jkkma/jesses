@@ -14,6 +14,7 @@
     onstop,
     onkeep,
     onresume,
+    ondiscard,
     onpause,
   }: {
     job: JobSnapshot | undefined;
@@ -22,11 +23,15 @@
     onstop: () => Promise<void>;
     onkeep: (id: string) => Promise<void>;
     onresume: (id: string) => Promise<void>;
+    ondiscard: (id: string) => Promise<void>;
     onpause: (id: string, paused: boolean) => Promise<void>;
   } = $props();
   let errors = $state<Record<string, string>>({});
   let queueError = $state<string | null>(null);
-  let actions = $state<Record<string, 'cancel' | 'keep' | 'resume' | 'pause' | undefined>>({});
+  let actions = $state<
+    Record<string, 'cancel' | 'keep' | 'resume' | 'discard' | 'pause' | undefined>
+  >({});
+  let confirmDiscard = $state<string | null>(null);
   let stopping = $state(false);
   const pending = $derived(jobs.filter((entry) => !terminalJob(entry.state)));
   const history = $derived(
@@ -78,13 +83,18 @@
     }, 1_000);
     return () => clearInterval(timer);
   });
-  async function runAction(id: string, action: 'cancel' | 'keep' | 'resume') {
+  const canDiscard = (entry: JobSnapshot) =>
+    entry.encodeSettings?.backend === 'av1an' &&
+    !!entry.recovery &&
+    ['stopped', 'failed', 'interrupted'].includes(entry.state);
+  async function runAction(id: string, action: 'cancel' | 'keep' | 'resume' | 'discard') {
     if (actions[id] || stopping) return;
     const entry = jobs.find((candidate) => candidate.id === id);
     if (
       !entry ||
       (action === 'keep' && !canKeepProgress(entry)) ||
-      (action === 'resume' && !canResumeJob(entry))
+      (action === 'resume' && !canResumeJob(entry)) ||
+      (action === 'discard' && (!canDiscard(entry) || confirmDiscard !== id))
     )
       return;
     actions = { ...actions, [id]: action };
@@ -92,7 +102,16 @@
     delete nextErrors[id];
     errors = nextErrors;
     try {
-      await (action === 'cancel' ? oncancel : action === 'keep' ? onkeep : onresume)(id);
+      await (
+        action === 'cancel'
+          ? oncancel
+          : action === 'keep'
+            ? onkeep
+            : action === 'resume'
+              ? onresume
+              : ondiscard
+      )(id);
+      if (action === 'discard') confirmDiscard = null;
     } catch (cause) {
       errors = { ...errors, [id]: errorMessage(cause) };
     } finally {
@@ -173,6 +192,39 @@
       onclick={() => runAction(entry.id, 'resume')}
       >{actions[entry.id] === 'resume' ? 'Resuming…' : 'Resume'}</Button
     >
+  {/if}
+  {#if canDiscard(entry)}
+    {#if confirmDiscard === entry.id}
+      <div
+        class="saved-progress"
+        role="group"
+        aria-label={`Discard saved progress for job ${entry.id}`}
+      >
+        <p class="small-muted">
+          Delete this job's saved AV1AN work? You will need to start a new encode. The source file
+          is untouched.
+        </p>
+        <div class="discard-actions">
+          <Button
+            variant="outline"
+            disabled={!!actions[entry.id] || stopping}
+            onclick={() => runAction(entry.id, 'discard')}
+            >{actions[entry.id] === 'discard' ? 'Discarding…' : 'Confirm discard'}</Button
+          >
+          <Button
+            variant="ghost"
+            disabled={!!actions[entry.id] || stopping}
+            onclick={() => (confirmDiscard = null)}>Keep progress</Button
+          >
+        </div>
+      </div>
+    {:else}
+      <Button
+        variant="ghost"
+        disabled={!!actions[entry.id] || stopping}
+        onclick={() => (confirmDiscard = entry.id)}>Discard saved progress</Button
+      >
+    {/if}
   {/if}
 {/snippet}
 
@@ -404,6 +456,11 @@
   }
   .job-error {
     color: #8c2c22;
+  }
+  .discard-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   progress {
     width: 100%;

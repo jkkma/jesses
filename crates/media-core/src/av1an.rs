@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Av1anGrainSettings {
+    /// Validated table bytes are part of the immutable request, never a mutable path.
+    pub table: Option<String>,
+    pub denoise: bool,
+    pub denoise_strength: u8,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum Av1anChunkMethod {
@@ -10,6 +19,7 @@ pub enum Av1anChunkMethod {
     Bestsource,
     Select,
     Hybrid,
+    Segment,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -40,12 +50,64 @@ pub enum Av1anChunkOrder {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub enum Av1anConcatMethod {
+    #[default]
+    Ffmpeg,
+    Mkvmerge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum Av1anPixelFormat {
+    Yuv420p,
+    Yuv420p10le,
+    Yuv422p,
+    Yuv422p10le,
+    Yuv444p,
+    Yuv444p10le,
+}
+
+impl Av1anPixelFormat {
+    pub const fn ffmpeg(self) -> &'static str {
+        match self {
+            Self::Yuv420p => "yuv420p",
+            Self::Yuv420p10le => "yuv420p10le",
+            Self::Yuv422p => "yuv422p",
+            Self::Yuv422p10le => "yuv422p10le",
+            Self::Yuv444p => "yuv444p",
+            Self::Yuv444p10le => "yuv444p10le",
+        }
+    }
+}
+
+fn default_max_tries() -> u8 {
+    3
+}
+fn default_scene_slices() -> u8 {
+    1
+}
+fn is_default_max_tries(value: &u8) -> bool {
+    *value == default_max_tries()
+}
+fn is_default_scene_slices(value: &u8) -> bool {
+    *value == default_scene_slices()
+}
+fn is_default_concat(value: &Av1anConcatMethod) -> bool {
+    *value == Av1anConcatMethod::Ffmpeg
+}
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub enum Av1anTargetMetric {
     #[default]
     Vmaf,
     Ssimulacra2,
     Butteraugli,
     Xpsnr,
+    XpsnrWeighted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -75,6 +137,24 @@ pub struct Av1anOptions {
     pub chunk_order: Av1anChunkOrder,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub encoder_threads: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pixel_format: Option<Av1anPixelFormat>,
+    #[serde(skip_serializing_if = "is_default_max_tries")]
+    #[ts(optional, as = "Option<_>")]
+    pub max_tries: u8,
+    #[serde(skip_serializing_if = "is_default_scene_slices")]
+    #[ts(optional, as = "Option<_>")]
+    pub scene_detection_slices: u8,
+    #[serde(skip_serializing_if = "is_default_concat")]
+    #[ts(optional, as = "Option<_>")]
+    pub concat_method: Av1anConcatMethod,
+    #[serde(skip_serializing_if = "is_false")]
+    #[ts(optional, as = "Option<_>")]
+    pub attach_settings: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub target_quality: Option<Av1anTargetQuality>,
 }
 
@@ -88,6 +168,12 @@ impl Default for Av1anOptions {
             minimum_scene_frames: 24,
             scene_downscale_height: Some(360),
             chunk_order: Av1anChunkOrder::LongToShort,
+            encoder_threads: None,
+            pixel_format: None,
+            max_tries: default_max_tries(),
+            scene_detection_slices: default_scene_slices(),
+            concat_method: Av1anConcatMethod::Ffmpeg,
+            attach_settings: false,
             target_quality: None,
         }
     }
@@ -97,8 +183,45 @@ impl Default for Av1anOptions {
 mod tests {
     use super::*;
     #[test]
+    fn existing_options_keep_their_serialized_recovery_identity() {
+        let saved = serde_json::json!({"chunkMethod":"lsmash", "splitMethod":"sceneDetection", "sceneDetection":"standard", "maximumChunkFrames":240, "minimumSceneFrames":24, "sceneDownscaleHeight":360, "chunkOrder":"longToShort"});
+        let options: Av1anOptions = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(options, Av1anOptions::default());
+        assert_eq!(serde_json::to_value(options).unwrap(), saved);
+    }
+    #[test]
     fn saved_target_without_metric_preserves_vmaf() {
         let target: Av1anTargetQuality = serde_json::from_str(r#"{"minimumScoreTenths":940,"maximumScoreTenths":960,"minimumCrf":15,"maximumCrf":50,"probes":4,"probingRate":1,"probeWidth":1920,"probeHeight":1080}"#).unwrap();
         assert_eq!(target.metric, Av1anTargetMetric::Vmaf);
+    }
+    #[test]
+    fn weighted_xpsnr_has_its_own_serialized_identity() {
+        let weighted = Av1anTargetMetric::XpsnrWeighted;
+        assert_eq!(
+            serde_json::to_string(&weighted).unwrap(),
+            "\"xpsnrWeighted\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Av1anTargetMetric>("\"xpsnrWeighted\"").unwrap(),
+            weighted
+        );
+        assert_ne!(weighted, Av1anTargetMetric::Xpsnr);
+    }
+    #[test]
+    fn explicit_pixel_format_is_optional_and_serializes_by_format_name() {
+        let mut options = Av1anOptions::default();
+        assert!(
+            serde_json::to_value(options)
+                .unwrap()
+                .get("pixelFormat")
+                .is_none()
+        );
+        options.pixel_format = Some(Av1anPixelFormat::Yuv444p10le);
+        let saved = serde_json::to_value(options).unwrap();
+        assert_eq!(saved["pixelFormat"], "yuv444p10le");
+        assert_eq!(
+            serde_json::from_value::<Av1anOptions>(saved).unwrap(),
+            options
+        );
     }
 }

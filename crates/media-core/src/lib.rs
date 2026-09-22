@@ -18,10 +18,12 @@ pub use utilities::{
     UtilityRequest, UtilityResult,
 };
 mod av1an;
+mod av1an_resources;
 pub use av1an::{
-    Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSceneDetection, Av1anSplitMethod,
-    Av1anTargetMetric, Av1anTargetQuality,
+    Av1anChunkMethod, Av1anChunkOrder, Av1anConcatMethod, Av1anGrainSettings, Av1anOptions,
+    Av1anPixelFormat, Av1anSceneDetection, Av1anSplitMethod, Av1anTargetMetric, Av1anTargetQuality,
 };
+pub use av1an_resources::{Av1anResourceEstimate, Av1anResourceRequest};
 mod batch;
 mod bitrate;
 mod container;
@@ -65,7 +67,7 @@ pub use temporal::{
     DeinterlaceMode, DeinterlaceSettings, FieldOrder, FrameRate, QtgmcPreset, QtgmcSettings,
     ResizeFilter, TemporalSettings,
 };
-pub use tone_map::ToneMapSettings;
+pub use tone_map::{ToneMapAlgorithm, ToneMapSettings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -247,9 +249,15 @@ pub fn typescript_contracts() -> String {
         Av1anSplitMethod::decl(&config),
         Av1anSceneDetection::decl(&config),
         Av1anChunkOrder::decl(&config),
+        Av1anConcatMethod::decl(&config),
+        Av1anPixelFormat::decl(&config),
+        Av1anResourceRequest::decl(&config),
+        Av1anResourceEstimate::decl(&config),
         Av1anTargetMetric::decl(&config),
         Av1anTargetQuality::decl(&config),
         Av1anOptions::decl(&config),
+        Av1anGrainSettings::decl(&config),
+        ToneMapAlgorithm::decl(&config),
         ToneMapSettings::decl(&config),
         RemuxRequest::decl(&config),
         MuxSource::decl(&config),

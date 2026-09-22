@@ -29,6 +29,10 @@ export function isSvtEncoder(encoder: VideoEncoder): boolean {
   return encoder === 'svtAv1' || encoder === 'svtAv1FiveFish' || encoder === 'svtAv1Hdr';
 }
 
+export function isAv1anEncoder(encoder: VideoEncoder): boolean {
+  return isSvtEncoder(encoder) || encoder === 'x264';
+}
+
 const x264Presets = [
   'ultrafast',
   'superfast',
@@ -184,12 +188,19 @@ export function forkSettingsSummary(
   return '';
 }
 
-export function requiredEncoderTools(backend: EncodeBackend, encoder: VideoEncoder): string[] {
+export function requiredEncoderTools(
+  backend: EncodeBackend,
+  encoder: VideoEncoder,
+  concatMethod?: 'ffmpeg' | 'mkvmerge',
+): string[] {
   return [
     'ffmpeg',
     'ffprobe',
     encoderOptions(encoder).tool,
-    ...(encoder === 'x265Standalone' ? ['mkvmerge'] : []),
+    ...(encoder === 'x265Standalone' ||
+    (backend === 'av1an' && (encoder === 'x264' || concatMethod === 'mkvmerge'))
+      ? ['mkvmerge']
+      : []),
     ...(backend === 'av1an' ? ['av1an'] : []),
   ];
 }
@@ -214,7 +225,11 @@ export function encodeSummary(settings: EncodeSettings): string {
     const route = ['x264', 'x265Standalone', 'aomAv1', 'vpxStandalone'].includes(settings.encoder)
       ? 'Standalone'
       : 'FFmpeg';
-    return `${route} ${options.name} · ${options.codec} · Source bit depth · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless)} · Preset ${presetLabel(settings.encoder, settings.svtPreset ?? settings.preset)} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
+    const workflow =
+      settings.backend === 'av1an'
+        ? `av1an / ${options.name} · ${settings.workers ?? 2} parallel chunks`
+        : `${route} ${options.name}`;
+    return `${workflow} · ${options.codec} · Source bit depth · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless)} · Preset ${presetLabel(settings.encoder, settings.svtPreset ?? settings.preset)} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
   }
   const name = encoderOptions(settings.encoder).name;
   return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · 10-bit · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless)} · Preset ${settings.svtPreset ?? settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;

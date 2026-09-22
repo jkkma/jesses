@@ -10,7 +10,7 @@ pub struct EncoderParameterQuery {
     pub backend: EncodeBackend,
 }
 
-/// Validated scalar overrides. Names are catalog identifiers, never raw flags.
+/// Validated encoder overrides. Names are catalog identifiers, never raw flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EncoderParameter {
@@ -26,6 +26,21 @@ pub struct EncoderParameterSpec {
     pub argument: String,
     pub minimum: u16,
     pub maximum: u16,
+    /// Whole, decimal, pairWhole, pairDecimal, choice, or choiceList.
+    #[serde(default)]
+    pub value_kind: String,
+    #[serde(default)]
+    pub minimum_value: String,
+    #[serde(default)]
+    pub maximum_value: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub example: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use media_core::{Av1anChunkMethod, Av1anOptions};
+use media_core::{Av1anChunkMethod, Av1anOptions, VideoEncoder};
 
 use serde::{
     Deserialize, Deserializer,
@@ -26,6 +26,8 @@ pub(super) struct Expected<'a> {
     pub source: &'a Path,
     pub chunks_directory: &'a Path,
     pub video_params: &'a [String],
+    pub encoder: VideoEncoder,
+    pub pixel_format: &'a str,
     pub total_frames: u64,
     pub fps_num: u32,
     pub fps_den: u32,
@@ -136,7 +138,7 @@ struct ProbingStatistic {
 impl TargetQuality {
     fn matches_plan(&self, expected: &Expected<'_>) -> bool {
         let Some(target) = expected.options.target_quality else {
-            return self.matches_disabled_plan(expected.chunks_directory);
+            return self.matches_disabled_plan(expected);
         };
         self.vmaf_res == format!("{}x{}", target.probe_width, target.probe_height)
             && self.probe_res
@@ -160,8 +162,8 @@ impl TargetQuality {
             && self.min_q == u64::from(target.minimum_crf)
             && self.max_q == u64::from(target.maximum_crf)
             && self.interp_method.is_none()
-            && self.encoder == "svt_av1"
-            && self.pix_format == "YUV420P10LE"
+            && self.encoder == super::encoder::receipt_name(expected.encoder)
+            && self.pix_format.eq_ignore_ascii_case(expected.pixel_format)
             && same_path(&self.temp, expected.chunks_directory)
             && self.workers > 0
             && self.video_params.as_deref() == Some(expected.video_params)
@@ -171,7 +173,7 @@ impl TargetQuality {
             && self.probing_statistic.name == "Mean"
             && self.probing_statistic.value.is_none()
     }
-    fn matches_disabled_plan(&self, chunks: &Path) -> bool {
+    fn matches_disabled_plan(&self, expected: &Expected<'_>) -> bool {
         self.vmaf_res == "1920x1080"
             && self.probe_res.is_none()
             && self.vmaf_scaler == "bicubic"
@@ -184,11 +186,16 @@ impl TargetQuality {
             && self.target.is_none()
             && self.metric == "VMAF"
             && self.min_q == 15
-            && self.max_q == 50
+            && self.max_q
+                == if expected.encoder == VideoEncoder::X264 {
+                    35
+                } else {
+                    50
+                }
             && self.interp_method.is_none()
-            && self.encoder == "svt_av1"
-            && self.pix_format == "YUV420P10LE"
-            && same_path(&self.temp, chunks)
+            && self.encoder == super::encoder::receipt_name(expected.encoder)
+            && self.pix_format.eq_ignore_ascii_case(expected.pixel_format)
+            && same_path(&self.temp, expected.chunks_directory)
             && self.workers > 0
             && self.video_params.is_none()
             && !self.params_copied
@@ -474,7 +481,8 @@ fn validate_receipt_shapes(
             (expected.options.maximum_chunk_frames > 0)
                 .then_some(u64::from(expected.options.maximum_chunk_frames)),
         )
-        || chunks.len() != scenes.split_scenes.len()
+        || (expected.options.chunk_method != Av1anChunkMethod::Segment
+            && chunks.len() != scenes.split_scenes.len())
     {
         return Err("Recovery scenes and chunks do not cover the validated source exactly".into());
     }
@@ -483,18 +491,33 @@ fn validate_receipt_shapes(
     chunks.sort_by_key(|chunk| chunk.index);
     let mut segments = Vec::<PathBuf>::new();
     let mut segment_offset = 0;
-    for (index, (chunk, scene)) in chunks.iter().zip(&scenes.split_scenes).enumerate() {
+    let mut segment_frames = 0u64;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let scene = scenes.split_scenes.get(index);
+        let range_valid = if expected.options.chunk_method == Av1anChunkMethod::Segment {
+            chunk.start_frame == 0
+                && chunk.end_frame > 0
+                && segment_frames
+                    .checked_add(chunk.end_frame)
+                    .is_some_and(|next| next <= expected.total_frames)
+        } else {
+            let scene = scene.expect("non-segment queue matches the scene count");
+            (expected.options.chunk_method == Av1anChunkMethod::Hybrid
+                || (chunk.start_frame == scene.start_frame && chunk.end_frame == scene.end_frame))
+                && chunk.end_frame.checked_sub(chunk.start_frame)
+                    == Some(scene.end_frame - scene.start_frame)
+        };
+        if expected.options.chunk_method == Av1anChunkMethod::Segment {
+            segment_frames = segment_frames.saturating_add(chunk.end_frame);
+        }
         let quality = &chunk.target_quality;
         if chunk.index != index
-            || (expected.options.chunk_method != Av1anChunkMethod::Hybrid
-                && (chunk.start_frame != scene.start_frame || chunk.end_frame != scene.end_frame))
-            || chunk.end_frame.checked_sub(chunk.start_frame)
-                != Some(scene.end_frame - scene.start_frame)
+            || !range_valid
             || !same_path(&chunk.temp, expected.chunks_directory)
             || chunk.proxy.is_some()
             || chunk.proxy_cmd.is_some()
-            || chunk.output_ext != "ivf"
-            || chunk.encoder != "svt_av1"
+            || chunk.output_ext != super::encoder::chunk_extension(expected.encoder)
+            || chunk.encoder != super::encoder::receipt_name(expected.encoder)
             || chunk.passes != 1
             || chunk.video_params != expected.video_params
             || chunk.noise_size != (None, None)
@@ -537,13 +560,16 @@ fn validate_receipt_shapes(
                     && argv[8] == (chunk.end_frame - 1).to_string().as_str()
             }
             Input::Video(input) => {
-                let input_valid = if expected.options.chunk_method == Av1anChunkMethod::Hybrid {
-                    if segments
-                        .last()
-                        .is_none_or(|path| !same_path(path, &input.path))
-                    {
+                let input_valid = if matches!(
+                    expected.options.chunk_method,
+                    Av1anChunkMethod::Hybrid | Av1anChunkMethod::Segment
+                ) {
+                    if segments.last().is_none_or(|path| {
+                        expected.options.chunk_method == Av1anChunkMethod::Segment
+                            || !same_path(path, &input.path)
+                    }) {
                         if chunk.start_frame != 0 {
-                            return Err("Hybrid segment does not start at its first frame".into());
+                            return Err("Source segment does not start at its first frame".into());
                         }
                         let name = format!("{:05}.mkv", segments.len());
                         if !same_path(
@@ -555,49 +581,82 @@ fn validate_receipt_shapes(
                                 &expected.chunks_directory.join("split/0.mkv"),
                             ))
                         {
-                            return Err(
-                                "Hybrid source segment is outside its exact owned path".into()
-                            );
+                            return Err("Source segment is outside its exact owned path".into());
                         }
                         segments.push(input.path.clone());
-                        segment_offset = scene.start_frame;
+                        if expected.options.chunk_method == Av1anChunkMethod::Hybrid {
+                            segment_offset = scene
+                                .expect("hybrid queue matches the scene count")
+                                .start_frame;
+                        }
                     }
-                    chunk.start_frame.checked_add(segment_offset) == Some(scene.start_frame)
-                        && chunk.end_frame.checked_add(segment_offset) == Some(scene.end_frame)
+                    if expected.options.chunk_method == Av1anChunkMethod::Segment {
+                        true
+                    } else {
+                        let scene = scene.expect("hybrid queue matches the scene count");
+                        chunk.start_frame.checked_add(segment_offset) == Some(scene.start_frame)
+                            && chunk.end_frame.checked_add(segment_offset) == Some(scene.end_frame)
+                    }
                 } else {
                     expected.options.chunk_method == Av1anChunkMethod::Select
                         && same_path(&input.path, expected.source)
                 };
                 let wanted: Vec<OsString> =
-                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i"]
-                        .into_iter()
-                        .map(OsString::from)
-                        .chain(std::iter::once(input.path.as_os_str().to_owned()))
-                        .chain(
-                            [
-                                "-vf".to_owned(),
-                                format!(
-                                    r"select=between(n\,{}\,{}),setpts=PTS-STARTPTS",
-                                    chunk.start_frame,
-                                    chunk.end_frame - 1
-                                ),
-                                "-pix_fmt".into(),
-                                "yuv420p10le".into(),
-                                "-strict".into(),
-                                "-1".into(),
-                                "-fps_mode".into(),
-                                "passthrough".into(),
-                                "-f".into(),
-                                "yuv4mpegpipe".into(),
-                                "-".into(),
-                            ]
+                    if expected.options.chunk_method == Av1anChunkMethod::Segment {
+                        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i"]
                             .into_iter()
-                            .map(OsString::from),
-                        )
-                        .collect();
+                            .map(OsString::from)
+                            .chain(std::iter::once(input.path.as_os_str().to_owned()))
+                            .chain(
+                                [
+                                    "-strict",
+                                    "-1",
+                                    "-pix_fmt",
+                                    expected.pixel_format,
+                                    "-f",
+                                    "yuv4mpegpipe",
+                                    "-",
+                                ]
+                                .into_iter()
+                                .map(OsString::from),
+                            )
+                            .collect()
+                    } else {
+                        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i"]
+                            .into_iter()
+                            .map(OsString::from)
+                            .chain(std::iter::once(input.path.as_os_str().to_owned()))
+                            .chain(
+                                [
+                                    "-vf".to_owned(),
+                                    format!(
+                                        r"select=between(n\,{}\,{}),setpts=PTS-STARTPTS",
+                                        chunk.start_frame,
+                                        chunk.end_frame - 1
+                                    ),
+                                    "-pix_fmt".into(),
+                                    expected.pixel_format.into(),
+                                    "-strict".into(),
+                                    "-1".into(),
+                                    "-fps_mode".into(),
+                                    "passthrough".into(),
+                                    "-f".into(),
+                                    "yuv4mpegpipe".into(),
+                                    "-".into(),
+                                ]
+                                .into_iter()
+                                .map(OsString::from),
+                            )
+                            .collect()
+                    };
                 input_valid
                     && same_path(&input.temp, expected.chunks_directory)
-                    && input.chunk_method == "Select"
+                    && input.chunk_method
+                        == if expected.options.chunk_method == Av1anChunkMethod::Segment {
+                            "Segment"
+                        } else {
+                            "Select"
+                        }
                     && input.cache_mode == "TEMP"
                     && !input.is_proxy
                     && *argv == wanted
@@ -608,6 +667,11 @@ fn validate_receipt_shapes(
                 "Recovery chunk {index} has an unexpected source command or reader"
             ));
         }
+    }
+    if expected.options.chunk_method == Av1anChunkMethod::Segment
+        && (segment_frames != expected.total_frames || segments.len() != chunks.len())
+    {
+        return Err("Segment queue does not cover every validated source frame".into());
     }
     if segments.len() > 1 && segments[0].file_name().is_some_and(|name| name == "0.mkv") {
         return Err("Hybrid segmented paths mix incompatible naming modes".into());
@@ -708,6 +772,8 @@ video.set_output()
     struct Fixture {
         source: PathBuf,
         options: Av1anOptions,
+        encoder: VideoEncoder,
+        pixel_format: &'static str,
         directory: PathBuf,
         script: String,
         params: Vec<String>,
@@ -744,6 +810,8 @@ video.set_output()
             Self {
                 source,
                 options: Av1anOptions::default(),
+                encoder: VideoEncoder::SvtAv1,
+                pixel_format: "yuv420p10le",
                 directory,
                 script,
                 params,
@@ -758,6 +826,8 @@ video.set_output()
                 source: &self.source,
                 chunks_directory: &self.directory,
                 video_params: &self.params,
+                encoder: self.encoder,
+                pixel_format: self.pixel_format,
                 total_frames: 48,
                 fps_num: 24,
                 fps_den: 1,
@@ -776,6 +846,90 @@ video.set_output()
                 &self.expected(),
             )
         }
+    }
+
+    #[test]
+    fn segment_queue_uses_owned_local_ranges_and_complete_source_coverage() {
+        let mut fixture = Fixture::new();
+        fixture.options.chunk_method = Av1anChunkMethod::Segment;
+        fixture.script.clear();
+        let segment = fixture.directory.join("split/0.mkv");
+        let mut chunk = fixture.queue[0].clone();
+        chunk["input"] = json!({"Video": {
+            "path": segment, "temp": fixture.directory,
+            "chunk_method": "Segment", "is_proxy": false, "cache_mode": "TEMP"
+        }});
+        let mut source_cmd: Vec<OsString> =
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+        source_cmd.push(segment.clone().into_os_string());
+        source_cmd.extend(
+            [
+                "-strict",
+                "-1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        chunk["source_cmd"] = json!(source_cmd);
+        chunk["start_frame"] = json!(0);
+        chunk["end_frame"] = json!(48);
+        fixture.queue = json!([chunk]);
+        fixture.done["done"]["00000"]["frames"] = json!(48);
+        let receipts = fixture.validate().unwrap();
+        assert_eq!(receipts.queued_chunks, 1);
+        assert_eq!(receipts.segments, vec![segment.clone()]);
+
+        fixture.queue[0]["end_frame"] = json!(47);
+        assert!(
+            fixture.validate().is_err(),
+            "a missing source frame is rejected"
+        );
+        fixture.queue[0]["end_frame"] = json!(48);
+        source_cmd[7] = "-vf".into();
+        fixture.queue[0]["source_cmd"] = json!(source_cmd);
+        assert!(
+            fixture.validate().is_err(),
+            "an altered source command is rejected"
+        );
+        source_cmd[7] = "-strict".into();
+        fixture.queue[0]["source_cmd"] = json!(source_cmd);
+        fixture.queue[0]["input"]["Video"]["path"] =
+            json!(fixture.directory.join("split/foreign.mkv"));
+        assert!(
+            fixture.validate().is_err(),
+            "a foreign source segment is rejected"
+        );
+    }
+
+    #[test]
+    fn x264_queue_accepts_only_matching_encoder_extension_and_pixel_format() {
+        let mut fixture = Fixture::new();
+        fixture.encoder = VideoEncoder::X264;
+        fixture.pixel_format = "yuv420p";
+        for chunk in fixture.queue.as_array_mut().unwrap() {
+            chunk["encoder"] = json!("x264");
+            chunk["output_ext"] = json!("264");
+            chunk["target_quality"]["encoder"] = json!("x264");
+            chunk["target_quality"]["pix_format"] = json!("YUV420P");
+            chunk["target_quality"]["max_q"] = json!(35);
+        }
+        assert!(fixture.validate().is_ok());
+        fixture.queue[0]["output_ext"] = json!("ivf");
+        assert!(fixture.validate().is_err());
+        fixture.queue[0]["output_ext"] = json!("264");
+        fixture.queue[0]["encoder"] = json!("svt_av1");
+        assert!(fixture.validate().is_err());
+        fixture.queue[0]["encoder"] = json!("x264");
+        fixture.queue[0]["target_quality"]["pix_format"] = json!("YUV420P10LE");
+        assert!(fixture.validate().is_err());
     }
 
     #[test]
@@ -908,6 +1062,7 @@ video.set_output()
             media_core::Av1anTargetMetric::Ssimulacra2,
             media_core::Av1anTargetMetric::Butteraugli,
             media_core::Av1anTargetMetric::Xpsnr,
+            media_core::Av1anTargetMetric::XpsnrWeighted,
         ] {
             fixture.options.target_quality.as_mut().unwrap().metric = metric;
             assert!(

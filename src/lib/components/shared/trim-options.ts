@@ -39,7 +39,6 @@ export function trimError(
   streams: MediaStream[],
 ): string | null {
   if (!draft.enabled) return null;
-  if (backend !== 'standalone') return 'Video intervals require standalone encoding.';
   if (draft.mode === 'time') {
     if (
       ![draft.startMilliseconds, draft.endMilliseconds].every(

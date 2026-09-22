@@ -2,6 +2,8 @@ import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import type {
+  Av1anResourceRequest,
+  Av1anResourceEstimate,
   ImageRequest,
   ImageResult,
   UtilityRequest,
@@ -42,6 +44,21 @@ import type {
   SavePreferencesRequest,
   PreferenceImportPreview,
 } from './generated';
+
+export async function estimateAv1anResources(
+  request: Av1anResourceRequest,
+): Promise<Av1anResourceEstimate | null> {
+  if (!isTauri()) return null;
+  return invoke<Av1anResourceEstimate>('estimate_av1an_resources', { request });
+}
+
+export function readAv1anGrainTable(path: string): Promise<string> {
+  return invoke<string>('read_av1an_grain_table', { path });
+}
+
+export function makeAv1anGrainPreset(preset: string, signal?: AbortSignal): Promise<string> {
+  return analyzeSource('make_av1an_grain_preset', preset, signal);
+}
 
 export function runImageJob(request: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
   return analyzeSource('run_image_job', request, signal);
@@ -391,6 +408,11 @@ export async function stopJob(id: string): Promise<JobSnapshot> {
 export async function resumeJob(id: string): Promise<JobSnapshot> {
   requireDesktop();
   return invoke<JobSnapshot>('resume_job', { id });
+}
+
+export async function discardAv1anRecovery(id: string): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('discard_av1an_recovery', { id });
 }
 
 export async function subscribeJobs(handler: (jobs: JobSnapshot[]) => void): Promise<() => void> {

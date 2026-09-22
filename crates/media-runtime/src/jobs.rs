@@ -9,6 +9,7 @@ mod batch_tests;
 mod cadence;
 mod container;
 mod encode;
+mod encode_settings;
 pub use encode::preview_encode_plan;
 mod encode_plan;
 pub(crate) mod files;
@@ -342,6 +343,8 @@ impl JobManager {
             parameters: request.parameters.clone(),
             temporal: None,
             av1an_options: request.av1an_options,
+            av1an_grain: request.av1an_grain.clone(),
+            av1an_filters: request.av1an_filters.clone(),
             rate_control: request.rate_control,
             tone_map: None,
             trim: None,
@@ -1099,6 +1102,71 @@ impl JobManager {
         }));
         self.queue_changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    /// Discard a stopped av1an job's owned recovery files without requiring its
+    /// source media or encoder installation to still be present.
+    pub async fn discard_av1an_recovery(&self, id: String) -> Result<JobSnapshot, AppError> {
+        let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        if state.shutting_down {
+            return Err(AppError::new(
+                "APP_CLOSING",
+                "The application is closing; saved progress cannot be discarded now.",
+                None,
+            ));
+        }
+        let entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None))?;
+        let snapshot = entry.snapshot.clone();
+        let eligible = matches!(
+            snapshot.state,
+            JobState::Stopped | JobState::Failed | JobState::Interrupted
+        ) && snapshot
+            .encode_settings
+            .as_ref()
+            .is_some_and(|settings| settings.backend == media_core::EncodeBackend::Av1an)
+            && snapshot.recovery.is_some()
+            && entry.task.as_ref().is_none_or(|task| task.is_finished());
+        if !eligible {
+            return Err(AppError::new(
+                "JOB_DISCARD_UNAVAILABLE",
+                "Only a stopped, failed, or interrupted av1an job with saved progress can discard its recovery files after its worker exits.",
+                None,
+            ));
+        }
+        av1an::Recovery::discard(
+            &id,
+            &snapshot.request,
+            snapshot
+                .encode_settings
+                .as_ref()
+                .expect("checked av1an settings"),
+            snapshot
+                .recovery
+                .as_ref()
+                .expect("checked recovery locator"),
+        )
+        .await?;
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.snapshot.id == id)
+            .expect("held job manager state lock");
+        entry.snapshot.recovery = None;
+        append_log(
+            &mut entry.snapshot,
+            "Saved av1an progress was discarded.".into(),
+        );
+        let updated = entry.snapshot.clone();
+        self.persist(&mut state).await?;
+        self.queue_changed.notify_waiters();
+        Ok(updated)
     }
 
     pub async fn cancel_all_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {

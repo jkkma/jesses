@@ -2,17 +2,23 @@ import type { EncodeBackend, MediaStream, ToneMapSettings } from '$lib/ipc/gener
 
 export type ToneMapDraft = {
   enabled: boolean;
+  algorithm: NonNullable<ToneMapSettings['algorithm']>;
   sourcePeakNits: number | undefined;
   hdr10BaseLayer: boolean;
 };
 export const defaultToneMap = (): ToneMapDraft => ({
   enabled: false,
+  algorithm: 'hable',
   sourcePeakNits: 1000,
   hdr10BaseLayer: false,
 });
 export function selectedToneMap(draft: ToneMapDraft): ToneMapSettings | undefined {
   return draft.enabled
-    ? { sourcePeakNits: draft.sourcePeakNits!, hdr10BaseLayer: draft.hdr10BaseLayer }
+    ? {
+        ...(draft.algorithm === 'mobius' ? { algorithm: 'mobius' as const } : {}),
+        sourcePeakNits: draft.sourcePeakNits!,
+        hdr10BaseLayer: draft.hdr10BaseLayer,
+      }
     : undefined;
 }
 export function toneMapError(
@@ -22,7 +28,8 @@ export function toneMapError(
   hdr10Fallback = false,
 ): string | null {
   if (!draft.enabled) return null;
-  if (backend !== 'standalone') return 'HDR-to-SDR tone mapping requires standalone encoding.';
+  if (draft.algorithm !== 'hable' && draft.algorithm !== 'mobius')
+    return 'Choose Hable or Mobius tone mapping.';
   if (
     typeof draft.sourcePeakNits !== 'number' ||
     !Number.isInteger(draft.sourcePeakNits) ||
@@ -47,6 +54,6 @@ export function toneMapError(
 }
 export function toneMapSummary(tone: ToneMapSettings | undefined | null): string {
   return tone
-    ? ` · SDR BT.709 · Hable ${tone.sourcePeakNits} → 100 nits${tone.hdr10BaseLayer ? ' · HDR10 base layer' : ''}`
+    ? ` · SDR BT.709 · ${tone.algorithm === 'mobius' ? 'Mobius' : 'Hable'} ${tone.sourcePeakNits} → 100 nits${tone.hdr10BaseLayer ? ' · HDR10 base layer' : ''}`
     : '';
 }

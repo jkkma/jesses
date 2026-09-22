@@ -188,11 +188,7 @@ impl Geometry {
             // untouched content onto it. LUT filling avoids a slow per-pixel
             // expression. Both branches retain identical frame timestamps.
             filters.push(format!("format={pixel_format}"));
-            let depth_shift = match pixel_format {
-                "yuv420p" => 0,
-                "yuv420p10le" => 2,
-                _ => unreachable!("Plan validates supported output formats"),
-            };
+            let depth_shift = if pixel_format.ends_with("10le") { 2 } else { 0 };
             let black = if full_range { 0 } else { 16 << depth_shift };
             let neutral = 128 << depth_shift;
             filters.push(format!(

@@ -593,30 +593,69 @@ async fn ffmpeg_encoders(
 
 fn parse_grain_presets(bytes: &[u8]) -> Vec<String> {
     let mut presets = Vec::new();
+    let mut applicable = Vec::new();
+    let mut modifiers = Vec::new();
     let text = String::from_utf8_lossy(bytes);
-    let mut in_presets = false;
+    let mut section = 0_u8;
     for line in text.lines() {
         let line = line.trim();
         if line == "Available Presets:" {
-            in_presets = true;
+            section = 1;
             continue;
         }
-        if in_presets && line.starts_with("Example:") {
-            break;
+        if let Some(names) = line
+            .strip_prefix("Available film stock modifiers (applies to ")
+            .and_then(|line| line.strip_suffix("):"))
+        {
+            applicable = names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| valid_grain_preset_name(name))
+                .map(str::to_owned)
+                .collect();
+            section = 2;
+            continue;
         }
-        if in_presets && !line.is_empty() {
+        if line.starts_with("Example:") {
+            section = 0;
+            continue;
+        }
+        if section == 1 && !line.is_empty() {
             let name = line.split("  (").next().unwrap_or_default().trim();
-            if !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            {
+            if valid_grain_preset_name(name) && !presets.iter().any(|preset| preset == name) {
                 presets.push(name.to_owned());
+            }
+        } else if section == 2 {
+            let suffix = line.split_whitespace().next().unwrap_or_default();
+            if let Some(number) = suffix.strip_prefix('-')
+                && number
+                    .parse::<u8>()
+                    .is_ok_and(|number| (1..=99).contains(&number))
+                && line.len() > suffix.len()
+                && !modifiers.iter().any(|modifier| modifier == suffix)
+            {
+                modifiers.push(suffix.to_owned());
+            }
+        }
+    }
+    let bases = presets.clone();
+    for base in bases.iter().filter(|base| applicable.contains(base)) {
+        for modifier in &modifiers {
+            let name = format!("{base}{modifier}");
+            if valid_grain_preset_name(&name) {
+                presets.push(name);
             }
         }
     }
     presets
+}
+
+fn valid_grain_preset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 async fn ocr_languages(tesseract: Option<&Path>, cancel: &watch::Receiver<bool>) -> Vec<String> {
@@ -2936,7 +2975,186 @@ async fn run_subtitle_ocr(
     }))
 }
 
-fn validate_grain_table(bytes: &[u8]) -> Result<u32, String> {
+pub fn read_av1an_grain_table(path: String) -> Result<String, AppError> {
+    let source = Source::open(valid_absolute(&path)?)?;
+    let mut bytes = Vec::new();
+    fs::File::open(&source.path)
+        .and_then(|file| file.take(262145).read_to_end(&mut bytes))
+        .map_err(|e| error("GRAIN_TABLE_UNREADABLE", e.to_string(), Some(&source.path)))?;
+    source.verify()?;
+    if bytes.len() > 262144 {
+        return Err(error(
+            "GRAIN_TABLE_INVALID",
+            "Encode grain tables must be at most 256 KiB.",
+            Some(&source.path),
+        ));
+    }
+    validate_grain_table(&bytes)
+        .map_err(|e| error("GRAIN_TABLE_INVALID", e, Some(&source.path)))?;
+    String::from_utf8(bytes)
+        .map_err(|e| error("GRAIN_TABLE_INVALID", e.to_string(), Some(&source.path)))
+}
+
+pub async fn make_av1an_grain_preset(
+    preset: String,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, AppError> {
+    let _permit = crate::analysis::permit(&cancel).await?;
+    if !valid_grain_preset_name(&preset) {
+        return Err(error(
+            "GRAIN_PRESET_INVALID",
+            "Choose an advertised film-stock preset.",
+            None,
+        ));
+    }
+    let grav = tool("grav1synth", "Film-stock presets").await?;
+    let ffmpeg = tool("ffmpeg", "Film-stock preset preparation").await?;
+    let svt = tool("SvtAv1EncApp", "Film-stock preset reference encoding").await?;
+    let listed = checked(
+        grav.clone(),
+        vec!["presets".into()],
+        &cancel,
+        Duration::from_secs(15),
+        None,
+        "Film-stock presets",
+    )
+    .await?;
+    if !parse_grain_presets(&listed.stdout)
+        .iter()
+        .any(|p| p == &preset)
+    {
+        return Err(error(
+            "GRAIN_PRESET_INVALID",
+            "This film-stock preset is not advertised by the installed tool.",
+            None,
+        ));
+    }
+    let scratch = Scratch::create("encode-grain-preset")?;
+    let stub = scratch.path.join("stub.mkv");
+    let grained = scratch.path.join("grained.mkv");
+    let table = scratch.path.join("grain.tbl");
+    let raw = scratch.path.join("stub.y4m");
+    let encoded = scratch.path.join("stub.ivf");
+    // The packaged FFmpeg deliberately uses standalone video encoders. Keep
+    // preset generation on that same toolchain instead of requiring libsvtav1.
+    let mut args: Vec<OsString> = [
+        "-v",
+        "error",
+        "-nostdin",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:s=64x64:r=24:d=15",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "yuv4mpegpipe",
+        "-n",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(os(&raw));
+    checked(
+        ffmpeg.clone(),
+        args,
+        &cancel,
+        Duration::from_secs(120),
+        None,
+        "Film-stock reference frames",
+    )
+    .await?;
+    checked(
+        svt,
+        vec![
+            "-i".into(),
+            os(&raw),
+            "-b".into(),
+            os(&encoded),
+            "--preset".into(),
+            "12".into(),
+            "--crf".into(),
+            "63".into(),
+            "--input-depth".into(),
+            "8".into(),
+            "--lp".into(),
+            "2".into(),
+        ],
+        &cancel,
+        Duration::from_secs(120),
+        None,
+        "AV1 preset reference",
+    )
+    .await?;
+    checked(
+        ffmpeg,
+        vec![
+            "-v".into(),
+            "error".into(),
+            "-nostdin".into(),
+            "-i".into(),
+            os(&encoded),
+            "-c:v".into(),
+            "copy".into(),
+            "-n".into(),
+            os(&stub),
+        ],
+        &cancel,
+        Duration::from_secs(120),
+        None,
+        "AV1 preset container",
+    )
+    .await?;
+    checked(
+        grav.clone(),
+        vec![
+            "apply".into(),
+            os(&stub),
+            "--output".into(),
+            os(&grained),
+            "--preset".into(),
+            preset.into(),
+            "--replace".into(),
+        ],
+        &cancel,
+        Duration::from_secs(120),
+        None,
+        "Film-stock preset generation",
+    )
+    .await?;
+    checked(
+        grav,
+        vec![
+            "inspect".into(),
+            os(&grained),
+            "--output".into(),
+            os(&table),
+        ],
+        &cancel,
+        Duration::from_secs(120),
+        None,
+        "Film-stock table extraction",
+    )
+    .await?;
+    let original = read_av1an_grain_table(table.to_string_lossy().into_owned())?;
+    let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
+    if let Some(last) = lines.iter_mut().rfind(|line| line.starts_with("E ")) {
+        let mut fields = last
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let end = fields[2]
+            .parse::<u64>()
+            .map_err(|_| error("GRAIN_TABLE_INVALID", "Invalid table coverage.", None))?;
+        fields[2] = end.max(864_000_000_000).to_string();
+        *last = fields.join(" ");
+    }
+    let result = lines.join("\n") + "\n";
+    validate_grain_table(result.as_bytes()).map_err(|e| error("GRAIN_TABLE_INVALID", e, None))?;
+    Ok(result)
+}
+
+pub(crate) fn validate_grain_table(bytes: &[u8]) -> Result<u32, String> {
     if bytes.is_empty() || bytes.len() > 64 * 1024 * 1024 || bytes.contains(&0) {
         return Err("The grain table is empty, too large, or contains binary data.".into());
     }
@@ -4168,6 +4386,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn film_stock_modifiers_expand_only_advertised_applicable_bases() {
+        let advertised = b"Available Presets:\n  Super8  (Super 8mm)\n  MaxMid  (Synthetic)\n  16mm  (16mm)\n  Classic35  (35mm)\n  Modern35  (Full Frame)\nExample: use 16mm\nAvailable film stock modifiers (applies to 16mm, Classic35, Modern35):\n  -1  Fujifilm Eterna 500T\n  -2  Kodak Vision3 250D\n  -3  Kodak Vision3 200T\nExample: use 16mm-3\n";
+        let presets = parse_grain_presets(advertised);
+        assert_eq!(presets.len(), 14);
+        for base in ["16mm", "Classic35", "Modern35"] {
+            for suffix in 1..=3 {
+                assert!(presets.contains(&format!("{base}-{suffix}")));
+            }
+        }
+        assert!(!presets.contains(&"Super8-3".to_owned()));
+        assert!(!presets.contains(&"MaxMid-3".to_owned()));
+        assert!(!presets.contains(&"16mm-4".to_owned()));
+        assert_eq!(
+            parse_grain_presets(b"Available Presets:\n  16mm  (16mm)\nExample: use 16mm\n"),
+            vec!["16mm"]
+        );
+    }
+
+    #[test]
     fn sample_plan_is_centered_bounded_and_non_overlapping() {
         let samples = plan_samples(7_200.0, 5, 10.0);
         assert_eq!(samples.len(), 5);
@@ -4189,6 +4426,46 @@ mod tests {
         );
         assert!(validate_grain_table(b"E 0 100 1 2 1\nE 99 200 1 3 1\n").is_err());
         assert!(validate_grain_table(b"E 0 100 1\0 1\n").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires grav1synth presets, FFmpeg and standalone SVT-AV1"]
+    async fn av1an_film_stock_preset_produces_immutable_table_bytes() {
+        let (_sender, cancel) = watch::channel(false);
+        let table = make_av1an_grain_preset("16mm".into(), cancel)
+            .await
+            .unwrap();
+        assert!(table.starts_with("filmgrn1\n"));
+        assert!(table.len() <= 262144);
+        assert!(validate_grain_table(table.as_bytes()).unwrap() > 0);
+        let end = table
+            .lines()
+            .rfind(|line| line.starts_with("E "))
+            .unwrap()
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(end >= 864_000_000_000);
+        let (_sender, cancel) = watch::channel(true);
+        assert!(
+            make_av1an_grain_preset("16mm".into(), cancel)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires grav1synth stock modifiers, FFmpeg and standalone SVT-AV1"]
+    async fn av1an_modified_film_stock_preset_generates_valid_table() {
+        let (_sender, cancel) = watch::channel(false);
+        let table = make_av1an_grain_preset("16mm-3".into(), cancel)
+            .await
+            .unwrap();
+        assert!(table.starts_with("filmgrn1\n"));
+        assert!(table.len() <= 262144);
+        assert!(validate_grain_table(table.as_bytes()).unwrap() > 0);
     }
 
     #[test]

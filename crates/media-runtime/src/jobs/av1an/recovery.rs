@@ -270,6 +270,8 @@ struct Manifest {
     prepared_identity: Option<String>,
     tools: Vec<Stamp>,
     params: Vec<String>,
+    #[serde(default = "default_pixel_format")]
+    pixel_format: String,
     fps_num: u32,
     fps_den: u32,
     total_frames: u64,
@@ -287,6 +289,17 @@ struct Manifest {
     segments: Vec<Stamp>,
     intermediate: Identity,
     final_video: Option<Stamp>,
+}
+
+fn default_pixel_format() -> String {
+    "yuv420p10le".into()
+}
+
+fn video_path(root: &Path, settings: &EncodeSettings) -> PathBuf {
+    root.join(format!(
+        "video.{}",
+        super::encoder::video_extension(settings.encoder, settings)
+    ))
 }
 
 fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
@@ -399,7 +412,16 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
         ("chunks/chunks.json", manifest.queue.as_ref()),
         ("chunks/scenes.json", manifest.scenes.as_ref()),
         ("chunks/split/loadscript.vpy", manifest.script.as_ref()),
-        ("video.ivf", manifest.final_video.as_ref()),
+        (
+            if super::encoder::video_extension(manifest.settings.encoder, &manifest.settings)
+                == "ivf"
+            {
+                "video.ivf"
+            } else {
+                "video.mkv"
+            },
+            manifest.final_video.as_ref(),
+        ),
     ];
     for (relative, stamp) in expected {
         if stamp.is_some_and(|stamp| stamp.path != root.join(relative)) {
@@ -429,18 +451,15 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
         ));
     }
     for (index, segment) in manifest.segments.iter().enumerate() {
-        if manifest
-            .settings
-            .av1an_options
-            .unwrap_or_default()
-            .chunk_method
-            != media_core::Av1anChunkMethod::Hybrid
-            || (segment.path != root.join("chunks/split").join(format!("{index:05}.mkv"))
-                && !(manifest.segments.len() == 1
-                    && index == 0
-                    && segment.path == root.join("chunks/split/0.mkv")))
+        if !matches!(
+            options.chunk_method,
+            media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment
+        ) || (segment.path != root.join("chunks/split").join(format!("{index:05}.mkv"))
+            && !(manifest.segments.len() == 1
+                && index == 0
+                && segment.path == root.join("chunks/split/0.mkv")))
         {
-            return Err(error(root, "Unexpected hybrid source segment location."));
+            return Err(error(root, "Unexpected source segment location."));
         }
     }
     if manifest.queue.is_some() != manifest.scenes.is_some()
@@ -448,6 +467,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             != manifest.script.is_some()
         || (manifest.queue.is_some() && expected_reader_cache.is_some())
             != manifest.reader_cache.is_some()
+        || (manifest.queue.is_none() && !manifest.segments.is_empty())
         || (manifest.queue.is_none() && !manifest.completed.is_empty())
         || (manifest.phase == RecoveryPhase::Finalizing) != manifest.final_video.is_some()
     {
@@ -460,9 +480,16 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     for (name, chunk) in &manifest.completed {
         if name.len() != 5
             || !name.bytes().all(|b| b.is_ascii_digit())
-            || chunk.file.path != root.join("chunks/encode").join(format!("{name}.ivf"))
+            || chunk.file.path
+                != root.join("chunks/encode").join(format!(
+                    "{name}.{}",
+                    super::encoder::chunk_extension(manifest.settings.encoder)
+                ))
             || chunk.frames == 0
-            || chunk.frames > 240
+            || chunk.frames > manifest.total_frames
+            || (options.chunk_method != media_core::Av1anChunkMethod::Segment
+                && options.maximum_chunk_frames > 0
+                && chunk.frames > u64::from(options.maximum_chunk_frames))
             || chunk.file.length == 0
         {
             return Err(error(root, "Invalid completed chunk recovery record."));
@@ -634,6 +661,8 @@ impl Workspace {
                 source: &self.manifest.source.path,
                 chunks_directory: &chunks,
                 video_params: &self.manifest.params,
+                encoder: self.manifest.settings.encoder,
+                pixel_format: &self.manifest.pixel_format,
                 total_frames: self.manifest.total_frames,
                 fps_num: self.manifest.fps_num,
                 fps_den: self.manifest.fps_den,
@@ -776,7 +805,11 @@ impl Workspace {
             if self.manifest.completed.contains_key(&chunk.name) {
                 continue;
             }
-            let path = encode.join(format!("{}.ivf", chunk.name));
+            let path = encode.join(format!(
+                "{}.{}",
+                chunk.name,
+                super::encoder::chunk_extension(self.manifest.settings.encoder)
+            ));
             // Once a completion receipt is observed, keep its file read-only
             // through concatenation. This closes the verification-to-reuse gap.
             let guard = Source::open(&path)?;
@@ -866,7 +899,11 @@ impl Workspace {
                         path.file_name()
                             .and_then(|name| name.to_str())
                             .is_some_and(|name| {
-                                let Some(index) = name.strip_suffix(".ivf") else {
+                                let extension = format!(
+                                    ".{}",
+                                    super::encoder::chunk_extension(self.manifest.settings.encoder)
+                                );
+                                let Some(index) = name.strip_suffix(&extension) else {
                                     return false;
                                 };
                                 index.len() == 5
@@ -918,6 +955,40 @@ impl Workspace {
 }
 
 impl Recovery {
+    /// Delete only the workspace bound to this saved job. Discarding progress
+    /// intentionally does not read the original media or installed tools: a
+    /// missing source must not prevent removal of an owned recovery directory.
+    pub(in crate::jobs) async fn discard(
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        locator: &Av1anRecovery,
+    ) -> Result<(), AppError> {
+        let (id, request, settings, locator) = (
+            id.to_owned(),
+            request.clone(),
+            settings.clone(),
+            locator.clone(),
+        );
+        let locator_path = PathBuf::from(&locator.workspace);
+        tokio::task::spawn_blocking(move || {
+            let (root, manifest) = load(&id, &request, &settings, &locator)?;
+            let (directory, lock) = lock_workspace(&root)?;
+            // The lock acquisition may have raced a workspace replacement.
+            let (_, current) = load(&id, &request, &settings, &locator)?;
+            if current.directory != manifest.directory || identity(&root)? != manifest.directory {
+                return Err(error(
+                    &root,
+                    "The recovery directory changed before discard.",
+                ));
+            }
+            drop(lock);
+            remove_tree(&root, &manifest.directory, Some(directory))
+        })
+        .await
+        .map_err(|cause| error(&locator_path, cause.to_string()))?
+    }
+
     pub(in crate::jobs) fn source_filter(&self) -> Result<Option<String>, AppError> {
         self.inner
             .lock()
@@ -946,11 +1017,12 @@ impl Recovery {
             source.to_owned(),
             cancel.clone(),
         );
-        let params = encoder_parameters(plan, &settings)
+        let params = super::encoder::parameters(plan, &settings)
             .into_iter()
             .map(|v| v.into_string().expect("encoder ASCII params"))
             .collect::<Vec<_>>();
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
+        let pixel_format = plan.output_pixel_format.to_owned();
         let source_filter = prepared.is_none().then(|| plan.decoder_filter()).flatten();
         tokio::task::spawn_blocking(move || {
             let original_source = digest(&source, Some(&cancel))?;
@@ -974,6 +1046,7 @@ impl Recovery {
                 if !source_matches
                     || !tool_contents_match(&manifest.tools, &tool_stamps)
                     || manifest.params != params
+                    || manifest.pixel_format != pixel_format
                     || manifest.fps_num != fps_num
                     || manifest.fps_den != fps_den
                     || manifest.total_frames != frame_count as u64
@@ -984,15 +1057,15 @@ impl Recovery {
                         "Source content, prepared decoded pixels, selected tools, encoder parameters, or frame timing changed; this job cannot reuse old chunks.",
                     ));
                 }
-                if identity(&root.join("video.ivf"))? != manifest.intermediate {
+                if identity(&video_path(&root, &settings))? != manifest.intermediate {
                     return Err(error(&root, "The durable video intermediate was replaced."));
                 }
-                let intermediate = Temporary::durable(&root.join("video.ivf"), true)?;
+                let intermediate = Temporary::durable(&video_path(&root, &settings), true)?;
                 (root, manifest, intermediate)
             } else {
                 let root = root_for(&id, &request)?;
                 fs::create_dir(&root).map_err(|e| error(&root, e.to_string()))?;
-                let intermediate = Temporary::durable(&root.join("video.ivf"), false)?;
+                let intermediate = Temporary::durable(&video_path(&root, &settings), false)?;
                 let (source_stamp, saved_original, prepared_identity) =
                     if let Some(prepared) = &prepared {
                         (
@@ -1014,6 +1087,7 @@ impl Recovery {
                     prepared_identity,
                     tools: tool_stamps,
                     params,
+                    pixel_format,
                     fps_num,
                     fps_den,
                     total_frames: frame_count as u64,
@@ -1116,7 +1190,7 @@ impl Recovery {
         })
         .await
     }
-    /// Hybrid creates copied GOP segments. Fingerprint/lock each file at its
+    /// Hybrid and Segment create copied source segments. Fingerprint/lock each file at its
     /// first checkpoint, and independently compare their complete decoded pixel
     /// sequence to the source before reuse or publication. No size/count-only
     /// receipt is accepted as evidence that a segment contains the right frames.
@@ -1166,7 +1240,7 @@ impl Recovery {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if bytes(&list)? != text.as_bytes() {
-                    return Err(error(&list, "Hybrid verification list changed."));
+                    return Err(error(&list, "Source segment verification list changed."));
                 }
             }
             Err(e) => return Err(error(&list, e.to_string())),
@@ -1230,7 +1304,7 @@ impl Recovery {
                 return Err(error(
                     input,
                     format!(
-                        "Hybrid source identity decode failed: {}",
+                        "Source segment identity decode failed: {}",
                         String::from_utf8_lossy(&result.stderr)
                     ),
                 ));
@@ -1241,7 +1315,7 @@ impl Recovery {
         if hashes[0] != hashes[1] {
             return Err(error(
                 input,
-                "Hybrid segments changed, reordered, omitted, or duplicated decoded source frames.",
+                "Source segments changed, reordered, omitted, or duplicated decoded source frames.",
             ));
         }
         self.with(|w| {
@@ -1276,7 +1350,8 @@ impl Recovery {
                 for chunk in &w.chunks {
                     chunk.verify()?;
                 }
-                w.manifest.final_video = Some(digest(&w.root.join("video.ivf"), None)?);
+                w.manifest.final_video =
+                    Some(digest(&video_path(&w.root, &w.manifest.settings), None)?);
                 w.manifest.phase = RecoveryPhase::Finalizing;
                 Ok(())
             })?;
@@ -1471,6 +1546,7 @@ mod tests {
                 prepared_identity: None,
                 tools: vec![],
                 params: vec![],
+                pixel_format: default_pixel_format(),
                 fps_num: 24,
                 fps_den: 1,
                 total_frames: 48,
@@ -1506,6 +1582,81 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn discard_requires_the_saved_owner_and_preserves_neighbor_without_source() {
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let locator = workspace.summary();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let neighbor = fixture.0.join("neighbor.txt");
+        fs::write(&neighbor, b"not workspace content").unwrap();
+
+        // An active job's exclusive workspace lock bars the discard API.
+        assert!(
+            Recovery::discard("owned-job", &request, &settings, &locator)
+                .await
+                .is_err()
+        );
+        assert!(root.exists());
+        drop(workspace);
+        drop(intermediate);
+        fs::remove_file(&request.input_path).unwrap();
+        Recovery::discard("owned-job", &request, &settings, &locator)
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(&neighbor).unwrap(), b"not workspace content");
+    }
+
+    #[tokio::test]
+    async fn discard_rejects_replaced_root_and_symlink_without_deleting_outside_data() {
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let locator = workspace.summary();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        drop(workspace);
+        drop(intermediate);
+
+        let moved = fixture.0.join("original-workspace");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::copy(moved.join("manifest.json"), root.join("manifest.json")).unwrap();
+        let foreign = root.join("foreign.txt");
+        fs::write(&foreign, b"foreign").unwrap();
+        assert!(
+            Recovery::discard("owned-job", &request, &settings, &locator)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+        assert!(moved.join("manifest.json").exists());
+
+        // Reopen the genuine root and place a link to an outside sentinel. A
+        // complete pre-delete walk must reject it before removing any entry.
+        fs::remove_dir_all(&root).unwrap();
+        fs::rename(&moved, &root).unwrap();
+        let sentinel = fixture.0.join("outside-sentinel.txt");
+        fs::write(&sentinel, b"outside").unwrap();
+        let link = root.join("outside-link");
+        #[cfg(unix)]
+        let link_created = std::os::unix::fs::symlink(&sentinel, &link).is_ok();
+        #[cfg(windows)]
+        let link_created = std::os::windows::fs::symlink_file(&sentinel, &link).is_ok();
+        if link_created {
+            assert!(
+                Recovery::discard("owned-job", &request, &settings, &locator)
+                    .await
+                    .is_err()
+            );
+            assert!(root.join("manifest.json").exists());
+        }
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
     }
 
     #[test]
@@ -1959,6 +2110,36 @@ mod tests {
             drop(intermediate);
             drop(workspace);
         }
+    }
+
+    #[test]
+    fn segment_checkpoint_paths_are_owned_and_require_a_queue() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            chunk_method: media_core::Av1anChunkMethod::Segment,
+            ..Default::default()
+        });
+        let split = workspace.root.join("chunks/split");
+        fs::create_dir_all(&split).unwrap();
+        let segment = split.join("0.mkv");
+        fs::write(&segment, b"owned segment").unwrap();
+        workspace
+            .manifest
+            .segments
+            .push(digest(&segment, None).unwrap());
+        assert!(validate_layout(&workspace.root, &workspace.manifest).is_err());
+        let queue = workspace.root.join("chunks/chunks.json");
+        let scenes = workspace.root.join("chunks/scenes.json");
+        fs::write(&queue, b"queue").unwrap();
+        fs::write(&scenes, b"scenes").unwrap();
+        workspace.manifest.queue = Some(digest(&queue, None).unwrap());
+        workspace.manifest.scenes = Some(digest(&scenes, None).unwrap());
+        validate_layout(&workspace.root, &workspace.manifest).unwrap();
+        workspace.manifest.segments[0].path = split.join("foreign.mkv");
+        assert!(validate_layout(&workspace.root, &workspace.manifest).is_err());
+        drop(intermediate);
+        drop(workspace);
     }
 
     #[test]

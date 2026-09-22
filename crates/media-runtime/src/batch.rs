@@ -544,6 +544,7 @@ fn quality_value(request: &BatchEncodeRequest) -> String {
             Av1anTargetMetric::Ssimulacra2 => "ssimulacra2",
             Av1anTargetMetric::Butteraugli => "butteraugli",
             Av1anTargetMetric::Xpsnr => "xpsnr",
+            Av1anTargetMetric::XpsnrWeighted => "xpsnr-weighted",
         };
         return format!(
             "{metric}_{}-{}",
@@ -808,6 +809,8 @@ pub(crate) async fn preview(
             temporal: input.temporal,
             parameters: request.parameters.clone(),
             av1an_options: request.av1an_options,
+            av1an_grain: request.av1an_grain.clone(),
+            av1an_filters: request.av1an_filters.clone(),
             rate_control: request.rate_control,
             tone_map: input.tone_map,
             trim: input.trim,
@@ -927,6 +930,8 @@ mod tests {
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                av1an_grain: None,
+                av1an_filters: Vec::new(),
                 output_container: None,
                 rate_control: None,
                 backend: EncodeBackend::Standalone,
@@ -1352,6 +1357,8 @@ mod tests {
         let request = BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            av1an_grain: None,
+            av1an_filters: Vec::new(),
             output_container: None,
             rate_control: None,
             lossless: false,
@@ -1387,10 +1394,19 @@ mod tests {
             result.items[0].error.as_ref().unwrap().code,
             "FILE_NOT_FOUND"
         );
+        let mut av1an_request = request.clone();
+        av1an_request.backend = media_core::EncodeBackend::Av1an;
+        let av1an = manager.preview_encode_batch(av1an_request).await.unwrap();
+        assert_eq!(
+            av1an.items[0].error.as_ref().unwrap().code,
+            "FILE_NOT_FOUND"
+        );
         for invalid in [
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                av1an_grain: None,
+                av1an_filters: Vec::new(),
                 output_container: None,
                 film_grain: 1,
                 ..request.clone()
@@ -1398,16 +1414,11 @@ mod tests {
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                av1an_grain: None,
+                av1an_filters: Vec::new(),
                 output_container: None,
                 hdr10_fallback: true,
                 ..request.clone()
-            },
-            BatchEncodeRequest {
-                parameters: Vec::new(),
-                av1an_options: None,
-                output_container: None,
-                backend: media_core::EncodeBackend::Av1an,
-                ..request
             },
         ] {
             assert_eq!(
@@ -1470,6 +1481,8 @@ mod tests {
             .preview_encode_batch(BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                av1an_grain: None,
+                av1an_filters: Vec::new(),
                 output_container: None,
                 rate_control: None,
                 lossless: false,

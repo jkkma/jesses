@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type {
   AppError,
+  Av1anResourceEstimate,
   EncodeRequest,
   JobSnapshot,
   MediaFile,
@@ -18,6 +19,9 @@ const av1anDefaults = {
   sceneDetection: 'standard',
   sceneDownscaleHeight: 360,
   splitMethod: 'sceneDetection',
+  maxTries: 3,
+  concatMethod: 'ffmpeg',
+  attachSettings: false,
 } as const;
 const baseStream: MediaStream = {
   index: 0,
@@ -146,6 +150,8 @@ async function desktopMock(
     held?: string[];
     pickerFailure?: AppError;
     media?: MediaFile;
+    resourceEstimate?: Av1anResourceEstimate;
+    grainTable?: string;
   } = {},
 ) {
   await page.addInitScript(
@@ -160,6 +166,8 @@ async function desktopMock(
       lateStop,
       heldCommands,
       pickerFailure,
+      resourceEstimate,
+      grainTable,
     }) => {
       const state = globalThis as unknown as Record<string, unknown>;
       let selectedMedia = initialMedia;
@@ -210,6 +218,8 @@ async function desktopMock(
               error: null,
             };
           if (command === 'get_capabilities') return capabilities;
+          if (command === 'read_av1an_grain_table' && grainTable) return grainTable;
+          if (command === 'estimate_av1an_resources' && resourceEstimate) return resourceEstimate;
           if (command === 'begin_media_analysis') return `analysis-${++callbackId}`;
           if (command === 'cancel_media_analysis') return;
           if (command === 'measure_loudness')
@@ -303,6 +313,8 @@ async function desktopMock(
       lateStop: options.lateStop ?? false,
       heldCommands: options.held ?? [],
       pickerFailure: options.pickerFailure,
+      resourceEstimate: options.resourceEstimate,
+      grainTable: options.grainTable,
     },
   );
 }
@@ -318,7 +330,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await desktopMock(page);
     await openEncode(page, tab);
     const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
-    const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+    const selector = workspace.getByLabel('Video encoder', {
       exact: true,
     });
     await expect(selector).toHaveValue('svtAv1Hdr');
@@ -629,11 +641,11 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await desktopMock(page);
     await openEncode(page, tab);
     const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
-    const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+    const selector = workspace.getByLabel('Video encoder', {
       exact: true,
     });
     await expect(selector).toHaveValue('svtAv1Hdr');
-    if (tab === 'av1an') await expect(selector.locator('option[value="x264"]')).toHaveCount(0);
+    if (tab === 'av1an') await expect(selector.locator('option[value="x264"]')).toHaveCount(1);
     await selector.selectOption('svtAv1FiveFish');
     await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('18');
     await expect(workspace.getByLabel('Encoder preset', { exact: true })).toHaveValue('2');
@@ -659,6 +671,9 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
               sceneDetection: 'standard',
               sceneDownscaleHeight: 360,
               splitMethod: 'sceneDetection',
+              maxTries: 3,
+              concatMethod: 'ffmpeg',
+              attachSettings: false,
             },
           }
         : {}),
@@ -708,6 +723,9 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
               sceneDetection: 'standard',
               sceneDownscaleHeight: 360,
               splitMethod: 'sceneDetection',
+              maxTries: 3,
+              concatMethod: 'ffmpeg',
+              attachSettings: false,
             },
           }
         : {}),
@@ -759,7 +777,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     await desktopMock(page);
     await openEncode(page, tab);
     const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
-    const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+    const selector = workspace.getByLabel('Video encoder', {
       exact: true,
     });
     await selector.selectOption('svtAv1FiveFish');
@@ -801,7 +819,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       await desktopMock(page, { missing: tool });
       await openEncode(page, tab);
       const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
-      const selector = workspace.getByLabel(tab === 'av1an' ? 'SVT-AV1 build' : 'Video encoder', {
+      const selector = workspace.getByLabel('Video encoder', {
         exact: true,
       });
       await selector.selectOption('svtAv1');
@@ -837,8 +855,8 @@ test('SVT fork drafts stay separate between sources and workflows without guessi
     .fill('C:\\exports\\anime-custom.mkv');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   const av1an = av1anWorkspace(page);
-  await expect(av1an.getByLabel('SVT-AV1 build', { exact: true })).toHaveValue('svtAv1Hdr');
-  await av1an.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+  await expect(av1an.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1Hdr');
+  await av1an.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
   await expect(av1an.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
   await av1an.getByLabel('Texture psy bias', { exact: true }).fill('2');
   const next = {
@@ -885,11 +903,11 @@ for (const outcome of ['destination', 'error'] as const) {
     });
     await openEncode(page, 'av1an');
     const workspace = av1anWorkspace(page);
-    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
     await workspace.getByRole('button', { name: 'Choose encode destination', exact: true }).click();
     await expect.poll(() => calls(page, 'plugin:dialog|save')).toHaveLength(1);
-    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1Hdr');
-    await workspace.getByLabel('SVT-AV1 build', { exact: true }).selectOption('svtAv1FiveFish');
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
+    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
     await release(page, 'plugin:dialog|save');
     await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
       inputPath.replace(/\.mkv$/, '_av1an_5fish.mkv'),
@@ -1043,7 +1061,9 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   await encoder.selectOption('svtAv1Hdr');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await expect(av1anWorkspace(page).getByLabel('Video encoder', { exact: true })).toHaveCount(0);
+  await expect(av1anWorkspace(page).getByLabel('Video encoder', { exact: true })).toHaveValue(
+    'svtAv1Hdr',
+  );
   await expect(av1anWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
   await page
     .getByRole('navigation', { name: 'Workspace' })
@@ -1934,11 +1954,11 @@ test('av1an accepts only whole worker counts in range', async ({ page }) => {
   await desktopMock(page);
   await openEncode(page, 'av1an');
   const workspace = av1anWorkspace(page);
-  for (const invalid of ['0', '33', '2.5', '']) {
+  for (const invalid of ['0', '65', '2.5', '']) {
     await workspace.getByLabel('Parallel chunks', { exact: true }).fill(invalid);
     await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   }
-  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('32');
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('64');
   await expect(page.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
 });
 
@@ -2052,7 +2072,7 @@ test('each encoder restores its own source draft and resets only that source', a
   await quick.getByLabel('Quality', { exact: true }).fill('35');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
-  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
   await expect(av1an.getByLabel('Encode destination', { exact: true })).toHaveValue(
     'C:\\media\\second_av1an_hdr.mkv',
   );
@@ -2406,6 +2426,62 @@ test('audio drafts are isolated by source and video encoder and workflow with av
   await expect(quick.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
 });
 
+test('AV1AN audio defaults carry safe conversion choices to new sources without gain or stream IDs', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByLabel('Audio codec', { exact: true }).selectOption('aac');
+  await workspace.getByLabel('Audio bitrate', { exact: true }).fill('256');
+  await workspace.getByLabel('Audio channels', { exact: true }).selectOption('surround51');
+  await workspace.getByLabel('Audio gain (dB)', { exact: true }).fill('-3');
+  const stored = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}'),
+  );
+  expect(stored.audio).toEqual({ codec: 'aac', bitrateKbps: 256, channels: 'surround51' });
+  expect(JSON.stringify(stored)).not.toContain(inputPath);
+  expect(JSON.stringify(stored)).not.toContain('streamIndex');
+  expect(JSON.stringify(stored)).not.toContain('gain');
+  await page.evaluate(() => {
+    const saved = JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}') as {
+      audio: Record<string, unknown>;
+    };
+    saved.audio.streamIndex = 99;
+    saved.audio.gain = { sourceFingerprint: 'not-a-preference' };
+    localStorage.setItem('jesses.av1an.preferences.v1', JSON.stringify(saved));
+  });
+  await openEncode(page, 'av1an');
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () => JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}').audio,
+      ),
+    )
+    .toEqual({ codec: 'aac', bitrateKbps: 256, channels: 'surround51' });
+  const next: MediaFile = {
+    ...media,
+    id: 'av1an-audio-next',
+    path: 'C:\\media\\next-audio.mkv',
+    name: 'next-audio.mkv',
+    streams: [media.streams[0], { ...media.streams[2], index: 13 }],
+  };
+  await importAnotherSource(page, next);
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await expect(workspace.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
+  await expect(workspace.getByLabel('Audio bitrate', { exact: true })).toHaveValue('256');
+  await expect(workspace.getByLabel('Audio channels', { exact: true })).toHaveValue('surround51');
+  await expect(workspace.getByLabel('Audio gain (dB)', { exact: true })).toHaveValue('0');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.audio).toEqual([
+    { streamIndex: 13, codec: 'aac', bitrateKbps: 256, channels: 'surround51' },
+  ]);
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(quickWorkspace(page).getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+});
+
 test('legacy job history remains readable without audio settings', async ({ page }) => {
   const legacy = snapshot('succeeded');
   delete (legacy.encodeSettings as Partial<EncodeRequest['settings']>).audio;
@@ -2534,6 +2610,34 @@ test('audio layout restrictions require an explicit downmix without changing the
   await expect(workspace.getByText('Source:', { exact: false })).toContainText('6 channels');
 });
 
+test('av1an queues explicit 5.1 and 7.1 audio layouts within codec limits', async ({ page }) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  const codec = workspace.getByLabel('Audio codec', { exact: true });
+  const channels = workspace.getByLabel('Audio channels', { exact: true });
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await codec.selectOption('eac3');
+  await channels.selectOption('surround51');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  await channels.selectOption('surround71');
+  await expect(workspace.getByRole('alert')).toContainText(
+    'E-AC-3 conversion supports up to 5.1 channels',
+  );
+  await expect(queue).toBeDisabled();
+  await codec.selectOption('flac');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const requests = (await calls(page, 'enqueue_encode')).map(
+    (call) => (call.payload as { request: EncodeRequest }).request,
+  );
+  expect(requests.map((request) => request.settings.audio[0])).toEqual([
+    { streamIndex: 3, codec: 'eac3', bitrateKbps: 128, channels: 'surround51' },
+    { streamIndex: 3, codec: 'flac', bitrateKbps: 128, channels: 'surround71' },
+  ]);
+});
+
 for (const encoder of ['x265', 'vp9'] as const) {
   test(`${encoder} uses FFmpeg with independent defaults and immutable source-depth queue settings`, async ({
     page,
@@ -2576,7 +2680,7 @@ for (const encoder of ['x265', 'vp9'] as const) {
     await page.getByRole('button', { name: 'av1an', exact: true }).click();
     await expect(
       av1anWorkspace(page)
-        .getByLabel('SVT-AV1 build', { exact: true })
+        .getByLabel('Video encoder', { exact: true })
         .locator(`option[value="${encoder}"]`),
     ).toHaveCount(0);
   });
@@ -2635,9 +2739,9 @@ test('frame trim validates boundaries and copied audio, restores drafts and keep
       .settings.trim,
   ).toEqual({ startFrame: 120, endFrameExclusive: 360 });
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await expect(av1anWorkspace(page).getByLabel('Trim video interval', { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    av1anWorkspace(page).getByLabel('Trim video interval', { exact: true }),
+  ).not.toBeChecked();
 });
 
 test('rate control validates bitrate and target size, restores encoder drafts and preserves queued settings', async ({
@@ -2739,7 +2843,9 @@ test('tone mapping requires explicit HDR rendering, validates peak and retains q
       .settings.toneMap,
   ).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true });
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await expect(av1anWorkspace(page).getByLabel('HDR / HLG to SDR', { exact: true })).toHaveCount(0);
+  await expect(
+    av1anWorkspace(page).getByLabel('HDR / HLG to SDR', { exact: true }),
+  ).not.toBeChecked();
 });
 
 test('av1an scene and VMAF controls validate, restore drafts and freeze queued settings', async ({
@@ -2769,7 +2875,7 @@ test('av1an scene and VMAF controls validate, restore drafts and freeze queued s
     chunkMethod: 'ffms2',
     splitMethod: 'fixedChunks',
     maximumChunkFrames: 120,
-    targetQuality: { minimumScoreTenths: 935, maximumScoreTenths: 960, probes: 3 },
+    targetQuality: { minimumScoreTenths: 935, maximumScoreTenths: 950, probes: 3 },
   });
   await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
   expect(request.settings.av1anOptions?.chunkMethod).toBe('ffms2');
@@ -2777,6 +2883,370 @@ test('av1an scene and VMAF controls validate, restore drafts and freeze queued s
   await expect(quickWorkspace(page).getByLabel('Source reader', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('bestsource');
+});
+
+test('FFmpeg segment reader explains keyframe splitting and reaches the AV1AN request', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('segment');
+  await expect(workspace).toContainText(
+    'stream-copy sizable intermediate files at source keyframes',
+  );
+  await expect(workspace).toContainText('exact decoded-source validation may fail');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anOptions?.chunkMethod).toBe('segment');
+});
+
+test('av1an x264 validates independent chunk and probe limits and freezes explicit options', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  const encoder = workspace.getByLabel('Video encoder', { exact: true });
+  await expect(encoder.locator('option')).toHaveCount(4);
+  await encoder.selectOption('x264');
+  await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('23');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await workspace.getByLabel('Output pixel format', { exact: true }).selectOption('yuv444p10le');
+  await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
+    inputPath.replace(/\.mkv$/, '_x264.mkv'),
+  );
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('65');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('64');
+  await workspace.getByLabel('Scene detection slices', { exact: true }).fill('4');
+  await workspace.getByLabel('Encoder threads', { exact: true }).fill('65');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Encoder threads', { exact: true }).fill('0');
+  await workspace.getByLabel('Chunk attempts', { exact: true }).fill('11');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Chunk attempts', { exact: true }).fill('5');
+  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toHaveValue('mkvmerge');
+  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toBeDisabled();
+  await expect(workspace).toContainText('H.264 chunks need mkvmerge');
+  await workspace.getByLabel('Attach encoding settings to the output', { exact: true }).check();
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  await workspace.getByLabel('Maximum probe CRF', { exact: true }).fill('52');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Maximum probe CRF', { exact: true }).fill('51');
+  await workspace.getByLabel('Minimum probe CRF', { exact: true }).fill('0');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings).toMatchObject({
+    backend: 'av1an',
+    encoder: 'x264',
+    workers: 64,
+    av1anOptions: {
+      pixelFormat: 'yuv444p10le',
+      sceneDetectionSlices: 4,
+      encoderThreads: 0,
+      maxTries: 5,
+      concatMethod: 'mkvmerge',
+      attachSettings: true,
+      targetQuality: { minimumCrf: 0, maximumCrf: 51 },
+    },
+  });
+  await encoder.selectOption('svtAv1Hdr');
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toHaveValue('ffmpeg');
+  await expect(
+    workspace
+      .getByLabel('Output pixel format', { exact: true })
+      .locator('option[value="yuv444p10le"]'),
+  ).toHaveCount(0);
+  await workspace.getByLabel('Output pixel format', { exact: true }).selectOption('yuv420p');
+  await expect(workspace).toContainText('hbd-mds 1/2) has no effect with 8-bit output');
+  await encoder.selectOption('x264');
+  await expect(workspace).not.toContainText('hbd-mds 1/2) has no effect with 8-bit output');
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('64');
+  await expect(workspace.getByLabel('Output pixel format', { exact: true })).toHaveValue(
+    'yuv444p10le',
+  );
+  await expect(workspace.getByLabel('Encoder threads', { exact: true })).toHaveValue('0');
+  expect(request.settings.av1anOptions?.maxTries).toBe(5);
+});
+
+test('av1an HDR quality targeting becomes available after explicit SDR tone mapping', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    media: {
+      ...media,
+      streams: media.streams.map((stream) =>
+        stream.kind === 'video'
+          ? {
+              ...stream,
+              pixelFormat: 'yuv420p10le',
+              bitDepth: 10,
+              colorPrimaries: 'bt2020',
+              colorTransfer: 'smpte2084',
+              colorSpace: 'bt2020nc',
+              colorRange: 'tv',
+              hdrFormat: 'HDR10',
+            }
+          : stream,
+      ),
+    },
+  });
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('HDR / HLG to SDR', { exact: true }).check();
+  await workspace.getByLabel('Tone mapping curve', { exact: true }).selectOption('mobius');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings).toMatchObject({
+    backend: 'av1an',
+    encoder: 'x264',
+    toneMap: { algorithm: 'mobius', sourcePeakNits: 1000 },
+    av1anOptions: { targetQuality: { metric: 'vmaf' } },
+  });
+});
+
+test('av1an memory guidance applies suggested parallelism to the queued request', async ({
+  page,
+}) => {
+  await desktopMock(page, {
+    resourceEstimate: {
+      logicalProcessors: 16,
+      totalMemoryMib: 16384,
+      availableMemoryMib: 8192,
+      perWorkerMib: 2048,
+      estimatedMemoryMib: 12288,
+      suggestedWorkers: 3,
+      suggestedThreads: 4,
+      suggestedSceneSlices: 2,
+      warning: 'Estimated memory exceeds available memory.',
+    },
+  });
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  const guidance = workspace.getByLabel('AV1AN memory guidance');
+  await expect(guidance).toContainText('Estimated memory');
+  await expect(guidance).toContainText('Estimated memory exceeds available memory.');
+  await guidance.getByRole('button', { name: 'Use suggested parallelism' }).click();
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await expect(workspace.getByLabel('Encoder threads', { exact: true })).toHaveValue('4');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings).toMatchObject({
+    workers: 3,
+    av1anOptions: { encoderThreads: 4, sceneDetectionSlices: 2 },
+  });
+});
+
+test('av1an trim is available and requires converted or excluded audio', async ({ page }) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByLabel('Trim video interval', { exact: true }).check();
+  await workspace.getByLabel('Start frame', { exact: true }).fill('2');
+  await workspace.getByLabel('End frame (excluded)', { exact: true }).fill('20');
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await expect(queue).toBeDisabled();
+  await expect(workspace.getByRole('alert')).toContainText('Choose an audio conversion');
+  await workspace.getByLabel('Include audio stream #3', { exact: true }).uncheck();
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings).toMatchObject({
+    backend: 'av1an',
+    trim: { startFrame: 2, endFrameExclusive: 20 },
+  });
+});
+
+test('SVT av1an grain draft is independent from x264 and saved in queued settings', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.locator('details.grain > summary').click();
+  await workspace.getByLabel('Use encoder denoised picture', { exact: true }).check();
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const first = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(first.settings.av1anGrain).toEqual({
+    table: null,
+    denoise: true,
+    denoiseStrength: 4,
+  });
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await expect(workspace.locator('details.grain')).toHaveCount(0);
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const second = ((await calls(page, 'enqueue_encode'))[1].payload as { request: EncodeRequest })
+    .request;
+  expect(second.settings.av1anGrain).toBeUndefined();
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
+  await workspace.locator('details.grain > summary').click();
+  await expect(workspace.getByLabel('Use encoder denoised picture', { exact: true })).toBeChecked();
+});
+
+test('an AV1AN grain table replaces SVT numeric grain strength in the saved request', async ({
+  page,
+}) => {
+  const table = 'E 0 100 1 2 3\n';
+  await desktopMock(page, { grainTable: table });
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+  await workspace.locator('details.grain > summary').click();
+  await workspace.getByLabel('Grain delivery', { exact: true }).selectOption('table');
+  await workspace.getByRole('button', { name: 'Choose grain table', exact: true }).click();
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toBeDisabled();
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.filmGrain).toBe(0);
+  expect(request.settings.av1anGrain).toEqual({ table, denoise: false, denoiseStrength: 4 });
+});
+
+test('a grain table picked for an old SVT draft cannot change another build', async ({ page }) => {
+  await desktopMock(page, { grainTable: 'E 0 100 1 2 3\n' });
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.locator('details.grain > summary').click();
+  await workspace.getByLabel('Grain delivery', { exact: true }).selectOption('table');
+  await page.evaluate(() =>
+    (globalThis as unknown as { __encodeMock: Mock }).__encodeMock.hold('plugin:dialog|open'),
+  );
+  await workspace.getByRole('button', { name: 'Choose grain table', exact: true }).click();
+  await expect.poll(() => calls(page, 'plugin:dialog|open')).toHaveLength(2);
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
+  await release(page, 'plugin:dialog|open');
+  await workspace.locator('details.grain > summary').click();
+  await expect(workspace.locator('details.grain')).not.toContainText('Grain table selected');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anGrain).toBeUndefined();
+});
+
+test('AV1AN custom filter rows preserve newline editing and freeze in the request', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.locator('details.filters > summary').click();
+  const filters = workspace.getByLabel('Pixel filters · one chain per line', { exact: true });
+  await filters.fill('eq=contrast=1.05\n');
+  await filters.pressSequentially('unsharp=5:5:0.3');
+  await expect(filters).toHaveValue('eq=contrast=1.05\nunsharp=5:5:0.3');
+  await filters.fill(Array.from({ length: 17 }, () => 'eq=contrast=1.05').join('\n'));
+  await expect(workspace.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
+  await filters.fill('eq=contrast=1.05\nunsharp=5:5:0.3');
+  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anFilters).toEqual(['eq=contrast=1.05', 'unsharp=5:5:0.3']);
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.locator('details.filters > summary').click();
+  await expect(
+    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
+  ).toHaveValue('');
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
+  await workspace.locator('details.filters > summary').click();
+  await expect(
+    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
+  ).toHaveValue('eq=contrast=1.05\nunsharp=5:5:0.3');
+});
+
+test('AV1AN restores safe infrastructure preferences across sessions without picture choices', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  let workspace = av1anWorkspace(page);
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await workspace.getByLabel('Join chunks with', { exact: true }).selectOption('mkvmerge');
+  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
+  await workspace.getByLabel('Quality', { exact: true }).fill('17');
+  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('5');
+  await workspace.getByLabel('Source reader', { exact: true }).selectOption('ffms2');
+  await workspace.getByLabel('Chunk order', { exact: true }).selectOption('sequential');
+  await workspace.getByLabel('Encoder threads', { exact: true }).fill('4');
+  await workspace.getByLabel('Scene detection slices', { exact: true }).fill('3');
+  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toBeDisabled();
+  await workspace.getByLabel('Output pixel format', { exact: true }).selectOption('yuv444p');
+  await workspace.locator('details.filters > summary').click();
+  await workspace
+    .getByLabel('Pixel filters · one chain per line', { exact: true })
+    .fill('eq=contrast=1.05');
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () => JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}').filters,
+      ),
+    )
+    .toEqual(['eq=contrast=1.05']);
+  await openEncode(page, 'av1an');
+  workspace = av1anWorkspace(page);
+  await expect(workspace.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1Hdr');
+  await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('30');
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('5');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('ffms2');
+  await expect(workspace.getByLabel('Chunk order', { exact: true })).toHaveValue('sequential');
+  await expect(workspace.getByLabel('Encoder threads', { exact: true })).toHaveValue('4');
+  await expect(workspace.getByLabel('Scene detection slices', { exact: true })).toHaveValue('3');
+  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toHaveValue('mkvmerge');
+  await expect(workspace.getByLabel('Output pixel format', { exact: true })).toHaveValue('');
+  await workspace.locator('details.filters > summary').click();
+  await expect(
+    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
+  ).toHaveValue('eq=contrast=1.05');
+  const stored = await page.evaluate(() => localStorage.getItem('jesses.av1an.preferences.v1'));
+  expect(stored).not.toContain(inputPath);
+  expect(stored).not.toContain('yuv444p');
+  expect(stored).not.toContain('"17"');
+});
+
+test('AV1AN ignores malformed stored counts and path-bearing filter rows', async ({ page }) => {
+  await desktopMock(page);
+  await page.goto('/');
+  await page.evaluate(() =>
+    localStorage.setItem(
+      'jesses.av1an.preferences.v1',
+      JSON.stringify({
+        version: 1,
+        chunkMethod: 'unknown-reader',
+        workers: 999,
+        filters: ['eq=contrast=C:/media/source.mkv'],
+        audio: { codec: 'eac3', bitrateKbps: 192, channels: 'surround71' },
+      }),
+    ),
+  );
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
+  await expect(workspace.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('lsmash');
+  await workspace.locator('details.filters > summary').click();
+  await expect(
+    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
+  ).toHaveValue('');
 });
 
 test('av1an perceptual metric direction and reader dependencies keep immutable queued settings', async ({
@@ -2794,8 +3264,20 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
     workspace.getByText('Lower scores mean fewer visible differences.', { exact: false }),
   ).toBeVisible();
   await expect(workspace.getByLabel('Minimum Butteraugli INF score', { exact: true })).toHaveValue(
-    '0.8',
+    '4',
   );
+  await expect(workspace.getByLabel('Maximum Butteraugli INF score', { exact: true })).toHaveValue(
+    '4',
+  );
+  await expect(
+    workspace.getByLabel('Minimum Butteraugli INF score', { exact: true }),
+  ).toHaveAttribute('min', '0.5');
+  await expect(
+    workspace.getByLabel('Maximum Butteraugli INF score', { exact: true }),
+  ).toHaveAttribute('max', '10');
+  await workspace.getByLabel('Minimum Butteraugli INF score', { exact: true }).fill('0.4');
+  await expect(queue).toBeDisabled();
+  await workspace.getByLabel('Minimum Butteraugli INF score', { exact: true }).fill('4');
   await workspace.getByLabel('Source reader', { exact: true }).selectOption('select');
   await expect(queue).toBeDisabled();
   await workspace.getByLabel('Target metric', { exact: true }).selectOption('xpsnr');
@@ -2813,10 +3295,43 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
     probingRate: 2,
   });
   await workspace.getByLabel('Target metric', { exact: true }).selectOption('ssimulacra2');
+  await expect(workspace.getByLabel('Minimum SSIMULACRA2 score', { exact: true })).toHaveValue(
+    '80',
+  );
+  await expect(workspace.getByLabel('Maximum SSIMULACRA2 score', { exact: true })).toHaveValue(
+    '80',
+  );
   expect(request.settings.av1anOptions?.targetQuality?.metric).toBe('xpsnr');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(workspace.getByLabel('Target metric', { exact: true })).toHaveValue('ssimulacra2');
+});
+
+test('weighted XPSNR target enforces its half-point score range', async ({ page }) => {
+  await desktopMock(page);
+  await openEncode(page, 'av1an');
+  const workspace = av1anWorkspace(page);
+  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
+  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
+  await workspace.getByLabel('Target metric', { exact: true }).selectOption('xpsnrWeighted');
+  const minimum = workspace.getByLabel('Minimum Weighted XPSNR (dB) score', { exact: true });
+  const maximum = workspace.getByLabel('Maximum Weighted XPSNR (dB) score', { exact: true });
+  await expect(minimum).toHaveValue('40');
+  await expect(maximum).toHaveValue('40');
+  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
+  await minimum.fill('40.1');
+  await expect(queue).toBeDisabled();
+  await minimum.fill('40');
+  await maximum.fill('40.5');
+  await expect(queue).toBeEnabled();
+  await queue.click();
+  const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
+    .request;
+  expect(request.settings.av1anOptions?.targetQuality).toMatchObject({
+    metric: 'xpsnrWeighted',
+    minimumScoreTenths: 400,
+    maximumScoreTenths: 405,
+  });
 });
 
 test('extended SVT quality and dedicated lossless mode freeze their explicit wire settings', async ({

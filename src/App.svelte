@@ -60,6 +60,7 @@
     cancelJob,
     stopJob as stopAndKeepProgress,
     resumeJob,
+    discardAv1anRecovery,
     setJobPaused,
     recentPathIsFolder,
   } from '$lib/ipc/client';
@@ -206,6 +207,12 @@
       jobs = [snapshot, ...jobs.filter((entry) => entry.id !== id)];
     }
     addLog('Saved job submitted for resume.');
+  }
+  async function discardSavedAv1anProgress(id: string) {
+    const before = jobs.find((entry) => entry.id === id);
+    const snapshot = await discardAv1anRecovery(id);
+    jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
+    addLog('Saved AV1AN progress discarded.');
   }
   async function pauseLiveJob(id: string, paused: boolean) {
     const before = jobs.find((entry) => entry.id === id);
@@ -1059,6 +1066,7 @@
         onstop={stopQueue}
         onkeep={keepJobProgress}
         onresume={resumeSavedJob}
+        ondiscard={discardSavedAv1anProgress}
         onpause={pauseLiveJob}
       />
     </div>

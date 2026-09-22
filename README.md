@@ -17,9 +17,9 @@ have explicit codec and track compatibility checks.
 SVT-AV1 is the primary encoding workflow. **SVT-AV1-HDR is the default**,
 **5fish is the anime option**, and mainline SVT-AV1 is also available. Quick Convert drives
 standalone SVT-AV1 and x264 executables, plus FFmpeg libx265 (HEVC) and libvpx (VP9). The separate av1an
-tab handles scene detection and parallel SVT-AV1 chunks. Both workflows copy
-selected audio, subtitles, and attachments by default. Quick Convert and standalone
-batch jobs can trim, crop, resize, add black borders, process frame rates and
+tab handles scene detection and parallel SVT-AV1 or x264 chunks. Both workflows copy
+selected audio, subtitles, and attachments by default. Quick Convert, av1an,
+and batch jobs can trim, crop, resize, add black borders, process frame rates and
 convert individual audio tracks. SVT-AV1 supports validated HDR10 output
 and optional film grain synthesis; x264 currently supports SDR H.264 output.
 Folder import and Batch encode prepare
@@ -242,7 +242,9 @@ job trims it. See the [trim validation record](tests/fixtures/trim-validation.md
 **FLAC (24-bit)**, **MP3**, **Vorbis**, and **E-AC-3**
 for each selected audio track. Copy is the initial setting and retains the source
 audio. Lossy conversion starts at 128 kb/s and offers **Preserve source**,
-**Mono**, or **Stereo** channel choices. The bitrate is the target for that track,
+**Mono**, **Stereo**, **5.1**, or **7.1** channel choices. E-AC-3 conversion supports
+up to 5.1; selecting more channels does not create original surround detail.
+The bitrate is the target for that track,
 without hidden scaling by channel count. The upper limit adjusts to the codec,
 sample rate, and channel count; mono Opus is limited to 256 kb/s. AAC, Opus, and
 Vorbis offer 32–512 kb/s subject to those limits. MP3 uses standard bitrates,
@@ -300,13 +302,14 @@ changes and reject content they cannot represent. See the
 [subtitle validation record](tests/fixtures/subtitle-validation.md).
 
 Open the separate **av1an** tab to use scene detection and parallel encoding with
-1–32 workers (default2). Scene detection can use standard/fast analysis or fixed
+1–64 workers (default 2). Scene detection can use standard/fast analysis or fixed
 chunks, configurable minimum/maximum lengths, analysis height and chunk order.
 L-SMASH Works, FFMS2 and BestSource require their respective VapourSynth plugin.
 FFmpeg select and hybrid readers require the corrected source-built av1an;
 older generators fail exact frame-count checks. All paths require FFmpeg,
-FFprobe and the selected SVT build. Jesses checks actual engine capabilities
-and selected plugin availability. The manifest-verified Windows bundle currently
+FFprobe and the selected SVT or x264 build; x264 also requires mkvmerge. Jesses
+checks actual engine capabilities and selected plugin availability. The
+manifest-verified Windows bundle currently
 ships L-SMASH and reports FFMS2/BestSource unavailable; both optional readers have
 passed a separate compatible external-runtime stop/reopen/resume gate, which is
 not a claim that they ship in the bundle. av1an currently encodes the first video track only; standalone encoders
@@ -323,11 +326,12 @@ always starts the standalone encoder directly; the av1an tab always starts av1an
 av1an runs in a uniquely reserved workspace inside the output folder, with caches
 kept there. Completed-chunk frame counts drive progress. The output passes the
 same decoded-frame, track, and metadata checks as standalone encoding. Jesses
-validates the concatenated IVF frame records and corrects its rate/count header
-before muxing, covering av1an versions that write a fixed 30 fps header. Existing
+validates SVT's concatenated IVF frame records and corrects their rate/count header
+before muxing, covering av1an versions that write a fixed 30 fps header. x264
+chunks use mkvmerge for a timed Matroska intermediate. Existing
 destinations are never replaced. **Stop and keep progress** waits for the supervised
 av1an worker tree to exit and retains its completed chunks. **Resume** in the job
-history continues with the original saved settings, including the selected SVT
+history continues with the original saved settings, including the selected encoder
 build. It works after restarting Jesses and never starts automatically. Source
 preparation runs again to verify the source before completed work is reused.
 
@@ -338,7 +342,9 @@ checkpoint are encoded again. The encoded video remains available if stopping
 or crashing interrupts final muxing or output validation; resuming that phase
 reuses the validated intermediate. A completed output is never overwritten.
 Cancel and Stop queue also retain available av1an recovery work. Stopping before
-recovery preparation finishes may leave no saved progress to resume.
+recovery preparation finishes may leave no saved progress to resume. Stopped,
+failed, or interrupted av1an jobs can discard their owned saved progress from
+job history after the worker exits.
 
 Standalone executable encoders retain only complete, verified phase boundaries:
 first-pass statistics, encoded video, an exact-cadence timing wrapper, or the final
@@ -355,11 +361,13 @@ Qualified VapourSynth source templates are checked byte-for-byte after validated
 path/cache/reader substitution. Hybrid source segments also undergo complete
 pixel-sequence comparison with the original before reuse or publication. See the
 [recovery validation record](tests/fixtures/av1an-recovery-validation.md) and
-[scene/target validation](tests/fixtures/av1an-options-validation.md).
+[scene/target validation](tests/fixtures/av1an-options-validation.md). See
+[av1an SVT and x264 options and qualification](docs/av1an-svt-x264.md) for the
+new encoder, grain, filter, scene, and recovery controls.
 
 **Perceptual targets** choose per-chunk CRF using mean VMAF v0.6.1, SSIMULACRA2,
-Butteraugli INF, or XPSNR minimum Y/U/V. Configure the ordered score range, CRF
-bounds, evaluation resolution, probe count and frame sampling. Higher is better
+Butteraugli INF, XPSNR minimum Y/U/V, or weighted XPSNR. Configure the ordered
+score range, CRF bounds, evaluation resolution, probe count and frame sampling. Higher is better
 for VMAF, SSIMULACRA2 and XPSNR; lower is better for Butteraugli. Changing the
 metric resets its suggested score range. Unreachable ranges can finish outside
 the target, and probe scores are retained in the engine detail log.
@@ -377,7 +385,7 @@ L-SMASH-only scoring requires the corrected software-probe engine;
 missing dependencies or older incompatible engines produce an explicit error.
 VMAF and every-frame XPSNR also require the corrected FFmpeg metric engine, which
 preserves the Y4M reference pixels during color-matrix negotiation. Probes
-preserve the selected SVT build, preset and advanced parameters. Probe references
+preserve the selected encoder build, preset and advanced parameters. Probe references
 and final chunks use the same validated temporal, tone-map, crop, resize, border
 and aspect-ratio filter chain.
 Targeting requires SDR; preserved HDR keeps CRF control. Old saved targets with
@@ -399,7 +407,7 @@ base layer. Supported Dolby Vision input is HEVC profile 7/compatibility 6 or
 profile 8/compatibility 1; profile 5 and unrecognized profiles fail explicitly.
 **HDR / HLG to SDR** is an explicit option in Quick Convert, av1an and each batch
 file. It accepts tagged limited-range 10-bit 4:2:0 BT.2020 PQ or HLG, uses
-Hable with a chosen signal peak (100–10000 nits), and produces 100-nit BT.709
+Hable or Mobius with a chosen signal peak (100–10000 nits), and produces 100-nit BT.709
 limited-range 10-bit SDR. HLG uses the 1000-nit reference display transfer.
 Tone mapping precedes subtitles and borders and removes source HDR metadata.
 Compatible dynamic-HDR base layers require its separate opt-in; unselected

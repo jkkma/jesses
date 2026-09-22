@@ -1,4 +1,4 @@
-"""Apply retained timestamp, scorer API, software-probe and metric-tag fixes."""
+"""Apply pinned timestamp, segment, scorer, software-probe and metric fixes."""
 
 import argparse
 import difflib
@@ -10,13 +10,14 @@ SOURCE_SHA256 = "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca
 SOURCE_ROOT = "Av1an-805dad69143fa0a81cfe2fb89c0b9e90a828ea72"
 MARKER = "ffmpeg9-passthrough-v1"
 PROBE_FILTER_MARKER = "target-probe-filter-v1"
+SEGMENT_MARKER = "segment-ffmpeg9-v1"
 
 
 def patch_source(source, archive_path, patch_path):
     with archive_path.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != SOURCE_SHA256:
             raise ValueError("The av1an patch requires the exact pinned upstream archive.")
-    paths = ["av1an-core/src/context.rs", "av1an/src/main.rs", "av1an-core/src/encoder/mod.rs", "av1an-core/src/encoder/tests.rs", "av1an-core/src/vapoursynth.rs", "av1an-core/src/metrics/xpsnr.rs", "av1an-core/src/metrics/vmaf.rs", "av1an-core/src/target_quality.rs", "av1an-core/src/settings.rs"]
+    paths = ["av1an-core/src/context.rs", "av1an/src/main.rs", "av1an-core/src/encoder/mod.rs", "av1an-core/src/encoder/tests.rs", "av1an-core/src/vapoursynth.rs", "av1an-core/src/metrics/xpsnr.rs", "av1an-core/src/metrics/vmaf.rs", "av1an-core/src/target_quality.rs", "av1an-core/src/settings.rs", "av1an-core/src/split/mod.rs"]
     original = {}
     with tarfile.open(archive_path) as archive:
         for path in paths:
@@ -41,7 +42,7 @@ def patch_source(source, archive_path, patch_path):
     before = '"{}-unstable (rev {}) ({})\n'
     if version.count(before) != 1:
         raise ValueError("The pinned av1an version banner changed.")
-    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + ']\n')
+    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [' + SEGMENT_MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + ']\n')
     before = "            vmaf_filter: self.vmaf_filter.clone(),\n"
     after = before + "            ffmpeg_filter_args: vec![],\n"
     if version.count(before) != 1:
@@ -251,6 +252,11 @@ def patch_source(source, archive_path, patch_path):
     if settings.count(before) != 1:
         raise ValueError("The pinned target-quality validation changed.")
     changed[paths[8]] = settings.replace(before, after)
+    # This pinned source already fixed Segment's FFmpeg 9 invocation. The
+    # marker promises that the build retains it; fail if a future pin drifts.
+    segment = original[paths[9]]
+    if '"-vsync"' in segment or segment.count('        "-fps_mode",\n        "passthrough",') != 1:
+        raise ValueError("The pinned source segment FFmpeg 9 behavior is absent.")
     patch_text = "".join("".join(difflib.unified_diff(original[path].splitlines(keepends=True), value.splitlines(keepends=True), fromfile="a/" + path, tofile="b/" + path)) for path, value in changed.items())
     with patch_path.open("x", encoding="utf-8", newline="\n") as output:
         output.write(patch_text)

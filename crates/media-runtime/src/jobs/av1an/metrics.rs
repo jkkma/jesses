@@ -9,6 +9,7 @@ pub(super) fn cli(metric: Av1anTargetMetric) -> &'static str {
         Av1anTargetMetric::Ssimulacra2 => "ssimulacra2",
         Av1anTargetMetric::Butteraugli => "butteraugli-inf",
         Av1anTargetMetric::Xpsnr => "xpsnr",
+        Av1anTargetMetric::XpsnrWeighted => "xpsnr-weighted",
     }
 }
 
@@ -18,6 +19,7 @@ pub(super) fn receipt(metric: Av1anTargetMetric) -> &'static str {
         Av1anTargetMetric::Ssimulacra2 => "SSIMULACRA2",
         Av1anTargetMetric::Butteraugli => "ButteraugliINF",
         Av1anTargetMetric::Xpsnr => "XPSNR",
+        Av1anTargetMetric::XpsnrWeighted => "XPSNRWeighted",
     }
 }
 
@@ -27,6 +29,7 @@ pub(super) fn label(metric: Av1anTargetMetric) -> &'static str {
         Av1anTargetMetric::Ssimulacra2 => "SSIMULACRA2 (higher is better)",
         Av1anTargetMetric::Butteraugli => "Butteraugli INF (lower is better)",
         Av1anTargetMetric::Xpsnr => "XPSNR minimum Y/U/V in dB (higher is better)",
+        Av1anTargetMetric::XpsnrWeighted => "Weighted XPSNR in dB (higher is better)",
     }
 }
 
@@ -34,7 +37,10 @@ pub(super) fn needs_vapoursynth(target: Av1anTargetQuality) -> bool {
     matches!(
         target.metric,
         Av1anTargetMetric::Ssimulacra2 | Av1anTargetMetric::Butteraugli
-    ) || (target.metric == Av1anTargetMetric::Xpsnr && target.probing_rate > 1)
+    ) || (matches!(
+        target.metric,
+        Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted
+    ) && target.probing_rate > 1)
 }
 
 fn found(version: &str, identifier: &str) -> bool {
@@ -56,7 +62,10 @@ pub(super) fn validate_plugin(
         return Err("Quality targeting with direct crop, scale, borders, tone-map, or frame-mode deinterlace transforms is currently qualified only for VMAF. Use VMAF, remove those transforms, or first create a lossless transformed source and target that file without another transform.".into());
     }
     if (target.metric == Av1anTargetMetric::Vmaf
-        || (target.metric == Av1anTargetMetric::Xpsnr && target.probing_rate == 1))
+        || (matches!(
+            target.metric,
+            Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted
+        ) && target.probing_rate == 1))
         && !version.contains("ffmpeg-metric-matrix-v1")
     {
         return Err("VMAF and every-frame XPSNR targeting require av1an with the ffmpeg-metric-matrix-v1 compatibility fix. The older engine lets FFmpeg change the untagged Y4M reference's color matrix, producing incorrect probe scores.".into());
@@ -76,7 +85,9 @@ pub(super) fn validate_plugin(
         Av1anTargetMetric::Butteraugli => {
             found(version, "com.julek.plugin") || found(version, "com.lumen.vship")
         }
-        Av1anTargetMetric::Xpsnr if target.probing_rate > 1 => found(version, "com.julek.vszip"),
+        Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted if target.probing_rate > 1 => {
+            found(version, "com.julek.vszip")
+        }
         _ => true,
     };
     if !available {
@@ -205,7 +216,7 @@ else:
     props = ['_FrameButteraugli']
 "#
         }
-        Av1anTargetMetric::Xpsnr => {
+        Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted => {
             "result = core.vszip.XPSNR(reference, distorted)\nprops = ['XPSNR_Y', 'XPSNR_U', 'XPSNR_V']\n"
         }
         Av1anTargetMetric::Vmaf => unreachable!("VMAF uses FFmpeg"),
@@ -367,7 +378,11 @@ mod tests {
             false,
         )
         .unwrap();
-        for metric in [Av1anTargetMetric::Vmaf, Av1anTargetMetric::Xpsnr] {
+        for metric in [
+            Av1anTargetMetric::Vmaf,
+            Av1anTargetMetric::Xpsnr,
+            Av1anTargetMetric::XpsnrWeighted,
+        ] {
             let checked = Av1anTargetQuality {
                 metric,
                 probing_rate: 1,
@@ -393,6 +408,7 @@ mod tests {
             Av1anTargetMetric::Ssimulacra2,
             Av1anTargetMetric::Butteraugli,
             Av1anTargetMetric::Xpsnr,
+            Av1anTargetMetric::XpsnrWeighted,
         ] {
             let filtered = Av1anTargetQuality { metric, ..target };
             assert!(
@@ -435,5 +451,8 @@ mod tests {
             .probing_rate = 2;
         assert!(options::validate_settings(&settings).is_err());
         assert!(script(Av1anTargetMetric::Butteraugli).contains("core.julek.Butteraugli("));
+        assert_eq!(cli(Av1anTargetMetric::XpsnrWeighted), "xpsnr-weighted");
+        assert_eq!(receipt(Av1anTargetMetric::XpsnrWeighted), "XPSNRWeighted");
+        assert!(script(Av1anTargetMetric::XpsnrWeighted).contains("core.vszip.XPSNR("));
     }
 }

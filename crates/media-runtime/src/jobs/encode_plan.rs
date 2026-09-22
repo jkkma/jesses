@@ -16,6 +16,9 @@ pub(super) use validation::Validation;
 pub(super) struct Plan {
     pub trim: Option<media_core::VideoTrim>,
     tone_map: Option<tone_map::Transform>,
+    grain_prefilter: Option<u8>,
+    prepare_metric_reference: bool,
+    custom_filters: Vec<String>,
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
     pub output_pixel_format: &'static str,
@@ -46,6 +49,8 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
     super::parameters::validate(settings)?;
     temporal::validate(settings)?;
     super::av1an::validate_settings(settings)?;
+    super::av1an::validate_grain(settings)?;
+    super::av1an::validate_filters(settings)?;
     super::rate_control::validate(settings)?;
     tone_map::validate_settings(settings)?;
     super::trim::validate_settings(settings)?;
@@ -85,7 +90,13 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 .map_or(settings.preset <= 13, |value| (-3..=13).contains(&value))
                 && settings.film_grain <= 50
         }
-        VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::X265Standalone => {
+        VideoEncoder::X264 => {
+            settings.crf <= 51
+                && settings.preset <= 9
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::X265 | VideoEncoder::X265Standalone => {
             standalone
                 && settings.crf <= 51
                 && settings.preset <= 9
@@ -121,8 +132,11 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                     "Use SVT CRF 1–70 in 0.25 steps, an advertised preset from -3–13, film grain synthesis from 0–50, and 1–32 workers."
                 }
-                VideoEncoder::X264 | VideoEncoder::X265 | VideoEncoder::X265Standalone => {
-                    "x264 and x265 require standalone mode, CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                VideoEncoder::X264 => {
+                    "x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                }
+                VideoEncoder::X265 | VideoEncoder::X265Standalone => {
+                    "x265 requires standalone mode, CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
                 VideoEncoder::Vp9 => {
                     "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, HDR10 fallback off, and 1–32 workers."
@@ -219,6 +233,15 @@ impl Plan {
             && video.color_space.as_deref() == Some("bt2020nc")
             && video.pix_fmt.as_deref() == Some("yuv420p10le")
             && video.color_range.as_deref() == Some("tv");
+        let explicit_pixel_format = settings
+            .av1an_options
+            .and_then(|options| options.pixel_format)
+            .map(media_core::Av1anPixelFormat::ffmpeg);
+        if is_hdr10 && tone_map.is_none() && explicit_pixel_format == Some("yuv420p") {
+            return Err(unsupported(
+                "HDR10 output requires 10-bit 4:2:0. Choose 10-bit output or enable SDR tone mapping.",
+            ));
+        }
         if is_hdr10 && !settings.encoder.is_svt() && tone_map.is_none() {
             return Err(unsupported(
                 "The selected non-SVT encoder currently supports SDR output only. Select SVT-AV1 for HDR10 output or enable explicit HDR/HLG-to-SDR tone mapping.",
@@ -313,16 +336,26 @@ impl Plan {
             }
         }
         Ok(Self {
+            custom_filters: settings.av1an_filters.clone(),
+            grain_prefilter: settings
+                .av1an_grain
+                .as_ref()
+                .filter(|grain| grain.table.is_some() && grain.denoise)
+                .map(|grain| grain.denoise_strength),
+            prepare_metric_reference: settings
+                .av1an_options
+                .and_then(|options| options.target_quality)
+                .is_some_and(|target| target.metric != media_core::Av1anTargetMetric::Vmaf),
             temporal: settings.temporal.map(temporal::Transform::new),
             trim: settings.trim,
             encoder: settings.encoder,
-            output_pixel_format: if settings.encoder.is_svt()
-                || video.pix_fmt.as_deref() == Some("yuv420p10le")
-            {
-                "yuv420p10le"
-            } else {
-                "yuv420p"
-            },
+            output_pixel_format: explicit_pixel_format.unwrap_or_else(|| {
+                if settings.encoder.is_svt() || video.pix_fmt.as_deref() == Some("yuv420p10le") {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                }
+            }),
             video_index: video.index,
             width: geometry.width,
             height: geometry.height,
@@ -405,6 +438,9 @@ impl Plan {
     /// source which all scene, chunk and quality-reference readers share.
     pub fn requires_av1an_preprocess(&self) -> bool {
         self.trim.is_some()
+            || self.grain_prefilter.is_some()
+            || !self.custom_filters.is_empty()
+            || (self.prepare_metric_reference && self.decoder_filter().is_some())
             || self
                 .temporal
                 .as_ref()
@@ -446,6 +482,13 @@ impl Plan {
 
     pub fn post_qtgmc_filter_with_text(&self, text: Option<&str>) -> Option<String> {
         let mut filters = Vec::new();
+        if let Some(strength) = self.grain_prefilter {
+            filters.push(format!(
+                "hqdn3d={strength}:{strength}:{}:{}",
+                u16::from(strength) * 3 / 2,
+                u16::from(strength) * 3 / 2
+            ));
+        }
         if let Some(filter) = self
             .temporal
             .as_ref()
@@ -498,6 +541,7 @@ impl Plan {
             // plan's square-pixel default on the owned QTGMC intermediate.
             filters.push("setsar=1/1:max=65535".into());
         }
+        filters.extend(self.custom_filters.iter().cloned());
         (!filters.is_empty()).then(|| filters.join(","))
     }
 
@@ -522,11 +566,19 @@ impl Plan {
         if let Some(aspect) = self.aspect {
             filters.push(aspect.filter());
         }
+        filters.extend(self.custom_filters.iter().cloned());
         (!filters.is_empty()).then(|| filters.join(","))
     }
 
     pub fn decoder_prefix(&self) -> Option<String> {
         let mut filters = Vec::new();
+        if let Some(strength) = self.grain_prefilter {
+            filters.push(format!(
+                "hqdn3d={strength}:{strength}:{}:{}",
+                u16::from(strength) * 3 / 2,
+                u16::from(strength) * 3 / 2
+            ));
+        }
         if let Some(trim) = self.trim {
             if let Some(time) = trim.time {
                 let seconds = |milliseconds: u32| {
@@ -640,7 +692,7 @@ impl Plan {
     }
 
     pub fn output_bit_depth(&self) -> u8 {
-        if self.output_pixel_format == "yuv420p10le" {
+        if self.output_pixel_format.ends_with("10le") {
             10
         } else {
             8
@@ -651,8 +703,12 @@ impl Plan {
         format == Some(self.output_pixel_format)
             || (!self.encoder.is_svt()
                 && self.full_range
-                && self.output_pixel_format == "yuv420p"
-                && format == Some("yuvj420p"))
+                && matches!(
+                    (self.output_pixel_format, format),
+                    ("yuv420p", Some("yuvj420p"))
+                        | ("yuv422p", Some("yuvj422p"))
+                        | ("yuv444p", Some("yuvj444p"))
+                ))
     }
 
     pub fn is_hdr10(&self) -> bool {
@@ -1510,6 +1566,25 @@ mod tests {
                     );
                     if encoder == VideoEncoder::SvtAv1Hdr {
                         assert!(args.windows(2).any(|pair| pair == ["--tune", "5"]));
+                        let mut overridden = settings.clone();
+                        overridden.parameters.push(media_core::EncoderParameter {
+                            name: "tune".into(),
+                            value: "0".into(),
+                        });
+                        let overridden_args =
+                            super::super::encode::encoder_parameters(&plan, &overridden);
+                        assert_eq!(
+                            overridden_args
+                                .iter()
+                                .filter(|value| *value == "--tune")
+                                .count(),
+                            1
+                        );
+                        assert!(
+                            overridden_args
+                                .windows(2)
+                                .any(|pair| pair == ["--tune", "0"])
+                        );
                     }
                 }
             }
@@ -1526,6 +1601,53 @@ mod tests {
             preset: 5,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn av1an_x264_explicit_output_formats_preserve_depth_and_chroma() {
+        use media_core::{Av1anOptions, Av1anPixelFormat};
+        let mut source = source();
+        source.streams[0].chroma_location = Some("left".into());
+        for (format, expected, depth) in [
+            (Av1anPixelFormat::Yuv420p, "yuv420p", 8),
+            (Av1anPixelFormat::Yuv420p10le, "yuv420p10le", 10),
+            (Av1anPixelFormat::Yuv422p, "yuv422p", 8),
+            (Av1anPixelFormat::Yuv422p10le, "yuv422p10le", 10),
+            (Av1anPixelFormat::Yuv444p, "yuv444p", 8),
+            (Av1anPixelFormat::Yuv444p10le, "yuv444p10le", 10),
+        ] {
+            let settings = EncodeSettings {
+                backend: EncodeBackend::Av1an,
+                av1an_options: Some(Av1anOptions {
+                    pixel_format: Some(format),
+                    ..Default::default()
+                }),
+                ..x264_settings()
+            };
+            let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+            assert_eq!(plan.output_pixel_format, expected);
+            assert_eq!(plan.output_bit_depth(), depth);
+            assert!(plan.matches_output_format(Some(expected)));
+        }
+    }
+
+    #[test]
+    fn av1an_svt_eight_bit_output_sets_matching_encoder_depth() {
+        let mut source = source();
+        source.streams[0].chroma_location = Some("left".into());
+        let settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        assert_eq!(plan.output_pixel_format, "yuv420p");
+        assert_eq!(plan.output_bit_depth(), 8);
+        let args = super::super::encode::encoder_parameters(&plan, &settings);
+        assert!(args.windows(2).any(|pair| pair == ["--input-depth", "8"]));
     }
 
     #[test]
@@ -1580,7 +1702,14 @@ mod tests {
     }
 
     #[test]
-    fn x264_requires_standalone_settings_and_rejects_hdr_or_unknown_chroma() {
+    fn x264_accepts_both_backends_and_rejects_hdr_or_unknown_chroma() {
+        assert!(
+            validate_settings(&EncodeSettings {
+                backend: EncodeBackend::Av1an,
+                ..x264_settings()
+            })
+            .is_ok()
+        );
         for crf in [0, 23, 51] {
             for preset in [0, 5, 9] {
                 assert!(
@@ -1608,10 +1737,6 @@ mod tests {
             },
             EncodeSettings {
                 hdr10_fallback: true,
-                ..x264_settings()
-            },
-            EncodeSettings {
-                backend: EncodeBackend::Av1an,
                 ..x264_settings()
             },
         ] {

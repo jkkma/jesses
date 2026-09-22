@@ -1,16 +1,25 @@
-//! Chunked SVT encoding under the same process ownership and artifact gates.
+//! Chunked encoding under the same process ownership and artifact gates.
 use super::{encode::encoder_parameters, encode_plan::Plan, *};
 
+mod filters;
+mod grain;
 mod launcher;
+pub(super) use filters::validate as validate_filters;
+pub(super) use grain::validate as validate_grain;
+pub(super) mod encoder;
 mod metrics;
 mod options;
+mod scenes;
 pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
 pub(super) use recovery::{PreparedSource, Recovery};
 
-pub(super) fn validate_encoder_path(encoder: &Path) -> Result<(), AppError> {
-    launcher::validate_encoder_path(encoder)
+pub(super) fn validate_encoder_path(
+    encoder: &Path,
+    settings: &EncodeSettings,
+) -> Result<(), AppError> {
+    launcher::validate_encoder_path(encoder, settings.encoder)
 }
 
 pub(super) fn validate_input(document: &Document, plan: &Plan) -> Result<(), AppError> {
@@ -42,14 +51,14 @@ pub(super) fn arguments(
 ) -> Vec<OsString> {
     // Only planner-owned scalars enter av1an's nested encoder argument string.
     // User paths are always separate native arguments, never shell text.
-    let params = encoder_parameters(plan, settings)
+    let params = encoder::parameters(plan, settings)
         .iter()
         .map(|v| v.to_str().expect("ASCII encoder parameters"))
         .collect::<Vec<_>>()
         .join(" ");
     let mut args: Vec<OsString> = [
         "--encoder",
-        "svt-av1",
+        encoder::name(settings.encoder),
         "--passes",
         "1",
         "--no-defaults",
@@ -57,12 +66,18 @@ pub(super) fn arguments(
         // av1an's av-ivf concatenator can panic on valid small AV1 packets.
         // FFmpeg copies the IVF chunks; our complete record and decode checks
         // still verify the resulting stream before publication.
-        "ffmpeg",
+        if encoder::uses_mkvmerge(settings.encoder, settings) {
+            "mkvmerge"
+        } else {
+            "ffmpeg"
+        },
         "--pix-format",
-        "yuv420p10le",
+        plan.output_pixel_format,
         "--cache-mode",
         "temp",
         "--max-tries",
+        // The value is bounded before it reaches the nested av1an CLI.
+        // A scalar is appended below because this fixed array contains &str.
         "3",
         "--keep",
         "--verbose",
@@ -80,6 +95,14 @@ pub(super) fn arguments(
     .into_iter()
     .map(OsString::from)
     .collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--max-tries") {
+        args[index + 1] = settings
+            .av1an_options
+            .unwrap_or_default()
+            .max_tries
+            .to_string()
+            .into();
+    }
     options::append(&mut args, settings, &params);
     if resume {
         args.push("--resume".into());
@@ -124,15 +147,16 @@ impl JobManager {
         executable: &Path,
         ffmpeg: &Path,
         ffprobe: &Path,
+        mkvmerge: Option<&Path>,
         recovery: &Recovery,
-        ivf: &Temporary,
+        video: &Temporary,
         plan: &Plan,
         settings: &EncodeSettings,
         cancel: &watch::Receiver<bool>,
         log_path: &Path,
         frame_count: usize,
     ) -> Result<(), AppError> {
-        validate_encoder_path(encoder)?;
+        validate_encoder_path(encoder, settings)?;
         if plan.is_hdr10()
             && settings
                 .av1an_options
@@ -167,12 +191,16 @@ impl JobManager {
         let launch_work = launch_directory.clone();
         let launch_ffmpeg = ffmpeg.to_owned();
         let launch_ffprobe = ffprobe.to_owned();
+        let launch_mkvmerge = mkvmerge.map(Path::to_owned);
+        let launch_family = settings.encoder;
         let mut launch = tokio::task::spawn_blocking(move || {
             launcher::Launch::prepare(
                 &launch_executable,
                 &launch_encoder,
+                launch_family,
                 &launch_ffmpeg,
                 &launch_ffprobe,
+                launch_mkvmerge.as_deref(),
                 &launch_work,
             )
         })
@@ -216,6 +244,7 @@ impl JobManager {
             cancel,
         )
         .await?;
+        let _grain_table = grain::stage(&work, settings)?;
         let version = version_text
             .lines()
             .find(|v| !v.is_empty())
@@ -223,6 +252,29 @@ impl JobManager {
             .to_owned();
         recovery.version(version_text).await?;
         recovery.verify_segments(ffmpeg, input, cancel).await?;
+        let prepared_scenes = if recovery.resume_chunks {
+            None
+        } else {
+            match scenes::prepare(
+                &launch.executable,
+                &launch.environment,
+                input,
+                &launch_directory,
+                &work.join("chunks"),
+                frame_count,
+                configured,
+                cancel,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    check_cancel(cancel)?;
+                    self.change(id, |snapshot| append_log(snapshot, format!("Parallel scene prepass was unavailable ({error}); av1an will detect scenes during encoding."))).await;
+                    None
+                }
+            }
+        };
         let internal_log = log_path.with_extension("av1an.log");
         self.change(id, |snapshot| {
             append_log(snapshot, format!("Tool: {} — {version}", executable.display()));
@@ -233,6 +285,9 @@ impl JobManager {
                 if source_filter.is_some() { append_log(snapshot, "Quality target: probe encodes and reference scoring use the same validated trim, temporal, tone-map, framing, and aspect-ratio filter chain as final chunks.".into()); }
                 else { append_log(snapshot, "Quality target: probe encodes and reference scoring read the same verified lossless processed source as final chunks.".into()); }
                 if target.probing_rate > 1 { append_log(snapshot, "Quality target warning: sampled-frame scores may differ from scoring every frame; the target is not a full-output quality measurement.".into()); }
+            }
+            if let Some(prepared) = &prepared_scenes {
+                append_log(snapshot, format!("Parallel scene prepass: {} slices produced {} scenes.", prepared.slices, prepared.scenes));
             }
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
@@ -284,19 +339,29 @@ impl JobManager {
             .expect("registered av1an job")
             .pause
             .clone();
+        // mkvmerge refuses an existing destination. It writes to this fresh
+        // launch-owned path; after a successful process and receipt checkpoint,
+        // copy the result into the identity-guarded durable video reservation.
+        let staged_video = encoder::uses_mkvmerge(settings.encoder, settings)
+            .then(|| launch_directory.join("encoded.mkv"));
+        let av1an_output = staged_video.as_deref().unwrap_or(&video.path);
+        let mut args = arguments(
+            input,
+            av1an_output,
+            &work,
+            &internal_log,
+            plan,
+            settings,
+            recovery.resume_chunks,
+            source_filter.as_deref(),
+        );
+        if let Some(prepared) = &prepared_scenes {
+            args.extend(["--scenes".into(), prepared.path.as_os_str().to_owned()]);
+        }
         let result = supervisor::run_with_environment(
             &CommandSpec {
                 executable: launch.executable.clone(),
-                args: arguments(
-                    input,
-                    &ivf.path,
-                    &work,
-                    &internal_log,
-                    plan,
-                    settings,
-                    recovery.resume_chunks,
-                    source_filter.as_deref(),
-                ),
+                args,
                 cwd: Some(work.clone()),
             },
             cancel.clone(),
@@ -309,7 +374,7 @@ impl JobManager {
         .await;
         let _ = event_task.await;
         let stage_cleanup = launch.cleanup();
-        let _ = tokio::fs::remove_dir(&launch_directory).await;
+        drop(prepared_scenes);
         // The process has exited, so seal its last complete receipts even when
         // cancellation won. A crash before this point reuses only prior receipts.
         let checkpoint = recovery
@@ -340,25 +405,74 @@ impl JobManager {
                 input,
             ));
         }
-        if configured.chunk_method == media_core::Av1anChunkMethod::Hybrid {
-            self.change(id, |snapshot| append_log(snapshot, "Verifying the complete decoded hybrid segment sequence against the original source.".into())).await;
+        if let Some(staged) = &staged_video {
+            let staged = staged.clone();
+            let mut destination = video.clone_file()?;
+            tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+                use std::io::{Seek, SeekFrom, Write};
+                let guard = Source::open(&staged)?;
+                let mut input = std::fs::File::open(&guard.path).map_err(|e| {
+                    files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
+                })?;
+                destination
+                    .set_len(0)
+                    .and_then(|_| destination.seek(SeekFrom::Start(0)).map(|_| ()))
+                    .map_err(|e| {
+                        files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
+                    })?;
+                std::io::copy(&mut input, &mut destination)
+                    .and_then(|_| destination.flush())
+                    .and_then(|_| destination.sync_all())
+                    .map_err(|e| {
+                        files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
+                    })?;
+                guard.verify()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| {
+                files::error(
+                    "ENCODE_VALIDATION_FAILED",
+                    e.to_string(),
+                    staged_video.as_ref().unwrap(),
+                )
+            })??;
+            let _ = tokio::fs::remove_file(staged_video.as_ref().unwrap()).await;
+        }
+        let _ = tokio::fs::remove_dir(&launch_directory).await;
+        if matches!(
+            configured.chunk_method,
+            media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment
+        ) {
+            self.change(id, |snapshot| {
+                append_log(
+                    snapshot,
+                    "Verifying the complete decoded segment sequence against the original source."
+                        .into(),
+                )
+            })
+            .await;
         }
         recovery.verify_segments(ffmpeg, input, cancel).await?;
-        ivf.flush_nonempty_async().await?;
-        let mut file = ivf.clone_file()?;
-        let geometry = (plan.width, plan.height);
-        let rate = (plan.fps_num, plan.fps_den);
-        let canceled = cancel.clone();
-        let normalized = tokio::task::spawn_blocking(move || {
-            normalize_ivf(&mut file, geometry, rate, frame_count, &canceled)
-        })
-        .await;
-        check_cancel(cancel)?;
-        let changed = normalized
-            .map_err(|e| files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &ivf.path))?
-            .map_err(|e| files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &ivf.path))?;
-        if changed {
-            self.change(id, |snapshot| append_log(snapshot, format!("Corrected av1an IVF rate to {}/{} after checking all {frame_count} sequential frame records.", rate.0, rate.1))).await;
+        video.flush_nonempty_async().await?;
+        if encoder::video_extension(settings.encoder, settings) == "ivf" {
+            let mut file = video.clone_file()?;
+            let geometry = (plan.width, plan.height);
+            let rate = (plan.fps_num, plan.fps_den);
+            let canceled = cancel.clone();
+            let normalized = tokio::task::spawn_blocking(move || {
+                normalize_ivf(&mut file, geometry, rate, frame_count, &canceled)
+            })
+            .await;
+            check_cancel(cancel)?;
+            let changed = normalized
+                .map_err(|e| files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &video.path))?
+                .map_err(|e| {
+                    files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &video.path)
+                })?;
+            if changed {
+                self.change(id, |snapshot| append_log(snapshot, format!("Corrected av1an IVF rate to {}/{} after checking all {frame_count} sequential frame records.", rate.0, rate.1))).await;
+            }
         }
         check_cancel(cancel)
     }
