@@ -709,6 +709,14 @@
         </p>{/if}
     </div>
   </div>
+  <details class="batch-operation-guidance">
+    <summary>Other operations</summary>
+    <p>
+      Utilities handles joins and concatenation in file-list order and runs CRF ladders one source
+      at a time. In Files, compare quality for a chosen source pair and inspect bitrate charts one
+      source at a time; inspect CRF ladder results per source.
+    </p>
+  </details>
   {#if error}<div class="notice error-notice" role="alert"><p>{error}</p></div>{/if}
   {#if submissionNotice}<div class="notice" role="status"><p>{submissionNotice}</p></div>{/if}
   <div class="batch-grid">
@@ -1227,6 +1235,18 @@
   .batch-sources,
   .batch-settings {
     min-width: 0;
+  }
+  .batch-operation-guidance {
+    margin-top: 8px;
+    font-size: 12px;
+  }
+  .batch-operation-guidance summary {
+    cursor: pointer;
+    color: var(--muted-foreground);
+  }
+  .batch-operation-guidance p {
+    margin: 8px 0 0 18px;
+    line-height: 1.45;
   }
   .selection-actions,
   .batch-submit {

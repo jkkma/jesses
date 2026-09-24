@@ -41,8 +41,10 @@ pub struct BatchEncodeInput {
     pub video_stream_index: u32,
 }
 
+/// Batch previews accept only encode fields; unrelated operation fields must
+/// not be silently discarded and interpreted as a different task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BatchEncodeRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<crate::EncoderParameter>,

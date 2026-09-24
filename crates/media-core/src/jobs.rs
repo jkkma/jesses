@@ -324,8 +324,10 @@ pub(crate) fn default_workers() -> u8 {
     2
 }
 
+/// Used by individual jobs, reviewed batches and saved requests. Reject fields
+/// from other operations rather than accepting them as an encode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EncodeRequest {
     pub source: RemuxRequest,
     pub settings: EncodeSettings,

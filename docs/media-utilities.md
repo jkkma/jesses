@@ -2,6 +2,19 @@
 
 The Utilities screen runs each operation as an owned, cancellable process tree. Sources stay open and are checked again before a result is published. Every output must be a new path; an existing file, directory, or dangling link is never replaced.
 
+## Choosing sources and batch behavior
+
+**Batch encode** applies an encoding recipe to each selected source. These operations run separately:
+
+| Operation          | Where to run it | Source selection                                                        |
+| ------------------ | --------------- | ----------------------------------------------------------------------- |
+| Concatenation      | Utilities       | One ordered list becomes one output.                                    |
+| Quality comparison | Files           | One explicitly aligned reference/candidate pair.                        |
+| Bitrate chart      | Files           | One selected file and stream per report.                                |
+| CRF ladder         | Utilities       | One source per run; review its results before choosing encode settings. |
+
+Selecting files in Batch does not run these operations for each file. Their own source controls remain independent of the batch selection. The preview and queue commands accept encode requests only and reject unexpected top-level fields before any jobs are admitted. Existing encode requests with omitted optional settings remain supported.
+
 ## Dependencies
 
 Use **Check utility tools** in the Utilities screen after installing a tool or language model. Discovery runs each tool's version command and reports the resolved executable and any failure.

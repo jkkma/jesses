@@ -365,6 +365,61 @@ async function openBatch(page: Page) {
   await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
 }
 
+test('batch explains other operations without running them or expanding a reviewed selection', async ({
+  page,
+}) => {
+  await desktopMock(page);
+  await openBatch(page);
+
+  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
+  const guidance = workspace.locator('details.batch-operation-guidance');
+  await expect(guidance.locator('summary')).toHaveText('Other operations');
+  await expect(guidance).toHaveJSProperty('open', false);
+  await guidance.locator('summary').click();
+  await expect(guidance).toContainText('joins and concatenation');
+  await expect(guidance).toContainText('file-list order');
+  await expect(guidance).toContainText('CRF ladders one source at a time');
+  await expect(guidance).toContainText('quality for a chosen source pair');
+  await expect(guidance).toContainText('bitrate charts one source at a time');
+  await expect(guidance).toContainText('CRF ladder results per source');
+  await guidance.locator('summary').click();
+
+  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
+  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
+  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
+    .request as BatchEncodeRequest;
+  expect(preview.inputs.map((input) => input.inputPath)).toEqual([episodes[0].path]);
+  const queue = workspace.getByRole('button', { name: 'Queue ready files', exact: true });
+  await expect(queue).toBeEnabled();
+
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Media utilities', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /^Files/ }).click();
+  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
+  await expect(queue).toBeEnabled();
+
+  for (const command of [
+    'begin_media_analysis',
+    'run_utility',
+    'analyze_quality',
+    'analyze_bitrate',
+  ])
+    expect(await calls(page, command)).toHaveLength(0);
+  expect(await calls(page, 'preview_encode_batch')).toHaveLength(1);
+
+  await queue.click();
+  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
+  expect(queued).toHaveLength(1);
+  expect(queued.map((request) => request.source.inputPath)).toEqual([episodes[0].path]);
+  for (const command of [
+    'begin_media_analysis',
+    'run_utility',
+    'analyze_quality',
+    'analyze_bitrate',
+  ])
+    expect(await calls(page, command)).toHaveLength(0);
+});
+
 test('crop resize and borders batch preview retains each source framing and immutable queue history', async ({
   page,
 }) => {
