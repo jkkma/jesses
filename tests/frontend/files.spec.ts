@@ -239,6 +239,56 @@ async function pickFiles(page: Page, paths: string[]) {
   );
 }
 
+test('search narrows the file list without changing the selected source or imported files', async ({
+  page,
+}) => {
+  const first = media('first', 'C:\\media\\Travel\\Coastal walk.mkv');
+  const second = media('second', 'C:\\media\\Archive\\café 東京.mkv');
+  await desktopMock(page, {
+    files: [
+      [first.path, first],
+      [second.path, second],
+    ],
+    pickerPaths: [first.path, second.path],
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  const library = page.getByRole('region', { name: 'Imported media', exact: true });
+  const inspector = page.getByRole('complementary', { name: 'Media inspector' });
+  await library.getByRole('button', { name: /^Coastal walk.mkv/ }).click();
+  const search = page.getByRole('searchbox', { name: 'Search source files' });
+  await search.fill('  ARCHIVE  ');
+  await expect(library.locator('.file-select')).toHaveCount(1);
+  await expect(library.locator('.file-select')).toContainText(second.name);
+  await expect(library.getByRole('status')).toHaveText('1 of 2 shown');
+  await expect(inspector.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+  await search.fill('東京');
+  await expect(library.locator('.file-select')).toContainText(second.name);
+  await search.fill('no such file');
+  await expect(library.getByText('No matching files', { exact: true })).toBeVisible();
+  await expect(library.locator('.file-select')).toHaveCount(0);
+  await library.getByRole('button', { name: 'Clear search', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await expect(search).toHaveValue('');
+  await expect(library.locator('.file-select')).toHaveCount(2);
+  await expect(library.getByRole('button', { name: /^Coastal walk.mkv/ })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await search.fill('archive');
+  await page.getByRole('button', { name: 'Convert a file', exact: false }).click();
+  await expect(
+    page
+      .getByRole('region', { name: 'Quick Convert workspace', exact: true })
+      .locator('.output-source'),
+  ).toContainText(first.name);
+  await page.getByRole('button', { name: /^Files/ }).click();
+  await expect(search).toHaveValue('archive');
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  await expect(search).toHaveValue('');
+  await expect(library.locator('.file-select')).toHaveCount(2);
+});
+
 test('mixed file and folder drops scan folders, retain per-entry errors, and preserve long Unicode paths', async ({
   page,
 }) => {

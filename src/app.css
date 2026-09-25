@@ -10,30 +10,30 @@
   font-size: 13px;
   line-height: 1.5;
   color-scheme: light;
-  color: #34322d;
-  background: #f0eee6;
+  color: #302e29;
+  background: #f7f6f2;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --background: #f0eee6;
-  --foreground: #34322d;
-  --card: #e3dacc;
-  --card-foreground: #34322d;
-  --popover: #e3dacc;
-  --popover-foreground: #34322d;
-  --primary: #ad5326;
-  --primary-foreground: #fff9ee;
-  --secondary: #e3dacc;
-  --secondary-foreground: #34322d;
-  --muted: #e3dacc;
-  --muted-foreground: #625c52;
-  --accent: #d5c8b7;
-  --accent-foreground: #34322d;
+  --background: #f7f6f2;
+  --foreground: #302e29;
+  --card: #fffefa;
+  --card-foreground: #302e29;
+  --popover: #fffefa;
+  --popover-foreground: #302e29;
+  --primary: #a74923;
+  --primary-foreground: #ffffff;
+  --secondary: #eeece5;
+  --secondary-foreground: #302e29;
+  --muted: #eeece5;
+  --muted-foreground: #666158;
+  --accent: #f3e8de;
+  --accent-foreground: #302e29;
   --destructive: #923b31;
-  --border: #7c7367;
-  --input: #7c7367;
+  --border: #b3aca0;
+  --input: #b3aca0;
   --ring: #8c482c;
-  --sidebar: #e3dacc;
+  --sidebar: #fffefa;
   --sidebar-foreground: #34322d;
   --sidebar-primary: #34322d;
   --sidebar-primary-foreground: #f0eee6;
@@ -41,10 +41,10 @@
   --sidebar-accent-foreground: #34322d;
   --sidebar-border: #7c7367;
   --sidebar-ring: #8c482c;
-  --radius: 2px;
+  --radius: 6px;
   --jesses-primary-hover: #91421d;
   --jesses-rust-text: #8c482c;
-  --rule: #c7beaf;
+  --rule: #dedbd2;
   --success: #4a6044;
 }
 
@@ -161,8 +161,10 @@ svg {
   text-transform: uppercase;
 }
 .panel {
-  background: #e3dacc;
+  background: var(--card);
   border: 1px solid var(--rule);
+  border-radius: 8px;
+  box-shadow: 0 2px 5px #302e2904;
 }
 .app-shell {
   display: flex;
@@ -178,6 +180,7 @@ svg {
   justify-content: space-between;
   gap: 20px;
   border-bottom: 1px solid var(--rule);
+  background: var(--card);
 }
 .brand {
   display: flex;
@@ -189,6 +192,7 @@ svg {
   height: 36px;
   object-fit: cover;
   border: 1px solid var(--rule);
+  border-radius: 7px;
 }
 .brand-wordmark {
   display: flex;
@@ -233,7 +237,7 @@ svg {
   justify-content: space-between;
   padding: 0 20px;
   border-bottom: 1px solid var(--rule);
-  background: #e3dacc;
+  background: var(--card);
 }
 .workspace-nav nav {
   height: 100%;
@@ -245,10 +249,11 @@ svg {
   height: 33px;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 0 14px;
+  gap: 8px;
+  padding: 0 11px;
   background: none;
   border: 1px solid transparent;
+  border-radius: 6px;
   font-size: 12px;
   color: var(--muted-foreground);
 }
@@ -257,9 +262,10 @@ svg {
   color: var(--foreground);
 }
 .workspace-nav nav button.active {
-  background: var(--foreground);
-  border-color: var(--foreground);
-  color: var(--background);
+  background: var(--accent);
+  border-color: #e9cdbc;
+  color: var(--jesses-rust-text);
+  font-weight: 600;
 }
 .nav-count {
   display: inline-flex;
@@ -267,7 +273,8 @@ svg {
   justify-content: center;
   min-width: 22px;
   height: 17px;
-  border: 1px solid currentColor;
+  background: var(--background);
+  border-radius: 4px;
   padding: 0 3px;
   margin-left: 4px;
   font:
@@ -298,7 +305,7 @@ main {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 0;
+  padding: 8px 0;
   font-size: 11px;
   border-bottom: 1px solid var(--rule);
   color: var(--muted-foreground);
@@ -370,6 +377,8 @@ h1 {
   color: var(--muted-foreground);
   padding: 2px 6px;
   border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--card);
 }
 .toolbar-actions {
   display: flex;
@@ -385,14 +394,141 @@ h1 {
   grid-template-columns: minmax(0, 1fr) 306px;
   gap: 20px;
   flex: 1;
-  min-height: 400px;
+  align-items: start;
+}
+.source-library-column {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+.library-search {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+.search-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted-foreground);
+  background: var(--card);
+}
+.search-field:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.search-field input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 12px;
+}
+.library-search > span {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.search-empty {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  min-height: 180px;
+  padding: 20px;
+  text-align: center;
+}
+.search-empty p,
+.search-empty > svg {
+  color: var(--muted-foreground);
+}
+.search-empty p {
+  font-size: 12px;
+}
+.workflow-launcher-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 10px;
+}
+.workflow-launcher-heading h2 {
+  font-size: 14px;
+}
+.workflow-launcher-heading > span {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.workflow-shortcuts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.workflow-shortcuts button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--card);
+  text-align: left;
+}
+.workflow-shortcuts button:hover {
+  background: var(--accent);
+  border-color: #d7b39c;
+}
+.workflow-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: var(--background);
+  color: var(--jesses-rust-text);
+}
+.workflow-shortcuts strong,
+.workflow-shortcuts small {
+  display: block;
+}
+.workflow-shortcuts strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.workflow-shortcuts small {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted-foreground);
+}
+.workflow-shortcuts button > svg {
+  margin-left: auto;
+  color: var(--muted-foreground);
+}
+[data-slot='button'] {
+  border-radius: 6px;
 }
 .file-library {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--rule);
   min-width: 0;
-  background: #f0eee6;
+  background: var(--card);
+  border-radius: 8px;
+  overflow: hidden;
 }
 .library-heading {
   height: 42px;
@@ -402,7 +538,7 @@ h1 {
   gap: 15px;
   padding: 0 17px;
   border-bottom: 1px solid var(--rule);
-  background: #e3dacc;
+  background: var(--card);
 }
 .library-empty {
   flex: 1;
@@ -411,44 +547,20 @@ h1 {
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 42px 25px 43px;
+  padding: 28px 25px;
+  min-height: 300px;
 }
 .empty-file-symbol {
   position: relative;
-  width: 88px;
-  height: 82px;
+  width: 64px;
+  height: 60px;
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--jesses-rust-text);
-  margin: 0 0 25px;
-}
-.corner {
-  position: absolute;
-  width: 11px;
-  height: 11px;
-  border-style: solid;
-  border-color: var(--rule);
-}
-.top-left {
-  left: 0;
-  top: 0;
-  border-width: 1px 0 0 1px;
-}
-.top-right {
-  right: 0;
-  top: 0;
-  border-width: 1px 1px 0 0;
-}
-.bottom-left {
-  left: 0;
-  bottom: 0;
-  border-width: 0 0 1px 1px;
-}
-.bottom-right {
-  right: 0;
-  bottom: 0;
-  border-width: 0 1px 1px 0;
+  margin: 0 0 16px;
+  background: var(--accent);
+  border-radius: 12px;
 }
 .library-empty h2 {
   font-size: 21px;
@@ -480,7 +592,8 @@ h1 {
   align-items: center;
   gap: 20px;
   color: var(--muted-foreground);
-  font-size: 10px;
+  font-size: 11px;
+  background: var(--background);
 }
 .library-empty-footer span {
   display: flex;
@@ -499,6 +612,7 @@ h1 {
   min-height: 38px;
   padding-block: 7px;
   border-bottom: 1px solid var(--rule);
+  border-radius: 8px 8px 0 0;
 }
 .heading-with-icon {
   display: inline-flex;
@@ -586,6 +700,8 @@ h1 {
 .file-table-scroll {
   overflow: auto;
   flex: 1;
+  max-height: 420px;
+  min-height: 155px;
 }
 .file-table {
   border-collapse: collapse;
@@ -595,7 +711,10 @@ h1 {
   font-size: 11px;
 }
 .file-table thead {
-  background: #e3dacc;
+  background: var(--background);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 .file-table th {
   font-size: 9px;
@@ -664,7 +783,7 @@ h1 {
   gap: 4px;
 }
 .file-name strong {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -690,6 +809,7 @@ h1 {
   border: 1px solid transparent;
   background: none;
   color: var(--muted-foreground);
+  border-radius: 5px;
 }
 .icon-button:hover:not(:disabled) {
   border-color: var(--border);
@@ -958,7 +1078,7 @@ h1 {
   min-width: 0;
 }
 .field label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   margin-bottom: 5px;
 }
@@ -967,11 +1087,11 @@ h1 {
   width: 100%;
   height: 34px;
   border: 1px solid var(--border);
-  border-radius: 1px;
-  background: var(--background);
-  color: var(--muted-foreground);
+  border-radius: 5px;
+  background: var(--card);
+  color: var(--foreground);
   padding: 0 9px;
-  font-size: 11px;
+  font-size: 12px;
   opacity: 1;
 }
 .field input[type='number'] {
@@ -997,7 +1117,7 @@ h1 {
   -webkit-text-fill-color: var(--muted-foreground);
 }
 .field p {
-  font-size: 10px;
+  font-size: 11px;
   margin-top: 6px;
   color: var(--muted-foreground);
 }
@@ -1213,7 +1333,7 @@ h1 {
 .log-panel {
   flex-shrink: 0;
   border-top: 1px solid var(--rule);
-  background: #e3dacc;
+  background: var(--card);
   margin-top: auto;
 }
 .log-bar {
@@ -1350,6 +1470,23 @@ h1 {
   }
 }
 @media (max-width: 1100px) {
+  .workspace-nav nav button {
+    padding-inline: 10px;
+  }
+  .workspace-nav nav button > svg {
+    display: none;
+  }
+  .workflow-shortcuts button {
+    gap: 9px;
+    padding: 11px;
+  }
+  .workflow-shortcuts button > svg {
+    display: none;
+  }
+  .workflow-icon {
+    width: 28px;
+    height: 32px;
+  }
   .file-columns,
   .convert-grid {
     grid-template-columns: minmax(0, 1fr) 275px;
@@ -1406,6 +1543,9 @@ h1 {
   }
   .file-table th:not(.name-column) {
     width: 64px;
+  }
+  .file-table th:nth-child(2) {
+    width: 86px;
   }
   .file-table th.remove-column {
     width: 28px;

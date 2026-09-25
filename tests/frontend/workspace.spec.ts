@@ -109,6 +109,34 @@ async function desktopMock(page: Page, paths: string[], media = fixture) {
   );
 }
 
+test('workflow shortcuts lead to source guidance and retain the selected sample', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /Convert a file/ }).click();
+  await expect(page.getByRole('region', { name: 'Choose a media source' })).toBeVisible();
+  await page.getByRole('button', { name: 'Try sample', exact: true }).click();
+  await expect(
+    page.getByRole('region', { name: 'Quick Convert workspace', exact: true }),
+  ).toBeVisible();
+  for (const [shortcut, navigation] of [
+    ['Convert a file', 'Quick Convert'],
+    ['Encode with av1an', 'av1an'],
+    ['Convert multiple files', 'Batch encode'],
+    ['Repackage streams', 'Remux'],
+  ]) {
+    await page.getByRole('button', { name: /^Files/ }).click();
+    await page
+      .getByRole('region', { name: 'Choose a workflow' })
+      .getByRole('button', { name: new RegExp(shortcut) })
+      .click();
+    await expect(
+      page.getByRole('navigation').getByRole('button', { name: navigation, exact: true }),
+    ).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByRole('region', { name: 'Choose a media source' })).toHaveCount(0);
+  }
+});
+
 test('browser preview starts empty, identifies sample data, and keeps encoding unavailable', async ({
   page,
 }) => {
@@ -161,11 +189,11 @@ test('desktop import retains good files through errors, deduplicates, and expose
   await page.goto('/');
   await expect(page.getByRole('button', { name: 'Add files', exact: true }).first()).toHaveCSS(
     'color',
-    'rgb(255, 249, 238)',
+    'rgb(255, 255, 255)',
   );
   await expect(page.getByRole('button', { name: 'Add files', exact: true }).first()).toHaveCSS(
     'background-color',
-    'rgb(173, 83, 38)',
+    'rgb(167, 73, 35)',
   );
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: fixture.name })).toBeVisible();
@@ -194,10 +222,10 @@ test('palette survives dark OS theme and minimum-size layout remains usable', as
   await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
   await page.setViewportSize({ width: 760, height: 600 });
   await page.goto('/');
-  await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(240, 238, 230)');
+  await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(247, 246, 242)');
   await expect(page.getByRole('complementary', { name: 'Media inspector' })).toHaveCSS(
     'background-color',
-    'rgb(227, 218, 204)',
+    'rgb(255, 254, 250)',
   );
   await page.getByRole('button', { name: 'Load sample', exact: true }).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(

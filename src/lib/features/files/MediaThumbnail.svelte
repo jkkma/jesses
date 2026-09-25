@@ -164,8 +164,8 @@
 
 <style>
   .thumbnail {
-    border-top: 1px solid var(--border);
-    margin-top: 12px;
+    border-top: 1px solid var(--rule);
+    padding-inline: 17px;
   }
   .thumbnail-toggle {
     width: 100%;
@@ -173,6 +173,8 @@
     text-align: left;
     font-size: 12px;
     font-weight: 600;
+    color: var(--foreground);
+    background: transparent;
   }
   .thumbnail-body {
     display: grid;

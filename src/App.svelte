@@ -10,6 +10,7 @@
   import {
     ArrowRight,
     Check,
+    Clapperboard,
     ChevronDown,
     ChevronUp,
     CircleAlert,
@@ -19,9 +20,11 @@
     FlaskConical,
     FolderOpen,
     HardDrive,
+    Layers,
     LoaderCircle,
     Monitor,
     Plus,
+    Search,
     SlidersHorizontal,
     Terminal,
     Trash2,
@@ -89,6 +92,7 @@
   let view = $state<View>('files');
   let files = $state<MediaFile[]>([]);
   let selectedId = $state<string | null>(null);
+  let fileQuery = $state('');
   let tools = $state<ToolInfo[]>(
     [
       { id: 'ffmpeg', name: 'FFmpeg' },
@@ -244,6 +248,13 @@
     );
   }
   const selectedFile = $derived(files.find((file) => file.id === selectedId));
+  const visibleFiles = $derived(
+    files.filter((file) =>
+      `${file.name} ${file.path}`
+        .toLocaleLowerCase()
+        .includes(fileQuery.trim().toLocaleLowerCase()),
+    ),
+  );
   const totalSize = $derived(files.reduce((total, file) => total + Number(file.sizeBytes), 0));
   const hasSample = $derived(files.some((file) => file.id === sampleId));
   const availableTools = $derived(tools.filter((tool) => tool.available).length);
@@ -308,6 +319,7 @@
   }
 
   function beginImport() {
+    fileQuery = '';
     const generation = ++importGeneration;
     importSession = { generation, folders: [], completed: [] };
     importQueue = [];
@@ -514,17 +526,20 @@
   function removeFile(id: string) {
     const file = files.find((entry) => entry.id === id);
     files = files.filter((entry) => entry.id !== id);
+    if (!files.length) fileQuery = '';
     if (selectedId === id) selectedId = files[0]?.id ?? null;
     if (file) addLog(`Removed ${file.name} from the workspace.`);
   }
 
   function clearFiles() {
+    fileQuery = '';
     files = [];
     selectedId = null;
     addLog('Source list cleared.');
   }
 
   function loadSample(nextView: View = 'files') {
+    fileQuery = '';
     if (files.some((file) => file.id === sampleId)) {
       selectedId = sampleId;
       view = nextView;
@@ -697,21 +712,21 @@
         class:active={view === 'av1an'}
         aria-current={view === 'av1an' ? 'page' : undefined}
         title="Scene-based AV1 encoding with parallel chunks"
-        onclick={() => (view = 'av1an')}>av1an</button
+        onclick={() => (view = 'av1an')}><Clapperboard size={16} aria-hidden="true" />av1an</button
       >
       <button
         type="button"
         class:active={view === 'batch'}
         aria-current={view === 'batch' ? 'page' : undefined}
         title="Apply one encoding recipe to multiple sources"
-        onclick={() => (view = 'batch')}>Batch encode</button
+        onclick={() => (view = 'batch')}><Layers size={16} aria-hidden="true" />Batch encode</button
       >
       <button
         type="button"
         class:active={view === 'remux'}
         aria-current={view === 'remux' ? 'page' : undefined}
         title="Repackage streams without re-encoding"
-        onclick={() => (view = 'remux')}>Remux</button
+        onclick={() => (view = 'remux')}><FolderOpen size={16} aria-hidden="true" />Remux</button
       >
       <button
         type="button"
@@ -726,7 +741,8 @@
         class:active={view === 'utilities'}
         aria-current={view === 'utilities' ? 'page' : undefined}
         title="Run focused media tasks such as cuts, joins, OCR, and analysis"
-        onclick={() => (view = 'utilities')}>Utilities</button
+        onclick={() => (view = 'utilities')}
+        ><FlaskConical size={16} aria-hidden="true" />Utilities</button
       >
     </nav>
     <span class="workspace-label">LOCAL WORKSPACE<span class="square-mark"></span></span>
@@ -845,131 +861,206 @@
           </div>
         {/if}
         <div class="file-columns">
-          <section
-            class="file-library"
-            class:has-files={files.length > 0}
-            aria-label="Imported media"
-          >
-            <div class="library-heading">
-              <span class="eyebrow">Input media</span><span class="small-muted"
-                >{files.length
-                  ? `${files.length} ${files.length === 1 ? 'file' : 'files'} · ${formatBytes(String(totalSize))}`
-                  : 'No files added'}</span
-              >
-            </div>
-            {#if files.length}
-              <div class="file-table-scroll">
-                <table class="file-table">
-                  <thead
-                    ><tr
-                      ><th class="name-column">Source</th><th>Duration</th><th>Video</th><th
-                        class="audio-column">Audio</th
-                      ><th class="size-column">Size</th><th class="remove-column"
-                        ><span class="sr-only">Remove</span></th
-                      ></tr
-                    ></thead
-                  ><tbody>
-                    {#each files as file (file.id)}
-                      {@const video = file.streams.find((stream) => stream.kind === 'video')}
-                      {@const audio = file.streams.find((stream) => stream.kind === 'audio')}
-                      <tr class:selected={selectedId === file.id}>
-                        <td class="name-cell"
-                          ><button
-                            type="button"
-                            class="file-select"
-                            aria-pressed={selectedId === file.id}
-                            onclick={() => (selectedId = file.id)}
-                            title={file.path}
-                            ><span class="file-type-icon"
-                              ><Film size={19} strokeWidth={1.5} aria-hidden="true" /></span
-                            ><span class="file-name"
-                              ><strong>{file.name}</strong><span
-                                >{file.id === sampleId
-                                  ? 'Synthetic sample'
-                                  : (file.format ?? 'Media file')}{video?.width && video.height
-                                  ? ` · ${video.width} × ${video.height}`
-                                  : ''}</span
-                              ></span
-                            ></button
-                          ></td
-                        >
-                        <td class="mono">{formatDuration(file.durationSeconds)}</td><td
-                          ><span class="table-codec">{video ? displayCodec(video.codec) : '—'}</span
-                          ></td
-                        ><td class="audio-column"
-                          ><span class="table-codec">{audio ? displayCodec(audio.codec) : '—'}</span
-                          ></td
-                        ><td class="mono size-column">{formatBytes(file.sizeBytes)}</td><td
-                          class="remove-column"
-                          ><button
-                            type="button"
-                            class="icon-button"
-                            aria-label={`Remove ${file.name}`}
-                            onclick={() => removeFile(file.id)}
-                            disabled={importing}><X size={14} aria-hidden="true" /></button
-                          ></td
-                        >
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-              {#if importing}<div class="import-progress" role="status">
-                  <LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading {importingName}…
-                </div>{/if}
-              <div class="library-bottom">
-                <span
-                  ><Check size={13} aria-hidden="true" />{hasSample
-                    ? 'Sample ready for inspection'
-                    : 'Source metadata loaded'}</span
-                ><button type="button" class="text-button" onclick={() => (view = 'convert')}
-                  >Review conversion defaults<ArrowRight size={13} aria-hidden="true" /></button
+          <div class="source-library-column">
+            <section
+              class="file-library"
+              class:has-files={files.length > 0}
+              aria-label="Imported media"
+            >
+              <div class="library-heading">
+                <span class="eyebrow">Input media</span><span class="small-muted"
+                  >{files.length
+                    ? `${files.length} ${files.length === 1 ? 'file' : 'files'} · ${formatBytes(String(totalSize))}`
+                    : 'No files added'}</span
                 >
               </div>
-            {:else}
-              <div class="library-empty">
-                <div class="empty-file-symbol">
-                  <span class="corner top-left"></span><span class="corner top-right"
-                  ></span><FilePlus2 size={42} strokeWidth={1.05} aria-hidden="true" /><span
-                    class="corner bottom-left"
-                  ></span><span class="corner bottom-right"></span>
-                </div>
-                <h2>{importing ? 'Reading your media…' : 'Your media starts here.'}</h2>
-                <p>
-                  {importing
-                    ? importingName
-                    : desktop
-                      ? 'Drop files anywhere in this window, or choose them from your computer.'
-                      : 'Add a video or audio file to explore its format, details, and individual streams.'}
-                </p>
-                <div class="empty-actions">
-                  <Button
-                    onclick={addFiles}
-                    disabled={!desktop || importing}
-                    title={!desktop
-                      ? 'Local files require the jesses desktop app'
-                      : 'Choose media files'}
-                    >{#if importing}<LoaderCircle
-                        size={15}
-                        class="spinning"
-                        aria-hidden="true"
-                      />Reading file{:else}<FolderOpen size={15} aria-hidden="true" />Add files{/if}</Button
+              {#if files.length}
+                <div class="library-search">
+                  <label class="search-field">
+                    <Search size={15} aria-hidden="true" />
+                    <input
+                      type="search"
+                      aria-label="Search source files"
+                      placeholder="Find a file by name or folder…"
+                      bind:value={fileQuery}
+                    />
+                  </label>
+                  <span class="small-muted" role="status"
+                    >{visibleFiles.length} of {files.length} shown</span
                   >
-                  {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
-                      ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
-                    >{/if}
                 </div>
-                <span class="empty-shortcut"
-                  >{desktop ? 'or press Ctrl + O' : 'Available in the desktop app'}</span
+                {#if !visibleFiles.length}
+                  <div class="search-empty">
+                    <Search size={22} aria-hidden="true" />
+                    <strong>No matching files</strong>
+                    <p>Try another name or folder. Your imported files are still here.</p>
+                    <button type="button" class="text-button" onclick={() => (fileQuery = '')}
+                      >Clear search</button
+                    >
+                  </div>
+                {:else}
+                  <div class="file-table-scroll">
+                    <table class="file-table">
+                      <thead
+                        ><tr
+                          ><th class="name-column">Source</th><th>Duration</th><th>Video</th><th
+                            class="audio-column">Audio</th
+                          ><th class="size-column">Size</th><th class="remove-column"
+                            ><span class="sr-only">Remove</span></th
+                          ></tr
+                        ></thead
+                      ><tbody>
+                        {#each visibleFiles as file (file.id)}
+                          {@const video = file.streams.find((stream) => stream.kind === 'video')}
+                          {@const audio = file.streams.find((stream) => stream.kind === 'audio')}
+                          <tr class:selected={selectedId === file.id}>
+                            <td class="name-cell"
+                              ><button
+                                type="button"
+                                class="file-select"
+                                aria-pressed={selectedId === file.id}
+                                onclick={() => (selectedId = file.id)}
+                                title={file.path}
+                                ><span class="file-type-icon"
+                                  ><Film size={19} strokeWidth={1.5} aria-hidden="true" /></span
+                                ><span class="file-name"
+                                  ><strong>{file.name}</strong><span
+                                    >{file.id === sampleId
+                                      ? 'Synthetic sample'
+                                      : (file.format ?? 'Media file')}{video?.width && video.height
+                                      ? ` · ${video.width} × ${video.height}`
+                                      : ''}</span
+                                  ></span
+                                ></button
+                              ></td
+                            >
+                            <td class="mono">{formatDuration(file.durationSeconds)}</td><td
+                              ><span class="table-codec"
+                                >{video ? displayCodec(video.codec) : '—'}</span
+                              ></td
+                            ><td class="audio-column"
+                              ><span class="table-codec"
+                                >{audio ? displayCodec(audio.codec) : '—'}</span
+                              ></td
+                            ><td class="mono size-column">{formatBytes(file.sizeBytes)}</td><td
+                              class="remove-column"
+                              ><button
+                                type="button"
+                                class="icon-button"
+                                aria-label={`Remove ${file.name}`}
+                                onclick={() => removeFile(file.id)}
+                                disabled={importing}><X size={14} aria-hidden="true" /></button
+                              ></td
+                            >
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                {/if}
+                {#if importing}<div class="import-progress" role="status">
+                    <LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading {importingName}…
+                  </div>{/if}
+                <div class="library-bottom">
+                  <span
+                    ><Check size={13} aria-hidden="true" />{hasSample
+                      ? 'Sample ready for inspection'
+                      : 'Source metadata loaded'}</span
+                  ><button type="button" class="text-button" onclick={() => (view = 'convert')}
+                    >Review conversion defaults<ArrowRight size={13} aria-hidden="true" /></button
+                  >
+                </div>
+              {:else}
+                <div class="library-empty">
+                  <div class="empty-file-symbol">
+                    <FilePlus2 size={42} strokeWidth={1.05} aria-hidden="true" />
+                  </div>
+                  <h2>{importing ? 'Reading your media…' : 'Your media starts here.'}</h2>
+                  <p>
+                    {importing
+                      ? importingName
+                      : desktop
+                        ? 'Drop files anywhere in this window, or choose them from your computer.'
+                        : 'Add a video or audio file to explore its format, details, and individual streams.'}
+                  </p>
+                  <div class="empty-actions">
+                    <Button
+                      onclick={addFiles}
+                      disabled={!desktop || importing}
+                      title={!desktop
+                        ? 'Local files require the jesses desktop app'
+                        : 'Choose media files'}
+                      >{#if importing}<LoaderCircle
+                          size={15}
+                          class="spinning"
+                          aria-hidden="true"
+                        />Reading file{:else}<FolderOpen size={15} aria-hidden="true" />Add files{/if}</Button
+                    >
+                    {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
+                        ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
+                      >{/if}
+                  </div>
+                  <span class="empty-shortcut"
+                    >{desktop ? 'or press Ctrl + O' : 'Available in the desktop app'}</span
+                  >
+                </div>
+                <div class="library-empty-footer">
+                  <span><Film size={14} aria-hidden="true" />Video</span><span
+                    ><HardDrive size={14} aria-hidden="true" />Audio</span
+                  ><span class="supported-note">Formats supported by ffprobe</span>
+                </div>
+              {/if}
+            </section>
+            <section class="workflow-launcher" aria-label="Choose a workflow">
+              <div class="workflow-launcher-heading">
+                <h2>What would you like to do?</h2>
+                <span
+                  >{selectedFile
+                    ? 'Continue with your selected source'
+                    : 'Pick a workflow to get started'}</span
                 >
               </div>
-              <div class="library-empty-footer">
-                <span><Film size={14} aria-hidden="true" />Video</span><span
-                  ><HardDrive size={14} aria-hidden="true" />Audio</span
-                ><span class="supported-note">Formats supported by ffprobe</span>
+              <div class="workflow-shortcuts">
+                <button type="button" onclick={() => (view = 'convert')}>
+                  <span class="workflow-icon"
+                    ><SlidersHorizontal size={19} aria-hidden="true" /></span
+                  >
+                  <span
+                    ><strong>Convert a file</strong><small
+                      >Choose a format, size, and quality.</small
+                    ></span
+                  >
+                  <ArrowRight size={15} aria-hidden="true" />
+                </button>
+                <button type="button" onclick={() => (view = 'av1an')}>
+                  <span class="workflow-icon"><Clapperboard size={19} aria-hidden="true" /></span>
+                  <span
+                    ><strong>Encode with av1an</strong><small>Encode scenes in parallel.</small
+                    ></span
+                  >
+                  <ArrowRight size={15} aria-hidden="true" />
+                </button>
+                <button type="button" onclick={() => (view = 'batch')}>
+                  <span class="workflow-icon"><Layers size={19} aria-hidden="true" /></span>
+                  <span
+                    ><strong>Convert multiple files</strong><small
+                      >Apply one recipe to your file list.</small
+                    ></span
+                  >
+                  <ArrowRight size={15} aria-hidden="true" />
+                </button>
+                <button type="button" onclick={() => (view = 'remux')}>
+                  <span class="workflow-icon"><FolderOpen size={19} aria-hidden="true" /></span>
+                  <span
+                    ><strong>Repackage streams</strong><small
+                      >Change containers without encoding.</small
+                    ></span
+                  >
+                  <ArrowRight size={15} aria-hidden="true" />
+                </button>
               </div>
-            {/if}
-          </section>
+            </section>
+          </div>
           <FileInspector file={selectedFile} sample={selectedFile?.id === sampleId} />
         </div>
         <div class="workspace-hint">

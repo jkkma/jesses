@@ -163,7 +163,7 @@
   .completion-panel {
     margin: 12px 0;
     border: 1px solid var(--border, #c0b7aa);
-    background: var(--panel, #e3dacc);
+    background: var(--card);
   }
   .completion-error {
     margin: 1rem 0;
@@ -203,7 +203,7 @@
   button {
     padding: 0.5rem;
     border: 1px solid #9b8c7a;
-    background: #f0eee6;
+    background: var(--background);
   }
   button {
     cursor: pointer;

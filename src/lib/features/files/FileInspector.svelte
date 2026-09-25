@@ -357,7 +357,7 @@
 
 <style>
   .more-metadata {
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--rule);
     margin-top: 8px;
   }
   .more-metadata summary {
@@ -366,6 +366,13 @@
     cursor: pointer;
     font-size: 11px;
     font-weight: 600;
+  }
+  .file-metadata {
+    padding-inline: 17px;
+    margin-top: 0;
+  }
+  .file-metadata summary {
+    padding-block: 12px;
   }
   .metadata-detail-grid {
     margin: 0 0 8px;

@@ -46,7 +46,7 @@
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
-  import { errorMessage } from '$lib/components/shared/format';
+  import { errorMessage, formatDuration } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from './AudioOptions.svelte';
   import SubtitleOptions from './SubtitleOptions.svelte';
@@ -209,6 +209,16 @@
   const active = $derived(jobs.find((job) => !terminalJob(job.state)));
   const videos = $derived(file?.streams.filter((stream) => stream.kind === 'video') ?? []);
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
+  const sourceDetails = $derived.by(() => {
+    const details: string[] = [];
+    if (selectedVideo?.width && selectedVideo.height) {
+      details.push(`${selectedVideo.width} × ${selectedVideo.height}`);
+    }
+    if (file?.durationSeconds != null && Number.isFinite(file.durationSeconds)) {
+      details.push(formatDuration(file.durationSeconds));
+    }
+    return details.join(' · ');
+  });
   const framingResult = $derived(framingDimensions(framing, selectedVideo));
   const framingValid = $derived(validFramingDraft(framing, selectedVideo));
   const toneMapIssue = $derived(
@@ -855,8 +865,9 @@
               aria-hidden="true"
             /></button
           >
+          {#if sourceDetails}<span class="source-details">{sourceDetails}</span>{/if}
         </div>
-        <div class="field">
+        <div class="field destination-field">
           <label for={`${idPrefix}-destination`}>Encode destination</label>
           <div class="destination-control">
             <input
@@ -891,6 +902,7 @@
         <div class="output-summary">
           <Clapperboard size={15} aria-hidden="true" />
           <p>
+            <span class="summary-label">Output settings</span>
             <strong>{depthLabel} {options.codec}</strong><span
               >{backend === 'av1an'
                 ? `av1an / ${options.name} · ${workers ?? '—'} workers`
@@ -1017,11 +1029,78 @@
     top: 12px;
     min-width: 0;
   }
+  .output-content {
+    gap: 11px;
+  }
+  .output-source {
+    padding: 10px 11px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    background: var(--background);
+  }
+  .output-source .eyebrow {
+    grid-column: 1;
+    grid-row: 1;
+    color: var(--muted-foreground);
+  }
+  .output-source strong {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    color: var(--foreground);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .source-details {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    color: var(--muted-foreground);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .destination-field label {
+    color: var(--foreground);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .destination-control input {
+    height: 36px;
+    border-radius: 7px;
+    background: var(--card);
+    color: var(--foreground);
+    font-size: 11px;
+  }
   .encode-actions {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
+  }
+  .encode-actions :global(.start-encode) {
+    width: 100%;
+    min-width: 0;
+    height: 38px;
+    font-weight: 700;
+  }
+  .output-summary {
+    align-items: flex-start;
+    padding: 10px 0 0;
+    border-block: 0;
+    border-top: 1px solid var(--rule);
+  }
+  .output-summary > :global(svg) {
+    margin-top: 2px;
+    color: var(--muted-foreground);
+    flex: 0 0 auto;
+  }
+  .output-summary .summary-label {
+    color: var(--muted-foreground);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .output-summary span:not(.summary-label) {
+    font-size: 11px;
+    line-height: 1.4;
   }
   .destination-control {
     display: flex;
@@ -1086,14 +1165,23 @@
     align-items: center;
   }
   .output-source .eyebrow {
-    grid-column: 1 / -1;
+    grid-column: 1;
   }
   .output-source strong,
   .output-source .text-button {
     margin-top: 0;
   }
   .output-source .text-button {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+    align-self: center;
     font-size: 10px;
+  }
+  @media (max-width: 850px) {
+    .encode-actions {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
   .text-button:disabled {
     opacity: 0.5;

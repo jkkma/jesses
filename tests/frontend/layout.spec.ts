@@ -8,7 +8,10 @@ for (const viewport of [
   test(`common encode controls and actions fit at ${viewport.width}px`, async ({ page }) => {
     await page.setViewportSize(viewport);
     await page.goto('/');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width);
     await page.getByRole('button', { name: 'Load sample', exact: true }).click();
+    await expect(page.getByRole('searchbox', { name: 'Search source files' })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width);
 
     for (const name of ['Quick Convert', 'av1an']) {
       await page.getByRole('button', { name, exact: true }).click();
