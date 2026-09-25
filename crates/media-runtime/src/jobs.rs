@@ -10,6 +10,7 @@ mod cadence;
 mod container;
 mod encode;
 mod encode_settings;
+mod external_tracks;
 pub use encode::preview_encode_plan;
 mod encode_plan;
 pub(crate) mod files;
@@ -340,6 +341,12 @@ impl JobManager {
         request: BatchEncodeRequest,
     ) -> Result<BatchEncodePreview, AppError> {
         encode::validate_settings(&EncodeSettings {
+            external_tracks: Vec::new(),
+            track_overrides: Vec::new(),
+            track_order: Vec::new(),
+            metadata_source_path: None,
+            chapters_source_path: None,
+            mov_timecode_track: None,
             parameters: request.parameters.clone(),
             temporal: None,
             av1an_options: request.av1an_options,
@@ -1483,7 +1490,7 @@ impl JobManager {
         metadata::verify(&document, &selected, &artifact)?;
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, temp, &output, None, scratch)
+        self.finalize(id, cancel, &source, None, temp, &output, None, scratch)
             .await
     }
 
@@ -1493,6 +1500,7 @@ impl JobManager {
         id: &str,
         cancel: &watch::Receiver<bool>,
         source: &Source,
+        external: Option<&external_tracks::ExternalTracks>,
         temporary: &Temporary,
         output: &Path,
         cadence: Option<container::Cadence>,
@@ -1501,11 +1509,23 @@ impl JobManager {
         // Cancellation and publication share a single commit lock: a cancel
         // accepted before this point cannot publish an output; after publication
         // the job is succeeded and cancellation is a no-op.
-        let converted = container::prepare(temporary, output, id, cancel, cadence, scratch).await?;
+        let converted = container::prepare(
+            temporary,
+            output,
+            id,
+            cancel,
+            cadence,
+            external.and_then(external_tracks::ExternalTracks::timecode),
+            scratch,
+        )
+        .await?;
         let temporary = converted.unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         source.verify()?;
+        if let Some(external) = external {
+            external.verify()?;
+        }
         temporary.publish(output)?;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             entry.snapshot.state = JobState::Succeeded;
@@ -2051,6 +2071,7 @@ mod tests {
                     "id",
                     &receiver,
                     &source,
+                    None,
                     &temporary,
                     &output,
                     None,
@@ -2069,6 +2090,7 @@ mod tests {
                     "id",
                     &receiver,
                     &source,
+                    None,
                     &temporary,
                     &mp4,
                     None,

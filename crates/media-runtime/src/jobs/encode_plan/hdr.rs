@@ -102,6 +102,20 @@ pub(super) struct StaticMetadata {
 }
 
 impl StaticMetadata {
+    /// MaxCLL is the first declared ceiling; a 10,000-nit placeholder is not
+    /// a measurement, so mastering luminance is used when available.
+    pub fn declared_peak_nits(&self) -> Option<f64> {
+        self.light
+            .map(|light| f64::from(light.0))
+            .filter(|value| *value > 0.0 && *value < 10_000.0)
+            .or_else(|| {
+                self.mastering
+                    .as_ref()
+                    .map(|mastering| mastering.values[8])
+                    .filter(|value| *value > 0.0 && *value < 10_000.0)
+            })
+    }
+
     pub fn parse(values: &[Value]) -> Result<Self, AppError> {
         let mut metadata = Self::default();
         for value in values {
@@ -196,26 +210,33 @@ pub(super) struct DolbyVision {
 }
 
 impl DolbyVision {
-    fn parse(value: &Value) -> Result<Self, AppError> {
+    fn parse(value: &Value, allow_profile5: bool) -> Result<Self, AppError> {
         let number = |key| value.get(key).and_then(Value::as_u64);
         let profile = number("dv_profile");
         let compatibility = number("dv_bl_signal_compatibility_id");
         if !matches!(
             (profile, compatibility),
             (Some(7), Some(6)) | (Some(8), Some(1))
-        ) || number("bl_present_flag") != Some(1)
+        ) && !(allow_profile5 && (profile, compatibility) == (Some(5), Some(0)))
+            || number("bl_present_flag") != Some(1)
             || number("rpu_present_flag") != Some(1)
             || (profile == Some(7) && number("el_present_flag") != Some(1))
-            || (profile == Some(8) && number("el_present_flag") != Some(0))
+            || (matches!(profile, Some(5 | 8)) && number("el_present_flag") != Some(0))
         {
-            return Err(unsupported(
-                "HDR10 fallback requires a confirmed Dolby Vision profile 7/compatibility 6 or profile 8/compatibility 1 HDR10 base layer. Other profiles, including profile 5, are unsupported.",
-            ));
+            return Err(unsupported(if allow_profile5 {
+                "Dolby Vision rendering requires profile 5/compatibility 0 with an intact single-layer RPU, or a confirmed profile 7/8 HDR10 base layer with its required layer flags."
+            } else {
+                "HDR10 fallback requires a confirmed Dolby Vision profile 7/compatibility 6 or profile 8/compatibility 1 HDR10 base layer. Profile 5 requires GPU/RPU rendering instead."
+            }));
         }
         Ok(Self {
             profile: profile.unwrap(),
             compatibility: compatibility.unwrap(),
         })
+    }
+
+    fn is_profile5(&self) -> bool {
+        self.profile == 5
     }
 }
 
@@ -224,16 +245,24 @@ pub(super) struct Hdr10 {
     pub metadata: StaticMetadata,
     pub discard_dynamic: bool,
     pub dolby: Option<DolbyVision>,
+    pub allow_profile5: bool,
 }
 
 impl Hdr10 {
-    pub fn build(values: &[Value], discard_dynamic: bool) -> Result<Self, AppError> {
+    pub fn build(
+        values: &[Value],
+        discard_dynamic: bool,
+        allow_profile5: bool,
+    ) -> Result<Self, AppError> {
         let mut dolby = None;
         for value in values
             .iter()
             .filter(|v| kind(v) == "DOVI configuration record")
         {
-            if dolby.replace(DolbyVision::parse(value)?).is_some() {
+            if dolby
+                .replace(DolbyVision::parse(value, allow_profile5)?)
+                .is_some()
+            {
                 return Err(unsupported(
                     "Duplicate Dolby Vision configuration records are ambiguous.",
                 ));
@@ -243,9 +272,32 @@ impl Hdr10 {
             metadata: StaticMetadata::parse(values)?,
             discard_dynamic,
             dolby,
+            allow_profile5,
         };
         validate_side_data(values, Some(&hdr), false)?;
         Ok(hdr)
+    }
+
+    pub fn require_profile5_rpu(&self, values: &[Value]) -> Result<(), AppError> {
+        if self.dolby.as_ref().is_some_and(DolbyVision::is_profile5) {
+            let has_rpu = values
+                .iter()
+                .any(|value| kind(value) == "Dolby Vision RPU Data");
+            let has_parsed_metadata = values.iter().any(|value| {
+                kind(value) == "Dolby Vision Metadata"
+                    && value.get("bl_bit_depth").and_then(Value::as_u64) == Some(10)
+                    && value
+                        .get("bl_video_full_range_flag")
+                        .and_then(Value::as_u64)
+                        == Some(1)
+            });
+            if !has_rpu || !has_parsed_metadata {
+                return Err(unsupported(
+                    "Dolby Vision profile 5 needs both intact RPU data and parsed full-range 10-bit Dolby metadata on every decoded frame. Its IPT picture cannot be rendered safely without both.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -262,19 +314,29 @@ pub(super) fn validate_side_data(
             | "Dolby Vision RPU Data"
             | "Dolby Vision Metadata"
             | "HEVC enhancement-layer decoder configuration" => {
-                let hdr = hdr.filter(|hdr| hdr.discard_dynamic && hdr.dolby.is_some() && !encoded).ok_or_else(|| unsupported("Dolby Vision requires explicit HDR10 fallback with a compatible base layer; its dynamic metadata and enhancement layer will be discarded."))?;
+                let hdr = hdr.filter(|hdr| hdr.discard_dynamic && hdr.dolby.is_some() && !encoded).ok_or_else(|| unsupported("Dolby Vision requires either explicit GPU/RPU rendering for profile 5 or explicit HDR10 fallback using a compatible profile 7/8 base layer."))?;
                 if kind(value) == "DOVI configuration record"
-                    && Some(DolbyVision::parse(value)?) != hdr.dolby
+                    && Some(DolbyVision::parse(value, hdr.allow_profile5)?) != hdr.dolby
                 {
                     return Err(unsupported(
                         "Dolby Vision configuration changed during decoding.",
                     ));
                 }
                 if kind(value) == "Dolby Vision Metadata" {
-                    for (key, expected) in [("bl_bit_depth", 10), ("bl_video_full_range_flag", 0)] {
+                    for (key, expected) in [
+                        ("bl_bit_depth", 10),
+                        (
+                            "bl_video_full_range_flag",
+                            u64::from(hdr.dolby.as_ref().is_some_and(DolbyVision::is_profile5)),
+                        ),
+                    ] {
                         if value.get(key).and_then(Value::as_u64) != Some(expected) {
                             return Err(unsupported(
-                                "Dolby Vision decoded metadata does not confirm a limited-range 10-bit base layer.",
+                                if hdr.dolby.as_ref().is_some_and(DolbyVision::is_profile5) {
+                                    "Dolby Vision profile 5 decoded metadata does not confirm a full-range 10-bit IPT base layer."
+                                } else {
+                                    "Dolby Vision decoded metadata does not confirm a limited-range 10-bit HDR10 base layer."
+                                },
                             ));
                         }
                     }

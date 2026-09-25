@@ -55,6 +55,43 @@ fn clock(seconds: f64, format: &str) -> String {
 }
 
 impl Text {
+    pub fn shifted(&self, seconds: f64) -> Result<Self, AppError> {
+        if !seconds.is_finite() || seconds.abs() > 86_400.0 {
+            return Err(unsupported("Subtitle timing offset exceeds 24 hours."));
+        }
+        let mut result = self.clone();
+        let precision = if self.format == "ass" { 100.0 } else { 1000.0 };
+        for cue in &mut result.cues {
+            if seconds != 0.0 && self.format == "webvtt" && has_inline_timestamp(&cue.body) {
+                return Err(unsupported(
+                    "WebVTT inline timestamp cues cannot be offset safely. Use zero offset or a track without timed inline markup.",
+                ));
+            }
+            cue.start = ((cue.start + seconds) * precision).round() / precision;
+            cue.end = ((cue.end + seconds) * precision).round() / precision;
+            if self.format == "ass" {
+                cue.fields[1] = clock(cue.start, self.format);
+                cue.fields[2] = clock(cue.end, self.format);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Text formats cannot represent negative timestamps. Retain the visible
+    /// part of shifted cues, using the same guarded clipping rules as trimming.
+    pub fn visible(&self) -> Result<Self, AppError> {
+        if self.cues.iter().all(|cue| cue.start >= 0.0) {
+            return Ok(self.clone());
+        }
+        self.clipped(Interval {
+            frames: 0,
+            source_start_frame: 0,
+            source_end_frame: 0,
+            start: 0.0,
+            end: f64::MAX,
+        })
+    }
+
     pub(crate) fn parse(format: &'static str, text: &str) -> Result<Self, AppError> {
         let text = text.replace("\r\n", "\n");
         let mut result = Self {
@@ -152,13 +189,7 @@ impl Text {
                     ));
                 }
             }
-            if self.format == "webvtt"
-                && cue
-                    .body
-                    .split('<')
-                    .skip(1)
-                    .any(|tag| tag.starts_with(|c: char| c.is_ascii_digit()) && tag.contains(':'))
-            {
+            if self.format == "webvtt" && has_inline_timestamp(&cue.body) {
                 return Err(unsupported(
                     "WebVTT inline timestamp cues are not supported by trimming. Exclude this track or use a source without timed inline markup.",
                 ));
@@ -213,6 +244,12 @@ impl Text {
     }
 }
 
+fn has_inline_timestamp(body: &str) -> bool {
+    body.split('<')
+        .skip(1)
+        .any(|tag| tag.starts_with(|c: char| c.is_ascii_digit()) && tag.contains(':'))
+}
+
 pub(crate) async fn read(
     ffmpeg: &Path,
     source: &Path,
@@ -232,6 +269,7 @@ pub(crate) async fn read(
         "-nostdin",
         "-protocol_whitelist",
         "file",
+        "-copyts",
         "-i",
     ]
     .into_iter()
@@ -247,6 +285,8 @@ pub(crate) async fn read(
         } else {
             "copy".into()
         },
+        "-avoid_negative_ts".into(),
+        "disabled".into(),
         "-f".into(),
         format.into(),
         "pipe:1".into(),
@@ -272,4 +312,40 @@ pub(crate) async fn read(
     let text = std::str::from_utf8(&capture.stdout)
         .map_err(|_| unsupported("Trimming requires UTF-8 text subtitles."))?;
     Text::parse(format, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shifted_ass_round_trips_its_rendered_event_timestamps() {
+        let source = Text::parse("ass", "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.10,0:00:01.20,Default,,0,0,0,,Caption\n").unwrap();
+        let shifted = source.shifted(0.255).unwrap().visible().unwrap();
+        let actual = Text::parse("ass", &shifted.render()).unwrap();
+        assert!(shifted.matches(&actual));
+        assert_eq!(actual.cues[0].start, 0.36);
+        assert_eq!(actual.cues[0].end, 1.46);
+    }
+
+    #[test]
+    fn negative_text_offset_keeps_only_the_visible_cue_interval() {
+        let source = Text::parse("srt", "1\n00:00:00,100 --> 00:00:01,200\nCaption\n\n2\n00:00:02,000 --> 00:00:03,000\nLater\n\n").unwrap();
+        let shifted = source.shifted(-0.5).unwrap().visible().unwrap();
+        assert_eq!((shifted.cues[0].start, shifted.cues[0].end), (0.0, 0.7));
+        assert_eq!((shifted.cues[1].start, shifted.cues[1].end), (1.5, 2.5));
+        assert!(shifted.matches(&Text::parse("srt", &shifted.render()).unwrap()));
+    }
+
+    #[test]
+    fn offset_rejects_unshifted_absolute_webvtt_inline_timestamps() {
+        let source = Text::parse(
+            "webvtt",
+            "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nBefore <00:00:02.000>after\n\n",
+        )
+        .unwrap();
+        assert!(source.shifted(0.0).is_ok());
+        assert!(source.shifted(0.5).is_err());
+        assert!(source.shifted(-0.5).is_err());
+    }
 }

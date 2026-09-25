@@ -79,6 +79,7 @@ pub(super) async fn build(
     plan: &Plan,
     settings: &EncodeSettings,
     selected: &[&metadata::Stream],
+    external: &super::super::external_tracks::ExternalTracks,
     trim: Option<&super::super::trim::Prepared>,
     source_interval: Option<(u32, u32)>,
     qtgmc: Option<&super::super::qtgmc::Prepared>,
@@ -113,6 +114,9 @@ pub(super) async fn build(
     if settings.lossless {
         preview.notes.push("Before publication, execution compares the complete decoded pixel stream with the processed encoder input. A mismatch fails the job even when the encoder reports lossless coding; try another preset or encoder.".into());
     }
+    if !external.is_empty() {
+        preview.notes.push("Additional audio, subtitles and attachments come from their displayed input files. Selected audio conversions preserve the shifted decoded sample timeline; copied tracks preserve packet contents and their requested timing offsets. The primary source owns video processing; container metadata and chapters use their selected donors. Every additional source is verified before publication and bound to recovery.".into());
+    }
     preview.stages.push(stage("Source frame validation",CommandSpec{executable:ffprobe.to_owned(),args:frame_scan_args(&source.path,plan.video_index,std::thread::available_parallelism().map_or(1,usize::from).min(8)),cwd:None},vec!["Already completed for this preview, including source cadence and per-frame color/field validation.".into()]));
     if let Some(qtgmc) = qtgmc {
         preview.stages.push(stage(
@@ -134,7 +138,7 @@ pub(super) async fn build(
         let work = super::super::rate_control::Stats::create(output, &format!("{id}-plan-av1an"))?;
         let log = work.path.join("av1an.log");
         let prepared = if qtgmc.is_none() && plan.requires_av1an_preprocess() {
-            if subtitles.bitmap_index().is_some() {
+            if subtitles.bitmap_input().is_some() {
                 return Err(AppError::new(
                     "AV1AN_PREPROCESS_SUBTITLE_UNSUPPORTED",
                     "av1an cannot burn a bitmap subtitle while preparing its verified lossless processed source. Copy the subtitle track or use standalone encoding.",
@@ -202,7 +206,7 @@ pub(super) async fn build(
                         &source.path,
                         plan,
                         subtitles.text_filter(),
-                        subtitles.bitmap_index(),
+                        subtitles.bitmap_input(),
                     )
                 },
                 cwd: if qtgmc.is_some() {
@@ -282,6 +286,7 @@ pub(super) async fn build(
         selected,
         plan,
         settings,
+        external,
     );
     if let Some(trim) = trim {
         trim.apply_mux(&mut args, selected, audio_filters)?;
@@ -314,5 +319,6 @@ pub(super) async fn build(
         ));
     }
     source.verify()?;
+    external.verify()?;
     check_cancel(cancel)
 }

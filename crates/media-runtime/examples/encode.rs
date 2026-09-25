@@ -34,6 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|s| s.kind == "video")
         .ok_or("No video stream")?;
     let settings = EncodeSettings {
+        track_overrides: Vec::new(),
+        track_order: Vec::new(),
+        metadata_source_path: None,
+        chapters_source_path: None,
+        mov_timecode_track: None,
+        external_tracks: Vec::new(),
         temporal: None,
         parameters: Vec::new(),
         av1an_options: None,

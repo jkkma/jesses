@@ -121,6 +121,23 @@ impl Source {
             )),
         }
     }
+
+    /// Compare held file identities; hardlinks keep distinct canonical paths.
+    pub fn same_file(&self, other: &Self) -> Result<bool, AppError> {
+        #[cfg(windows)]
+        {
+            let left = windows_file_id(&self.file)
+                .map_err(|cause| error("FILE_UNREADABLE", cause.to_string(), &self.path))?;
+            let right = windows_file_id(&other.file)
+                .map_err(|cause| error("FILE_UNREADABLE", cause.to_string(), &other.path))?;
+            Ok(left == right)
+        }
+        #[cfg(unix)]
+        {
+            Ok(self.fingerprint.device == other.fingerprint.device
+                && self.fingerprint.inode == other.fingerprint.inode)
+        }
+    }
 }
 
 pub(super) fn validate_request(request: &RemuxRequest) -> Result<(), AppError> {
@@ -658,6 +675,23 @@ mod tests {
         drop(temp);
         assert!(!path.exists());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn held_sources_recognize_hardlinks_as_the_same_file() {
+        let dir = Fixture::new();
+        let original = dir.0.join("original.mkv");
+        let alias = dir.0.join("alias.mkv");
+        let separate = dir.0.join("separate.mkv");
+        fs::write(&original, b"one source").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        fs::write(&separate, b"another source").unwrap();
+        let original = Source::open(&original).unwrap();
+        let alias = Source::open(&alias).unwrap();
+        let separate = Source::open(&separate).unwrap();
+        assert!(original.same_file(&original).unwrap());
+        assert!(original.same_file(&alias).unwrap());
+        assert!(!original.same_file(&separate).unwrap());
     }
 
     #[test]

@@ -40,9 +40,13 @@ so temporal filters retain the surrounding frames they need. The scoring-only
 reference filter remains separate. Probe filter arguments are retained in the recovery queue and checked
 before resuming. Older queues remain compatible when no input filter is needed;
 filtered quality-target jobs require an engine carrying the new marker.
-Direct filtered targeting currently supports VMAF only; other metrics reject
-that combination because their upstream reference readers omit the transforms.
-Unfiltered sources and already prepared sources retain the other metric paths.
+For non-VMAF targets with crop, scale, borders, tone-map or frame-mode
+deinterlace transforms, Jesses first writes and verifies a lossless FFV1 source.
+Scene detection, probe encodes, final chunks and metric reference readers then
+use those same processed frames without applying the transforms again. Recovery
+pins both the original source and the decoded processed pixels. The direct
+`--ffmpeg` filtered-probe path remains VMAF-only because the other upstream
+reference readers omit those filters; bypassing preparation is rejected.
 
 ## Build
 

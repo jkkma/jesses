@@ -280,6 +280,136 @@ async fn multi_source_mp4_keeps_edits_and_incompatible_webm_fails_before_output(
 }
 
 #[tokio::test]
+#[ignore = "requires FFmpeg with libx264/AAC and FFprobe"]
+async fn explicit_false_default_never_silently_becomes_mp4_or_mov_default() {
+    let directory = Fixture::new();
+    let source = directory.0.join("nondefault-source.mkv");
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=96x64:r=24:d=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=550:sample_rate=48000:duration=1",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-c:v",
+        "libx264",
+        "-threads:v",
+        "2",
+        "-c:a",
+        "aac",
+        "-disposition:v:0",
+        "0",
+        "-disposition:a:0",
+        "0",
+        "-disposition:a:1",
+        "0",
+    ]);
+    command.push(source.as_os_str().to_owned());
+    tool("ffmpeg", command).await;
+    let original = Sha256::digest(std::fs::read(&source).unwrap());
+    let manager = JobManager::new(directory.0.join("logs"));
+    for extension in ["mp4", "mov"] {
+        let mut request = MuxRequest {
+            sources: vec![MuxSource {
+                id: "source".into(),
+                input_path: source.to_string_lossy().into_owned(),
+            }],
+            tracks: (0..3)
+                .map(|stream_index| MuxTrack {
+                    source_id: "source".into(),
+                    stream_index,
+                    title: None,
+                    language: None,
+                    default: None,
+                    forced: None,
+                })
+                .collect(),
+            metadata_source_id: "source".into(),
+            chapters_source_id: None,
+            output_path: directory
+                .0
+                .join(format!("rejected.{extension}"))
+                .to_string_lossy()
+                .into_owned(),
+        };
+        request.tracks[0].default = Some(false);
+        let job = manager.start_mux(request.clone()).await.unwrap();
+        let result = finish(&manager, &job.id).await;
+        assert_eq!(result.state, JobState::Failed, "{result:#?}");
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            "CONTAINER_INCOMPATIBLE"
+        );
+        assert!(
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("would promote this first track")
+        );
+        assert!(!Path::new(&request.output_path).exists());
+
+        // Explicit false on the first audio track is preserved when another
+        // audio track is explicitly default.
+        request.output_path = directory
+            .0
+            .join(format!("other-default.{extension}"))
+            .to_string_lossy()
+            .into_owned();
+        request.tracks[0].default = None;
+        request.tracks[1].default = Some(false);
+        request.tracks[2].default = Some(true);
+        let job = manager.start_mux(request.clone()).await.unwrap();
+        let result = finish(&manager, &job.id).await;
+        assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
+        let mut probe_args = args(&["-v", "error", "-show_streams", "-of", "json", "-i"]);
+        probe_args.push(request.output_path.clone().into());
+        let output: serde_json::Value =
+            serde_json::from_slice(&tool("ffprobe", probe_args).await).unwrap();
+        assert_eq!(output["streams"][1]["disposition"]["default"], 0);
+        assert_eq!(output["streams"][2]["disposition"]["default"], 1);
+
+        // A later explicit false remains false when FFmpeg supplies the
+        // implicit default for an earlier, unoverridden track.
+        request.output_path = directory
+            .0
+            .join(format!("later-false.{extension}"))
+            .to_string_lossy()
+            .into_owned();
+        request.tracks[1].default = None;
+        request.tracks[2].default = Some(false);
+        let job = manager.start_mux(request.clone()).await.unwrap();
+        let result = finish(&manager, &job.id).await;
+        assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
+        let mut probe_args = args(&["-v", "error", "-show_streams", "-of", "json", "-i"]);
+        probe_args.push(request.output_path.clone().into());
+        let output: serde_json::Value =
+            serde_json::from_slice(&tool("ffprobe", probe_args).await).unwrap();
+        assert_eq!(output["streams"][1]["disposition"]["default"], 1);
+        assert_eq!(output["streams"][2]["disposition"]["default"], 0);
+    }
+    manager.shutdown().await;
+    assert_eq!(Sha256::digest(std::fs::read(&source).unwrap()), original);
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe and standalone x264"]
 async fn quick_encode_trim_to_mp4_and_convert_imported_mp4_text_back_to_matroska() {
     let directory = Fixture::new();

@@ -1,6 +1,11 @@
-//! The final container is built only from the already verified Matroska stage.
-//! It receives a separate owned sibling and cannot publish an unverified result.
-use std::{collections::HashSet, ffi::OsString, path::Path, time::Duration};
+//! The final container uses the verified Matroska stage, plus an optional guarded
+//! QuickTime timecode source. Its owned sibling is verified before publication.
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use media_core::{AppError, ContainerFormat, EncodeSettings, SubtitleMode};
 use tokio::sync::watch;
@@ -18,6 +23,11 @@ pub(super) struct Cadence {
     pub numerator: u32,
     pub denominator: u32,
     pub frames: usize,
+}
+
+pub(super) struct TimecodeTrack {
+    pub source: PathBuf,
+    pub stream: Stream,
 }
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -169,6 +179,7 @@ pub(super) fn preflight(
             }
             for key in stream.tags.keys() {
                 if !metadata::is_derived_stream_tag(key)
+                    && !(container == ContainerFormat::Mov && key.eq_ignore_ascii_case("timecode"))
                     && !matches!(
                         key.to_ascii_lowercase().as_str(),
                         "title" | "language" | "handler_name" | "vendor_id" | "name"
@@ -211,6 +222,7 @@ fn arguments(
     document: &Document,
     container: ContainerFormat,
     cadence: Option<Cadence>,
+    timecode: Option<&TimecodeTrack>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-v",
@@ -225,8 +237,19 @@ fn arguments(
     .map(OsString::from)
     .collect();
     args.push(input.as_os_str().to_owned());
+    if let Some(timecode) = timecode {
+        args.extend([
+            "-protocol_whitelist".into(),
+            "file".into(),
+            "-i".into(),
+            timecode.source.as_os_str().to_owned(),
+        ]);
+    }
     for stream in &document.streams {
         args.extend(["-map".into(), format!("0:{}", stream.index).into()]);
+    }
+    if let Some(timecode) = timecode {
+        args.extend(["-map".into(), format!("1:{}", timecode.stream.index).into()]);
     }
     args.extend([
         "-map_metadata".into(),
@@ -354,7 +377,8 @@ fn normalize(
             );
         }
         if iso {
-            if first.insert(stream.codec_type.clone())
+            if stream.codec_type.as_deref() != Some("data")
+                && first.insert(stream.codec_type.clone())
                 && !kinds_with_default.contains(&stream.codec_type)
             {
                 stream.disposition.insert("default".into(), 1);
@@ -376,15 +400,56 @@ fn normalize(
     Ok(converted)
 }
 
+/// MP4/MOV assigns the first track of a media kind as default when no track
+/// of that kind is marked default. A user-requested `default: false` on that
+/// first track must not be silently promoted during final normalization.
+pub(super) fn preflight_explicit_defaults(
+    output: &Path,
+    selected: &[&Stream],
+    explicitly_disabled: &[u32],
+) -> Result<(), AppError> {
+    if !matches!(format(output)?, ContainerFormat::Mp4 | ContainerFormat::Mov)
+        || explicitly_disabled.is_empty()
+    {
+        return Ok(());
+    }
+    let kinds_with_default: HashSet<_> = selected
+        .iter()
+        .filter(|stream| stream.disposition.get("default").copied().unwrap_or(0) != 0)
+        .filter_map(|stream| stream.codec_type.as_deref())
+        .collect();
+    let mut first = HashSet::new();
+    for stream in selected {
+        let Some(kind) = stream.codec_type.as_deref() else {
+            continue;
+        };
+        if kind != "data"
+            && first.insert(kind)
+            && explicitly_disabled.contains(&stream.index)
+            && !kinds_with_default.contains(kind)
+        {
+            return Err(invalid(format!(
+                "Stream {} explicitly disables its default flag, but MP4/MOV requires one default {kind} track and would promote this first track. Mark another {kind} track default or choose Matroska.",
+                stream.index
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn prepare<'a>(
     input: &Temporary,
     output: &Path,
     id: &str,
     cancel: &watch::Receiver<bool>,
     cadence: Option<Cadence>,
+    timecode: Option<&TimecodeTrack>,
     scratch: &'a mut Vec<Temporary>,
 ) -> Result<Option<&'a Temporary>, AppError> {
     let container = format(output)?;
+    if timecode.is_some() && container != ContainerFormat::Mov {
+        return Err(invalid("QuickTime timecode can be copied only into MOV."));
+    }
     if container == ContainerFormat::Matroska {
         return Ok(None);
     }
@@ -410,7 +475,14 @@ pub(super) async fn prepare<'a>(
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: ffmpeg.clone(),
-            args: arguments(&input.path, &artifact.path, &document, container, cadence),
+            args: arguments(
+                &input.path,
+                &artifact.path,
+                &document,
+                container,
+                cadence,
+                timecode,
+            ),
             cwd: None,
         },
         cancel.clone(),
@@ -428,6 +500,11 @@ pub(super) async fn prepare<'a>(
     artifact.flush_nonempty_async().await?;
     let mut actual = super::probe(&ffprobe, &artifact.path, cancel, None).await?;
     let mut expected = document.clone();
+    if let Some(timecode) = timecode {
+        let mut stream = timecode.stream.clone();
+        stream.index = expected.streams.len() as u32;
+        expected.streams.push(stream);
+    }
     let converted = normalize(&mut expected, &mut actual, container)?;
     metadata::verify_container(
         &expected,
@@ -435,6 +512,18 @@ pub(super) async fn prepare<'a>(
         &actual,
         &converted,
     )?;
+    if let Some(timecode) = timecode {
+        super::mux::verify_shifted_packets(
+            &ffprobe,
+            &timecode.source,
+            timecode.stream.index,
+            &artifact.path,
+            document.streams.len() as u32,
+            0.0,
+            cancel,
+        )
+        .await?;
+    }
     for (source, target) in document.streams.iter().zip(&actual.streams) {
         if source.codec_type.as_deref() == Some("subtitle") {
             let before = trim::read_subtitles(
@@ -691,5 +780,27 @@ mod tests {
             "Picture"
         );
         assert_eq!(expected.streams[0].disposition["default"], 1);
+    }
+
+    #[test]
+    fn explicit_false_is_rejected_only_when_iso_would_promote_that_first_track() {
+        let mut doc = document();
+        let selected = doc.streams.iter().collect::<Vec<_>>();
+        assert!(preflight_explicit_defaults(Path::new("out.mp4"), &selected, &[0]).is_err());
+        assert!(preflight_explicit_defaults(Path::new("out.mov"), &selected, &[0]).is_err());
+        assert!(preflight_explicit_defaults(Path::new("out.mkv"), &selected, &[0]).is_ok());
+        assert!(preflight_explicit_defaults(Path::new("out.mp4"), &selected, &[]).is_ok());
+        doc.streams.push(
+            serde_json::from_value(serde_json::json!({
+                "index":3,"codec_type":"video","codec_name":"h264",
+                "disposition":{"default":1}
+            }))
+            .unwrap(),
+        );
+        let selected = doc.streams.iter().collect::<Vec<_>>();
+        assert!(preflight_explicit_defaults(Path::new("out.mp4"), &selected, &[0]).is_ok());
+        doc.streams[2].disposition.insert("default".into(), 0);
+        let selected = doc.streams.iter().collect::<Vec<_>>();
+        assert!(preflight_explicit_defaults(Path::new("out.mp4"), &selected, &[3]).is_ok());
     }
 }

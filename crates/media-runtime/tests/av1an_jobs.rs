@@ -538,6 +538,90 @@ async fn av1an_target_probe_and_final_chunks_share_temporal_and_aspect_processin
 }
 
 #[tokio::test]
+#[ignore = "requires packaged av1an with CPU scorers, FFmpeg, FFprobe, SVT-AV1, VapourSynth and L-SMASH"]
+async fn av1an_filtered_non_vmaf_targets_score_the_verified_processed_source() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/filtered-target-gap-20260925")
+        .join(format!("native-{nonce}"));
+    std::fs::create_dir_all(&root).unwrap();
+    if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+        media_runtime::configure_bundled_tools(PathBuf::from(resources)).unwrap();
+    }
+    let input = root.join("source.mkv");
+    synthesize(&input, "320x180", 48).await;
+    let original = std::fs::read(&input).unwrap();
+
+    for (name, metric, rate) in [
+        ("ssimulacra2", media_core::Av1anTargetMetric::Ssimulacra2, 2),
+        ("butteraugli", media_core::Av1anTargetMetric::Butteraugli, 2),
+        ("xpsnr", media_core::Av1anTargetMetric::Xpsnr, 1),
+        (
+            "xpsnr-weighted",
+            media_core::Av1anTargetMetric::XpsnrWeighted,
+            2,
+        ),
+    ] {
+        let output = root.join(format!("{name}.mkv"));
+        let manager = JobManager::new(root.join(format!("{name}-logs")));
+        let mut request = request(&input, &output, 12);
+        request.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+        request.settings.workers = 1;
+        request.settings.framing = serde_json::from_value(serde_json::json!({
+            "crop": {"top": 10, "right": 0, "bottom": 10, "left": 0},
+            "resizeWidth": 256
+        }))
+        .unwrap();
+        request.settings.av1an_options = Some(media_core::Av1anOptions {
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            maximum_chunk_frames: 48,
+            scene_downscale_height: None,
+            target_quality: Some(media_core::Av1anTargetQuality {
+                metric,
+                minimum_score_tenths: 0,
+                maximum_score_tenths: 1_000,
+                minimum_crf: 30,
+                maximum_crf: 34,
+                probes: 1,
+                probing_rate: rate,
+                probe_width: 256,
+                probe_height: 128,
+            }),
+            ..Default::default()
+        });
+        let submitted = manager.start_encode(request).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        std::fs::write(
+            root.join(format!("{name}-snapshot.json")),
+            serde_json::to_vec_pretty(&finished).unwrap(),
+        )
+        .unwrap();
+        if finished.state != JobState::Succeeded {
+            manager.shutdown().await;
+            panic!("filtered {name} target failed: {finished:#?}");
+        }
+        assert!(finished.logs.iter().any(|line| line.contains(
+            "probe encodes and reference scoring read the same verified lossless processed source"
+        )));
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["width"], 256);
+        assert_eq!(video["height"], 128);
+        assert_eq!(video["nb_read_frames"], "48");
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        manager.shutdown().await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, SVT-AV1, VapourSynth and L-SMASH on PATH"]
 async fn canceling_running_av1an_stops_workers_and_releases_output_handles() {
     let fixture = Fixture::new();

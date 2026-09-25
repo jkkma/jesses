@@ -59,7 +59,7 @@ pub(super) fn validate_plugin(
         return Err("Quality targeting requires av1an with the target-probe-filter-v1 compatibility fix. Older engines omit final-chunk FFmpeg transforms from probe encodes, so transformed references can be scored against different pixels or geometry.".into());
     }
     if requires_probe_filter && target.metric != Av1anTargetMetric::Vmaf {
-        return Err("Quality targeting with direct crop, scale, borders, tone-map, or frame-mode deinterlace transforms is currently qualified only for VMAF. Use VMAF, remove those transforms, or first create a lossless transformed source and target that file without another transform.".into());
+        return Err("Quality targeting with direct crop, scale, borders, tone-map, or frame-mode deinterlace transforms is qualified only for VMAF. Other metrics require a verified lossless transformed source before av1an starts; Jesses normally prepares it automatically.".into());
     }
     if (target.metric == Av1anTargetMetric::Vmaf
         || (matches!(

@@ -1,4 +1,9 @@
-import type { EncodeBackend, MediaStream, VideoTrim } from '$lib/ipc/generated';
+import type {
+  EncodeBackend,
+  MediaStream,
+  SubtitleTrackSettings,
+  VideoTrim,
+} from '$lib/ipc/generated';
 import type { AudioTrackDraft } from './audio-options';
 
 export type TrimDraft = {
@@ -37,6 +42,7 @@ export function trimError(
   audio: AudioTrackDraft[],
   included: number[],
   streams: MediaStream[],
+  subtitles: SubtitleTrackSettings[] = [],
 ): string | null {
   if (!draft.enabled) return null;
   if (draft.mode === 'time') {
@@ -77,10 +83,16 @@ export function trimError(
       (stream) =>
         stream.kind === 'subtitle' &&
         included.includes(stream.index) &&
-        !['ass', 'subrip', 'webvtt'].includes(stream.codec ?? ''),
+        !['ass', 'subrip', 'webvtt', 'mov_text'].includes(stream.codec ?? '') &&
+        !(
+          ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(
+            stream.codec ?? '',
+          ) &&
+          subtitles.some((track) => track.streamIndex === stream.index && track.mode === 'burnIn')
+        ),
     )
   )
-    return 'Trimming supports ASS, SubRip and WebVTT text subtitles. Exclude unsupported subtitle tracks.';
+    return 'Trimming supports text subtitles and burned bitmap subtitles. Exclude unsupported subtitle tracks or burn bitmap subtitles into video.';
   return null;
 }
 export function trimSummary(trim: VideoTrim | undefined | null): string {

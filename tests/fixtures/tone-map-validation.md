@@ -124,3 +124,31 @@ under `Videos/Jesses-complete-native-20260913`, including
 `native-hdr-output-independent.json` and `native-hdr-sdr-frame.png`.
 The working-source encoder guidance was corrected after this build to explain
 tone mapping for native HDR input. Later packages require their own checks.
+
+## Measured peaks and GPU rendering, 2026-09-25
+
+The working tree adds Auto, CPU and GPU backend selection, measured PQ peaks,
+Reinhard, and GPU Spline. Old saved jobs retain CPU/manual behavior. Auto probes
+a complete Vulkan/libplacebo render on a hardware GPU and falls back to CPU when
+unavailable; a forced GPU request fails explicitly. AV1AN retains CPU rendering.
+
+Windows native jobs passed with Hable and Spline on an integrated Radeon GPU,
+manual Reinhard on CPU, and measured CPU fallback using bundled FFmpeg without
+libplacebo. Outputs had the expected decoded frame count and limited-range
+BT.709 tags, and source bytes stayed unchanged. Peak sampling uses the fully
+scanned video interval: a regression with one second of PQ video and ten seconds
+of unselected audio correctly sampled the initial bright frames.
+
+A full standalone profile-5 job also passed using Chromium's documented Dolby
+Vision test clip. A test-only stream-copy remux moved its positive first timestamp
+to zero while retaining the Dolby configuration and per-frame RPU. The GPU applied
+the RPU and produced SDR with the exact frame count and no output Dolby metadata.
+The original and derived input bytes stayed unchanged during encoding. A direct
+comparison with RPU application disabled produced different decoded frame hashes.
+
+Profile 5 requires intact raw RPU and parsed Dolby metadata on every decoded
+frame, a working GPU, and measured peak mode. It cannot use CPU, AV1AN or an HDR10
+base-layer fallback. The separately selected HDR10 base-layer route strips dynamic
+Dolby/HDR10+ metadata before GPU rendering and disables RPU application. These are
+working-tree checks on one Windows GPU; they do not qualify a new package or other
+operating systems.

@@ -12,6 +12,7 @@ use media_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -134,6 +135,51 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
     })
 }
 
+fn external_source_stamps(
+    settings: &EncodeSettings,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Vec<Stamp>, AppError> {
+    let mut paths = BTreeSet::new();
+    let mut guards = Vec::new();
+    for path in super::external_tracks::additional_source_paths(settings) {
+        let guard = Source::open(path)?;
+        if paths.insert(crate::batch::path_key(&guard.path)) {
+            guards.push(guard);
+        }
+    }
+    guards.sort_by(|left, right| left.path.cmp(&right.path));
+    guards
+        .iter()
+        .map(|guard| {
+            let stamp = digest(&guard.path, cancel)?;
+            guard.verify()?;
+            Ok(stamp)
+        })
+        .collect()
+}
+
+fn verify_external_sources(
+    manifest: &Manifest,
+    settings: &EncodeSettings,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    if manifest.external_sources != external_source_stamps(settings, cancel)? {
+        return Err(error(
+            Path::new(&manifest.request.output_path),
+            "A selected external source changed or lacks a recovery fingerprint.",
+        ));
+    }
+    Ok(())
+}
+
+fn external_source_count(settings: &EncodeSettings) -> usize {
+    super::external_tracks::additional_source_paths(settings)
+        .into_iter()
+        .map(crate::batch::path_key)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn copy_verified(
     source: &Path,
     destination: &Path,
@@ -241,6 +287,8 @@ struct Manifest {
     request: RemuxRequest,
     settings: EncodeSettings,
     source: Stamp,
+    #[serde(default)]
+    external_sources: Vec<Stamp>,
     tools: Vec<Stamp>,
     plan: Vec<String>,
     total_frames: u64,
@@ -261,6 +309,7 @@ struct Seed {
     request: RemuxRequest,
     settings: EncodeSettings,
     source: Stamp,
+    external_sources: Vec<Stamp>,
     tools: Vec<Stamp>,
     plan: Vec<String>,
     total_frames: u64,
@@ -518,25 +567,30 @@ impl Recovery {
         let root = root_for(id, request)?;
         let source_path = source.to_owned();
         let cancel_copy = cancel.clone();
-        let (source_stamp, tool_guards, tool_stamps) = tokio::task::spawn_blocking(move || {
-            let source_stamp = digest(&source_path, Some(&cancel_copy))?;
-            let guards = tools
-                .iter()
-                .map(|path| Source::open(path))
-                .collect::<Result<Vec<_>, _>>()?;
-            let stamps = guards
-                .iter()
-                .map(|guard| digest(&guard.path, Some(&cancel_copy)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, AppError>((source_stamp, guards, stamps))
-        })
-        .await
-        .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))??;
+        let external_settings = settings.clone();
+        let (source_stamp, external_sources, tool_guards, tool_stamps) =
+            tokio::task::spawn_blocking(move || {
+                let source_stamp = digest(&source_path, Some(&cancel_copy))?;
+                let external_sources =
+                    external_source_stamps(&external_settings, Some(&cancel_copy))?;
+                let guards = tools
+                    .iter()
+                    .map(|path| Source::open(path))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let stamps = guards
+                    .iter()
+                    .map(|guard| digest(&guard.path, Some(&cancel_copy)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, AppError>((source_stamp, external_sources, guards, stamps))
+            })
+            .await
+            .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))??;
         let seed = Seed {
             id: id.to_owned(),
             request: request.clone(),
             settings: settings.clone(),
             source: source_stamp,
+            external_sources,
             tools: tool_stamps,
             plan,
             total_frames: total_frames as u64,
@@ -571,6 +625,9 @@ impl Recovery {
             }
             if manifest.source != seed.source {
                 changed.push("source content");
+            }
+            if manifest.external_sources != seed.external_sources {
+                changed.push("external source content");
             }
             if manifest.tools != seed.tools {
                 changed.push("tools");
@@ -686,6 +743,7 @@ impl Recovery {
             request: self.seed.request.clone(),
             settings: self.seed.settings.clone(),
             source: self.seed.source.clone(),
+            external_sources: self.seed.external_sources.clone(),
             tools: self.seed.tools.clone(),
             plan: self.seed.plan.clone(),
             total_frames: self.seed.total_frames,
@@ -1061,6 +1119,12 @@ pub(super) fn discover_locator(
         ));
     }
     validate_layout(&root, &manifest)?;
+    if manifest.external_sources.len() != external_source_count(settings) {
+        return Err(error(
+            &root,
+            "The selected external sources lack recovery fingerprints.",
+        ));
+    }
     manifest_summary(&root, &manifest).map(Some).ok_or_else(|| {
         error(
             &root,
@@ -1075,7 +1139,18 @@ pub(super) fn validate_locator(
     settings: &EncodeSettings,
     locator: &StandaloneRecovery,
 ) -> Result<(), AppError> {
-    discover_locator(id, request, settings, Some(locator)).map(|_| ())
+    discover_locator(id, request, settings, Some(locator))?;
+    let root = root_for(id, request)?;
+    let manifest: Manifest = serde_json::from_slice(&bytes(&root.join("manifest.json"))?)
+        .map_err(|cause| error(&root, cause.to_string()))?;
+    if manifest.id != id
+        || manifest.request != *request
+        || manifest.settings != *settings
+        || manifest.directory != identity(&root)?
+    {
+        return Err(error(&root, "Recovery bindings changed before resume."));
+    }
+    verify_external_sources(&manifest, settings, None)
 }
 
 #[cfg(test)]
@@ -1130,6 +1205,7 @@ mod tests {
                     request,
                     settings: EncodeSettings::default(),
                     source: digest(&self.source, None).unwrap(),
+                    external_sources: vec![],
                     tools: vec![tool_stamp],
                     plan: vec!["verified plan".into()],
                     total_frames: 48,
@@ -1299,6 +1375,196 @@ mod tests {
         assert!(remove_owned_contents(&recovery.root, &manifest, &mut recovery.lock).is_err());
         assert!(artifact.is_file());
         assert!(recovery.root.join("manifest.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn external_sources_bind_resume_and_reject_missing_or_changed_stamps() {
+        let fixture = Fixture::new();
+        let external = fixture.directory.join("external.mka");
+        fs::write(&external, b"external-a").unwrap();
+        let settings = EncodeSettings {
+            external_tracks: vec![
+                media_core::ExternalTrack {
+                    offset_milliseconds: 0,
+                    subtitle_mode: None,
+                    title: None,
+                    language: None,
+                    default: None,
+                    forced: None,
+                    audio: None,
+                    input_path: external.to_string_lossy().into_owned(),
+                    stream_index: 0,
+                },
+                media_core::ExternalTrack {
+                    offset_milliseconds: 0,
+                    subtitle_mode: None,
+                    title: None,
+                    language: None,
+                    default: None,
+                    forced: None,
+                    audio: None,
+                    input_path: external.to_string_lossy().into_owned(),
+                    stream_index: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let (_, cancel) = watch::channel(false);
+        let request = fixture.request();
+        let mut prepared = Recovery::prepare(
+            "job-1",
+            &request,
+            &settings,
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "mkv",
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let video = fixture.video("external-video");
+        let locator = prepared
+            .recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .recovery
+                .manifest
+                .as_ref()
+                .unwrap()
+                .external_sources
+                .len(),
+            1
+        );
+        drop(prepared);
+        assert!(discover_locator("job-1", &request, &settings, Some(&locator)).is_ok());
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
+
+        let manifest_path = root_for("job-1", &request).unwrap().join("manifest.json");
+        let saved = fs::read(&manifest_path).unwrap();
+        let mut missing: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        missing.as_object_mut().unwrap().remove("external_sources");
+        fs::write(&manifest_path, serde_json::to_vec(&missing).unwrap()).unwrap();
+        assert!(discover_locator("job-1", &request, &settings, Some(&locator)).is_err());
+        fs::write(&manifest_path, saved).unwrap();
+
+        fs::write(&external, b"external-b").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
+        let moved = fixture.directory.join("moved-external.mka");
+        fs::rename(&external, &moved).unwrap();
+        fs::write(&external, b"external-a").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
+    }
+
+    #[tokio::test]
+    async fn donor_only_sources_are_fingerprinted_for_standalone_resume() {
+        let fixture = Fixture::new();
+        let metadata = fixture.directory.join("metadata.mka");
+        let chapters = fixture.directory.join("chapters.mka");
+        fs::write(&metadata, b"metadata donor").unwrap();
+        fs::write(&chapters, b"chapter donor").unwrap();
+        let settings = EncodeSettings {
+            metadata_source_path: Some(metadata.to_string_lossy().into_owned()),
+            chapters_source_path: Some(chapters.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let (_, cancel) = watch::channel(false);
+        let request = fixture.request();
+        let mut prepared = Recovery::prepare(
+            "job-1",
+            &request,
+            &settings,
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "mkv",
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let video = fixture.video("donor-video");
+        let locator = prepared
+            .recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .recovery
+                .manifest
+                .as_ref()
+                .unwrap()
+                .external_sources
+                .len(),
+            2
+        );
+        drop(prepared);
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
+        fs::write(&chapters, b"changed chapter donor").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_without_external_stamps_remains_resumable() {
+        let fixture = Fixture::new();
+        let mut recovery = fixture.recovery(false, "mkv");
+        let request = recovery.seed.request.clone();
+        let settings = recovery.seed.settings.clone();
+        let (_, cancel) = watch::channel(false);
+        let video = fixture.video("legacy-video");
+        let locator = recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        let manifest_path = recovery.root.join("manifest.json");
+        drop(recovery);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("external_sources");
+        fs::write(&manifest_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(discover_locator("job-1", &request, &settings, Some(&locator)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_removes_owned_workspace_when_external_source_is_missing() {
+        let fixture = Fixture::new();
+        let external = fixture.directory.join("external.mka");
+        fs::write(&external, b"external bytes").unwrap();
+        let mut recovery = fixture.recovery(false, "mkv");
+        recovery.seed.settings.external_tracks = vec![media_core::ExternalTrack {
+            offset_milliseconds: 0,
+            subtitle_mode: None,
+            title: None,
+            language: None,
+            default: None,
+            forced: None,
+            audio: None,
+            input_path: external.to_string_lossy().into_owned(),
+            stream_index: 0,
+        }];
+        recovery.seed.external_sources =
+            external_source_stamps(&recovery.seed.settings, None).unwrap();
+        let root = recovery.root.clone();
+        let (_, cancel) = watch::channel(false);
+        let video = fixture.video("cleanup-video");
+        recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        fs::remove_file(&external).unwrap();
+        recovery.cleanup().unwrap();
+        assert!(!root.exists());
+        assert!(!external.exists());
+        assert!(fixture.source.exists());
     }
 
     #[tokio::test]

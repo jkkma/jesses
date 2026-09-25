@@ -2836,12 +2836,17 @@ test('tone mapping requires explicit HDR rendering, validates peak and retains q
   await queue.click();
   const request = ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest })
     .request;
-  expect(request.settings.toneMap).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true });
+  expect(request.settings.toneMap).toEqual({
+    sourcePeakNits: 2000,
+    hdr10BaseLayer: true,
+    backend: 'auto',
+    peakMode: 'measured',
+  });
   await quick.getByLabel('Signal peak (nits)', { exact: true }).fill('1000');
   expect(
     ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request
       .settings.toneMap,
-  ).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true });
+  ).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true, backend: 'auto', peakMode: 'measured' });
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
   await expect(
     av1anWorkspace(page).getByLabel('HDR / HLG to SDR', { exact: true }),

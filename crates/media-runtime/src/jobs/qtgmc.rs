@@ -185,6 +185,7 @@ impl Prepared {
         id: &str,
         plan: &Plan,
         trim: Option<(u32, u32)>,
+        subtitles: &super::subtitles::Prepared,
         ffmpeg: &Path,
         cancel: &watch::Receiver<bool>,
     ) -> Result<Self, AppError> {
@@ -226,14 +227,40 @@ impl Prepared {
             "yuv4mpegpipe",
             "-i",
             "pipe:0",
-            "-map",
-            "0:v:0",
         ]
         .into_iter()
         .map(OsString::from)
         .collect();
-        if let Some(filter) = plan.post_qtgmc_filter_with_text(None) {
-            consumer_args.extend(["-vf".into(), filter.into()]);
+        consumer_args.splice(0..0, plan.tone_map_device_args());
+        if let Some((path, index, offset)) = subtitles.bitmap_input() {
+            consumer_args.insert(0, "-copyts".into());
+            consumer_args.extend([
+                "-itsoffset".into(),
+                format!("{offset:.6}").into(),
+                "-protocol_whitelist".into(),
+                "file".into(),
+                "-i".into(),
+                path.as_os_str().to_owned(),
+            ]);
+            let filter = super::subtitles::bitmap_filter(
+                "0:v:0",
+                plan.post_qtgmc_prefix().as_deref(),
+                plan.post_qtgmc_suffix_with_text(subtitles.text_filter())
+                    .as_deref(),
+                plan.output_bit_depth(),
+                index,
+            );
+            consumer_args.extend([
+                "-filter_complex".into(),
+                filter.into(),
+                "-map".into(),
+                "[jesses_video]".into(),
+            ]);
+        } else {
+            consumer_args.extend(["-map".into(), "0:v:0".into()]);
+            if let Some(filter) = plan.post_qtgmc_filter_with_text(subtitles.text_filter()) {
+                consumer_args.extend(["-vf".into(), filter.into()]);
+            }
         }
         consumer_args.extend([
             "-r".into(),
@@ -273,7 +300,7 @@ impl Prepared {
             consumer: CommandSpec {
                 executable: ffmpeg.to_owned(),
                 args: consumer_args,
-                cwd: None,
+                cwd: subtitles.decoder_cwd().map(Path::to_path_buf),
             },
             environment: runtime.environment,
             _script: script,

@@ -388,9 +388,9 @@
           {:else}Requires the selected FFmpeg with a working libvmaf v0.6.1 model.{/if}
         </p>
         {#if framed}<p>
-            VMAF probes and their reference use the same crop, resize, borders, and frame processing
-            as the encode. Other metrics require an unfiltered source or a separately prepared
-            lossless source with those changes already applied.
+            For VMAF, probes and their reference use the same crop, resize, borders, and frame
+            processing as the encode. For other metrics, Jesses prepares and verifies a lossless
+            source with those changes before scoring and encoding.
           </p>{/if}
         {#if draft.target.probingRate > 1}<p>
             Sampling scores only every {draft.target.probingRate} frames.

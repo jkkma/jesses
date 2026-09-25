@@ -29,6 +29,7 @@ struct ProbeStream {
     index: u32,
     codec_type: Option<String>,
     codec_name: Option<String>,
+    codec_tag_string: Option<String>,
     codec_long_name: Option<String>,
     profile: Option<String>,
     bit_rate: Option<Value>,
@@ -240,6 +241,17 @@ pub(crate) fn parse_probe(
                 _ => None,
             };
             let (static_metadata, dynamic_formats) = hdr_headers(&stream.side_data_list);
+            let dolby_vision_profile = stream
+                .side_data_list
+                .iter()
+                .filter(|data| {
+                    data.get("side_data_type").and_then(Value::as_str)
+                        == Some("DOVI configuration record")
+                })
+                .filter_map(|data| data.get("dv_profile").and_then(Value::as_u64))
+                .filter_map(|profile| u8::try_from(profile).ok())
+                .reduce(|a, b| if a == b { a } else { 0 })
+                .filter(|profile| *profile != 0);
             let tags = stream.tags.unwrap_or_default();
             let rotation_degrees = stream
                 .side_data_list
@@ -261,6 +273,7 @@ pub(crate) fn parse_probe(
                 index: stream.index,
                 kind: nonempty(stream.codec_type).unwrap_or_else(|| "unknown".into()),
                 codec: nonempty(stream.codec_name),
+                codec_tag: nonempty(stream.codec_tag_string),
                 codec_long_name: nonempty(stream.codec_long_name),
                 profile: color_value(stream.profile),
                 bit_rate: decimal_rate(stream.bit_rate.as_ref()),
@@ -310,6 +323,7 @@ pub(crate) fn parse_probe(
                 hdr_format,
                 has_hdr_static_metadata: is_video.then_some(static_metadata),
                 dynamic_hdr_formats: is_video.then_some(dynamic_formats),
+                dolby_vision_profile: is_video.then_some(dolby_vision_profile).flatten(),
             }
         })
         .collect();
@@ -613,6 +627,7 @@ mod tests {
         assert_eq!(pq.color_space.as_deref(), Some("bt2020nc"));
         assert_eq!(pq.color_range.as_deref(), Some("tv"));
         assert_eq!(pq.has_hdr_static_metadata, Some(true));
+        assert_eq!(pq.dolby_vision_profile, Some(7));
         assert_eq!(
             pq.dynamic_hdr_formats.as_deref(),
             Some(["Dolby Vision".into(), "HDR10+".into()].as_slice())
@@ -621,6 +636,7 @@ mod tests {
         assert_eq!(hlg.hdr_format.as_deref(), Some("HDR / HLG"));
         assert_eq!(hlg.bit_depth, Some(10));
         assert_eq!(hlg.has_hdr_static_metadata, Some(false));
+        assert_eq!(hlg.dolby_vision_profile, None);
         assert_eq!(hlg.dynamic_hdr_formats.as_deref(), Some([].as_slice()));
         assert_eq!(parsed.streams[2].bit_depth, Some(8));
         assert_eq!(parsed.streams[2].color_primaries, None);

@@ -78,6 +78,32 @@
   } from './tone-map-options';
   import { defaultTrim, selectedTrim, trimError, type TrimDraft } from './trim-options';
   import SourcePreview from './SourcePreview.svelte';
+  import ExternalTracks from './ExternalTracks.svelte';
+  import TrackLayout from './TrackLayout.svelte';
+  import {
+    invalidateMovTimecodeChoice,
+    movTimecodeIssue,
+    selectedMovTimecode,
+    type MovTimecodeChoice,
+  } from './mov-timecode';
+  import {
+    defaultTrackOrder,
+    effectiveTrackOrder,
+    invalidateSourceDonor,
+    selectedTrackOrder,
+    sourceDonorIssue,
+    trackTagsIssue,
+    type SourceDonor,
+    type TrackTags,
+  } from './track-layout';
+  import {
+    copyExternalChoices,
+    externalTrackIssue,
+    externalTrackSummary,
+    invalidateExternalChoices,
+    requestExternalTracks,
+    type ExternalTrackChoice,
+  } from './external-tracks';
   import {
     copyFramingDraft,
     defaultFramingDraft,
@@ -110,6 +136,8 @@
   import type {
     EncodeBackend,
     EncodeRequest,
+    EncodeTrackOverride,
+    EncodeTrackRef,
     Av1anGrainSettings,
     JobSnapshot,
     MediaFile,
@@ -120,6 +148,7 @@
   let {
     backend,
     file,
+    files,
     tools,
     jobs,
     connected,
@@ -130,6 +159,7 @@
   }: {
     backend: EncodeBackend;
     file: MediaFile | undefined;
+    files: MediaFile[];
     tools: ToolInfo[];
     jobs: JobSnapshot[];
     connected: boolean;
@@ -154,6 +184,12 @@
   let texturePsyBias = $state<number | undefined>(0);
   let hdrTune = $state<HdrTune>('filmGrain');
   let included = $state<number[]>([]);
+  let externalTracks = $state<ExternalTrackChoice[]>([]);
+  let trackOverrides = $state<EncodeTrackOverride[]>([]);
+  let trackOrder = $state<EncodeTrackRef[]>([]);
+  let metadataDonor = $state<SourceDonor | undefined>();
+  let chaptersDonor = $state<SourceDonor | undefined>();
+  let movTimecode = $state<MovTimecodeChoice | undefined>();
   let audio = $state<AudioTrackDraft[]>([]);
   let subtitles = $state<SubtitleTrackSettings[]>([]);
   let framing = $state(defaultFramingDraft());
@@ -189,6 +225,12 @@
     texturePsyBias: number | undefined;
     hdrTune: HdrTune;
     included: number[];
+    externalTracks: ExternalTrackChoice[];
+    trackOverrides: EncodeTrackOverride[];
+    trackOrder: EncodeTrackRef[];
+    metadataDonor: SourceDonor | undefined;
+    chaptersDonor: SourceDonor | undefined;
+    movTimecode: MovTimecodeChoice | undefined;
     audio: AudioTrackDraft[];
     subtitles: SubtitleTrackSettings[];
     framing: FramingDraft;
@@ -224,7 +266,9 @@
   const toneMapIssue = $derived(
     toneMapError(toneMap, backend, selectedVideo, isSvtEncoder(encoder) && hdr10Fallback),
   );
-  const trimIssue = $derived(trimError(trim, backend, audio, included, file?.streams ?? []));
+  const trimIssue = $derived(
+    trimError(trim, backend, audio, included, file?.streams ?? [], subtitles),
+  );
   const subtitleIssue = $derived(
     subtitleError(
       subtitles,
@@ -253,6 +297,43 @@
       (!chunked || videoIndex === videos[0]?.index),
   );
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
+  const externalIssue = $derived(
+    externalTrackIssue(externalTracks, files, file, {
+      trimming: trim.enabled,
+      backend,
+      video: selectedVideo,
+      toneMapped: toneMap.enabled,
+      primaryBurnCount: selectedSubtitles(subtitles, included).filter(
+        (track) => track.mode === 'burnIn',
+      ).length,
+    }),
+  );
+  const layoutDefaults = $derived(
+    defaultTrackOrder(file, videoIndex, included, externalTracks, files),
+  );
+  const layoutIssue = $derived(
+    sourceDonorIssue(metadataDonor, files, 'Container metadata') ||
+      sourceDonorIssue(chaptersDonor, files, 'Chapters') ||
+      trackOverrides
+        .filter((override) =>
+          effectiveTrackOrder(trackOrder, layoutDefaults).some(
+            (ref) => !ref.inputPath && ref.streamIndex === override.streamIndex,
+          ),
+        )
+        .map(trackTagsIssue)
+        .find(Boolean) ||
+      externalTracks.map(trackTagsIssue).find(Boolean) ||
+      null,
+  );
+  const timecodeIssue = $derived(
+    movTimecodeIssue(
+      movTimecode,
+      files,
+      destinationContainer(destination) === 'mov',
+      trim.enabled,
+      temporal,
+    ),
+  );
   const usableSource = $derived(!!file && !file.id.startsWith('jesses-synthetic'));
   const toolsReady = $derived(
     requiredEncoderTools(backend, encoder, av1an.concatMethod).every((id) =>
@@ -315,6 +396,9 @@
       !parameterError(parameters, null, encoder) &&
       framingValid &&
       !trimIssue &&
+      !externalIssue &&
+      !layoutIssue &&
+      !timecodeIssue &&
       !temporalError(temporal, backend) &&
       !toneMapIssue &&
       !subtitleIssue &&
@@ -347,6 +431,12 @@
       source?.streams
         .filter((stream) => !['video', 'data'].includes(stream.kind))
         .map((stream) => stream.index) ?? [];
+    externalTracks = [];
+    trackOverrides = [];
+    trackOrder = [];
+    metadataDonor = undefined;
+    chaptersDonor = undefined;
+    movTimecode = undefined;
     audio =
       chunked && usePreferences
         ? defaultAv1anAudio(source?.streams ?? [])
@@ -387,6 +477,12 @@
           texturePsyBias,
           hdrTune,
           included: [...included],
+          externalTracks: copyExternalChoices(externalTracks),
+          trackOverrides: trackOverrides.map((entry) => ({ ...entry })),
+          trackOrder: trackOrder.map((entry) => ({ ...entry })),
+          metadataDonor: metadataDonor ? { ...metadataDonor } : undefined,
+          chaptersDonor: chaptersDonor ? { ...chaptersDonor } : undefined,
+          movTimecode: movTimecode ? { ...movTimecode } : undefined,
           audio: audio.map((track) => ({ ...track })),
           subtitles: subtitles.map((track) => ({ ...track })),
           framing: copyFramingDraft(framing),
@@ -411,6 +507,12 @@
           destination,
         } = draft);
         included = [...draft.included];
+        externalTracks = copyExternalChoices(draft.externalTracks);
+        trackOverrides = draft.trackOverrides.map((entry) => ({ ...entry }));
+        trackOrder = draft.trackOrder.map((entry) => ({ ...entry }));
+        metadataDonor = draft.metadataDonor ? { ...draft.metadataDonor } : undefined;
+        chaptersDonor = draft.chaptersDonor ? { ...draft.chaptersDonor } : undefined;
+        movTimecode = draft.movTimecode ? { ...draft.movTimecode } : undefined;
         audio = draft.audio.map((track) => ({ ...track }));
         subtitles = draft.subtitles.map((track) => ({ ...track }));
         framing = copyFramingDraft(draft.framing);
@@ -438,10 +540,44 @@
   $effect(() => {
     if (chunked && usableSource) saveAv1anPreferences(av1an, workers, av1anFilters);
   });
+  $effect(() => {
+    const available = files;
+    untrack(() => {
+      externalTracks = invalidateExternalChoices(externalTracks, available);
+      metadataDonor = invalidateSourceDonor(metadataDonor, available);
+      chaptersDonor = invalidateSourceDonor(chaptersDonor, available);
+      movTimecode = invalidateMovTimecodeChoice(movTimecode, available);
+      for (const draft of drafts.values()) {
+        draft.externalTracks = invalidateExternalChoices(draft.externalTracks, available);
+        draft.metadataDonor = invalidateSourceDonor(draft.metadataDonor, available);
+        draft.chaptersDonor = invalidateSourceDonor(draft.chaptersDonor, available);
+        draft.movTimecode = invalidateMovTimecodeChoice(draft.movTimecode, available);
+      }
+    });
+  });
   function toggle(index: number) {
     included = included.includes(index)
       ? included.filter((value) => value !== index)
       : [...included, index];
+  }
+  function updatePrimaryTags(streamIndex: number, tags: TrackTags) {
+    const remaining = trackOverrides.filter((entry) => entry.streamIndex !== streamIndex);
+    trackOverrides = Object.keys(tags).length
+      ? [...remaining, { streamIndex, ...tags }]
+      : remaining;
+  }
+  function updateExternalTags(inputPath: string, streamIndex: number, tags: TrackTags) {
+    externalTracks = externalTracks.map((choice) => {
+      if (choice.inputPath !== inputPath || choice.streamIndex !== streamIndex) return choice;
+      const {
+        title: _title,
+        language: _language,
+        default: _default,
+        forced: _forced,
+        ...rest
+      } = choice;
+      return { ...rest, ...tags };
+    });
   }
   function isCurrentDraft(generation: number, identity: string | null): boolean {
     return (
@@ -466,6 +602,11 @@
     const copies = copiedStreams
       .filter((stream) => included.includes(stream.index))
       .sort((a, b) => Number(a.kind === 'attachment') - Number(b.kind === 'attachment'));
+    const selectedPrimary = new Set([videoIndex, ...copies.map((stream) => stream.index)]);
+    const selectedOverrides = trackOverrides
+      .filter((entry) => selectedPrimary.has(entry.streamIndex))
+      .map((entry) => ({ ...entry }));
+    const selectedOrder = selectedTrackOrder(trackOrder, layoutDefaults);
     return {
       source: {
         inputPath: file.path,
@@ -506,6 +647,20 @@
         ...(selectedSubtitles(subtitles, included).length
           ? { subtitles: selectedSubtitles(subtitles, included) }
           : {}),
+        ...(externalTracks.length
+          ? {
+              externalTracks: requestExternalTracks(externalTracks),
+            }
+          : {}),
+        ...(selectedOverrides.length ? { trackOverrides: selectedOverrides } : {}),
+        ...(selectedOrder?.length ? { trackOrder: selectedOrder } : {}),
+        ...(metadataDonor && metadataDonor.inputPath !== file.path
+          ? { metadataSourcePath: metadataDonor.inputPath }
+          : {}),
+        ...(chaptersDonor && chaptersDonor.inputPath !== file.path
+          ? { chaptersSourcePath: chaptersDonor.inputPath }
+          : {}),
+        ...(movTimecode ? { movTimecodeTrack: selectedMovTimecode(movTimecode, file) } : {}),
         framing: selectedFraming(framing),
         ...(trim.enabled ? { trim: selectedTrim(trim) } : {}),
         ...(toneMap.enabled ? { toneMap: selectedToneMap(toneMap) } : {}),
@@ -553,7 +708,7 @@
       <p>
         {chunked
           ? 'Scene-based encoding with av1an. Choose an encoder and run parallel chunks.'
-          : 'Encode one source at a time. Pick an encoder, review the output, then start the job.'}
+          : 'Encode video with your selected tracks. Pick an encoder, review the output, then start the job.'}
       </p>
     </div>
     {#if sourcePicker}
@@ -751,6 +906,7 @@
             />
             <ToneMapOptions
               draft={toneMap}
+              {backend}
               {disabled}
               error={toneMapIssue}
               onchange={(next) => (toneMap = next)}
@@ -848,6 +1004,38 @@
             </div>
           {:else}<p class="small-muted">No additional tracks to copy.</p>{/each}
         </div>
+        <ExternalTracks
+          idPrefix={backend}
+          {backend}
+          video={selectedVideo}
+          toneMapped={toneMap.enabled}
+          {files}
+          primary={file}
+          selected={externalTracks}
+          {disabled}
+          issue={externalIssue}
+          onchange={(next) => (externalTracks = next)}
+        />
+        <TrackLayout
+          {files}
+          primary={file}
+          defaults={layoutDefaults}
+          order={trackOrder}
+          overrides={trackOverrides}
+          external={externalTracks}
+          {metadataDonor}
+          {chaptersDonor}
+          {movTimecode}
+          outputIsMov={destinationContainer(destination) === 'mov'}
+          issue={layoutIssue || timecodeIssue}
+          {disabled}
+          onorder={(next) => (trackOrder = next)}
+          onprimarytags={updatePrimaryTags}
+          onexternaltags={updateExternalTags}
+          onmetadata={(next) => (metadataDonor = next)}
+          onchapters={(next) => (chaptersDonor = next)}
+          ontimecode={(next) => (movTimecode = next)}
+        />
       </section>
     </div>
     <aside class="panel output-panel">
@@ -928,6 +1116,23 @@
             {#if selectedSubtitles(subtitles, included).length}<span
                 >{subtitleSummary(selectedSubtitles(subtitles, included))}</span
               >{/if}
+            {#if externalTracks.length}<span>{externalTrackSummary(externalTracks)}</span>{/if}
+            {#if selectedTrackOrder(trackOrder, layoutDefaults)}<span
+                >Custom output track order</span
+              >{/if}
+            {#if trackOverrides.length}<span>Primary track labels or flags edited</span>{/if}
+            {#if metadataDonor}<span
+                >Metadata from {files.find((entry) => entry.path === metadataDonor?.inputPath)
+                  ?.name ?? 'unavailable source'}</span
+              >{/if}
+            {#if chaptersDonor}<span
+                >Chapters from {files.find((entry) => entry.path === chaptersDonor?.inputPath)
+                  ?.name ?? 'unavailable source'}</span
+              >{/if}
+            {#if movTimecode}<span
+                >MOV timecode from {files.find((entry) => entry.path === movTimecode?.inputPath)
+                  ?.name ?? 'unavailable source'}</span
+              >{/if}
             <span
               >{framingResult.error
                 ? 'Check crop, resize and border values'
@@ -970,6 +1175,9 @@
         {:else if !framingValid}<p class="disabled-reason">
             {framingResult.error}
           </p>
+        {:else if externalIssue}<p class="disabled-reason" role="alert">{externalIssue}</p>
+        {:else if layoutIssue}<p class="disabled-reason" role="alert">{layoutIssue}</p>
+        {:else if timecodeIssue}<p class="disabled-reason" role="alert">{timecodeIssue}</p>
         {:else if subtitleIssue}<p class="disabled-reason" role="alert">{subtitleIssue}</p>
         {:else if !validAudio(audio, included, file?.streams ?? [])}<p class="disabled-reason">
             Check the selected audio codec, channels, and bitrate. Any compatibility issue is shown

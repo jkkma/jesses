@@ -199,6 +199,22 @@ fn tags_preserved(source: &BTreeMap<String, String>, output: &BTreeMap<String, S
         .all(|(k, v)| output.get(k) == Some(v))
 }
 
+fn format_tags_preserved(
+    source: &BTreeMap<String, String>,
+    output: &BTreeMap<String, String>,
+) -> bool {
+    let output = stable_tags(output);
+    stable_tags(source).iter().all(|(key, value)| {
+        // These describe the source container's file structure. FFmpeg writes
+        // the destination brand itself; carrying MOV values into the verified
+        // Matroska staging file creates duplicate, semicolon-joined tags.
+        matches!(
+            key.as_str(),
+            "major_brand" | "minor_version" | "compatible_brands"
+        ) || output.get(key) == Some(value)
+    })
+}
+
 pub(super) fn verify(
     source: &Document,
     selected: &[&Stream],
@@ -273,16 +289,22 @@ fn verify_inner(
         };
         let converted_subtitle = expected.codec_type.as_deref() == Some("subtitle")
             && converted_subtitles.contains(&expected.index);
-        if let Some(source_start) =
-            track_start(expected).filter(|_| converted_audio.is_none() && !converted_subtitle)
-        {
+        if let Some(source_start) = track_start(expected).filter(|_| {
+            converted_audio.is_none()
+                    && !converted_subtitle
+                    // Attachments have no playback timeline. FFprobe may give
+                    // them the container start, which belongs to another file
+                    // when an attachment is copied into a mixed-source output.
+                    && expected.codec_type.as_deref() != Some("attachment")
+        }) {
             let output_start = track_start(actual);
             if !output_start
                 .is_some_and(|start| start.is_finite() && (start - source_start).abs() <= 0.002)
             {
-                return Err(fail(
-                    "The output track start time changed, which could affect synchronization.",
-                ));
+                return Err(fail(&format!(
+                    "The output track start time changed, which could affect synchronization (source stream {}, output stream {}: {source_start:.6} s -> {output_start:?} s).",
+                    expected.index, actual.index,
+                )));
             }
         }
         if expected.codec_type != actual.codec_type
@@ -357,7 +379,7 @@ fn verify_inner(
         && !output
             .format
             .as_ref()
-            .is_some_and(|f| tags_preserved(&source_format.tags, &f.tags))
+            .is_some_and(|f| format_tags_preserved(&source_format.tags, &f.tags))
     {
         return Err(fail("The output did not preserve container metadata."));
     }
@@ -433,6 +455,33 @@ mod tests {
             {"index":2,"codec_type":"audio","codec_name":"flac","channels":2,"nb_read_packets":"96","tags":{"LANGUAGE":"jpn","title":"Original"}},
             {"index":5,"codec_type":"attachment","extradata_hash":"SHA256:fixture","tags":{"filename":"font.ttf","mimetype":"application/x-truetype-font"}}
         ],"chapters":[{"start_time":"0","end_time":"2","tags":{"title":"Opening"}}],"format":{"duration":"2","tags":{"title":"Sample","ENCODER":"source tool"}}})).unwrap()
+    }
+
+    #[test]
+    fn destination_container_brands_do_not_replace_descriptive_metadata() {
+        let source = BTreeMap::from([
+            ("major_brand".into(), "qt  ".into()),
+            ("minor_version".into(), "512".into()),
+            ("compatible_brands".into(), "qt  ".into()),
+            ("title".into(), "Original".into()),
+        ]);
+        let mut output = BTreeMap::from([("TITLE".into(), "Original".into())]);
+        assert!(format_tags_preserved(&source, &output));
+        assert!(!tags_preserved(&source, &output));
+        output.insert("TITLE".into(), "Changed".into());
+        assert!(!format_tags_preserved(&source, &output));
+    }
+
+    #[test]
+    fn attachment_container_starts_are_not_playback_timestamps() {
+        let mut source = fixture();
+        source.streams[2].start_time = Some("0.250".into());
+        let mut output = source.clone();
+        output.streams[2].start_time = Some("0.000".into());
+        let selected = source.selected(&[0, 2, 5]).unwrap();
+        verify(&source, &selected, &output).unwrap();
+        output.streams[2].extradata_hash = Some("SHA256:changed".into());
+        assert!(verify(&source, &selected, &output).is_err());
     }
 
     #[test]

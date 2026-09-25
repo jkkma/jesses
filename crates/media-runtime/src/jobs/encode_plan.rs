@@ -46,6 +46,7 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    super::external_tracks::validate(settings)?;
     super::parameters::validate(settings)?;
     temporal::validate(settings)?;
     super::av1an::validate_settings(settings)?;
@@ -247,13 +248,14 @@ impl Plan {
                 "The selected non-SVT encoder currently supports SDR output only. Select SVT-AV1 for HDR10 output or enable explicit HDR/HLG-to-SDR tone mapping.",
             ));
         }
-        let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg) {
+        let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg || tone.dv5) {
             Some(Hdr10::build(
                 &video.side_data_list,
                 settings.hdr10_fallback
                     || tone_map
                         .as_ref()
-                        .is_some_and(|tone| tone.settings.hdr10_base_layer),
+                        .is_some_and(|tone| tone.settings.hdr10_base_layer || tone.dv5),
+                tone_map.as_ref().is_some_and(|tone| tone.dv5),
             )?)
         } else {
             None
@@ -389,13 +391,17 @@ impl Plan {
                 sdr_color(video.color_space.as_deref())?
             },
             hdr10,
-            full_range: match video.color_range.as_deref() {
-                Some("tv") => false,
-                Some("pc") => true,
-                _ => {
-                    return Err(unsupported(
-                        "Explicit limited or full color range is required.",
-                    ));
+            full_range: if tone_map.is_some() {
+                false
+            } else {
+                match video.color_range.as_deref() {
+                    Some("tv") => false,
+                    Some("pc") => true,
+                    _ => {
+                        return Err(unsupported(
+                            "Explicit limited or full color range is required.",
+                        ));
+                    }
                 }
             },
             chroma: if tone_map.is_some() {
@@ -481,6 +487,18 @@ impl Plan {
     }
 
     pub fn post_qtgmc_filter_with_text(&self, text: Option<&str>) -> Option<String> {
+        let filters = [
+            self.post_qtgmc_prefix(),
+            self.post_qtgmc_suffix_with_text(text),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    /// Processing before bitmap subtitle graphics. Text and geometry follow.
+    pub fn post_qtgmc_prefix(&self) -> Option<String> {
         let mut filters = Vec::new();
         if let Some(strength) = self.grain_prefilter {
             filters.push(format!(
@@ -499,6 +517,11 @@ impl Plan {
         if let Some(tone) = &self.tone_map {
             filters.push(tone.filter());
         }
+        (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    pub fn post_qtgmc_suffix_with_text(&self, text: Option<&str>) -> Option<String> {
+        let mut filters = Vec::new();
         if let Some(framing) = self.geometry.filter_with_text(
             self.matrix,
             self.full_range,
@@ -621,18 +644,43 @@ impl Plan {
         if let Some(aspect) = self.aspect {
             filters.push(aspect.filter());
         }
+        filters.extend(self.custom_filters.iter().cloned());
         (!filters.is_empty()).then(|| filters.join(","))
     }
 
-    pub async fn check_tone_map_tools(
-        &self,
+    pub async fn resolve_tone_map(
+        &mut self,
         ffmpeg: &std::path::Path,
+        source: &std::path::Path,
+        duration_seconds: Option<f64>,
         cancel: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), AppError> {
-        if let Some(tone) = &self.tone_map {
-            tone.check_tools(ffmpeg, cancel).await?;
+        let declared_peak = self
+            .hdr10
+            .as_ref()
+            .and_then(|hdr| hdr.metadata.declared_peak_nits());
+        if let Some(tone) = &mut self.tone_map {
+            tone.resolve(
+                ffmpeg,
+                source,
+                self.video_index,
+                duration_seconds,
+                declared_peak,
+                cancel,
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    pub fn tone_map_device_args(&self) -> Vec<std::ffi::OsString> {
+        self.tone_map
+            .as_ref()
+            .map_or_else(Vec::new, tone_map::Transform::device_args)
+    }
+
+    pub fn tone_map_description(&self) -> Option<String> {
+        self.tone_map.as_ref().map(tone_map::Transform::description)
     }
 
     pub async fn check_temporal_tools(
@@ -897,6 +945,9 @@ impl Plan {
                 ));
             }
             validate_side_data(&frame.side_data_list, self.validation_hdr(encoded), encoded)?;
+            if !encoded && let Some(hdr) = self.hdr10.as_ref() {
+                hdr.require_profile5_rpu(&frame.side_data_list)?;
+            }
             if let Some(hdr) = self.validation_hdr(encoded) {
                 let actual = StaticMetadata::parse(&frame.side_data_list)?;
                 hdr.metadata.validate_present(&actual, encoded)?;
@@ -1382,6 +1433,88 @@ mod tests {
                 .is_err(),
             "No stream configuration to confirm Dolby compatibility"
         );
+    }
+
+    #[test]
+    fn profile5_requires_gpu_route_and_rpu_on_every_decoded_frame() {
+        let (mut source, mut decoded) = hdr_source_and_frames();
+        let stream = &mut source.streams[0];
+        stream.color_range = Some("pc".into());
+        stream.color_primaries = None;
+        stream.color_transfer = None;
+        stream.color_space = None;
+        stream.chroma_location = Some("left".into());
+        stream.side_data_list.push(serde_json::json!({
+            "side_data_type":"DOVI configuration record",
+            "dv_profile":5,
+            "dv_bl_signal_compatibility_id":0,
+            "bl_present_flag":1,
+            "rpu_present_flag":1,
+            "el_present_flag":0
+        }));
+        for frame in &mut decoded.frames {
+            frame.color_range = Some("pc".into());
+            frame.color_primaries = None;
+            frame.color_transfer = None;
+            frame.color_space = None;
+            frame.chroma_location = Some("left".into());
+            frame.side_data_list.push(serde_json::json!({
+                "side_data_type":"Dolby Vision RPU Data"
+            }));
+            frame.side_data_list.push(serde_json::json!({
+                "side_data_type":"Dolby Vision Metadata",
+                "bl_bit_depth":10,
+                "bl_video_full_range_flag":1
+            }));
+        }
+        let mut settings = EncodeSettings {
+            tone_map: Some(
+                serde_json::from_value(serde_json::json!({
+                    "sourcePeakNits":1000,
+                    "backend":"auto",
+                    "peakMode":"measured"
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        assert!(plan.tone_map.as_ref().unwrap().dv5);
+        assert!(
+            !plan.full_range,
+            "SDR output must be limited even from a full-range IPT source"
+        );
+        plan.validate_source_frames(&decoded, &source.streams[0])
+            .unwrap();
+        decoded.frames[1].side_data_list.retain(|value| {
+            value
+                .get("side_data_type")
+                .and_then(serde_json::Value::as_str)
+                != Some("Dolby Vision RPU Data")
+        });
+        assert!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .is_err()
+        );
+        decoded.frames[1].side_data_list.push(serde_json::json!({
+            "side_data_type":"Dolby Vision RPU Data"
+        }));
+        decoded.frames[1].side_data_list.retain(|value| {
+            value
+                .get("side_data_type")
+                .and_then(serde_json::Value::as_str)
+                != Some("Dolby Vision Metadata")
+        });
+        assert!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .is_err(),
+            "Raw RPU without parsed metadata must not qualify profile 5 rendering"
+        );
+        settings.tone_map.as_mut().unwrap().backend = media_core::ToneMapBackend::Cpu;
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err());
+        settings.tone_map.as_mut().unwrap().backend = media_core::ToneMapBackend::Auto;
+        settings.tone_map.as_mut().unwrap().hdr10_base_layer = true;
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err());
     }
 
     #[test]

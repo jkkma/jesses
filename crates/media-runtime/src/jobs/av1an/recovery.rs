@@ -259,6 +259,9 @@ struct Manifest {
     /// The source av1an reads. A frame-changing preprocessing workflow copies
     /// its verified lossless output to a stable path inside this workspace.
     source: Stamp,
+    /// Selected non-video sources remain outside this owned workspace.
+    #[serde(default)]
+    external_sources: Vec<Stamp>,
     /// The immutable user source remains the authority for the request and the
     /// final audio/metadata mux when av1an reads a prepared video instead.
     #[serde(default)]
@@ -594,6 +597,43 @@ fn source_matches_attempt(
             && manifest.original_source.is_none()
             && manifest.prepared_identity.is_none())
     }
+}
+
+fn external_source_stamps(
+    settings: &EncodeSettings,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Vec<Stamp>, AppError> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut guards = Vec::new();
+    for path in super::super::external_tracks::additional_source_paths(settings) {
+        let guard = Source::open(path)?;
+        if paths.insert(crate::batch::path_key(&guard.path)) {
+            guards.push(guard);
+        }
+    }
+    guards.sort_by(|left, right| left.path.cmp(&right.path));
+    guards
+        .iter()
+        .map(|guard| {
+            let stamp = digest(&guard.path, cancel)?;
+            guard.verify()?;
+            Ok(stamp)
+        })
+        .collect()
+}
+
+fn verify_external_sources(
+    manifest: &Manifest,
+    settings: &EncodeSettings,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    if manifest.external_sources != external_source_stamps(settings, cancel)? {
+        return Err(error(
+            Path::new(&manifest.request.output_path),
+            "A selected external source changed or lacks a recovery fingerprint.",
+        ));
+    }
+    Ok(())
 }
 
 impl Workspace {
@@ -1026,6 +1066,7 @@ impl Recovery {
         let source_filter = prepared.is_none().then(|| plan.decoder_filter()).flatten();
         tokio::task::spawn_blocking(move || {
             let original_source = digest(&source, Some(&cancel))?;
+            let external_sources = external_source_stamps(&settings, Some(&cancel))?;
             let tool_guards = tools
                 .iter()
                 .map(|path| Source::open(path))
@@ -1044,6 +1085,7 @@ impl Recovery {
                     Some(&cancel),
                 )?;
                 if !source_matches
+                    || manifest.external_sources != external_sources
                     || !tool_contents_match(&manifest.tools, &tool_stamps)
                     || manifest.params != params
                     || manifest.pixel_format != pixel_format
@@ -1083,6 +1125,7 @@ impl Recovery {
                     request,
                     settings,
                     source: source_stamp,
+                    external_sources,
                     original_source: saved_original,
                     prepared_identity,
                     tools: tool_stamps,
@@ -1490,7 +1533,8 @@ impl JobManager {
                     "This is not an encoding job.",
                 )
             })?;
-            load(&snapshot.id, &snapshot.request, settings, locator)?;
+            let (_, manifest) = load(&snapshot.id, &snapshot.request, settings, locator)?;
+            verify_external_sources(&manifest, settings, None)?;
             Ok(())
         })
         .await
@@ -1542,6 +1586,7 @@ mod tests {
                 request,
                 settings,
                 source: digest(&source, None).unwrap(),
+                external_sources: vec![],
                 original_source: None,
                 prepared_identity: None,
                 tools: vec![],
@@ -1587,7 +1632,23 @@ mod tests {
     #[tokio::test]
     async fn discard_requires_the_saved_owner_and_preserves_neighbor_without_source() {
         let fixture = Fixture::new();
-        let (workspace, intermediate) = fixture.workspace();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let external = fixture.0.join("external.mka");
+        fs::write(&external, b"external bytes").unwrap();
+        workspace.manifest.settings.external_tracks = vec![media_core::ExternalTrack {
+            offset_milliseconds: 0,
+            subtitle_mode: None,
+            title: None,
+            language: None,
+            default: None,
+            forced: None,
+            audio: None,
+            input_path: external.to_string_lossy().into_owned(),
+            stream_index: 0,
+        }];
+        workspace.manifest.external_sources =
+            external_source_stamps(&workspace.manifest.settings, None).unwrap();
+        workspace.save().unwrap();
         let root = workspace.root.clone();
         let locator = workspace.summary();
         let request = workspace.manifest.request.clone();
@@ -1605,10 +1666,12 @@ mod tests {
         drop(workspace);
         drop(intermediate);
         fs::remove_file(&request.input_path).unwrap();
+        fs::remove_file(&external).unwrap();
         Recovery::discard("owned-job", &request, &settings, &locator)
             .await
             .unwrap();
         assert!(!root.exists());
+        assert!(!external.exists());
         assert_eq!(fs::read(&neighbor).unwrap(), b"not workspace content");
     }
 
@@ -1730,6 +1793,94 @@ mod tests {
     }
 
     #[test]
+    fn external_sources_bind_resume_and_missing_stamps_reject_mixed_jobs() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let external = fixture.0.join("external.mka");
+        fs::write(&external, b"external-a").unwrap();
+        workspace.manifest.settings.external_tracks = vec![
+            media_core::ExternalTrack {
+                offset_milliseconds: 0,
+                subtitle_mode: None,
+                title: None,
+                language: None,
+                default: None,
+                forced: None,
+                audio: None,
+                input_path: external.to_string_lossy().into_owned(),
+                stream_index: 0,
+            },
+            media_core::ExternalTrack {
+                offset_milliseconds: 0,
+                subtitle_mode: None,
+                title: None,
+                language: None,
+                default: None,
+                forced: None,
+                audio: None,
+                input_path: external.to_string_lossy().into_owned(),
+                stream_index: 1,
+            },
+        ];
+        workspace.manifest.external_sources =
+            external_source_stamps(&workspace.manifest.settings, None).unwrap();
+        assert_eq!(workspace.manifest.external_sources.len(), 1);
+        workspace.save().unwrap();
+        let locator = workspace.summary();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let manifest_path = workspace.root.join("manifest.json");
+
+        let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        verify_external_sources(&loaded, &settings, None).unwrap();
+        let saved = fs::read(&manifest_path).unwrap();
+        let mut missing: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        missing.as_object_mut().unwrap().remove("external_sources");
+        fs::write(&manifest_path, serde_json::to_vec(&missing).unwrap()).unwrap();
+        let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+        fs::write(&manifest_path, saved).unwrap();
+
+        fs::write(&external, b"external-b").unwrap();
+        let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+        let moved = fixture.0.join("moved-external.mka");
+        fs::rename(&external, &moved).unwrap();
+        fs::write(&external, b"external-a").unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+        drop(workspace);
+        drop(intermediate);
+    }
+
+    #[test]
+    fn donor_only_sources_are_fingerprinted_for_av1an_resume() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let metadata = fixture.0.join("metadata.mka");
+        let chapters = fixture.0.join("chapters.mka");
+        fs::write(&metadata, b"metadata donor").unwrap();
+        fs::write(&chapters, b"chapter donor").unwrap();
+        workspace.manifest.settings.metadata_source_path =
+            Some(metadata.to_string_lossy().into_owned());
+        workspace.manifest.settings.chapters_source_path =
+            Some(chapters.to_string_lossy().into_owned());
+        workspace.manifest.external_sources =
+            external_source_stamps(&workspace.manifest.settings, None).unwrap();
+        assert_eq!(workspace.manifest.external_sources.len(), 2);
+        workspace.save().unwrap();
+        let locator = workspace.summary();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        verify_external_sources(&loaded, &settings, None).unwrap();
+        drop(workspace);
+        drop(intermediate);
+        fs::write(&metadata, b"changed donor").unwrap();
+        let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+    }
+
+    #[test]
     fn legacy_manifest_without_borders_matches_default_framing_without_rewriting_receipts() {
         let fixture = Fixture::new();
         let (workspace, intermediate) = fixture.workspace();
@@ -1739,6 +1890,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("borders");
+        legacy.as_object_mut().unwrap().remove("external_sources");
         let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
         fs::write(&manifest_path, &legacy_bytes).unwrap();
         let (_, loaded) = load(
@@ -1749,6 +1901,7 @@ mod tests {
         )
         .unwrap();
         assert!(loaded == workspace.manifest);
+        verify_external_sources(&loaded, &workspace.manifest.settings, None).unwrap();
         assert_eq!(fs::read(&manifest_path).unwrap(), legacy_bytes);
         let mut changed = workspace.manifest.settings.clone();
         changed.framing.borders.left = 2;

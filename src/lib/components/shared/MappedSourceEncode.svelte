@@ -35,15 +35,15 @@
       {#if missing}
         The chosen source was removed. Choose an encoding source to continue.
       {:else if sourceId}
-        Video, copied tracks, geometry and color settings use {source?.name}. You can inspect other
-        files without changing this source.
+        Video, geometry and color use {source?.name}. Tracks, container metadata and chapters can be
+        chosen below.
       {:else}
         Pin a source here to keep encoding it while you inspect other files.
       {/if}
     </p>
   </section>
 {/snippet}
-<SingleEncode {...props} file={source} {sourcePicker} />
+<SingleEncode {...props} {files} file={source} {sourcePicker} />
 
 <style>
   .source-mapping {

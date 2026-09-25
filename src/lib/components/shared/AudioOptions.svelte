@@ -14,6 +14,8 @@
     stream,
     settings,
     disabled = false,
+    showLoudness = true,
+    compact = false,
     onchange,
   }: {
     idPrefix: string;
@@ -21,6 +23,8 @@
     stream: MediaStream;
     settings: AudioTrackDraft;
     disabled?: boolean;
+    showLoudness?: boolean;
+    compact?: boolean;
     onchange: (settings: AudioTrackDraft) => void;
   } = $props();
   const id = $derived(`${idPrefix}-audio-${stream.index}`);
@@ -38,7 +42,12 @@
   }
 </script>
 
-<div class="audio-options" role="group" aria-label={`Audio settings for stream #${stream.index}`}>
+<div
+  class:compact
+  class="audio-options"
+  role="group"
+  aria-label={`Audio settings for stream #${stream.index}`}
+>
   <p class="audio-source">
     Source: {stream.codec ?? 'Unknown codec'} · {stream.channels == null
       ? 'Unknown channels'
@@ -125,13 +134,17 @@
     </p>
   {/if}
   {#if compatibilityError}<p class="audio-help" role="alert">{compatibilityError}</p>{/if}
-  <LoudnessControl {inputPath} {settings} {disabled} {onchange} />
+  {#if showLoudness}<LoudnessControl {inputPath} {settings} {disabled} {onchange} />{/if}
 </div>
 
 <style>
   .audio-options {
     padding: 10px 0 12px 20px;
     border-bottom: 1px solid var(--border);
+  }
+  .audio-options.compact {
+    padding: 3px 0 9px 24px;
+    border-bottom: 0;
   }
   .audio-controls {
     display: grid;

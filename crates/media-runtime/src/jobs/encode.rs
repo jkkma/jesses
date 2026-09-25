@@ -188,12 +188,28 @@ impl JobManager {
         )
         .await?;
         let selected = document.selected(&request.stream_indices)?;
-        container::preflight(&output, &document, &selected, Some(settings))?;
+        let external = super::external_tracks::ExternalTracks::prepare(
+            &source, request, settings, &document, &ffprobe, cancel,
+        )
+        .await?;
+        let mut output_document = external.extend_document(&document, settings);
+        let mux_settings = external.mux_settings(settings);
+        let preflight_indices =
+            external.output_indices(&document, request.stream_indices.clone(), settings)?;
+        let preflight_selected = output_document.selected(&preflight_indices)?;
+        audio::validate_selection(&preflight_selected, &mux_settings)?;
+        super::trim::validate_selection(&preflight_selected, &mux_settings)?;
+        super::subtitles::validate_selection(&preflight_selected, &mux_settings)?;
+        container::preflight(
+            &output,
+            &output_document,
+            &preflight_selected,
+            Some(&mux_settings),
+        )?;
         let mut plan = Plan::build(&document, &selected, settings)?;
-        plan.check_tone_map_tools(&ffmpeg, cancel).await?;
         plan.check_temporal_tools(&ffmpeg, cancel).await?;
-        audio::check_encoders(&ffmpeg, settings, cancel).await?;
-        if audio::converted(settings).any(|track| {
+        audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
+        if audio::converted(&mux_settings).any(|track| {
             matches!(
                 track.codec,
                 media_core::AudioCodec::Aac | media_core::AudioCodec::Opus
@@ -218,11 +234,18 @@ impl JobManager {
             .await?;
         }
         let mut audio_timelines = Vec::new();
-        for track in audio::converted(settings) {
-            let source_track = selected
-                .iter()
-                .find(|stream| stream.index == track.stream_index)
-                .expect("validated audio selection");
+        for track in audio::converted(&mux_settings) {
+            let (audio_path, source_track) = external
+                .audio_source(track.stream_index)
+                .unwrap_or_else(|| {
+                    (
+                        source.path.as_path(),
+                        *selected
+                            .iter()
+                            .find(|stream| stream.index == track.stream_index)
+                            .expect("validated audio selection"),
+                    )
+                });
             if matches!(
                 track.codec,
                 media_core::AudioCodec::Flac
@@ -251,7 +274,19 @@ impl JobManager {
                 "Decoding selected audio to verify its complete sample timeline.",
             )
             .await;
-            let timeline = audio::scan(&ffprobe, &source.path, source_track, false, cancel).await?;
+            let timeline = audio::scan(&ffprobe, audio_path, source_track, false, cancel)
+                .await?
+                .shifted(external.offset_seconds(track.stream_index));
+            if external.audio_source(track.stream_index).is_some() {
+                let (start, end) = timeline.bounds();
+                let expected = output_document
+                    .streams
+                    .iter_mut()
+                    .find(|stream| stream.index == track.stream_index)
+                    .expect("prepared converted external stream");
+                expected.packet_start_time = Some(start);
+                expected.duration = Some(end.to_string());
+            }
             audio_timelines.push((track, timeline));
         }
         if settings.backend == media_core::EncodeBackend::Av1an {
@@ -274,6 +309,16 @@ impl JobManager {
         let frame_count = self
             .scan_frames(id, &ffprobe, &source.path, &mut plan, video, false, cancel)
             .await?;
+        external.validate_timecode_clock(plan.fps_num, plan.fps_den, frame_count)?;
+        // Container duration may include a longer audio or subtitle track.
+        // Peak sampling belongs to the selected, fully scanned source video.
+        let source_video_duration = frame_count as f64 * plan.frame_seconds();
+        plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
+            .await?;
+        if let Some(description) = plan.tone_map_description() {
+            self.change(id, |snapshot| append_log(snapshot, description))
+                .await;
+        }
         if declared_rate != (plan.fps_num, plan.fps_den) {
             self.change(id, |snapshot| {
                 append_log(snapshot, format!(
@@ -298,6 +343,21 @@ impl JobManager {
                 audio_filters.insert(track.stream_index, filter);
             }
         }
+        // Current MP4/MOV muxing loses AAC priming for positive track origins.
+        // Check the effective decoded start after any trim has rebased it, and
+        // fail before encoding rather than publish an extra leading AAC frame.
+        if audio_timelines.iter().any(|(track, timeline)| {
+            track.codec == media_core::AudioCodec::Aac && timeline.bounds().0 > 0.002
+        }) && matches!(
+            container::format(&output)?,
+            media_core::ContainerFormat::Mp4 | media_core::ContainerFormat::Mov
+        ) {
+            return Err(AppError::new(
+                "AUDIO_CONTAINER_UNSUPPORTED",
+                "This MP4/MOV workflow cannot preserve AAC priming when the audio starts after zero. Choose Matroska to keep the original audio timing, or choose another audio codec.",
+                None,
+            ));
+        }
         let source_frame_count = interval.map_or(frame_count, |interval| interval.frames);
         if plan.requires_exact_duplicate_scan() {
             self.phase(
@@ -320,6 +380,7 @@ impl JobManager {
             plan.set_exact_duplicate_count(source_frame_count, report.unique_frames)?;
         }
         let frame_count = plan.activate_temporal(source_frame_count)?;
+        let combined_selected = output_document.selected(&preflight_indices)?;
         let prepared_trim = if let Some(interval) = interval {
             self.phase(
                 id,
@@ -330,8 +391,9 @@ impl JobManager {
             Some(
                 super::trim::Prepared::build(
                     interval,
-                    &document,
-                    &selected,
+                    &output_document,
+                    &combined_selected,
+                    &external,
                     &ffmpeg,
                     &source.path,
                     &output,
@@ -345,10 +407,11 @@ impl JobManager {
             None
         };
         let subtitle_assets = super::subtitles::Prepared::build(
-            settings,
+            &mux_settings,
             &document,
-            &selected,
+            &combined_selected,
             prepared_trim.as_ref(),
+            &external,
             &ffmpeg,
             &source.path,
             &output,
@@ -356,8 +419,18 @@ impl JobManager {
             cancel,
         )
         .await?;
-        let output_indices = subtitle_assets.effective_indices(&selected);
-        let output_selected = document.selected(&output_indices)?;
+        let output_indices = subtitle_assets.effective_indices(&combined_selected);
+        let output_selected = output_document.selected(&output_indices)?;
+        let explicit_defaults_off = output_selected
+            .iter()
+            .filter(|stream| {
+                external
+                    .track_metadata(stream.index, settings)
+                    .is_some_and(|options| options.default == Some(false))
+            })
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        container::preflight_explicit_defaults(&output, &output_selected, &explicit_defaults_off)?;
         let measured_nonvideo = if matches!(
             settings.rate_control,
             Some(media_core::VideoRateControl::TargetSize { .. })
@@ -416,6 +489,7 @@ impl JobManager {
                 &output_selected,
                 &plan,
                 settings,
+                &external,
             );
             if let Some(prepared) = &prepared_trim {
                 prepared.apply_mux(&mut args, &output_selected, &audio_filters)?;
@@ -480,13 +554,6 @@ impl JobManager {
         source.verify()?;
         check_cancel(cancel)?;
         let qtgmc = if plan.requires_qtgmc() {
-            if subtitle_assets.text_filter().is_some() || subtitle_assets.bitmap_index().is_some() {
-                return Err(AppError::new(
-                    "QTGMC_SUBTITLE_UNSUPPORTED",
-                    "QTGMC cannot currently burn subtitles while its verified lossless intermediate is prepared. Copy or convert the subtitle track, or choose BWDIF deinterlacing.",
-                    None,
-                ));
-            }
             self.phase(
                 id,
                 JobState::Preparing,
@@ -504,6 +571,7 @@ impl JobManager {
                         u32::try_from(value.source_end_frame).expect("validated frame bound"),
                     )
                 }),
+                &subtitle_assets,
                 &ffmpeg,
                 cancel,
             )
@@ -563,6 +631,7 @@ impl JobManager {
                 &plan,
                 settings,
                 &output_selected,
+                &external,
                 prepared_trim.as_ref(),
                 interval.map(|value| {
                     (
@@ -580,6 +649,7 @@ impl JobManager {
             )
             .await?;
             source.verify()?;
+            external.verify()?;
             return check_cancel(cancel);
         }
         let qtgmc_identity = if let Some(prepared) = &qtgmc {
@@ -601,7 +671,7 @@ impl JobManager {
             && qtgmc.is_none()
             && plan.requires_av1an_preprocess()
         {
-            if subtitle_assets.bitmap_index().is_some() {
+            if subtitle_assets.bitmap_input().is_some() {
                 return Err(AppError::new(
                     "AV1AN_PREPROCESS_SUBTITLE_UNSUPPORTED",
                     "av1an cannot burn a bitmap subtitle while preparing its verified lossless processed source. Copy the subtitle track or use standalone encoding.",
@@ -920,7 +990,7 @@ impl JobManager {
                     args: if let Some(qtgmc) = &qtgmc {
                         decoder_args_preprocessed(&qtgmc.video.path, &plan)
                     } else if subtitle_assets.text_filter().is_none()
-                        && subtitle_assets.bitmap_index().is_none()
+                        && subtitle_assets.bitmap_input().is_none()
                     {
                         decoder_args(&source.path, &plan)
                     } else {
@@ -928,7 +998,7 @@ impl JobManager {
                             &source.path,
                             &plan,
                             subtitle_assets.text_filter(),
-                            subtitle_assets.bitmap_index(),
+                            subtitle_assets.bitmap_input(),
                         )
                     },
                     cwd: if qtgmc.is_some() {
@@ -1256,6 +1326,7 @@ impl JobManager {
                 &output_selected,
                 &plan,
                 settings,
+                &external,
             );
             if let Some(prepared) = &prepared_trim {
                 prepared.apply_mux(&mut mux_arguments, &output_selected, &audio_filters)?;
@@ -1307,7 +1378,7 @@ impl JobManager {
             let expected_document = subtitle_assets.expected_document(
                 prepared_trim
                     .as_ref()
-                    .map_or(&document, |prepared| &prepared.expected),
+                    .map_or(&output_document, |prepared| &prepared.expected),
             );
             let expected_document = plan.temporal_document(expected_document);
             let expected_selected = expected_document.selected(&output_indices)?;
@@ -1318,8 +1389,9 @@ impl JobManager {
                 plan.video_index,
                 plan.output_codec(),
                 (plan.width, plan.height),
-                &settings.audio,
+                &mux_settings.audio,
             )?;
+            external.verify_metadata_overrides(settings, &expected_selected, &artifact)?;
             if let Some(prepared) = &prepared_trim {
                 prepared
                     .verify_subtitles(
@@ -1414,7 +1486,7 @@ impl JobManager {
                         &source.path,
                         &plan,
                         subtitle_assets.text_filter(),
-                        subtitle_assets.bitmap_index(),
+                        subtitle_assets.bitmap_input(),
                     )
                 },
                 cwd: if prepared_path.is_some() {
@@ -1453,10 +1525,22 @@ impl JobManager {
             })
             .await;
         }
+        external
+            .verify_packets_excluding(
+                &ffprobe,
+                &temp.path,
+                &output_selected,
+                &prepared_trim
+                    .as_ref()
+                    .map_or_else(Vec::new, |trim| trim.subtitle_indices()),
+                cancel,
+            )
+            .await?;
         self.finalize(
             id,
             cancel,
             &source,
+            Some(&external),
             temp,
             &output,
             Some(container::Cadence {
@@ -1833,7 +1917,7 @@ fn decoder_args_with_subtitles(
     input: &Path,
     plan: &Plan,
     text: Option<&str>,
-    bitmap: Option<u32>,
+    bitmap: Option<(&Path, u32, f64)>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-hide_banner",
@@ -1846,34 +1930,30 @@ fn decoder_args_with_subtitles(
         "-noautorotate",
         "-protocol_whitelist",
         "file",
-        "-i",
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
+    args.extend(plan.tone_map_device_args());
+    args.push("-i".into());
     args.push(input.as_os_str().to_owned());
-    if let Some(bitmap) = bitmap {
-        let mut filter = if let Some(prefix) = plan.decoder_prefix() {
-            format!(
-                "[0:{}]{prefix}[jesses_prepared];[jesses_prepared]",
-                plan.video_index
-            )
-        } else {
-            format!("[0:{}]", plan.video_index)
-        };
-        filter.push_str(&format!(
-            "[0:{bitmap}]overlay=eof_action=pass:repeatlast=0:format={}",
-            if plan.output_bit_depth() == 10 {
-                "yuv420p10"
-            } else {
-                "yuv420"
-            }
-        ));
-        if let Some(geometry) = plan.geometry_filter_with_text(text) {
-            filter.push(',');
-            filter.push_str(&geometry);
-        }
-        filter.push_str("[jesses_video]");
+    if let Some((path, bitmap, offset)) = bitmap {
+        args.insert(0, "-copyts".into());
+        args.extend([
+            "-itsoffset".into(),
+            format!("{offset:.6}").into(),
+            "-protocol_whitelist".into(),
+            "file".into(),
+            "-i".into(),
+            path.as_os_str().to_owned(),
+        ]);
+        let filter = super::subtitles::bitmap_filter(
+            &format!("0:{}", plan.video_index),
+            plan.decoder_prefix().as_deref(),
+            plan.geometry_filter_with_text(text).as_deref(),
+            plan.output_bit_depth(),
+            bitmap,
+        );
         args.extend([
             "-filter_complex".into(),
             filter.into(),
@@ -2298,7 +2378,10 @@ fn mux_args(
     selected: &[&metadata::Stream],
     plan: &Plan,
     settings: &EncodeSettings,
+    external: &super::external_tracks::ExternalTracks,
 ) -> Vec<OsString> {
+    let effective_settings = external.mux_settings(settings);
+    let settings = &effective_settings;
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -2313,29 +2396,40 @@ fn mux_args(
     .map(OsString::from)
     .collect();
     args.push(input.as_os_str().to_owned());
-    if audio::converted(settings).next().is_some() {
+    if audio::converted(settings).next().is_some() || !external.is_empty() {
         // Codec delay can create negative packet DTS. Keep source timestamps
         // and prohibit the muxer from shifting every track to compensate.
         args.insert(0, "-copyts".into());
     }
     args.push("-i".into());
     args.push(ivf.as_os_str().to_owned());
+    external.append_inputs(&mut args);
     for stream in selected {
+        let (input_index, stream_index) = external.input_stream(stream.index);
         args.extend([
             "-map".into(),
             if stream.index == plan.video_index {
                 "1:v:0".into()
             } else {
-                format!("0:{}", stream.index).into()
+                format!("{input_index}:{stream_index}").into()
             },
         ]);
     }
-    args.extend(
-        ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
-            .into_iter()
-            .map(OsString::from),
-    );
+    args.extend([
+        "-map_metadata".into(),
+        external.metadata_input_index().to_string().into(),
+        "-map_chapters".into(),
+        external.chapters_input_index().to_string().into(),
+        "-c".into(),
+        "copy".into(),
+    ]);
+    // MOV/MP4 brands and minor versions describe the container being written.
+    // They cannot be copied into the verified Matroska staging file as tags.
+    for key in ["major_brand", "minor_version", "compatible_brands"] {
+        args.extend(["-metadata".into(), format!("{key}=").into()]);
+    }
     for (index, stream) in selected.iter().enumerate() {
+        let (input_index, stream_index) = external.input_stream(stream.index);
         let converted_audio =
             audio::converted(settings).find(|track| track.stream_index == stream.index);
         if let Some(track) = converted_audio {
@@ -2343,7 +2437,7 @@ fn mux_args(
         }
         args.extend([
             format!("-map_metadata:s:{index}").into(),
-            format!("0:s:{}", stream.index).into(),
+            format!("{input_index}:s:{stream_index}").into(),
         ]);
         let disposition = stream
             .disposition
@@ -2360,6 +2454,20 @@ fn mux_args(
                 disposition.into()
             },
         ]);
+        if let Some(options) = external.track_metadata(stream.index, settings) {
+            for (key, value) in [
+                ("title", options.title.clone()),
+                ("handler_name", options.title),
+                ("language", options.language),
+            ] {
+                if let Some(value) = value {
+                    args.extend([
+                        format!("-metadata:s:{index}").into(),
+                        format!("{key}={value}").into(),
+                    ]);
+                }
+            }
+        }
         if stream.index == plan.video_index {
             let (sar_num, sar_den) = plan
                 .output_sar()
@@ -2407,7 +2515,7 @@ fn mux_args(
             }
         }
     }
-    if audio::converted(settings).next().is_some() {
+    if audio::converted(settings).next().is_some() || !external.is_empty() {
         args.extend(["-avoid_negative_ts".into(), "disabled".into()]);
     }
     args.extend(["-f", "matroska", "-y"].into_iter().map(OsString::from));
@@ -2557,6 +2665,7 @@ mod tests {
             &selected,
             &plan,
             &EncodeSettings::default(),
+            &super::external_tracks::ExternalTracks::default(),
         );
         let cleared: Vec<_> = args
             .windows(2)

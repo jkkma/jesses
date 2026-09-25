@@ -188,6 +188,11 @@ impl Cadence {
             self.plan.validation_hdr(self.encoded),
             self.encoded,
         )?;
+        if !self.encoded
+            && let Some(hdr) = self.plan.hdr10.as_ref()
+        {
+            hdr.require_profile5_rpu(&frame.side_data_list)?;
+        }
         if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
             let actual = StaticMetadata::parse(&frame.side_data_list)?;
             hdr.metadata.validate_present(&actual, self.encoded)?;

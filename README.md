@@ -47,6 +47,13 @@ imports and PNG/JPEG/GIF exports. The Files inspector adds cancellable thumbnail
 with display rotation and pixel aspect ratio. Quick Convert and av1an can keep
 an [encoding source selected independently](docs/source-selection-and-previews.md)
 while another file is inspected.
+Both encoding workflows can also include audio, subtitles and attachments from
+other imported files through **Tracks from other files**. External audio can be
+copied or converted with its own codec, bitrate, channel layout and gain, including
+measured loudness. Each external media track has a signed timing offset. Quick
+Convert can convert or burn external subtitles with their source fonts, including
+when trimming or using QTGMC. The chosen video source owns picture processing;
+track order, track metadata, container metadata and chapters have separate controls.
 
 [Notifications and finish actions](docs/completion-actions.md) are session-only.
 An explicitly armed close/shutdown action requires a successful queue and an
@@ -257,7 +264,9 @@ Opus uses FFmpeg's `libopus` encoder at 48 kHz. AAC uses FFmpeg's native AAC-LC
 encoder at the supported source sample rate. Use a matching FFmpeg and FFprobe
 pair from 8.1 or newer. A small synthetic preflight checks that both tools correctly
 handle AAC priming before conversion starts. Older tools remain usable for copied
-audio. Required encoders and source channel
+audio. AAC conversion with an audio start after zero requires Matroska; MP4/MOV
+cannot preserve its priming delay in this workflow and is rejected before video
+encoding. Required encoders and source channel
 layouts are checked before video encoding. MP3 requires mono or stereo. Preserve
 rejects layouts that a codec would silently reinterpret or downmix; choose an
 explicit channel conversion or another codec. Additional codecs exercise the
@@ -403,15 +412,24 @@ Static HDR mastering and content light metadata are checked in the source and
 decoded output, allowing only AV1's fixed-point precision difference. **Allow
 HDR10 fallback** is off by default. Turning it on explicitly permits discarding
 Dolby Vision enhancement data and HDR10+ dynamic metadata in favor of an HDR10
-base layer. Supported Dolby Vision input is HEVC profile 7/compatibility 6 or
-profile 8/compatibility 1; profile 5 and unrecognized profiles fail explicitly.
+base layer. Supported Dolby Vision base layers are HEVC profile 7/compatibility 6
+or profile 8/compatibility 1; profile 5 has no HDR10 base layer.
 **HDR / HLG to SDR** is an explicit option in Quick Convert, av1an and each batch
 file. It accepts tagged limited-range 10-bit 4:2:0 BT.2020 PQ or HLG, uses
-Hable or Mobius with a chosen signal peak (100–10000 nits), and produces 100-nit BT.709
-limited-range 10-bit SDR. HLG uses the 1000-nit reference display transfer.
+Hable, Mobius or Reinhard, and produces 100-nit BT.709 limited-range 10-bit SDR.
+CPU processing accepts a manual peak (100–10000 nits) or samples PQ luminance with
+headroom bounded by declared source metadata. HLG uses the 1000-nit reference display
+transfer. Standalone **Auto** tries a real Vulkan/libplacebo GPU and falls back to
+CPU when unavailable; **GPU** requires a successful hardware render probe. The GPU
+measures peaks per frame and also supports Spline. Auto substitutes Hable if Spline
+falls back to CPU, with the resolved route recorded in the job. av1an uses CPU
+processing. Omitted backend and peak options in older saved jobs retain CPU/manual
+behavior.
 Tone mapping precedes subtitles and borders and removes source HDR metadata.
 Compatible dynamic-HDR base layers require its separate opt-in; unselected
-rendering retains the existing HDR10 workflow. All source and output frame
+rendering retains the existing HDR10 workflow. Dolby Vision profile 5 has a separate
+standalone GPU route that applies its RPU; it cannot fall back to CPU or HDR10.
+All source and output frame
 checks remain. av1an quality probes and final chunks receive the same validated
 tone-map processing through either the shared filter chain or a verified prepared
 source; recovery binds the corresponding filter or decoded identity before saved

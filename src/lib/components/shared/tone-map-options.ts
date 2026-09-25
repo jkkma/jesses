@@ -2,20 +2,26 @@ import type { EncodeBackend, MediaStream, ToneMapSettings } from '$lib/ipc/gener
 
 export type ToneMapDraft = {
   enabled: boolean;
-  algorithm: NonNullable<ToneMapSettings['algorithm']>;
+  algorithm: 'hable' | 'mobius' | 'reinhard' | 'spline';
+  backend: 'auto' | 'cpu' | 'gpu';
+  peakMode: 'manual' | 'measured';
   sourcePeakNits: number | undefined;
   hdr10BaseLayer: boolean;
 };
 export const defaultToneMap = (): ToneMapDraft => ({
   enabled: false,
   algorithm: 'hable',
+  backend: 'auto',
+  peakMode: 'measured',
   sourcePeakNits: 1000,
   hdr10BaseLayer: false,
 });
 export function selectedToneMap(draft: ToneMapDraft): ToneMapSettings | undefined {
   return draft.enabled
     ? {
-        ...(draft.algorithm === 'mobius' ? { algorithm: 'mobius' as const } : {}),
+        ...(draft.algorithm !== 'hable' ? { algorithm: draft.algorithm } : {}),
+        ...(draft.backend !== 'cpu' ? { backend: draft.backend } : {}),
+        ...(draft.peakMode !== 'manual' ? { peakMode: draft.peakMode } : {}),
         sourcePeakNits: draft.sourcePeakNits!,
         hdr10BaseLayer: draft.hdr10BaseLayer,
       }
@@ -28,8 +34,20 @@ export function toneMapError(
   hdr10Fallback = false,
 ): string | null {
   if (!draft.enabled) return null;
-  if (draft.algorithm !== 'hable' && draft.algorithm !== 'mobius')
-    return 'Choose Hable or Mobius tone mapping.';
+  if (!['hable', 'mobius', 'reinhard', 'spline'].includes(draft.algorithm))
+    return 'Choose a supported tone mapping curve.';
+  if (!['auto', 'cpu', 'gpu'].includes(draft.backend))
+    return 'Choose Auto, CPU or GPU tone mapping.';
+  if (!['manual', 'measured'].includes(draft.peakMode))
+    return 'Choose manual or measured signal peak.';
+  if (backend === 'av1an' && draft.backend === 'gpu')
+    return 'av1an uses CPU tone mapping. Choose Auto or CPU.';
+  if (draft.backend === 'gpu' && draft.peakMode !== 'measured')
+    return 'GPU tone mapping requires measured peak detection.';
+  if (draft.algorithm === 'spline' && (draft.backend === 'cpu' || backend === 'av1an'))
+    return 'Spline requires standalone Auto or GPU tone mapping.';
+  if (draft.algorithm === 'spline' && draft.peakMode !== 'measured')
+    return 'Spline requires measured peak detection on Auto or GPU.';
   if (
     typeof draft.sourcePeakNits !== 'number' ||
     !Number.isInteger(draft.sourcePeakNits) ||
@@ -39,6 +57,20 @@ export function toneMapError(
     return 'Enter a signal peak from 100 to 10000 nits.';
   if (hdr10Fallback)
     return 'Turn off HDR10 output fallback and use the tone mapping base-layer option when needed.';
+  const dolbyVisionProfile = video?.dolbyVisionProfile;
+  if (dolbyVisionProfile === 5 && draft.hdr10BaseLayer)
+    return 'Dolby Vision profile 5 has no HDR10 base layer. Turn off the base-layer option.';
+  if (dolbyVisionProfile === 5 && (backend === 'av1an' || draft.backend === 'cpu'))
+    return 'Dolby Vision profile 5 requires standalone Auto or GPU rendering with a capable Vulkan/libplacebo route.';
+  if (dolbyVisionProfile === 5 && draft.peakMode !== 'measured')
+    return 'Dolby Vision profile 5 requires measured peak detection.';
+  if (dolbyVisionProfile === 5) {
+    if (!['hevc', 'h265'].includes(video?.codec ?? '') || video?.pixelFormat !== 'yuv420p10le')
+      return 'Dolby Vision profile 5 rendering requires a 10-bit 4:2:0 HEVC source.';
+    if (video?.colorRange && video.colorRange !== 'pc' && video.colorRange !== 'unknown')
+      return 'Dolby Vision profile 5 rendering requires full-range input.';
+    return null;
+  }
   if (
     !video ||
     video.colorPrimaries !== 'bt2020' ||
@@ -53,7 +85,10 @@ export function toneMapError(
   return null;
 }
 export function toneMapSummary(tone: ToneMapSettings | undefined | null): string {
-  return tone
-    ? ` · SDR BT.709 · ${tone.algorithm === 'mobius' ? 'Mobius' : 'Hable'} ${tone.sourcePeakNits} → 100 nits${tone.hdr10BaseLayer ? ' · HDR10 base layer' : ''}`
-    : '';
+  if (!tone) return '';
+  const algorithm = { hable: 'Hable', mobius: 'Mobius', reinhard: 'Reinhard', spline: 'Spline' }[
+    tone.algorithm ?? 'hable'
+  ];
+  const route = { auto: 'Auto', cpu: 'CPU', gpu: 'GPU' }[tone.backend ?? 'cpu'];
+  return ` · SDR BT.709 · ${algorithm} · ${route} · ${tone.peakMode === 'measured' ? `measured peak (fallback ${tone.sourcePeakNits} nits)` : `${tone.sourcePeakNits} → 100 nits`}${tone.hdr10BaseLayer ? ' · HDR10 base layer' : ''}`;
 }

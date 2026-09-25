@@ -681,6 +681,21 @@ pub(super) struct Timeline {
 }
 
 impl Timeline {
+    /// Apply an authored presentation offset after scanning source samples.
+    /// Sample count and continuity evidence remain exactly as scanned.
+    pub(super) fn shifted(&self, offset_seconds: f64) -> Self {
+        let mut shifted = self.clone();
+        shifted.start += offset_seconds;
+        shifted
+    }
+
+    pub(super) fn bounds(&self) -> (f64, f64) {
+        (
+            self.start,
+            self.start + self.samples as f64 / f64::from(self.rate),
+        )
+    }
+
     /// Container edit lists quantize codec delay to their source time base. This
     /// bound applies only to copying a verified stage into a different container.
     pub(super) fn verify_container(

@@ -1942,10 +1942,12 @@ test('tone mapping batch keeps per-file HDR choices and invalidates its reviewed
     algorithm: 'mobius',
     sourcePeakNits: 1200,
     hdr10BaseLayer: false,
+    backend: 'auto',
+    peakMode: 'measured',
   });
   expect(submitted.inputs[1].toneMap).toBeUndefined();
   const reviewed = page.getByRole('region', { name: 'Batch output preview' });
-  await expect(reviewed).toContainText('Mobius 1200 → 100 nits');
+  await expect(reviewed).toContainText('Mobius · Auto · measured peak (fallback 1200 nits)');
   await workspace.getByLabel('Signal peak (nits)', { exact: true }).fill('1000');
   await expect(
     reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
@@ -1957,6 +1959,8 @@ test('tone mapping batch keeps per-file HDR choices and invalidates its reviewed
     algorithm: 'mobius',
     sourcePeakNits: 1000,
     hdr10BaseLayer: false,
+    backend: 'auto',
+    peakMode: 'measured',
   });
   expect(queued[1].settings.toneMap).toBeUndefined();
 });

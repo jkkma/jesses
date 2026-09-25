@@ -39,7 +39,8 @@ pub use media_core::{
 pub use media_core::{AutoCropRequest, AutoCropResult, FramePreviewRequest, FramePreviewResult};
 pub use media_core::{
     Av1anRecovery, BorderSettings, CropSettings, EncodeBackend, EncodeRequest, EncodeSettings,
-    HdrTune, JobSnapshot, JobState, RecoveryPhase, RemuxRequest, VideoEncoder, VideoFraming,
+    EncodeTrackOverride, EncodeTrackRef, ExternalAudioSettings, ExternalTrack, HdrTune,
+    JobSnapshot, JobState, RecoveryPhase, RemuxRequest, VideoEncoder, VideoFraming,
 };
 pub use media_core::{MuxRequest, MuxSource, MuxTrack};
 pub use probe::probe_media;

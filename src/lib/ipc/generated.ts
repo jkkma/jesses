@@ -126,7 +126,7 @@ export type MediaStream = {
 /**
  * Original source stream index, independent of presentation order.
  */
-index: number, kind: string, codec: string | null, codecLongName?: string, profile?: string, bitRate?: string, durationSeconds?: number, averageFrameRate?: string, nominalFrameRate?: string, isDefault?: boolean, attachmentFilename?: string, attachmentMimeType?: string, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
+index: number, kind: string, codec: string | null, codecTag?: string, codecLongName?: string, profile?: string, bitRate?: string, durationSeconds?: number, averageFrameRate?: string, nominalFrameRate?: string, isDefault?: boolean, attachmentFilename?: string, attachmentMimeType?: string, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
 /**
  * Reported display-matrix rotation, in degrees as finite decimal text.
  */
@@ -146,7 +146,11 @@ hasHdrStaticMetadata?: boolean | null,
 /**
  * Formats reported in stream headers; absence does not rule out frame metadata.
  */
-dynamicHdrFormats?: Array<string> | null, };
+dynamicHdrFormats?: Array<string> | null,
+/**
+ * Header-declared Dolby Vision profile; runtime validates its full record.
+ */
+dolbyVisionProfile?: number, };
 
 export type MediaFile = {
 /**
@@ -286,19 +290,47 @@ export type Av1anGrainSettings = {
  */
 table: string | null, denoise: boolean, denoiseStrength: number, };
 
-export type ToneMapAlgorithm = "hable" | "mobius";
+export type ToneMapAlgorithm = "hable" | "mobius" | "reinhard" | "spline";
+
+export type ToneMapBackend = "cpu" | "auto" | "gpu";
+
+export type ToneMapPeakMode = "manual" | "measured";
 
 export type ToneMapSettings = { algorithm?: ToneMapAlgorithm,
 /**
  * Signal peak relative to the fixed 100-nit SDR target.
  */
-sourcePeakNits: number,
+sourcePeakNits: number, backend?: ToneMapBackend, peakMode?: ToneMapPeakMode,
 /**
  * Discard dynamic HDR only for the already-qualified HDR10 base-layer profiles.
  */
 hdr10BaseLayer: boolean, };
 
 export type RemuxRequest = { inputPath: string, outputPath: string, streamIndices: Array<number>, };
+
+export type ExternalTrack = { inputPath: string, streamIndex: number,
+/**
+ * Omission preserves the original track without conversion.
+ */
+audio?: ExternalAudioSettings,
+/**
+ * Per-track presentation shift; positive values delay this track.
+ */
+offsetMilliseconds?: number,
+/**
+ * Omission copies the selected subtitle without changing its format.
+ */
+subtitleMode?: SubtitleMode,
+/**
+ * None preserves each tag/disposition; empty title or language clears it.
+ */
+title?: string, language?: string, default?: boolean, forced?: boolean, };
+
+export type EncodeTrackOverride = { streamIndex: number, title?: string, language?: string, default?: boolean, forced?: boolean, };
+
+export type EncodeTrackRef = { inputPath?: string, streamIndex: number, };
+
+export type ExternalAudioSettings = { codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain, };
 
 export type MuxSource = { id: string, inputPath: string, };
 
@@ -379,7 +411,16 @@ export type EncodeCommandStage = { label: string, executable: string, arguments:
 
 export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
 
-export type EncodeSettings = { parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
+export type EncodeSettings = {
+/**
+ * Additional audio, subtitles and attachments; picture processing stays
+ * with the primary video. Metadata and chapter donors are selected below.
+ */
+externalTracks?: Array<ExternalTrack>, trackOverrides?: Array<EncodeTrackOverride>, trackOrder?: Array<EncodeTrackRef>, metadataSourcePath?: string, chaptersSourcePath?: string,
+/**
+ * A real QuickTime tmcd data stream copied only into a final MOV file.
+ */
+movTimecodeTrack?: EncodeTrackRef, parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
 /**
  * Omission preserves constant-quality encoding and old saved jobs.
  */

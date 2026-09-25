@@ -12,9 +12,111 @@ pub struct RemuxRequest {
     pub stream_indices: Vec<u32>,
 }
 
+/// A track from another source; indices are local to its input file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalTrack {
+    pub input_path: String,
+    pub stream_index: u32,
+    /// Omission preserves the original track without conversion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub audio: Option<ExternalAudioSettings>,
+    /// Per-track presentation shift; positive values delay this track.
+    #[serde(default, skip_serializing_if = "is_zero_offset")]
+    #[ts(optional, as = "Option<_>")]
+    pub offset_milliseconds: i32,
+    /// Omission copies the selected subtitle without changing its format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subtitle_mode: Option<crate::SubtitleMode>,
+    /// None preserves each tag/disposition; empty title or language clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub forced: Option<bool>,
+}
+
+/// Overrides for a selected track in the primary video source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EncodeTrackOverride {
+    pub stream_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub forced: Option<bool>,
+}
+
+/// Explicit output ordering; an omitted input path denotes the primary source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EncodeTrackRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input_path: Option<String>,
+    pub stream_index: u32,
+}
+
+/// Audio conversion for an external track. Its containing selection owns the
+/// source identity and stream index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalAudioSettings {
+    pub codec: AudioCodec,
+    #[serde(default = "default_audio_bitrate")]
+    pub bitrate_kbps: u16,
+    #[serde(default)]
+    pub channels: AudioChannels,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub gain: Option<AudioGain>,
+}
+
+fn is_zero_offset(value: &i32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeSettings {
+    /// Additional audio, subtitles and attachments; picture processing stays
+    /// with the primary video. Metadata and chapter donors are selected below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, as = "Option<_>")]
+    pub external_tracks: Vec<ExternalTrack>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, as = "Option<_>")]
+    pub track_overrides: Vec<EncodeTrackOverride>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, as = "Option<_>")]
+    pub track_order: Vec<EncodeTrackRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub metadata_source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub chapters_source_path: Option<String>,
+    /// A real QuickTime tmcd data stream copied only into a final MOV file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mov_timecode_track: Option<EncodeTrackRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<crate::EncoderParameter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +190,12 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            external_tracks: Vec::new(),
+            track_overrides: Vec::new(),
+            track_order: Vec::new(),
+            metadata_source_path: None,
+            chapters_source_path: None,
+            mov_timecode_track: None,
             temporal: None,
             parameters: Vec::new(),
             av1an_options: None,

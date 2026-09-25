@@ -815,6 +815,7 @@
                       />
                       {#if backend === 'standalone'}<ToneMapOptions
                           draft={draft.toneMap}
+                          {backend}
                           disabled={submitting || previewing}
                           error={toneMapError(
                             draft.toneMap,

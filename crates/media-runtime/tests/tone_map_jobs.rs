@@ -571,3 +571,203 @@ async fn standalone_svt_builds_receive_sdr_pixels_and_no_hdr_metadata() {
         assert!(!actual.to_string().contains("Mastering display"));
     }
 }
+
+#[tokio::test]
+#[ignore = "requires native HDR x265/x264 tools; optionally set JESSES_HDR_TEST_BUNDLE to a verified package root"]
+async fn measured_gpu_or_bundle_cpu_fallback_and_manual_reinhard_finish_sdr_jobs() {
+    let bundle = std::env::var_os("JESSES_HDR_TEST_BUNDLE");
+    if let Some(root) = &bundle {
+        media_runtime::configure_bundled_tools(PathBuf::from(root)).unwrap();
+    }
+    let fixture = Fixture::new();
+    let input = hdr_source(&fixture, "smpte2084", 24).await;
+    let original = std::fs::read(&input).unwrap();
+    let routes = if bundle.is_some() {
+        vec![("measured-auto", "auto", "measured", "hable")]
+    } else {
+        vec![
+            ("measured-auto", "auto", "measured", "hable"),
+            ("measured-spline", "gpu", "measured", "spline"),
+            ("manual-reinhard", "cpu", "manual", "reinhard"),
+        ]
+    };
+    for (name, backend, peak_mode, algorithm) in routes {
+        let destination = fixture.0.join(format!("{name}.mkv"));
+        let mut request = request(&input, &destination, VideoEncoder::X264, 4);
+        request.settings.tone_map = Some(
+            serde_json::from_value(json!({
+                "sourcePeakNits":1000,
+                "backend":backend,
+                "peakMode":peak_mode,
+                "algorithm":algorithm
+            }))
+            .unwrap(),
+        );
+        let manager = JobManager::new(fixture.0.join(format!("logs-{name}")));
+        let job = manager.start_encode(request.clone()).await.unwrap();
+        let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+        manager.shutdown().await;
+        assert_eq!(result.state, JobState::Succeeded, "{name}: {result:#?}");
+        assert_eq!(result.encode_settings.as_ref(), Some(&request.settings));
+        let logs = result.logs.join("\n");
+        if let Some(root) = &bundle {
+            let package_name = Path::new(root).file_name().unwrap().to_string_lossy();
+            assert!(
+                logs.contains(package_name.as_ref()),
+                "Bundled FFmpeg was not selected: {logs}"
+            );
+        }
+        if backend == "cpu" {
+            assert!(
+                logs.contains("CPU zscale tone mapping with Reinhard curve"),
+                "{logs}"
+            );
+        } else if bundle.is_some() {
+            assert!(logs.contains("CPU zscale tone mapping"), "{logs}");
+            assert!(logs.contains("GPU unavailable"), "{logs}");
+            assert!(
+                logs.contains("sampled"),
+                "PQ peak sampling did not complete: {logs}"
+            );
+        } else {
+            assert!(logs.contains("GPU libplacebo tone mapping"), "{logs}");
+        }
+        let document = probe(&destination, &["-show_streams", "-count_frames"]).await;
+        let video = document["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["color_transfer"], "bt709");
+        assert_eq!(video["color_primaries"], "bt709");
+        assert_eq!(video["color_space"], "bt709");
+        assert_eq!(video["color_range"], "tv");
+        assert_eq!(video["nb_read_frames"], "24");
+        assert!(!video.to_string().contains("DOVI"));
+        assert!(
+            !output(
+                command("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&destination)
+                    .args(["-map", "0:v:0", "-frames:v", "1", "-f", "md5", "-"]),
+            )
+            .await
+            .is_empty()
+        );
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "set JESSES_HDR_DV5_FIXTURE to a zero-origin profile-5 MP4 with intact RPU and DOVI configuration"]
+async fn profile5_rpu_gpu_job_renders_complete_sdr_output() {
+    let input =
+        PathBuf::from(std::env::var_os("JESSES_HDR_DV5_FIXTURE").expect("DV5 fixture path"));
+    let fixture = Fixture::new();
+    let destination = fixture.0.join("dolby-vision-sdr.mkv");
+    let original = std::fs::read(&input).unwrap();
+    let source = probe(&input, &["-show_streams", "-count_frames"]).await;
+    let input_video = &source["streams"][0];
+    assert_eq!(input_video["color_range"], "pc");
+    assert_eq!(input_video["side_data_list"][0]["dv_profile"], 5);
+    let expected_frames = input_video["nb_read_frames"].as_str().unwrap().to_owned();
+    let request: EncodeRequest = serde_json::from_value(json!({
+        "source": {
+            "inputPath": input.to_string_lossy(),
+            "outputPath": destination.to_string_lossy(),
+            "streamIndices": [0]
+        },
+        "settings": {
+            "videoStreamIndex": 0,
+            "encoder": "x264",
+            "crf": 28,
+            "preset": 4,
+            "toneMap": {
+                "sourcePeakNits": 1000,
+                "backend": "gpu",
+                "peakMode": "measured",
+                "algorithm": "hable"
+            }
+        }
+    }))
+    .unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let job = manager.start_encode(request).await.unwrap();
+    let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
+    assert!(result.logs.join("\n").contains("Dolby Vision RPU applied"));
+    let output_doc = probe(&destination, &["-show_streams", "-count_frames"]).await;
+    let video = &output_doc["streams"][0];
+    assert_eq!(video["nb_read_frames"], expected_frames);
+    assert_eq!(video["color_transfer"], "bt709");
+    assert_eq!(video["color_primaries"], "bt709");
+    assert_eq!(video["color_space"], "bt709");
+    assert_eq!(video["color_range"], "tv");
+    assert!(!video.to_string().contains("DOVI"));
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg signalstats, x265 and x264"]
+async fn measured_peak_uses_selected_video_duration_not_long_unselected_audio() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("short-hdr-video-long-audio.mkv");
+    output(
+        command("ffmpeg").args([
+            "-v", "error", "-nostdin", "-y",
+            "-f", "lavfi", "-i", "color=c=white:s=320x180:r=24:d=0.25",
+            "-f", "lavfi", "-i", "color=c=black:s=320x180:r=24:d=0.75",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=10",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p10le,setsar=1,setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc[v]",
+            "-map", "[v]", "-map", "2:a",
+            "-c:v", "libx265", "-preset", "ultrafast",
+            "-x265-params", "log-level=error:pools=2:frame-threads=2:bframes=0:chromaloc=0",
+            "-c:a", "pcm_s16le",
+            "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+            "-colorspace", "bt2020nc", "-color_range", "tv",
+            "-chroma_sample_location", "left",
+        ]).arg(&input),
+    )
+    .await;
+    let source_doc = probe(&input, &["-show_streams", "-show_format", "-count_frames"]).await;
+    assert_eq!(source_doc["streams"][0]["nb_read_frames"], "24");
+    assert_eq!(source_doc["format"]["duration"], "10.000000");
+    let original = std::fs::read(&input).unwrap();
+    let destination = fixture.0.join("measured-sdr.mkv");
+    let request: EncodeRequest = serde_json::from_value(json!({
+        "source": {
+            "inputPath": input.to_string_lossy(),
+            "outputPath": destination.to_string_lossy(),
+            "streamIndices": [0]
+        },
+        "settings": {
+            "videoStreamIndex": 0,
+            "encoder": "x264",
+            "crf": 28,
+            "preset": 4,
+            "toneMap": {
+                "sourcePeakNits": 1000,
+                "backend": "cpu",
+                "peakMode": "measured"
+            }
+        }
+    }))
+    .unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let job = manager.start_encode(request).await.unwrap();
+    let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
+    assert!(
+        result.logs.join("\n").contains("sampled 10000 nits"),
+        "Peak scan missed the bright first quarter of the selected video: {result:#?}"
+    );
+    let output_doc = probe(&destination, &["-show_streams", "-count_frames"]).await;
+    assert_eq!(output_doc["streams"][0]["nb_read_frames"], "24");
+    assert_eq!(output_doc["streams"][0]["color_transfer"], "bt709");
+    assert_eq!(output_doc["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}

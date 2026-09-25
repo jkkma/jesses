@@ -12,6 +12,7 @@ use media_core::{AppError, EncodeBackend, EncodeSettings, SubtitleMode};
 use tokio::sync::watch;
 
 use super::{
+    external_tracks::ExternalTracks,
     files::Temporary,
     metadata::{Document, Stream},
     trim,
@@ -42,6 +43,25 @@ fn target(mode: SubtitleMode) -> Option<(&'static str, &'static str)> {
         SubtitleMode::WebVtt => Some(("webvtt", "webvtt")),
         _ => None,
     }
+}
+
+/// Sub2video can emit an empty canvas and the first caption at the same
+/// microsecond. Evaluate the overlay one microsecond later so framesync consumes
+/// both updates, then restore the picture's timestamp. Keeping the main input
+/// on AVTB also prevents a subtitle clear from rounding to the next video frame.
+pub(super) fn bitmap_filter(
+    video: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    depth: u8,
+    index: u32,
+) -> String {
+    let prefix = prefix.map_or_else(String::new, |value| format!("{value},"));
+    let suffix = suffix.map_or_else(String::new, |value| format!(",{value}"));
+    format!(
+        "[{video}]{prefix}settb=AVTB,setpts=PTS+1[jesses_prepared];[jesses_prepared][1:{index}]overlay=eof_action=pass:repeatlast=0:format={},setpts=PTS-1{suffix}[jesses_video]",
+        if depth == 10 { "yuv420p10" } else { "yuv420" }
+    )
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
@@ -130,6 +150,12 @@ struct Conversion {
     derived_tags: Vec<String>,
 }
 
+struct Bitmap {
+    path: PathBuf,
+    index: u32,
+    offset_seconds: f64,
+}
+
 pub(super) struct Prepared {
     // Rust drops fields in declaration order: files disappear before directory.
     assets: Vec<Temporary>,
@@ -137,7 +163,7 @@ pub(super) struct Prepared {
     conversions: Vec<Conversion>,
     overridden: Vec<u32>,
     burned: Option<u32>,
-    bitmap: Option<u32>,
+    bitmap: Option<Bitmap>,
     text_filter: Option<String>,
 }
 
@@ -176,6 +202,7 @@ impl Prepared {
         document: &Document,
         selected: &[&Stream],
         trimmed: Option<&trim::Prepared>,
+        external: &ExternalTracks,
         ffmpeg: &Path,
         input: &Path,
         output: &Path,
@@ -206,9 +233,19 @@ impl Prepared {
                 .find(|stream| stream.index == track.stream_index)
                 .expect("validated selected subtitle");
             let codec = stream.codec_name.as_deref().unwrap_or_default();
+            let (subtitle_input, subtitle_document, source_index) =
+                external.source_track(track.stream_index).map_or(
+                    (input, document, track.stream_index),
+                    |(path, document, index)| (path, document, index),
+                );
             let Some(source_format) = format(codec) else {
                 result.burned = Some(track.stream_index);
-                result.bitmap = Some(track.stream_index);
+                result.bitmap = Some(Bitmap {
+                    path: subtitle_input.to_path_buf(),
+                    index: source_index,
+                    offset_seconds: external.offset_seconds(track.stream_index)
+                        - trimmed.map_or(0.0, |trim| trim.interval.start),
+                });
                 continue;
             };
             if result.directory.is_none() {
@@ -225,7 +262,15 @@ impl Prepared {
                 if let Some((asset, _)) = trimmed.and_then(|trim| trim.asset(track.stream_index)) {
                     trim::read_subtitles(ffmpeg, asset, 0, codec, cancel).await?
                 } else {
-                    trim::read_subtitles(ffmpeg, input, track.stream_index, codec, cancel).await?
+                    let text =
+                        trim::read_subtitles(ffmpeg, subtitle_input, source_index, codec, cancel)
+                            .await?;
+                    if external.source_track(track.stream_index).is_some() {
+                        text.shifted(external.offset_seconds(track.stream_index))?
+                            .visible()?
+                    } else {
+                        text
+                    }
                 };
             let source_path = result.write_asset(
                 &format!("source-{}", track.stream_index),
@@ -235,7 +280,7 @@ impl Prepared {
             if track.mode == SubtitleMode::BurnIn {
                 result.burned = Some(track.stream_index);
                 result
-                    .extract_fonts(document, ffmpeg, input, cancel)
+                    .extract_fonts(subtitle_document, ffmpeg, subtitle_input, cancel)
                     .await?;
                 // The process cwd is the private directory. User-controlled paths
                 // and attachment names never enter the filter language.
@@ -266,7 +311,7 @@ impl Prepared {
                     "pipe:1".into(),
                 ]
                 .into();
-                let bytes = capture(ffmpeg, args, 32 * 1024 * 1024, input, cancel).await?;
+                let bytes = capture(ffmpeg, args, 32 * 1024 * 1024, subtitle_input, cancel).await?;
                 let text = trim::Text::parse(
                     target_format,
                     std::str::from_utf8(&bytes)
@@ -335,11 +380,16 @@ impl Prepared {
                 "The source contains more than 128 font attachments.",
             ));
         }
-        let video = document
+        let sample = document
             .streams
             .iter()
             .find(|stream| stream.codec_type.as_deref() == Some("video"))
-            .ok_or_else(|| invalid("Source video is missing."))?;
+            .or_else(|| {
+                document.streams.iter().find(|stream| {
+                    matches!(stream.codec_type.as_deref(), Some("subtitle" | "audio"))
+                })
+            })
+            .ok_or_else(|| invalid("Subtitle font source has no readable media track."))?;
         let mut total = 0usize;
         for stream in fonts {
             let args = [
@@ -353,11 +403,11 @@ impl Prepared {
                 "-i".into(),
                 input.as_os_str().to_owned(),
                 "-map".into(),
-                format!("0:{}", video.index).into(),
-                "-frames:v".into(),
+                format!("0:{}", sample.index).into(),
+                "-t".into(),
                 "0".into(),
-                "-an".into(),
-                "-sn".into(),
+                "-c".into(),
+                "copy".into(),
                 "-f".into(),
                 "null".into(),
                 "-".into(),
@@ -397,8 +447,10 @@ impl Prepared {
     pub fn text_filter(&self) -> Option<&str> {
         self.text_filter.as_deref()
     }
-    pub fn bitmap_index(&self) -> Option<u32> {
+    pub fn bitmap_input(&self) -> Option<(&Path, u32, f64)> {
         self.bitmap
+            .as_ref()
+            .map(|bitmap| (bitmap.path.as_path(), bitmap.index, bitmap.offset_seconds))
     }
     pub fn decoder_cwd(&self) -> Option<&Path> {
         self.text_filter

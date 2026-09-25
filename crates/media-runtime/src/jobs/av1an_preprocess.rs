@@ -67,6 +67,7 @@ impl Prepared {
         .into_iter()
         .map(OsString::from)
         .collect();
+        args.splice(0..0, plan.tone_map_device_args());
         args.push(source.as_os_str().to_owned());
         args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
         let mut filters = processing

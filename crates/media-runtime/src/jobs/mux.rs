@@ -346,6 +346,14 @@ impl JobManager {
         let expected = expected_document(request, &inputs)?;
         let selected = expected.streams.iter().collect::<Vec<_>>();
         super::container::preflight(&output, &expected, &selected, None)?;
+        let explicit_defaults_off = request
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.default == Some(false))
+            .map(|(index, _)| index as u32)
+            .collect::<Vec<_>>();
+        super::container::preflight_explicit_defaults(&output, &selected, &explicit_defaults_off)?;
         self.change(id, |snapshot| {
             snapshot.duration_seconds = expected.selected_duration(&selected)
         })
@@ -459,7 +467,7 @@ impl JobManager {
             .await?;
         }
         let converted =
-            super::container::prepare(temporary, &output, id, cancel, None, scratch).await?;
+            super::container::prepare(temporary, &output, id, cancel, None, None, scratch).await?;
         let temporary = converted.unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
@@ -491,6 +499,41 @@ struct Packet {
     duration: Option<f64>,
     size: u64,
     hash: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PacketTimeline {
+    pub min_pts: f64,
+    pub max_end: f64,
+}
+
+fn timeline_from_packets(reader: &mut dyn Read) -> Result<Option<PacketTimeline>, String> {
+    let mut timeline: Option<PacketTimeline> = None;
+    packets(reader, |packet| {
+        let pts = packet
+            .pts
+            .ok_or("A copied packet has no presentation timestamp.")?;
+        let duration = packet
+            .duration
+            .filter(|value| *value >= 0.0)
+            .ok_or("A copied packet has no valid duration.")?;
+        let end = pts + duration;
+        if !end.is_finite() {
+            return Err("A copied packet end time is invalid.".into());
+        }
+        timeline = Some(match timeline {
+            Some(current) => PacketTimeline {
+                min_pts: current.min_pts.min(pts),
+                max_end: current.max_end.max(end),
+            },
+            None => PacketTimeline {
+                min_pts: pts,
+                max_end: end,
+            },
+        });
+        Ok(())
+    })?;
+    Ok(timeline)
 }
 
 fn timing_matches(a: Option<f64>, b: Option<f64>) -> bool {
@@ -623,6 +666,49 @@ fn packet_spec(ffprobe: &Path, input: &Path, index: u32) -> CommandSpec {
     }
 }
 
+/// Inspect one selected stream with bounded memory and an owned, cancellable
+/// FFprobe process. Stream duration headers describe spans on offset sources;
+/// only complete packet evidence establishes the copied timeline's endpoints.
+pub(super) async fn packet_timeline(
+    ffprobe: &Path,
+    input: &Path,
+    index: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<PacketTimeline>, AppError> {
+    let result = supervisor::run_streaming_stdout(
+        &packet_spec(ffprobe, input, index),
+        cancel.clone(),
+        8192,
+        Duration::from_secs(86400),
+        timeline_from_packets,
+    )
+    .await
+    .map_err(|cause| match cause {
+        supervisor::SupervisorError::Cancelled | supervisor::SupervisorError::Timeout => {
+            process_error(cause, input)
+        }
+        _ => files::error(
+            "PACKET_TIMELINE_INVALID",
+            format!(
+                "Could not establish timing for external stream {index}: {cause}. Choose a track with readable packet timestamps and durations."
+            ),
+            input,
+        ),
+    })?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(files::error(
+            "PACKET_TIMELINE_INVALID",
+            format!(
+                "FFprobe could not establish timing for external stream {index}. Choose a readable audio or subtitle track. {}",
+                String::from_utf8_lossy(&result.stderr)
+            ),
+            input,
+        ));
+    }
+    check_cancel(cancel)?;
+    Ok(result.value)
+}
+
 pub(super) async fn verify_packets(
     ffprobe: &Path,
     source: &Path,
@@ -640,6 +726,34 @@ pub(super) async fn verify_packets(
         cancel,
         false,
         false,
+        0.0,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Compare copied packets while requiring the one requested presentation shift.
+/// Payload, packet count, order, and durations stay under the same checks as an
+/// unshifted copy; only PTS and DTS receive the explicit offset.
+pub(super) async fn verify_shifted_packets(
+    ffprobe: &Path,
+    source: &Path,
+    source_index: u32,
+    output: &Path,
+    output_index: u32,
+    offset_seconds: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    compare_packets(
+        ffprobe,
+        source,
+        source_index,
+        output,
+        output_index,
+        cancel,
+        false,
+        false,
+        offset_seconds,
     )
     .await
     .map(|_| ())
@@ -663,6 +777,7 @@ pub(super) async fn verify_container_packets(
         cancel,
         true,
         allow_aac_duration_reshape,
+        0.0,
     )
     .await
 }
@@ -677,6 +792,7 @@ async fn compare_packets(
     cancel: &watch::Receiver<bool>,
     reconstruct_initial_dts: bool,
     allow_aac_duration_reshape: bool,
+    offset_seconds: f64,
 ) -> Result<Option<f64>, AppError> {
     let source_spec = packet_spec(ffprobe, source, source_index);
     let output_spec = packet_spec(ffprobe, output, output_index);
@@ -727,8 +843,12 @@ async fn compare_packets(
                 }
                 if expected.hash != actual.hash
                     || expected.size != actual.size
-                    || !timing_matches(expected.pts, actual.pts)
-                    || (!reconstructed && !timing_matches(expected.dts, actual.dts))
+                    || !timing_matches(expected.pts.map(|pts| pts + offset_seconds), actual.pts)
+                    || (!reconstructed
+                        && !timing_matches(
+                            expected.dts.map(|dts| dts + offset_seconds),
+                            actual.dts,
+                        ))
                 {
                     return Err("A copied packet's content or timing changed.".into());
                 }
@@ -872,6 +992,35 @@ mod tests {
     }
 
     #[test]
+    fn packet_timeline_uses_actual_first_pts_and_last_packet_end() {
+        let hash = format!("SHA256:{}", "a".repeat(64));
+        let rows = format!(
+            "pts_time=10.250|dts_time=10.250|duration_time=0.500|size=64|data_hash={hash}\npts_time=10.000|dts_time=10.000|duration_time=0.125|size=64|data_hash={hash}\npts_time=11.000|dts_time=11.000|duration_time=0.750|size=64|data_hash={hash}\n"
+        );
+        assert_eq!(
+            timeline_from_packets(&mut rows.as_bytes()).unwrap(),
+            Some(PacketTimeline {
+                min_pts: 10.0,
+                max_end: 11.75,
+            })
+        );
+        assert_eq!(timeline_from_packets(&mut b"".as_slice()).unwrap(), None);
+    }
+
+    #[test]
+    fn packet_timeline_rejects_missing_or_invalid_timing_evidence() {
+        let hash = format!("SHA256:{}", "a".repeat(64));
+        for row in [
+            format!("dts_time=1|duration_time=1|size=64|data_hash={hash}\n"),
+            format!("pts_time=1|size=64|data_hash={hash}\n"),
+            format!("pts_time=1|duration_time=-1|size=64|data_hash={hash}\n"),
+            format!("pts_time=1e308|duration_time=1e308|size=64|data_hash={hash}\n"),
+        ] {
+            assert!(timeline_from_packets(&mut row.as_bytes()).is_err(), "{row}");
+        }
+    }
+
+    #[test]
     fn aac_duration_reshape_requires_the_next_unchanged_decode_timestamp() {
         assert!(packet_duration_matches(
             Some(0.023),
@@ -973,6 +1122,14 @@ mod tests {
         args.extend(["-c", "copy", "-avoid_negative_ts", "disabled"].map(OsString::from));
         args.push(shifted.as_os_str().to_owned());
         run(args).await;
+        verify_shifted_packets(&ffprobe, &original, 0, &shifted, 0, 0.25, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            verify_shifted_packets(&ffprobe, &original, 0, &shifted, 0, 0.20, &cancel)
+                .await
+                .is_err()
+        );
         verify_packets(&ffprobe, &original, 0, &original, 0, &cancel)
             .await
             .unwrap();

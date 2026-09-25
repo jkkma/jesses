@@ -56,7 +56,8 @@ pub use encoder_parameters::{
 };
 pub use jobs::{
     AudioChannels, AudioCodec, AudioGain, AudioTrackSettings, Av1anRecovery, BorderSettings,
-    CropSettings, EncodeBackend, EncodeRequest, EncodeSettings, HdrTune, JobSnapshot, JobState,
+    CropSettings, EncodeBackend, EncodeRequest, EncodeSettings, EncodeTrackOverride,
+    EncodeTrackRef, ExternalAudioSettings, ExternalTrack, HdrTune, JobSnapshot, JobState,
     RecoveryPhase, RemuxRequest, StandaloneRecovery, StandaloneRecoveryPhase, VideoEncoder,
     VideoFraming, VideoRateControl, VideoTimeTrim, VideoTrim,
 };
@@ -67,7 +68,7 @@ pub use temporal::{
     DeinterlaceMode, DeinterlaceSettings, FieldOrder, FrameRate, QtgmcPreset, QtgmcSettings,
     ResizeFilter, TemporalSettings,
 };
-pub use tone_map::{ToneMapAlgorithm, ToneMapSettings};
+pub use tone_map::{ToneMapAlgorithm, ToneMapBackend, ToneMapPeakMode, ToneMapSettings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +112,9 @@ pub struct MediaStream {
     pub index: u32,
     pub kind: String,
     pub codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub codec_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub codec_long_name: Option<String>,
@@ -192,6 +196,10 @@ pub struct MediaStream {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub dynamic_hdr_formats: Option<Vec<String>>,
+    /// Header-declared Dolby Vision profile; runtime validates its full record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub dolby_vision_profile: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, thiserror::Error)]
@@ -295,8 +303,14 @@ pub fn typescript_contracts() -> String {
         Av1anOptions::decl(&config),
         Av1anGrainSettings::decl(&config),
         ToneMapAlgorithm::decl(&config),
+        ToneMapBackend::decl(&config),
+        ToneMapPeakMode::decl(&config),
         ToneMapSettings::decl(&config),
         RemuxRequest::decl(&config),
+        ExternalTrack::decl(&config),
+        EncodeTrackOverride::decl(&config),
+        EncodeTrackRef::decl(&config),
+        ExternalAudioSettings::decl(&config),
         MuxSource::decl(&config),
         MuxTrack::decl(&config),
         MuxRequest::decl(&config),

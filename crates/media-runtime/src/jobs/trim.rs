@@ -58,8 +58,11 @@ pub(super) fn validate_selection(
             Some("subtitle")
                 if !matches!(
                     stream.codec_name.as_deref(),
-                    Some("ass" | "subrip" | "webvtt")
-                ) =>
+                    Some("ass" | "subrip" | "webvtt" | "mov_text")
+                ) && !settings.subtitles.iter().any(|track| {
+                    track.stream_index == stream.index
+                        && track.mode == media_core::SubtitleMode::BurnIn
+                }) =>
             {
                 return Err(unsupported(format!(
                     "Subtitle stream #{} uses an unsupported trim format. Select ASS, SubRip or WebVTT text subtitles, or exclude this track.",
@@ -180,6 +183,7 @@ impl Interval {
                 Some("video" | "audio" | "subtitle")
             ) {
                 stream.start_time = Some("0".into());
+                stream.packet_start_time = Some(0.0);
                 stream.duration = Some(self.duration().to_string());
                 stream
                     .tags
@@ -198,6 +202,7 @@ struct Subtitle {
 }
 
 pub(super) struct Prepared {
+    pub interval: Interval,
     pub expected: Document,
     subtitles: Vec<Subtitle>,
     chapters: PathBuf,
@@ -225,6 +230,12 @@ async fn write_asset(
 }
 
 impl Prepared {
+    pub fn subtitle_indices(&self) -> Vec<u32> {
+        self.subtitles
+            .iter()
+            .map(|subtitle| subtitle.source_index)
+            .collect()
+    }
     pub(super) fn asset(&self, source_index: u32) -> Option<(&Path, &str)> {
         self.subtitles
             .iter()
@@ -236,6 +247,7 @@ impl Prepared {
         interval: Interval,
         source: &Document,
         selected: &[&Stream],
+        external: &super::external_tracks::ExternalTracks,
         ffmpeg: &Path,
         input: &Path,
         output: &Path,
@@ -245,16 +257,23 @@ impl Prepared {
     ) -> Result<Self, AppError> {
         let mut expected = interval.expected_document(source)?;
         let mut subtitles = Vec::new();
-        for stream in selected
-            .iter()
-            .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
-        {
+        for stream in selected.iter().filter(|stream| {
+            stream.codec_type.as_deref() == Some("subtitle")
+                && matches!(
+                    stream.codec_name.as_deref(),
+                    Some("ass" | "subrip" | "webvtt" | "mov_text")
+                )
+        }) {
             let codec = stream
                 .codec_name
                 .as_deref()
                 .ok_or_else(|| unsupported("Subtitle codec is missing."))?;
-            let text = subtitles::read(ffmpeg, input, stream.index, codec, cancel)
+            let (source_path, source_index) = external
+                .source_track(stream.index)
+                .map_or((input, stream.index), |(path, _, index)| (path, index));
+            let text = subtitles::read(ffmpeg, source_path, source_index, codec, cancel)
                 .await?
+                .shifted(external.offset_seconds(stream.index))?
                 .clipped(interval)?;
             let path = write_asset(
                 output,
@@ -310,6 +329,7 @@ impl Prepared {
         )
         .await?;
         Ok(Self {
+            interval,
             expected,
             subtitles,
             chapters,
@@ -322,6 +342,7 @@ impl Prepared {
         selected: &[&Stream],
         audio_filters: &BTreeMap<u32, String>,
     ) -> Result<(), AppError> {
+        let first_input = args.iter().filter(|arg| *arg == "-i").count();
         let mut inputs = Vec::<OsString>::new();
         for subtitle in &self.subtitles {
             inputs.extend([
@@ -342,15 +363,19 @@ impl Prepared {
             .position(|arg| arg == "-map")
             .expect("mapped encoder output");
         args.splice(first_map..first_map, inputs);
+        let mut output_position = 0;
         for index in 0..args.len() - 1 {
             if args[index] == "-map" {
                 if let Some(position) = self.subtitles.iter().position(|subtitle| {
-                    args[index + 1] == format!("0:{}", subtitle.source_index).as_str()
+                    selected
+                        .get(output_position)
+                        .is_some_and(|stream| stream.index == subtitle.source_index)
                 }) {
-                    args[index + 1] = format!("{}:0", position + 2).into();
+                    args[index + 1] = format!("{}:0", position + first_input).into();
                 }
+                output_position += 1;
             } else if args[index] == "-map_chapters" {
-                args[index + 1] = (2 + self.subtitles.len()).to_string().into();
+                args[index + 1] = (first_input + self.subtitles.len()).to_string().into();
             }
         }
         for (stream_index, prefix) in audio_filters {

@@ -806,6 +806,12 @@ pub(crate) async fn preview(
     let mut items = Vec::with_capacity(total);
     for (index, input) in request.inputs.clone().into_iter().enumerate() {
         let settings = EncodeSettings {
+            external_tracks: Vec::new(),
+            track_overrides: Vec::new(),
+            track_order: Vec::new(),
+            metadata_source_path: None,
+            chapters_source_path: None,
+            mov_timecode_track: None,
             temporal: input.temporal,
             parameters: request.parameters.clone(),
             av1an_options: request.av1an_options,
@@ -984,6 +990,7 @@ mod tests {
                     index: 3,
                     kind: "video".into(),
                     codec: Some("h264".into()),
+                    codec_tag: None,
                     codec_long_name: None,
                     profile: None,
                     bit_rate: None,
@@ -1014,6 +1021,7 @@ mod tests {
                     hdr_format: None,
                     has_hdr_static_metadata: None,
                     dynamic_hdr_formats: None,
+                    dolby_vision_profile: None,
                 }],
             },
         )
