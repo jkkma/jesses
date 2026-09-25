@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 type Call = { command: string; payload: Record<string, unknown> };
 async function setup(page: Page, hold = false) {
   await page.addInitScript(
@@ -225,6 +226,7 @@ test('finish action is explicit, session-only and can be canceled from its count
 }) => {
   await setup(page);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await page.getByText('When the queue finishes', { exact: true }).click();
   await page.getByLabel('Finish action', { exact: true }).selectOption('shutdown');
   await page.getByRole('button', { name: 'Apply to this queue', exact: true }).click();
@@ -267,6 +269,7 @@ test('server disarm clears the selected finish action while ordinary polling pre
 }) => {
   await setup(page);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await page.getByText('When the queue finishes', { exact: true }).click();
   const select = page.getByLabel('Finish action', { exact: true });
   await select.selectOption('shutdown');

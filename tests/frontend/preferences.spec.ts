@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type { UserPreferences, SavePreferencesRequest } from '../../src/lib/ipc/generated';
 
 async function setup(page: Page) {
@@ -142,6 +143,7 @@ test('preferences persist, recent media reopens, and new destinations use the sa
   await page.getByLabel('Recent media', { exact: true }).selectOption('C:\\media\\sample.mkv');
   await page.getByRole('button', { name: 'Open recent', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
     'C:\\exports\\sample_av1_hdr.mkv',
   );
@@ -150,6 +152,7 @@ test('preferences persist, recent media reopens, and new destinations use the sa
   await page.getByRole('button', { name: 'Save preferences', exact: true }).click();
   await expect(page.getByText('Preferences saved.', { exact: false })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
     'C:\\exports\\sample_av1_hdr.mkv',
   );
@@ -158,10 +161,11 @@ test('preferences persist, recent media reopens, and new destinations use the sa
   await expect(page.getByLabel('Default output folder', { exact: true })).toHaveValue(
     'D:\\new exports',
   );
-  await page.getByRole('button', { name: 'Files 00', exact: true }).click();
+  await page.getByRole('button', { name: 'Files 0', exact: true }).click();
   await page.getByLabel('Recent media', { exact: true }).selectOption('C:\\media\\sample.mkv');
   await page.getByRole('button', { name: 'Open recent', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
     'D:\\new exports\\sample_av1_hdr.mkv',
   );
@@ -194,7 +198,7 @@ test('import waits for explicit Apply and removes an unavailable recent only aft
   expect(await count(page, 'save_preferences')).toBe(2);
   await page.getByRole('button', { name: 'Clear recent media', exact: true }).click();
   await expect(page.getByText('Recent-media history cleared.', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Files 00', exact: true }).click();
+  await page.getByRole('button', { name: 'Files 0', exact: true }).click();
   await expect(page.getByLabel('Recent media', { exact: true })).toHaveCount(0);
 });
 
@@ -213,7 +217,7 @@ test('reopening an already loaded recent file selects it without duplicating or 
     ).toHaveAttribute('aria-pressed', 'true');
   }
   expect(await count(page, 'probe_media')).toBe(2);
-  await expect(page.getByRole('button', { name: 'Files 02', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Files 2', exact: true })).toBeVisible();
 });
 
 test('clearing recent media preserves unsaved general edits until Save', async ({ page }) => {

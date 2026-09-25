@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type { JobSnapshot, MediaFile } from '../../src/lib/ipc/generated';
 
 const savedJob = (
@@ -251,6 +252,7 @@ async function desktopMock(
 async function openJobs(page: Page) {
   await page.goto('/');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
 }
 
 test('live pause keeps cancellation and saved-progress stop available and continues in place', async ({
@@ -492,6 +494,7 @@ test('resume uses immutable saved settings despite a different editor draft and 
   await page.goto('/');
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const editor = page.getByRole('region', { name: 'av1an workspace', exact: true });
   await editor.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
   await editor.getByLabel('Quality', { exact: true }).fill('45');
@@ -508,6 +511,7 @@ test('resume uses immutable saved settings despite a different editor draft and 
   await emit(page, [{ ...original, state: 'stopped' }]);
   await page.reload();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(currentJob(page)).toContainText('Progress saved · Ready to resume');
   expect(await calls(page, 'resume_job')).toHaveLength(0);
 });
@@ -584,6 +588,7 @@ for (const command of ['stop_job', 'resume_job'] as const) {
     await expect(currentJob(page).getByRole('button', { name: action, exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
     await page.getByRole('button', { name: 'av1an', exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(currentJob(page).getByRole('alert')).toContainText(
       'Saved progress could not be read',
     );

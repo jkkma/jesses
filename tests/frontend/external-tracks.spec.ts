@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EncodeRequest, MediaFile, MediaStream } from '../../src/lib/ipc/generated';
@@ -234,6 +235,7 @@ const workspace = (page: Page, tab: 'Quick Convert' | 'av1an') =>
 
 async function choosePrimary(page: Page, tab: 'Quick Convert' | 'av1an') {
   await page.getByRole('button', { name: tab, exact: true }).click();
+  await showAllEncodeSettings(page);
   await workspace(page, tab)
     .getByLabel('Source for this encode', { exact: true })
     .selectOption(primary.id);
@@ -417,10 +419,12 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       .click();
     await page.getByRole('button', { name: `Remove ${donorOnly.name}`, exact: true }).click();
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(form.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
     await expect(layout).toContainText('Container metadata source was removed or changed');
     await importFile(page, { ...donorOnly, title: 'Updated donor' });
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(form.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
     await layout.getByLabel('Container metadata source').selectOption(donorOnly.id);
     await expect(form.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
@@ -812,6 +816,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       .click();
     await page.getByRole('button', { name: `Remove ${dubbed.name}`, exact: true }).click();
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(form.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
     await expect(form).toContainText('A selected track source was removed');
     await expect(tracks).toContainText('dub.mka · stream #2 needs to be selected again.');
@@ -820,6 +825,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       streams: [stream(2, 'audio', 'opus', 'Updated dub'), ...dubbed.streams.slice(1)],
     });
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(form.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
     await expect(tracks).toContainText('Updated dub');
     await tracks
@@ -983,6 +989,7 @@ test('Dolby Vision profile 5 requires standalone Auto/GPU rendering', async ({ p
   await quick.getByLabel('Processing route').selectOption('gpu');
   await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const av1an = workspace(page, 'av1an');
   await av1an.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await av1an.getByLabel('HDR / HLG to SDR', { exact: true }).check();

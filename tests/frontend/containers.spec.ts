@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type { BatchEncodeRequest, EncodeRequest, MediaFile } from '../../src/lib/ipc/generated';
 
 const source: MediaFile = {
@@ -142,6 +143,7 @@ async function mock(page: Page) {
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: source.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
 }
 const calls = (page: Page, command: string) =>
   page.evaluate(
@@ -177,6 +179,7 @@ test('container choice updates the destination and describes text/default behavi
   await expect(quick.locator('.output-summary')).toContainText(' · MKV');
   expect(submitted.source.outputPath).toMatch(/\.mp4$/);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const chunked = page.getByRole('region', { name: 'av1an workspace', exact: true });
   await chunked.getByLabel('Output container', { exact: true }).selectOption('mp4');
   await expect(chunked.locator('.output-summary')).toContainText(' · MP4');

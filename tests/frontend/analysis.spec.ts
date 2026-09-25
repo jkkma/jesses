@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type {
   AutoCropResult,
   BatchEncodeRequest,
@@ -201,6 +202,7 @@ async function mock(page: Page, source: MediaFile = media) {
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: source.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
 }
 const workspace = (page: Page) =>
   page.getByRole('region', { name: 'Quick Convert workspace', exact: true });

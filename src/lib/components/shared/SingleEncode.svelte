@@ -35,15 +35,7 @@
   } from '$lib/components/shared/container-options';
   import { untrack, type Snippet } from 'svelte';
   import { preferredDestination } from '$lib/preferences.svelte';
-  import {
-    ArrowRight,
-    AudioLines,
-    Clapperboard,
-    FolderOutput,
-    Info,
-    Play,
-    RotateCcw,
-  } from '@lucide/svelte';
+  import { ArrowRight, FolderOutput, Info, Play, RotateCcw } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
   import { errorMessage, formatDuration } from '$lib/components/shared/format';
@@ -199,6 +191,35 @@
   let error = $state<string | null>(null);
   let submitting = $state(false);
   let temporal = $state(defaultTemporal());
+  const settingsTabs = [
+    { id: 'video', label: 'Video' },
+    { id: 'audio', label: 'Audio & subtitles' },
+    { id: 'filters', label: 'Filters' },
+    { id: 'advanced', label: 'Advanced' },
+  ] as const;
+  type SettingsTab = (typeof settingsTabs)[number]['id'];
+  let settingsTab = $state<SettingsTab>('video');
+  let showAllSettings = $state(false);
+
+  function selectSettingsTab(tab: SettingsTab) {
+    settingsTab = tab;
+    showAllSettings = false;
+  }
+
+  function handleSettingsKey(event: KeyboardEvent, index: number) {
+    const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+    if (!offset && event.key !== 'Home' && event.key !== 'End') return;
+    event.preventDefault();
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? settingsTabs.length - 1
+          : (index + offset + settingsTabs.length) % settingsTabs.length;
+    settingsTab = settingsTabs[next].id;
+    const button = event.currentTarget as HTMLButtonElement;
+    button.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+  }
   const outputFrameRateLabel = $derived(
     temporal.changeRate
       ? temporalError(temporal, 'standalone')
@@ -344,46 +365,71 @@
   const grainConflict = $derived(
     chunked && isSvtEncoder(encoder) ? av1anGrainConflict(parameters, filmGrain, av1anGrain) : null,
   );
-  const validSettings = $derived(
-    (!chunked || isAv1anEncoder(encoder)) &&
-      validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune) &&
-      validRate(rate) &&
-      !rateIssue &&
-      (!chunked ||
-        !av1anError(
-          av1an,
-          knownHdr(selectedVideo) && !toneMap.enabled,
-          encoder,
-          destinationContainer(destination) === 'matroska',
-        )) &&
-      (!chunked ||
-        !av1anGrain ||
-        ((av1anGrain.table === null || av1anGrain.table.length > 0) &&
+  const videoSettingsIssue = $derived.by(() => {
+    if (chunked && !isAv1anEncoder(encoder)) return 'Choose an encoder supported by av1an.';
+    if (!validRate(rate)) return 'Enter a valid whole-number bitrate or target size.';
+    if (rateIssue) return rateIssue;
+    if (
+      !(chunked && av1an.targetEnabled) &&
+      rate.mode === 'quality' &&
+      !(
+        typeof crf === 'number' &&
+        Number.isFinite(crf) &&
+        (isSvtEncoder(encoder) ? Number.isInteger(crf * 4) : Number.isInteger(crf)) &&
+        crf >= options.crfMin &&
+        crf <= options.crfMax
+      )
+    )
+      return `Use ${isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF ${options.crfMin}–${options.crfMax}.`;
+    if (!Number.isInteger(preset) || !options.presets.some((choice) => choice.value === preset))
+      return 'Choose a listed encoder preset.';
+    if (
+      chunked &&
+      !(typeof workers === 'number' && Number.isInteger(workers) && workers >= 1 && workers <= 64)
+    )
+      return 'Use 1–64 parallel chunks.';
+    return null;
+  });
+  const tuningSettingsIssue = $derived.by(() => {
+    if (!validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune))
+      return 'Check encoder tuning: use lineart and texture bias 0–7 and a listed HDR tune.';
+    if (
+      isSvtEncoder(encoder) &&
+      !(
+        typeof filmGrain === 'number' &&
+        Number.isInteger(filmGrain) &&
+        filmGrain >= 0 &&
+        filmGrain <= 50
+      )
+    )
+      return 'Use film grain synthesis 0–50.';
+    if (chunked) {
+      const issue = av1anError(
+        av1an,
+        knownHdr(selectedVideo) && !toneMap.enabled,
+        encoder,
+        destinationContainer(destination) === 'matroska',
+      );
+      if (issue) return issue;
+      if (
+        av1anGrain &&
+        !(
+          (av1anGrain.table === null || av1anGrain.table.length > 0) &&
           (av1anGrain.table === null || filmGrain === 0) &&
           Number.isInteger(av1anGrain.denoiseStrength) &&
           av1anGrain.denoiseStrength >= 1 &&
-          av1anGrain.denoiseStrength <= 16)) &&
-      (!chunked || av1anFilters.length <= 16) &&
-      ((chunked && av1an.targetEnabled) ||
-        rate.mode !== 'quality' ||
-        (typeof crf === 'number' &&
-          Number.isFinite(crf) &&
-          (!isSvtEncoder(encoder) || Number.isInteger(crf * 4)) &&
-          (isSvtEncoder(encoder) || Number.isInteger(crf)) &&
-          crf >= options.crfMin &&
-          crf <= options.crfMax)) &&
-      Number.isInteger(preset) &&
-      options.presets.some((choice) => choice.value === preset) &&
-      (!isSvtEncoder(encoder) ||
-        (typeof filmGrain === 'number' &&
-          Number.isInteger(filmGrain) &&
-          filmGrain >= 0 &&
-          filmGrain <= 50)) &&
-      (backend !== 'av1an' ||
-        (typeof workers === 'number' &&
-          Number.isInteger(workers) &&
-          workers >= 1 &&
-          workers <= 64)),
+          av1anGrain.denoiseStrength <= 16
+        )
+      )
+        return 'Check the grain table and use denoise strength 1–16.';
+    }
+    return null;
+  });
+  const customFiltersIssue = $derived(
+    chunked && av1anFilters.length > 16 ? 'Use at most 16 custom pixel filters.' : null,
+  );
+  const validSettings = $derived(
+    !videoSettingsIssue && !tuningSettingsIssue && !customFiltersIssue,
   );
   const canQueue = $derived(
     !disabled &&
@@ -406,6 +452,35 @@
       !!destination.trim(),
   );
   const canStart = $derived(canQueue && !active);
+  const settingsIssues = $derived(
+    [
+      { tab: 'video' as const, message: videoSettingsIssue },
+      {
+        tab: 'filters' as const,
+        message:
+          framingResult.error ||
+          trimIssue ||
+          toneMapIssue ||
+          temporalError(temporal, backend) ||
+          customFiltersIssue,
+      },
+      {
+        tab: 'audio' as const,
+        message:
+          externalIssue ||
+          layoutIssue ||
+          timecodeIssue ||
+          subtitleIssue ||
+          (!validAudio(audio, included, file?.streams ?? [])
+            ? 'Check the audio codec, channels, and bitrate.'
+            : null),
+      },
+      {
+        tab: 'advanced' as const,
+        message: tuningSettingsIssue || grainConflict || parameterError(parameters, null, encoder),
+      },
+    ].filter((issue) => issue.message),
+  );
 
   function reset(
     source: MediaFile | undefined,
@@ -701,14 +776,11 @@
 >
   <div class="view-intro">
     <div>
-      <span class="eyebrow"
-        >{chunked ? 'Scene detection & parallel chunks' : 'Standalone encoders'}</span
-      >
       <h1>{chunked ? 'av1an' : 'Quick Convert'}</h1>
       <p>
         {chunked
-          ? 'Scene-based encoding with av1an. Choose an encoder and run parallel chunks.'
-          : 'Encode video with your selected tracks. Pick an encoder, review the output, then start the job.'}
+          ? 'Encode scenes in parallel.'
+          : 'Choose your video settings, then start encoding.'}
       </p>
     </div>
     {#if sourcePicker}
@@ -720,36 +792,55 @@
         {depthLabel}</span
       >{/if}
   </div>
-  <details class="compatibility-note">
-    <summary>Source compatibility</summary>
-    {#if encoder === 'x265' || encoder === 'vp9'}<p>
-        FFmpeg {encoder === 'x265' ? 'libx265' : 'libvpx-vp9'} encodes tagged SDR at the source's 8-bit
-        or 10-bit depth. HDR sources require explicit tone mapping to SDR. The runtime checks that FFmpeg
-        includes the selected library and pixel format before encoding.
-      </p>{/if}
-    {#if encoder === 'x264'}<p>
-        Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0 color.
-        The source's 8-bit or 10-bit depth is retained when supported by the installed x264 build.
-        HDR sources require tone mapping to SDR, and interlacing requires explicit deinterlacing.
-        Source compatibility and encoder depth support are checked before encoding.
-      </p>{:else if isSvtEncoder(encoder)}<p>
-        Supports progressive SDR and compatible HDR10 video with a constant frame rate, square
-        pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Explicit deinterlacing is
-        available when needed. Rotation is not supported. Source compatibility is checked before
-        encoding.
-      </p>{/if}
-  </details>
   {#if error}<div class="notice error-notice" role="alert">
       <Info size={16} aria-hidden="true" />
       <p>{error}</p>
     </div>{/if}
   <div class="convert-grid">
     <div class="convert-settings">
-      <section class="panel settings-panel">
+      <div class="settings-toolbar">
+        <div
+          class="settings-tabs"
+          role="tablist"
+          aria-label="Encode settings"
+          hidden={showAllSettings}
+        >
+          {#each settingsTabs as tab, index}
+            <button
+              type="button"
+              role="tab"
+              id={`${idPrefix}-tab-${tab.id}`}
+              aria-controls={`${idPrefix}-settings-${tab.id}`}
+              aria-selected={settingsTab === tab.id}
+              tabindex={settingsTab === tab.id ? 0 : -1}
+              onclick={() => selectSettingsTab(tab.id)}
+              onkeydown={(event) => handleSettingsKey(event, index)}
+            >
+              {tab.label}{#if settingsIssues.some((issue) => issue.tab === tab.id)}<span
+                  class="tab-warning"
+                  aria-hidden="true">!</span
+                >{/if}
+            </button>
+          {/each}
+        </div>
+        {#if showAllSettings}<strong>All settings</strong>{/if}
+        <button
+          type="button"
+          class="text-button settings-view"
+          aria-pressed={showAllSettings}
+          onclick={() => (showAllSettings = !showAllSettings)}
+          >{showAllSettings ? 'Use tabs' : 'Show all settings'}</button
+        >
+      </div>
+      <section
+        class="panel settings-panel settings-section"
+        id={`${idPrefix}-settings-video`}
+        role={showAllSettings ? 'region' : 'tabpanel'}
+        aria-label="Video"
+        hidden={!showAllSettings && settingsTab !== 'video'}
+      >
         <div class="section-heading">
-          <span class="heading-with-icon"
-            ><Clapperboard size={16} aria-hidden="true" /><span class="eyebrow">Video</span></span
-          >
+          <span class="eyebrow">Video settings</span>
           <button type="button" class="text-button" {disabled} onclick={() => reset(file, false)}
             ><RotateCcw size={13} aria-hidden="true" />Reset settings</button
           >
@@ -763,7 +854,6 @@
                   <option value={choice.value}>{choice.label}</option>
                 {/each}
               </select>
-              <p>Each encoder keeps its own settings and output destination for this source.</p>
             </div>
             <div class="field">
               <label for={`${idPrefix}-video-stream`}>Video stream</label>
@@ -791,16 +881,6 @@
               </p>
             </div>
           </div>
-          {#if chunked}<Av1anOptionsControl
-              {idPrefix}
-              draft={av1an}
-              {encoder}
-              {disabled}
-              attachmentSupported={destinationContainer(destination) === 'matroska'}
-              hdr={knownHdr(selectedVideo) && !toneMap.enabled}
-              framed={framingSummary(selectedFraming(framing)) !== 'Source dimensions'}
-              onchange={(value) => (av1an = value)}
-            />{/if}
           {#if !chunked}<RateControlOptions
               {idPrefix}
               draft={rate}
@@ -834,116 +914,31 @@
             >
             <p>{options.presetHelp}</p>
           </div>
-          <EncodeOptions
-            {idPrefix}
-            {disabled}
-            {backend}
-            {encoder}
-            allowBackendSelection={false}
-            bind:workers
-            bind:filmGrain
-            bind:hdr10Fallback
-            bind:lineartPsyBias
-            bind:texturePsyBias
-            bind:hdrTune
-            grainTableSelected={chunked && !!av1anGrain?.table}
-          />
-          {#if chunked && isSvtEncoder(encoder)}
-            {#key JSON.stringify([encoder, file?.id])}
-              <Av1anGrain
-                value={av1anGrain}
-                {disabled}
-                onchange={(value) => {
-                  av1anGrain = value ? { ...value } : undefined;
-                  if (value?.table) filmGrain = 0;
-                }}
-              />
-            {/key}
-          {/if}
           {#if chunked}
-            {#key JSON.stringify([encoder, file?.id])}
-              <Av1anFilters
-                value={av1anFilters}
+            <div class="field">
+              <label for={`${idPrefix}-workers`}>Parallel chunks</label>
+              <input
+                id={`${idPrefix}-workers`}
+                type="number"
+                min="1"
+                max="64"
+                step="1"
+                bind:value={workers}
                 {disabled}
-                onchange={(value) => (av1anFilters = [...value])}
               />
-            {/key}
+              <p>How many scenes to encode at once.</p>
+            </div>
           {/if}
-          {#if chunked}<Av1anResources
-              {encoder}
-              {workers}
-              sourceWidth={selectedVideo?.width}
-              sourceHeight={selectedVideo?.height}
-              outputWidth={framingResult.width}
-              outputHeight={framingResult.height}
-              filtered={framingSummary(selectedFraming(framing)) !== 'Source dimensions' ||
-                !!selectedTemporal(temporal) ||
-                toneMap.enabled ||
-                trim.enabled ||
-                av1anFilters.length > 0}
-              floatFilter={toneMap.enabled}
-              {disabled}
-              onapply={(nextWorkers, threads, slices) => {
-                workers = nextWorkers;
-                av1an = { ...av1an, encoderThreads: threads, sceneDetectionSlices: slices };
-              }}
-            />{/if}
-          <div class="video-adjustments full-width">
-            <AdvancedEncoderOptions
-              {encoder}
-              {backend}
-              value={parameters}
-              {disabled}
-              onchange={(value) => (parameters = value)}
-            />
-            {#if grainConflict}<p class="disabled-reason" role="alert">{grainConflict}</p>{/if}
-            <TemporalOptions
-              value={temporal}
-              video={selectedVideo}
-              {backend}
-              {disabled}
-              onchange={(value) => (temporal = value)}
-            />
-            <ToneMapOptions
-              draft={toneMap}
-              {backend}
-              {disabled}
-              error={toneMapIssue}
-              onchange={(next) => (toneMap = next)}
-            /><TrimOptions
-              {idPrefix}
-              draft={trim}
-              {disabled}
-              error={trimIssue}
-              onchange={(next) => (trim = next)}
-            />
-            <FramingOptions
-              {idPrefix}
-              draft={framing}
-              stream={selectedVideo}
-              {disabled}
-              onchange={(next) => (framing = next)}
-            />
-            {#if file && typeof videoIndex === 'number'}
-              <SourcePreview
-                {file}
-                videoStreamIndex={videoIndex}
-                crop={selectedFraming(framing).crop}
-                disabled={disabled || !desktop}
-                onapply={(crop) => (framing = { ...framing, crop: { ...crop } })}
-              />
-            {/if}
-          </div>
         </div>
       </section>
-      <section class="panel settings-panel">
-        <div class="section-heading">
-          <span class="heading-with-icon"
-            ><AudioLines size={16} aria-hidden="true" /><span class="eyebrow"
-              >Audio & source tracks</span
-            ></span
-          >
-        </div>
+      <section
+        class="panel settings-panel settings-section"
+        id={`${idPrefix}-settings-audio`}
+        role={showAllSettings ? 'region' : 'tabpanel'}
+        aria-label="Audio & subtitles"
+        hidden={!showAllSettings && settingsTab !== 'audio'}
+      >
+        <div class="section-heading"><span class="eyebrow">Audio & subtitles</span></div>
         <p class="copy-note">
           Choose actions for selected audio and subtitle tracks. Attachments are copied.
         </p>
@@ -1037,6 +1032,159 @@
           ontimecode={(next) => (movTimecode = next)}
         />
       </section>
+      <section
+        class="panel settings-panel settings-section"
+        id={`${idPrefix}-settings-filters`}
+        role={showAllSettings ? 'region' : 'tabpanel'}
+        aria-label="Filters"
+        hidden={!showAllSettings && settingsTab !== 'filters'}
+      >
+        <div class="section-heading"><span class="eyebrow">Filters</span></div>
+        <div class="video-adjustments filter-fields">
+          <TemporalOptions
+            value={temporal}
+            video={selectedVideo}
+            {backend}
+            {disabled}
+            onchange={(value) => (temporal = value)}
+          />
+          <ToneMapOptions
+            draft={toneMap}
+            {backend}
+            {disabled}
+            error={toneMapIssue}
+            onchange={(next) => (toneMap = next)}
+          /><TrimOptions
+            {idPrefix}
+            draft={trim}
+            {disabled}
+            error={trimIssue}
+            onchange={(next) => (trim = next)}
+          />
+          <FramingOptions
+            {idPrefix}
+            draft={framing}
+            stream={selectedVideo}
+            {disabled}
+            onchange={(next) => (framing = next)}
+          />
+          {#if file && typeof videoIndex === 'number'}
+            <SourcePreview
+              {file}
+              videoStreamIndex={videoIndex}
+              crop={selectedFraming(framing).crop}
+              disabled={disabled || !desktop}
+              onapply={(crop) => (framing = { ...framing, crop: { ...crop } })}
+            />
+          {/if}
+          {#if chunked}
+            {#key JSON.stringify([encoder, file?.id])}
+              <Av1anFilters
+                value={av1anFilters}
+                {disabled}
+                onchange={(value) => (av1anFilters = [...value])}
+              />
+            {/key}
+          {/if}
+        </div>
+      </section>
+      <section
+        class="panel settings-panel settings-section"
+        id={`${idPrefix}-settings-advanced`}
+        role={showAllSettings ? 'region' : 'tabpanel'}
+        aria-label="Advanced"
+        hidden={!showAllSettings && settingsTab !== 'advanced'}
+      >
+        <div class="section-heading"><span class="eyebrow">Advanced</span></div>
+        <div class="setting-fields">
+          <EncodeOptions
+            {idPrefix}
+            {disabled}
+            {backend}
+            {encoder}
+            allowBackendSelection={false}
+            showWorkers={false}
+            bind:workers
+            bind:filmGrain
+            bind:hdr10Fallback
+            bind:lineartPsyBias
+            bind:texturePsyBias
+            bind:hdrTune
+            grainTableSelected={chunked && !!av1anGrain?.table}
+          />
+          {#if chunked && isSvtEncoder(encoder)}
+            {#key JSON.stringify([encoder, file?.id])}
+              <Av1anGrain
+                value={av1anGrain}
+                {disabled}
+                onchange={(value) => {
+                  av1anGrain = value ? { ...value } : undefined;
+                  if (value?.table) filmGrain = 0;
+                }}
+              />
+            {/key}
+          {/if}
+          {#if chunked}<Av1anOptionsControl
+              {idPrefix}
+              draft={av1an}
+              {encoder}
+              {disabled}
+              attachmentSupported={destinationContainer(destination) === 'matroska'}
+              hdr={knownHdr(selectedVideo) && !toneMap.enabled}
+              framed={framingSummary(selectedFraming(framing)) !== 'Source dimensions'}
+              onchange={(value) => (av1an = value)}
+            />{/if}
+          {#if chunked}<Av1anResources
+              {encoder}
+              {workers}
+              sourceWidth={selectedVideo?.width}
+              sourceHeight={selectedVideo?.height}
+              outputWidth={framingResult.width}
+              outputHeight={framingResult.height}
+              filtered={framingSummary(selectedFraming(framing)) !== 'Source dimensions' ||
+                !!selectedTemporal(temporal) ||
+                toneMap.enabled ||
+                trim.enabled ||
+                av1anFilters.length > 0}
+              floatFilter={toneMap.enabled}
+              {disabled}
+              onapply={(nextWorkers, threads, slices) => {
+                workers = nextWorkers;
+                av1an = { ...av1an, encoderThreads: threads, sceneDetectionSlices: slices };
+              }}
+            />{/if}
+          <div class="video-adjustments full-width">
+            <AdvancedEncoderOptions
+              {encoder}
+              {backend}
+              value={parameters}
+              {disabled}
+              onchange={(value) => (parameters = value)}
+            />
+            {#if grainConflict}<p class="disabled-reason" role="alert">{grainConflict}</p>{/if}
+          </div>
+          <details class="compatibility-note">
+            <summary>Source compatibility</summary>
+            {#if encoder === 'x265' || encoder === 'vp9'}<p>
+                FFmpeg {encoder === 'x265' ? 'libx265' : 'libvpx-vp9'} encodes tagged SDR at the source's
+                8-bit or 10-bit depth. HDR sources require explicit tone mapping to SDR. The runtime checks
+                that FFmpeg includes the selected library and pixel format before encoding.
+              </p>{/if}
+            {#if encoder === 'x264'}<p>
+                Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0
+                color. The source's 8-bit or 10-bit depth is retained when supported by the
+                installed x264 build. HDR sources require tone mapping to SDR, and interlacing
+                requires explicit deinterlacing. Source compatibility and encoder depth support are
+                checked before encoding.
+              </p>{:else if isSvtEncoder(encoder)}<p>
+                Supports progressive SDR and compatible HDR10 video with a constant frame rate,
+                square pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Explicit
+                deinterlacing is available when needed. Rotation is not supported. Source
+                compatibility is checked before encoding.
+              </p>{/if}
+          </details>
+        </div>
+      </section>
     </div>
     <aside class="panel output-panel">
       <div class="section-heading">
@@ -1075,6 +1223,7 @@
         <ContainerOptions
           value={destinationContainer(destination)}
           onchange={(value) => (destination = containerDestination(destination, value))}
+          compactHelp={!showAllSettings}
           {disabled}
         />
         <div class="encode-actions">
@@ -1087,8 +1236,8 @@
             >Add to queue</Button
           >
         </div>
-        <div class="output-summary">
-          <Clapperboard size={15} aria-hidden="true" />
+        <details class="output-summary" open={showAllSettings}>
+          <summary>Review output settings</summary>
           <p>
             <span class="summary-label">Output settings</span>
             <strong>{depthLabel} {options.codec}</strong><span
@@ -1117,6 +1266,11 @@
                 >{subtitleSummary(selectedSubtitles(subtitles, included))}</span
               >{/if}
             {#if externalTracks.length}<span>{externalTrackSummary(externalTracks)}</span>{/if}
+            {#if trim.enabled}<span>Video interval trimmed</span>{/if}
+            {#if toneMap.enabled}<span>HDR to SDR tone mapping enabled</span>{/if}
+            {#if selectedTemporal(temporal)}<span>Frame processing enabled</span>{/if}
+            {#if av1anFilters.length}<span>{av1anFilters.length} custom pixel filters</span>{/if}
+            {#if parameters.length}<span>{parameters.length} advanced encoder parameters</span>{/if}
             {#if selectedTrackOrder(trackOrder, layoutDefaults)}<span
                 >Custom output track order</span
               >{/if}
@@ -1139,11 +1293,23 @@
                 : framingSummary(selectedFraming(framing))}</span
             >
           </p>
-        </div>
-        <CommandPlanPreview request={commandRequest} {disabled} />
-        <p class="small-muted">
-          Queue encodes with different sources or destinations. Jobs run one at a time.
-        </p>
+        </details>
+        {#if settingsIssues.length && !showAllSettings}
+          <div class="settings-issues" role="alert">
+            {#each settingsIssues as issue}
+              <p>{issue.message}</p>
+              <button type="button" class="text-button" onclick={() => selectSettingsTab(issue.tab)}
+                >Review {settingsTabs
+                  .find((tab) => tab.id === issue.tab)
+                  ?.label.toLowerCase()}</button
+              >
+            {/each}
+          </div>
+        {/if}
+        <details class="command-details" open={showAllSettings}>
+          <summary>Command preview</summary>
+          <CommandPlanPreview request={commandRequest} {disabled} />
+        </details>
         {#if !desktop}<p class="disabled-reason">Encoding requires the desktop app.</p>
         {:else if !connected}<p class="disabled-reason">Connecting to the job runtime…</p>
         {:else if !usableSource || !videos.length}<p class="disabled-reason">
@@ -1192,7 +1358,64 @@
 </section>
 
 <style>
+  .settings-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 12px;
+    min-height: 36px;
+  }
+  .settings-tabs {
+    display: flex;
+    gap: 3px;
+    flex-wrap: wrap;
+  }
+  .settings-tabs[hidden],
+  .settings-section[hidden] {
+    display: none;
+  }
+  .settings-tabs button {
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    padding: 7px 10px;
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+  .settings-tabs button:hover {
+    background: var(--secondary);
+  }
+  .settings-tabs button[aria-selected='true'] {
+    background: var(--card);
+    border-color: var(--border);
+    color: var(--foreground);
+    font-weight: 600;
+  }
+  .settings-view {
+    font-size: 11px;
+  }
+  .tab-warning,
+  .settings-issues {
+    color: var(--destructive);
+  }
+  .tab-warning {
+    margin-left: 5px;
+    font-weight: 700;
+  }
+  .settings-issues {
+    display: grid;
+    gap: 5px;
+    font-size: 11px;
+  }
+  .settings-issues button {
+    justify-self: start;
+  }
+  .filter-fields {
+    padding: 14px;
+  }
   .compatibility-note {
+    grid-column: 1 / -1;
     margin-bottom: 12px;
     color: var(--muted-foreground);
     font-size: 11px;
@@ -1289,15 +1512,20 @@
     font-weight: 700;
   }
   .output-summary {
-    align-items: flex-start;
+    display: block;
     padding: 10px 0 0;
     border-block: 0;
     border-top: 1px solid var(--rule);
   }
-  .output-summary > :global(svg) {
-    margin-top: 2px;
-    color: var(--muted-foreground);
-    flex: 0 0 auto;
+  .output-summary summary,
+  .command-details > summary {
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--foreground);
+  }
+  .output-summary p,
+  .command-details[open] > :global(section) {
+    margin-top: 8px;
   }
   .output-summary .summary-label {
     color: var(--muted-foreground);

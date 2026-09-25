@@ -328,7 +328,7 @@ test('mixed file and folder drops scan folders, retain per-entry errors, and pre
   await page.goto('/');
   await drop(page, [firstFolder, longUnicode, secondFolder, unreadable]);
 
-  await expect(page.getByRole('button', { name: 'Files 03', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Files 3', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Episode 02.mkv', exact: true })).toBeVisible();
   await expect(page.getByRole('alert')).toContainText('A protected child could not be read.');
   await expect(page.getByRole('alert')).toContainText('The dropped file could not be read.');
@@ -364,7 +364,7 @@ test('Windows spelling aliases are queued once and canonical media identity dedu
   await page.goto('/');
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
 
-  await expect(page.getByRole('button', { name: 'Files 01', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Files 1', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Remove Café 東京.mkv', exact: true })).toHaveCount(
     1,
   );
@@ -424,7 +424,7 @@ test('stopping during dropped-file classification never starts its probe after t
   expect((await calls(page, 'probe_media')).map((call) => call.payload.path)).toEqual([
     replacement,
   ]);
-  await expect(page.getByRole('button', { name: 'Files 01', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Files 1', exact: true })).toBeVisible();
 });
 
 test('a stopped slow probe cannot reorder completed paths above a newer import in recents', async ({
@@ -458,6 +458,6 @@ test('a stopped slow probe cannot reorder completed paths above a newer import i
   await expect(recentOptions).toHaveCount(3);
   await expect(recentOptions.nth(1)).toHaveText(replacement);
   await expect(recentOptions.nth(2)).toHaveText(completed);
-  await expect(page.getByRole('button', { name: 'Files 02', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Files 2', exact: true })).toBeVisible();
   await expect(page.getByText('stopped-late.mkv', { exact: true })).toHaveCount(0);
 });

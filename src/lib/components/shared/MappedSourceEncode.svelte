@@ -23,7 +23,11 @@
   >
     <div class="source-field">
       <label for={id}>Source for this encode</label>
-      <select {id} bind:value={sourceId}>
+      <select
+        {id}
+        bind:value={sourceId}
+        title="Pin a source to keep encoding it while you inspect other files."
+      >
         <option value="">Use the current media selection</option>
         {#each files as entry (entry.id)}
           <option value={entry.id}>{entry.name}</option>
@@ -31,16 +35,9 @@
         {#if missing}<option value={sourceId}>Removed source — choose a file</option>{/if}
       </select>
     </div>
-    <p>
-      {#if missing}
+    {#if missing}<p role="alert">
         The chosen source was removed. Choose an encoding source to continue.
-      {:else if sourceId}
-        Video, geometry and color use {source?.name}. Tracks, container metadata and chapters can be
-        chosen below.
-      {:else}
-        Pin a source here to keep encoding it while you inspect other files.
-      {/if}
-    </p>
+      </p>{:else if sourceId}<p>Pinned to {source?.name}.</p>{/if}
   </section>
 {/snippet}
 <SingleEncode {...props} {files} file={source} {sourcePicker} />

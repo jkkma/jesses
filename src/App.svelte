@@ -19,7 +19,6 @@
     Film,
     FlaskConical,
     FolderOpen,
-    HardDrive,
     Layers,
     LoaderCircle,
     Monitor,
@@ -28,7 +27,6 @@
     SlidersHorizontal,
     Terminal,
     Trash2,
-    Upload,
     Wrench,
     X,
   } from '@lucide/svelte';
@@ -660,43 +658,17 @@
 <div class="app-shell">
   <header class="app-header">
     <div class="brand">
-      <img src="/app-icon.png" width="36" height="36" alt="" />
+      <img src="/app-icon.png" width="30" height="30" alt="" />
       <div class="brand-wordmark">jesses</div>
-      <span class="brand-divider"></span><span class="app-description">Media workspace</span>
     </div>
-    <button
-      type="button"
-      class="environment-status"
-      onclick={() => (view = 'tools')}
-      title="View tools and environment"
-    >
-      {#if !desktop}<Monitor size={14} aria-hidden="true" /><span>Browser preview</span>
-      {:else if toolsLoading}<LoaderCircle size={14} class="spinning" aria-hidden="true" /><span
-          >Checking tools</span
-        >
-      {:else if toolsError}<CircleAlert size={14} aria-hidden="true" /><span>Tool check failed</span
-        >
-      {:else if availableTools === tools.length && tools.length > 0}<Check
-          size={14}
-          aria-hidden="true"
-        /><span>Tools available</span>
-      {:else}<CircleAlert size={14} aria-hidden="true" /><span
-          >{availableTools} / {tools.length} tools available</span
-        >{/if}
-      <ArrowRight size={12} aria-hidden="true" />
-    </button>
-  </header>
-
-  <div class="workspace-nav">
-    <nav aria-label="Workspace workflows">
+    <nav class="workspace-nav" aria-label="Workspace workflows">
       <button
         type="button"
         class:active={view === 'files'}
         aria-current={view === 'files' ? 'page' : undefined}
         title="Start here: add and inspect source media"
         onclick={() => (view = 'files')}
-        ><Files size={16} aria-hidden="true" />Files<span class="nav-count"
-          >{files.length.toString().padStart(2, '0')}</span
+        ><Files size={16} aria-hidden="true" />Files<span class="nav-count">{files.length}</span
         ></button
       >
       <button
@@ -745,8 +717,28 @@
         ><FlaskConical size={16} aria-hidden="true" />Utilities</button
       >
     </nav>
-    <span class="workspace-label">LOCAL WORKSPACE<span class="square-mark"></span></span>
-  </div>
+    <button
+      type="button"
+      class="environment-status"
+      onclick={() => (view = 'tools')}
+      title="View tools and environment"
+    >
+      {#if !desktop}<Monitor size={14} aria-hidden="true" /><span>Browser preview</span>
+      {:else if toolsLoading}<LoaderCircle size={14} class="spinning" aria-hidden="true" /><span
+          >Checking tools</span
+        >
+      {:else if toolsError}<CircleAlert size={14} aria-hidden="true" /><span>Tool check failed</span
+        >
+      {:else if availableTools === tools.length && tools.length > 0}<Check
+          size={14}
+          aria-hidden="true"
+        /><span>Tools available</span>
+      {:else}<CircleAlert size={14} aria-hidden="true" /><span
+          >{availableTools} / {tools.length} tools available</span
+        >{/if}
+      <ArrowRight size={12} aria-hidden="true" />
+    </button>
+  </header>
 
   <main>
     {#if !desktop}
@@ -774,8 +766,8 @@
           >
           <p>
             {desktop
-              ? 'Add a file or folder from Files. Your source stays unchanged while you review the workflow.'
-              : 'The browser preview cannot read local files, but the sample shows where each setting belongs.'}
+              ? 'Add a file or folder from Files.'
+              : 'Load the sample to explore the settings.'}
           </p>
         </div>
         <div class="source-required-actions">
@@ -792,21 +784,9 @@
     {#if view === 'files'}
       <section class="files-workspace" aria-label="Source files">
         <div class="files-toolbar">
-          <div>
-            <h1>
-              Source files<span class="heading-count"
-                >{files.length.toString().padStart(2, '0')}</span
-              >
-            </h1>
-            <p>Add media once, then inspect it or choose a workflow.</p>
-          </div>
+          <h1>Source files</h1>
           <div class="toolbar-actions">
-            <Button variant="outline" onclick={addFolder} disabled={!desktop || importing}
-              ><FolderOpen size={15} aria-hidden="true" />Add folder</Button
-            >
-            <Button variant="ghost" onclick={clearFiles} disabled={!files.length || importing}
-              ><Trash2 size={14} aria-hidden="true" />Clear list</Button
-            ><Button
+            <Button
               onclick={addFiles}
               disabled={!desktop || importing}
               title={!desktop
@@ -815,34 +795,42 @@
               >{#if importing}<LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading
                 files{:else}<Plus size={16} aria-hidden="true" />Add files{/if}</Button
             >
+            <Button variant="outline" onclick={addFolder} disabled={!desktop || importing}
+              ><FolderOpen size={15} aria-hidden="true" />Add folder</Button
+            >
+            <Button variant="ghost" onclick={clearFiles} disabled={!files.length || importing}
+              ><Trash2 size={14} aria-hidden="true" />Clear list</Button
+            >
           </div>
         </div>
-        <div class="folder-import-options">
+        <div class="file-options">
           <label
             ><input
               type="checkbox"
               checked={recursiveImport}
               onchange={changeRecursive}
               disabled={!desktop || importing}
+              title="Folder scans stop at 500 media files or 10,000 entries"
             /> Include subfolders</label
           >
-          <span class="small-muted">Folder scans stop at 500 media files or 10,000 entries.</span>
+          {#if preferences.loaded && preferences.value.recentPaths.length}
+            <div class="recent-media">
+              <label for="recent-media-path">Recent media</label>
+              <select id="recent-media-path" bind:value={recentSelection} disabled={importing}>
+                <option value="">Choose a file or folder</option>
+                {#each preferences.value.recentPaths as path}<option value={path}>{path}</option
+                  >{/each}
+              </select>
+              <Button
+                variant="outline"
+                onclick={openRecent}
+                disabled={importing || !recentSelection}>Open recent</Button
+              >
+            </div>
+          {/if}
           {#if importing}<Button variant="outline" onclick={stopImport}>Stop import</Button>{/if}
         </div>
         {#if importNotice}<div class="notice" role="status"><p>{importNotice}</p></div>{/if}
-        {#if preferences.loaded && preferences.value.recentPaths.length}
-          <div class="recent-media">
-            <label for="recent-media-path">Recent media</label>
-            <select id="recent-media-path" bind:value={recentSelection} disabled={importing}>
-              <option value="">Choose a file or folder</option>
-              {#each preferences.value.recentPaths as path}<option value={path}>{path}</option
-                >{/each}
-            </select>
-            <Button variant="outline" onclick={openRecent} disabled={importing || !recentSelection}
-              >Open recent</Button
-            >
-          </div>
-        {/if}
         {#if importErrors.length}
           <div class="notice error-notice import-errors" role="alert">
             <CircleAlert size={17} aria-hidden="true" />
@@ -860,6 +848,39 @@
             >
           </div>
         {/if}
+        <section class="workflow-launcher" aria-label="Choose a workflow">
+          <h2 class="sr-only">Choose a workflow</h2>
+          <div class="workflow-shortcuts">
+            <button
+              type="button"
+              onclick={() => (view = 'convert')}
+              title="Choose a format, size, and quality"
+            >
+              <SlidersHorizontal size={16} aria-hidden="true" /><span>Convert a file</span>
+            </button>
+            <button
+              type="button"
+              onclick={() => (view = 'av1an')}
+              title="Encode scenes in parallel"
+            >
+              <Clapperboard size={16} aria-hidden="true" /><span>Encode with av1an</span>
+            </button>
+            <button
+              type="button"
+              onclick={() => (view = 'batch')}
+              title="Apply one recipe to your file list"
+            >
+              <Layers size={16} aria-hidden="true" /><span>Convert multiple files</span>
+            </button>
+            <button
+              type="button"
+              onclick={() => (view = 'remux')}
+              title="Change containers without encoding"
+            >
+              <FolderOpen size={16} aria-hidden="true" /><span>Repackage streams</span>
+            </button>
+          </div>
+        </section>
         <div class="file-columns">
           <div class="source-library-column">
             <section
@@ -961,116 +982,27 @@
                 {#if importing}<div class="import-progress" role="status">
                     <LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading {importingName}…
                   </div>{/if}
-                <div class="library-bottom">
-                  <span
-                    ><Check size={13} aria-hidden="true" />{hasSample
-                      ? 'Sample ready for inspection'
-                      : 'Source metadata loaded'}</span
-                  ><button type="button" class="text-button" onclick={() => (view = 'convert')}
-                    >Review conversion defaults<ArrowRight size={13} aria-hidden="true" /></button
-                  >
-                </div>
               {:else}
                 <div class="library-empty">
                   <div class="empty-file-symbol">
-                    <FilePlus2 size={42} strokeWidth={1.05} aria-hidden="true" />
+                    <FilePlus2 size={26} strokeWidth={1.5} aria-hidden="true" />
                   </div>
-                  <h2>{importing ? 'Reading your media…' : 'Your media starts here.'}</h2>
+                  <h2>{importing ? 'Reading your media…' : 'No media yet'}</h2>
                   <p>
                     {importing
                       ? importingName
                       : desktop
-                        ? 'Drop files anywhere in this window, or choose them from your computer.'
-                        : 'Add a video or audio file to explore its format, details, and individual streams.'}
+                        ? 'Drop files here or use Add files above (Ctrl+O).'
+                        : 'Load a sample to inspect its media details.'}
                   </p>
-                  <div class="empty-actions">
-                    <Button
-                      onclick={addFiles}
-                      disabled={!desktop || importing}
-                      title={!desktop
-                        ? 'Local files require the jesses desktop app'
-                        : 'Choose media files'}
-                      >{#if importing}<LoaderCircle
-                          size={15}
-                          class="spinning"
-                          aria-hidden="true"
-                        />Reading file{:else}<FolderOpen size={15} aria-hidden="true" />Add files{/if}</Button
-                    >
-                    {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
-                        ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
-                      >{/if}
-                  </div>
-                  <span class="empty-shortcut"
-                    >{desktop ? 'or press Ctrl + O' : 'Available in the desktop app'}</span
-                  >
-                </div>
-                <div class="library-empty-footer">
-                  <span><Film size={14} aria-hidden="true" />Video</span><span
-                    ><HardDrive size={14} aria-hidden="true" />Audio</span
-                  ><span class="supported-note">Formats supported by ffprobe</span>
+                  {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
+                      ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
+                    >{/if}
                 </div>
               {/if}
             </section>
-            <section class="workflow-launcher" aria-label="Choose a workflow">
-              <div class="workflow-launcher-heading">
-                <h2>What would you like to do?</h2>
-                <span
-                  >{selectedFile
-                    ? 'Continue with your selected source'
-                    : 'Pick a workflow to get started'}</span
-                >
-              </div>
-              <div class="workflow-shortcuts">
-                <button type="button" onclick={() => (view = 'convert')}>
-                  <span class="workflow-icon"
-                    ><SlidersHorizontal size={19} aria-hidden="true" /></span
-                  >
-                  <span
-                    ><strong>Convert a file</strong><small
-                      >Choose a format, size, and quality.</small
-                    ></span
-                  >
-                  <ArrowRight size={15} aria-hidden="true" />
-                </button>
-                <button type="button" onclick={() => (view = 'av1an')}>
-                  <span class="workflow-icon"><Clapperboard size={19} aria-hidden="true" /></span>
-                  <span
-                    ><strong>Encode with av1an</strong><small>Encode scenes in parallel.</small
-                    ></span
-                  >
-                  <ArrowRight size={15} aria-hidden="true" />
-                </button>
-                <button type="button" onclick={() => (view = 'batch')}>
-                  <span class="workflow-icon"><Layers size={19} aria-hidden="true" /></span>
-                  <span
-                    ><strong>Convert multiple files</strong><small
-                      >Apply one recipe to your file list.</small
-                    ></span
-                  >
-                  <ArrowRight size={15} aria-hidden="true" />
-                </button>
-                <button type="button" onclick={() => (view = 'remux')}>
-                  <span class="workflow-icon"><FolderOpen size={19} aria-hidden="true" /></span>
-                  <span
-                    ><strong>Repackage streams</strong><small
-                      >Change containers without encoding.</small
-                    ></span
-                  >
-                  <ArrowRight size={15} aria-hidden="true" />
-                </button>
-              </div>
-            </section>
           </div>
           <FileInspector file={selectedFile} sample={selectedFile?.id === sampleId} />
-        </div>
-        <div class="workspace-hint">
-          <Upload size={13} aria-hidden="true" /><span
-            >{desktop
-              ? 'Add multiple files at once. Select a source to see its streams.'
-              : 'Try “Load sample” to explore the inspector with clearly labeled demonstration data.'}</span
-          ><span class="private-label"
-            ><HardDrive size={12} aria-hidden="true" />Local by design</span
-          >
         </div>
       </section>
     {:else if view === 'tools'}
@@ -1223,33 +1155,42 @@
 <style>
   .recent-media {
     display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
+    flex: 1 1 430px;
+    justify-content: flex-end;
+    gap: 7px;
     align-items: center;
-    margin-bottom: 16px;
+    min-width: 0;
+  }
+  .recent-media label {
+    white-space: nowrap;
+    font-size: 11px;
   }
   .recent-media select {
-    flex: 1;
-    min-width: 160px;
-    max-width: 100%;
-    padding: 8px;
+    flex: 0 1 260px;
+    min-width: 120px;
+    height: 30px;
+    padding: 0 7px;
     border: 1px solid var(--border);
+    border-radius: 5px;
     background: var(--background);
+    font-size: 11px;
   }
-  .folder-import-options {
+  .file-options {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 14px;
-    margin: 0 0 10px;
+    gap: 7px 16px;
+    min-height: 37px;
+    padding: 3px 0 7px;
   }
-  .folder-import-options label {
+  .file-options > label {
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 12px;
+    gap: 6px;
+    font-size: 11px;
+    white-space: nowrap;
   }
-  .folder-import-options input {
+  .file-options input {
     accent-color: #ad5326;
   }
   .source-required {
@@ -1281,34 +1222,12 @@
     flex-wrap: wrap;
     gap: 8px;
   }
-  .empty-actions {
-    display: flex;
-    justify-content: center;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 24px;
-  }
-  .library-empty .empty-actions :global([data-slot='button']) {
-    margin-top: 0;
-  }
-  :global(.workspace-nav nav) {
-    flex-wrap: wrap;
-  }
-  :global(.workspace-nav) {
-    min-height: 44px;
-    height: auto;
-  }
-  :global(.toolbar-actions) {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-  @media (max-width: 1000px) {
-    :global(.workspace-label) {
-      display: none;
-    }
-  }
   @media (max-width: 850px) {
     .source-required-actions {
+      flex-basis: 100%;
+    }
+    .recent-media {
+      justify-content: flex-start;
       flex-basis: 100%;
     }
   }

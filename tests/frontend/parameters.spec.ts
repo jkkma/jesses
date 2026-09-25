@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type { BatchEncodeRequest, EncodeRequest, MediaFile } from '../../src/lib/ipc/generated';
 
 const source: MediaFile = {
@@ -308,6 +309,7 @@ async function mock(page: Page, corruptPresets = false) {
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: source.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
 }
 const calls = (page: Page, command: string) =>
   page.evaluate(
@@ -356,6 +358,7 @@ test('AV1AN x264 exposes named tune and decimal pair overrides in the queued req
 }) => {
   await mock(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
@@ -390,6 +393,7 @@ test('AV1AN SVT accepts adaptive quantization and complex visual-model overrides
 }) => {
   await mock(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
   await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
   await workspace.getByLabel('Override Adaptive quantization mode', { exact: true }).check();
@@ -411,6 +415,7 @@ test('AV1AN SVT accepts adaptive quantization and complex visual-model overrides
 test('AV1AN blocks conflicting SVT grain sources before queueing', async ({ page }) => {
   await mock(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
   await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
   await workspace.getByText('Advanced encoder parameters', { exact: true }).click();

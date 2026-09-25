@@ -137,11 +137,63 @@ test('workflow shortcuts lead to source guidance and retain the selected sample'
   }
 });
 
+test('encode tabs retain edits and bring hidden invalid settings back into view', async ({
+  page,
+}) => {
+  await desktopMock(page, [fixture.path]);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const workspace = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
+  await workspace.getByLabel('Quality', { exact: true }).fill('28');
+  await workspace.getByRole('tab', { name: 'Advanced', exact: true }).click();
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('');
+  await workspace.getByRole('tab', { name: 'Video', exact: true }).click();
+  await workspace.getByRole('button', { name: 'Review advanced', exact: true }).click();
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toBeVisible();
+  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
+  await workspace.getByRole('tab', { name: 'Filters', exact: true }).click();
+  const framing = workspace.locator('.framing-options');
+  await framing.locator('summary').click();
+  await framing.getByLabel('Crop top (pixels)', { exact: true }).fill('-2');
+  await workspace.getByRole('tab', { name: 'Video', exact: true }).click();
+  await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('28');
+  await expect(
+    workspace.getByRole('button', { name: 'Review filters', exact: true }),
+  ).toBeVisible();
+  await workspace.getByRole('button', { name: 'Review filters', exact: true }).click();
+  await expect(framing.getByLabel('Crop top (pixels)', { exact: true })).toBeVisible();
+  await framing.getByLabel('Crop top (pixels)', { exact: true }).fill('0');
+  await expect(workspace.getByRole('button', { name: 'Review filters', exact: true })).toHaveCount(
+    0,
+  );
+  await workspace.getByRole('button', { name: 'Show all settings', exact: true }).click();
+  await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('28');
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
+  await expect(workspace.getByLabel('Include audio stream #3', { exact: true })).toBeVisible();
+  await workspace.getByRole('button', { name: 'Use tabs', exact: true }).click();
+  await workspace.getByRole('tab', { name: 'Advanced', exact: true }).click();
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
+  await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  const av1an = page.getByRole('region', { name: 'av1an workspace', exact: true });
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('');
+  await av1an.getByRole('tab', { name: 'Audio & subtitles', exact: true }).click();
+  await av1an.getByRole('button', { name: 'Review video', exact: true }).click();
+  await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toBeVisible();
+  await av1an.getByLabel('Parallel chunks', { exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(workspace.getByRole('tab', { name: 'Advanced', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
+});
+
 test('browser preview starts empty, identifies sample data, and keeps encoding unavailable', async ({
   page,
 }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Your media starts here.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'No media yet' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Add files', exact: true }).first()).toBeDisabled();
   await page.getByRole('button', { name: 'Load sample', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Coastal walk.mkv' })).toBeVisible();
@@ -162,7 +214,7 @@ test('browser preview starts empty, identifies sample data, and keeps encoding u
   await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Change source' }).click();
   await page.getByRole('button', { name: 'Remove Coastal walk.mkv' }).click();
-  await expect(page.getByRole('heading', { name: 'Your media starts here.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'No media yet' })).toBeVisible();
 });
 
 test('workflow pages explain the first step and keep the sample in context', async ({ page }) => {

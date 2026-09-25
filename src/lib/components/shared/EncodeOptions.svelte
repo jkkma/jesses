@@ -6,6 +6,7 @@
     idPrefix,
     disabled = false,
     allowBackendSelection = true,
+    showWorkers = true,
     backend = $bindable<EncodeBackend>('standalone'),
     encoder = 'svtAv1Hdr',
     workers = $bindable<number | undefined>(2),
@@ -19,6 +20,7 @@
     idPrefix: string;
     disabled?: boolean;
     allowBackendSelection?: boolean;
+    showWorkers?: boolean;
     backend?: EncodeBackend;
     encoder?: VideoEncoder;
     workers?: number;
@@ -55,19 +57,19 @@
       Jobs never resume automatically.
     </p>
   </div>
-  <div class="field encode-field">
-    <label for={`${idPrefix}-workers`}>Parallel chunks</label>
-    <input
-      id={`${idPrefix}-workers`}
-      type="number"
-      min="1"
-      max="64"
-      step="1"
-      bind:value={workers}
-      {disabled}
-    />
-    <p>1–64 workers · More parallel chunks use more CPU and memory.</p>
-  </div>
+  {#if showWorkers}<div class="field encode-field">
+      <label for={`${idPrefix}-workers`}>Parallel chunks</label>
+      <input
+        id={`${idPrefix}-workers`}
+        type="number"
+        min="1"
+        max="64"
+        step="1"
+        bind:value={workers}
+        {disabled}
+      />
+      <p>1–64 workers · More parallel chunks use more CPU and memory.</p>
+    </div>{/if}
 {/if}
 {#if encoder === 'svtAv1FiveFish'}
   <div class="field">

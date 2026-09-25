@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { showAllEncodeSettings } from './helpers/encode-settings';
 import type {
   AppError,
   Av1anResourceEstimate,
@@ -556,6 +557,7 @@ test('crop resize and border drafts survive source, encoder and workflow switche
   };
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
   await expect(quick.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
   await quick.getByLabel('Crop bottom (pixels)', { exact: true }).fill('8');
@@ -567,6 +569,7 @@ test('crop resize and border drafts survive source, encoder and workflow switche
     .click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const av1an = av1anWorkspace(page);
   await av1an.getByText('Crop, resize & borders', { exact: true }).click();
   await expect(av1an.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
@@ -582,6 +585,7 @@ test('crop resize and border drafts survive source, encoder and workflow switche
     borders: { top: 0, right: 0, bottom: 0, left: 8 },
   });
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('4');
   await expect(quick.getByLabel('Picture width (pixels)', { exact: true })).toHaveValue('160');
   await expect(quick.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('12');
@@ -854,6 +858,7 @@ test('SVT fork drafts stay separate between sources and workflows without guessi
     .getByLabel('Encode destination', { exact: true })
     .fill('C:\\exports\\anime-custom.mkv');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const av1an = av1anWorkspace(page);
   await expect(av1an.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1Hdr');
   await av1an.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
@@ -868,6 +873,7 @@ test('SVT fork drafts stay separate between sources and workflows without guessi
   };
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1FiveFish');
   await expect(quick.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
   await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
@@ -879,6 +885,7 @@ test('SVT fork drafts stay separate between sources and workflows without guessi
     .click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
   await expect(quick.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('7');
@@ -887,6 +894,7 @@ test('SVT fork drafts stay separate between sources and workflows without guessi
   );
   await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Texture psy bias', { exact: true })).toHaveValue('2');
 });
 
@@ -1026,6 +1034,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   };
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(encoder).toHaveValue('x264');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
   await expect(quick.getByLabel('Encode destination', { exact: true })).toHaveValue(
@@ -1040,6 +1049,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
     .click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
   await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toBeChecked();
@@ -1061,6 +1071,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
   await encoder.selectOption('svtAv1Hdr');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1anWorkspace(page).getByLabel('Video encoder', { exact: true })).toHaveValue(
     'svtAv1Hdr',
   );
@@ -1071,6 +1082,7 @@ test('x264 and SVT restore independent drafts for each source and reset only the
     .click();
   await page.locator('button.file-select').filter({ hasText: next.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await encoder.selectOption('x264');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('26');
 });
@@ -1088,6 +1100,7 @@ for (const missing of ['x264', 'svt-av1-hdr'] as const) {
       enabled: missing === 'svt-av1-hdr',
     });
     await page.getByRole('button', { name: 'av1an', exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(
       av1anWorkspace(page).getByRole('button', { name: 'Start encode', exact: true }),
     ).toBeEnabled({ enabled: missing === 'x264' });
@@ -1137,6 +1150,7 @@ test('x264 ignores an enqueue error after source replacement and keeps submissio
     path: 'C:\\media\\next.mkv',
   });
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('23');
   await expect(quick.getByLabel('Video encoder', { exact: true })).toBeDisabled();
   await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
@@ -1231,6 +1245,7 @@ async function openEncode(page: Page, tab: 'Quick Convert' | 'av1an' = 'Quick Co
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: media.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: tab, exact: true }).click();
+  await showAllEncodeSettings(page);
 }
 
 test('loudness stays read-only until explicit apply and freezes measured gain in a job', async ({
@@ -1421,6 +1436,7 @@ test('encode draft survives navigation and Reset settings restores defaults', as
   await quickWorkspace(page).getByLabel('Encode destination', { exact: true }).fill(outputPath);
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quickWorkspace(page).getByLabel('Video stream', { exact: true })).toHaveValue('4');
   await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('20');
   await expect(quickWorkspace(page).getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
@@ -1477,6 +1493,7 @@ test('invalid quality, blank output, and audio-only sources cannot start an enco
     .click();
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quickWorkspace(page).getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(
     quickWorkspace(page).getByLabel('Include audio stream #12', { exact: true }),
@@ -1558,6 +1575,7 @@ test('reconnected encode jobs distinguish source scans, encoding, and output val
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   const job = page.getByRole('region', { name: 'Current encode job' });
   const source = job.getByRole('progressbar', { name: 'Source validation progress', exact: true });
   const encode = job.getByRole('progressbar', { name: 'Encode progress', exact: true });
@@ -1613,6 +1631,7 @@ test('validation stays indeterminate when source duration is unknown and support
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   const job = page.getByRole('region', { name: 'Current encode job' });
   const progress = job.getByRole('progressbar', {
     name: 'Source validation progress',
@@ -1641,6 +1660,7 @@ test('phase estimates use observed time, age during a stall, and reset before ou
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   const job = page.getByRole('region', { name: 'Current encode job' });
   const estimate = job.getByLabel('Current phase estimate', { exact: true });
   await expect(estimate).toHaveCount(0);
@@ -1688,6 +1708,7 @@ test('unknown duration shows estimated speed alone and canceling clears it', asy
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   const job = page.getByRole('region', { name: 'Current encode job' });
   const estimate = job.getByLabel('Current phase estimate', { exact: true });
   await page.clock.runFor(5_000);
@@ -1729,6 +1750,7 @@ test('encodes can be queued for different sources while another job is running',
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: next.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
   await expect
     .poll(() => calls(page, 'enqueue_encode'))
@@ -1942,9 +1964,11 @@ test('Quick Convert validates grain and stays available without av1an installed'
   await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('50');
   await expect(start).toBeEnabled();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(start).toBeDisabled();
   await expect(av1anWorkspace(page)).toContainText('and av1an');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(start).toBeEnabled();
   await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('50');
   expect(await calls(page, 'start_encode')).toHaveLength(0);
@@ -1997,6 +2021,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   await quick.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\standalone.mkv');
 
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an).toBeVisible();
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(av1an.getByLabel('Encoder preset', { exact: true })).toHaveValue('2');
@@ -2012,6 +2037,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   await av1an.getByLabel('Encode destination', { exact: true }).fill('C:\\exports\\chunks.mkv');
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Video stream', { exact: true })).toHaveValue('4');
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('20');
   await expect(quick.getByLabel('Encoder preset', { exact: true })).toHaveValue('8');
@@ -2023,6 +2049,7 @@ test('standalone and av1an drafts stay independent across navigation and reset',
   );
   await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('27');
   await expect(av1an.getByLabel('Encoder preset', { exact: true })).toHaveValue('5');
   await expect(av1an.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('12');
@@ -2046,6 +2073,7 @@ test('each encoder restores its own source draft and resets only that source', a
   const av1an = av1anWorkspace(page);
   await quick.getByLabel('Quality', { exact: true }).fill('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await av1an.getByLabel('Quality', { exact: true }).fill('27');
   await av1an.getByLabel('Parallel chunks', { exact: true }).fill('3');
 
@@ -2067,10 +2095,12 @@ test('each encoder restores its own source draft and resets only that source', a
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
   await expect(page.getByRole('heading', { name: next.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(quick.getByLabel('Video stream', { exact: true })).toHaveValue('12');
   await quick.getByLabel('Quality', { exact: true }).fill('35');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
   await expect(av1an.getByLabel('Encode destination', { exact: true })).toHaveValue(
@@ -2082,8 +2112,10 @@ test('each encoder restores its own source draft and resets only that source', a
   await files.click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('27');
   await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
   await av1an.getByRole('button', { name: 'Reset settings', exact: true }).click();
@@ -2091,15 +2123,19 @@ test('each encoder restores its own source draft and resets only that source', a
   await files.click();
   await page.locator('button.file-select').filter({ hasText: next.name }).click();
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('33');
   await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('6');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('35');
   await files.click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Quality', { exact: true })).toHaveValue('21');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByLabel('Quality', { exact: true })).toHaveValue('30');
   await expect(av1an.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
 });
@@ -2120,6 +2156,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
   expect(started.request.settings.backend).toBe('standalone');
   expect(started.request.settings.crf).toBe(25);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1an.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   await av1an.getByLabel('Parallel chunks', { exact: true }).fill('3');
   await av1an.getByLabel('Quality', { exact: true }).fill('22');
@@ -2162,6 +2199,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
   await expect(pending).toContainText('av1an / SVT-AV1-HDR · 3 parallel chunks');
   await av1an.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await quick.getByRole('button', { name: 'Reset settings', exact: true }).click();
   await expect(current).toContainText(standaloneOutput);
   await expect(pending).toContainText(av1anOutput);
@@ -2170,6 +2208,7 @@ test('standalone and av1an submit fixed backends into one shared queue and histo
   await expect(pending).toContainText('Canceled');
   await expect(current).toContainText('Running');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(pending).toContainText('Canceled');
   await expect(current).toContainText(standaloneOutput);
   expect((await calls(page, 'start_encode'))[0].payload).toEqual(started);
@@ -2201,6 +2240,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     };
     await importAnotherSource(page, next);
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('30');
     await expect(workspace.getByLabel('Quality', { exact: true })).toBeDisabled();
     await expect(workspace.getByRole('button', { name: 'Starting…', exact: true })).toBeDisabled();
@@ -2254,6 +2294,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       };
       await importAnotherSource(page, next);
       await page.getByRole('button', { name: tab, exact: true }).click();
+      await showAllEncodeSettings(page);
       const expectedDestination = `C:\\media\\later_${tab === 'av1an' ? 'av1an' : 'av1'}_hdr.mkv`;
       await expect(workspace.getByLabel('Encode destination', { exact: true })).toHaveValue(
         expectedDestination,
@@ -2383,6 +2424,7 @@ test('audio drafts are isolated by source and video encoder and workflow with av
   await quick.getByLabel('Audio codec', { exact: true }).selectOption('aac');
   await quick.getByLabel('Audio channels', { exact: true }).selectOption('mono');
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const chunked = av1anWorkspace(page);
   await expect(chunked.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
   await chunked.getByLabel('Audio codec', { exact: true }).selectOption('opus');
@@ -2393,6 +2435,7 @@ test('audio drafts are isolated by source and video encoder and workflow with av
     { streamIndex: 3, codec: 'opus', bitrateKbps: 128, channels: 'stereo' },
   ]);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
   await expect(quick.getByLabel('Audio channels', { exact: true })).toHaveValue('mono');
   const next = {
@@ -2404,6 +2447,7 @@ test('audio drafts are isolated by source and video encoder and workflow with av
   };
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(
     quick.getByRole('group', { name: 'Audio settings for stream #3', exact: true }),
   ).toHaveCount(0);
@@ -2420,6 +2464,7 @@ test('audio drafts are isolated by source and video encoder and workflow with av
     .click();
   await page.locator('button.file-select').filter({ hasText: media.name }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
   await expect(quick.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
@@ -2468,6 +2513,7 @@ test('AV1AN audio defaults carry safe conversion choices to new sources without 
   };
   await importAnotherSource(page, next);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(workspace.getByLabel('Audio codec', { exact: true })).toHaveValue('aac');
   await expect(workspace.getByLabel('Audio bitrate', { exact: true })).toHaveValue('256');
   await expect(workspace.getByLabel('Audio channels', { exact: true })).toHaveValue('surround51');
@@ -2479,6 +2525,7 @@ test('AV1AN audio defaults carry safe conversion choices to new sources without 
     { streamIndex: 13, codec: 'aac', bitrateKbps: 256, channels: 'surround51' },
   ]);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quickWorkspace(page).getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
 });
 
@@ -2559,7 +2606,10 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     test(`${tab} queues explicit ${codec} audio settings`, async ({ page }) => {
       await desktopMock(page);
       await openEncode(page);
-      if (tab === 'av1an') await page.getByRole('button', { name: 'av1an', exact: true }).click();
+      if (tab === 'av1an') {
+        await page.getByRole('button', { name: 'av1an', exact: true }).click();
+        await showAllEncodeSettings(page);
+      }
       const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
       await workspace.getByLabel('Audio codec', { exact: true }).selectOption(codec);
       await workspace.getByLabel('Audio channels', { exact: true }).selectOption('mono');
@@ -2678,6 +2728,7 @@ for (const encoder of ['x265', 'vp9'] as const) {
       `FFmpeg ${encoder === 'x265' ? 'x265 · HEVC' : 'VP9 · VP9'} · Source bit depth`,
     );
     await page.getByRole('button', { name: 'av1an', exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(
       av1anWorkspace(page)
         .getByLabel('Video encoder', { exact: true })
@@ -2739,6 +2790,7 @@ test('frame trim validates boundaries and copied audio, restores drafts and keep
       .settings.trim,
   ).toEqual({ startFrame: 120, endFrameExclusive: 360 });
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(
     av1anWorkspace(page).getByLabel('Trim video interval', { exact: true }),
   ).not.toBeChecked();
@@ -2789,6 +2841,7 @@ test('rate control validates bitrate and target size, restores encoder drafts an
     ((await calls(page, 'enqueue_encode'))[0].payload as { request: EncodeRequest }).request,
   ).toEqual(first);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(av1anWorkspace(page).getByLabel('Rate control', { exact: true })).toHaveCount(0);
 });
 
@@ -2848,6 +2901,7 @@ test('tone mapping requires explicit HDR rendering, validates peak and retains q
       .settings.toneMap,
   ).toEqual({ sourcePeakNits: 2000, hdr10BaseLayer: true, backend: 'auto', peakMode: 'measured' });
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(
     av1anWorkspace(page).getByLabel('HDR / HLG to SDR', { exact: true }),
   ).not.toBeChecked();
@@ -2859,6 +2913,7 @@ test('av1an scene and VMAF controls validate, restore drafts and freeze queued s
   await desktopMock(page);
   await openEncode(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const workspace = av1anWorkspace(page);
   await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
@@ -2885,8 +2940,10 @@ test('av1an scene and VMAF controls validate, restore drafts and freeze queued s
   await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
   expect(request.settings.av1anOptions?.chunkMethod).toBe('ffms2');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(quickWorkspace(page).getByLabel('Source reader', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('bestsource');
 });
 
@@ -3260,6 +3317,7 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
   await desktopMock(page);
   await openEncode(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   const workspace = av1anWorkspace(page);
   await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
@@ -3308,7 +3366,9 @@ test('av1an perceptual metric direction and reader dependencies keep immutable q
   );
   expect(request.settings.av1anOptions?.targetQuality?.metric).toBe('xpsnr');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await showAllEncodeSettings(page);
   await page.getByRole('button', { name: 'av1an', exact: true }).click();
+  await showAllEncodeSettings(page);
   await expect(workspace.getByLabel('Target metric', { exact: true })).toHaveValue('ssimulacra2');
 });
 
@@ -3434,6 +3494,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
     };
     await importAnotherSource(page, next);
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     const workspace = tab === 'av1an' ? av1anWorkspace(page) : quickWorkspace(page);
     await workspace.getByText('Crop, resize & borders', { exact: true }).click();
     await expect(workspace.getByLabel('Video dimensions', { exact: true })).toContainText(
@@ -3452,6 +3513,7 @@ for (const tab of ['Quick Convert', 'av1an'] as const) {
       .click();
     await page.getByRole('button', { name: `Remove ${media.name}`, exact: true }).click();
     await page.getByRole('button', { name: tab, exact: true }).click();
+    await showAllEncodeSettings(page);
     await expect(mapping).toContainText('The chosen source was removed.');
     await expect(
       workspace.getByRole('button', { name: 'Add to queue', exact: true }),

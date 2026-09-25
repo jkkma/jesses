@@ -25,6 +25,15 @@ for (const viewport of [
       expect(start!.y).toBeGreaterThanOrEqual(0);
       expect(start!.y + start!.height).toBeLessThanOrEqual(viewport.height);
 
+      await expect(workspace.getByRole('tab', { name: 'Video', exact: true })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).not.toBeVisible();
+      await expect(
+        workspace.getByRole('tabpanel', { name: 'Audio & subtitles' }),
+      ).not.toBeVisible();
+      await workspace.getByRole('tab', { name: 'Filters', exact: true }).click();
       const framing = workspace.locator('.framing-options');
       await expect(framing).not.toHaveAttribute('open', '');
       await framing.locator('summary').focus();
@@ -33,6 +42,15 @@ for (const viewport of [
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width);
       await framing.locator('summary').click();
       await expect(framing.getByLabel('Crop top (pixels)', { exact: true })).not.toBeVisible();
+      const tabs = workspace.getByRole('tablist', { name: 'Encode settings' });
+      await tabs.getByRole('tab', { name: 'Filters', exact: true }).focus();
+      await page.keyboard.press('ArrowRight');
+      await expect(tabs.getByRole('tab', { name: 'Advanced', exact: true })).toBeFocused();
+      await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toBeVisible();
+      await page.keyboard.press('Home');
+      await expect(tabs.getByRole('tab', { name: 'Video', exact: true })).toBeFocused();
+      await expect(quality).toBeVisible();
+      await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).not.toBeVisible();
     }
 
     for (const name of ['Batch encode', 'Remux', 'Utilities']) {
