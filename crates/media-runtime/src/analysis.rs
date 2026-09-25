@@ -235,7 +235,19 @@ fn seconds(text: Option<&str>) -> Option<f64> {
     text?
         .parse::<f64>()
         .ok()
-        .filter(|n| n.is_finite() && *n > 0.0)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+fn reported_duration(stream: &Stream, format: Option<&Format>) -> Option<f64> {
+    seconds(stream.duration.as_deref())
+        .or_else(|| {
+            stream
+                .tags
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("duration"))
+                .and_then(|(_, value)| crate::probe::duration_tag_seconds(value))
+        })
+        .or_else(|| seconds(format.and_then(|format| format.duration.as_deref())))
 }
 
 async fn inspect(
@@ -259,7 +271,7 @@ async fn inspect(
     let ffmpeg = tool("ffmpeg", cancel).await?;
     let mut args: Vec<OsString> = [
         "-v", "error", "-protocol_whitelist", "file", "-show_streams", "-show_format",
-        "-show_entries", "stream=index,codec_type,width,height,duration,sample_aspect_ratio,color_transfer,color_primaries,color_space,color_range:stream_tags=rotate:stream_side_data=rotation:format=duration",
+        "-show_entries", "stream=index,codec_type,width,height,duration,sample_aspect_ratio,color_transfer,color_primaries,color_space,color_range:stream_tags:stream_side_data=side_data_type,displaymatrix,rotation:format=duration",
         "-of", "json", "-i",
     ].into_iter().map(OsString::from).collect();
     args.push(source.path.as_os_str().to_owned());
@@ -296,14 +308,7 @@ async fn inspect(
             &source.path,
         ));
     }
-    let duration = seconds(stream.duration.as_deref()).or_else(|| {
-        seconds(
-            document
-                .format
-                .as_ref()
-                .and_then(|format| format.duration.as_deref()),
-        )
-    });
+    let duration = reported_duration(&stream, document.format.as_ref());
     Ok(Input {
         source,
         stream,
@@ -363,21 +368,89 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
     (rounded(width), rounded(height))
 }
 
-/// Display thumbnails honor the source display matrix and SAR. Editing previews
-/// intentionally keep coded coordinates so a crop never targets rotated pixels.
-fn display_geometry(input: &Input) -> Result<(u32, u32, &'static str), AppError> {
-    let rotation = input
-        .stream
+fn parse_display_matrix(text: &str) -> Option<[i64; 9]> {
+    let mut matrix = [0; 9];
+    let mut rows = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (index, values) = line.trim().split_once(':')?;
+        if rows >= 3 || index.parse::<usize>().ok()? != rows {
+            return None;
+        }
+        let values = values
+            .split_whitespace()
+            .map(str::parse::<i64>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        if values.len() != 3 {
+            return None;
+        }
+        matrix[rows * 3..rows * 3 + 3].copy_from_slice(&values);
+        rows += 1;
+    }
+    (rows == 3).then_some(matrix)
+}
+
+/// Return whether the axes swap and the matching FFmpeg pixel transform.
+/// Matrix entries are 16.16, except the homogeneous 2.30 denominator.
+fn matrix_transform(matrix: [i64; 9]) -> Option<(bool, &'static str)> {
+    const ONE: i64 = 65_536;
+    const NEGATIVE_ONE: i64 = -65_536;
+    const HOMOGENEOUS: i64 = 1_073_741_824;
+    let [a, b, c, d, e, f, g, h, i] = matrix;
+    // MP4 track matrices may move the display origin after rotation. FFmpeg's
+    // autorotation applies the orthogonal pixel transform and ignores that
+    // translation for the decoded raster.
+    if (c, f, i) != (0, 0, HOMOGENEOUS) || i32::try_from(g).is_err() || i32::try_from(h).is_err() {
+        return None;
+    }
+    match (a, b, d, e) {
+        (ONE, 0, 0, ONE) => Some((false, "")),
+        (0, NEGATIVE_ONE, ONE, 0) => Some((true, "transpose=cclock,")),
+        (NEGATIVE_ONE, 0, 0, NEGATIVE_ONE) => Some((false, "hflip,vflip,")),
+        (0, ONE, NEGATIVE_ONE, 0) => Some((true, "transpose=clock,")),
+        (NEGATIVE_ONE, 0, 0, ONE) => Some((false, "hflip,")),
+        (ONE, 0, 0, NEGATIVE_ONE) => Some((false, "vflip,")),
+        (0, ONE, ONE, 0) => Some((true, "transpose=cclock_flip,")),
+        (0, NEGATIVE_ONE, NEGATIVE_ONE, 0) => Some((true, "transpose=clock_flip,")),
+        _ => None,
+    }
+}
+
+fn display_transform(stream: &Stream) -> Result<(bool, &'static str), &'static str> {
+    let matrices = stream
+        .side_data_list
+        .iter()
+        .filter(|side_data| {
+            side_data.get("displaymatrix").is_some()
+                || side_data.get("side_data_type").and_then(|v| v.as_str())
+                    == Some("Display Matrix")
+        })
+        .collect::<Vec<_>>();
+    if !matrices.is_empty() {
+        if matrices.len() != 1 {
+            return Err("The source has ambiguous display matrices.");
+        }
+        let matrix = matrices[0]
+            .get("displaymatrix")
+            .and_then(|value| value.as_str())
+            .and_then(parse_display_matrix)
+            .ok_or("The source display matrix is malformed.")?;
+        return matrix_transform(matrix)
+            .ok_or("The source display matrix is not a supported rotation or reflection.");
+    }
+
+    // Older containers may expose only a rotation tag. Do not use this summary
+    // when the full matrix is present: a reflected matrix can report a misleading angle.
+    let rotation = stream
         .side_data_list
         .iter()
         .filter_map(|v| v.get("rotation"))
         .find_map(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
         .or_else(|| {
-            input
-                .stream
+            stream
                 .tags
                 .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("rotate"))?
+                .find(|(key, _)| key.eq_ignore_ascii_case("rotate"))?
                 .1
                 .parse()
                 .ok()
@@ -386,12 +459,26 @@ fn display_geometry(input: &Input) -> Result<(u32, u32, &'static str), AppError>
     let angle = rotation.rem_euclid(360.0);
     let quarter = (angle / 90.0).round();
     if !angle.is_finite() || (angle - quarter * 90.0).abs() > 0.01 {
-        return Err(error(
-            "ANALYSIS_INPUT_UNSUPPORTED",
-            "Display previews support rotations in 90-degree steps. Use the coded source preview for other display matrices.",
-            &input.source.path,
-        ));
+        return Err("Display previews support rotations in 90-degree steps.");
     }
+    Ok(match quarter as u32 % 4 {
+        1 => (true, "transpose=cclock,"),
+        2 => (false, "hflip,vflip,"),
+        3 => (true, "transpose=clock,"),
+        _ => (false, ""),
+    })
+}
+
+/// Display thumbnails honor the source display matrix and SAR. Editing previews
+/// intentionally keep coded coordinates so a crop never targets rotated pixels.
+fn display_geometry(input: &Input) -> Result<(u32, u32, &'static str), AppError> {
+    let (swaps_axes, transform) = display_transform(&input.stream).map_err(|message| {
+        error(
+            "ANALYSIS_INPUT_UNSUPPORTED",
+            format!("{message} Use the coded source preview for this video."),
+            &input.source.path,
+        )
+    })?;
     let sar = match input.stream.sample_aspect_ratio.as_deref() {
         None | Some("N/A" | "0:1") => 1.0,
         Some(value) => value
@@ -407,14 +494,13 @@ fn display_geometry(input: &Input) -> Result<(u32, u32, &'static str), AppError>
             })?,
     };
     let width = (f64::from(input.width) * sar).round().max(2.0) as u32;
-    let (width, height, rotation_filter) = match quarter as u32 % 4 {
-        1 => (input.height, width, "transpose=cclock,"),
-        2 => (width, input.height, "hflip,vflip,"),
-        3 => (input.height, width, "transpose=clock,"),
-        _ => (width, input.height, ""),
+    let (width, height) = if swaps_axes {
+        (input.height, width)
+    } else {
+        (width, input.height)
     };
     let (width, height) = preview_size(width, height);
-    Ok((width, height, rotation_filter))
+    Ok((width, height, transform))
 }
 
 fn preview_filter(input: &Input, width: u32, height: u32) -> Result<(String, bool), AppError> {
@@ -683,6 +769,88 @@ pub async fn detect_crop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_stream_duration_precedes_container_and_zero_precedes_tag() {
+        let mut stream: Stream = serde_json::from_value(serde_json::json!({
+            "index": 1,
+            "duration": "0",
+            "tags": {"DuRaTiOn": "00:00:01.000000000"},
+        }))
+        .unwrap();
+        let format = Format {
+            duration: Some("3.0".into()),
+        };
+        assert_eq!(reported_duration(&stream, Some(&format)), Some(0.0));
+        stream.duration = None;
+        assert_eq!(reported_duration(&stream, Some(&format)), Some(1.0));
+        stream.tags.clear();
+        assert_eq!(reported_duration(&stream, Some(&format)), Some(3.0));
+        stream.duration = Some("NaN".into());
+        assert_eq!(reported_duration(&stream, Some(&format)), Some(3.0));
+    }
+
+    #[test]
+    fn all_orthogonal_display_matrices_select_the_matching_pixel_transform() {
+        const U: i64 = 65_536;
+        let cases = [
+            ((U, 0, 0, U), (false, "")),
+            ((0, -U, U, 0), (true, "transpose=cclock,")),
+            ((-U, 0, 0, -U), (false, "hflip,vflip,")),
+            ((0, U, -U, 0), (true, "transpose=clock,")),
+            ((-U, 0, 0, U), (false, "hflip,")),
+            ((U, 0, 0, -U), (false, "vflip,")),
+            ((0, U, U, 0), (true, "transpose=cclock_flip,")),
+            ((0, -U, -U, 0), (true, "transpose=clock_flip,")),
+        ];
+        for ((a, b, d, e), expected) in cases {
+            assert_eq!(
+                matrix_transform([a, b, 0, d, e, 0, 0, 0, 1_073_741_824]),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            matrix_transform([0, -U, 0, U, 0, 0, 160 * U, -96 * U, 1_073_741_824]),
+            Some((true, "transpose=cclock,"))
+        );
+    }
+
+    #[test]
+    fn full_matrix_overrides_rotation_summary_and_rejects_malformed_or_sheared_values() {
+        let matrix = "\n00000000: -65536 0 0\n00000001: 0 65536 0\n00000002: 0 0 1073741824\n";
+        let stream: Stream = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "side_data_list": [{
+                "side_data_type": "Display Matrix",
+                "displaymatrix": matrix,
+                "rotation": -180,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(display_transform(&stream), Ok((false, "hflip,")));
+        assert_eq!(parse_display_matrix(matrix).unwrap()[0], -65_536);
+        for invalid in [
+            "",
+            "00000000: 65536 0 0\n00000001: 0 65536 0",
+            "00000000: 65536 0 0\n00000001: 0 65536 0\n00000002: 0 0 bad",
+            "00000000: 65536 0 0\n00000001: 0 65536 0\n00000002: 0 0 1073741824\n00000003: 0 0 0",
+        ] {
+            assert!(parse_display_matrix(invalid).is_none(), "{invalid:?}");
+        }
+        for invalid in [
+            [65_536, 12, 0, 0, 65_536, 0, 0, 0, 1_073_741_824],
+            [65_536, 0, 1, 0, 65_536, 0, 0, 0, 1_073_741_824],
+            [65_536, 0, 0, 0, 65_536, 0, 0, 0, 0],
+        ] {
+            assert!(matrix_transform(invalid).is_none());
+        }
+        let malformed: Stream = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "side_data_list": [{"side_data_type": "Display Matrix", "rotation": 0}],
+        }))
+        .unwrap();
+        assert!(display_transform(&malformed).is_err());
+    }
 
     #[test]
     fn changing_picture_positions_keep_the_union_not_only_the_largest_area() {

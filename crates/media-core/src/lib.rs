@@ -91,16 +91,53 @@ pub struct MediaFile {
     pub size_bytes: String,
     pub duration_seconds: Option<f64>,
     pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub language: Option<String>,
+    /// Reported bits per second, kept as decimal text without JS rounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub bit_rate: Option<String>,
     pub streams: Vec<MediaStream>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaStream {
     /// Original source stream index, independent of presentation order.
     pub index: u32,
     pub kind: String,
     pub codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub codec_long_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub bit_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub average_frame_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub nominal_frame_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachment_filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachment_mime_type: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,6 +363,9 @@ mod tests {
             size_bytes: "9007199254740993".into(),
             duration_seconds: None,
             format: None,
+            title: None,
+            language: None,
+            bit_rate: None,
             streams: vec![],
         })
         .unwrap();

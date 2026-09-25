@@ -16,6 +16,11 @@ export function formatBytes(bytes: string): string {
   return `${(value / 1024 ** power).toLocaleString(undefined, { maximumFractionDigits: power < 2 ? 0 : 2 })} ${units[power]}`;
 }
 
+/** Keep FFprobe's decimal text exact; large bit rates can exceed Number's integer precision. */
+export function formatBitRate(bitsPerSecond: string | null | undefined): string {
+  return bitsPerSecond?.trim() ? `${bitsPerSecond} bit/s` : 'Not reported';
+}
+
 export function displayCodec(codec: string | null): string {
   return codec ? codec.toUpperCase() : 'Unknown';
 }

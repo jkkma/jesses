@@ -9,6 +9,7 @@
     MediaFile,
   } from '$lib/ipc/generated';
   import { errorMessage } from './format';
+  import { previewMaximum } from './preview-position';
 
   let {
     file,
@@ -26,15 +27,7 @@
 
   const id = $props.id();
   const stream = $derived(file.streams.find((item) => item.index === videoStreamIndex));
-  const frameDuration = $derived.by(() => {
-    const [numerator, denominator] = (stream?.frameRate ?? '').split('/').map(Number);
-    return numerator > 0 && denominator > 0 ? denominator / numerator : 0.05;
-  });
-  const maximum = $derived(
-    file.durationSeconds === null
-      ? 86400
-      : Math.max(0, Math.min(86400, file.durationSeconds - frameDuration)),
-  );
+  const maximum = $derived(previewMaximum(file.durationSeconds, stream));
   let expanded = $state(false);
   let position = $state(0);
   let preview = $state<FramePreviewResult | null>(null);
@@ -49,6 +42,7 @@
   let previewGeneration = 0;
   let cropGeneration = 0;
   let activeSource = '';
+  let activeFile: MediaFile | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const shownCrop = $derived(proposal?.crop ?? crop);
@@ -62,22 +56,29 @@
     !!preview && !!proposal && preview.sourceFingerprint === proposal.sourceFingerprint,
   );
 
-  function cancel() {
+  function stopPreview() {
     clearTimeout(timer);
     ++previewGeneration;
-    ++cropGeneration;
     previewAbort?.abort();
-    cropAbort?.abort();
     previewAbort = null;
-    cropAbort = null;
     loading = false;
+  }
+
+  function cancel() {
+    stopPreview();
+    ++cropGeneration;
+    cropAbort?.abort();
+    cropAbort = null;
     detecting = false;
+    if (!preview) proposal = null;
   }
 
   $effect(() => {
-    const source = `${file.path}\0${videoStreamIndex}`;
+    const currentFile = file;
+    const source = `${currentFile.path}\0${videoStreamIndex}`;
     untrack(() => {
-      if (activeSource === source) return;
+      if (activeSource === source && activeFile === currentFile) return;
+      activeFile = currentFile;
       activeSource = source;
       cancel();
       position = 0;
@@ -96,13 +97,14 @@
   onDestroy(cancel);
 
   async function loadPreview() {
-    clearTimeout(timer);
+    stopPreview();
     if (disabled || !expanded) return;
+    preview = null;
     if (!Number.isFinite(position) || position < 0 || position > maximum) {
       previewError = 'Choose a position within this source.';
+      proposal = null;
       return;
     }
-    previewAbort?.abort();
     const controller = new AbortController();
     previewAbort = controller;
     const generation = ++previewGeneration;
@@ -120,21 +122,29 @@
         cropError = 'The source changed since detection. Detect the crop again for this image.';
       }
     } catch (cause) {
-      if (!controller.signal.aborted && source === activeSource && generation === previewGeneration)
+      if (
+        !controller.signal.aborted &&
+        source === activeSource &&
+        generation === previewGeneration
+      ) {
         previewError = errorMessage(cause);
+        proposal = null;
+      }
     } finally {
       if (generation === previewGeneration) loading = false;
     }
   }
 
   function seek(input: HTMLInputElement) {
+    stopPreview();
     position = input.valueAsNumber;
-    clearTimeout(timer);
-    // Cancel immediately; waiting for the debounce must not publish an older
-    // seek result under the newly selected position.
-    previewAbort?.abort();
-    ++previewGeneration;
-    loading = false;
+    preview = null;
+    previewError = '';
+    if (!Number.isFinite(position) || position < 0 || position > maximum) {
+      previewError = 'Choose a position within this source.';
+      proposal = null;
+      return;
+    }
     timer = setTimeout(() => void loadPreview(), 180);
   }
 
@@ -235,7 +245,7 @@
             step="0.01"
             value={position}
             {disabled}
-            onchange={(event) => seek(event.currentTarget)}
+            oninput={(event) => seek(event.currentTarget)}
           />
         </div>
         <Button variant="outline" onclick={loadPreview} {disabled}>

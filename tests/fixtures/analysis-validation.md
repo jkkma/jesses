@@ -1,5 +1,10 @@
 # Source preview and automatic crop validation
 
+The later [metadata and display preview checks](metadata-preview-validation.md)
+extend inspector thumbnails to orthogonal rotations, reflections and pixel aspect
+ratio, and fix selected-stream duration and failed-refresh invalidation. The
+original qualification below describes the earlier source-preview slice.
+
 Native Windows interaction was additionally exercised on 2026-09-13 with the
 interim portable development build. A two-video source showed the correct red
 and blue original streams, updated after seeking, proposed exact known borders,

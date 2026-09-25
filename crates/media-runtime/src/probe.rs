@@ -20,6 +20,8 @@ struct ProbeDocument {
 struct ProbeFormat {
     format_name: Option<String>,
     duration: Option<Value>,
+    bit_rate: Option<Value>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +29,10 @@ struct ProbeStream {
     index: u32,
     codec_type: Option<String>,
     codec_name: Option<String>,
+    codec_long_name: Option<String>,
+    profile: Option<String>,
+    bit_rate: Option<Value>,
+    disposition: Option<Value>,
     width: Option<u32>,
     height: Option<u32>,
     sample_aspect_ratio: Option<String>,
@@ -72,6 +78,33 @@ fn sample_rate(value: Option<&Value>) -> Option<u32> {
         _ => None,
     }?;
     u32::try_from(number).ok().filter(|number| *number > 0)
+}
+
+fn decimal_rate(value: Option<&Value>) -> Option<String> {
+    let rate = match value? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(number) => number.parse::<u64>().ok(),
+        _ => None,
+    }?;
+    (rate > 0).then(|| rate.to_string())
+}
+
+/// Matroska commonly reports per-stream duration as a tag, without a numeric
+/// duration field. Reject malformed clocks instead of substituting file length.
+pub(crate) fn duration_tag_seconds(value: &str) -> Option<f64> {
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<u32>().ok()?;
+    let minutes = parts.next()?.parse::<u32>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() || minutes >= 60 || !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    Some(f64::from(hours) * 3600.0 + f64::from(minutes) * 60.0 + seconds)
+}
+
+fn stream_duration(stream: &ProbeStream) -> Option<f64> {
+    number(stream.duration.as_ref())
+        .or_else(|| duration_tag_seconds(&tag(stream.tags.as_ref()?, "duration")?))
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
@@ -188,13 +221,14 @@ pub(crate) fn parse_probe(
             document
                 .streams
                 .iter()
-                .filter_map(|stream| number(stream.duration.as_ref()))
+                .filter_map(stream_duration)
                 .reduce(f64::max)
         });
     let streams = document
         .streams
         .into_iter()
         .map(|stream| {
+            let duration_seconds = stream_duration(&stream);
             let is_video = stream.codec_type.as_deref() == Some("video");
             let bit_depth = sample_rate(stream.bits_per_raw_sample.as_ref())
                 .filter(|depth| *depth <= 64)
@@ -216,14 +250,36 @@ pub(crate) fn parse_probe(
                 .filter(|n| n.is_finite())
                 .map(|n| n.to_string());
             let aspect = |v: Option<String>| v.filter(|s| positive_rational(&s.replace(':', "/")));
-            let frame_rate = stream
+            let average_frame_rate = stream
                 .avg_frame_rate
-                .filter(|value| positive_rational(value))
-                .or_else(|| stream.r_frame_rate.filter(|value| positive_rational(value)));
+                .filter(|value| positive_rational(value));
+            let nominal_frame_rate = stream.r_frame_rate.filter(|value| positive_rational(value));
+            let frame_rate = average_frame_rate
+                .clone()
+                .or_else(|| nominal_frame_rate.clone());
             MediaStream {
                 index: stream.index,
                 kind: nonempty(stream.codec_type).unwrap_or_else(|| "unknown".into()),
                 codec: nonempty(stream.codec_name),
+                codec_long_name: nonempty(stream.codec_long_name),
+                profile: color_value(stream.profile),
+                bit_rate: decimal_rate(stream.bit_rate.as_ref()),
+                duration_seconds,
+                average_frame_rate,
+                nominal_frame_rate,
+                is_default: stream.disposition.as_ref().and_then(|value| {
+                    match value.get("default")? {
+                        Value::Bool(value) => Some(*value),
+                        Value::Number(value) => match value.as_u64() {
+                            Some(0) => Some(false),
+                            Some(1) => Some(true),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }),
+                attachment_filename: tag(&tags, "filename"),
+                attachment_mime_type: tag(&tags, "mimetype"),
                 width: stream.width,
                 height: stream.height,
                 sample_aspect_ratio: aspect(stream.sample_aspect_ratio),
@@ -257,15 +313,20 @@ pub(crate) fn parse_probe(
             }
         })
         .collect();
+    let format = document.format;
+    let format_tags = format.as_ref().and_then(|format| format.tags.as_ref());
     Ok(MediaFile {
         id: media_id(&path),
         path,
         name,
         size_bytes: size.to_string(),
         duration_seconds,
-        format: document
-            .format
-            .and_then(|format| nonempty(format.format_name)),
+        title: format_tags.and_then(|tags| tag(tags, "title")),
+        language: format_tags.and_then(|tags| tag(tags, "language")),
+        bit_rate: format
+            .as_ref()
+            .and_then(|format| decimal_rate(format.bit_rate.as_ref())),
+        format: format.and_then(|format| nonempty(format.format_name)),
         streams,
     })
 }
@@ -454,6 +515,82 @@ mod tests {
         let error = parse_probe(b"not json", "broken".into(), "broken".into(), 0).unwrap_err();
         assert_eq!(error.code, "PROBE_INVALID_RESPONSE");
         assert_eq!(error.path.as_deref(), Some("broken"));
+    }
+
+    #[test]
+    fn preserves_full_inspector_metadata_and_exact_decimal_rates() {
+        let parsed = parse_probe(br#"{"streams":[
+          {"index":0,"codec_type":"video","codec_name":"h264","codec_long_name":"H.264 / AVC","profile":"High","bit_rate":"9007199254740993","avg_frame_rate":"24000/1001","r_frame_rate":"30/1","field_order":"tt","disposition":{"default":1},"tags":{"DURATION":"00:00:01.001000000"}},
+          {"index":3,"codec_type":"audio","codec_name":"dts","profile":"DTS-HD MA","bit_rate":768000,"channel_layout":"5.1(side)","disposition":{"default":0},"duration":"3.5","tags":{"DURATION":"00:00:02.0"}},
+          {"index":5,"codec_type":"attachment","codec_name":"ttf","tags":{"FILENAME":"caption-font.ttf","MIMETYPE":"application/x-truetype-font"}},
+          {"index":6,"codec_type":"data","codec_name":"bin_data"}
+        ],"format":{"bit_rate":"9007199254740995","tags":{"TITLE":"Example title","LANGUAGE":"eng"}}}"#,
+            "source.mkv".into(), "source.mkv".into(), 1).unwrap();
+        assert_eq!(parsed.duration_seconds, Some(3.5));
+        assert_eq!(parsed.title.as_deref(), Some("Example title"));
+        assert_eq!(parsed.language.as_deref(), Some("eng"));
+        assert_eq!(parsed.bit_rate.as_deref(), Some("9007199254740995"));
+        let video = &parsed.streams[0];
+        assert_eq!(video.codec_long_name.as_deref(), Some("H.264 / AVC"));
+        assert_eq!(video.profile.as_deref(), Some("High"));
+        assert_eq!(video.bit_rate.as_deref(), Some("9007199254740993"));
+        assert_eq!(video.duration_seconds, Some(1.001));
+        assert_eq!(video.average_frame_rate.as_deref(), Some("24000/1001"));
+        assert_eq!(video.nominal_frame_rate.as_deref(), Some("30/1"));
+        assert_eq!(video.field_order.as_deref(), Some("tt"));
+        assert_eq!(video.is_default, Some(true));
+        let audio = &parsed.streams[1];
+        assert_eq!(audio.codec.as_deref(), Some("dts"));
+        assert_eq!(audio.profile.as_deref(), Some("DTS-HD MA"));
+        assert_eq!(audio.bit_rate.as_deref(), Some("768000"));
+        assert_eq!(audio.channel_layout.as_deref(), Some("5.1(side)"));
+        assert_eq!(audio.duration_seconds, Some(3.5));
+        assert_eq!(audio.is_default, Some(false));
+        assert_eq!(
+            parsed.streams[2].attachment_filename.as_deref(),
+            Some("caption-font.ttf")
+        );
+        assert_eq!(
+            parsed.streams[2].attachment_mime_type.as_deref(),
+            Some("application/x-truetype-font")
+        );
+        assert_eq!(parsed.streams[3].kind, "data");
+        assert_eq!(parsed.streams[3].is_default, None);
+        let json = serde_json::to_value(parsed).unwrap();
+        assert_eq!(json["streams"][0]["bitRate"], "9007199254740993");
+    }
+
+    #[test]
+    fn rejects_invalid_extra_metadata_without_inventing_values() {
+        for text in [
+            "NaN",
+            "00:60:01",
+            "00:00:60",
+            "00:00:NaN",
+            "-1:00:00",
+            "00:00:-1",
+            "1:02",
+            "1:02:03:04",
+        ] {
+            assert_eq!(duration_tag_seconds(text), None, "{text}");
+        }
+        assert_eq!(duration_tag_seconds("01:02:03.125"), Some(3723.125));
+        assert_eq!(duration_tag_seconds("00:00:00.000"), Some(0.0));
+        let parsed = parse_probe(br#"{"streams":[
+          {"index":0,"bit_rate":"NaN","profile":"unknown","codec_long_name":" ","avg_frame_rate":"0/0","r_frame_rate":"1/0","disposition":{"default":2},"duration":"Infinity","tags":{"DURATION":"00:60:00"}},
+          {"index":1,"bit_rate":-1,"duration":"0","tags":{"DURATION":"00:00:05"}}
+        ],"format":{"bit_rate":"0"}}"#, "unknown".into(), "unknown".into(), 0).unwrap();
+        assert_eq!(parsed.bit_rate, None);
+        let stream = &parsed.streams[0];
+        assert_eq!(stream.codec_long_name, None);
+        assert_eq!(stream.profile, None);
+        assert_eq!(stream.bit_rate, None);
+        assert_eq!(stream.duration_seconds, None);
+        assert_eq!(stream.average_frame_rate, None);
+        assert_eq!(stream.nominal_frame_rate, None);
+        assert_eq!(stream.is_default, None);
+        assert_eq!(parsed.streams[1].bit_rate, None);
+        assert_eq!(parsed.streams[1].duration_seconds, Some(0.0));
     }
 
     #[test]

@@ -126,7 +126,7 @@ export type MediaStream = {
 /**
  * Original source stream index, independent of presentation order.
  */
-index: number, kind: string, codec: string | null, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
+index: number, kind: string, codec: string | null, codecLongName?: string, profile?: string, bitRate?: string, durationSeconds?: number, averageFrameRate?: string, nominalFrameRate?: string, isDefault?: boolean, attachmentFilename?: string, attachmentMimeType?: string, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
 /**
  * Reported display-matrix rotation, in degrees as finite decimal text.
  */
@@ -156,7 +156,11 @@ id: string, path: string, name: string,
 /**
  * Decimal text preserves byte counts beyond JavaScript's safe integer range.
  */
-sizeBytes: string, durationSeconds: number | null, format: string | null, streams: Array<MediaStream>, };
+sizeBytes: string, durationSeconds: number | null, format: string | null, title?: string, language?: string,
+/**
+ * Reported bits per second, kept as decimal text without JS rounding.
+ */
+bitRate?: string, streams: Array<MediaStream>, };
 
 export type AppError = { code: string, message: string, path: string | null, };
 

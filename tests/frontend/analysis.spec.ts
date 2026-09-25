@@ -33,13 +33,15 @@ type Mock = {
   hold: (command: string) => void;
   release: (command: string, index?: number) => void;
   fingerprint: (value: string) => void;
+  failNextPreview: () => void;
 };
-async function mock(page: Page) {
+async function mock(page: Page, source: MediaFile = media) {
   await page.addInitScript(
     ({ source }) => {
       let callback = 0;
       let nextId = 0;
       let cropFingerprint = 'original';
+      let failNextPreview = false;
       const calls: Call[] = [];
       const held = new Set<string>();
       const pending = new Map<string, (() => void)[]>();
@@ -54,6 +56,9 @@ async function mock(page: Page) {
         },
         fingerprint: (value) => {
           cropFingerprint = value;
+        },
+        failNextPreview: () => {
+          failNextPreview = true;
         },
       } satisfies Mock;
       state.isTauri = true;
@@ -99,6 +104,10 @@ async function mock(page: Page) {
           if (command === 'begin_media_analysis') return `analysis-${++nextId}`;
           if (command === 'cancel_media_analysis') return;
           if (command === 'preview_frame') {
+            if (failNextPreview) {
+              failNextPreview = false;
+              throw { code: 'SOURCE_CHANGED', message: 'The source changed during analysis.' };
+            }
             const request = payload.request as FramePreviewRequest;
             return {
               imageDataUrl:
@@ -186,11 +195,11 @@ async function mock(page: Page) {
         },
       };
     },
-    { source: media },
+    { source },
   );
   await page.goto('/');
   await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: media.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: source.name, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
 }
 const workspace = (page: Page) =>
@@ -205,7 +214,7 @@ const calls = (page: Page, command: string) =>
   );
 const control = (
   page: Page,
-  action: 'hold' | 'release' | 'fingerprint',
+  action: 'hold' | 'release' | 'fingerprint' | 'failNextPreview',
   command: string,
   index?: number,
 ) =>
@@ -213,6 +222,7 @@ const control = (
     ({ action, command, index }) => {
       const mock = (globalThis as unknown as { __analysisMock: Mock }).__analysisMock;
       if (action === 'release') mock.release(command, index);
+      else if (action === 'failNextPreview') mock.failNextPreview();
       else mock[action](command);
     },
     { action, command, index },
@@ -379,4 +389,102 @@ test('inspector thumbnails request display orientation and discard stale scrub r
   expect((await calls(page, 'preview_frame'))[2].payload.request).toMatchObject({
     positionSeconds: 5,
   });
+});
+
+test('a failed source refresh removes the old frame and crop proposal', async ({ page }) => {
+  await mock(page);
+  const quick = workspace(page);
+  await quick.getByText('Source preview & automatic crop', { exact: true }).click();
+  await expect(quick.getByRole('img')).toBeVisible();
+  await quick.getByRole('button', { name: 'Detect black borders', exact: true }).click();
+  await expect(
+    quick.getByRole('button', { name: 'Apply detected crop', exact: true }),
+  ).toBeEnabled();
+
+  await control(page, 'hold', 'preview_frame');
+  await control(page, 'failNextPreview', '');
+  await quick.getByRole('button', { name: 'Refresh preview', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(2);
+  await expect(quick.getByRole('img')).toHaveCount(0);
+  await expect(
+    quick.getByRole('button', { name: 'Apply detected crop', exact: true }),
+  ).toBeDisabled();
+
+  await control(page, 'release', 'preview_frame');
+  await expect(quick.getByRole('alert')).toContainText('The source changed during analysis.');
+  await expect(quick.getByRole('button', { name: 'Apply detected crop', exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test('typing a thumbnail position cancels pending work before blur and rejects an invalid seek', async ({
+  page,
+}) => {
+  await mock(page);
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  const thumbnail = page.getByRole('region', { name: 'Video thumbnail', exact: true });
+  await thumbnail.getByRole('button', { name: 'Video thumbnail & scrubbing', exact: true }).click();
+  await expect(thumbnail.getByRole('img')).toBeVisible();
+
+  await control(page, 'hold', 'preview_frame');
+  await thumbnail.getByRole('button', { name: 'Refresh thumbnail', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(2);
+  await expect(thumbnail.getByRole('img')).toHaveCount(0);
+  await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).fill('5');
+  await expect
+    .poll(async () =>
+      (await calls(page, 'cancel_media_analysis')).some((call) => call.payload.id === 'analysis-2'),
+    )
+    .toBe(true);
+  await expect.poll(async () => (await calls(page, 'preview_frame')).length).toBe(3);
+  await control(page, 'release', 'preview_frame');
+  await expect(thumbnail.getByRole('img')).toHaveCount(0);
+  await control(page, 'release', 'preview_frame');
+  await expect(thumbnail).toContainText('5.00 s');
+
+  await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).fill('-1');
+  await expect(thumbnail.getByRole('alert')).toContainText(
+    'Choose a position within this video stream.',
+  );
+  await expect(thumbnail.getByRole('img')).toHaveCount(0);
+  expect(await calls(page, 'preview_frame')).toHaveLength(3);
+});
+
+test('both preview position limits follow the selected video stream duration', async ({ page }) => {
+  const source = {
+    ...media,
+    streams: media.streams.map((stream) => ({
+      ...stream,
+      durationSeconds: stream.index === 4 ? 2 : 12,
+    })),
+  };
+  await mock(page, source);
+  const quick = workspace(page);
+  await quick.getByText('Source preview & automatic crop', { exact: true }).click();
+  await quick.getByLabel('Video stream', { exact: true }).selectOption('4');
+  const quickMaximum = Number(
+    await quick.getByLabel('Position (seconds)', { exact: true }).getAttribute('max'),
+  );
+  expect(quickMaximum).toBeCloseTo(2 - 1 / 24);
+
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('button', { name: /^Files/ })
+    .click();
+  const thumbnail = page.getByRole('region', { name: 'Video thumbnail', exact: true });
+  await thumbnail.getByRole('button', { name: 'Video thumbnail & scrubbing', exact: true }).click();
+  await thumbnail.getByLabel('Thumbnail video stream', { exact: true }).selectOption('4');
+  const thumbnailMaximum = Number(
+    await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).getAttribute('max'),
+  );
+  expect(thumbnailMaximum).toBeCloseTo(2 - 1 / 24);
+  const before = (await calls(page, 'preview_frame')).length;
+  await thumbnail.getByLabel('Thumbnail position (seconds)', { exact: true }).fill('3');
+  await expect(thumbnail.getByRole('alert')).toContainText(
+    'Choose a position within this video stream.',
+  );
+  expect(await calls(page, 'preview_frame')).toHaveLength(before);
 });

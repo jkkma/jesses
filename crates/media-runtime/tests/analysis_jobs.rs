@@ -409,3 +409,231 @@ async fn inspector_thumbnail_honors_rotation_and_sar_without_changing_coded_crop
     assert_eq!((coded.width, coded.height), (192, 112));
     assert_eq!(Sha256::digest(std::fs::read(&rotated).unwrap()), before);
 }
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn inspector_thumbnail_matches_autorotation_for_reflected_display_matrices() {
+    let directory = Fixture::new();
+    let original = directory.0.join("asymmetric.mp4");
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "0",
+    ]);
+    command.push(original.as_os_str().to_owned());
+    ffmpeg(command).await;
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+
+    for (name, rotation, flip) in [
+        ("horizontal", "0", "-display_hflip:v:0"),
+        ("vertical", "0", "-display_vflip:v:0"),
+        ("reflected-quarter", "90", "-display_hflip:v:0"),
+        ("reflected-three-quarter", "270", "-display_hflip:v:0"),
+    ] {
+        let source = directory.0.join(format!("{name}.mp4"));
+        let mut command = args(&["-v", "error", "-display_rotation:v:0", rotation, flip, "-i"]);
+        command.push(original.as_os_str().to_owned());
+        command.extend(args(&["-c", "copy"]));
+        command.push(source.as_os_str().to_owned());
+        ffmpeg(command).await;
+        let before = Sha256::digest(std::fs::read(&source).unwrap());
+        let request = FramePreviewRequest {
+            input_path: source.to_string_lossy().into_owned(),
+            video_stream_index: 0,
+            position_seconds: 0.0,
+            display_orientation: Some(true),
+        };
+        let preview = preview_frame(request.clone(), cancel.clone())
+            .await
+            .unwrap();
+        let actual = preview_pixels(
+            &directory.0.join(format!("{name}-preview.png")),
+            &preview.image_data_url,
+        )
+        .await;
+        let mut reference = args(&["-v", "error", "-i"]);
+        reference.push(source.as_os_str().to_owned());
+        reference.extend(args(&[
+            "-vf",
+            &format!(
+                "scale={}:{}:flags=lanczos,format=rgb24,setsar=1",
+                preview.width, preview.height
+            ),
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ]));
+        assert_eq!(
+            Sha256::digest(actual),
+            Sha256::digest(ffmpeg(reference).await),
+            "{name} display pixels differ from FFmpeg autorotation"
+        );
+        let coded = preview_frame(
+            FramePreviewRequest {
+                display_orientation: None,
+                ..request
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((coded.width, coded.height), (192, 112));
+        assert_eq!(Sha256::digest(std::fs::read(&source).unwrap()), before);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn translated_mp4_display_matrix_keeps_the_same_oriented_pixels() {
+    let directory = Fixture::new();
+    let original = directory.0.join("original.mp4");
+    let rotated = directory.0.join("rotated.mp4");
+    let translated = directory.0.join("translated.mp4");
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "0",
+    ]);
+    command.push(original.as_os_str().to_owned());
+    ffmpeg(command).await;
+    let mut command = args(&["-v", "error", "-display_rotation:v:0", "90", "-i"]);
+    command.push(original.as_os_str().to_owned());
+    command.extend(args(&["-c", "copy"]));
+    command.push(rotated.as_os_str().to_owned());
+    ffmpeg(command).await;
+    std::fs::copy(&rotated, &translated).unwrap();
+
+    // The MP4 tkhd box stores this unique 3x3 display matrix as big-endian
+    // fixed-point words. Change only its origin (the last row's first two words).
+    let matrix = [0_i32, -65_536, 0, 65_536, 0, 0, 0, 0, 1_073_741_824];
+    let pattern = matrix
+        .iter()
+        .flat_map(|entry| entry.to_be_bytes())
+        .collect::<Vec<_>>();
+    let mut bytes = std::fs::read(&translated).unwrap();
+    let positions = bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == pattern).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(positions.len(), 1, "expected one MP4 track display matrix");
+    let offset = positions[0];
+    bytes[offset + 24..offset + 28].copy_from_slice(&(160_i32 << 16).to_be_bytes());
+    bytes[offset + 28..offset + 32].copy_from_slice(&(-96_i32 << 16).to_be_bytes());
+    std::fs::write(&translated, bytes).unwrap();
+    let before = Sha256::digest(std::fs::read(&translated).unwrap());
+
+    let reference_pixels = |path: &Path| {
+        let mut command = args(&["-v", "error", "-i"]);
+        command.push(path.as_os_str().to_owned());
+        command.extend(args(&[
+            "-vf",
+            "scale=112:192:flags=lanczos,format=rgb24,setsar=1",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ]));
+        command
+    };
+    let unshifted = ffmpeg(reference_pixels(&rotated)).await;
+    let expected = ffmpeg(reference_pixels(&translated)).await;
+    assert_eq!(Sha256::digest(unshifted), Sha256::digest(&expected));
+
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let preview = preview_frame(
+        FramePreviewRequest {
+            input_path: translated.to_string_lossy().into_owned(),
+            video_stream_index: 0,
+            position_seconds: 0.0,
+            display_orientation: Some(true),
+        },
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!((preview.width, preview.height), (112, 192));
+    let actual = preview_pixels(
+        &directory.0.join("translated-preview.png"),
+        &preview.image_data_url,
+    )
+    .await;
+    assert_eq!(Sha256::digest(actual), Sha256::digest(expected));
+    assert_eq!(Sha256::digest(std::fs::read(&translated).unwrap()), before);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn selected_matroska_stream_duration_rejects_seeks_before_container_end() {
+    let directory = Fixture::new();
+    let source = directory.0.join("different-stream-durations.mkv");
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=192x112:r=24:d=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=128x96:r=24:d=1",
+        "-map",
+        "0:v",
+        "-map",
+        "1:v",
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+    ]);
+    command.push(source.as_os_str().to_owned());
+    ffmpeg(command).await;
+    let before = Sha256::digest(std::fs::read(&source).unwrap());
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let request = FramePreviewRequest {
+        input_path: source.to_string_lossy().into_owned(),
+        video_stream_index: 1,
+        position_seconds: 0.5,
+        display_orientation: None,
+    };
+    preview_frame(request.clone(), cancel.clone())
+        .await
+        .unwrap();
+    let error = preview_frame(
+        FramePreviewRequest {
+            position_seconds: 1.5,
+            ..request
+        },
+        cancel,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "ANALYSIS_SETTINGS_INVALID");
+    assert_eq!(Sha256::digest(std::fs::read(&source).unwrap()), before);
+}

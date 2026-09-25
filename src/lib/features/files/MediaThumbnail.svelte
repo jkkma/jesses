@@ -3,6 +3,7 @@
   import { previewFrame, isDesktop } from '$lib/ipc/client';
   import type { FramePreviewResult, MediaFile } from '$lib/ipc/generated';
   import { errorMessage } from '$lib/components/shared/format';
+  import { previewMaximum } from '$lib/components/shared/preview-position';
   let { file, sample = false }: { file: MediaFile; sample?: boolean } = $props();
   const id = $props.id();
   const videos = $derived(file.streams.filter((s) => s.kind === 'video'));
@@ -12,11 +13,16 @@
   let result = $state<FramePreviewResult | null>(null);
   let busy = $state(false);
   let error = $state('');
-  let source = '';
+  let activeFile: MediaFile | undefined;
   let generation = 0;
   let controller: AbortController | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const max = $derived(Math.max(0, Math.min(86400, (file.durationSeconds ?? 86400) - 0.05)));
+  const max = $derived(
+    previewMaximum(
+      file.durationSeconds,
+      videos.find((video) => video.index === streamIndex),
+    ),
+  );
   const disabled = $derived(sample || !isDesktop());
 
   function cancel() {
@@ -27,11 +33,11 @@
     busy = false;
   }
   $effect(() => {
-    const path = file.path;
+    const currentFile = file;
     const first = videos[0]?.index ?? 0;
     untrack(() => {
-      if (source === path) return;
-      source = path;
+      if (activeFile === currentFile) return;
+      activeFile = currentFile;
       cancel();
       streamIndex = first;
       position = 0;
@@ -43,8 +49,12 @@
   onDestroy(cancel);
   async function load() {
     cancel();
-    if (disabled || !expanded || !Number.isFinite(position) || position < 0 || position > max)
+    if (disabled || !expanded) return;
+    result = null;
+    if (!Number.isFinite(position) || position < 0 || position > max) {
+      error = 'Choose a position within this video stream.';
       return;
+    }
     const current = ++generation;
     const pending = new AbortController();
     controller = pending;
@@ -68,6 +78,12 @@
   function seek(value: number) {
     cancel();
     position = value;
+    result = null;
+    error = '';
+    if (!Number.isFinite(value) || value < 0 || value > max) {
+      error = 'Choose a position within this video stream.';
+      return;
+    }
     timer = setTimeout(() => void load(), 180);
   }
 </script>
@@ -123,7 +139,7 @@
           step="0.05"
           value={position}
           {disabled}
-          onchange={(e) => seek(e.currentTarget.valueAsNumber)}
+          oninput={(e) => seek(e.currentTarget.valueAsNumber)}
         />
         {#if max > 0}<input
             aria-label="Scrub thumbnail"
