@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "jesses"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
  "media-core",
  "media-runtime",
