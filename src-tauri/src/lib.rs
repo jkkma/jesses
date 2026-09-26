@@ -451,6 +451,15 @@ async fn get_capabilities() -> Vec<ToolInfo> {
 pub fn run() {
     let exiting = Arc::new(AtomicU8::new(0));
     tauri::Builder::default()
+        // This must run before setup opens the persisted history and WebView.
+        // Scoop launches and version directories all share the same app ID.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {

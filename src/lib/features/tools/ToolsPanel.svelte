@@ -205,7 +205,7 @@
   {/if}
   <section class="panel about-panel">
     <div>
-      <div class="brand-wordmark">jesses<span class="version-tag">0.1.0</span></div>
+      <div class="brand-wordmark">jesses<span class="version-tag">0.1.1</span></div>
       <p>Desktop media encoding, muxing, and analysis.</p>
       <span class="small-muted">Created by jkkma.</span>
     </div>

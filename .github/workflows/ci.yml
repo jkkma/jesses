@@ -150,3 +150,6 @@ jobs:
       - run: pnpm contracts:check
       - name: Check the native executable with embedded frontend
         run: pnpm tauri build --debug --no-bundle --target ${{ matrix.target }}
+      - name: Verify repeated Windows launches preserve Scoop history
+        if: runner.os == 'Windows'
+        run: python scripts/test-windows-single-instance.py --executable target/${{ matrix.target }}/debug/jesses.exe --root target/single-instance-smoke

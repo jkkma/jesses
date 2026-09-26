@@ -1147,7 +1147,7 @@
   </section>
   <footer class="status-bar">
     <span
-      >jesses <span class="mono">0.1.0</span><span class="footer-divider">/</span>Created by jkkma</span
+      >jesses <span class="mono">0.1.1</span><span class="footer-divider">/</span>Created by jkkma</span
     ><span>Desktop media encoding, muxing, and analysis.</span>
   </footer>
 </div>
