@@ -35,12 +35,12 @@ impl Drop for Fixture {
         }
     }
 }
-async fn ffmpeg(values: Vec<OsString>) -> Vec<u8> {
+async fn tool_output(name: &str, values: Vec<OsString>) -> Vec<u8> {
     let tools = media_runtime::get_capabilities().await;
     let executable = PathBuf::from(
         tools
             .into_iter()
-            .find(|t| t.id == "ffmpeg")
+            .find(|t| t.id == name)
             .unwrap()
             .path
             .unwrap(),
@@ -65,6 +65,12 @@ async fn ffmpeg(values: Vec<OsString>) -> Vec<u8> {
     );
     output.stdout
 }
+async fn ffmpeg(values: Vec<OsString>) -> Vec<u8> {
+    tool_output("ffmpeg", values).await
+}
+async fn ffprobe(values: Vec<OsString>) -> serde_json::Value {
+    serde_json::from_slice(&tool_output("ffprobe", values).await).unwrap()
+}
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
@@ -72,9 +78,146 @@ async fn pixels(path: &Path) -> Vec<u8> {
     let mut a = args(&["-v", "error", "-i"]);
     a.push(path.into());
     a.extend(args(&[
-        "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
     ]));
     ffmpeg(a).await
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn rational_image_rates_preserve_every_source_frame_and_timestamp() {
+    let fixture = Fixture::new();
+    let source_pattern = fixture.0.join("source-%02d.png");
+    let mut create = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=64x48:r=17:d=1",
+        "-frames:v",
+        "17",
+        "-pix_fmt",
+        "rgb24",
+        "-threads",
+        "1",
+    ]);
+    create.push(source_pattern.into());
+    ffmpeg(create).await;
+
+    // Reverse filenames so a filename sort cannot accidentally pass.
+    let paths: Vec<PathBuf> = (1..=17)
+        .rev()
+        .map(|i| fixture.0.join(format!("source-{i:02}.png")))
+        .collect();
+    let original_bytes: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let mut expected = Vec::new();
+    for path in &paths {
+        expected.extend(pixels(path).await);
+    }
+    assert_eq!(expected.len(), 17 * 64 * 48 * 3);
+    let (_sender, cancel) = watch::channel(false);
+    for (label, numerator, denominator) in [
+        ("half", 1, 2),
+        ("twelve", 12, 1),
+        ("ntsc24", 24_000, 1001),
+        ("ntsc30", 30_000, 1001),
+        ("sixty", 60, 1),
+        ("one-twenty", 120, 1),
+    ] {
+        let output = fixture.0.join(format!("{label}.mkv"));
+        let result = run_image_job(
+            ImageRequest::ImportSequence {
+                paths: paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                frame_rate: FrameRate {
+                    numerator,
+                    denominator,
+                },
+                output_path: output.to_string_lossy().into_owned(),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.frame_count, 17, "{label}");
+        assert_eq!(
+            pixels(&output).await,
+            expected,
+            "{label}: decoded frame identities"
+        );
+
+        let mut probe_args = args(&[
+            "-v",
+            "error",
+            "-count_frames",
+            "-show_streams",
+            "-show_frames",
+            "-show_format",
+            "-of",
+            "json",
+        ]);
+        probe_args.push(output.into());
+        let probe = ffprobe(probe_args).await;
+        let stream = &probe["streams"][0];
+        assert_eq!(stream["codec_name"], "ffv1", "{label}");
+        assert_eq!(stream["nb_read_frames"], "17", "{label}");
+        let rate = stream["avg_frame_rate"].as_str().unwrap();
+        let (actual_num, actual_den) = rate.split_once('/').unwrap();
+        let actual_num: u64 = actual_num.parse().unwrap();
+        let actual_den: u64 = actual_den.parse().unwrap();
+        assert_eq!(
+            actual_num * u64::from(denominator),
+            actual_den * u64::from(numerator),
+            "{label}: stream rate {rate}"
+        );
+
+        let frames = probe["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 17, "{label}: metadata frame count");
+        for (index, frame) in frames.iter().enumerate() {
+            let pts: f64 = frame["best_effort_timestamp_time"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let expected_pts = index as f64 * f64::from(denominator) / f64::from(numerator);
+            assert!(
+                (pts - expected_pts).abs() <= 0.0015,
+                "{label}: frame {index} PTS {pts} expected {expected_pts}"
+            );
+        }
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected_duration = 17.0 * f64::from(denominator) / f64::from(numerator);
+        assert!(
+            (duration - expected_duration).abs() <= 0.003,
+            "{label}: duration {duration} expected {expected_duration}"
+        );
+    }
+    for (path, original) in paths.iter().zip(original_bytes) {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            original,
+            "source bytes changed: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]

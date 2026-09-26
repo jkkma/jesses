@@ -41,10 +41,12 @@ and [palette filters](https://ffmpeg.org/ffmpeg-filters.html#palettegen).
 ## Validation
 
 The opt-in image_jobs tests exercise real FFmpeg/FFprobe: explicit nonalphabetic
-ordering, exact decoded RGB round trips through FFV1 and PNG, source-byte
+ordering at 1/2, 12, 24000/1001, 30000/1001, 60 and 120 fps, exact decoded RGB
+frame identity and rational timing, FFV1 and PNG round trips, source-byte
 preservation, rejected existing destinations, GIF/JPEG/still decoding and
 pre-cancellation. Unit tests cancel a staged copy after its first chunk and
 replace an owned staged file before cleanup, confirming that the partial is
-removed and the foreign replacement survives. Browser tests exercise reviewed
+removed and the foreign replacement survives. An actual-tool test cancels a
+running image process and checks that it reports cancellation. Browser tests exercise reviewed
 order, rational FPS and output import. These tests do not establish packaged
 Linux or clean-machine coverage.

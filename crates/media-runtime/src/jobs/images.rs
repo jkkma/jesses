@@ -9,7 +9,6 @@ use serde::Deserialize;
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -72,7 +71,12 @@ async fn run(
         Duration::from_secs(3600),
     )
     .await
-    .map_err(|e| error(e.to_string(), program))?;
+    .map_err(|e| match e {
+        supervisor::SupervisorError::Cancelled => {
+            AppError::new("JOB_CANCELED", "Image processing was canceled.", None)
+        }
+        other => error(other.to_string(), program),
+    })?;
     check(cancel)?;
     if !result.status.success() {
         return Err(error(
@@ -572,32 +576,34 @@ pub async fn run_image_job(
                 copy_source(&source, &mut stage, p, &cancel).await?;
                 sources.push(source);
             }
-            let manifest = stage.path.join("frames.ffconcat");
-            let mut text = "ffconcat version 1.0\n".to_owned();
-            for i in 0..sources.len() {
-                text.push_str(&format!(
-                    "file frame-{i:05}.img\nduration {:.12}\n",
-                    f64::from(frame_rate.denominator) / f64::from(frame_rate.numerator)
-                ));
-            }
-            let mut manifest_file = stage.create_file(manifest.clone())?;
-            manifest_file
-                .write_all(text.as_bytes())
-                .and_then(|_| manifest_file.sync_all())
-                .map_err(|e| error(e.to_string(), &manifest))?;
             let temporary = Temporary::create(&output, &id())?;
             let mut a = args(&[
-                "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "1", "-i",
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "image2",
+                "-framerate",
+                &format!("{}/{}", frame_rate.numerator, frame_rate.denominator),
+                "-pattern_type",
+                "sequence",
+                "-start_number",
+                "0",
+                "-c:v",
+                codec.as_deref().unwrap(),
+                "-i",
             ]);
-            // A relative manifest plus an owned cwd avoids FFmpeg treating a
-            // Windows extended-path prefix as a concat URL authority.
-            a.push("frames.ffconcat".into());
+            // Every staged name is contiguous and private. image2 assigns the
+            // requested input time base before sync can drop or duplicate
+            // frames; concat inherits the image decoder's 25 fps time base.
+            // A relative pattern plus an owned cwd also avoids Windows
+            // extended-path prefixes being parsed as protocol authorities.
+            a.push("frame-%05d.img".into());
             a.extend(args(&[
                 "-map",
                 "0:v:0",
                 "-an",
-                "-r",
-                &format!("{}/{}", frame_rate.numerator, frame_rate.denominator),
                 "-frames:v",
                 &sources.len().to_string(),
                 "-c:v",
@@ -838,6 +844,7 @@ pub async fn run_image_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture(label: &str) -> PathBuf {
@@ -914,5 +921,45 @@ mod tests {
         fs::remove_file(entry_path).unwrap();
         fs::remove_dir(stage_path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFmpeg"]
+    async fn active_image_tool_cancellation_keeps_job_canceled_code() {
+        let root = fixture("active-cancel");
+        let output = root.join("active.mkv");
+        let ffmpeg = tool("ffmpeg").await.unwrap();
+        let (owner, cancel) = watch::channel(false);
+        let observed = output.clone();
+        let task = tokio::spawn(async move {
+            let mut command = args(&[
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-re",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=64x48:r=30",
+                "-t",
+                "30",
+                "-c:v",
+                "ffv1",
+            ]);
+            command.push(output.as_os_str().to_owned());
+            run(&ffmpeg, command, None, &cancel).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observed.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("FFmpeg did not start its output");
+        owner.send_replace(true);
+        let failure = task.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, "JOB_CANCELED");
+        fs::remove_dir_all(root).unwrap();
     }
 }
