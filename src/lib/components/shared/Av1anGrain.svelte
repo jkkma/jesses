@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Av1anGrainSettings } from '$lib/ipc/generated';
+  import type { Av1anGrainSettings, VideoEncoder } from '$lib/ipc/generated';
   import {
     chooseUtilityFile,
     readAv1anGrainTable,
@@ -10,10 +10,14 @@
   import { errorMessage } from './format';
   let {
     value,
+    encoder,
+    tableOnly = false,
     disabled = false,
     onchange,
   }: {
     value: Av1anGrainSettings | undefined;
+    encoder: VideoEncoder;
+    tableOnly?: boolean;
     disabled?: boolean;
     onchange: (value: Av1anGrainSettings | undefined) => void;
   } = $props();
@@ -89,12 +93,15 @@
 
 <details class="grain">
   <summary
-    >SVT grain analysis and tables <small
+    >{encoder === 'aomAv1' ? 'AOM' : 'SVT'} grain analysis and tables
+    <small
       >{table
         ? 'Grain table selected'
-        : value?.denoise
-          ? 'Encoder denoising on'
-          : 'Encoder denoising off'}</small
+        : tableOnly
+          ? 'No grain table selected'
+          : value?.denoise
+            ? 'Encoder denoising on'
+            : 'Encoder denoising off'}</small
     ></summary
   >
   <fieldset disabled={disabled || pending}>
@@ -107,7 +114,11 @@
         if (mode === 'encoder') onchange(undefined);
       }}
     >
-      <option value="encoder">Encoder analysis · use film grain strength above</option>
+      <option value="encoder"
+        >{tableOnly
+          ? 'Film grain strength above'
+          : 'Encoder analysis · use film grain strength above'}</option
+      >
       <option value="table">Grain table file</option>
       <option value="preset">Film-stock preset</option>
     </select>
@@ -125,23 +136,24 @@
         >
         <button type="button" onclick={generate}>Prepare grain preset</button>{/if}
     {/if}
-    <label class="check"
-      ><input
-        type="checkbox"
-        checked={value?.denoise ?? false}
-        onchange={(e) => patch({ denoise: e.currentTarget.checked })}
-      />{table ? 'Denoise picture before applying table' : 'Use encoder denoised picture'}</label
-    >
-    {#if table && value?.denoise}<label
-        >Denoise strength<input
-          type="number"
-          min="1"
-          max="16"
-          step="1"
-          value={value.denoiseStrength}
-          oninput={(e) => patch({ denoiseStrength: e.currentTarget.valueAsNumber })}
-        /></label
-      >{/if}
+    {#if table || !tableOnly}<label class="check"
+        ><input
+          type="checkbox"
+          checked={value?.denoise ?? false}
+          onchange={(e) => patch({ denoise: e.currentTarget.checked })}
+        />{table ? 'Denoise picture before applying table' : 'Use encoder denoised picture'}</label
+      >
+      {#if table && value?.denoise}<label
+          >Denoise strength<input
+            type="number"
+            min="1"
+            max="16"
+            step="1"
+            value={value.denoiseStrength}
+            oninput={(e) => patch({ denoiseStrength: e.currentTarget.valueAsNumber })}
+          /></label
+        >{/if}
+    {/if}
     {#if table}<p>
         {table.split('\n').filter((line) => line.startsWith('E ')).length} table segments stored with
         this job. The original file is read only; recovery uses these saved table bytes.
@@ -154,9 +166,12 @@
         }}>Clear grain table</button
       >{/if}
     <p>
-      Encoder analysis uses the film grain strength above. Tables replace that strength. SVT builds
-      may use only the first table segment; grain synthesis approximates texture and does not
-      restore the original grain exactly.
+      {tableOnly
+        ? 'Film grain strength is set above.'
+        : 'Encoder analysis uses the film grain strength above.'} Tables replace that strength.
+      {encoder === 'aomAv1' ? 'AOM' : 'SVT'} grain synthesis approximates texture and does not restore
+      the original grain exactly.
+      {#if encoder !== 'aomAv1'}SVT builds may use only the first table segment.{/if}
     </p>
   </fieldset>
   {#if pending}<p>

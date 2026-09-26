@@ -53,6 +53,9 @@ pub struct BatchEncodeRequest {
     pub av1an_options: Option<crate::Av1anOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub output_pixel_format: Option<crate::Av1anPixelFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub av1an_grain: Option<crate::Av1anGrainSettings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(optional, as = "Option<_>")]

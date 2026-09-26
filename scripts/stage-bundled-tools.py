@@ -9,7 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import shutil
 import subprocess
@@ -66,12 +66,144 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def aom_tree_sha256(path: Path) -> str:
+    with tarfile.open(path) as archive:
+        members = archive.getmembers()
+        if len(members) > 30_000 or sum(item.size for item in members) > MAX_DOWNLOAD:
+            raise ValueError("The AOM source archive exceeds bounds.")
+        output = hashlib.sha256()
+        seen = set()
+        for item in sorted(members, key=lambda member: member.name):
+            parts = PurePosixPath(item.name).parts
+            if (not parts or item.name.startswith("/") or "\\" in item.name or
+                    ".." in parts or item.name in seen or not (item.isfile() or item.isdir())):
+                raise ValueError(f"Unsafe AOM source member: {item.name}")
+            seen.add(item.name)
+            content = hashlib.sha256(archive.extractfile(item).read()).hexdigest().encode() if item.isfile() else b"DIR"
+            output.update(item.name.encode() + b"\0" + content + b"\n")
+        return output.hexdigest()
+
+
 def stage_x264(delivery: Path, tools_root: Path, target: str) -> dict:
     return stage_standalone(delivery, tools_root, target, "x264")
 
 
 def stage_svt(delivery: Path, tools_root: Path, target: str) -> dict:
     return stage_standalone(delivery, tools_root, target, "svt-av1")
+
+
+def stage_extra_encoder(delivery: Path, tools_root: Path, target: str, identifier: str) -> dict:
+    """Stage a source-complete Windows AOM, VPX or x265 delivery."""
+    if target != "x86_64-pc-windows-msvc" or identifier not in {"aom", "vpx", "x265"}:
+        raise ValueError("Additional standalone encoders require Windows x64.")
+    package = importlib.util.spec_from_file_location("desktop_package", ROOT / "scripts/package-desktop.py")
+    desktop = importlib.util.module_from_spec(package)
+    package.loader.exec_module(desktop)
+    receipt_path = delivery / "build-provenance.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    tool_id = {"aom": "aomenc", "vpx": "vpxenc", "x265": "x265"}[identifier]
+    if (receipt.get("schemaVersion") != 1 or receipt.get("target") != target or
+            receipt.get("id") != identifier or receipt["tool"]["id"] != tool_id or
+            receipt["tool"]["path"] != tool_id + ".exe"):
+        raise ValueError("The additional standalone delivery has a different identity or platform.")
+    media_path = tools_root / "ffmpeg/build-provenance.json"
+    if not media_path.is_file() or digest(media_path) != receipt["sharedMediaProvenanceSha256"]:
+        raise ValueError("The additional encoder requires its exact shared media delivery.")
+    media = json.loads(media_path.read_text(encoding="utf-8"))
+    runtime_bases = {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}
+    runtime = receipt["runtimeSources"]
+    if len(runtime) != 4 or {item["base"] for item in runtime} != runtime_bases or any(
+            item not in media["additionalSources"] for item in runtime):
+        raise ValueError("The additional encoder's compiler runtime sources are incomplete.")
+    lock = json.loads((ROOT / "scripts/standalone-tool-sources.json").read_text(encoding="utf-8"))
+    source = receipt["source"]
+    own_source = identifier == "aom"
+    extra_payload = []
+    if identifier == "aom":
+        pin = lock["aom"]
+        if any(source.get(key) != pin[key] for key in ("version", "commit", "url", "treeSha256", "patch", "patchSha256")) or source["path"] != "source.tar.gz":
+            raise ValueError("The AOM source and patch pins differ from the package lock.")
+        if aom_tree_sha256(delivery / source["path"]) != pin["treeSha256"]:
+            raise ValueError("The AOM source archive differs from the pinned file tree.")
+        extra_payload.append({"path": source["path"], "sha256": source["sha256"]})
+        if not any(item["path"] == pin["patch"] and item["sha256"] == pin["patchSha256"] for item in receipt["buildInputs"]):
+            raise ValueError("The pinned AOM source patch is missing.")
+        qualification = receipt.get("qualification", {})
+        tunes = qualification.get("aomPerceptualTunes", [])
+        if ({item.get("tune") for item in tunes} != {"iq", "ssimulacra2"} or
+                any(item.get("encodedFrameCount") != 4 or item.get("chromaSamplePosition") != "vertical" for item in tunes) or
+                len(qualification.get("files", [])) != 3):
+            raise ValueError("The AOM perceptual tunes lack native encode qualification.")
+        extra_payload.extend(qualification["files"])
+    elif identifier == "vpx":
+        pin = lock["vpx"]
+        if (source not in media["additionalSources"] and
+                {key: value for key, value in source.items() if not key.startswith("upstreamArchive")} not in media["additionalSources"]):
+            raise ValueError("The VPX source package differs from the shared media source.")
+        if (source.get("version") != "1.17.0-1" or source.get("upstreamArchivePath") != "source.tar.gz" or
+                source.get("upstreamArchiveSha256") != pin["sourceMemberSha256"]):
+            raise ValueError("The VPX upstream source archive differs from its pinned package member.")
+        extra_payload.append({"path": "source.tar.gz", "sha256": pin["sourceMemberSha256"]})
+        if not any(item["path"] == "vpx-diff-shim.sh" for item in receipt["buildInputs"]):
+            raise ValueError("The VPX configure shim is missing from the retained build inputs.")
+    else:
+        pin = lock["x265"]
+        if source not in media["additionalSources"] or source["base"] != pin["sourcePackage"] or source["version"] != "4.3-1":
+            raise ValueError("The x265 source differs from the shared media source.")
+        media_lock = json.loads((tools_root / "ffmpeg/build/scripts/package-ffmpeg-windows-lock.json").read_text(encoding="utf-8"))
+        binaries = [item for item in media_lock["packages"] if item["name"] == pin["package"]]
+        if len(binaries) != 1 or binaries[0] != {key: value for key, value in receipt["binaryPackage"].items() if key != "path"}:
+            raise ValueError("The x265 binary package differs from the shared compiler lock.")
+        extra_payload.append({"path": "binary-package.pkg.tar.zst", "sha256": binaries[0]["sha256"]})
+        if not receipt["licenses"] or any(item not in media["licenses"] for item in receipt["licenses"]):
+            raise ValueError("The x265 source notices differ from shared media notices.")
+    expected = {"build-provenance.json": digest(receipt_path)}
+    for item in [receipt["tool"], *extra_payload, *receipt["supportFiles"],
+                 *([] if identifier == "x265" else receipt["licenses"]), *receipt["buildInputs"]]:
+        path = desktop.relative_path(item["path"])
+        if str(path) in expected:
+            raise ValueError("The additional encoder receipt repeats a payload.")
+        expected[str(path).replace("\\", "/")] = item["sha256"]
+    actual = {item["path"]: item["sha256"] for item in desktop.inventory(delivery)}
+    if not receipt["buildInputs"] or not receipt["licenses"] or expected != actual:
+        raise ValueError("The additional encoder payload differs from its receipt.")
+    if digest(delivery / "standalone-tool-sources.json") != digest(ROOT / "scripts/standalone-tool-sources.json"):
+        raise ValueError("The additional encoder's copied source lock differs from the active lock.")
+    if identifier == "aom" and digest(delivery / lock["aom"]["patch"]) != lock["aom"]["patchSha256"]:
+        raise ValueError("The staged AOM patch differs from its pinned hash.")
+    executable = delivery / receipt["tool"]["path"]
+    switch = "--help" if identifier in {"aom", "vpx"} else "--version"
+    environment = os.environ.copy()
+    environment["PATH"] = str(delivery) + os.pathsep + str(Path(os.environ["SystemRoot"]) / "System32")
+    result = subprocess.run([str(executable), switch], env=environment, capture_output=True, text=True, timeout=20)
+    output = (result.stdout + result.stderr).strip()
+    marker = {"aom": "3.14.1", "vpx": "1.17.0", "x265": "4.3"}[identifier]
+    if marker not in output or (identifier == "x265" and output != receipt["tool"]["version"]):
+        raise ValueError("The additional encoder identity differs from its build receipt.")
+    if identifier in {"aom", "vpx"} and receipt["tool"]["version"] not in output:
+        raise ValueError("The encoder identity differs from its build receipt.")
+    directory = tools_root / tool_id
+    shutil.copytree(delivery, directory)
+    def prefix(item, folder):
+        return {**item, "path": folder + "/" + item["path"]}
+    runtime_notices = [item for item in media["licenses"] if any(
+        item["path"].startswith(f"licenses/{base}/") for base in runtime_bases)]
+    own_licenses = [] if identifier == "x265" else [prefix(item, tool_id) for item in receipt["licenses"]]
+    source_record = prefix(source, tool_id if own_source else "ffmpeg")
+    additional_sources = [prefix(item, "ffmpeg") for item in runtime]
+    if identifier == "vpx":
+        additional_sources.append(prefix({"path": "source.tar.gz", "sha256": lock["vpx"]["sourceMemberSha256"]}, tool_id))
+    build_inputs = [*[prefix(item, tool_id) for item in receipt["buildInputs"]],
+                    *[prefix(item, "ffmpeg") for item in media["buildInputs"]]]
+    if identifier == "x265":
+        build_inputs.append(prefix(receipt["binaryPackage"], tool_id))
+    return {**prefix(receipt["tool"], tool_id), "source": source_record,
+            "additionalSources": additional_sources,
+            "licenses": [*own_licenses, *[prefix(item, "ffmpeg") for item in [*runtime_notices, *([] if identifier != "x265" else receipt["licenses"])]]],
+            "buildInputs": build_inputs,
+            "supportFiles": [prefix(item, tool_id) for item in receipt["supportFiles"]],
+            "qualificationFiles": [prefix(item, tool_id) for item in receipt.get("qualification", {}).get("files", [])],
+            "buildProvenance": {"path": tool_id + "/build-provenance.json", "sha256": digest(receipt_path)}}
 
 
 def stage_av1an(delivery: Path, tools_root: Path, target: str) -> dict:
@@ -165,11 +297,11 @@ def download(url: str, expected: str, cache: Path) -> Path:
     return cached
 
 
-def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None) -> Path:
+def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None) -> Path:
     host = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "x86_64-unknown-linux-gnu" if sys.platform == "linux" else "unsupported"
     if target != host or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise ValueError("Stage and verify tools on the matching Windows x64 or Linux x64 host.")
-    if (x264_build or svt_build or av1an_build) and not ffmpeg_build:
+    if (x264_build or svt_build or av1an_build or aom_build or vpx_build or x265_build) and not ffmpeg_build:
         raise ValueError("Standalone encoders share verified source resources with the FFmpeg build.")
     if sys.platform == "win32":
         import ctypes
@@ -237,12 +369,15 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
         staged.append(stage_svt(svt_build.absolute(), tools_root, target))
     if av1an_build is not None:
         staged.append(stage_av1an(av1an_build.absolute(), tools_root, target))
+    for identifier, delivery in (("aom", aom_build), ("vpx", vpx_build), ("x265", x265_build)):
+        if delivery is not None:
+            staged.append(stage_extra_encoder(delivery.absolute(), tools_root, target, identifier))
     available = {tool["id"] for tool in staged}
     if "av1an" in available:
         available.update(("VapourSynth", "L-SMASH Works"))
     manifest = {"schemaVersion": 1, "target": target, "tools": staged,
                 "binaryManifestSha256": digest(forks_path), "sourceManifestSha256": digest(sources_path),
-                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
+                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "aomenc", "vpxenc", "x265", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
     (tools_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     config = destination / "tauri-tools.conf.json"
     config.write_text(json.dumps({"bundle": {"resources": {str(tools_root): "resources/tools/"}}}, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -258,8 +393,11 @@ def main() -> None:
     parser.add_argument("--x264-build", type=Path, help="Verified standalone x264 build sharing that media source delivery")
     parser.add_argument("--svt-build", type=Path, help="Verified mainline SVT-AV1 build sharing that media runtime source delivery")
     parser.add_argument("--av1an-build", type=Path, help="Verified portable av1an engine and source-complete frameserver delivery")
+    parser.add_argument("--aom-build", type=Path, help="Verified standalone AOM delivery")
+    parser.add_argument("--vpx-build", type=Path, help="Verified standalone VPX delivery")
+    parser.add_argument("--x265-build", type=Path, help="Verified standalone x265 delivery")
     args = parser.parse_args()
-    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build)}")
+    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build, args.aom_build, args.vpx_build, args.x265_build)}")
 
 
 if __name__ == "__main__":

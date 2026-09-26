@@ -111,9 +111,12 @@ export async function cancelFinishAction(): Promise<CompletionStatus> {
   requireDesktop();
   return invoke('cancel_finish_action');
 }
-export async function inspectSavedJob(path: string): Promise<SavedJobInspection> {
+export async function inspectSavedJob(
+  path: string,
+  svtBuild: VideoEncoder | null = null,
+): Promise<SavedJobInspection> {
   requireDesktop();
-  return invoke('inspect_saved_job', { path });
+  return invoke('inspect_saved_job', { path, svtBuild });
 }
 export async function exportSavedJob(path: string, request: EncodeRequest): Promise<string> {
   requireDesktop();

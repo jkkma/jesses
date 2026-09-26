@@ -92,7 +92,11 @@ def build_julek(destination, sources, cmake, cl, env, compiler):
     jxl = source / "thirdparty/libjxl"
     build = destination / "jxl-build"
     installed = source / "thirdparty/libjxl_build/install"
-    common = ["-G", "Ninja", f"-DCMAKE_C_COMPILER={cl}", f"-DCMAKE_CXX_COMPILER={cl}", f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded", "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW", "-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG", "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5", "-DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE", "-DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=TRUE"]
+    # MSVC expands __FILE__ to the absolute source path, and libjxl retains
+    # those diagnostics in julek.dll. Trim the private checkout prefix at
+    # compile time so the distributed DLL only contains source-relative paths.
+    trim_source = f"/d1trimfile:{destination}\\"
+    common = ["-G", "Ninja", f"-DCMAKE_C_COMPILER={cl}", f"-DCMAKE_CXX_COMPILER={cl}", f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded", "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW", f"-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG {trim_source}", f"-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG {trim_source}", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5", "-DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE", "-DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=TRUE"]
     flags = ["-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTING=OFF", "-DJPEGXL_ENABLE_BENCHMARK=OFF", "-DJPEGXL_ENABLE_EXAMPLES=OFF", "-DJPEGXL_ENABLE_FUZZERS=OFF", "-DJPEGXL_ENABLE_JNI=OFF", "-DJPEGXL_ENABLE_MANPAGES=OFF", "-DJPEGXL_ENABLE_OPENEXR=OFF", "-DJPEGXL_ENABLE_SJPEG=OFF", "-DJPEGXL_ENABLE_TOOLS=OFF", "-DJPEGXL_ENABLE_JPEGLI=OFF", "-DJPEGXL_ENABLE_PLUGINS=OFF", "-DJPEGXL_ENABLE_VIEWERS=OFF", "-DJPEGXL_ENABLE_SKCMS=ON", "-DJPEGXL_BUNDLE_SKCMS=ON", "-DCMAKE_DISABLE_FIND_PACKAGE_PNG=TRUE", "-DCMAKE_DISABLE_FIND_PACKAGE_JPEG=TRUE", "-DCMAKE_DISABLE_FIND_PACKAGE_OpenEXR=TRUE", f"-DCMAKE_INSTALL_PREFIX={installed}"]
     with (destination / "julek-build.log").open("x", encoding="utf-8") as log:
         support.run([cmake, "-S", jxl, "-B", build, *common, *flags], destination, env, log)
@@ -113,6 +117,9 @@ def finish(destination, archives, lock, binaries, compiler, compiler_receipt):
     for name, binary in binaries.items():
         output = delivery / "plugins" / binary.name
         shutil.copy2(binary, output)
+        payload = output.read_bytes().lower()
+        if any(marker in payload for marker in (str(destination).encode().lower(), b"c:\\users\\", b"/users/")):
+            raise ValueError(f"The {name} DLL embeds a local source or user path.")
         dump = subprocess.check_output([str(compiler / "ucrt64/bin/objdump.exe"), "-p", str(output)], text=True)
         dependencies = re.findall(r"DLL Name:\s*(\S+)", dump)
         if not dependencies or any(name.lower() not in allowed and not name.lower().startswith("api-ms-win-") for name in dependencies):
@@ -147,6 +154,7 @@ def main():
     parser.add_argument("--vapoursynth-source", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--cache", type=Path, default=Path("target/tool-download-cache"))
+    parser.add_argument("--reuse-vszip-build", type=Path, help="Reuse a fully verified pinned scorer delivery's unchanged vszip.dll")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise ValueError("This native recipe targets Windows x64.")
@@ -167,10 +175,23 @@ def main():
     zig = support.unpack(archives["zigBuild"], destination / "zig") / "zig.exe"
     cmake = support.unpack(archives["cmakeBuild"], destination / "cmake") / "bin/cmake.exe"
     env, cl, compiler_receipt = support.msvc_environment(compiler, args.python.resolve(strict=True))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        zip_future = pool.submit(build_zip, destination, sources, zig, env)
-        julek_future = pool.submit(build_julek, destination, sources, cmake, cl, env, compiler)
-        binaries = {"vszip": zip_future.result(), "julek": julek_future.result()}
+    if args.reuse_vszip_build:
+        scorer = load("verified_scorer", "add-package-av1an-scorers.py")
+        prior = args.reuse_vszip_build.resolve(strict=True)
+        receipt = scorer.checked(prior, ("plugins", "additionalSources", "licenses", "buildInputs"))
+        previous_sources = {record["component"]: record["sha256"] for record in receipt["additionalSources"]}
+        if previous_sources != {key: value["sha256"] for key, value in lock["inputs"].items() if key not in {"zigBuild", "cmakeBuild"}}:
+            raise ValueError("The reused scorer was not built from the pinned source closure.")
+        vszip = next((record for record in receipt["plugins"] if record["id"] == "vszip"), None)
+        if vszip is None or len(receipt["plugins"]) != 2:
+            raise ValueError("The reused scorer delivery is incomplete.")
+        shutil.copy2(prior / "build/vszip-local-dependencies.zon", destination / "vszip-local-dependencies.zon")
+        binaries = {"vszip": prior / vszip["path"], "julek": build_julek(destination, sources, cmake, cl, env, compiler)}
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            zip_future = pool.submit(build_zip, destination, sources, zig, env)
+            julek_future = pool.submit(build_julek, destination, sources, cmake, cl, env, compiler)
+            binaries = {"vszip": zip_future.result(), "julek": julek_future.result()}
     finish(destination, archives, lock, binaries, compiler, compiler_receipt)
 
 

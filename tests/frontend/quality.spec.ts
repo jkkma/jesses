@@ -59,17 +59,26 @@ async function setup(page: Page, hold = false) {
                 mock.release = resolve;
               });
             const request = payload.request as QualityRequest;
+            const step = request.options?.subsample ?? 1;
+            const frameCount = Math.ceil(request.frameCount / step);
             return {
               metric: request.metric,
-              frameCount: 2,
+              frameCount,
               score: 0.99,
-              points: [
-                { frame: 0, score: 1 },
-                { frame: 1, score: 0.98 },
-              ],
+              points: Array.from({ length: frameCount }, (_, i) => ({
+                frame: i * step,
+                score: i === 0 ? 1 : 0.98,
+              })),
               referenceFingerprint: 'reference',
               candidateFingerprint: 'candidate',
-              model: null,
+              model:
+                request.metric === 'vmaf'
+                  ? {
+                      standard: 'vmaf_v0.6.1',
+                      negative: 'vmaf_v0.6.1neg',
+                      fourK: 'vmaf_4k_v0.6.1',
+                    }[request.options?.vmafModel ?? 'standard']
+                  : null,
               message: 'Review these selected frames.',
             } satisfies QualityResult;
           }
@@ -123,6 +132,7 @@ test('quality comparison uses explicit source indices and intervals with keyboar
     candidateStartFrame: 12,
     frameCount: 2,
     metric: 'ssim',
+    options: { alignment: 'none', vmafModel: 'standard', subsample: 1, fixFrameRate: false },
   });
   await region.getByRole('slider', { name: 'Inspect comparison frame' }).focus();
   await page.keyboard.press('End');
@@ -165,4 +175,76 @@ test('closing cancels comparison and suppresses late scores', async ({ page }) =
   await disclosure.click();
   await expect(page.getByRole('img', { name: 'SSIM score by frame' })).toHaveCount(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('alignment, VMAF model, sampling and fixed-rate settings reach the immutable export', async ({
+  page,
+}) => {
+  await setup(page);
+  await page.getByRole('button', { name: /Compare video quality/ }).click();
+  const region = page.getByRole('region', { name: 'Quality comparison', exact: true });
+  await region.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
+  await region.getByRole('checkbox', { name: 'VMAF', exact: true }).check();
+  await region.getByText('Alignment and sampling', { exact: true }).click();
+  await region
+    .getByLabel('Reference alignment', { exact: true })
+    .selectOption('cropAndResizeReference');
+  await region.getByLabel('VMAF model', { exact: true }).selectOption('fourK');
+  await region.getByLabel('Score every Nth frame', { exact: true }).fill('5');
+  await region.getByLabel('Pair by frame number when timestamps differ').check();
+  await region.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(2);
+  expect(
+    (await calls(page, 'analyze_quality')).map(
+      (call) => (call.payload.request as QualityRequest).metric,
+    ),
+  ).toEqual(['ssim', 'vmaf']);
+  const request = (await calls(page, 'analyze_quality'))[1].payload.request as QualityRequest;
+  expect(request.options).toEqual({
+    alignment: 'cropAndResizeReference',
+    vmafModel: 'fourK',
+    subsample: 5,
+    fixFrameRate: true,
+  });
+  await region.getByRole('button', { name: /VMAF: 0.990/ }).click();
+  await region.getByRole('slider', { name: 'Inspect comparison frame' }).focus();
+  await page.keyboard.press('End');
+  await expect(region).toContainText('Frame 235: 0.980');
+  await region.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  const exported = (await calls(page, 'export_analysis'))[0].payload.request as {
+    report: { request: QualityRequest };
+  };
+  expect(exported.report.request).toEqual(request);
+  await region.getByLabel('VMAF model', { exact: true }).selectOption('negative');
+  await expect(region.getByRole('button', { name: 'Export CSV', exact: true })).toHaveCount(0);
+  await region.getByLabel('Score every Nth frame', { exact: true }).fill('1001');
+  await expect(
+    region.getByRole('button', { name: 'Compare selected frames', exact: true }),
+  ).toBeDisabled();
+});
+
+test('canceling a later metric preserves only completed score and its export', async ({ page }) => {
+  await setup(page, true);
+  await page.getByRole('button', { name: /Compare video quality/ }).click();
+  const region = page.getByRole('region', { name: 'Quality comparison', exact: true });
+  await region.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
+  await region.getByRole('checkbox', { name: 'PSNR', exact: true }).check();
+  await region.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(1);
+  await page.evaluate(() =>
+    (globalThis as unknown as { __qualityMock: Mock }).__qualityMock.release?.(),
+  );
+  await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(2);
+  await region.getByRole('button', { name: 'Cancel comparison', exact: true }).click();
+  await expect(region.getByRole('alert')).toContainText('1 completed score remains available');
+  await page.evaluate(() =>
+    (globalThis as unknown as { __qualityMock: Mock }).__qualityMock.release?.(),
+  );
+  await expect(region).toContainText('SSIM: 0.990000');
+  await expect(region).not.toContainText('PSNR: 0.990');
+  await region.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  const exported = (await calls(page, 'export_analysis'))[0].payload.request as {
+    report: { request: QualityRequest };
+  };
+  expect(exported.report.request.metric).toBe('ssim');
 });

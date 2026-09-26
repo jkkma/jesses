@@ -28,24 +28,38 @@ pub(in crate::jobs) fn validate_settings(settings: &EncodeSettings) -> Result<()
             "Use encoder threads 0–64, chunk attempts 1–10, scene slices 1–16, maximum chunk length 0–100000 (0 disables), a minimum scene length of 1–100000 not exceeding an enabled chunk limit, and an even scene height of 64–4320 or original resolution.",
         ));
     }
-    if settings.encoder.is_svt()
-        && options.pixel_format.is_some_and(|format| {
-            !matches!(
+    if options.pixel_format.is_some_and(|format| {
+        (settings.encoder.is_svt()
+            && !matches!(
                 format,
                 media_core::Av1anPixelFormat::Yuv420p | media_core::Av1anPixelFormat::Yuv420p10le
-            )
-        })
-    {
+            ))
+            || (settings.encoder == media_core::VideoEncoder::VpxStandalone
+                && matches!(
+                    format,
+                    media_core::Av1anPixelFormat::Yuv422p
+                        | media_core::Av1anPixelFormat::Yuv422p10le
+                ))
+    }) {
         return Err(invalid(
-            "SVT-AV1 accepts only 8-bit or 10-bit 4:2:0 output. x264 can also use 4:2:2 or 4:4:4.",
+            "SVT-AV1 accepts 4:2:0 output, VPX accepts 4:2:0 or 4:4:4, and AOM, x264, and x265 also accept 4:2:2; use 8-bit or 10-bit output.",
         ));
     }
-    let maximum_crf = if settings.encoder == media_core::VideoEncoder::X264 {
+    let maximum_crf = if matches!(
+        settings.encoder,
+        media_core::VideoEncoder::X264 | media_core::VideoEncoder::X265Standalone
+    ) {
         51
     } else {
         63
     };
-    let minimum_crf = if settings.encoder == media_core::VideoEncoder::X264 {
+    let minimum_crf = if matches!(
+        settings.encoder,
+        media_core::VideoEncoder::X264
+            | media_core::VideoEncoder::X265Standalone
+            | media_core::VideoEncoder::AomAv1
+            | media_core::VideoEncoder::VpxStandalone
+    ) {
         0
     } else {
         1

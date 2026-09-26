@@ -1,5 +1,5 @@
 //! Actual FFmpeg image ordering, export, no-clobber and cancellation gates.
-use media_core::{FrameRate, ImageOutput, ImageRequest};
+use media_core::{FrameRate, ImageOutput, ImagePixelFormat, ImageRequest};
 use media_runtime::{
     jobs::run_image_job,
     supervisor::{CommandSpec, run_capture},
@@ -89,6 +89,171 @@ async fn pixels(path: &Path) -> Vec<u8> {
         "-",
     ]));
     ffmpeg(a).await
+}
+
+async fn pixels_as(path: &Path, pixel_format: &str) -> Vec<u8> {
+    let mut a = args(&["-v", "error", "-i"]);
+    a.push(path.into());
+    a.extend(args(&[
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        pixel_format,
+        "-",
+    ]));
+    ffmpeg(a).await
+}
+
+async fn all_pixels_as(path: &Path, pixel_format: &str) -> Vec<u8> {
+    let mut a = args(&["-v", "error", "-i"]);
+    a.push(path.into());
+    a.extend(args(&[
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        pixel_format,
+        "-",
+    ]));
+    ffmpeg(a).await
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn explicit_png_depth_and_alpha_preserve_decoded_samples() {
+    let fixture = Fixture::new();
+    let raw = fixture.0.join("source.rgba64le");
+    let source = fixture.0.join("source.png");
+    let mut samples = Vec::new();
+    for index in 0..16u16 {
+        for channel in [
+            0x1234 + index,
+            0x5678 + index,
+            0x9abc + index,
+            0x3456 + index,
+        ] {
+            samples.extend(channel.to_le_bytes());
+        }
+    }
+    std::fs::write(&raw, &samples).unwrap();
+    let mut create = args(&[
+        "-v", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "rgba64le", "-s", "4x4", "-r",
+        "1", "-i",
+    ]);
+    create.push(raw.into());
+    create.extend(args(&[
+        "-frames:v",
+        "1",
+        "-c:v",
+        "png",
+        "-pix_fmt",
+        "rgba64be",
+    ]));
+    create.push(source.clone().into());
+    ffmpeg(create).await;
+    let source_bytes = std::fs::read(&source).unwrap();
+    let decoded = pixels_as(&source, "rgba64be").await;
+    assert_eq!(
+        &decoded[..8],
+        &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x34, 0x56]
+    );
+    let (_owner, cancel) = watch::channel(false);
+    for (format, expected_layout) in [
+        (ImagePixelFormat::Rgb24, "rgb24"),
+        (ImagePixelFormat::Rgba, "rgba"),
+        (ImagePixelFormat::Rgb48, "rgb48be"),
+        (ImagePixelFormat::Rgba64, "rgba64be"),
+    ] {
+        let output = fixture.0.join(format!("{:?}.png", format));
+        let result = run_image_job(
+            ImageRequest::Export {
+                input_path: source.to_string_lossy().into_owned(),
+                stream_index: 0,
+                start_frame: 0,
+                frame_count: 1,
+                format: ImageOutput::Png,
+                output_path: output.to_string_lossy().into_owned(),
+                width: None,
+                pixel_format: Some(format),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.frame_count, 1);
+        let mut probe_args = args(&[
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "json",
+            "-i",
+        ]);
+        probe_args.push(output.clone().into());
+        let probe = ffprobe(probe_args).await;
+        assert_eq!(probe["streams"][0]["pix_fmt"], expected_layout);
+        let result_bytes = pixels_as(&output, expected_layout).await;
+        assert_eq!(result_bytes, pixels_as(&source, expected_layout).await);
+        if format == ImagePixelFormat::Rgba64 {
+            assert_eq!(
+                &result_bytes[..8],
+                &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x34, 0x56]
+            );
+        }
+        if format == ImagePixelFormat::Rgba {
+            assert!(
+                result_bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 255 && pixel[3] != 0)
+            );
+        }
+    }
+    let imported = fixture.0.join("high-depth-sequence.mkv");
+    let result = run_image_job(
+        ImageRequest::ImportSequence {
+            paths: vec![source.to_string_lossy().into_owned(); 2],
+            frame_rate: FrameRate {
+                numerator: 24,
+                denominator: 1,
+            },
+            output_path: imported.to_string_lossy().into_owned(),
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.frame_count, 2);
+    let imported_pixels = all_pixels_as(&imported, "rgba64be").await;
+    assert_eq!(imported_pixels, [decoded.clone(), decoded.clone()].concat());
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    let invalid = fixture.0.join("not-alpha.jpg");
+    let error = run_image_job(
+        ImageRequest::Export {
+            input_path: source.to_string_lossy().into_owned(),
+            stream_index: 0,
+            start_frame: 0,
+            frame_count: 1,
+            format: ImageOutput::Jpeg,
+            output_path: invalid.to_string_lossy().into_owned(),
+            width: None,
+            pixel_format: Some(ImagePixelFormat::Rgba),
+        },
+        cancel,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "IMAGE_JOB_FAILED");
+    assert!(!invalid.exists());
 }
 
 #[tokio::test]
@@ -286,6 +451,7 @@ async fn explicit_image_order_round_trips_through_lossless_import_and_png_export
             format: ImageOutput::PngSequence,
             output_path: directory.to_string_lossy().into_owned(),
             width: None,
+            pixel_format: None,
         },
         cancel.clone(),
     )
@@ -309,6 +475,7 @@ async fn explicit_image_order_round_trips_through_lossless_import_and_png_export
             format: ImageOutput::PngSequence,
             output_path: directory.to_string_lossy().into_owned(),
             width: None,
+            pixel_format: None,
         },
         cancel,
     )
@@ -351,6 +518,7 @@ async fn gif_and_still_exports_decode_and_cancellation_never_publishes() {
                 format,
                 output_path: output.to_string_lossy().into_owned(),
                 width: Some(48),
+                pixel_format: None,
             },
             cancel.clone(),
         )
@@ -371,6 +539,7 @@ async fn gif_and_still_exports_decode_and_cancellation_never_publishes() {
             format: ImageOutput::PngSequence,
             output_path: output.to_string_lossy().into_owned(),
             width: None,
+            pixel_format: None,
         },
         cancel,
     )

@@ -32,7 +32,11 @@ leaves any same-name replacement created by another process untouched. Completed
 output is published after decoding checks.
 
 PNG retains full-color image output. JPEG is lossy. GIF uses a 256-color palette
-and centisecond timing, so its color and timing precision differ from video.
+and centisecond timing, so its color and timing precision differ from video and
+it cannot retain an alpha plane. For PNG stills and sequences, choose RGB or RGBA
+at 8 or 16 bits per channel when the source calls for it. An explicit selection
+is checked against the decoded PNG format and every frame's raw RGB and alpha
+samples before publication. JPEG and GIF do not accept this PNG-only setting.
 HDR input must first use the explicit HDR-to-SDR conversion in Quick Convert.
 
 The implementation uses FFmpeg's [image and concat formats](https://ffmpeg.org/ffmpeg-formats.html)

@@ -10,6 +10,9 @@ fn aom_color(value: u8, kind: &str) -> &'static str {
         ("primaries", 1) | ("transfer", 1) | ("matrix", 1) => "bt709",
         ("primaries", 5) | ("transfer", 5) | ("matrix", 5) => "bt470bg",
         ("primaries", 6) | ("transfer", 6) | ("matrix", 6) => "bt601",
+        ("primaries", 9) => "bt2020",
+        ("transfer", 16) => "smpte2084",
+        ("matrix", 9) => "bt2020ncl",
         _ => unreachable!("validated SDR color"),
     }
 }
@@ -28,9 +31,21 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     // AV1 Main profile carries both 8-bit and 10-bit 4:2:0. VP9 uses profile 2
     // for 10-bit 4:2:0. Y4M used to make aomenc repair the invalid AV1 profile
     // selection implicitly; raw input requires the correct profile up front.
-    let profile = match settings.encoder {
-        VideoEncoder::AomAv1 => 0,
-        VideoEncoder::VpxStandalone => u8::from(plan.output_bit_depth() == 10) * 2,
+    let chroma = if plan.output_pixel_format.contains("444") {
+        "444"
+    } else if plan.output_pixel_format.contains("422") {
+        "422"
+    } else {
+        "420"
+    };
+    let profile = match (settings.encoder, chroma, plan.output_bit_depth()) {
+        (VideoEncoder::AomAv1, "420", _) => 0,
+        (VideoEncoder::AomAv1, "444", _) => 1,
+        (VideoEncoder::AomAv1, "422", _) => 2,
+        (VideoEncoder::VpxStandalone, "420", 8) => 0,
+        (VideoEncoder::VpxStandalone, "444", 8) => 1,
+        (VideoEncoder::VpxStandalone, "420", 10) => 2,
+        (VideoEncoder::VpxStandalone, "444", 10) => 3,
         _ => unreachable!("standalone AOM/VPX encoder"),
     };
     let mut args: Vec<OsString> = vec![
@@ -65,19 +80,23 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                 )
                 .into(),
                 format!("--matrix-coefficients={}", aom_color(plan.matrix, "matrix")).into(),
-                format!(
-                    "--chroma-sample-position={}",
-                    match plan.chroma {
-                        "left" => "vertical",
-                        "topleft" => "colocated",
-                        _ => unreachable!("validated AOM chroma position"),
-                    }
-                )
-                .into(),
             ]);
-            if raw_i420(plan, settings) {
+            if chroma == "420" {
+                args.push(
+                    format!(
+                        "--chroma-sample-position={}",
+                        match plan.chroma {
+                            "left" => "vertical",
+                            "topleft" => "colocated",
+                            _ => unreachable!("validated AOM chroma position"),
+                        }
+                    )
+                    .into(),
+                );
+            }
+            if raw_video_input(plan, settings) {
                 args.extend([
-                    "--i420".into(),
+                    format!("--i{chroma}").into(),
                     format!("--width={}", plan.width).into(),
                     format!("--height={}", plan.height).into(),
                 ]);
@@ -89,16 +108,19 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         ]),
         _ => unreachable!("standalone AOM/VPX encoder"),
     }
+    if settings.encoder == VideoEncoder::AomAv1 {
+        args.extend(super::av1an::aom_grain_parameters(settings));
+    }
     args.extend(super::super::parameters::arguments(settings));
     args.push("-".into());
     args
 }
 
-/// AOM's high-bit-depth Y4M token does not distinguish left-positioned
-/// 4:2:0 from centered chroma. Feed raw I420 instead and bind the otherwise
-/// header-owned geometry, cadence and depth through explicit aomenc options.
-fn raw_i420(plan: &Plan, settings: &EncodeSettings) -> bool {
-    settings.encoder == VideoEncoder::AomAv1 && plan.output_bit_depth() > 8
+/// AOM's high-bit-depth 4:2:0 Y4M token cannot distinguish left from centered
+/// chroma. Raw input also avoids ambiguous non-4:2:0 Y4M geometry/format.
+fn raw_video_input(plan: &Plan, settings: &EncodeSettings) -> bool {
+    settings.encoder == VideoEncoder::AomAv1
+        && (plan.output_bit_depth() > 8 || !plan.output_pixel_format.contains("420"))
 }
 
 pub(super) fn configure_producer_output(
@@ -106,7 +128,7 @@ pub(super) fn configure_producer_output(
     plan: &Plan,
     settings: &EncodeSettings,
 ) -> bool {
-    if !raw_i420(plan, settings) {
+    if !raw_video_input(plan, settings) {
         return false;
     }
     let format = args
@@ -122,6 +144,7 @@ pub(super) fn validate_help(
     encoder: VideoEncoder,
     depth: u8,
     lossless: bool,
+    output_pixel_format: &str,
 ) -> Result<(), String> {
     let mut required = vec![
         "--ivf",
@@ -153,8 +176,18 @@ pub(super) fn validate_help(
     if lossless {
         required.push("--lossless");
     }
-    if encoder == VideoEncoder::AomAv1 && depth > 8 {
-        required.extend(["--i420", "--width", "--height"]);
+    if encoder == VideoEncoder::AomAv1 && (depth > 8 || !output_pixel_format.contains("420")) {
+        required.extend(["--width", "--height"]);
+        required.push(if output_pixel_format.contains("444") {
+            "--i444"
+        } else if output_pixel_format.contains("422") {
+            "--i422"
+        } else {
+            "--i420"
+        });
+    }
+    if encoder == VideoEncoder::VpxStandalone && output_pixel_format.contains("444") {
+        required.push("--i444");
     }
     if required.iter().any(|flag| {
         !help
@@ -203,18 +236,19 @@ mod tests {
         let aom = format!(
             "{common} --lossless=<arg> --color-primaries=<arg> --transfer-characteristics=<arg> --matrix-coefficients=<arg> --chroma-sample-position=<arg> --i420 --width=<arg> --height=<arg>"
         );
-        assert!(validate_help(&aom, VideoEncoder::AomAv1, 10, true).is_ok());
+        assert!(validate_help(&aom, VideoEncoder::AomAv1, 10, true, "yuv420p10le").is_ok());
         assert!(
             validate_help(
                 &aom.replace("--lossless=<arg>", ""),
                 VideoEncoder::AomAv1,
                 10,
-                true
+                true,
+                "yuv420p10le"
             )
             .is_err()
         );
         let vpx = format!("{common} --codec=<arg> --color-space=<arg>");
-        assert!(validate_help(&vpx, VideoEncoder::VpxStandalone, 8, false).is_ok());
+        assert!(validate_help(&vpx, VideoEncoder::VpxStandalone, 8, false, "yuv420p").is_ok());
     }
 
     #[test]

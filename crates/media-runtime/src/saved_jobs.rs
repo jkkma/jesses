@@ -3,6 +3,7 @@ use crate::jobs::files::Source;
 use media_core::{AppError, EncodeRequest, SavedJobInspection};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
+mod compatibility;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,20 +12,24 @@ struct SavedRequest {
     version: u32,
     request: EncodeRequest,
 }
-pub fn inspect_saved_job(path: String) -> Result<SavedJobInspection, AppError> {
+fn read_saved_job(path: &str) -> Result<Vec<u8>, AppError> {
     let source = Source::open(Path::new(&path))?;
     let mut bytes = Vec::new();
     std::fs::File::open(&source.path)
         .and_then(|f| f.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes))
-        .map_err(|e| AppError::new("SAVED_JOB_UNREADABLE", e.to_string(), Some(path.clone())))?;
+        .map_err(|e| AppError::new("SAVED_JOB_UNREADABLE", e.to_string(), Some(path.to_owned())))?;
     source.verify()?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err(AppError::new(
             "SAVED_JOB_TOO_LARGE",
             "Saved job files must be at most 4 MiB.",
-            Some(path),
+            Some(path.to_owned()),
         ));
     }
+    Ok(bytes)
+}
+pub fn inspect_saved_job(path: String) -> Result<SavedJobInspection, AppError> {
+    let bytes = read_saved_job(&path)?;
     let parsed = serde_json::from_slice::<SavedRequest>(&bytes)
         .ok()
         .filter(|s| s.format == "jesses-encode-request" && s.version == 1);
@@ -32,6 +37,40 @@ pub fn inspect_saved_job(path: String) -> Result<SavedJobInspection, AppError> {
         Some(saved)=>SavedJobInspection {path,compatible:true,message:"This file contains a saved encode request. It can start a new job after source, tools and destination are checked. Recovery is available only through this installation's verified job history.".into(),request:Some(saved.request)},
         None=>SavedJobInspection {path,compatible:false,message:"This saved job cannot be resumed here. Continue it in the application that created it. Its media, arguments and recovery files were left unchanged.".into(),request:None},
     })
+}
+
+/// Compatibility imports probe the original media before choosing stream indices.
+/// Engine workspaces are never opened, edited, executed or treated as our receipts.
+pub async fn inspect_saved_job_with_media(path: String) -> Result<SavedJobInspection, AppError> {
+    inspect_saved_job_with_encoder(path, None).await
+}
+
+pub async fn inspect_saved_job_with_encoder(
+    path: String,
+    svt_build: Option<media_core::VideoEncoder>,
+) -> Result<SavedJobInspection, AppError> {
+    let bytes = read_saved_job(&path)?;
+    if let Some(sidecar) = compatibility::parse(&bytes) {
+        let media = crate::probe_media(sidecar.file_path.clone()).await?;
+        let request = sidecar.request(&media, svt_build).and_then(|request| {
+            crate::jobs::validate_imported_settings(&request.settings)
+                .map_err(|error| error.message)?;
+            Ok(request)
+        });
+        return Ok(match request {
+            Ok(request) => SavedJobInspection {
+                path, compatible: true,
+                message: "Imported the supported AV1AN settings and original stream selection. Choose a new destination to start a new encode. The sidecar has no verifiable source/tool fingerprints, so completed chunks cannot be adopted; its recovery folder remains unchanged.".into(),
+                request: Some(request),
+            },
+            Err(reason) => SavedJobInspection {
+                path, compatible: false,
+                message: format!("This AV1AN sidecar was recognized, but its settings cannot be transferred exactly: {reason}"),
+                request: None,
+            },
+        });
+    }
+    inspect_saved_job(path)
 }
 pub fn export_saved_job(path: String, request: EncodeRequest) -> Result<String, AppError> {
     let p = Path::new(&path);

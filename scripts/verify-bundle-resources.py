@@ -52,7 +52,7 @@ def verify_resources(resources):
         raise ValueError("Unsupported extracted tool manifest.")
     records = {}
     for tool in manifest["tools"]:
-        payloads = [tool, tool["source"], *tool["licenses"], *tool.get("additionalSources", []), *tool.get("buildInputs", []), *tool.get("supportFiles", [])]
+        payloads = [tool, tool["source"], *tool["licenses"], *tool.get("additionalSources", []), *tool.get("buildInputs", []), *tool.get("supportFiles", []), *tool.get("qualificationFiles", [])]
         if "buildProvenance" in tool:
             payloads.append(tool["buildProvenance"])
         for record in payloads:
@@ -74,7 +74,7 @@ def main():
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--require-media", action="store_true")
-    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an"])
+    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an", "aomenc", "vpxenc", "x265"])
     args = parser.parse_args()
     packages = args.packages.resolve(strict=True)
     probe = args.probe.resolve(strict=True)

@@ -17,6 +17,7 @@ pub enum QtgmcPreset {
     Medium,
     Slow,
     Slower,
+    VerySlow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

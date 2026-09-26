@@ -5,7 +5,12 @@ mod filters;
 mod grain;
 mod launcher;
 pub(super) use filters::validate as validate_filters;
+pub(super) use grain::stage_standalone as stage_standalone_grain_table;
 pub(super) use grain::validate as validate_grain;
+pub(super) use grain::{
+    TABLE_NAME as GRAIN_TABLE_NAME, aom_parameters as aom_grain_parameters,
+    parameters as grain_parameters,
+};
 pub(super) mod encoder;
 mod metrics;
 mod options;

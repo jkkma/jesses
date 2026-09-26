@@ -65,6 +65,7 @@ pub enum Av1anPixelFormat {
     Yuv422p10le,
     Yuv444p,
     Yuv444p10le,
+    Yuva420p,
 }
 
 impl Av1anPixelFormat {
@@ -76,6 +77,7 @@ impl Av1anPixelFormat {
             Self::Yuv422p10le => "yuv422p10le",
             Self::Yuv444p => "yuv444p",
             Self::Yuv444p10le => "yuv444p10le",
+            Self::Yuva420p => "yuva420p",
         }
     }
 }

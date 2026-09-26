@@ -715,6 +715,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         .preview_encode_batch(BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             output_container: None,
@@ -791,6 +792,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         .preview_encode_batch(BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             output_container: None,

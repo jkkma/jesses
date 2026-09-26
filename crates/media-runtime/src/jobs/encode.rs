@@ -17,8 +17,20 @@ pub(in crate::jobs) fn standalone_x264_arguments(
 ) -> Vec<OsString> {
     x264::arguments(plan, settings)
 }
+pub(in crate::jobs) fn standalone_aom_vpx_arguments(
+    plan: &Plan,
+    settings: &EncodeSettings,
+) -> Vec<OsString> {
+    aom_vpx::arguments(plan, settings)
+}
 #[path = "x265.rs"]
 mod x265;
+pub(in crate::jobs) fn standalone_x265_arguments(
+    plan: &Plan,
+    settings: &EncodeSettings,
+) -> Vec<OsString> {
+    x265::arguments(plan, settings)
+}
 use super::*;
 pub use command_plan::preview_encode_plan;
 use media_core::VideoEncoder;
@@ -78,6 +90,18 @@ impl JobManager {
         })
         .await
         .map_err(|e| AppError::new("PREFLIGHT_FAILED", e.to_string(), None))??;
+        if settings.output_pixel_format == Some(media_core::Av1anPixelFormat::Yuva420p)
+            && !matches!(
+                container::format(&output)?,
+                media_core::ContainerFormat::Matroska | media_core::ContainerFormat::Webm
+            )
+        {
+            return Err(AppError::new(
+                "CONTAINER_INCOMPATIBLE",
+                "VP9 alpha output requires a Matroska (.mkv) or WebM (.webm) destination.",
+                None,
+            ));
+        }
         audio::validate_gain_source(&source, settings)?;
         if settings
             .av1an_options
@@ -207,6 +231,54 @@ impl JobManager {
             Some(&mux_settings),
         )?;
         let mut plan = Plan::build(&document, &selected, settings)?;
+        let mkvmerge = if settings.encoder == VideoEncoder::AomAv1
+            && plan.is_hdr10()
+            && mkvmerge.is_none()
+        {
+            Some(discover("mkvmerge", cancel).await.map_err(|_| {
+                AppError::new(
+                    "TOOL_MISSING",
+                    "Preserving HDR10 with AOM requires mkvmerge to carry mastering and content-light metadata. Install MKVToolNix and refresh Tools.",
+                    None,
+                )
+            })?)
+        } else {
+            mkvmerge
+        };
+        if settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10() {
+            let tool = mkvmerge.as_ref().expect("HDR10 AOM requires mkvmerge");
+            let result = supervisor::run_capture(
+                &CommandSpec {
+                    executable: tool.clone(),
+                    args: vec!["--help".into()],
+                    cwd: None,
+                },
+                cancel.clone(),
+                256 * 1024,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|error| process_error(error, tool))?;
+            let help = String::from_utf8_lossy(&result.stdout);
+            if !result.status.success()
+                || [
+                    "--chromaticity-coordinates",
+                    "--white-color-coordinates",
+                    "--max-luminance",
+                    "--min-luminance",
+                    "--max-content-light",
+                    "--max-frame-light",
+                ]
+                .iter()
+                .any(|flag| !help.contains(flag))
+            {
+                return Err(files::error(
+                    "ENCODER_CAPABILITY_UNSUPPORTED",
+                    "The selected mkvmerge cannot carry HDR10 mastering and content-light metadata for AOM output.",
+                    tool,
+                ));
+            }
+        }
         plan.check_temporal_tools(&ffmpeg, cancel).await?;
         audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
         if audio::converted(&mux_settings).any(|track| {
@@ -294,7 +366,7 @@ impl JobManager {
             super::av1an::validate_input(&document, &plan)?;
         }
         if !settings.encoder.is_svt() {
-            check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
+            check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
         let video = selected
             .iter()
@@ -329,7 +401,7 @@ impl JobManager {
             }).await;
         }
         if settings.encoder.is_svt() {
-            check_encoder_capabilities(&encoder, &plan, settings, cancel).await?;
+            check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
         let interval = settings
             .trim
@@ -927,6 +999,11 @@ impl JobManager {
             .as_ref()
             .or_else(|| scratch.last())
             .expect("owned encoded video intermediate");
+        let standalone_grain_table = if settings.backend == media_core::EncodeBackend::Standalone {
+            super::av1an::stage_standalone_grain_table(&output, &attempt_id, settings)?
+        } else {
+            None
+        };
         self.change(id, |snapshot| {
             append_log(
                 snapshot,
@@ -960,7 +1037,7 @@ impl JobManager {
             if settings.backend == media_core::EncodeBackend::Av1an {
                 let recovery = recovery.as_ref().expect("av1an recovery workspace");
                 if !recovery.finalizing {
-                    self.phase(id, JobState::Running, if settings.encoder == VideoEncoder::X264 { "av1an is detecting scenes and encoding parallel x264 chunks; selected audio settings will be applied afterward." } else { "av1an is detecting scenes and encoding parallel SVT-AV1 chunks; selected audio settings will be applied afterward." }).await;
+                    self.phase(id, JobState::Running, &format!("av1an is detecting scenes and encoding parallel {} chunks; selected audio settings will be applied afterward.", settings.encoder.name())).await;
                     self.encode_av1an(
                         id,
                         av1an_input.as_deref().expect("prepared av1an input"),
@@ -1014,6 +1091,22 @@ impl JobManager {
                     args: consumer_arguments(&plan, settings),
                     cwd: None,
                 };
+                if let Some(table) = &standalone_grain_table {
+                    let name = super::av1an::GRAIN_TABLE_NAME;
+                    for index in 0..consumer.args.len() {
+                        if consumer.args[index] == "--fgs-table"
+                            && consumer.args.get(index + 1) == Some(&OsString::from(name))
+                        {
+                            consumer.args[index + 1] = table.path().as_os_str().to_owned();
+                        } else if consumer.args[index]
+                            == OsString::from(format!("--film-grain-table={name}"))
+                        {
+                            let mut argument = OsString::from("--film-grain-table=");
+                            argument.push(table.path().as_os_str());
+                            consumer.args[index] = argument;
+                        }
+                    }
+                }
                 let raw_aom_input =
                     aom_vpx::configure_producer_output(&mut producer.args, &plan, settings);
                 self.phase(id, JobState::Running, match settings.encoder {
@@ -1171,16 +1264,19 @@ impl JobManager {
                         .await;
                 }
             }
-            let needs_timing_wrapper = matches!(
-                settings.encoder,
-                VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
-            );
+            let needs_timing_wrapper = (settings.backend == media_core::EncodeBackend::Standalone
+                && matches!(
+                    settings.encoder,
+                    VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
+                ))
+                || (settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10());
             let wrapped_timed = if needs_timing_wrapper {
                 if let Some(saved) = standalone_timed.take() {
-                    let encoder_name = if settings.encoder == VideoEncoder::X265Standalone {
-                        "x265"
-                    } else {
-                        "vpxenc"
+                    let encoder_name = match settings.encoder {
+                        VideoEncoder::X265Standalone => "x265",
+                        VideoEncoder::VpxStandalone => "vpxenc",
+                        VideoEncoder::AomAv1 => "aomenc",
+                        _ => unreachable!("validated timing wrapper"),
                     };
                     self.change(id, |snapshot| {
                     append_log(
@@ -1194,10 +1290,11 @@ impl JobManager {
                     check_cancel(cancel)?;
                     source.verify()?;
                     intermediate.flush_nonempty_async().await?;
-                    let encoder_name = if settings.encoder == VideoEncoder::X265Standalone {
-                        "x265"
-                    } else {
-                        "vpxenc"
+                    let encoder_name = match settings.encoder {
+                        VideoEncoder::X265Standalone => "x265",
+                        VideoEncoder::VpxStandalone => "vpxenc",
+                        VideoEncoder::AomAv1 => "aomenc",
+                        _ => unreachable!("validated timing wrapper"),
                     };
                     let mut wrapped =
                         Temporary::create(&output, &format!("{attempt_id}-{encoder_name}-timed"))?;
@@ -1207,6 +1304,8 @@ impl JobManager {
                 JobState::Running,
                 if settings.encoder == VideoEncoder::X265Standalone {
                     "Assigning the exact rational frame rate and B-frame presentation order with mkvmerge."
+                } else if settings.encoder == VideoEncoder::AomAv1 {
+                    "Carrying verified HDR10 mastering and content-light metadata through mkvmerge."
                 } else {
                     "Replacing vpxenc's normalized IVF rate with the validated exact rational frame rate using mkvmerge."
                 },
@@ -1218,11 +1317,18 @@ impl JobManager {
                     let result = supervisor::run(
                         &CommandSpec {
                             executable: mkvmerge.as_ref().expect("x265 timing dependency").clone(),
-                            args: x265::mkvmerge_arguments(
-                                &intermediate.path,
-                                &wrapped.path,
-                                &plan,
-                            ),
+                            args: {
+                                let mut args = x265::mkvmerge_arguments(
+                                    &intermediate.path,
+                                    &wrapped.path,
+                                    &plan,
+                                );
+                                if settings.encoder == VideoEncoder::AomAv1 {
+                                    let metadata = plan.aom_hdr_mkvmerge_arguments();
+                                    args.splice(args.len() - 1..args.len() - 1, metadata);
+                                }
+                                args
+                            },
                             cwd: None,
                         },
                         cancel.clone(),
@@ -1285,17 +1391,17 @@ impl JobManager {
                             &wrapped.path,
                         ));
                     }
-                    let summary = standalone_recovery
-                        .as_mut()
-                        .expect("standalone recovery")
-                        .checkpoint_video(
-                            &wrapped,
-                            media_core::StandaloneRecoveryPhase::TimingWrapComplete,
-                            cancel,
-                        )
-                        .await?;
-                    self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
-                        .await;
+                    if let Some(recovery) = standalone_recovery.as_mut() {
+                        let summary = recovery
+                            .checkpoint_video(
+                                &wrapped,
+                                media_core::StandaloneRecoveryPhase::TimingWrapComplete,
+                                cancel,
+                            )
+                            .await?;
+                        self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
+                            .await;
+                    }
                     Some(wrapped)
                 }
             } else {
@@ -1467,7 +1573,45 @@ impl JobManager {
                     .await;
             }
         }
-        if settings.lossless {
+        if plan.has_alpha() {
+            self.phase(
+                id,
+                JobState::Finalizing,
+                "Verifying every VP9 alpha frame with the libvpx decoder before publication.",
+            )
+            .await;
+            let reference = CommandSpec {
+                executable: ffmpeg.clone(),
+                args: decoder_args(&source.path, &plan),
+                cwd: None,
+            };
+            let mut candidate_args = decoder_args_preprocessed(&temp.path, &plan);
+            let map = candidate_args
+                .iter()
+                .position(|argument| argument == "-map")
+                .expect("decoder stream map");
+            candidate_args[map + 1] = format!("0:{video_position}").into();
+            let candidate = CommandSpec {
+                executable: ffmpeg.clone(),
+                args: candidate_args,
+                cwd: None,
+            };
+            let evidence = super::alpha::verify(
+                &reference,
+                &candidate,
+                plan.width,
+                plan.height,
+                frame_count,
+                settings.lossless,
+                &temp.path,
+                cancel,
+            )
+            .await?;
+            source.verify()?;
+            self.change(id, |snapshot| append_log(snapshot, evidence))
+                .await;
+        }
+        if settings.lossless && !plan.has_alpha() {
             self.phase(id, JobState::Finalizing, "Comparing every decoded lossless pixel against the processed encoder input before publication.").await;
             let prepared_path = qtgmc
                 .as_ref()
@@ -1549,6 +1693,13 @@ impl JobManager {
                 denominator: plan.fps_den,
                 frames: frame_count,
             }),
+            plan.has_alpha().then_some((
+                &plan,
+                ffmpeg.as_path(),
+                video_position,
+                frame_count,
+                settings.lossless,
+            )),
             scratch,
         )
         .await?;
@@ -1716,7 +1867,17 @@ async fn frame_scan(
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(8);
-    let args = frame_scan_args(input, stream.index, threads);
+    let mut args = frame_scan_args(input, stream.index, threads);
+    if !encoded && plan.source_is_vp9_alpha() {
+        let input_position = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("frame scan input");
+        args.splice(
+            input_position..input_position,
+            ["-c:v".into(), "libvpx-vp9".into()],
+        );
+    }
     let mut validation = Validation::new(plan.clone(), stream.clone(), encoded);
     let output = supervisor::run_streaming_stdout(
         &CommandSpec {
@@ -1811,7 +1972,51 @@ async fn validate_video_checkpoint(
     expected_frames: usize,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
-    let document = probe(ffprobe, &checkpoint.path, cancel, Some(&[0])).await?;
+    let document = if plan.encoder == VideoEncoder::X265Standalone {
+        // Raw HEVC has no presentation timestamps until mkvmerge assigns the
+        // verified rational clock. Probe its codec and color fields here,
+        // then require exact decoded frame count before the timing wrapper.
+        let result = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffprobe.to_owned(),
+                args: [
+                    "-v",
+                    "error",
+                    "-show_streams",
+                    "-show_format",
+                    "-of",
+                    "json",
+                    "-i",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain([checkpoint.path.as_os_str().to_owned()])
+                .collect(),
+                cwd: None,
+            },
+            cancel.clone(),
+            512 * 1024,
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| process_error(error, &checkpoint.path))?;
+        if !result.status.success() {
+            return Err(files::error(
+                "ENCODE_VALIDATION_FAILED",
+                "The raw HEVC checkpoint could not be inspected before timing is assigned.",
+                &checkpoint.path,
+            ));
+        }
+        serde_json::from_slice::<metadata::Document>(&result.stdout).map_err(|error| {
+            files::error(
+                "PROBE_INVALID_RESPONSE",
+                error.to_string(),
+                &checkpoint.path,
+            )
+        })?
+    } else {
+        probe(ffprobe, &checkpoint.path, cancel, Some(&[0])).await?
+    };
     let encoded = document.streams.first().ok_or_else(|| {
         files::error(
             "ENCODE_VALIDATION_FAILED",
@@ -1904,12 +2109,18 @@ pub(super) fn decoder_args_preprocessed(input: &Path, plan: &Plan) -> Vec<OsStri
         plan.output_pixel_format.into(),
         "-color_range".into(),
         if plan.full_range { "pc" } else { "tv" }.into(),
-        "-strict".into(),
-        "-1".into(),
-        "-f".into(),
-        "yuv4mpegpipe".into(),
-        "pipe:1".into(),
     ]);
+    if plan.has_alpha() {
+        args.extend(["-f".into(), "rawvideo".into(), "pipe:1".into()]);
+    } else {
+        args.extend([
+            "-strict".into(),
+            "-1".into(),
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "pipe:1".into(),
+        ]);
+    }
     args
 }
 
@@ -1935,6 +2146,9 @@ fn decoder_args_with_subtitles(
     .map(OsString::from)
     .collect();
     args.extend(plan.tone_map_device_args());
+    if plan.source_is_vp9_alpha() {
+        args.extend(["-c:v".into(), "libvpx-vp9".into()]);
+    }
     args.push("-i".into());
     args.push(input.as_os_str().to_owned());
     if let Some((path, bitmap, offset)) = bitmap {
@@ -1995,15 +2209,21 @@ fn decoder_args_with_subtitles(
             plan.output_pixel_format,
             "-color_range",
             if plan.full_range { "pc" } else { "tv" },
-            "-strict",
-            "-1",
-            "-f",
-            "yuv4mpegpipe",
-            "pipe:1",
         ]
         .into_iter()
         .map(OsString::from),
     );
+    if plan.has_alpha() {
+        args.extend(["-f".into(), "rawvideo".into(), "pipe:1".into()]);
+    } else {
+        args.extend([
+            "-strict".into(),
+            "-1".into(),
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "pipe:1".into(),
+        ]);
+    }
     args
 }
 
@@ -2090,6 +2310,7 @@ fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<Os
         .map(OsString::from)
         .collect();
     args.extend(encoder_parameters(plan, settings));
+    super::av1an::grain_parameters(&mut args, settings);
     args.push("-b".into());
     args.push(output.as_os_str().to_owned());
     args
@@ -2110,8 +2331,88 @@ fn consumer_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
     }
 }
 
+/// av1an's Y4M pipe uses generic 4:2:0 tokens that do not carry source chroma
+/// siting. Test the selected aomenc with exactly that token and the explicit
+/// left-position flag before creating a resumable encoding workspace.
+async fn check_av1an_aom_y4m(
+    encoder: &Path,
+    output: &Path,
+    depth: u8,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    use std::io::Write;
+    let id = format!(
+        "aom-y4m-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let input = Temporary::create_extension(output, &id, "y4m")?;
+    let mut bytes = format!(
+        "YUV4MPEG2 W64 H64 F24:1 Ip A1:1 C{}\nFRAME\n",
+        if depth == 10 { "420p10" } else { "420" }
+    )
+    .into_bytes();
+    if depth == 10 {
+        for (sample, count) in [(64u16, 64 * 64), (512u16, 2 * 32 * 32)] {
+            for _ in 0..count {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+    } else {
+        bytes.extend(std::iter::repeat_n(16u8, 64 * 64));
+        bytes.extend(std::iter::repeat_n(128u8, 2 * 32 * 32));
+    }
+    let mut file = input.clone_file()?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            files::error(
+                "ENCODER_CAPABILITY_UNSUPPORTED",
+                error.to_string(),
+                &input.path,
+            )
+        })?;
+    drop(file);
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: encoder.to_owned(),
+            args: vec![
+                "--ivf".into(),
+                "--output=-".into(),
+                "--passes=1".into(),
+                "--end-usage=q".into(),
+                "--cq-level=63".into(),
+                "--cpu-used=8".into(),
+                "--profile=0".into(),
+                format!("--bit-depth={depth}").into(),
+                format!("--input-bit-depth={depth}").into(),
+                "--chroma-sample-position=vertical".into(),
+                "--disable-warning-prompt".into(),
+                input.path.as_os_str().to_owned(),
+            ],
+            cwd: None,
+        },
+        cancel.clone(),
+        128 * 1024,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|error| process_error(error, encoder))?;
+    if !result.status.success() || !result.stdout.starts_with(b"DKIF") {
+        return Err(files::error(
+            "ENCODER_CAPABILITY_UNSUPPORTED",
+            format!(
+                "The selected aomenc cannot encode {depth}-bit av1an Y4M with explicitly left-positioned chroma. Install a compatible aomenc build and refresh Tools."
+            ),
+            encoder,
+        ));
+    }
+    Ok(())
+}
+
 async fn check_encoder_capabilities(
     encoder: &Path,
+    output: &Path,
     plan: &Plan,
     settings: &EncodeSettings,
     cancel: &watch::Receiver<bool>,
@@ -2138,11 +2439,8 @@ async fn check_encoder_capabilities(
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        let capabilities = ffmpeg_video::validate_help(
-            &help,
-            settings.encoder,
-            ffmpeg_video::encoder_pixel_format(settings.encoder, plan.output_bit_depth()),
-        );
+        let capabilities =
+            ffmpeg_video::validate_help(&help, settings.encoder, ffmpeg_video::output_format(plan));
         super::parameters::check_help(encoder, settings, &help, cancel).await?;
         if !result.status.success() || capabilities.is_err() {
             return Err(files::error(
@@ -2273,6 +2571,7 @@ async fn check_encoder_capabilities(
             settings.encoder,
             plan.output_bit_depth(),
             settings.lossless,
+            plan.output_pixel_format,
         );
         if !result.status.success() || capabilities.is_err() {
             return Err(files::error(
@@ -2282,6 +2581,35 @@ async fn check_encoder_capabilities(
                 }),
                 encoder,
             ));
+        }
+        if settings.encoder == VideoEncoder::AomAv1
+            && (settings.film_grain > 0 || settings.av1an_grain.is_some())
+        {
+            let table = settings
+                .av1an_grain
+                .as_ref()
+                .is_some_and(|grain| grain.table.is_some());
+            let denoise = settings
+                .av1an_grain
+                .as_ref()
+                .is_some_and(|grain| grain.denoise);
+            if (table && !help.contains("--film-grain-table="))
+                || ((!table || denoise) && !help.contains("--denoise-noise-level="))
+                || (denoise && !help.contains("--enable-dnl-denoising="))
+            {
+                return Err(files::error(
+                    "ENCODER_CAPABILITY_UNSUPPORTED",
+                    "The selected aomenc does not advertise the requested grain table or denoising options.",
+                    encoder,
+                ));
+            }
+        }
+        if settings.backend == media_core::EncodeBackend::Av1an
+            && settings.encoder == VideoEncoder::AomAv1
+            && plan.chroma == "left"
+            && plan.output_pixel_format.contains("420")
+        {
+            check_av1an_aom_y4m(encoder, output, plan.output_bit_depth(), cancel).await?;
         }
         return Ok(());
     }
@@ -2295,6 +2623,17 @@ async fn check_encoder_capabilities(
                 capabilities.err().unwrap_or_else(|| {
                     "The installed x265 CLI failed its capability check.".into()
                 }),
+                encoder,
+            ));
+        }
+        if plan.is_hdr10()
+            && (!(help.contains("--hdr10") || help.contains("--[no-]hdr10"))
+                || !help.contains("--master-display")
+                || !help.contains("--max-cll"))
+        {
+            return Err(files::error(
+                "ENCODER_CAPABILITY_UNSUPPORTED",
+                "The selected x265 does not advertise HDR10 mastering and content-light SEI options.",
                 encoder,
             ));
         }
@@ -2497,6 +2836,12 @@ fn mux_args(
                 format!("-chroma_sample_location:{index}").into(),
                 plan.chroma.into(),
             ]);
+            if plan.has_alpha() {
+                // Stream metadata is copied from the original input above.
+                // The encoded VP9 alpha flag must be explicitly restored after
+                // that copy so the final Matroska advertises its alpha blocks.
+                args.extend([format!("-metadata:s:{index}").into(), "alpha_mode=1".into()]);
+            }
         }
         if stream.index == plan.video_index || converted_audio.is_some() {
             // Keep descriptive tags, but source bitrate/frame/byte statistics

@@ -69,12 +69,15 @@ fn validate(report: &AnalysisReport) -> Result<(), AppError> {
                     .all(|p| p[0].start_seconds < p[1].start_seconds)
         }
         AnalysisReport::Quality { request, result } => {
+            let options = request.options.clone().unwrap_or_default();
+            let step = options.subsample;
             [&request.reference_path, &request.candidate_path]
                 .into_iter()
                 .all(|p| !p.is_empty() && text_valid(p, 32768))
                 && request.metric == result.metric
-                && request.frame_count == result.frame_count
-                && (1..=60000).contains(&result.frame_count)
+                && (1..=60000).contains(&request.frame_count)
+                && (1..=1000).contains(&step)
+                && result.frame_count == request.frame_count.div_ceil(step)
                 && result.points.len() == result.frame_count as usize
                 && fingerprint(&result.reference_fingerprint)
                 && fingerprint(&result.candidate_fingerprint)
@@ -83,18 +86,18 @@ fn validate(report: &AnalysisReport) -> Result<(), AppError> {
                 && result.score.is_none_or(finite)
                 && (result.score.is_some() || result.metric == QualityMetric::Psnr)
                 && result.points.iter().enumerate().all(|(i, p)| {
-                    p.frame as usize == i
+                    u32::try_from(i).ok().and_then(|i| i.checked_mul(step)) == Some(p.frame)
                         && p.score.is_none_or(finite)
                         && (p.score.is_some() || result.metric == QualityMetric::Psnr)
                 })
                 && request
                     .reference_start_frame
-                    .checked_add(result.frame_count)
-                    .is_some()
+                    .checked_add(request.frame_count)
+                    .is_some_and(|end| end <= 1_000_000)
                 && request
                     .candidate_start_frame
-                    .checked_add(result.frame_count)
-                    .is_some()
+                    .checked_add(request.frame_count)
+                    .is_some_and(|end| end <= 1_000_000)
         }
     };
     if okay {
@@ -127,14 +130,20 @@ fn metadata(report: &AnalysisReport) -> Vec<(&'static str, String)> {
             ("average_megabits_per_second",result.average_megabits_per_second.map_or_else(|| "unknown".into(),|v|v.to_string())),
             ("peak_window_megabits_per_second",result.peak_window_megabits_per_second.to_string()),
             ("payload_scope","Compressed packets only; container overhead excluded. Windows use their full width.".into())],
-        AnalysisReport::Quality { request, result } => vec![
+        AnalysisReport::Quality { request, result } => {
+            let options = request.options.clone().unwrap_or_default();
+            vec![
             ("analysis",metric_name(result.metric).into()),("reference_path",request.reference_path.clone()),
             ("candidate_path",request.candidate_path.clone()),("reference_fingerprint",result.reference_fingerprint.clone()),
             ("candidate_fingerprint",result.candidate_fingerprint.clone()),("reference_stream_index",request.reference_stream_index.to_string()),
             ("candidate_stream_index",request.candidate_stream_index.to_string()),("reference_start_frame",request.reference_start_frame.to_string()),
             ("candidate_start_frame",request.candidate_start_frame.to_string()),("frame_count",result.frame_count.to_string()),
+            ("requested_frame_count",request.frame_count.to_string()),("scored_frame_count",result.frame_count.to_string()),
+            ("sample_step",options.subsample.to_string()),("reference_alignment",format!("{:?}",options.alignment)),
+            ("fixed_rate_pairing",options.fix_frame_rate.to_string()),("measurement_details",result.message.clone()),
             ("aggregate_score",score(result.score)),("model",result.model.clone().unwrap_or_default()),
-            ("pairing","Explicit corresponding frame intervals. Scores apply only to this interval.".into())],
+            ("pairing","Explicit corresponding frame intervals. Scores apply only to this interval.".into())]
+        },
     }
 }
 
@@ -353,10 +362,13 @@ pub fn export_analysis(request: AnalysisExportRequest) -> Result<String, AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use media_core::{QualityPoint, QualityRequest, QualityResult};
+    use media_core::{
+        QualityAlignment, QualityOptions, QualityPoint, QualityRequest, QualityResult,
+    };
     fn report() -> AnalysisReport {
         AnalysisReport::Quality {
             request: QualityRequest {
+                options: None,
                 reference_path: "=unsafe<source>\".mkv".into(),
                 reference_stream_index: 4,
                 reference_start_frame: 120,
@@ -406,6 +418,34 @@ mod tests {
         assert!(svg.contains("<circle cx=\"90.000\" cy=\"585.000\""));
         assert!(svg.contains("<circle cx=\"1140.000\" cy=\"135.000\""));
         assert_eq!(svg.matches("<circle ").count(), 2);
+    }
+    #[test]
+    fn sampled_quality_exports_keep_original_frame_numbers_and_selected_settings() {
+        let mut report = report();
+        let AnalysisReport::Quality { request, result } = &mut report else {
+            unreachable!()
+        };
+        request.frame_count = 7;
+        request.options = Some(QualityOptions {
+            alignment: QualityAlignment::CropAndResizeReference,
+            subsample: 3,
+            fix_frame_rate: true,
+            ..QualityOptions::default()
+        });
+        result.points[1].frame = 3;
+        result.points[2].frame = 6;
+        validate(&report).unwrap();
+        let csv = csv(&report);
+        assert!(csv.contains("\"requested_frame_count\",\"7\""));
+        assert!(csv.contains("\"sample_step\",\"3\""));
+        assert!(csv.contains("\"reference_alignment\",\"CropAndResizeReference\""));
+        assert!(csv.contains("\"fixed_rate_pairing\",\"true\""));
+        assert!(csv.contains("3,123,15,infinity\r\n"));
+        let AnalysisReport::Quality { result, .. } = &mut report else {
+            unreachable!()
+        };
+        result.points[2].frame = 5;
+        assert!(validate(&report).is_err());
     }
     #[test]
     fn saved_analysis_json_retains_the_measured_float_bits() {

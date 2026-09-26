@@ -1,0 +1,28 @@
+diff --git a/common/y4minput.c b/common/y4minput.c
+index 038912e..e4addc0 100644
+--- a/common/y4minput.c
++++ b/common/y4minput.c
+@@ -885,14 +885,19 @@ int y4m_input_open(y4m_input *y4m_ctx, FILE *file, char *skip_buffer,
+             "Only progressive scan handled.\n");
+     return -1;
+   }
+-  /* Only support vertical chroma sample position if the input format is
+-   * already 420mpeg2. Colocated is not supported in Y4M.
++  /* Y4M 420, 420jpeg and 420p10 do not reliably describe the source chroma
++   * siting after a frameserver has written them. Honor an explicit vertical
++   * position for these native I420 input paths; the caller must know the siting.
++   * Colocated is not supported in Y4M.
+    */
+   if (csp == AOM_CSP_VERTICAL &&
+-      strcmp(y4m_ctx->chroma_type, "420mpeg2") != 0) {
++      strcmp(y4m_ctx->chroma_type, "420mpeg2") != 0 &&
++      strcmp(y4m_ctx->chroma_type, "420") != 0 &&
++      strcmp(y4m_ctx->chroma_type, "420jpeg") != 0 &&
++      strcmp(y4m_ctx->chroma_type, "420p10") != 0) {
+     fprintf(stderr,
+             "Vertical chroma sample position only supported "
+-            "for 420mpeg2 input\n");
++            "for 420, 420jpeg, 420mpeg2 or 420p10 input\n");
+     return -1;
+   }
+   if (csp == AOM_CSP_COLOCATED) {

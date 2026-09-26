@@ -4,7 +4,10 @@ use crate::{
     jobs::files::Source,
     supervisor::{CommandSpec, SupervisorError, run_capture, run_streaming_stdout},
 };
-use media_core::{AppError, QualityMetric, QualityPoint, QualityRequest, QualityResult};
+use media_core::{
+    AppError, QualityAlignment, QualityMetric, QualityPoint, QualityRequest, QualityResult,
+    QualityVmafModel,
+};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -39,6 +42,27 @@ fn args(values: &[&str]) -> Vec<OsString> {
 struct FrameScan {
     pts: Vec<f64>,
     geometry: BTreeMap<String, String>,
+    width: u32,
+    height: u32,
+    sar: (u32, u32),
+}
+fn parse_sar(value: &str) -> Result<(u32, u32), String> {
+    if value == "N/A" {
+        return Ok((1, 1));
+    }
+    let (n, d) = value
+        .split_once(':')
+        .ok_or("Invalid sample aspect ratio.")?;
+    let (n, d) = (
+        n.parse::<u32>()
+            .map_err(|_| "Invalid sample aspect ratio.")?,
+        d.parse::<u32>()
+            .map_err(|_| "Invalid sample aspect ratio.")?,
+    );
+    if n == 0 || d == 0 || f64::from(n) / f64::from(d) > 100.0 {
+        return Err("Invalid sample aspect ratio.".into());
+    }
+    Ok((n, d))
 }
 fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameScan, String> {
     let mut reader = BufReader::new(reader);
@@ -90,11 +114,15 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
             {
                 return Err("Quality inputs need strictly increasing timestamps.".into());
             }
-            if fields.get("interlaced_frame").map(String::as_str) != Some("0")
-                || fields.get("sample_aspect_ratio").map(String::as_str) != Some("1:1")
-            {
-                return Err("Quality inputs need progressive square-pixel video.".into());
+            if fields.get("interlaced_frame").map(String::as_str) != Some("0") {
+                return Err("Quality inputs need progressive video.".into());
             }
+            parse_sar(
+                fields
+                    .get("sample_aspect_ratio")
+                    .map(String::as_str)
+                    .ok_or("Missing sample aspect ratio.")?,
+            )?;
             let width = fields
                 .get("width")
                 .and_then(|s| s.parse::<u32>().ok())
@@ -153,9 +181,24 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
     if pts.len() != count as usize {
         return Err("The selected interval extends beyond the decoded video.".into());
     }
+    let mut geometry = geometry.ok_or("No decoded video frames.")?;
+    let width = geometry
+        .remove("width")
+        .unwrap()
+        .parse()
+        .map_err(|_| "Invalid width.")?;
+    let height = geometry
+        .remove("height")
+        .unwrap()
+        .parse()
+        .map_err(|_| "Invalid height.")?;
+    let sar = parse_sar(&geometry.remove("sample_aspect_ratio").unwrap())?;
     Ok(FrameScan {
         pts,
-        geometry: geometry.ok_or("No decoded video frames.")?,
+        geometry,
+        width,
+        height,
+        sar,
     })
 }
 async fn inspect(
@@ -353,11 +396,236 @@ fn psnr_summary(stderr: &[u8]) -> Result<Option<f64>, AppError> {
         .map(Some)
         .ok_or_else(|| fail("Invalid pooled PSNR value."))
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Crop {
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+}
+
+fn parse_crop(line: &str, width: u32, height: u32) -> Option<Crop> {
+    let value = line.split("crop=").nth(1)?.split_whitespace().next()?;
+    let values: Vec<_> = value.split(':').map(str::parse::<u32>).collect();
+    let [Ok(w), Ok(h), Ok(x), Ok(y)] = values.as_slice() else {
+        return None;
+    };
+    if *w < 32
+        || *h < 32
+        || *x > width.saturating_sub(*w)
+        || *y > height.saturating_sub(*h)
+        || *w > width
+        || *h > height
+        || *w % 2 != 0
+        || *h % 2 != 0
+    {
+        return None;
+    }
+    Some(Crop {
+        width: *w,
+        height: *h,
+        x: *x,
+        y: *y,
+    })
+}
+
+fn choose_crop(stderr: &[u8], width: u32, height: u32) -> Option<Crop> {
+    let text = String::from_utf8_lossy(stderr);
+    let crops: Vec<_> = text
+        .lines()
+        .filter_map(|line| parse_crop(line, width, height))
+        .collect();
+    if crops.is_empty() {
+        return None;
+    }
+    let mut counts = BTreeMap::<(u32, u32, u32, u32), usize>::new();
+    for c in &crops {
+        *counts.entry((c.width, c.height, c.x, c.y)).or_default() += 1;
+    }
+    let (common, common_count) = counts.into_iter().max_by_key(|(c, n)| (*n, c.0 * c.1))?;
+    let selected = if common_count * 100 > crops.len() * 80 {
+        Crop {
+            width: common.0,
+            height: common.1,
+            x: common.2,
+            y: common.3,
+        }
+    } else {
+        // Disagreeing samples must never discard more of the picture than a
+        // sampled frame permits. Retain their union, rounded out to even edges.
+        let left = crops.iter().map(|c| c.x).min()? & !1;
+        let top = crops.iter().map(|c| c.y).min()? & !1;
+        let right = crops.iter().map(|c| c.x + c.width).max()?.div_ceil(2) * 2;
+        let bottom = crops.iter().map(|c| c.y + c.height).max()?.div_ceil(2) * 2;
+        let right = right.min(width);
+        let bottom = bottom.min(height);
+        Crop {
+            width: right - left,
+            height: bottom - top,
+            x: left,
+            y: top,
+        }
+    };
+    Some(selected)
+}
+
+async fn detect_reference_crop(
+    reference: &Source,
+    stream: u32,
+    interval: (u32, u32),
+    size: (u32, u32),
+    ffmpeg: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Crop, AppError> {
+    let (start, count) = interval;
+    let (width, height) = size;
+    let step = count.div_ceil(60).max(1);
+    let filter = format!(
+        "[0:{stream}]trim=start_frame={start}:end_frame={},select=not(mod(n\\,{step})),cropdetect=limit=0.094117647:round=2:reset=0:skip=0[scan]",
+        start + count
+    );
+    let mut arguments = args(&[
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "info",
+        "-threads",
+        "4",
+        "-noautorotate",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+    ]);
+    arguments.push(reference.path.as_os_str().into());
+    arguments.extend(args(&[
+        "-filter_complex",
+        &filter,
+        "-map",
+        "[scan]",
+        "-frames:v",
+        "60",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "null",
+        "-",
+    ]));
+    let result = run_capture(
+        &CommandSpec {
+            executable: ffmpeg.into(),
+            args: arguments,
+            cwd: None,
+        },
+        cancel.clone(),
+        256 * 1024,
+        Duration::from_secs(1800),
+    )
+    .await
+    .map_err(process_error)?;
+    if !result.status.success() {
+        return Err(fail(format!(
+            "Reference crop detection failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+    choose_crop(&result.stderr,width,height).ok_or_else(|| fail("Reference crop detection found no usable sampled picture. Choose resize only or another interval."))
+}
+
+fn display_width(width: u32, sar: (u32, u32)) -> Result<u32, AppError> {
+    let scaled = (f64::from(width) * f64::from(sar.0) / f64::from(sar.1) / 2.0).round() * 2.0;
+    if !(32.0..=8192.0).contains(&scaled) {
+        return Err(fail(
+            "Displayed frame width is outside the supported 32–8192 pixel range.",
+        ));
+    }
+    Ok(scaled as u32)
+}
+
+struct Comparison {
+    reference: Vec<String>,
+    candidate: Vec<String>,
+    width: u32,
+    height: u32,
+}
+fn comparison(
+    left: &FrameScan,
+    right: &FrameScan,
+    alignment: QualityAlignment,
+    crop: Option<Crop>,
+) -> Result<Comparison, AppError> {
+    let mut reference = Vec::new();
+    let mut candidate = Vec::new();
+    let mut ref_size = (left.width, left.height);
+    if let Some(crop) = crop {
+        ref_size = (crop.width, crop.height);
+        reference.push(format!(
+            "crop={}:{}:{}:{}",
+            crop.width, crop.height, crop.x, crop.y
+        ));
+    }
+    let matching_storage = (right.width, right.height) == ref_size
+        && u64::from(left.sar.0) * u64::from(right.sar.1)
+            == u64::from(right.sar.0) * u64::from(left.sar.1);
+    let desqueeze = !matching_storage && (left.sar.0 != left.sar.1 || right.sar.0 != right.sar.1);
+    let candidate_size = if desqueeze {
+        (display_width(right.width, right.sar)?, right.height)
+    } else {
+        (right.width, right.height)
+    };
+    if desqueeze && (candidate_size != (right.width, right.height) || right.sar.0 != right.sar.1) {
+        candidate.push(format!(
+            "scale={}:{}:flags=bicubic,setsar=1",
+            candidate_size.0, candidate_size.1
+        ));
+    }
+    let resize = matches!(
+        alignment,
+        QualityAlignment::ResizeReference | QualityAlignment::CropAndResizeReference
+    );
+    let target = if resize {
+        candidate_size
+    } else if desqueeze {
+        (display_width(ref_size.0, left.sar)?, ref_size.1)
+    } else {
+        ref_size
+    };
+    if target != ref_size || (desqueeze && left.sar.0 != left.sar.1) {
+        reference.push(format!(
+            "scale={}:{}:flags=bicubic,setsar=1",
+            target.0, target.1
+        ));
+    }
+    if target != candidate_size {
+        return Err(fail(format!(
+            "Aligned reference is {}×{} and candidate is {}×{}. Choose Resize reference or a different crop.",
+            target.0, target.1, candidate_size.0, candidate_size.1
+        )));
+    }
+    Ok(Comparison {
+        reference,
+        candidate,
+        width: target.0,
+        height: target.1,
+    })
+}
+
+fn model_name(model: QualityVmafModel) -> &'static str {
+    match model {
+        QualityVmafModel::Standard => "vmaf_v0.6.1",
+        QualityVmafModel::Negative => "vmaf_v0.6.1neg",
+        QualityVmafModel::FourK => "vmaf_4k_v0.6.1",
+    }
+}
 pub async fn analyze_quality(
     request: QualityRequest,
     cancel: watch::Receiver<bool>,
 ) -> Result<QualityResult, AppError> {
     let _permit = permit(&cancel).await?;
+    let options = request.options.clone().unwrap_or_default();
+    if !(1..=1000).contains(&options.subsample) {
+        return Err(fail("Score every 1 to 1,000 frames."));
+    }
     if request.frame_count == 0
         || request.frame_count > MAX_FRAMES
         || request.reference_start_frame > MAX_SCAN - request.frame_count
@@ -398,34 +666,73 @@ pub async fn analyze_quality(
     .await?;
     if left.geometry != right.geometry {
         return Err(fail(
-            "Reference and candidate must have matching dimensions, pixel format and color metadata. Prepare an explicitly matched reference first.",
+            "Reference and candidate must have matching pixel format and color metadata. Prepare an explicitly matched reference first.",
         ));
     }
-    for (a, b) in left.pts.iter().zip(&right.pts) {
-        if ((a - left.pts[0]) - (b - right.pts[0])).abs() > 0.0021 {
-            return Err(fail(
-                "Decoded frame timing differs. Select corresponding frame intervals without changing cadence.",
-            ));
+    if !options.fix_frame_rate {
+        for (a, b) in left.pts.iter().zip(&right.pts) {
+            if ((a - left.pts[0]) - (b - right.pts[0])).abs() > 0.0021 {
+                return Err(fail(
+                    "Decoded frame timing differs. Select corresponding frame intervals or enable fixed-rate frame pairing.",
+                ));
+            }
         }
     }
+    let crop_requested = matches!(
+        options.alignment,
+        QualityAlignment::CropReference | QualityAlignment::CropAndResizeReference
+    );
+    let crop = if crop_requested {
+        Some(
+            detect_reference_crop(
+                &reference,
+                request.reference_stream_index,
+                (request.reference_start_frame, request.frame_count),
+                (left.width, left.height),
+                &ffmpeg,
+                &cancel,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let aligned = comparison(&left, &right, options.alignment, crop)?;
     let workspace = Workspace::create()?;
     let metric = match request.metric {
-        QualityMetric::Psnr => "psnr=stats_file=quality.log:shortest=1:repeatlast=0",
-        QualityMetric::Ssim => "ssim=stats_file=quality.log:shortest=1:repeatlast=0",
-        QualityMetric::Vmaf => {
-            "libvmaf=log_fmt=json:log_path=quality.log:model=version=vmaf_v0.6.1:n_threads=4:shortest=1:repeatlast=0"
-        }
+        QualityMetric::Psnr => "psnr=stats_file=quality.log:shortest=1:repeatlast=0".to_owned(),
+        QualityMetric::Ssim => "ssim=stats_file=quality.log:shortest=1:repeatlast=0".to_owned(),
+        QualityMetric::Vmaf => format!(
+            "libvmaf=log_fmt=json:log_path=quality.log:model=version\\={}:n_threads=4:shortest=1:repeatlast=0",
+            model_name(options.vmaf_model)
+        ),
     };
-    // Frame timings have been compared above. Ordinal timestamps prevent a
-    // container's sub-millisecond rounding from pairing a neighboring frame.
+    let sample = if options.subsample > 1 {
+        format!("select=not(mod(n\\,{}))", options.subsample)
+    } else {
+        String::new()
+    };
+    let chain = |filters: &[String]| {
+        let mut parts = filters.to_vec();
+        if !sample.is_empty() {
+            parts.push(sample.clone());
+        }
+        parts.push("settb=1/1".into());
+        parts.push("setpts=N".into());
+        parts.join(",")
+    };
+    // Input timestamps are checked unless fixed-rate pairing was requested;
+    // both chains then receive identical ordinal timestamps after sampling.
     let filter = format!(
-        "[0:{}]trim=start_frame={}:end_frame={},settb=1/1,setpts=N[ref];[1:{}]trim=start_frame={}:end_frame={},settb=1/1,setpts=N[dist];[dist][ref]{}[scored]",
+        "[0:{}]trim=start_frame={}:end_frame={},{}[ref];[1:{}]trim=start_frame={}:end_frame={},{}[dist];[dist][ref]{}[scored]",
         request.reference_stream_index,
         request.reference_start_frame,
         request.reference_start_frame + request.frame_count,
+        chain(&aligned.reference),
         request.candidate_stream_index,
         request.candidate_start_frame,
         request.candidate_start_frame + request.frame_count,
+        chain(&aligned.candidate),
         metric
     );
     let mut arguments = args(&[
@@ -459,7 +766,7 @@ pub async fn analyze_quality(
         "-map",
         "[scored]",
         "-frames:v",
-        &request.frame_count.to_string(),
+        &request.frame_count.div_ceil(options.subsample).to_string(),
         "-fps_mode",
         "passthrough",
         "-f",
@@ -484,8 +791,11 @@ pub async fn analyze_quality(
             String::from_utf8_lossy(&result.stderr)
         )));
     }
-    let (mut score, points) =
-        parse_report(&workspace.read()?, request.metric, request.frame_count)?;
+    let scored_count = request.frame_count.div_ceil(options.subsample);
+    let (mut score, mut points) = parse_report(&workspace.read()?, request.metric, scored_count)?;
+    for point in &mut points {
+        point.frame *= options.subsample;
+    }
     if request.metric == QualityMetric::Psnr {
         score = psnr_summary(&result.stderr)?;
     }
@@ -499,7 +809,29 @@ pub async fn analyze_quality(
         ));
     }
     check_cancel(&cancel)?;
-    Ok(QualityResult{metric:request.metric,frame_count:request.frame_count,score,points,reference_fingerprint:ref_identity,candidate_fingerprint:candidate_identity,model:(request.metric==QualityMetric::Vmaf).then(||"vmaf_v0.6.1".into()),message:"Higher scores indicate closer agreement within these selected frames. PSNR uses pooled mean-square error; infinite PSNR means identical decoded pixels. Metrics do not replace visual review.".into()})
+    let crop_text = crop.map_or_else(
+        || "no crop".into(),
+        |c| format!("reference crop {}×{} at {},{}", c.width, c.height, c.x, c.y),
+    );
+    let pairing = if options.fix_frame_rate {
+        "paired by frame number at fixed rate"
+    } else {
+        "verified matching source timing"
+    };
+    Ok(QualityResult {
+        metric: request.metric,
+        frame_count: scored_count,
+        score,
+        points,
+        reference_fingerprint: ref_identity,
+        candidate_fingerprint: candidate_identity,
+        model: (request.metric == QualityMetric::Vmaf)
+            .then(|| model_name(options.vmaf_model).into()),
+        message: format!(
+            "Scored {scored_count} of {} selected frames at {}×{} ({crop_text}; {pairing}). Higher scores indicate closer agreement. PSNR uses pooled mean-square error; infinite PSNR means identical decoded pixels. Metrics do not replace visual review.",
+            request.frame_count, aligned.width, aligned.height
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -533,5 +865,33 @@ mod tests {
             .is_err()
         );
         assert!(parse_report(b"n:1 All:1.0\n", QualityMetric::Ssim, 2).is_err());
+    }
+    #[test]
+    fn crop_consensus_keeps_full_picture_when_samples_disagree() {
+        let samples = b"crop=192:112:8:8\ncrop=190:112:6:8\ncrop=192:112:8:8\n";
+        assert_eq!(
+            choose_crop(samples, 208, 128),
+            Some(Crop {
+                width: 194,
+                height: 112,
+                x: 6,
+                y: 8
+            })
+        );
+        assert_eq!(parse_crop("crop=300:112:8:8", 208, 128), None);
+        assert_eq!(
+            choose_crop(b"crop=192:112:7:8\ncrop=190:112:8:8\n", 208, 128),
+            Some(Crop {
+                width: 194,
+                height: 112,
+                x: 6,
+                y: 8
+            })
+        );
+    }
+    #[test]
+    fn anamorphic_width_rounds_to_even_display_frame() {
+        assert_eq!(display_width(720, (32, 27)).unwrap(), 854);
+        assert_eq!(display_width(144, (4, 3)).unwrap(), 192);
     }
 }

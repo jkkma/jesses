@@ -58,10 +58,11 @@ async fn inspect_utility_capabilities(
     media_runtime::inspect_utility_capabilities(running.cancel.clone()).await
 }
 #[tauri::command]
-async fn inspect_saved_job(path: String) -> Result<media_core::SavedJobInspection, AppError> {
-    tauri::async_runtime::spawn_blocking(move || media_runtime::inspect_saved_job(path))
-        .await
-        .map_err(|e| AppError::new("SAVED_JOB_UNREADABLE", e.to_string(), None))?
+async fn inspect_saved_job(
+    path: String,
+    svt_build: Option<media_core::VideoEncoder>,
+) -> Result<media_core::SavedJobInspection, AppError> {
+    media_runtime::inspect_saved_job_with_encoder(path, svt_build).await
 }
 #[tauri::command]
 async fn export_saved_job(
@@ -445,7 +446,140 @@ async fn probe_media(path: String) -> Result<MediaFile, AppError> {
 
 #[tauri::command]
 async fn get_capabilities() -> Vec<ToolInfo> {
-    media_runtime::get_capabilities().await
+    // Discovery checks several tools concurrently. Keep that combined future
+    // off the IPC dispatcher's small main-thread stack.
+    Box::pin(media_runtime::get_capabilities()).await
+}
+
+// Keep each generated command dispatcher in its own stack frame. A single
+// generate_handler! containing every command exceeded the default Windows
+// main-thread stack once capability discovery was invoked from the WebView.
+#[inline(never)]
+fn invoke_utilities(invoke: tauri::ipc::Invoke) -> bool {
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        estimate_av1an_resources,
+        read_av1an_grain_table,
+        make_av1an_grain_preset,
+        run_utility,
+        inspect_utility_capabilities,
+        inspect_saved_job,
+        export_saved_job,
+        run_image_job
+    ];
+    handler(invoke)
+}
+
+#[inline(never)]
+fn invoke_settings(invoke: tauri::ipc::Invoke) -> bool {
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        set_completion_options,
+        get_completion_status,
+        cancel_finish_action,
+        export_analysis,
+        get_preferences,
+        get_parameter_presets,
+        save_parameter_preset,
+        remove_parameter_preset,
+        save_preferences,
+        remember_recent_media,
+        preview_preference_import,
+        recent_path_is_folder,
+        get_storage_locations
+    ];
+    handler(invoke)
+}
+
+#[inline(never)]
+fn invoke_analysis(invoke: tauri::ipc::Invoke) -> bool {
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        begin_media_analysis,
+        cancel_media_analysis,
+        preview_frame,
+        detect_crop,
+        get_encoder_parameters,
+        preview_encode_plan,
+        analyze_bitrate,
+        analyze_quality,
+        set_job_paused,
+        measure_loudness,
+        probe_media,
+        get_capabilities
+    ];
+    handler(invoke)
+}
+
+#[inline(never)]
+fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        start_remux,
+        start_mux,
+        start_encode,
+        enqueue_encode,
+        scan_media_folder,
+        preview_encode_batch,
+        enqueue_encode_batch,
+        cancel_all_jobs,
+        cancel_job,
+        stop_job,
+        resume_job,
+        discard_av1an_recovery,
+        list_jobs,
+        subscribe_jobs
+    ];
+    handler(invoke)
+}
+
+fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
+    match invoke.message.command() {
+        "estimate_av1an_resources"
+        | "read_av1an_grain_table"
+        | "make_av1an_grain_preset"
+        | "run_utility"
+        | "inspect_utility_capabilities"
+        | "inspect_saved_job"
+        | "export_saved_job"
+        | "run_image_job" => invoke_utilities(invoke),
+        "set_completion_options"
+        | "get_completion_status"
+        | "cancel_finish_action"
+        | "export_analysis"
+        | "get_preferences"
+        | "get_parameter_presets"
+        | "save_parameter_preset"
+        | "remove_parameter_preset"
+        | "save_preferences"
+        | "remember_recent_media"
+        | "preview_preference_import"
+        | "recent_path_is_folder"
+        | "get_storage_locations" => invoke_settings(invoke),
+        "begin_media_analysis"
+        | "cancel_media_analysis"
+        | "preview_frame"
+        | "detect_crop"
+        | "get_encoder_parameters"
+        | "preview_encode_plan"
+        | "analyze_bitrate"
+        | "analyze_quality"
+        | "set_job_paused"
+        | "measure_loudness"
+        | "probe_media"
+        | "get_capabilities" => invoke_analysis(invoke),
+        "start_remux"
+        | "start_mux"
+        | "start_encode"
+        | "enqueue_encode"
+        | "scan_media_folder"
+        | "preview_encode_batch"
+        | "enqueue_encode_batch"
+        | "cancel_all_jobs"
+        | "cancel_job"
+        | "stop_job"
+        | "resume_job"
+        | "discard_av1an_recovery"
+        | "list_jobs"
+        | "subscribe_jobs" => invoke_jobs(invoke),
+        _ => false,
+    }
 }
 
 pub fn run() {
@@ -521,55 +655,7 @@ pub fn run() {
             completion::start(app.handle().clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            estimate_av1an_resources,
-            read_av1an_grain_table,
-            make_av1an_grain_preset,
-            run_utility,
-            inspect_utility_capabilities,
-            inspect_saved_job,
-            export_saved_job,
-            run_image_job,
-            set_completion_options,
-            get_completion_status,
-            cancel_finish_action,
-            export_analysis,
-            get_preferences,
-            get_parameter_presets,
-            save_parameter_preset,
-            remove_parameter_preset,
-            save_preferences,
-            remember_recent_media,
-            preview_preference_import,
-            recent_path_is_folder,
-            get_storage_locations,
-            begin_media_analysis,
-            cancel_media_analysis,
-            preview_frame,
-            detect_crop,
-            get_encoder_parameters,
-            preview_encode_plan,
-            analyze_bitrate,
-            analyze_quality,
-            set_job_paused,
-            measure_loudness,
-            probe_media,
-            get_capabilities,
-            start_remux,
-            start_mux,
-            start_encode,
-            enqueue_encode,
-            scan_media_folder,
-            preview_encode_batch,
-            enqueue_encode_batch,
-            cancel_all_jobs,
-            cancel_job,
-            stop_job,
-            resume_job,
-            discard_av1an_recovery,
-            list_jobs,
-            subscribe_jobs
-        ])
+        .invoke_handler(invoke_command)
         .build(tauri::generate_context!())
         .expect("could not start jesses")
         .run(move |app, event| {

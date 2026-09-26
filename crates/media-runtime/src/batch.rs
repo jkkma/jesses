@@ -815,6 +815,7 @@ pub(crate) async fn preview(
             temporal: input.temporal,
             parameters: request.parameters.clone(),
             av1an_options: request.av1an_options,
+            output_pixel_format: request.output_pixel_format,
             av1an_grain: request.av1an_grain.clone(),
             av1an_filters: request.av1an_filters.clone(),
             rate_control: request.rate_control,
@@ -936,6 +937,7 @@ mod tests {
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
                 output_container: None,
@@ -1377,6 +1379,7 @@ mod tests {
         let request = BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             output_container: None,
@@ -1425,6 +1428,7 @@ mod tests {
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
                 output_container: None,
@@ -1434,6 +1438,7 @@ mod tests {
             BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
                 output_container: None,
@@ -1501,6 +1506,7 @@ mod tests {
             .preview_encode_batch(BatchEncodeRequest {
                 parameters: Vec::new(),
                 av1an_options: None,
+                output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
                 output_container: None,

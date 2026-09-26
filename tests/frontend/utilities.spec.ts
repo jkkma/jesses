@@ -171,6 +171,46 @@ test('keyframe cut submits the reviewed source interval and shows validation', a
     await page.screenshot({ path: 'target/utilities-minimum.png', fullPage: true });
   }
 });
+test('temporal export utilities submit explicit methods and keep results separate from imports', async ({
+  page,
+}) => {
+  await setup(page);
+  const region = page.getByRole('region', { name: 'Media utilities', exact: true });
+  await region
+    .getByRole('combobox', { name: 'Utility', exact: true })
+    .selectOption('deinterlaceExport');
+  await region
+    .getByRole('combobox', { name: 'Field order', exact: true })
+    .selectOption('bottomFirst');
+  await region.getByRole('combobox', { name: 'Output rate', exact: true }).selectOption('frame');
+  await region.getByRole('button', { name: 'Run utility', exact: true }).click();
+  expect((await calls(page, 'run_utility'))[0].payload.request).toEqual({
+    kind: 'deinterlaceExport',
+    request: {
+      inputPath: 'C:\\media\\source.mkv',
+      outputPath: 'C:\\output\\new.mkv',
+      videoStreamIndex: 2,
+      method: 'qtgmc',
+      mode: 'frame',
+      fieldOrder: 'bottomFirst',
+      qtgmcPreset: 'verySlow',
+    },
+  });
+  expect(await calls(page, 'probe_media')).toHaveLength(1);
+  await region
+    .getByRole('combobox', { name: 'Utility', exact: true })
+    .selectOption('cadenceRepairExport');
+  await region.getByRole('button', { name: 'Run utility', exact: true }).click();
+  expect((await calls(page, 'run_utility'))[1].payload.request).toEqual({
+    kind: 'cadenceRepairExport',
+    request: {
+      inputPath: 'C:\\media\\source.mkv',
+      outputPath: 'C:\\output\\new.mkv',
+      videoStreamIndex: 2,
+    },
+  });
+  expect(await calls(page, 'probe_media')).toHaveLength(1);
+});
 test('image sequence uses reviewed order instead of sorting source names', async ({ page }) => {
   await setup(page);
   await page.getByText('Images and sequences', { exact: true }).click();
@@ -219,6 +259,12 @@ test('foreign saved jobs explain compatibility without queueing saved commands',
   await expect(
     page.getByRole('button', { name: 'Choose destination and queue a new encode', exact: true }),
   ).toHaveCount(0);
+  expect(await calls(page, 'enqueue_encode')).toHaveLength(0);
+  await page.getByLabel('Original SVT build for historical imports').selectOption('svtAv1FiveFish');
+  await expect(page.getByText(/Continue it in the application that created it/)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Inspect saved job', exact: true }).click();
+  const inspections = await calls(page, 'inspect_saved_job');
+  expect(inspections.at(-1)?.payload.svtBuild).toBe('svtAv1FiveFish');
   expect(await calls(page, 'enqueue_encode')).toHaveLength(0);
 });
 test('finish action is explicit, session-only and can be canceled from its countdown', async ({

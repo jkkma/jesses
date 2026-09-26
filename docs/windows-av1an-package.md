@@ -79,6 +79,26 @@ MSVC runtime; native import checks require every remaining import to be a
 Windows system DLL. The merge retains the original source archives, notices,
 compiler recipe and hashes and refuses to replace an existing runtime file.
 
+The next Windows extension supplies QTGMC's six supported presets:
+
+```sh
+python scripts/build-package-av1an-qtgmc.py --destination target/package-qtgmc --cache target/qtgmc-archive-cache
+python scripts/package-av1an-qtgmc.py --destination target/package-av1an-qtgmc --av1an-build target/package-av1an-scorers/delivery --qtgmc-build target/package-qtgmc/delivery --ffmpeg-build target/package-ffmpeg/delivery --msys-root target/package-media-compiler/msys64
+```
+
+Use the resulting `target/package-av1an-qtgmc/delivery` for `--av1an-build`
+when staging. `scripts/qtgmc-windows-lock.json` pins the Python modules, native
+plugins, FFTW and their corresponding sources. FFT3DFilter and MiscFilters are
+built with the static MSVC runtime so the package does not rely on an installed
+Microsoft C++ redistributable. The other native payloads retain their exact
+upstream archive and member hashes. Source archives, license notices, recipes,
+compiler details and output hashes accompany the extension.
+
+The `havsfunc` and `vsutil` modules live in `python/qtgmc-deps.zip`, listed in
+the embedded interpreter's search path. Importing them does not create loose
+bytecode files in the manifest-verified runtime. The extension includes only
+the dependencies needed by the exposed QTGMC presets.
+
 ## Runtime and native gates
 
 The engine and frameserver use this package layout:
@@ -115,6 +135,12 @@ BestSource remain optional external readers. The manifest-verified package
 reports both absent and the app rejects either selection before encoding. A
 separate compatible external runtime passed both readers through fixed-chunk
 stop, reopen and resume; that result does not add them to the packaged inventory.
+
+The QTGMC merge checks native DLL dependencies, evaluates real frames for Faster,
+Fast, Medium, Slow, Slower and Very Slow, and repeats all three CPU scorer probes
+after adding the plugins. Every probe must preserve the complete Python/runtime
+inventory. These component gates supplement the application's native export
+checks; they do not qualify optional external readers or GPU plugins.
 
 On Windows, `scripts/install-vship.ps1` can stage the pinned Vship 5.1.1 x64
 Vulkan plugin, its complete source archive and license in the application's

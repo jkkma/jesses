@@ -1,43 +1,46 @@
-# Explicit frame-paired quality analysis
+# Quality comparison validation
 
-The inspector compares selected reference and candidate video streams with SSIM,
-PSNR or VMAF v0.6.1. Each interval uses an explicit zero-based start frame and
-frame count. Full decoded inspection establishes that both intervals exist and
-have matching dimensions, 8/10-bit 4:2:0 pixel format, SDR color, chroma placement,
-square pixels and relative frame timing (2.1 ms container-rounding tolerance).
-Ordinal timestamps then pair exactly one corresponding frame from each input.
-No frame repetition, automatic scaling or implicit tone mapping is used. Users
-must still verify that the selected intervals show corresponding content.
+The quality inspector compares explicit corresponding reference and candidate video
+intervals with any selected combination of SSIM, PSNR, and VMAF. Every metric has
+its own request, result, per-frame graph, and export. A failed or canceled metric
+cannot attach a later result to an earlier request. The file selected in the Files
+view is the reference; the chosen second file is the candidate. Both video stream
+indices, zero-based start frames, and frame count are explicit.
 
-PSNR uses FFmpeg's pooled-error summary, not an average of decibel values or the
-rounded per-frame MSE log. Infinite PSNR is represented explicitly as identical
-decoded pixels. SSIM and VMAF aggregate the per-frame scores. VMAF selects the
-versioned built-in `vmaf_v0.6.1` model explicitly. The [FFmpeg filter documentation](https://ffmpeg.org/ffmpeg-filters.html)
-defines the scorers and frame synchronization options.
+Decoded inspection confirms that both intervals exist, timestamps increase within
+each input, video is progressive 8/10-bit planar 4:2:0 SDR, and color metadata and
+pixel format match. By default, relative frame timing must agree within 2.1 ms.
+The fixed-rate option pairs corresponding frames by ordinal position when source
+timestamps differ. It never creates, drops, or repeats decoded frames. Users must
+still verify that both intervals show corresponding content.
 
-Windows qualification on 2026-09-13 passed two parser cases, two browser cases,
-and `quality_jobs` with actual FFmpeg/FFprobe. The real-tool test compares PSNR
-with independently decoded byte-level mean-square error to within 0.00001 dB,
-checks exact SSIM and infinite PSNR on identical pixels, runs VMAF, rejects an
-interval beyond EOF, and checks cancellation and source hashes/timestamps.
-The browser checks cover original stream identities, explicit offsets/count,
-keyboard frame inspection, invalid counts and late-result cancellation.
+Reference alignment offers no change, automatic crop, resize to the candidate,
+and crop then resize. Crop detection samples the selected reference interval and
+chooses a common rectangle when more than 80% of samples agree; otherwise it keeps
+the union of sampled visible areas. The selected crop and measured dimensions are
+included in the result message. If storage dimensions or sample aspect ratios
+differ and either input is anamorphic, comparison uses even-width square-pixel
+display frames. An unchanged pair with matching anamorphic storage stays untouched.
+The reference alone is cropped or resized; the candidate is only de-squeezed when
+needed. Incompatible final dimensions fail before scoring.
 
-A real 120-frame section of the full av1an episode output was compared with an
-explicitly prepared lossless reference from original frames [2880,3000), with the
-same 16-pixel top border and 10-bit format. Scores were SSIM **0.9985560333**,
-PSNR **55.50073 dB**, and VMAF **97.0998128**. These scores apply only to that
-matched interval. Requests, lossless reference and per-frame results are retained
-under `Videos/Jesses-migration-native-20260913/real-quality-*`.
+Sampling scores frames 0, N, 2N, and so on in **both** inputs, up to N=1000.
+The result counts scored frames and retains the selected interval's original frame
+numbers in points and exports. VMAF uses one of three built-in versioned models:
+`vmaf_v0.6.1`, `vmaf_v0.6.1neg`, or `vmaf_4k_v0.6.1`. No model file is modified.
+PSNR uses FFmpeg's pooled-error summary rather than averaging frame decibels;
+infinite PSNR represents identical decoded pixels.
 
-Work is cancellable, shares the two-analysis concurrency limit, and owns every
-tool process. Source scans cap at one million frames, requested intervals at
-60,000 frames, and tool records/reports have explicit size/time limits. The frozen
-Windows desktop build `49c84b2425f90efa7842acc5d297fd2dd4c23458550d575a5843e1e744fb6777`
-used its source-built FFmpeg/FFprobe pair to compare this real interval through
-the native candidate picker and explicit frame controls. Its displayed VMAF
-97.100 and final-frame119 score97.354 match the retained numeric result after
-display rounding. Keyboard End reached that final point. Evidence is retained
-under `Videos/Jesses-complete-native-20260913/native-vmaf-*`.
-Final Windows release qualification remains a separate gate. Linux runtime
-qualification is deferred. HDR scoring and additional metric plugins are not enabled.
+Quality analysis is read-only and cancellable. It shares the two-analysis limit,
+uses supervised FFmpeg/FFprobe processes, caps source scans at one million frames,
+limits requests to 60,000 frames, and bounds diagnostic output and runtime. The
+selected source fingerprints are verified again after scoring. HDR tone mapping
+and arbitrary metric filter graphs remain outside this inspector.
+
+Validation: `cargo test -p media-core quality:: --lib`,
+`cargo test -p media-runtime quality:: --lib`,
+`cargo test -p media-runtime --test quality_jobs -- --ignored`, and
+`pnpm test -- tests/frontend/quality.spec.ts`. The opt-in real-tool test uses
+FFmpeg with libvmaf and FFprobe. It checks independent pixel-error arithmetic,
+model-dependent VMAF scores, crop/resize/anamorphic geometry, sampling, fixed-rate
+pairing, cancellation, and unchanged source hashes and timestamps.

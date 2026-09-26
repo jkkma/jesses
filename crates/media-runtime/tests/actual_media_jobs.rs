@@ -240,6 +240,7 @@ async fn actual_media_utility_and_image_routes_preserve_source_and_publish_recei
                     format,
                     output_path: text(&output.join(name)),
                     width: Some(640),
+                    pixel_format: None,
                 },
                 cancel.clone(),
             )
@@ -258,6 +259,7 @@ async fn actual_media_utility_and_image_routes_preserve_source_and_publish_recei
                 format: ImageOutput::PngSequence,
                 output_path: text(&sequence),
                 width: Some(640),
+                pixel_format: None,
             },
             cancel.clone(),
         )

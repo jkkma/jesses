@@ -7,6 +7,9 @@
   import Av1anResources from '$lib/components/shared/Av1anResources.svelte';
   import Av1anGrain from '$lib/components/shared/Av1anGrain.svelte';
   import Av1anFilters from '$lib/components/shared/Av1anFilters.svelte';
+  import OutputPixelFormat from '$lib/components/shared/OutputPixelFormat.svelte';
+  import { allowedOutputPixelFormats } from '$lib/components/shared/output-pixel-format';
+  import type { Av1anPixelFormat } from '$lib/ipc/generated';
   import {
     defaultAv1anAudio,
     readAv1anPreferences,
@@ -92,6 +95,7 @@
     encoderOptions,
     requiredEncoderTools,
     knownHdr,
+    preservableHdr10,
     encoderChoices,
     isAv1anEncoder,
     isSvtEncoder,
@@ -146,6 +150,7 @@
   let av1an = $state(defaultAv1an());
   let av1anGrain = $state<Av1anGrainSettings | undefined>();
   let av1anFilters = $state<string[]>([]);
+  let outputPixelFormat = $state<Av1anPixelFormat | undefined>();
   let crf = $state<number | undefined>(30);
   let preset = $state(2);
   let backend = $state<EncodeBackend>('standalone');
@@ -187,6 +192,7 @@
     av1an: Av1anDraft;
     av1anGrain: Av1anGrainSettings | undefined;
     av1anFilters: string[];
+    outputPixelFormat: Av1anPixelFormat | undefined;
     crf: number | undefined;
     preset: number;
     workers: number | undefined;
@@ -215,6 +221,7 @@
           av1an: copyAv1an(av1an),
           av1anGrain: av1anGrain ? { ...av1anGrain } : undefined,
           av1anFilters: [...av1anFilters],
+          outputPixelFormat,
           crf,
           preset,
           workers,
@@ -232,6 +239,7 @@
         av1an = copyAv1an(priorSettings.av1an);
         av1anGrain = priorSettings.av1anGrain ? { ...priorSettings.av1anGrain } : undefined;
         av1anFilters = [...priorSettings.av1anFilters];
+        outputPixelFormat = priorSettings.outputPixelFormat;
         ({
           crf,
           preset,
@@ -323,7 +331,15 @@
   const toolsReady = $derived(
     requiredEncoderTools(backend, encoder, av1an.concatMethod).every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
-    ),
+    ) &&
+      (encoder !== 'aomAv1' ||
+        !selectedFiles.some(
+          (file) =>
+            preservableHdr10(
+              file.streams.find((stream) => stream.index === drafts[file.id].video),
+            ) && !drafts[file.id].toneMap.enabled,
+        ) ||
+        tools.some((tool) => tool.id === 'mkvmerge' && tool.available)),
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
   const grainConflict = $derived(
@@ -347,14 +363,16 @@
           encoder,
           outputContainer === 'matroska',
         )) &&
-      (backend !== 'av1an' ||
-        !av1anGrain ||
+      (!av1anGrain ||
         ((av1anGrain.table === null || av1anGrain.table.length > 0) &&
           (av1anGrain.table === null || filmGrain === 0) &&
+          (backend === 'av1an' || !isSvtEncoder(encoder) || av1anGrain.table !== null) &&
           Number.isInteger(av1anGrain.denoiseStrength) &&
           av1anGrain.denoiseStrength >= 1 &&
           av1anGrain.denoiseStrength <= 16)) &&
-      (backend !== 'av1an' || av1anFilters.length <= 16) &&
+      av1anFilters.length <= 16 &&
+      (!outputPixelFormat || allowedOutputPixelFormats(encoder).includes(outputPixelFormat)) &&
+      (outputPixelFormat !== 'yuva420p' || ['matroska', 'webm'].includes(outputContainer)) &&
       ((backend === 'av1an' && av1an.targetEnabled) ||
         rate.mode !== 'quality' ||
         (typeof crf === 'number' &&
@@ -365,7 +383,7 @@
           crf <= options.crfMax)) &&
       Number.isInteger(preset) &&
       options.presets.some((choice) => choice.value === preset) &&
-      (!isSvtEncoder(encoder) ||
+      (!(isSvtEncoder(encoder) || encoder === 'aomAv1') ||
         (typeof filmGrain === 'number' &&
           Number.isInteger(filmGrain) &&
           filmGrain >= 0 &&
@@ -385,6 +403,7 @@
       av1an,
       av1anGrain,
       av1anFilters,
+      outputPixelFormat,
       crf,
       preset,
       backend,
@@ -488,6 +507,7 @@
     av1an = defaultAv1an(useInfrastructurePreferences && backend === 'av1an');
     av1anGrain = undefined;
     av1anFilters = usePreferences && backend === 'av1an' ? readAv1anPreferences().filters : [];
+    outputPixelFormat = undefined;
     crf = options.defaultCrf;
     preset = options.defaultPreset;
     workers =
@@ -557,7 +577,7 @@
     if (
       !canPreview ||
       (rate.mode === 'quality' && crf === undefined) ||
-      (isSvtEncoder(encoder) && filmGrain === undefined)
+      ((isSvtEncoder(encoder) || encoder === 'aomAv1') && filmGrain === undefined)
     )
       return;
     const key = draftKey;
@@ -571,10 +591,11 @@
       outputNameTemplate: outputNameTemplate.trim(),
       namingDate,
       ...(backend === 'av1an' ? { av1anOptions: selectedAv1an(av1an, encoder) } : {}),
-      ...(backend === 'av1an' && isSvtEncoder(encoder) && av1anGrain
+      ...(backend === 'standalone' && outputPixelFormat ? { outputPixelFormat } : {}),
+      ...((isSvtEncoder(encoder) || encoder === 'aomAv1') && av1anGrain
         ? { av1anGrain: { ...av1anGrain } }
         : {}),
-      ...(backend === 'av1an' && av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
+      ...(av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
       ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
         ? { rateControl: selectedRate(rate) }
         : {}),
@@ -591,7 +612,7 @@
       backend,
       encoder,
       workers: backend === 'av1an' ? workers! : 2,
-      filmGrain: isSvtEncoder(encoder) ? filmGrain! : 0,
+      filmGrain: isSvtEncoder(encoder) || encoder === 'aomAv1' ? filmGrain! : 0,
       hdr10Fallback: isSvtEncoder(encoder) ? hdr10Fallback : false,
       lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
       texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
@@ -701,11 +722,13 @@
           Use each episode's settings for explicit BWDIF deinterlacing, frame-rate conversion or
           HDR/HLG-to-SDR tone mapping. Subtitles start with Copy source; supported tracks can be
           converted or burned into video. Sources need a validated constant frame rate, square
-          pixels and 4:2:0 color. Mixed field order and cadence repair are not supported.
+          pixels and supported planar 4:2:0, 4:2:2 or 4:4:4 video. Eight-, ten- and twelve-bit
+          sources are converted to the selected encoder's supported output format. Mixed field order
+          requires preprocessing.
         </p>{:else}<p>
-          Av1an uses the first video track and prepares selected trim, deinterlacing, and HDR-to-SDR
-          tone mapping before scene detection. Subtitle tracks and attachments are copied; subtitle
-          conversion or burn-in requires standalone encoding.
+          Av1an uses each file's selected video track and validates its processing settings before
+          encoding. Prepared source processing keeps scene detection, quality references and output
+          aligned. Selected audio, subtitle and attachment settings remain part of each queued job.
         </p>{/if}
     </div>
   </div>
@@ -771,11 +794,11 @@
               {#if file.id.startsWith('jesses-synthetic')}<p class="disabled-reason">
                   Synthetic preview only. Import a local file to encode.
                 </p>{/if}
-              {#if !isSvtEncoder(encoder) && knownHdr(file.streams.find((stream) => stream.index === draft.video)) && !draft.toneMap.enabled}<p
+              {#if !isSvtEncoder(encoder) && !(['x265Standalone', 'aomAv1'].includes(encoder) && preservableHdr10(file.streams.find((stream) => stream.index === draft.video))) && knownHdr(file.streams.find((stream) => stream.index === draft.video)) && !draft.toneMap.enabled}<p
                   class="disabled-reason"
                 >
-                  {options.name} needs SDR video. Open this episode's settings and enable explicit HDR-to-SDR
-                  tone mapping, or choose an SVT build for compatible HDR10 output.
+                  {options.name} needs explicit HDR-to-SDR tone mapping for this episode. Tagged 10-bit
+                  BT.2020/PQ HDR10 can be preserved with SVT-AV1, x265 or AOM.
                 </p>{/if}
               {#if draft.selected}
                 <details
@@ -1109,12 +1132,29 @@
             bind:lineartPsyBias
             bind:texturePsyBias
             bind:hdrTune
-            grainTableSelected={backend === 'av1an' && !!av1anGrain?.table}
+            grainTableSelected={!!av1anGrain?.table}
           />
-          {#if backend === 'av1an' && isSvtEncoder(encoder)}
+          {#if backend === 'standalone'}<OutputPixelFormat
+              id="batch-output-pixel-format"
+              {encoder}
+              value={outputPixelFormat}
+              disabled={submitting || !desktop}
+              onchange={(value) => (outputPixelFormat = value)}
+            />{#if outputPixelFormat && !allowedOutputPixelFormats(encoder).includes(outputPixelFormat)}<p
+                role="alert"
+              >
+                Choose an output pixel format supported by this encoder.
+              </p>{/if}{#if outputPixelFormat === 'yuva420p' && !['matroska', 'webm'].includes(outputContainer)}<p
+                role="alert"
+              >
+                VP9 alpha requires a Matroska or WebM destination.
+              </p>{/if}{/if}
+          {#if isSvtEncoder(encoder) || encoder === 'aomAv1'}
             {#key `${backend}:${encoder}`}
               <Av1anGrain
+                {encoder}
                 value={av1anGrain}
+                tableOnly={backend === 'standalone' && isSvtEncoder(encoder)}
                 disabled={submitting || !desktop}
                 onchange={(value) => {
                   av1anGrain = value ? { ...value } : undefined;
@@ -1123,15 +1163,13 @@
               />
             {/key}
           {/if}
-          {#if backend === 'av1an'}
-            {#key `${backend}:${encoder}`}
-              <Av1anFilters
-                value={av1anFilters}
-                disabled={submitting || !desktop}
-                onchange={(value) => (av1anFilters = [...value])}
-              />
-            {/key}
-          {/if}
+          {#key `${backend}:${encoder}`}
+            <Av1anFilters
+              value={av1anFilters}
+              disabled={submitting || !desktop}
+              onchange={(value) => (av1anFilters = [...value])}
+            />
+          {/key}
           {#if backend === 'av1an'}<Av1anResources
               {encoder}
               {workers}

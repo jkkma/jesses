@@ -1,4 +1,4 @@
-//! FFmpeg library encoders consume the validated Y4M pipe and emit timed MKV
+//! FFmpeg library encoders consume validated Y4M (rawvideo for VP9 alpha) and emit timed MKV
 //! through the supervisor's already-owned output handle.
 use std::ffi::OsString;
 
@@ -39,7 +39,19 @@ pub(super) fn encoder_pixel_format(encoder: VideoEncoder, depth: u8) -> &'static
     }
 }
 
+pub(super) fn output_format(plan: &Plan) -> &'static str {
+    if matches!(
+        plan.encoder,
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+    ) {
+        encoder_pixel_format(plan.encoder, plan.output_bit_depth())
+    } else {
+        plan.output_pixel_format
+    }
+}
+
 pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+    let alpha = settings.encoder == VideoEncoder::Vp9 && plan.output_pixel_format == "yuva420p";
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -48,27 +60,49 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         "-xerror",
         "-protocol_whitelist",
         "pipe",
-        "-f",
-        "yuv4mpegpipe",
-        "-chroma_sample_location",
-        plan.chroma,
-        "-i",
-        "pipe:0",
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-dn",
-        "-c:v",
-        library(settings.encoder),
-        "-pix_fmt",
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
+    if alpha {
+        args.extend([
+            "-f".into(),
+            "rawvideo".into(),
+            "-pixel_format".into(),
+            "yuva420p".into(),
+            "-video_size".into(),
+            format!("{}x{}", plan.width, plan.height).into(),
+            "-framerate".into(),
+            format!("{}/{}", plan.fps_num, plan.fps_den).into(),
+        ]);
+    } else {
+        args.extend([
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "-chroma_sample_location".into(),
+            plan.chroma.into(),
+        ]);
+    }
+    args.extend(
+        [
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            library(settings.encoder),
+            "-pix_fmt",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>(),
+    );
     // The '+' prevents FFmpeg from choosing an alternative pixel format when
     // the installed encoder cannot produce the source's validated bit depth.
-    let encoder_format = encoder_pixel_format(settings.encoder, plan.output_bit_depth());
+    let encoder_format = output_format(plan);
     args.push(format!("+{encoder_format}").into());
     args.extend([
         // Y4M carries pixel depth/range but not all colorimetry. Reattach the
@@ -136,13 +170,25 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                 "-threads".into(),
                 "4".into(),
                 "-profile:v".into(),
-                if plan.output_bit_depth() == 10 {
-                    "2"
-                } else {
-                    "0"
+                match (
+                    plan.output_pixel_format.starts_with("yuv444"),
+                    plan.output_bit_depth(),
+                ) {
+                    (false, 8) => "0",
+                    (true, 8) => "1",
+                    (false, _) => "2",
+                    (true, _) => "3",
                 }
                 .into(),
             ]);
+            if alpha {
+                args.extend([
+                    "-auto-alt-ref".into(),
+                    "0".into(),
+                    "-metadata:s:v:0".into(),
+                    "alpha_mode=1".into(),
+                ]);
+            }
         }
         VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
             const PRESETS: [&str; 7] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"];
@@ -208,6 +254,14 @@ pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> 
         .is_some_and(|formats| formats.split_whitespace().any(|value| value == format));
     let options: &[&str] = match encoder {
         VideoEncoder::X265 => &["-crf", "-preset", "-x265-params"],
+        VideoEncoder::Vp9 if format == "yuva420p" => &[
+            "-crf",
+            "-cpu-used",
+            "-deadline",
+            "-row-mt",
+            "-lossless",
+            "-auto-alt-ref",
+        ],
         VideoEncoder::Vp9 => &["-crf", "-cpu-used", "-deadline", "-row-mt", "-lossless"],
         VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
             &["-cq", "-preset", "-tune", "-rc", "-qp"]

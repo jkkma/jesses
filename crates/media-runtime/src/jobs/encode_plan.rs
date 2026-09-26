@@ -21,6 +21,8 @@ pub(super) struct Plan {
     custom_filters: Vec<String>,
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
+    source_pixel_format: &'static str,
+    source_is_vp9_alpha: bool,
     pub output_pixel_format: &'static str,
     pub video_index: u32,
     pub width: u32,
@@ -52,6 +54,65 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
     super::av1an::validate_settings(settings)?;
     super::av1an::validate_grain(settings)?;
     super::av1an::validate_filters(settings)?;
+    let av1an_format = settings
+        .av1an_options
+        .and_then(|options| options.pixel_format);
+    if let (Some(shared), Some(av1an)) = (settings.output_pixel_format, av1an_format)
+        && shared != av1an
+    {
+        return Err(AppError::new(
+            "ENCODE_SETTINGS_INVALID",
+            "The shared output pixel format conflicts with av1an's selected pixel format.",
+            None,
+        ));
+    }
+    if settings.backend == EncodeBackend::Av1an && settings.output_pixel_format.is_some() {
+        return Err(AppError::new(
+            "ENCODE_SETTINGS_INVALID",
+            "Set av1an's output pixel format in av1an options; the shared output pixel format belongs to standalone encoding.",
+            None,
+        ));
+    }
+    if let Some(format) = settings.output_pixel_format.or(av1an_format) {
+        use media_core::Av1anPixelFormat as Pixel;
+        if format == Pixel::Yuva420p
+            && !(settings.backend == EncodeBackend::Standalone
+                && settings.encoder == VideoEncoder::Vp9)
+        {
+            return Err(AppError::new(
+                "ENCODE_SETTINGS_INVALID",
+                "Alpha-bearing YUVA 4:2:0 output requires standalone FFmpeg VP9.",
+                None,
+            ));
+        }
+        let allowed = match settings.encoder {
+            VideoEncoder::SvtAv1
+            | VideoEncoder::SvtAv1FiveFish
+            | VideoEncoder::SvtAv1Hdr
+            | VideoEncoder::H264Nvenc
+            | VideoEncoder::HevcNvenc => matches!(format, Pixel::Yuv420p | Pixel::Yuv420p10le),
+            VideoEncoder::VpxStandalone => !matches!(format, Pixel::Yuv422p | Pixel::Yuv422p10le),
+            VideoEncoder::Vp9 => matches!(
+                format,
+                Pixel::Yuv420p
+                    | Pixel::Yuv420p10le
+                    | Pixel::Yuv444p
+                    | Pixel::Yuv444p10le
+                    | Pixel::Yuva420p
+            ),
+            VideoEncoder::X264
+            | VideoEncoder::X265
+            | VideoEncoder::X265Standalone
+            | VideoEncoder::AomAv1 => format != Pixel::Yuva420p,
+        };
+        if !allowed {
+            return Err(AppError::new(
+                "ENCODE_SETTINGS_INVALID",
+                "The selected encoder does not support that output chroma and bit depth. Choose a supported pixel format.",
+                None,
+            ));
+        }
+    }
     super::rate_control::validate(settings)?;
     tone_map::validate_settings(settings)?;
     super::trim::validate_settings(settings)?;
@@ -97,9 +158,15 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
         }
-        VideoEncoder::X265 | VideoEncoder::X265Standalone => {
+        VideoEncoder::X265 => {
             standalone
                 && settings.crf <= 51
+                && settings.preset <= 9
+                && settings.film_grain == 0
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::X265Standalone => {
+            settings.crf <= 51
                 && settings.preset <= 9
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
@@ -111,9 +178,14 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
         }
-        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
-            standalone
-                && settings.crf <= 63
+        VideoEncoder::AomAv1 => {
+            settings.crf <= 63
+                && settings.preset <= 8
+                && settings.film_grain <= 50
+                && !settings.hdr10_fallback
+        }
+        VideoEncoder::VpxStandalone => {
+            settings.crf <= 63
                 && settings.preset <= 8
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
@@ -137,13 +209,16 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                     "x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
                 VideoEncoder::X265 | VideoEncoder::X265Standalone => {
-                    "x265 requires standalone mode, CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "x265 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
                 VideoEncoder::Vp9 => {
                     "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
-                VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
-                    "Standalone AOM/VPX require CRF 0–63, speed preset 0–8, grain 0, HDR10 fallback off, and 1–32 workers."
+                VideoEncoder::AomAv1 => {
+                    "AOM requires CRF 0–63, speed preset 0–8, film grain synthesis 0–50, HDR10 fallback off, and 1–32 workers."
+                }
+                VideoEncoder::VpxStandalone => {
+                    "VPX requires CRF 0–63, speed preset 0–8, grain 0, HDR10 fallback off, and 1–32 workers."
                 }
                 VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
                     "NVENC requires standalone mode, quality 0–51, preset P1–P7, grain 0, HDR10 fallback off, and 1–32 workers."
@@ -176,6 +251,56 @@ fn sdr_color(text: Option<&str>) -> Result<u8, AppError> {
     }
 }
 
+fn source_pixel_format(
+    format: Option<&str>,
+    full_range: bool,
+) -> Result<(&'static str, u8), AppError> {
+    match format {
+        Some("yuv420p") => Ok(("yuv420p", 8)),
+        Some("yuv422p") => Ok(("yuv422p", 8)),
+        Some("yuv444p") => Ok(("yuv444p", 8)),
+        Some("yuv420p10le") => Ok(("yuv420p10le", 10)),
+        Some("yuv422p10le") => Ok(("yuv422p10le", 10)),
+        Some("yuv444p10le") => Ok(("yuv444p10le", 10)),
+        Some("yuv420p12le") => Ok(("yuv420p12le", 12)),
+        Some("yuv422p12le") => Ok(("yuv422p12le", 12)),
+        Some("yuv444p12le") => Ok(("yuv444p12le", 12)),
+        Some("yuyv422") => Ok(("yuyv422", 8)),
+        Some("uyvy422") => Ok(("uyvy422", 8)),
+        Some("rgb24") if full_range => Ok(("rgb24", 8)),
+        Some("bgr24") if full_range => Ok(("bgr24", 8)),
+        Some("gbrp") if full_range => Ok(("gbrp", 8)),
+        Some("gbrp10le") if full_range => Ok(("gbrp10le", 10)),
+        Some("gbrp12le") if full_range => Ok(("gbrp12le", 12)),
+        Some("gbrp16le") if full_range => Ok(("gbrp16le", 16)),
+        Some("rgb48le") if full_range => Ok(("rgb48le", 16)),
+        Some("rgb48be") if full_range => Ok(("rgb48be", 16)),
+        Some("rgba") if full_range => Ok(("rgba", 8)),
+        Some("yuva420p") => Ok(("yuva420p", 8)),
+        Some("yuvj420p") if full_range => Ok(("yuvj420p", 8)),
+        Some("yuvj422p") if full_range => Ok(("yuvj422p", 8)),
+        Some("yuvj444p") if full_range => Ok(("yuvj444p", 8)),
+        _ => Err(unsupported(
+            "Encoding requires explicitly tagged planar YUV 4:2:0/4:2:2/4:4:4 (8/10/12-bit), packed YUYV/UYVY 4:2:2, full-range opaque RGB/GBR (8–16-bit), or supported 8-bit RGBA/YUVA420P for standalone VP9 alpha output. Other alpha-bearing, packed, and hardware-only formats need a separate conversion workflow.",
+        )),
+    }
+}
+
+fn rgb_source_format(format: &str) -> bool {
+    matches!(
+        format,
+        "rgb24"
+            | "bgr24"
+            | "rgba"
+            | "gbrp"
+            | "gbrp10le"
+            | "gbrp12le"
+            | "gbrp16le"
+            | "rgb48le"
+            | "rgb48be"
+    )
+}
+
 impl Plan {
     pub fn build(
         document: &Document,
@@ -197,13 +322,44 @@ impl Plan {
         }
         let video = videos[0];
         let tone_map = tone_map::Transform::build(video, settings)?;
-        let full_range_8bit = !settings.encoder.is_svt()
-            && video.pix_fmt.as_deref() == Some("yuvj420p")
-            && video.color_range.as_deref() == Some("pc");
-        if !matches!(video.pix_fmt.as_deref(), Some("yuv420p" | "yuv420p10le")) && !full_range_8bit
+        let source_has_alpha_tag = video
+            .tags
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode") && value == "1");
+        let source_is_vp9_alpha = source_has_alpha_tag
+            && video.codec_name.as_deref() == Some("vp9")
+            && video.pix_fmt.as_deref() == Some("yuv420p");
+        if source_has_alpha_tag && !source_is_vp9_alpha {
+            return Err(unsupported(
+                "An alpha_mode source needs supported VP9 8-bit 4:2:0 alpha metadata and an explicit alpha-preserving output.",
+            ));
+        }
+        let (source_pixel_format, source_depth) = source_pixel_format(
+            if source_is_vp9_alpha {
+                Some("yuva420p")
+            } else {
+                video.pix_fmt.as_deref()
+            },
+            video.color_range.as_deref() == Some("pc"),
+        )?;
+        let rgb_source = rgb_source_format(source_pixel_format);
+        let alpha_source = matches!(source_pixel_format, "rgba" | "yuva420p");
+        if settings.encoder.is_svt()
+            && video.color_range.as_deref() == Some("pc")
+            && !rgb_source
+            && tone_map.is_none()
         {
             return Err(unsupported(
-                "Encoding supports 8-bit or 10-bit planar 4:2:0 video only.",
+                "SVT requires limited-range YUV. Full-range opaque RGB can be explicitly converted to limited-range BT.709 output.",
+            ));
+        }
+        if rgb_source
+            && (video.color_space.as_deref() != Some("gbr")
+                || video.color_primaries.as_deref() != Some("bt709")
+                || video.color_transfer.as_deref() != Some("bt709"))
+        {
+            return Err(unsupported(
+                "RGB/GBR input requires full-range BT.709 primaries and transfer with an explicit GBR identity matrix. RGBA alpha requires standalone VP9 YUVA output.",
             ));
         }
         if settings.temporal.is_none_or(|temporal| {
@@ -235,17 +391,51 @@ impl Plan {
             && video.pix_fmt.as_deref() == Some("yuv420p10le")
             && video.color_range.as_deref() == Some("tv");
         let explicit_pixel_format = settings
-            .av1an_options
-            .and_then(|options| options.pixel_format)
+            .output_pixel_format
+            .or_else(|| {
+                settings
+                    .av1an_options
+                    .and_then(|options| options.pixel_format)
+            })
             .map(media_core::Av1anPixelFormat::ffmpeg);
-        if is_hdr10 && tone_map.is_none() && explicit_pixel_format == Some("yuv420p") {
+        if alpha_source != (explicit_pixel_format == Some("yuva420p")) {
+            return Err(unsupported(
+                "Alpha-bearing RGBA/YUVA420P input requires explicit standalone VP9 YUVA420P output; YUVA output requires a source with alpha.",
+            ));
+        }
+        if alpha_source
+            && (settings.temporal.is_some()
+                || !settings.av1an_filters.is_empty()
+                || settings
+                    .subtitles
+                    .iter()
+                    .any(|subtitle| subtitle.mode == media_core::SubtitleMode::BurnIn))
+        {
+            return Err(unsupported(
+                "VP9 alpha preservation currently supports trim and framing, but not temporal filters, custom pixel filters, or subtitle burn-in.",
+            ));
+        }
+        if is_hdr10
+            && tone_map.is_none()
+            && explicit_pixel_format.is_some_and(|format| format != "yuv420p10le")
+        {
             return Err(unsupported(
                 "HDR10 output requires 10-bit 4:2:0. Choose 10-bit output or enable SDR tone mapping.",
             ));
         }
-        if is_hdr10 && !settings.encoder.is_svt() && tone_map.is_none() {
+        if is_hdr10
+            && !matches!(
+                settings.encoder,
+                VideoEncoder::SvtAv1
+                    | VideoEncoder::SvtAv1FiveFish
+                    | VideoEncoder::SvtAv1Hdr
+                    | VideoEncoder::AomAv1
+                    | VideoEncoder::X265Standalone
+            )
+            && tone_map.is_none()
+        {
             return Err(unsupported(
-                "The selected non-SVT encoder currently supports SDR output only. Select SVT-AV1 for HDR10 output or enable explicit HDR/HLG-to-SDR tone mapping.",
+                "The selected encoder supports SDR output only. Select SVT-AV1, AOM, or standalone x265 for preserved HDR10, or enable explicit HDR/HLG-to-SDR tone mapping.",
             ));
         }
         let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg || tone.dv5) {
@@ -342,7 +532,7 @@ impl Plan {
             grain_prefilter: settings
                 .av1an_grain
                 .as_ref()
-                .filter(|grain| grain.table.is_some() && grain.denoise)
+                .filter(|grain| settings.encoder.is_svt() && grain.table.is_some() && grain.denoise)
                 .map(|grain| grain.denoise_strength),
             prepare_metric_reference: settings
                 .av1an_options
@@ -351,8 +541,10 @@ impl Plan {
             temporal: settings.temporal.map(temporal::Transform::new),
             trim: settings.trim,
             encoder: settings.encoder,
+            source_pixel_format,
+            source_is_vp9_alpha,
             output_pixel_format: explicit_pixel_format.unwrap_or_else(|| {
-                if settings.encoder.is_svt() || video.pix_fmt.as_deref() == Some("yuv420p10le") {
+                if settings.encoder.is_svt() || source_depth >= 10 {
                     "yuv420p10le"
                 } else {
                     "yuv420p"
@@ -387,11 +579,13 @@ impl Plan {
                 1
             } else if is_hdr10 {
                 9
+            } else if rgb_source {
+                1 // The encoded YUV uses BT.709; RGB input carries GBR identity.
             } else {
                 sdr_color(video.color_space.as_deref())?
             },
             hdr10,
-            full_range: if tone_map.is_some() {
+            full_range: if tone_map.is_some() || (settings.encoder.is_svt() && rgb_source) {
                 false
             } else {
                 match video.color_range.as_deref() {
@@ -411,6 +605,13 @@ impl Plan {
                     Some("left") => "left",
                     Some("topleft") => "topleft",
                     Some("center") if !settings.encoder.is_svt() => "center",
+                    None | Some("unspecified" | "unknown")
+                        if source_pixel_format.contains("444") || rgb_source =>
+                    {
+                        // 4:4:4 has no chroma sample offset. Conversion to a
+                        // subsampled output needs a deterministic destination.
+                        "left"
+                    }
                     None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => {
                         "unknown"
                     }
@@ -431,6 +632,19 @@ impl Plan {
 
     pub fn output_sar(&self) -> &str {
         &self.output_sar
+    }
+
+    pub fn has_alpha(&self) -> bool {
+        self.output_pixel_format == "yuva420p"
+    }
+
+    pub fn source_is_vp9_alpha(&self) -> bool {
+        self.source_is_vp9_alpha
+    }
+
+    fn matches_source_stream_format(&self, format: Option<&str>) -> bool {
+        format == Some(self.source_pixel_format)
+            || (self.source_is_vp9_alpha && format == Some("yuv420p"))
     }
 
     pub fn requires_qtgmc(&self) -> bool {
@@ -516,6 +730,9 @@ impl Plan {
         }
         if let Some(tone) = &self.tone_map {
             filters.push(tone.filter());
+        }
+        if let Some(conversion) = self.pixel_conversion() {
+            filters.push(conversion);
         }
         (!filters.is_empty()).then(|| filters.join(","))
     }
@@ -627,7 +844,46 @@ impl Plan {
         if let Some(tone) = &self.tone_map {
             filters.push(tone.filter());
         }
+        if let Some(conversion) = self.pixel_conversion() {
+            filters.push(conversion);
+        }
         (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    fn pixel_conversion(&self) -> Option<String> {
+        let input = if self.tone_map.is_some() {
+            "yuv420p10le"
+        } else {
+            self.source_pixel_format
+        };
+        if input == self.output_pixel_format {
+            return None;
+        }
+        let matrix = match self.matrix {
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            9 => "bt2020",
+            _ => unreachable!("validated color matrix"),
+        };
+        let input_range = if rgb_source_format(self.source_pixel_format) || self.full_range {
+            "full"
+        } else {
+            "limited"
+        };
+        let output_range = if self.full_range { "full" } else { "limited" };
+        let (x, y) = match self.chroma {
+            "left" => (0, 128),
+            "topleft" => (0, 0),
+            "center" => (128, 128),
+            // An unspecified 4:2:0 input remains unspecified. The scale
+            // operation uses its conventional left sample position.
+            _ => (0, 128),
+        };
+        Some(format!(
+            "scale=iw:ih:flags=bilinear+accurate_rnd:in_color_matrix={matrix}:out_color_matrix={matrix}:in_range={input_range}:out_range={output_range}:in_h_chr_pos={x}:out_h_chr_pos={x}:in_v_chr_pos={y}:out_v_chr_pos={y}:sws_dither=ed,format={}",
+            self.output_pixel_format
+        ))
     }
 
     pub fn geometry_filter_with_text(&self, text: Option<&str>) -> Option<String> {
@@ -747,8 +1003,16 @@ impl Plan {
         }
     }
 
+    fn high_chroma_output(&self) -> bool {
+        matches!(
+            self.output_pixel_format,
+            "yuv422p" | "yuv422p10le" | "yuv444p" | "yuv444p10le"
+        )
+    }
+
     pub fn matches_output_format(&self, format: Option<&str>) -> bool {
         format == Some(self.output_pixel_format)
+            || (self.output_pixel_format == "yuva420p" && format == Some("yuv420p"))
             || (!self.encoder.is_svt()
                 && self.full_range
                 && matches!(
@@ -771,6 +1035,52 @@ impl Plan {
             }
             if let Some((cll, fall)) = hdr.metadata.light {
                 args.extend(["--content-light".into(), format!("{cll},{fall}").into()]);
+            }
+        }
+        args
+    }
+
+    pub fn x265_hdr_arguments(&self) -> Vec<std::ffi::OsString> {
+        let mut args = Vec::new();
+        if let Some(hdr) = self.validation_hdr(true) {
+            args.push("--hdr10".into());
+            if let Some(mastering) = &hdr.metadata.mastering {
+                args.extend(["--master-display".into(), mastering.x265_argument().into()]);
+            }
+            if let Some((cll, fall)) = hdr.metadata.light {
+                args.extend(["--max-cll".into(), format!("{cll},{fall}").into()]);
+            }
+        }
+        args
+    }
+
+    /// AOM's CLI writes HDR CICP into AV1 but cannot emit mastering or CLL
+    /// metadata OBUs. Matroska carries those verified values through the
+    /// subsequent FFmpeg copy mux, including when the destination is MP4.
+    pub fn aom_hdr_mkvmerge_arguments(&self) -> Vec<std::ffi::OsString> {
+        let mut args = vec![
+            "--color-matrix-coefficients".into(),
+            "0:9".into(),
+            "--color-transfer-characteristics".into(),
+            "0:16".into(),
+            "--color-primaries".into(),
+            "0:9".into(),
+            "--color-bits-per-channel".into(),
+            "0:10".into(),
+            "--color-range".into(),
+            "0:1".into(),
+        ];
+        if let Some(hdr) = self.validation_hdr(true) {
+            if let Some(mastering) = &hdr.metadata.mastering {
+                args.extend(mastering.mkvmerge_arguments());
+            }
+            if let Some((cll, fall)) = hdr.metadata.light {
+                args.extend([
+                    "--max-content-light".into(),
+                    format!("0:{cll}").into(),
+                    "--max-frame-light".into(),
+                    format!("0:{fall}").into(),
+                ]);
             }
         }
         args
@@ -897,6 +1207,11 @@ impl Plan {
         if frames.frames.is_empty() {
             return Err(unsupported("The video did not decode to any frames."));
         }
+        if !encoded && !self.matches_source_stream_format(stream.pix_fmt.as_deref()) {
+            return Err(unsupported(
+                "The decoded source pixel format differs from the selected stream.",
+            ));
+        }
         let mut observed_hdr = StaticMetadata::parse(&stream.side_data_list)?;
         validate_side_data(
             &stream.side_data_list,
@@ -930,6 +1245,7 @@ impl Plan {
             };
             if normalize_chroma(frame.chroma_location.as_deref())
                 != normalize_chroma(stream.chroma_location.as_deref())
+                && !(encoded && self.high_chroma_output() && frame.chroma_location.is_none())
             {
                 return Err(unsupported(
                     "Decoded frame chroma placement differs from the selected source.",
@@ -938,7 +1254,7 @@ impl Plan {
             if if encoded {
                 !self.matches_output_format(frame.pix_fmt.as_deref())
             } else {
-                frame.pix_fmt != stream.pix_fmt
+                frame.pix_fmt.as_deref() != Some(self.source_pixel_format)
             } {
                 return Err(unsupported(
                     "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
@@ -1027,22 +1343,38 @@ impl Plan {
         let optional_container_field_matches = |actual: Option<&str>, expected: Option<&str>| {
             actual == expected || (allow_absent_vp9_container_fields && actual.is_none())
         };
-        let chroma_matches = match self.chroma {
-            "left" => {
-                optional_container_field_matches(output.chroma_location.as_deref(), Some("left"))
+        let chroma_matches = if self.high_chroma_output() && output.chroma_location.is_none() {
+            // HEVC and some other high-chroma bitstreams do not expose a
+            // chroma-location field through FFprobe. The producer's explicit
+            // conversion and decoded pixel format remain independently checked.
+            true
+        } else {
+            match self.chroma {
+                "left" => optional_container_field_matches(
+                    output.chroma_location.as_deref(),
+                    Some("left"),
+                ),
+                "topleft" => optional_container_field_matches(
+                    output.chroma_location.as_deref(),
+                    Some("topleft"),
+                ),
+                "center" => optional_container_field_matches(
+                    output.chroma_location.as_deref(),
+                    Some("center"),
+                ),
+                _ => matches!(
+                    output.chroma_location.as_deref(),
+                    None | Some("unspecified" | "unknown")
+                ),
             }
-            "topleft" => {
-                optional_container_field_matches(output.chroma_location.as_deref(), Some("topleft"))
-            }
-            "center" => {
-                optional_container_field_matches(output.chroma_location.as_deref(), Some("center"))
-            }
-            _ => matches!(
-                output.chroma_location.as_deref(),
-                None | Some("unspecified" | "unknown")
-            ),
         };
-        if output.codec_name.as_deref() != Some(self.output_codec())
+        if (self.output_pixel_format == "yuva420p"
+            && !allow_absent_vp9_container_fields
+            && !output
+                .tags
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode") && value == "1"))
+            || output.codec_name.as_deref() != Some(self.output_codec())
             || !self.matches_output_format(output.pix_fmt.as_deref())
             || output.width != Some(self.width)
             || output.height != Some(self.height)
@@ -1062,16 +1394,18 @@ impl Plan {
                     )
                     || output.color_range.as_deref() != Some("tv")
             } else {
-                source.color_space != output.color_space
-                    || !optional_container_field_matches(
-                        output.color_transfer.as_deref(),
-                        expected_transfer,
-                    )
-                    || !optional_container_field_matches(
-                        output.color_primaries.as_deref(),
-                        expected_primaries,
-                    )
-                    || source.color_range != output.color_range
+                (if rgb_source_format(self.source_pixel_format) {
+                    output.color_space.as_deref() != Some("bt709")
+                } else {
+                    source.color_space != output.color_space
+                }) || !optional_container_field_matches(
+                    output.color_transfer.as_deref(),
+                    expected_transfer,
+                ) || !optional_container_field_matches(
+                    output.color_primaries.as_deref(),
+                    expected_primaries,
+                ) || output.color_range.as_deref()
+                    != Some(if self.full_range { "pc" } else { "tv" })
             }
             || !chroma_matches
         {
@@ -1950,6 +2284,277 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn planar_source_formats_are_validated_before_explicit_output_conversion() {
+        for (source_format, source_range, output_format) in [
+            ("yuv422p", "tv", "yuv420p"),
+            ("yuv444p", "tv", "yuv420p"),
+            ("yuv422p10le", "tv", "yuv420p10le"),
+            ("yuv444p10le", "tv", "yuv420p10le"),
+            ("yuv420p12le", "tv", "yuv420p10le"),
+            ("yuv422p12le", "tv", "yuv420p10le"),
+            ("yuv444p12le", "tv", "yuv420p10le"),
+            ("yuvj422p", "pc", "yuv420p"),
+            ("yuvj444p", "pc", "yuv420p"),
+            ("yuyv422", "tv", "yuv420p"),
+            ("uyvy422", "tv", "yuv420p"),
+        ] {
+            let mut source = source();
+            source.streams[0].pix_fmt = Some(source_format.into());
+            source.streams[0].color_range = Some(source_range.into());
+            source.streams[0].chroma_location = Some("left".into());
+            let mut plan =
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).unwrap();
+            assert_eq!(plan.source_pixel_format, source_format);
+            assert_eq!(plan.output_pixel_format, output_format);
+            let filter = plan.decoder_filter().unwrap();
+            assert!(filter.contains("scale=iw:ih:"), "{source_format}: {filter}");
+            assert!(filter.contains(&format!("format={output_format}")));
+            assert!(filter.contains("in_color_matrix=bt709:out_color_matrix=bt709"));
+            let mut decoded = frames(&["0", "0.042"]);
+            for frame in &mut decoded.frames {
+                frame.pix_fmt = Some(source_format.into());
+                frame.color_range = Some(source_range.into());
+                frame.chroma_location = Some("left".into());
+            }
+            assert_eq!(
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .unwrap(),
+                2
+            );
+            let mut wrong = Frames {
+                frames: decoded.frames.clone(),
+            };
+            wrong.frames[1].pix_fmt = Some(output_format.into());
+            assert!(
+                plan.validate_source_frames(&wrong, &source.streams[0])
+                    .is_err()
+            );
+            let mut encoded = source.streams[0].clone();
+            encoded.pix_fmt = Some(output_format.into());
+            assert!(plan.matches_output_format(encoded.pix_fmt.as_deref()));
+            assert!(!plan.matches_output_format(Some(source_format)));
+        }
+    }
+
+    #[test]
+    fn opaque_rgb_has_an_explicit_gbr_to_bt709_conversion_and_alpha_is_rejected() {
+        for source_format in ["rgb24", "bgr24"] {
+            let mut source = source();
+            let stream = &mut source.streams[0];
+            stream.pix_fmt = Some(source_format.into());
+            stream.color_range = Some("pc".into());
+            stream.color_space = Some("gbr".into());
+            stream.chroma_location = None;
+            let mut plan =
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).unwrap();
+            assert_eq!(plan.source_pixel_format, source_format);
+            assert_eq!(plan.output_pixel_format, "yuv420p");
+            assert_eq!(plan.matrix, 1);
+            assert_eq!(plan.chroma, "left");
+            assert!(
+                plan.decoder_filter()
+                    .unwrap()
+                    .contains("out_color_matrix=bt709:in_range=full:out_range=full")
+            );
+            let mut decoded = frames(&["0", "0.042"]);
+            for frame in &mut decoded.frames {
+                frame.pix_fmt = Some(source_format.into());
+                frame.color_range = Some("pc".into());
+                frame.color_space = Some("gbr".into());
+                frame.chroma_location = None;
+            }
+            assert_eq!(
+                plan.validate_source_frames(&decoded, &source.streams[0])
+                    .unwrap(),
+                2
+            );
+            let mut encoded = source.streams[0].clone();
+            encoded.codec_name = Some("h264".into());
+            encoded.pix_fmt = Some("yuv420p".into());
+            encoded.color_space = Some("bt709".into());
+            encoded.chroma_location = Some("left".into());
+            assert!(
+                plan.validate_encoded_stream(&source.streams[0], &encoded)
+                    .is_ok()
+            );
+            source.streams[0].pix_fmt = Some("rgba".into());
+            assert!(
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).is_err()
+            );
+            source.streams[0].pix_fmt = Some(source_format.into());
+            source.streams[0].color_space = Some("bt709".into());
+            assert!(
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn svt_converts_full_range_opaque_rgb_to_limited_range_yuv() {
+        let mut source = source();
+        let stream = &mut source.streams[0];
+        stream.pix_fmt = Some("rgb24".into());
+        stream.color_range = Some("pc".into());
+        stream.color_space = Some("gbr".into());
+        stream.chroma_location = None;
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1,
+            ..Default::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        assert_eq!(plan.source_pixel_format, "rgb24");
+        assert_eq!(plan.output_pixel_format, "yuv420p10le");
+        assert!(!plan.full_range);
+        assert!(
+            plan.decoder_filter()
+                .unwrap()
+                .contains("in_range=full:out_range=limited")
+        );
+        let mut output = source.streams[0].clone();
+        output.codec_name = Some("av1".into());
+        output.pix_fmt = Some("yuv420p10le".into());
+        output.color_range = Some("tv".into());
+        output.color_space = Some("bt709".into());
+        output.chroma_location = Some("left".into());
+        assert!(
+            plan.validate_encoded_stream(&source.streams[0], &output)
+                .is_ok()
+        );
+        source.streams[0].pix_fmt = Some("yuvj420p".into());
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err());
+    }
+
+    #[test]
+    fn shared_output_format_cannot_bypass_av1an_options_or_encoder_chroma_limits() {
+        let source = source();
+        let shared = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::X264,
+            output_pixel_format: Some(media_core::Av1anPixelFormat::Yuv444p),
+            ..x264_settings()
+        };
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &shared).is_err());
+        let conflict = EncodeSettings {
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p),
+                ..Default::default()
+            }),
+            ..shared.clone()
+        };
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &conflict).is_err());
+        let unsupported = EncodeSettings {
+            backend: EncodeBackend::Standalone,
+            encoder: VideoEncoder::VpxStandalone,
+            output_pixel_format: Some(media_core::Av1anPixelFormat::Yuv422p),
+            ..Default::default()
+        };
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &unsupported).is_err());
+    }
+
+    #[test]
+    fn vp9_alpha_requires_explicit_standalone_route_and_alpha_source() {
+        let opaque = source();
+        let alpha_settings = EncodeSettings {
+            encoder: VideoEncoder::Vp9,
+            output_pixel_format: Some(media_core::Av1anPixelFormat::Yuva420p),
+            ..Default::default()
+        };
+        assert!(Plan::build(&opaque, &opaque.selected(&[0]).unwrap(), &alpha_settings).is_err());
+        let mut transparent = source();
+        transparent.streams[0].pix_fmt = Some("yuva420p".into());
+        transparent.streams[0].chroma_location = Some("left".into());
+        assert!(
+            Plan::build(
+                &transparent,
+                &transparent.selected(&[0]).unwrap(),
+                &EncodeSettings {
+                    encoder: VideoEncoder::Vp9,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        let plan = Plan::build(
+            &transparent,
+            &transparent.selected(&[0]).unwrap(),
+            &alpha_settings,
+        )
+        .unwrap();
+        assert!(plan.has_alpha());
+        let wrong_encoder = EncodeSettings {
+            encoder: VideoEncoder::X264,
+            ..alpha_settings.clone()
+        };
+        assert!(
+            Plan::build(
+                &transparent,
+                &transparent.selected(&[0]).unwrap(),
+                &wrong_encoder
+            )
+            .is_err()
+        );
+        let av1an = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::Vp9,
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuva420p),
+                ..Default::default()
+            }),
+            output_pixel_format: None,
+            ..alpha_settings.clone()
+        };
+        assert!(Plan::build(&transparent, &transparent.selected(&[0]).unwrap(), &av1an).is_err());
+        let mut tagged = source();
+        tagged.streams[0].codec_name = Some("vp9".into());
+        tagged.streams[0].chroma_location = Some("left".into());
+        tagged.streams[0]
+            .tags
+            .insert("ALPHA_MODE".into(), "1".into());
+        assert!(
+            Plan::build(
+                &tagged,
+                &tagged.selected(&[0]).unwrap(),
+                &EncodeSettings {
+                    encoder: VideoEncoder::Vp9,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        let plan = Plan::build(&tagged, &tagged.selected(&[0]).unwrap(), &alpha_settings).unwrap();
+        assert!(plan.source_is_vp9_alpha());
+    }
+
+    #[test]
+    fn full_chroma_output_and_unsupported_source_formats_remain_distinct() {
+        let mut source = source();
+        source.streams[0].pix_fmt = Some("yuv444p10le".into());
+        source.streams[0].chroma_location = None;
+        let settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv444p10le),
+                ..Default::default()
+            }),
+            ..x264_settings()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        assert_eq!(plan.output_pixel_format, "yuv444p10le");
+        assert_eq!(plan.chroma, "left");
+        assert!(plan.pixel_conversion().is_none());
+        for unsupported_format in ["rgb24", "gbrp", "yuva420p", "nv12", "p010le"] {
+            source.streams[0].pix_fmt = Some(unsupported_format.into());
+            assert!(
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err(),
+                "{unsupported_format}"
+            );
+        }
+        source.streams[0].pix_fmt = Some("yuvj444p".into());
+        source.streams[0].color_range = Some("tv".into());
+        assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err());
+    }
     #[test]
     fn fractional_cfr_accepts_timestamp_rounding_but_rejects_vfr() {
         let source = source();
@@ -2171,7 +2776,7 @@ mod tests {
     fn rejects_unsupported_color_geometry_interlace_and_settings() {
         for (field, value) in [
             ("color_transfer", "smpte2084"),
-            ("pix_fmt", "yuv444p"),
+            ("pix_fmt", "rgb24"),
             ("sample_aspect_ratio", "4:3"),
             ("field_order", "tt"),
             ("start_time", "1"),

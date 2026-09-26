@@ -16,6 +16,36 @@ pub enum UtilityRequest {
     SubtitleOcr(SubtitleOcrRequest),
     Grain(GrainRequest),
     CrfLadder(CrfLadderRequest),
+    DeinterlaceExport(DeinterlaceExportRequest),
+    CadenceRepairExport(CadenceRepairExportRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum DeinterlaceExportMethod {
+    Qtgmc,
+    Bwdif,
+    Yadif,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeinterlaceExportRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub video_stream_index: u32,
+    pub method: DeinterlaceExportMethod,
+    pub mode: crate::DeinterlaceMode,
+    pub field_order: crate::FieldOrder,
+    pub qtgmc_preset: crate::QtgmcPreset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CadenceRepairExportRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub video_stream_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -118,6 +148,9 @@ pub enum LadderMetric {
     Psnr,
     Ssim,
     Vmaf,
+    Ssimulacra2,
+    ButteraugliInf,
+    XpsnrWeighted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -211,6 +244,7 @@ pub struct CrfLadderResult {
     pub sampled_seconds: f64,
     pub sampled_fraction: f64,
     pub rungs: Vec<CrfLadderRung>,
+    pub recommendation_threshold: Option<f64>,
     pub recommended_crf: Option<u8>,
     pub source_fingerprint: String,
     pub message: String,

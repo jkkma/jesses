@@ -41,10 +41,38 @@ Windows builds include a [portable av1an frameserver](windows-av1an-package.md):
 the pinned engine, VapourSynth R79, L-SMASH and private CPython runtime, with
 complete sources, license notices, build receipts and per-child environment
 selection. The workflow adds source-built vszip and Julek CPU scorers in a
-separate verified merge. Linux also has retained standalone x264/mainline SVT
+separate verified merge. The Julek recipe trims checkout paths from MSVC
+`__FILE__` diagnostics and rejects a DLL that still embeds a local user path.
+The next verified merge adds QTGMC's Python modules and native plugin closure,
+retaining corresponding sources and evaluating all six supported presets.
+See the portable av1an build document for both extension recipes.
+Linux also has retained standalone x264/mainline SVT
 source recipes and historical native package evidence, described in the Linux
 build document. Linux packaging, including av1an, is deferred and is not part of
 the active Windows release gate.
+
+Windows x64 also has pinned standalone `aomenc`, `vpxenc` and `x265` deliveries.
+With a verified media delivery and isolated compiler, build each encoder into
+a new directory:
+
+```powershell
+foreach ($encoder in @('aom', 'vpx', 'x265')) {
+  python scripts/build-package-extra-encoders.py --encoder $encoder --destination "target/package-$encoder" --ffmpeg-build target/package-ffmpeg/delivery --msys-root target/media-compiler/msys64
+}
+```
+
+Pass the resulting `delivery` directories to `stage-bundled-tools.py` as
+`--aom-build`, `--vpx-build` and `--x265-build`.
+The AOM recipe pins the exact upstream commit and canonical source-file tree;
+Gitiles archive timestamps vary between downloads. It retains the Y4M chroma
+patch and exercises both `iq` and `ssimulacra2` on four 10-bit frames. VPX
+uses the complete upstream 1.17.0 source already held in the verified MSYS
+source package. x265 comes from the exact public MSYS binary package in the
+verified compiler lock, with its complete matching source package and license
+notices referenced from the media delivery. The x265 support DLLs are copied
+from that verified compiler and hashed in the delivery receipt. The stager
+checks each delivery's full payload inventory against its source and build
+receipt before including it in portable resources.
 Install the remaining tools described in
 [standalone encoders](standalone-encoders.md) and
 [SVT forks](svt-forks.md), then check **Tools & settings**.

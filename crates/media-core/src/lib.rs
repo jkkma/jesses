@@ -10,9 +10,10 @@ pub use saved_jobs::SavedJobInspection;
 mod completion;
 pub use completion::{CompletionOptions, CompletionStatus, FinishAction};
 mod utilities;
-pub use images::{ImageOutput, ImageRequest, ImageResult};
+pub use images::{ImageOutput, ImagePixelFormat, ImageRequest, ImageResult};
 pub use utilities::{
-    ColorMetadataTransferRequest, ConcatRequest, CrfLadderRequest, CrfLadderResult, CrfLadderRung,
+    CadenceRepairExportRequest, ColorMetadataTransferRequest, ConcatRequest, CrfLadderRequest,
+    CrfLadderResult, CrfLadderRung, DeinterlaceExportMethod, DeinterlaceExportRequest,
     GrainRequest, GrainSource, GrainTableResult, KeyframeCutRequest, LadderEncoder, LadderMetric,
     SubtitleOcrRequest, SubtitleOcrResult, UtilityArtifact, UtilityCapabilities, UtilityDependency,
     UtilityRequest, UtilityResult,
@@ -37,7 +38,10 @@ pub use loudness::{LoudnessRequest, LoudnessResult};
 pub use preferences::{
     GeneralPreferences, PreferenceImportPreview, SavePreferencesRequest, UserPreferences,
 };
-pub use quality::{QualityMetric, QualityPoint, QualityRequest, QualityResult};
+pub use quality::{
+    QualityAlignment, QualityMetric, QualityOptions, QualityPoint, QualityRequest, QualityResult,
+    QualityVmafModel,
+};
 pub use reports::{AnalysisExportFormat, AnalysisExportRequest, AnalysisReport};
 mod mux;
 mod subtitles;
@@ -238,6 +242,7 @@ pub fn typescript_contracts() -> String {
         CompletionOptions::decl(&config),
         CompletionStatus::decl(&config),
         ImageOutput::decl(&config),
+        ImagePixelFormat::decl(&config),
         ImageRequest::decl(&config),
         ImageResult::decl(&config),
         UtilityRequest::decl(&config),
@@ -253,6 +258,9 @@ pub fn typescript_contracts() -> String {
         LadderEncoder::decl(&config),
         LadderMetric::decl(&config),
         CrfLadderRequest::decl(&config),
+        DeinterlaceExportMethod::decl(&config),
+        DeinterlaceExportRequest::decl(&config),
+        CadenceRepairExportRequest::decl(&config),
         UtilityArtifact::decl(&config),
         SubtitleOcrResult::decl(&config),
         GrainTableResult::decl(&config),
@@ -278,6 +286,9 @@ pub fn typescript_contracts() -> String {
         LoudnessRequest::decl(&config),
         LoudnessResult::decl(&config),
         QualityMetric::decl(&config),
+        QualityAlignment::decl(&config),
+        QualityVmafModel::decl(&config),
+        QualityOptions::decl(&config),
         QualityPoint::decl(&config),
         QualityRequest::decl(&config),
         QualityResult::decl(&config),

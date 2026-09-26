@@ -12,5 +12,24 @@
     "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
     "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
     "root": "cmake-4.4.3-windows-x86_64"
+  },
+  "aom": {
+    "version": "3.14.1",
+    "commit": "03087864cf4bea6abb0d28f95cf7843511413d8f",
+    "url": "https://aomedia.googlesource.com/aom/+archive/03087864cf4bea6abb0d28f95cf7843511413d8f.tar.gz",
+    "treeSha256": "98ca413d03098099b02893c26e5c45f297f46b70a6f437b2bd84619dcd167e2c",
+    "patch": "aom-v3.14.1-y4m-vertical-420.patch",
+    "patchSha256": "7e597ec1ba5a7923440a8c465ecf3aa6ab72136773f90f21ca594a30fe520ed3"
+  },
+  "vpx": {
+    "version": "1.17.0",
+    "sourceMember": "mingw-w64-libvpx/libvpx-1.17.0.tar.gz",
+    "sourceMemberSha256": "1020f184046187baa2985dbde38e0691f49c44088bca7a1842b0236c6081dc0a",
+    "sourceRoot": "libvpx-1.17.0"
+  },
+  "x265": {
+    "version": "4.3",
+    "package": "mingw-w64-ucrt-x86_64-x265",
+    "sourcePackage": "mingw-w64-x265"
   }
 }

@@ -7,6 +7,9 @@
   import Av1anResources from './Av1anResources.svelte';
   import Av1anGrain from './Av1anGrain.svelte';
   import Av1anFilters from './Av1anFilters.svelte';
+  import OutputPixelFormat from './OutputPixelFormat.svelte';
+  import { allowedOutputPixelFormats } from './output-pixel-format';
+  import type { Av1anPixelFormat } from '$lib/ipc/generated';
   import {
     defaultAv1anAudio,
     readAv1anPreferences,
@@ -118,6 +121,7 @@
     presetLabel,
     sourceBitDepth,
     knownHdr,
+    preservableHdr10,
     encoderChoices,
     isAv1anEncoder,
     isSvtEncoder,
@@ -167,6 +171,7 @@
   let av1an = $state(defaultAv1an());
   let av1anGrain = $state<Av1anGrainSettings | undefined>();
   let av1anFilters = $state<string[]>([]);
+  let outputPixelFormat = $state<Av1anPixelFormat | undefined>();
   let crf = $state<number | undefined>(30);
   let preset = $state(2);
   let workers = $state<number | undefined>(2);
@@ -237,6 +242,7 @@
     av1an: Av1anDraft;
     av1anGrain: Av1anGrainSettings | undefined;
     av1anFilters: string[];
+    outputPixelFormat: Av1anPixelFormat | undefined;
     crf: number | undefined;
     preset: number;
     workers: number | undefined;
@@ -302,7 +308,10 @@
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
   const hdrUnsupported = $derived(
-    !isSvtEncoder(encoder) && knownHdr(selectedVideo) && !toneMap.enabled,
+    !isSvtEncoder(encoder) &&
+      !(['x265Standalone', 'aomAv1'].includes(encoder) && preservableHdr10(selectedVideo)) &&
+      knownHdr(selectedVideo) &&
+      !toneMap.enabled,
   );
   const depthLabel = $derived(
     toneMap.enabled
@@ -359,7 +368,11 @@
   const toolsReady = $derived(
     requiredEncoderTools(backend, encoder, av1an.concatMethod).every((id) =>
       tools.some((tool) => tool.id === id && tool.available),
-    ),
+    ) &&
+      (encoder !== 'aomAv1' ||
+        !preservableHdr10(selectedVideo) ||
+        toneMap.enabled ||
+        tools.some((tool) => tool.id === 'mkvmerge' && tool.available)),
   );
   const disabled = $derived(!desktop || !usableSource || submitting);
   const grainConflict = $derived(
@@ -394,7 +407,7 @@
     if (!validForkSettings(encoder, lineartPsyBias, texturePsyBias, hdrTune))
       return 'Check encoder tuning: use lineart and texture bias 0–7 and a listed HDR tune.';
     if (
-      isSvtEncoder(encoder) &&
+      (isSvtEncoder(encoder) || encoder === 'aomAv1') &&
       !(
         typeof filmGrain === 'number' &&
         Number.isInteger(filmGrain) &&
@@ -403,6 +416,17 @@
       )
     )
       return 'Use film grain synthesis 0–50.';
+    if (av1anGrain && (isSvtEncoder(encoder) || encoder === 'aomAv1')) {
+      if (
+        (av1anGrain.table !== null && av1anGrain.table.length === 0) ||
+        (av1anGrain.table !== null && filmGrain !== 0) ||
+        !Number.isInteger(av1anGrain.denoiseStrength) ||
+        av1anGrain.denoiseStrength < 1 ||
+        av1anGrain.denoiseStrength > 16 ||
+        (!chunked && isSvtEncoder(encoder) && av1anGrain.table === null)
+      )
+        return 'Check the grain table and use denoise strength 1–16.';
+    }
     if (chunked) {
       const issue = av1anError(
         av1an,
@@ -411,25 +435,22 @@
         destinationContainer(destination) === 'matroska',
       );
       if (issue) return issue;
-      if (
-        av1anGrain &&
-        !(
-          (av1anGrain.table === null || av1anGrain.table.length > 0) &&
-          (av1anGrain.table === null || filmGrain === 0) &&
-          Number.isInteger(av1anGrain.denoiseStrength) &&
-          av1anGrain.denoiseStrength >= 1 &&
-          av1anGrain.denoiseStrength <= 16
-        )
-      )
-        return 'Check the grain table and use denoise strength 1–16.';
     }
     return null;
   });
   const customFiltersIssue = $derived(
-    chunked && av1anFilters.length > 16 ? 'Use at most 16 custom pixel filters.' : null,
+    av1anFilters.length > 16 ? 'Use at most 16 custom pixel filters.' : null,
+  );
+  const pixelFormatIssue = $derived(
+    outputPixelFormat && !allowedOutputPixelFormats(encoder).includes(outputPixelFormat)
+      ? 'Choose an output pixel format supported by this encoder.'
+      : outputPixelFormat === 'yuva420p' &&
+          !['matroska', 'webm'].includes(destinationContainer(destination))
+        ? 'VP9 alpha requires a Matroska or WebM destination.'
+        : null,
   );
   const validSettings = $derived(
-    !videoSettingsIssue && !tuningSettingsIssue && !customFiltersIssue,
+    !videoSettingsIssue && !tuningSettingsIssue && !customFiltersIssue && !pixelFormatIssue,
   );
   const canQueue = $derived(
     !disabled &&
@@ -494,6 +515,7 @@
     av1an = defaultAv1an(useInfrastructurePreferences);
     av1anGrain = undefined;
     av1anFilters = chunked && usePreferences ? readAv1anPreferences().filters : [];
+    outputPixelFormat = undefined;
     crf = options.defaultCrf;
     preset = options.defaultPreset;
     workers = chunked && useInfrastructurePreferences ? readAv1anPreferences().workers : 2;
@@ -543,6 +565,7 @@
           av1an: copyAv1an(av1an),
           av1anGrain: av1anGrain ? { ...av1anGrain } : undefined,
           av1anFilters: [...av1anFilters],
+          outputPixelFormat,
           crf,
           preset,
           workers,
@@ -599,6 +622,7 @@
         av1an = copyAv1an(draft.av1an);
         av1anGrain = draft.av1anGrain ? { ...draft.av1anGrain } : undefined;
         av1anFilters = [...draft.av1anFilters];
+        outputPixelFormat = draft.outputPixelFormat;
         error = null;
       } else {
         const previousDraftForSource =
@@ -693,10 +717,11 @@
         ...(selectedTemporal(temporal) ? { temporal: selectedTemporal(temporal) } : {}),
         videoStreamIndex: videoIndex,
         ...(chunked ? { av1anOptions: selectedAv1an(av1an, encoder) } : {}),
-        ...(chunked && isSvtEncoder(encoder) && av1anGrain
+        ...(!chunked && outputPixelFormat ? { outputPixelFormat } : {}),
+        ...((isSvtEncoder(encoder) || encoder === 'aomAv1') && av1anGrain
           ? { av1anGrain: { ...av1anGrain } }
           : {}),
-        ...(chunked && av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
+        ...(av1anFilters.length ? { av1anFilters: [...av1anFilters] } : {}),
         ...(rate.mode === 'bitrate' || rate.mode === 'targetSize'
           ? { rateControl: selectedRate(rate) }
           : {}),
@@ -713,7 +738,7 @@
         backend,
         encoder,
         workers: backend === 'av1an' ? workers! : 2,
-        filmGrain: isSvtEncoder(encoder) ? filmGrain! : 0,
+        filmGrain: isSvtEncoder(encoder) || encoder === 'aomAv1' ? filmGrain! : 0,
         hdr10Fallback: isSvtEncoder(encoder) ? hdr10Fallback : false,
         lineartPsyBias: encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
         texturePsyBias: encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
@@ -749,7 +774,7 @@
       !file ||
       videoIndex === undefined ||
       (rate.mode === 'quality' && crf === undefined) ||
-      (isSvtEncoder(encoder) && filmGrain === undefined)
+      ((isSvtEncoder(encoder) || encoder === 'aomAv1') && filmGrain === undefined)
     )
       return;
     const request = currentRequest();
@@ -1077,15 +1102,13 @@
               onapply={(crop) => (framing = { ...framing, crop: { ...crop } })}
             />
           {/if}
-          {#if chunked}
-            {#key JSON.stringify([encoder, file?.id])}
-              <Av1anFilters
-                value={av1anFilters}
-                {disabled}
-                onchange={(value) => (av1anFilters = [...value])}
-              />
-            {/key}
-          {/if}
+          {#key JSON.stringify([encoder, file?.id])}
+            <Av1anFilters
+              value={av1anFilters}
+              {disabled}
+              onchange={(value) => (av1anFilters = [...value])}
+            />
+          {/key}
         </div>
       </section>
       <section
@@ -1110,12 +1133,21 @@
             bind:lineartPsyBias
             bind:texturePsyBias
             bind:hdrTune
-            grainTableSelected={chunked && !!av1anGrain?.table}
+            grainTableSelected={!!av1anGrain?.table}
           />
-          {#if chunked && isSvtEncoder(encoder)}
+          {#if !chunked}<OutputPixelFormat
+              id={`${idPrefix}-output-pixel-format`}
+              {encoder}
+              value={outputPixelFormat}
+              {disabled}
+              onchange={(value) => (outputPixelFormat = value)}
+            />{#if pixelFormatIssue}<p role="alert">{pixelFormatIssue}</p>{/if}{/if}
+          {#if isSvtEncoder(encoder) || encoder === 'aomAv1'}
             {#key JSON.stringify([encoder, file?.id])}
               <Av1anGrain
                 value={av1anGrain}
+                {encoder}
+                tableOnly={!chunked && isSvtEncoder(encoder)}
                 {disabled}
                 onchange={(value) => {
                   av1anGrain = value ? { ...value } : undefined;
@@ -1171,11 +1203,17 @@
                 that FFmpeg includes the selected library and pixel format before encoding.
               </p>{/if}
             {#if encoder === 'x264'}<p>
-                Encode progressive SDR to H.264 with a constant frame rate, square pixels, and 4:2:0
-                color. The source's 8-bit or 10-bit depth is retained when supported by the
-                installed x264 build. HDR sources require tone mapping to SDR, and interlacing
-                requires explicit deinterlacing. Source compatibility and encoder depth support are
-                checked before encoding.
+                Encode progressive SDR to H.264 at the selected 8-bit or 10-bit output depth. Planar
+                8-bit, 10-bit, and 12-bit sources can be converted to supported output depth; av1an
+                also offers 4:2:2 and 4:4:4 output when the installed x264 build supports it. HDR
+                sources require tone mapping to SDR, and interlacing requires explicit
+                deinterlacing.
+              </p>{:else if ['aomAv1', 'vpxStandalone', 'x265Standalone'].includes(encoder)}<p>
+                {options.name} accepts progressive planar 8-bit, 10-bit, or 12-bit SDR sources, converting
+                to a selected 8-bit or 10-bit output depth. The installed encoder is checked before encoding.
+                av1an uses mkvmerge for VP9 and x265 chunk timing. x265 and AOM can preserve tagged 10-bit
+                BT.2020/PQ HDR10 with verified static metadata; other HDR sources require tone mapping
+                to SDR.
               </p>{:else if isSvtEncoder(encoder)}<p>
                 Supports progressive SDR and compatible HDR10 video with a constant frame rate,
                 square pixels, and 4:2:0 color. HDR10 preserves static HDR metadata. Explicit
@@ -1252,7 +1290,9 @@
                 lineartPsyBias,
                 texturePsyBias,
                 hdrTune,
-              })}{isSvtEncoder(encoder) ? ` · Grain ${filmGrain ?? '—'}` : ''} · {{
+              })}{isSvtEncoder(encoder) || encoder === 'aomAv1'
+                ? ` · Grain ${filmGrain ?? '—'}`
+                : ''} · {{
                 matroska: 'MKV',
                 mp4: 'MP4',
                 mov: 'MOV',
@@ -1318,7 +1358,9 @@
         {:else if !toolsReady}<p class="disabled-reason">
             Install FFmpeg, FFprobe, standalone {options.name}{backend === 'av1an'
               ? ', and av1an'
-              : ''}{chunked && (encoder === 'x264' || av1an.concatMethod === 'mkvmerge')
+              : ''}{chunked &&
+            (['x264', 'x265Standalone', 'vpxStandalone'].includes(encoder) ||
+              av1an.concatMethod === 'mkvmerge')
               ? ', and mkvmerge'
               : ''}, then refresh Tools & settings.
           </p>
@@ -1326,17 +1368,19 @@
             av1an requires the first video track. Use Quick Convert for another video track.
           </p>
         {:else if hdrUnsupported}<p class="disabled-reason">
-            {options.name} supports SDR sources only. Choose SVT-AV1-HDR for compatible HDR10 video.
+            {options.name} needs explicit HDR-to-SDR tone mapping for this source. Tagged 10-bit BT.2020/PQ
+            HDR10 can be preserved with SVT-AV1, x265 or AOM.
           </p>
         {:else if !validRate(rate)}<p class="disabled-reason">
             Enter a valid whole-number bitrate or target size above.
           </p>
         {:else if !validSettings}<p class="disabled-reason">
             Use {isSvtEncoder(encoder) ? 'quarter-step' : 'whole-number'} CRF {options.crfMin}–{options.crfMax},
-            a listed preset{isSvtEncoder(encoder) ? ', and grain 0–50' : ''}{encoder ===
-            'svtAv1FiveFish'
-              ? '; lineart and texture bias 0–7'
-              : ''}{chunked ? '; parallel chunks 1–64' : ''}.
+            a listed preset{isSvtEncoder(encoder) || encoder === 'aomAv1'
+              ? ', and grain 0–50'
+              : ''}{encoder === 'svtAv1FiveFish' ? '; lineart and texture bias 0–7' : ''}{chunked
+              ? '; parallel chunks 1–64'
+              : ''}.
           </p>
         {:else if !framingValid}<p class="disabled-reason">
             {framingResult.error}

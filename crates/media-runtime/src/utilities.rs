@@ -39,6 +39,8 @@ const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const MEDIA_LIMIT: Duration = Duration::from_secs(6 * 60 * 60);
 const PROBE_LIMIT: Duration = Duration::from_secs(60);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+mod ladder_scorers;
+mod temporal_exports;
 
 fn error(code: &str, message: impl Into<String>, path: Option<&Path>) -> AppError {
     AppError::new(
@@ -831,6 +833,7 @@ struct ProbeStream {
     channel_layout: Option<String>,
     time_base: Option<String>,
     avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
     pix_fmt: Option<String>,
     field_order: Option<String>,
     sample_aspect_ratio: Option<String>,
@@ -3847,6 +3850,9 @@ fn quality_metric(metric: LadderMetric) -> Option<QualityMetric> {
         LadderMetric::Psnr => Some(QualityMetric::Psnr),
         LadderMetric::Ssim => Some(QualityMetric::Ssim),
         LadderMetric::Vmaf => Some(QualityMetric::Vmaf),
+        LadderMetric::Ssimulacra2 | LadderMetric::ButteraugliInf | LadderMetric::XpsnrWeighted => {
+            None
+        }
     }
 }
 
@@ -3856,6 +3862,9 @@ fn default_threshold(metric: LadderMetric) -> Option<f64> {
         LadderMetric::Psnr => Some(45.0),
         LadderMetric::Ssim => Some(0.98),
         LadderMetric::Vmaf => Some(95.0),
+        LadderMetric::Ssimulacra2 => Some(80.0),
+        LadderMetric::ButteraugliInf => Some(4.0),
+        LadderMetric::XpsnrWeighted => None,
     }
 }
 
@@ -4015,7 +4024,12 @@ fn aggregate_score(metric: LadderMetric, scores: &[(Option<f64>, u64)]) -> Optio
     if weight <= 0.0 {
         return None;
     }
-    if metric == LadderMetric::Psnr {
+    if !matches!(metric, LadderMetric::Psnr | LadderMetric::XpsnrWeighted)
+        && scores.iter().any(|(score, _)| score.is_none())
+    {
+        return None;
+    }
+    if matches!(metric, LadderMetric::Psnr | LadderMetric::XpsnrWeighted) {
         let mse = scores
             .iter()
             .map(|(score, frames)| {
@@ -4032,6 +4046,24 @@ fn aggregate_score(metric: LadderMetric, scores: &[(Option<f64>, u64)]) -> Optio
             .sum::<f64>()
             / weight,
     )
+}
+
+fn recommended_ladder_crf(
+    metric: LadderMetric,
+    threshold: Option<f64>,
+    rungs: &[CrfLadderRung],
+) -> Option<u8> {
+    let threshold = threshold?;
+    rungs
+        .iter()
+        .filter(|rung| match (metric, rung.score) {
+            (LadderMetric::Psnr | LadderMetric::XpsnrWeighted, None) => true,
+            (LadderMetric::ButteraugliInf, Some(score)) => score <= threshold,
+            (_, Some(score)) => score >= threshold,
+            _ => false,
+        })
+        .map(|rung| rung.crf)
+        .max()
 }
 
 async fn run_crf_ladder(
@@ -4077,6 +4109,9 @@ async fn run_crf_ladder(
                 LadderMetric::Psnr => !(0.0..=100.0).contains(&value),
                 LadderMetric::Ssim => !(0.0..=1.0).contains(&value),
                 LadderMetric::Vmaf => !(0.0..=100.0).contains(&value),
+                LadderMetric::Ssimulacra2 => !(-100.0..=100.0).contains(&value),
+                LadderMetric::ButteraugliInf => !(0.0..=1000.0).contains(&value),
+                LadderMetric::XpsnrWeighted => !(0.0..=1000.0).contains(&value),
             }
     }) {
         return Err(error(
@@ -4152,6 +4187,8 @@ async fn run_crf_ladder(
         request.sample_seconds,
     );
     let scratch = Scratch::create("crf-ladder")?;
+    let scorer =
+        ladder_scorers::Scorer::prepare(request.metric, &ffmpeg, &scratch.path, cancel).await?;
     struct Sample {
         reference: PathBuf,
         seconds: f64,
@@ -4279,6 +4316,7 @@ async fn run_crf_ladder(
                 })?;
                 let quality = crate::quality::analyze_quality(
                     QualityRequest {
+                        options: None,
                         reference_path: sample.reference.to_string_lossy().into_owned(),
                         reference_stream_index: 0,
                         reference_start_frame: 0,
@@ -4292,6 +4330,19 @@ async fn run_crf_ladder(
                 )
                 .await?;
                 scores.push((quality.score, sample.frames));
+            } else if request.metric != LadderMetric::None {
+                let score = scorer
+                    .as_ref()
+                    .expect("prepared scorer for selected metric")
+                    .score(
+                        &sample.reference,
+                        &candidate,
+                        sample.frames,
+                        &scratch.path,
+                        cancel,
+                    )
+                    .await?;
+                scores.push((score, sample.frames));
             }
         }
         let score = aggregate_score(request.metric, &scores);
@@ -4330,17 +4381,7 @@ async fn run_crf_ladder(
         ));
     }
     check_cancel(cancel)?;
-    let recommended_crf = threshold.and_then(|threshold| {
-        rungs
-            .iter()
-            .filter(|rung| match (request.metric, rung.score) {
-                (LadderMetric::Psnr, None) => true,
-                (_, Some(score)) => score >= threshold,
-                _ => false,
-            })
-            .map(|rung| rung.crf)
-            .max()
-    });
+    let recommended_crf = recommended_ladder_crf(request.metric, threshold, &rungs);
     let sampled_seconds = prepared.iter().map(|sample| sample.seconds).sum::<f64>();
     Ok(UtilityResult::CrfLadder(CrfLadderResult {
         encoder: request.encoder,
@@ -4351,13 +4392,14 @@ async fn run_crf_ladder(
         sampled_seconds,
         sampled_fraction: (sampled_seconds / source_duration).min(1.0),
         rungs,
+        recommendation_threshold: threshold,
         recommended_crf,
         source_fingerprint,
         message: "Each rung encoded the same lossless, frame-counted samples. Size and bitrate are measured video-only; whole-file size is a projection and can move with unsampled scene complexity.".into(),
         diagnostics: vec![
             "Only the selected FFmpeg wrapper preset, CRF, and pixel format are represented. Audio, subtitles, attachments, chapters, production encode filters, standalone-encoder-only settings, and container overhead do not transfer into this ladder.".into(),
             match threshold {
-                Some(value) => format!("The recommendation is the highest tested CRF meeting the selected metric threshold ({value})."),
+                Some(value) => format!("The recommendation is the highest tested CRF meeting the selected metric threshold ({value}); Butteraugli distance qualifies at or below it, while quality scores qualify at or above it."),
                 None => "No score threshold was selected, so no CRF recommendation was made.".into(),
             },
         ],
@@ -4378,6 +4420,12 @@ pub async fn run_utility(
         UtilityRequest::SubtitleOcr(request) => run_subtitle_ocr(request, &cancel).await,
         UtilityRequest::Grain(request) => run_grain(request, &cancel).await,
         UtilityRequest::CrfLadder(request) => run_crf_ladder(request, &cancel).await,
+        UtilityRequest::DeinterlaceExport(request) => {
+            temporal_exports::deinterlace(request, &cancel).await
+        }
+        UtilityRequest::CadenceRepairExport(request) => {
+            temporal_exports::repair_cadence(request, &cancel).await
+        }
     }
 }
 
@@ -4481,5 +4529,55 @@ mod tests {
         let score = aggregate_score(LadderMetric::Psnr, &[(Some(40.0), 10), (None, 10)]).unwrap();
         assert!((score - 43.0103).abs() < 0.001);
         assert_eq!(aggregate_score(LadderMetric::Psnr, &[(None, 10)]), None);
+    }
+
+    #[test]
+    fn ladder_metrics_pool_samples_and_recommend_in_the_correct_direction() {
+        let xpsnr = aggregate_score(
+            LadderMetric::XpsnrWeighted,
+            &[(Some(40.0), 10), (Some(30.0), 30)],
+        )
+        .unwrap();
+        assert!((xpsnr - 31.1079).abs() < 0.002);
+        assert_eq!(
+            aggregate_score(LadderMetric::XpsnrWeighted, &[(None, 2)]),
+            None
+        );
+        assert_eq!(
+            aggregate_score(LadderMetric::Ssimulacra2, &[(Some(80.0), 2), (None, 2)]),
+            None
+        );
+        assert_eq!(
+            aggregate_score(
+                LadderMetric::ButteraugliInf,
+                &[(Some(2.0), 1), (Some(6.0), 3)]
+            ),
+            Some(5.0)
+        );
+
+        let rung = |crf, score| CrfLadderRung {
+            crf,
+            encoded_bytes: "1".into(),
+            encoded_seconds: 1.0,
+            bitrate_kbps: 1.0,
+            bytes_per_minute: "1".into(),
+            projected_size_bytes: "1".into(),
+            score: Some(score),
+            encode_seconds: 1.0,
+        };
+        let quality = [rung(18, 90.0), rung(28, 82.0), rung(42, 60.0)];
+        assert_eq!(
+            recommended_ladder_crf(LadderMetric::Ssimulacra2, Some(80.0), &quality),
+            Some(28)
+        );
+        let distance = [rung(18, 1.0), rung(28, 3.0), rung(42, 7.0)];
+        assert_eq!(
+            recommended_ladder_crf(LadderMetric::ButteraugliInf, Some(4.0), &distance),
+            Some(28)
+        );
+        assert_eq!(
+            recommended_ladder_crf(LadderMetric::XpsnrWeighted, None, &quality),
+            None
+        );
     }
 }

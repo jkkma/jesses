@@ -37,8 +37,9 @@
     </p>
     <p>
       Use the crop, resize, trim and frame-rate controls for geometry or timing. Custom filters
-      cannot read or write files. A verified lossless intermediate keeps scene detection and quality
-      scoring aligned with the filtered encode.
+      cannot read or write files. Standalone jobs filter frames in the encoder's source pipe; av1an
+      prepares a verified lossless intermediate so scene detection and quality scoring see the same
+      pixels.
     </p>
   </div>
 </details>

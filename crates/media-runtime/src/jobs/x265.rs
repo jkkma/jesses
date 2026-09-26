@@ -19,11 +19,14 @@ const PRESETS: [&str; 10] = [
     "placebo",
 ];
 
-fn color(value: u8) -> &'static str {
+fn color(value: u8, kind: &str) -> &'static str {
     match value {
         1 => "bt709",
         5 => "bt470bg",
         6 => "smpte170m",
+        16 if kind == "transfer" => "smpte2084",
+        9 if kind == "matrix" => "bt2020nc",
+        9 => "bt2020",
         _ => unreachable!("validated SDR color"),
     }
 }
@@ -48,11 +51,11 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         "--range".into(),
         if plan.full_range { "full" } else { "limited" }.into(),
         "--colorprim".into(),
-        color(plan.primaries).into(),
+        color(plan.primaries, "primaries").into(),
         "--transfer".into(),
-        color(plan.transfer).into(),
+        color(plan.transfer, "transfer").into(),
         "--colormatrix".into(),
-        color(plan.matrix).into(),
+        color(plan.matrix, "matrix").into(),
         "--chromaloc".into(),
         match plan.chroma {
             "left" => "0",
@@ -67,6 +70,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     } else {
         args.extend(["--crf".into(), settings.crf.to_string().into()]);
     }
+    args.extend(plan.x265_hdr_arguments());
     args.extend(super::super::parameters::arguments(settings));
     args
 }

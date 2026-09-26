@@ -58,11 +58,15 @@ jobs:
         run: python scripts/test-qualify-scoop.py
       - run: python scripts/test-package-toolchain.py
       - run: python scripts/test-package-standalone.py
+      - name: Verify additional Windows standalone delivery contracts
+        if: runner.os == 'Windows'
+        run: python scripts/test-package-extra-encoders.py
       - name: Verify Linux standalone package recipes
         if: runner.os == 'Linux'
         run: python scripts/test-package-standalone-linux.py
       - run: python scripts/test-package-av1an.py
       - run: python scripts/test-package-av1an-scorers.py
+      - run: python scripts/test-package-av1an-qtgmc.py
       - name: Verify Linux FFmpeg package recipes
         if: runner.os == 'Linux'
         run: python scripts/test-package-ffmpeg-linux.py
@@ -96,6 +100,13 @@ jobs:
         shell: bash
         if: runner.os == 'Windows'
         run: python scripts/build-package-svt.py --destination "$RUNNER_TEMP/jesses-svt" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build source-complete Windows AOM, VPX and x265 CLIs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for encoder in aom vpx x265; do
+            python scripts/build-package-extra-encoders.py --encoder "$encoder" --destination "$RUNNER_TEMP/jesses-$encoder" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+          done
       - name: Build portable Windows av1an and its complete frameserver sources
         if: runner.os == 'Windows'
         shell: bash
@@ -106,12 +117,18 @@ jobs:
         run: |
           python scripts/package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-scorers" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64" --vapoursynth-source "$RUNNER_TEMP/jesses-av1an/frameserver/source/vapoursynth-acabf605b2205b32d65859bb2736405719d2fafd" --python "$RUNNER_TEMP/jesses-av1an/frameserver/python-input/tools/python.exe"
           python scripts/add-package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-av1an-scorers" --av1an-build "$RUNNER_TEMP/jesses-av1an/delivery" --scorers-build "$RUNNER_TEMP/jesses-scorers/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build and qualify source-complete Windows QTGMC dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/build-package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-qtgmc" --cache "$RUNNER_TEMP/jesses-qtgmc-cache"
+          python scripts/package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-av1an-qtgmc" --av1an-build "$RUNNER_TEMP/jesses-av1an-scorers/delivery" --qtgmc-build "$RUNNER_TEMP/jesses-qtgmc/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
       - name: Stage verified tools and complete source archives
         shell: bash
         run: |
           standalone_args=()
           if [ "$RUNNER_OS" = Windows ]; then
-            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-x264/delivery" --svt-build "$RUNNER_TEMP/jesses-svt/delivery" --av1an-build "$RUNNER_TEMP/jesses-av1an-scorers/delivery")
+            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-x264/delivery" --svt-build "$RUNNER_TEMP/jesses-svt/delivery" --av1an-build "$RUNNER_TEMP/jesses-av1an-qtgmc/delivery" --aom-build "$RUNNER_TEMP/jesses-aom/delivery" --vpx-build "$RUNNER_TEMP/jesses-vpx/delivery" --x265-build "$RUNNER_TEMP/jesses-x265/delivery")
           else
             standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-standalone-linux/x264/delivery" --svt-build "$RUNNER_TEMP/jesses-standalone-linux/svt-av1/delivery")
           fi
@@ -122,7 +139,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an
+          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265
       - name: Verify Linux bundled discovery with external tools unavailable
         if: runner.os == 'Linux'
         shell: bash
@@ -139,7 +156,7 @@ jobs:
           export JESSES_SVT_AV1_5FISH="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-5fish/SvtAv1EncApp$suffix"
           export JESSES_SVT_AV1_HDR="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-hdr/SvtAv1EncApp$suffix"
           cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --test image_jobs --locked -- --ignored --test-threads=1
-          # QTGMC is qualified with an external runtime; it is not in this bundle.
+          # Bundled QTGMC is evaluated against real frames by the dependency merger above.
           cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip qtgmc
       - name: Qualify portable av1an with external tools and conflicting runtimes unavailable
         if: runner.os == 'Windows'
@@ -182,7 +199,7 @@ jobs:
         run: |
           suffix=""
           standalone_args=(--require-tool x264 --require-tool svt-av1)
-          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an); fi
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265); fi
           python scripts/verify-bundle-resources.py --packages "$RUNNER_TEMP/jesses-packages" --probe "$CARGO_TARGET_DIR/debug/examples/package_tools$suffix" --destination "$RUNNER_TEMP/jesses-extracted-bundles" --require-media "${standalone_args[@]}"
       - name: Retain native gate evidence
         if: always()
@@ -199,6 +216,8 @@ jobs:
             ${{ runner.temp }}/jesses-av1an/**/*.log
             ${{ runner.temp }}/jesses-scorers/*.log
             ${{ runner.temp }}/jesses-av1an-scorers/**/*.log
+            ${{ runner.temp }}/jesses-qtgmc/**/*.log
+            ${{ runner.temp }}/jesses-av1an-qtgmc/**/*.log
             ${{ runner.temp }}/jesses-appimage-repair/restoration.json
             ${{ runner.temp }}/jesses-appimage-repair/*.log
             ${{ runner.temp }}/jesses-appimage-repair/original/*.AppImage

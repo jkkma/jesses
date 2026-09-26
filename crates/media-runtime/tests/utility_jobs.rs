@@ -61,6 +61,101 @@ fn run(program: &str, args: &[&str]) {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires FFmpeg xpsnr, libx264, and the installed CPU VapourSynth vszip/julek scorers"]
+async fn crf_ladder_scores_all_new_metrics_with_expected_direction() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("ladder-scorer-source.mkv");
+    run(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-n",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=128x96:r=24",
+            "-frames:v",
+            "8",
+            "-vf",
+            "format=yuv420p10le,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-chroma_sample_location",
+            "left",
+            &path(&source),
+        ],
+    );
+    let original = fs::read(&source).unwrap();
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    for (metric, lower_is_better) in [
+        (LadderMetric::Ssimulacra2, false),
+        (LadderMetric::ButteraugliInf, true),
+        (LadderMetric::XpsnrWeighted, false),
+    ] {
+        let result = media_runtime::run_utility(
+            UtilityRequest::CrfLadder(CrfLadderRequest {
+                input_path: path(&source),
+                video_stream_index: 0,
+                encoder: LadderEncoder::H264,
+                preset: "ultrafast".into(),
+                pixel_format: "yuv420p10le".into(),
+                crfs: vec![18, 42],
+                sample_count: 1,
+                sample_seconds: 1.0,
+                metric,
+                recommendation_threshold: None,
+            }),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let UtilityResult::CrfLadder(result) = result else {
+            panic!("expected ladder result")
+        };
+        let first = result.rungs[0].score.expect("low CRF metric score");
+        let second = result.rungs[1].score.expect("high CRF metric score");
+        assert!(
+            first.is_finite() && second.is_finite(),
+            "{metric:?}: {first} {second}"
+        );
+        assert!(
+            if lower_is_better {
+                first < second
+            } else {
+                first > second
+            },
+            "{metric:?}: {first} {second}"
+        );
+        assert_eq!(
+            result.recommendation_threshold,
+            match metric {
+                LadderMetric::Ssimulacra2 => Some(80.0),
+                LadderMetric::ButteraugliInf => Some(4.0),
+                LadderMetric::XpsnrWeighted => None,
+                _ => unreachable!(),
+            }
+        );
+        if metric == LadderMetric::XpsnrWeighted {
+            assert_eq!(result.recommended_crf, None);
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
+
 fn capture(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().unwrap();
     assert!(

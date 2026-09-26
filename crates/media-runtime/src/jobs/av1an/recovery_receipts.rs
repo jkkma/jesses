@@ -187,10 +187,10 @@ impl TargetQuality {
             && self.metric == "VMAF"
             && self.min_q == 15
             && self.max_q
-                == if expected.encoder == VideoEncoder::X264 {
-                    35
-                } else {
-                    50
+                == match expected.encoder {
+                    VideoEncoder::X264 | VideoEncoder::X265Standalone => 35,
+                    VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => 55,
+                    _ => 50,
                 }
             && self.interp_method.is_none()
             && self.encoder == super::encoder::receipt_name(expected.encoder)

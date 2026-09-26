@@ -11,6 +11,27 @@ pub enum ImageOutput {
     Gif,
 }
 
+/// PNG's explicit RGB layouts. The 16-bit formats are big-endian on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ImagePixelFormat {
+    Rgb24,
+    Rgba,
+    Rgb48,
+    Rgba64,
+}
+
+impl ImagePixelFormat {
+    pub const fn ffmpeg(self) -> &'static str {
+        match self {
+            Self::Rgb24 => "rgb24",
+            Self::Rgba => "rgba",
+            Self::Rgb48 => "rgb48be",
+            Self::Rgba64 => "rgba64be",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "operation",
@@ -33,6 +54,9 @@ pub enum ImageRequest {
         output_path: String,
         #[serde(default)]
         width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pixel_format: Option<ImagePixelFormat>,
     },
 }
 

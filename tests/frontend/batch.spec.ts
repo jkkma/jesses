@@ -1052,14 +1052,11 @@ test('x264 batch keeps HDR failures visible while queueing only reviewed SDR req
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(
-    workspace.getByText(
-      "x264 needs SDR video. Open this episode's settings and enable explicit HDR-to-SDR tone mapping, or choose an SVT build for compatible HDR10 output.",
-      {
-        exact: true,
-      },
-    ),
+    workspace.getByText(/x264 needs explicit HDR-to-SDR tone mapping for this episode\./, {
+      exact: true,
+    }),
   ).toBeVisible();
-  await expect(workspace).not.toContainText('lossless');
+  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
     '1 ready / 2 reviewed',
@@ -1800,13 +1797,9 @@ test('batch exposes direct encoders and blocks unsupported NVENC two-pass and ta
   await openBatch(page);
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await expect(encoder.locator('option[value="aomAv1"]')).toHaveText('AOM · AV1 (standalone)');
-  await expect(encoder.locator('option[value="vpxStandalone"]')).toHaveText(
-    'VP9 · vpxenc (standalone)',
-  );
-  await expect(encoder.locator('option[value="x265Standalone"]')).toHaveText(
-    'x265 · HEVC (standalone)',
-  );
+  await expect(encoder.locator('option[value="aomAv1"]')).toHaveText('AOM · AV1');
+  await expect(encoder.locator('option[value="vpxStandalone"]')).toHaveText('VP9 · vpxenc');
+  await expect(encoder.locator('option[value="x265Standalone"]')).toHaveText('x265 · HEVC');
   await encoder.selectOption('x265Standalone');
   await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
   const request = (await calls(page, 'preview_encode_batch'))[0].payload
@@ -2009,7 +2002,7 @@ test('av1an x264 batch preserves explicit options and invalidates review when ch
   const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
   await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
   const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await expect(encoder.locator('option')).toHaveCount(4);
+  await expect(encoder.locator('option')).toHaveCount(7);
   await encoder.selectOption('x264');
   await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
   await workspace.getByLabel('Output pixel format', { exact: true }).selectOption('yuv422p');

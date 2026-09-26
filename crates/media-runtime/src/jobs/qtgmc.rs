@@ -11,9 +11,9 @@ use std::{
 };
 use tokio::sync::watch;
 
-struct Runtime {
-    vspipe: PathBuf,
-    environment: Option<ChildEnvironment>,
+pub(crate) struct Runtime {
+    pub vspipe: PathBuf,
+    pub environment: Option<ChildEnvironment>,
 }
 
 fn optional_av1an(result: Result<PathBuf, AppError>) -> Result<Option<PathBuf>, AppError> {
@@ -24,7 +24,7 @@ fn optional_av1an(result: Result<PathBuf, AppError>) -> Result<Option<PathBuf>, 
     }
 }
 
-async fn runtime(cancel: &watch::Receiver<bool>) -> Result<Runtime, AppError> {
+pub(crate) async fn runtime(cancel: &watch::Receiver<bool>) -> Result<Runtime, AppError> {
     let av1an = optional_av1an(discover("av1an", cancel).await)?;
     if let Some(av1an) = av1an {
         let bundled = crate::bundled_tools::av1an_runtime(&av1an)
@@ -80,6 +80,7 @@ fn preset(preset: QtgmcPreset) -> &'static str {
         QtgmcPreset::Medium => "Medium",
         QtgmcPreset::Slow => "Slow",
         QtgmcPreset::Slower => "Slower",
+        QtgmcPreset::VerySlow => "Very Slow",
     }
 }
 
@@ -95,7 +96,7 @@ fn literal(path: &Path) -> Result<String, AppError> {
         .map_err(|error| files::error("QTGMC_PREPARE_FAILED", error.to_string(), path))
 }
 
-pub(super) fn source_script(
+pub(crate) fn source_script(
     source: &Path,
     cache: &Path,
     stream_index: u32,
@@ -514,7 +515,7 @@ impl Prepared {
     }
 }
 
-pub(super) async fn check_tools(
+pub(crate) async fn check_tools(
     vspipe: &Path,
     environment: Option<&ChildEnvironment>,
     work: &Path,

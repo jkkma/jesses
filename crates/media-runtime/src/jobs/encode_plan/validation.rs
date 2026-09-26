@@ -136,6 +136,15 @@ impl Cadence {
 
     fn validate(&mut self, frame: &Frame) -> Result<(), AppError> {
         if self.count == 0 {
+            if !self.encoded
+                && !self
+                    .plan
+                    .matches_source_stream_format(self.stream.pix_fmt.as_deref())
+            {
+                return Err(unsupported(
+                    "The decoded source pixel format differs from the selected stream.",
+                ));
+            }
             self.observed_hdr = StaticMetadata::parse(&self.stream.side_data_list)?;
             validate_side_data(
                 &self.stream.side_data_list,
@@ -169,6 +178,7 @@ impl Cadence {
         };
         if normalize_chroma(frame.chroma_location.as_deref())
             != normalize_chroma(self.stream.chroma_location.as_deref())
+            && !(self.encoded && self.plan.high_chroma_output() && frame.chroma_location.is_none())
         {
             return Err(unsupported(
                 "Decoded frame chroma placement differs from the selected source.",
@@ -177,7 +187,7 @@ impl Cadence {
         if if self.encoded {
             !self.plan.matches_output_format(frame.pix_fmt.as_deref())
         } else {
-            frame.pix_fmt != self.stream.pix_fmt
+            frame.pix_fmt.as_deref() != Some(self.plan.source_pixel_format)
         } {
             return Err(unsupported(
                 "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",

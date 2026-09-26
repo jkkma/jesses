@@ -4,7 +4,7 @@ use crate::{
     discovery::find_executable,
     supervisor::{self, CommandSpec},
 };
-use media_core::{AppError, ImageOutput, ImageRequest, ImageResult};
+use media_core::{AppError, ImageOutput, ImagePixelFormat, ImageRequest, ImageResult};
 use serde::Deserialize;
 use std::{
     ffi::OsString,
@@ -98,6 +98,55 @@ async fn run(
 }
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
+}
+
+async fn frame_hashes(
+    ffmpeg: &Path,
+    input: &Path,
+    stream: u32,
+    filter: Option<&str>,
+    format: ImagePixelFormat,
+    count: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Vec<String>, AppError> {
+    let mut a = args(&["-v", "error", "-nostdin", "-i"]);
+    a.push(input.as_os_str().to_owned());
+    a.extend(args(&["-map", &format!("0:{stream}")]));
+    if let Some(filter) = filter {
+        a.extend(args(&["-vf", filter]));
+    }
+    a.extend(args(&[
+        "-frames:v",
+        &count.to_string(),
+        "-c:v",
+        "rawvideo",
+        "-pix_fmt",
+        format.ffmpeg(),
+        "-f",
+        "framemd5",
+        "-",
+    ]));
+    let data = run(ffmpeg, a, None, cancel).await?;
+    let lines = String::from_utf8(data).map_err(|e| error(e.to_string(), input))?;
+    let hashes = lines
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            line.rsplit(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if hashes.len() != count as usize
+        || hashes
+            .iter()
+            .any(|hash| hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(error("Could not verify every decoded image sample.", input));
+    }
+    Ok(hashes)
 }
 
 #[derive(Deserialize)]
@@ -650,6 +699,7 @@ pub async fn run_image_job(
             format,
             output_path,
             width,
+            pixel_format,
         } => {
             let output = destination(&output_path)?;
             if frame_count == 0
@@ -663,6 +713,14 @@ pub async fn run_image_job(
                 ));
             }
             let sequence = matches!(format, ImageOutput::PngSequence | ImageOutput::JpegSequence);
+            if pixel_format.is_some()
+                && !matches!(format, ImageOutput::Png | ImageOutput::PngSequence)
+            {
+                return Err(error(
+                    "Explicit RGB depth and alpha are available for PNG images only.",
+                    &output,
+                ));
+            }
             if matches!(format, ImageOutput::Png | ImageOutput::Jpeg) && frame_count != 1 {
                 return Err(error(
                     "Still-image output requires exactly one frame.",
@@ -721,6 +779,9 @@ pub async fn run_image_job(
             if let Some(target) = width {
                 filter.push_str(&format!(",scale={target}:-1:flags=lanczos"));
             }
+            if let Some(pixel_format) = pixel_format {
+                filter.push_str(&format!(",format={}", pixel_format.ffmpeg()));
+            }
             let destination = stage.path.join(if sequence {
                 format!("frame-%06d.{extension}")
             } else {
@@ -759,6 +820,8 @@ pub async fn run_image_job(
                 ]));
                 if extension == "jpg" {
                     a.extend(args(&["-q:v", "2"]));
+                } else if let Some(pixel_format) = pixel_format {
+                    a.extend(args(&["-c:v", "png", "-pix_fmt", pixel_format.ffmpeg()]));
                 }
                 if !sequence {
                     a.extend(args(&["-update", "1"]));
@@ -784,6 +847,23 @@ pub async fn run_image_job(
                 ));
             }
             let mut result_size = None;
+            let expected_hashes = if let Some(pixel_format) = pixel_format {
+                Some(
+                    frame_hashes(
+                        &ffmpeg,
+                        &source.path,
+                        stream_index,
+                        Some(&filter),
+                        pixel_format,
+                        frame_count,
+                        &cancel,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let mut observed_hashes = Vec::new();
             for p in stage.entry_paths() {
                 let verified = inspect(p, &ffprobe, &cancel).await?;
                 let v = verified
@@ -805,10 +885,28 @@ pub async fn run_image_job(
                     ));
                 }
                 let size = geometry(v, p)?;
+                if let Some(pixel_format) = pixel_format {
+                    if v.pix_fmt.as_deref() != Some(pixel_format.ffmpeg()) {
+                        return Err(error(
+                            "The PNG output changed the selected RGB depth or alpha layout.",
+                            p,
+                        ));
+                    }
+                    observed_hashes
+                        .extend(frame_hashes(&ffmpeg, p, 0, None, pixel_format, 1, &cancel).await?);
+                }
                 if result_size.is_some_and(|v| v != size) {
                     return Err(error("Exported images have inconsistent dimensions.", p));
                 }
                 result_size = Some(size);
+            }
+            if let Some(expected_hashes) = expected_hashes
+                && observed_hashes != expected_hashes
+            {
+                return Err(error(
+                    "The PNG output changed decoded RGB or alpha samples.",
+                    &output,
+                ));
             }
             source.verify()?;
             check(&cancel)?;

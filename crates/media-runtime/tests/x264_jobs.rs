@@ -533,6 +533,7 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
         .preview_encode_batch(BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             output_container: None,
@@ -623,6 +624,7 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
         .preview_encode_batch(BatchEncodeRequest {
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             output_container: None,

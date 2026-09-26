@@ -7,3 +7,13 @@ export function knownHdr(stream: MediaStream | undefined): boolean {
     !!stream?.dynamicHdrFormats?.length
   );
 }
+
+export function preservableHdr10(stream: MediaStream | undefined): boolean {
+  return (
+    stream?.pixelFormat === 'yuv420p10le' &&
+    stream.colorRange === 'tv' &&
+    stream.colorPrimaries === 'bt2020' &&
+    stream.colorTransfer === 'smpte2084' &&
+    stream.colorSpace === 'bt2020nc'
+  );
+}

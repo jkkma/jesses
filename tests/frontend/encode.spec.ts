@@ -1120,7 +1120,7 @@ for (const depth of [8, 10]) {
         exact: true,
       }),
     ).toBeVisible();
-    await expect(quick).not.toContainText('lossless');
+    await expect(quick.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
     await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeEnabled();
   });
 }
@@ -1191,12 +1191,9 @@ test('x264 blocks known HDR while SVT remains selectable', async ({ page }) => {
   const quick = quickWorkspace(page);
   await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
   await expect(
-    quick.getByText(
-      'x264 supports SDR sources only. Choose SVT-AV1-HDR for compatible HDR10 video.',
-      {
-        exact: true,
-      },
-    ),
+    quick.getByText(/x264 needs explicit HDR-to-SDR tone mapping for this source\./, {
+      exact: true,
+    }),
   ).toBeVisible();
   await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
   await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
@@ -2751,7 +2748,7 @@ for (const encoder of ['x265', 'vp9'] as const) {
     await quick.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
     await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
     await expect(quick).toContainText(
-      `${encoder === 'x265' ? 'x265' : 'VP9'} supports SDR sources only.`,
+      `${encoder === 'x265' ? 'x265' : 'VP9'} needs explicit HDR-to-SDR tone mapping for this source.`,
     );
   });
 }
@@ -2972,7 +2969,7 @@ test('av1an x264 validates independent chunk and probe limits and freezes explic
   await openEncode(page, 'av1an');
   const workspace = av1anWorkspace(page);
   const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await expect(encoder.locator('option')).toHaveCount(4);
+  await expect(encoder.locator('option')).toHaveCount(7);
   await encoder.selectOption('x264');
   await expect(workspace.getByLabel('Quality', { exact: true })).toHaveValue('23');
   await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
@@ -2993,7 +2990,7 @@ test('av1an x264 validates independent chunk and probe limits and freezes explic
   await workspace.getByLabel('Chunk attempts', { exact: true }).fill('5');
   await expect(workspace.getByLabel('Join chunks with', { exact: true })).toHaveValue('mkvmerge');
   await expect(workspace.getByLabel('Join chunks with', { exact: true })).toBeDisabled();
-  await expect(workspace).toContainText('H.264 chunks need mkvmerge');
+  await expect(workspace).toContainText('This encoder needs mkvmerge to assign exact frame timing');
   await workspace.getByLabel('Attach encoding settings to the output', { exact: true }).check();
   await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
   await workspace.getByLabel('Maximum probe CRF', { exact: true }).fill('52');

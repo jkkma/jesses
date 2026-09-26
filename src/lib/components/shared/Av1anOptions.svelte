@@ -33,7 +33,8 @@
     { key: 'probeWidth', label: 'Metric evaluation width', min: 128, max: 8192 },
     { key: 'probeHeight', label: 'Metric evaluation height', min: 128, max: 8192 },
   ] as const;
-  const maximumProbeCrf = $derived(encoder === 'x264' ? 51 : 63);
+  const maximumProbeCrf = $derived(encoder === 'x264' || encoder === 'x265Standalone' ? 51 : 63);
+  const requiredMkvmerge = $derived(['x264', 'x265Standalone', 'vpxStandalone'].includes(encoder));
   const summary = $derived.by(() => {
     const readers: Record<Av1anDraft['chunkMethod'], string> = {
       lsmash: 'L-SMASH Works',
@@ -195,15 +196,19 @@
           <option value="">Source/default</option>
           <option value="yuv420p">4:2:0 · 8-bit</option>
           <option value="yuv420p10le">4:2:0 · 10-bit</option>
-          {#if encoder === 'x264'}
+          {#if encoder === 'x264' || encoder === 'x265Standalone' || encoder === 'aomAv1'}
             <option value="yuv422p">4:2:2 · 8-bit</option>
             <option value="yuv422p10le">4:2:2 · 10-bit</option>
+          {/if}
+          {#if encoder === 'x264' || encoder === 'x265Standalone' || encoder === 'aomAv1' || encoder === 'vpxStandalone'}
             <option value="yuv444p">4:4:4 · 8-bit</option>
             <option value="yuv444p10le">4:4:4 · 10-bit</option>
           {/if}
         </select>
         <p>Set an explicit chroma format and bit depth when the encoder build supports it.</p>
-        {#if encoder !== 'x264' && draft.pixelFormat === 'yuv420p'}<p class="small-muted">
+        {#if (encoder === 'svtAv1' || encoder === 'svtAv1FiveFish' || encoder === 'svtAv1Hdr') && draft.pixelFormat === 'yuv420p'}<p
+            class="small-muted"
+          >
             High-bit-depth mode decision (hbd-mds 1/2) has no effect with 8-bit output.
           </p>{/if}
       </div>
@@ -242,8 +247,8 @@
         <label for={`${idPrefix}-concat-method`}>Join chunks with</label>
         <select
           id={`${idPrefix}-concat-method`}
-          value={encoder === 'x264' ? 'mkvmerge' : (draft.concatMethod ?? 'ffmpeg')}
-          disabled={encoder === 'x264'}
+          value={requiredMkvmerge ? 'mkvmerge' : (draft.concatMethod ?? 'ffmpeg')}
+          disabled={requiredMkvmerge}
           onchange={(event) =>
             onchange({
               ...draft,
@@ -253,8 +258,8 @@
           <option value="ffmpeg">FFmpeg</option>
           <option value="mkvmerge">mkvmerge</option>
         </select>
-        {#if encoder === 'x264'}<p class="small-muted">
-            H.264 chunks need mkvmerge to retain exact timestamps when joined.
+        {#if requiredMkvmerge}<p class="small-muted">
+            This encoder needs mkvmerge to assign exact frame timing when chunks are joined.
           </p>{/if}
       </div>
       <label class="check wide-control" for={`${idPrefix}-attach-settings`}>

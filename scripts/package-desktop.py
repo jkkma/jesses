@@ -148,7 +148,7 @@ def verify(directory: Path) -> dict:
             if tool["id"] in identifiers:
                 raise ValueError("Duplicate bundled tool identity.")
             identifiers.add(tool["id"])
-            records = [tool, tool["source"], *tool["licenses"], *tool.get("additionalSources", []), *tool.get("buildInputs", []), *tool.get("supportFiles", [])]
+            records = [tool, tool["source"], *tool["licenses"], *tool.get("additionalSources", []), *tool.get("buildInputs", []), *tool.get("supportFiles", []), *tool.get("qualificationFiles", [])]
             if "buildProvenance" in tool:
                 records.append(tool["buildProvenance"])
             for record in records:

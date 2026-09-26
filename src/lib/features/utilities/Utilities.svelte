@@ -16,12 +16,23 @@
     GrainSource,
     LadderEncoder,
     LadderMetric,
+    DeinterlaceExportMethod,
+    DeinterlaceMode,
+    FieldOrder,
+    QtgmcPreset,
   } from '$lib/ipc/generated';
   import { errorMessage, formatBytes, fileName } from '$lib/components/shared/format';
   import ImageWorkflows from './ImageWorkflows.svelte';
   let { files, onimport }: { files: MediaFile[]; onimport: (paths: string[]) => void } = $props();
   let kind = $state<
-    'keyframeCut' | 'concat' | 'colorMetadataTransfer' | 'subtitleOcr' | 'grain' | 'crfLadder'
+    | 'keyframeCut'
+    | 'concat'
+    | 'colorMetadataTransfer'
+    | 'subtitleOcr'
+    | 'grain'
+    | 'crfLadder'
+    | 'deinterlaceExport'
+    | 'cadenceRepairExport'
   >('keyframeCut');
   let source = $state('');
   let stream = $state(0);
@@ -45,8 +56,12 @@
   let crfs = $state('18, 23, 28');
   let samples = $state(3);
   let seconds = $state(2);
-  let metric = $state<LadderMetric>('ssim');
+  let metric = $state<LadderMetric>('vmaf');
   let threshold = $state('');
+  let deinterlaceMethod = $state<DeinterlaceExportMethod>('qtgmc');
+  let deinterlaceMode = $state<DeinterlaceMode>('bob');
+  let fieldOrder = $state<FieldOrder>('topFirst');
+  let qtgmcPreset = $state<QtgmcPreset>('verySlow');
   let pending = $state(false);
   let checking = $state(false);
   let error = $state<string | null>(null);
@@ -63,6 +78,11 @@
     stream =
       selected?.streams.find((s) => s.kind === (kind === 'subtitleOcr' ? 'subtitle' : 'video'))
         ?.index ?? 0;
+  });
+  $effect(() => {
+    const order = selected?.streams.find((s) => s.index === stream)?.fieldOrder;
+    if (order && ['bb', 'bt', 'bff'].includes(order)) fieldOrder = 'bottomFirst';
+    else if (order && ['tt', 'tb', 'tff'].includes(order)) fieldOrder = 'topFirst';
   });
   $effect(() => {
     referenceStream = referenceFile?.streams.find((s) => s.kind === 'video')?.index ?? 0;
@@ -177,6 +197,24 @@
               outputPath: output,
             },
           };
+        else if (kind === 'deinterlaceExport')
+          request = {
+            kind,
+            request: {
+              inputPath: source,
+              outputPath: output,
+              videoStreamIndex: stream,
+              method: deinterlaceMethod,
+              mode: deinterlaceMode,
+              fieldOrder,
+              qtgmcPreset,
+            },
+          };
+        else if (kind === 'cadenceRepairExport')
+          request = {
+            kind,
+            request: { inputPath: source, outputPath: output, videoStreamIndex: stream },
+          };
         else {
           let grain: GrainRequest;
           if (grainOperation === 'measure')
@@ -250,6 +288,8 @@
           ><option value="colorMetadataTransfer">Transfer color metadata</option><option
             value="subtitleOcr">Subtitle OCR</option
           ><option value="grain">AV1 film grain</option><option value="crfLadder">CRF ladder</option
+          ><option value="deinterlaceExport">Deinterlace to new file</option><option
+            value="cadenceRepairExport">Repair padded cadence</option
           ></select
         ></label
       >
@@ -260,7 +300,7 @@
               >{/each}</select
           ></label
         >{/if}
-      {#if ['colorMetadataTransfer', 'subtitleOcr', 'crfLadder'].includes(kind)}<label
+      {#if ['colorMetadataTransfer', 'subtitleOcr', 'crfLadder', 'deinterlaceExport', 'cadenceRepairExport'].includes(kind)}<label
           >{kind === 'subtitleOcr' ? 'Subtitle' : 'Video'} stream<select
             bind:value={stream}
             disabled={pending}
@@ -341,6 +381,49 @@
       <p>
         Recognize bitmap subtitle text with installed Tesseract language models. Review the saved
         SRT for recognition errors.
+      </p>
+    {:else if kind === 'deinterlaceExport'}
+      <p>
+        Export a progressive near-lossless H.264 Matroska file. Audio, subtitles, attachments, and
+        source files remain separate from this new output.
+      </p>
+      <div class="fields">
+        <label
+          >Method<select bind:value={deinterlaceMethod} disabled={pending}
+            ><option value="qtgmc">QTGMC · motion compensated</option><option value="bwdif"
+              >BWDIF</option
+            ><option value="yadif">YADIF</option></select
+          ></label
+        >
+        <label
+          >Output rate<select bind:value={deinterlaceMode} disabled={pending}
+            ><option value="bob">One frame per field · double rate</option><option value="frame"
+              >One frame per source frame</option
+            ></select
+          ></label
+        >
+        <label
+          >Field order<select bind:value={fieldOrder} disabled={pending}
+            ><option value="topFirst">Top field first</option><option value="bottomFirst"
+              >Bottom field first</option
+            ></select
+          ></label
+        >
+        {#if deinterlaceMethod === 'qtgmc'}<label
+            >QTGMC preset<select bind:value={qtgmcPreset} disabled={pending}
+              ><option value="faster">Faster</option><option value="fast">Fast</option><option
+                value="medium">Medium</option
+              ><option value="slow">Slow</option><option value="slower">Slower</option><option
+                value="verySlow">Very Slow · default</option
+              ></select
+            ></label
+          >{/if}
+      </div>
+    {:else if kind === 'cadenceRepairExport'}
+      <p>
+        Repair an interlaced capture with more than 2% repeated-frame padding. The utility compares
+        decoded frame content with presentation times, exports at the source's declared rate, and
+        leaves fields interlaced for later deinterlacing.
       </p>
     {/if}
     {#if kind === 'colorMetadataTransfer' || (kind === 'grain' && grainOperation === 'measure')}
@@ -459,13 +542,18 @@
           /></label
         ><label
           >Quality metric<select bind:value={metric} disabled={pending}
-            ><option value="none">Size and speed only</option><option value="ssim">SSIM</option
-            ><option value="psnr">PSNR</option><option value="vmaf">VMAF</option></select
+            ><option value="none">Size and speed only</option><option value="vmaf">VMAF</option
+            ><option value="ssimulacra2">SSIMULACRA2</option><option value="butteraugliInf"
+              >Butteraugli INF · lower is better</option
+            ><option value="xpsnrWeighted">Weighted XPSNR</option><option value="ssim">SSIM</option
+            ><option value="psnr">PSNR</option></select
           ></label
         >{#if metric !== 'none'}<label class="threshold-field"
             >Recommendation threshold<input
               bind:value={threshold}
-              placeholder="Use metric default"
+              placeholder={metric === 'xpsnrWeighted'
+                ? 'No automatic threshold'
+                : 'Use metric default'}
               disabled={pending}
             /></label
           >{/if}
@@ -487,7 +575,12 @@
         <h2>Completed</h2>
         <p>{result.result.message}</p>
         {#if result.kind === 'crfLadder'}
-          <p>Recommended CRF: {result.result.recommendedCrf ?? 'No rung meets the threshold'}</p>
+          <p>
+            Recommended CRF: {result.result.recommendedCrf ??
+              (result.result.recommendationThreshold === null
+                ? 'No automatic recommendation'
+                : 'No rung meets the threshold')}
+          </p>
           <div class="table-scroll">
             <table>
               <thead
@@ -498,11 +591,14 @@
                 ></thead
               ><tbody
                 >{#each result.result.rungs as rung}<tr
-                    ><td>{rung.crf}</td><td>{rung.score?.toFixed(4) ?? '—'}</td><td
-                      >{rung.bitrateKbps.toFixed(1)}</td
-                    ><td>{formatBytes(rung.projectedSizeBytes)}</td><td
-                      >{rung.encodeSeconds.toFixed(2)}</td
-                    ></tr
+                    ><td>{rung.crf}</td><td
+                      >{rung.score?.toFixed(4) ??
+                        (result.result.metric === 'xpsnrWeighted' || result.result.metric === 'psnr'
+                          ? '∞'
+                          : '—')}</td
+                    ><td>{rung.bitrateKbps.toFixed(1)}</td><td
+                      >{formatBytes(rung.projectedSizeBytes)}</td
+                    ><td>{rung.encodeSeconds.toFixed(2)}</td></tr
                   >{/each}</tbody
               >
             </table>

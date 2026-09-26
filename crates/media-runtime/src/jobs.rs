@@ -1,6 +1,7 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
+mod alpha;
 mod audio;
 mod av1an;
 mod av1an_preprocess;
@@ -21,7 +22,7 @@ mod lossless;
 mod metadata;
 mod mux;
 pub(crate) mod parameters;
-mod qtgmc;
+pub(crate) mod qtgmc;
 mod rate_control;
 #[cfg(test)]
 mod real_tests;
@@ -350,6 +351,7 @@ impl JobManager {
             parameters: request.parameters.clone(),
             temporal: None,
             av1an_options: request.av1an_options,
+            output_pixel_format: request.output_pixel_format,
             av1an_grain: request.av1an_grain.clone(),
             av1an_filters: request.av1an_filters.clone(),
             rate_control: request.rate_control,
@@ -1490,8 +1492,10 @@ impl JobManager {
         metadata::verify(&document, &selected, &artifact)?;
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(id, cancel, &source, None, temp, &output, None, scratch)
-            .await
+        self.finalize(
+            id, cancel, &source, None, temp, &output, None, None, scratch,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1504,6 +1508,7 @@ impl JobManager {
         temporary: &Temporary,
         output: &Path,
         cadence: Option<container::Cadence>,
+        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
@@ -1519,7 +1524,63 @@ impl JobManager {
             scratch,
         )
         .await?;
+        let converted_alpha = converted.is_some();
         let temporary = converted.unwrap_or(temporary);
+        if converted_alpha
+            && let Some((plan, ffmpeg, video_position, frame_count, lossless)) = alpha
+        {
+            let ffprobe = discover("ffprobe", cancel).await?;
+            let document = probe(&ffprobe, &temporary.path, cancel, None).await?;
+            let video = document.streams.get(video_position).ok_or_else(|| {
+                AppError::new(
+                    "ENCODE_ALPHA_VALIDATION_FAILED",
+                    "The final container has no planned VP9 alpha stream.",
+                    None,
+                )
+            })?;
+            if !video
+                .tags
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode") && value == "1")
+            {
+                return Err(AppError::new(
+                    "ENCODE_ALPHA_VALIDATION_FAILED",
+                    "The final container lost VP9 alpha_mode metadata.",
+                    None,
+                ));
+            }
+            let reference = CommandSpec {
+                executable: ffmpeg.to_owned(),
+                args: encode::decoder_args(&source.path, plan),
+                cwd: None,
+            };
+            let mut candidate_args = encode::decoder_args_preprocessed(&temporary.path, plan);
+            let map = candidate_args
+                .iter()
+                .position(|argument| argument == "-map")
+                .expect("decoder stream map");
+            candidate_args[map + 1] = format!("0:{video_position}").into();
+            let candidate = CommandSpec {
+                executable: ffmpeg.to_owned(),
+                args: candidate_args,
+                cwd: None,
+            };
+            let evidence = alpha::verify(
+                &reference,
+                &candidate,
+                plan.width,
+                plan.height,
+                frame_count,
+                lossless,
+                &temporary.path,
+                cancel,
+            )
+            .await?;
+            self.change(id, |snapshot| {
+                append_log(snapshot, format!("Final container: {evidence}"))
+            })
+            .await;
+        }
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         source.verify()?;
@@ -1938,6 +1999,12 @@ pub async fn get_encoder_parameters(
     parameters::catalog(encoder, backend, cancel).await
 }
 
+pub(crate) fn validate_imported_settings(
+    settings: &media_core::EncodeSettings,
+) -> Result<(), media_core::AppError> {
+    encode_plan::validate_settings(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,6 +2142,7 @@ mod tests {
                     &temporary,
                     &output,
                     None,
+                    None,
                     &mut Vec::new()
                 )
                 .await
@@ -2093,6 +2161,7 @@ mod tests {
                     None,
                     &temporary,
                     &mp4,
+                    None,
                     None,
                     &mut Vec::new()
                 )

@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         temporal: None,
         parameters: Vec::new(),
         av1an_options: None,
+        output_pixel_format: None,
         av1an_grain: None,
         av1an_filters: Vec::new(),
         rate_control: None,

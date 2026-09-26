@@ -4,7 +4,7 @@ import { temporalSummary } from './temporal-options';
 import { rateSummary } from './rate-control-options';
 import { subtitleSummary } from './subtitle-options';
 import { toneMapSummary } from './tone-map-options';
-export { knownHdr } from './media-color';
+export { knownHdr, preservableHdr10 } from './media-color';
 import type { EncodeBackend, EncodeSettings, MediaStream, VideoEncoder } from '$lib/ipc/generated';
 import { audioSummary } from './audio-options';
 import { framingSummary } from './framing-options';
@@ -16,9 +16,9 @@ export const encoderChoices: { value: VideoEncoder; label: string }[] = [
   { value: 'svtAv1FiveFish', label: 'SVT-AV1 5fish · Anime' },
   { value: 'svtAv1', label: 'SVT-AV1 · Standard' },
   { value: 'x264', label: 'x264 · H.264' },
-  { value: 'x265Standalone', label: 'x265 · HEVC (standalone)' },
-  { value: 'aomAv1', label: 'AOM · AV1 (standalone)' },
-  { value: 'vpxStandalone', label: 'VP9 · vpxenc (standalone)' },
+  { value: 'x265Standalone', label: 'x265 · HEVC' },
+  { value: 'aomAv1', label: 'AOM · AV1' },
+  { value: 'vpxStandalone', label: 'VP9 · vpxenc' },
   { value: 'h264Nvenc', label: 'NVIDIA NVENC · H.264' },
   { value: 'hevcNvenc', label: 'NVIDIA NVENC · HEVC' },
   { value: 'x265', label: 'x265 · HEVC (FFmpeg)' },
@@ -30,7 +30,9 @@ export function isSvtEncoder(encoder: VideoEncoder): boolean {
 }
 
 export function isAv1anEncoder(encoder: VideoEncoder): boolean {
-  return isSvtEncoder(encoder) || encoder === 'x264';
+  return (
+    isSvtEncoder(encoder) || ['x264', 'x265Standalone', 'aomAv1', 'vpxStandalone'].includes(encoder)
+  );
 }
 
 const x264Presets = [
@@ -198,7 +200,8 @@ export function requiredEncoderTools(
     'ffprobe',
     encoderOptions(encoder).tool,
     ...(encoder === 'x265Standalone' ||
-    (backend === 'av1an' && (encoder === 'x264' || concatMethod === 'mkvmerge'))
+    (backend === 'av1an' &&
+      (['x264', 'vpxStandalone'].includes(encoder) || concatMethod === 'mkvmerge'))
       ? ['mkvmerge']
       : []),
     ...(backend === 'av1an' ? ['av1an'] : []),
@@ -213,9 +216,16 @@ export function presetLabel(encoder: VideoEncoder, preset: number): string {
 }
 
 export function sourceBitDepth(stream: MediaStream | undefined): number | null {
-  if (stream?.bitDepth === 8 || stream?.bitDepth === 10) return stream.bitDepth;
-  if (stream?.pixelFormat === 'yuv420p' || stream?.pixelFormat === 'yuvj420p') return 8;
-  if (stream?.pixelFormat === 'yuv420p10le') return 10;
+  if (stream?.bitDepth === 8 || stream?.bitDepth === 10 || stream?.bitDepth === 12)
+    return stream.bitDepth;
+  if (
+    ['yuv420p', 'yuv422p', 'yuv444p', 'yuvj420p', 'yuvj422p', 'yuvj444p'].includes(
+      stream?.pixelFormat ?? '',
+    )
+  )
+    return 8;
+  if (['yuv420p10le', 'yuv422p10le', 'yuv444p10le'].includes(stream?.pixelFormat ?? '')) return 10;
+  if (['yuv420p12le', 'yuv422p12le', 'yuv444p12le'].includes(stream?.pixelFormat ?? '')) return 12;
   return null;
 }
 

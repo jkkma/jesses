@@ -1,5 +1,7 @@
 //! Opt-in actual frame comparison, with independent pixel-error arithmetic.
-use media_core::{QualityMetric, QualityRequest};
+use media_core::{
+    QualityAlignment, QualityMetric, QualityOptions, QualityRequest, QualityVmafModel,
+};
 use media_runtime::{
     analyze_quality,
     supervisor::{CommandSpec, run_capture},
@@ -124,6 +126,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
         candidate_start_frame: 12,
         frame_count: 24,
         metric: QualityMetric::Psnr,
+        options: None,
     };
     let source_pixels = pixels(&ffmpeg, &reference).await;
     let candidate_pixels = pixels(&ffmpeg, &candidate).await;
@@ -165,6 +168,193 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
             }
         }
     }
+    let sampled = analyze_quality(
+        QualityRequest {
+            options: Some(QualityOptions {
+                subsample: 5,
+                ..QualityOptions::default()
+            }),
+            metric: QualityMetric::Ssim,
+            ..request.clone()
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sampled.frame_count, 5);
+    assert_eq!(
+        sampled.points.iter().map(|p| p.frame).collect::<Vec<_>>(),
+        vec![0, 5, 10, 15, 20]
+    );
+    let mut model_scores = Vec::new();
+    for model in [
+        QualityVmafModel::Standard,
+        QualityVmafModel::Negative,
+        QualityVmafModel::FourK,
+    ] {
+        let selected = analyze_quality(
+            QualityRequest {
+                options: Some(QualityOptions {
+                    vmaf_model: model,
+                    subsample: 4,
+                    ..QualityOptions::default()
+                }),
+                metric: QualityMetric::Vmaf,
+                ..request.clone()
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.frame_count, 6);
+        model_scores.push(selected.score.unwrap());
+        assert_eq!(
+            selected.model.as_deref(),
+            Some(match model {
+                QualityVmafModel::Standard => "vmaf_v0.6.1",
+                QualityVmafModel::Negative => "vmaf_v0.6.1neg",
+                QualityVmafModel::FourK => "vmaf_4k_v0.6.1",
+            })
+        );
+    }
+    assert!(
+        model_scores[0] != model_scores[1]
+            && model_scores[0] != model_scores[2]
+            && model_scores[1] != model_scores[2],
+        "VMAF model selection did not change the score: {model_scores:?}"
+    );
+    let padded = directory.join("reference padded.mkv");
+    let mut arguments = args(&["-v", "error", "-nostdin", "-i"]);
+    arguments.push(reference.as_os_str().into());
+    arguments.extend(args(&["-vf", "pad=208:128:8:8:black", "-c:v", "ffv1"]));
+    arguments.push(padded.as_os_str().into());
+    capture(&ffmpeg, arguments).await;
+    let crop_request = QualityRequest {
+        reference_path: padded.to_string_lossy().into_owned(),
+        metric: QualityMetric::Ssim,
+        options: Some(QualityOptions {
+            alignment: QualityAlignment::CropReference,
+            ..QualityOptions::default()
+        }),
+        ..request.clone()
+    };
+    let cropped = analyze_quality(crop_request.clone(), cancel.clone())
+        .await
+        .unwrap();
+    assert!(cropped.score.unwrap() > 0.9);
+    assert!(
+        cropped.message.contains("reference crop 192×112 at 8,8"),
+        "{}",
+        cropped.message
+    );
+    assert!(
+        analyze_quality(
+            QualityRequest {
+                options: None,
+                ..crop_request
+            },
+            cancel.clone()
+        )
+        .await
+        .is_err()
+    );
+    let large = directory.join("reference large.mkv");
+    let mut arguments = args(&["-v", "error", "-nostdin", "-i"]);
+    arguments.push(reference.as_os_str().into());
+    arguments.extend(args(&["-vf","scale=384:224,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709","-c:v","ffv1","-chroma_sample_location","left"]));
+    arguments.push(large.as_os_str().into());
+    capture(&ffmpeg, arguments).await;
+    let resized = analyze_quality(
+        QualityRequest {
+            reference_path: large.to_string_lossy().into_owned(),
+            metric: QualityMetric::Ssim,
+            options: Some(QualityOptions {
+                alignment: QualityAlignment::ResizeReference,
+                ..QualityOptions::default()
+            }),
+            ..request.clone()
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(resized.score.unwrap() > 0.9);
+    let large_padded = directory.join("reference large padded.mkv");
+    let mut arguments = args(&["-v", "error", "-nostdin", "-i"]);
+    arguments.push(large.as_os_str().into());
+    arguments.extend(args(&["-vf", "pad=400:240:8:8:black", "-c:v", "ffv1"]));
+    arguments.push(large_padded.as_os_str().into());
+    capture(&ffmpeg, arguments).await;
+    let crop_and_resized = analyze_quality(
+        QualityRequest {
+            reference_path: large_padded.to_string_lossy().into_owned(),
+            metric: QualityMetric::Ssim,
+            options: Some(QualityOptions {
+                alignment: QualityAlignment::CropAndResizeReference,
+                ..QualityOptions::default()
+            }),
+            ..request.clone()
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(crop_and_resized.score.unwrap() > 0.9);
+    assert!(
+        crop_and_resized
+            .message
+            .contains("reference crop 384×224 at 8,8")
+    );
+    let anamorphic = directory.join("reference anamorphic.mkv");
+    let mut arguments = args(&["-v", "error", "-nostdin", "-i"]);
+    arguments.push(reference.as_os_str().into());
+    arguments.extend(args(&["-vf","scale=144:112,setsar=4/3,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709","-c:v","ffv1","-chroma_sample_location","left"]));
+    arguments.push(anamorphic.as_os_str().into());
+    capture(&ffmpeg, arguments).await;
+    let desqueezed = analyze_quality(
+        QualityRequest {
+            reference_path: anamorphic.to_string_lossy().into_owned(),
+            metric: QualityMetric::Ssim,
+            ..request.clone()
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(desqueezed.score.unwrap() > 0.8);
+    let retimed = directory.join("candidate retimed.mkv");
+    let mut arguments = args(&["-v", "error", "-nostdin", "-i"]);
+    arguments.push(candidate.as_os_str().into());
+    arguments.extend(args(&["-vf","setpts=2*PTS,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709","-fps_mode","passthrough","-c:v","ffv1","-chroma_sample_location","left"]));
+    arguments.push(retimed.as_os_str().into());
+    capture(&ffmpeg, arguments).await;
+    let timed = QualityRequest {
+        candidate_path: retimed.to_string_lossy().into_owned(),
+        metric: QualityMetric::Ssim,
+        ..request.clone()
+    };
+    let timing_error = analyze_quality(timed.clone(), cancel.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        timing_error.message.contains("timing differs"),
+        "{}",
+        timing_error.message
+    );
+    let fixed = analyze_quality(
+        QualityRequest {
+            options: Some(QualityOptions {
+                fix_frame_rate: true,
+                ..QualityOptions::default()
+            }),
+            ..timed
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixed.frame_count, 24);
+    assert!(fixed.message.contains("paired by frame number"));
     let identical = QualityRequest {
         candidate_path: reference.to_string_lossy().into_owned(),
         ..request.clone()
@@ -211,6 +401,9 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     for (path, (hash, time)) in [&reference, &candidate].into_iter().zip(integrity) {
         assert_eq!(Sha256::digest(std::fs::read(path).unwrap()), hash);
         assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), time);
+        std::fs::remove_file(path).unwrap();
+    }
+    for path in [&padded, &large, &large_padded, &anamorphic, &retimed] {
         std::fs::remove_file(path).unwrap();
     }
     std::fs::remove_dir(directory).unwrap();

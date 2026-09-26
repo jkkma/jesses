@@ -8,7 +8,7 @@ export type StandaloneRecoveryPhase = "passOneComplete" | "videoComplete" | "tim
 
 export type QtgmcSettings = { mode: DeinterlaceMode, fieldOrder: FieldOrder, preset: QtgmcPreset, };
 
-export type QtgmcPreset = "faster" | "fast" | "medium" | "slow" | "slower";
+export type QtgmcPreset = "faster" | "fast" | "medium" | "slow" | "slower" | "verySlow";
 
 export type CadenceRepairSettings = {
 /**
@@ -35,15 +35,17 @@ export type CompletionStatus = { options: CompletionOptions, armedJobs: number, 
 
 export type ImageOutput = "png" | "jpeg" | "pngSequence" | "jpegSequence" | "gif";
 
+export type ImagePixelFormat = "rgb24" | "rgba" | "rgb48" | "rgba64";
+
 export type ImageRequest = { "operation": "importSequence",
 /**
  * Explicit presentation order, independent of the source filenames.
  */
-paths: Array<string>, frameRate: FrameRate, outputPath: string, } | { "operation": "export", inputPath: string, streamIndex: number, startFrame: number, frameCount: number, format: ImageOutput, outputPath: string, width: number | null, };
+paths: Array<string>, frameRate: FrameRate, outputPath: string, } | { "operation": "export", inputPath: string, streamIndex: number, startFrame: number, frameCount: number, format: ImageOutput, outputPath: string, width: number | null, pixelFormat?: ImagePixelFormat, };
 
 export type ImageResult = { outputPath: string, frameCount: number, width: number, height: number, notes: Array<string>, };
 
-export type UtilityRequest = { "kind": "keyframeCut", "request": KeyframeCutRequest } | { "kind": "concat", "request": ConcatRequest } | { "kind": "colorMetadataTransfer", "request": ColorMetadataTransferRequest } | { "kind": "subtitleOcr", "request": SubtitleOcrRequest } | { "kind": "grain", "request": GrainRequest } | { "kind": "crfLadder", "request": CrfLadderRequest };
+export type UtilityRequest = { "kind": "keyframeCut", "request": KeyframeCutRequest } | { "kind": "concat", "request": ConcatRequest } | { "kind": "colorMetadataTransfer", "request": ColorMetadataTransferRequest } | { "kind": "subtitleOcr", "request": SubtitleOcrRequest } | { "kind": "grain", "request": GrainRequest } | { "kind": "crfLadder", "request": CrfLadderRequest } | { "kind": "deinterlaceExport", "request": DeinterlaceExportRequest } | { "kind": "cadenceRepairExport", "request": CadenceRepairExportRequest };
 
 export type UtilityResult = { "kind": "artifact", "result": UtilityArtifact } | { "kind": "subtitleOcr", "result": SubtitleOcrResult } | { "kind": "grainTable", "result": GrainTableResult } | { "kind": "crfLadder", "result": CrfLadderResult };
 
@@ -78,7 +80,7 @@ export type GrainSource = { "kind": "table", tablePath: string, } | { "kind": "p
 
 export type LadderEncoder = "h264" | "hevc" | "av1" | "vp9";
 
-export type LadderMetric = "none" | "psnr" | "ssim" | "vmaf";
+export type LadderMetric = "none" | "psnr" | "ssim" | "vmaf" | "ssimulacra2" | "butteraugliInf" | "xpsnrWeighted";
 
 export type CrfLadderRequest = { inputPath: string, videoStreamIndex: number, encoder: LadderEncoder,
 /**
@@ -90,6 +92,12 @@ preset: string, pixelFormat: string, crfs: Array<number>, sampleCount: number, s
  */
 recommendationThreshold: number | null, };
 
+export type DeinterlaceExportMethod = "qtgmc" | "bwdif" | "yadif";
+
+export type DeinterlaceExportRequest = { inputPath: string, outputPath: string, videoStreamIndex: number, method: DeinterlaceExportMethod, mode: DeinterlaceMode, fieldOrder: FieldOrder, qtgmcPreset: QtgmcPreset, };
+
+export type CadenceRepairExportRequest = { inputPath: string, outputPath: string, videoStreamIndex: number, };
+
 export type UtilityArtifact = { operation: string, outputPath: string,
 /**
  * Decimal text preserves byte counts beyond JavaScript's safe integer range.
@@ -100,7 +108,7 @@ export type SubtitleOcrResult = { outputPath: string, cueCount: number, language
 
 export type GrainTableResult = { outputPath: string, segmentCount: number, sourceFingerprints: Array<string>, message: string, diagnostics: Array<string>, };
 
-export type CrfLadderResult = { encoder: LadderEncoder, preset: string, metric: LadderMetric, sourceDurationSeconds: number, sourceSizeBytes: string, sampledSeconds: number, sampledFraction: number, rungs: Array<CrfLadderRung>, recommendedCrf: number | null, sourceFingerprint: string, message: string, diagnostics: Array<string>, };
+export type CrfLadderResult = { encoder: LadderEncoder, preset: string, metric: LadderMetric, sourceDurationSeconds: number, sourceSizeBytes: string, sampledSeconds: number, sampledFraction: number, rungs: Array<CrfLadderRung>, recommendationThreshold: number | null, recommendedCrf: number | null, sourceFingerprint: string, message: string, diagnostics: Array<string>, };
 
 export type CrfLadderRung = { crf: number, encodedBytes: string, encodedSeconds: number, bitrateKbps: number, bytesPerMinute: string, projectedSizeBytes: string, score: number | null, encodeSeconds: number, };
 
@@ -229,13 +237,27 @@ suggestedGainTenthsDb: number | null, targetLimitedByPeak: boolean, sourceFinger
 
 export type QualityMetric = "psnr" | "ssim" | "vmaf";
 
+export type QualityAlignment = "none" | "cropReference" | "resizeReference" | "cropAndResizeReference";
+
+export type QualityVmafModel = "standard" | "negative" | "fourK";
+
+export type QualityOptions = { alignment: QualityAlignment, vmafModel: QualityVmafModel,
+/**
+ * One scores every selected frame; N scores frames 0, N, 2N, ... on both inputs.
+ */
+subsample: number,
+/**
+ * Pair selected frames in ordinal order even when container timestamps disagree.
+ */
+fixFrameRate: boolean, };
+
 export type QualityPoint = { frame: number,
 /**
  * None represents infinite PSNR for identical decoded pixels.
  */
 score: number | null, };
 
-export type QualityRequest = { referencePath: string, referenceStreamIndex: number, referenceStartFrame: number, candidatePath: string, candidateStreamIndex: number, candidateStartFrame: number, frameCount: number, metric: QualityMetric, };
+export type QualityRequest = { referencePath: string, referenceStreamIndex: number, referenceStartFrame: number, candidatePath: string, candidateStreamIndex: number, candidateStartFrame: number, frameCount: number, metric: QualityMetric, options?: QualityOptions, };
 
 export type QualityResult = { metric: QualityMetric, frameCount: number, score: number | null, points: Array<QualityPoint>, referenceFingerprint: string, candidateFingerprint: string, model: string | null, message: string, };
 
@@ -272,7 +294,7 @@ export type Av1anChunkOrder = "longToShort" | "shortToLong" | "sequential" | "ra
 
 export type Av1anConcatMethod = "ffmpeg" | "mkvmerge";
 
-export type Av1anPixelFormat = "yuv420p" | "yuv420p10le" | "yuv422p" | "yuv422p10le" | "yuv444p" | "yuv444p10le";
+export type Av1anPixelFormat = "yuv420p" | "yuv420p10le" | "yuv422p" | "yuv422p10le" | "yuv444p" | "yuv444p10le" | "yuva420p";
 
 export type Av1anResourceRequest = { encoder: VideoEncoder, sourceWidth: number, sourceHeight: number, outputWidth: number, outputHeight: number, workers: number, filtered: boolean, floatFilter: boolean, };
 
@@ -420,7 +442,11 @@ externalTracks?: Array<ExternalTrack>, trackOverrides?: Array<EncodeTrackOverrid
 /**
  * A real QuickTime tmcd data stream copied only into a final MOV file.
  */
-movTimecodeTrack?: EncodeTrackRef, parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
+movTimecodeTrack?: EncodeTrackRef, parameters?: Array<EncoderParameter>, temporal?: TemporalSettings, av1anOptions?: Av1anOptions,
+/**
+ * Explicit encoded video format. Omission keeps the historical encoder default.
+ */
+outputPixelFormat?: Av1anPixelFormat, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
 /**
  * Omission preserves constant-quality encoding and old saved jobs.
  */
@@ -485,7 +511,7 @@ export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, 
 
 export type BatchEncodeInput = { temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
+export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputPixelFormat?: Av1anPixelFormat, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
 /**
  * Local calendar date captured once when the batch preview is requested.
  * It is required only when the filename template contains `{date}`.

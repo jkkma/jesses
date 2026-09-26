@@ -57,6 +57,7 @@ fn native(mut value: Spec) -> Spec {
         "ipratio" => "--ipratio",
         "pbratio" => "--pbratio",
         "crf-max" => "--crf-max",
+        "keyint" => "--keyint",
         "ac-bias" => "--ac-bias",
         "tx-bias" => "--tx-bias",
         "sharpness" => "--sharpness",
@@ -484,6 +485,15 @@ pub(super) fn svt() -> Vec<Spec> {
     let grain = "Film grain and noise";
     let tools = "Encoding tools";
     vec![
+        number(
+            "keyint",
+            "Maximum keyframe interval",
+            1,
+            10000,
+            rate,
+            "Set the maximum GOP length in frames.",
+            "240",
+        ),
         number(
             "tune",
             "Tune",

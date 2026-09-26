@@ -32,6 +32,17 @@ such a file displays the source and encoder before queueing it with a newly
 chosen destination. Execution revalidates the original source and tools.
 
 This starts a new encode. Durable av1an and standalone phase recovery remain
-attached to verified job history and their saved workspaces. Foreign sidecars or engine files are inspected
-as bounded data and receive a compatibility explanation; saved command strings
-are never executed or imported as cleanup authority.
+attached to verified job history and their saved workspaces. A recognized historical AV1AN
+sidecar can import explicit supported encoder, worker, scene, pixel-format and audio
+settings. Original media is probed so selected streams retain their real indices.
+For an SVT sidecar, select the original mainline, 5fish or HDR build before inspection;
+the historical format does not record this choice. Source color declarations must
+match the current probe. Choose a new destination before queueing. Unknown arguments,
+an unspecified SVT build, or a command naming a trimmed intermediate receive a specific explanation;
+the import never silently discards those settings.
+
+Historical sidecars do not contain verifiable source/tool fingerprints. Their
+completed chunks cannot be adopted as Jesses recovery receipts. Source files,
+sidecars and engine workspaces remain unchanged; saved command strings are parsed
+as data and never executed or imported as cleanup authority. Historical temporary
+folder, log-file and resume arguments are recognized but never used by the new job.

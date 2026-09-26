@@ -6,13 +6,19 @@
     exportSavedJob,
     isDesktop,
   } from '$lib/ipc/client';
-  import type { JobSnapshot, SavedJobInspection, EncodeRequest } from '$lib/ipc/generated';
+  import type {
+    JobSnapshot,
+    SavedJobInspection,
+    EncodeRequest,
+    VideoEncoder,
+  } from '$lib/ipc/generated';
   import { errorMessage, fileName } from '$lib/components/shared/format';
   let {
     jobs,
     onqueue,
   }: { jobs: JobSnapshot[]; onqueue: (request: EncodeRequest) => Promise<void> } = $props();
   let selected = $state('');
+  let svtBuild = $state<VideoEncoder | ''>('');
   let inspection = $state<SavedJobInspection | null>(null);
   let pending = $state(false);
   let error = $state<string | null>(null);
@@ -26,7 +32,7 @@
       const path = await chooseUtilityFile('Inspect saved job', ['json']);
       if (path) {
         inspection = null;
-        inspection = await inspectSavedJob(path);
+        inspection = await inspectSavedJob(path, svtBuild || null);
       }
     } catch (e) {
       error = errorMessage(e);
@@ -101,6 +107,21 @@
           >Inspect saved job</button
         >
       </div>
+      <label
+        >Original SVT build for historical imports
+        <select
+          bind:value={svtBuild}
+          disabled={pending}
+          onchange={() => {
+            inspection = null;
+          }}
+        >
+          <option value="">Not specified</option>
+          <option value="svtAv1">SVT-AV1 mainline</option>
+          <option value="svtAv1FiveFish">SVT-AV1 5fish</option>
+          <option value="svtAv1Hdr">SVT-AV1 HDR</option>
+        </select>
+      </label>
     </div>
     {#if inspection}<div class="inspection" role="status">
         <p>{inspection.message}</p>

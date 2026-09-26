@@ -19,15 +19,21 @@ Selecting files in Batch does not run these operations for each file. Their own 
 
 Use **Check utility tools** in the Utilities screen after installing a tool or language model. Discovery runs each tool's version command and reports the resolved executable and any failure.
 
-| Feature                                 | Required tools                                                                                 |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Lossless keyframe cut and concatenation | FFmpeg and FFprobe                                                                             |
-| Matroska color metadata transfer        | FFmpeg, FFprobe, and `mkvmerge`                                                                |
-| Bitmap subtitle OCR                     | FFmpeg, FFprobe, Subtitle Edit `seconv`, Tesseract, and the selected Tesseract language models |
-| AV1 grain operations                    | FFprobe and `grav1synth`                                                                       |
-| CRF ladder                              | FFmpeg and FFprobe; the selected FFmpeg encoder wrapper; the FFmpeg `libvmaf` filter for VMAF  |
+| Feature                                 | Required tools                                                                                                                                                                                                                     |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Lossless keyframe cut and concatenation | FFmpeg and FFprobe                                                                                                                                                                                                                 |
+| Matroska color metadata transfer        | FFmpeg, FFprobe, and `mkvmerge`                                                                                                                                                                                                    |
+| Bitmap subtitle OCR                     | FFmpeg, FFprobe, Subtitle Edit `seconv`, Tesseract, and the selected Tesseract language models                                                                                                                                     |
+| AV1 grain operations                    | FFprobe and `grav1synth`                                                                                                                                                                                                           |
+| CRF ladder                              | FFmpeg and FFprobe; the selected FFmpeg encoder wrapper; `libvmaf` or `xpsnr` FFmpeg filter when selected; for SSIMULACRA2 or Butteraugli, a Windows VapourSynth Python runtime with L-SMASH and the CPU `vszip` or `julek` plugin |
+| Deinterlace to new file                 | FFmpeg and FFprobe with libx264; QTGMC additionally needs a working VSPipe, havsfunc, L-SMASH and its filter plugins                                                                                                               |
+| Repair padded cadence                   | FFmpeg and FFprobe with libx264, VSPipe and BestSource                                                                                                                                                                             |
 
 FFmpeg, FFprobe, and `mkvmerge` can use the absolute executable overrides `JESSES_FFMPEG`, `JESSES_FFPROBE`, and `JESSES_MKVMERGE`. Otherwise utilities use verified packaged tools when present, then native executables found through absolute `PATH` entries. `grav1synth` uses absolute `PATH` entries.
+
+The Windows package recipe includes the CPU quality scorers and QTGMC dependencies
+in its verified AV1AN runtime. BestSource remains an optional external reader for
+padded-cadence repair. `mkvmerge`, OCR tools and `grav1synth` remain external tools.
 
 On Windows, Subtitle Edit `seconv` and Tesseract are discovered first in these stable per-user locations:
 
@@ -139,9 +145,19 @@ The ladder accepts progressive, square-pixel video and 1 to 8 distinct CRFs. It 
 
 Supported FFmpeg wrappers are `libx264`, `libx265`, `libsvtav1`, and `libvpx-vp9`. Pixel format is `yuv420p` or `yuv420p10le`. Each sample is decoded once into a frame-counted lossless FFV1 reference, and every rung encodes the same references. Candidate duration and decoded frame count must match before scoring.
 
-Size-only ladders do not require a score. PSNR, SSIM, and VMAF scoring require explicitly tagged, supported SDR range/matrix/primaries/transfer/chroma location. Default recommendation thresholds are 45 dB PSNR, 0.98 SSIM, and 95 VMAF. The recommendation is the highest tested CRF that meets the threshold. PSNR is pooled through error energy; SSIM and VMAF are weighted by decoded frame count.
+Size-only ladders do not require a score. PSNR, SSIM, VMAF, SSIMULACRA2, Butteraugli INF, and weighted XPSNR scoring require explicitly tagged, supported SDR range/matrix/primaries/transfer/chroma location. SSIMULACRA2 and Butteraugli use the selected AV1AN installation's CPU VapourSynth plugins and stop before encoding if those plugins are unavailable. Butteraugli uses the 203-nit scale; lower scores mean less distortion. Weighted XPSNR combines the Y/U/V error energies in a 4:1:1 ratio for 4:2:0 video. Every metric checks the expected frame count and rejects missing or nonfinite frame scores.
+
+Default recommendation thresholds are 45 dB PSNR, 0.98 SSIM, 95 VMAF, 80 SSIMULACRA2, and 4 Butteraugli. Weighted XPSNR has no automatic threshold; enter one to request a recommendation. The recommendation is the highest tested CRF meeting the threshold. Butteraugli qualifies at or below its threshold; other scores qualify at or above it. PSNR and weighted XPSNR pool sample error energy; SSIM, VMAF, SSIMULACRA2, and Butteraugli average by decoded frame count.
 
 The reported bitrate is sampled video bitrate. Whole-file size is a projection across source duration and can move with unsampled scene complexity. Audio, subtitles, attachments, chapters, container overhead, production filters, and standalone-encoder-only settings do not transfer into the ladder.
+
+## Temporal exports
+
+**Deinterlace to new file** exports progressive H.264 in Matroska at CRF 12. QTGMC is the default method and defaults to its Very Slow preset; BWDIF and YADIF are also available. Choose one frame per field to double the source's frame rate, or one frame per source frame to retain it. Select the field order explicitly when the source declaration is wrong. The original source stays intact and the output is offered for optional import after validation.
+
+**Repair padded cadence** is for an interlaced capture whose decoded frame count exceeds its duration at its declared frame rate by more than 2%. It uses decoded presentation timestamps to place each output frame and frame-content differences to prefer real pictures over repeats near that time. The result remains interlaced at the declared rate, so it can be deinterlaced afterward. A file whose count already fits its duration is refused before writing a redundant copy. The input must have a declared field order, a measurable duration and rate, and a working BestSource reader.
+
+Both exports copy audio and supported subtitle and attachment streams, preserve source color and aspect declarations, and reject tagged HDR because this CRF 12 x264 path cannot establish static HDR metadata preservation. Jesses checks every expected decoded frame, output rate and field order, full decode, copied packet payload order, stable tags, chapters, and container duration before publishing to a new path.
 
 ## Real-tool validation
 
@@ -163,3 +179,5 @@ cargo test -p media-runtime --test utility_jobs -- --ignored --nocapture
 ```
 
 The test is meaningful runtime evidence for those tool builds and generated fixtures. It is not packaged clean-machine or cross-platform qualification.
+
+On 2026-09-26 a separate native temporal fixture passed BWDIF and QTGMC bob exports of an eight-frame interlaced source, each producing 16 progressive frames with copied PCM audio and unchanged source bytes. A second BWDIF export retained a non-square 4:3 sample aspect ratio. A padded capture with 36 coded pictures at 24 fps produced a 24-frame interlaced cadence-repair output, retaining audio and source bytes. An unpadded capture and tagged HDR input were refused without publishing an output; active cancellation removed its temporary output and left the source unchanged.

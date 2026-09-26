@@ -8,6 +8,9 @@ pub(super) fn name(encoder: VideoEncoder) -> &'static str {
     match encoder {
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "svt-av1",
         VideoEncoder::X264 => "x264",
+        VideoEncoder::AomAv1 => "aom",
+        VideoEncoder::VpxStandalone => "vpx",
+        VideoEncoder::X265Standalone => "x265",
         _ => unreachable!("validated av1an encoder"),
     }
 }
@@ -25,6 +28,9 @@ pub(super) fn binary(encoder: VideoEncoder) -> &'static str {
             "SvtAv1EncApp"
         }
         VideoEncoder::X264 => "x264",
+        VideoEncoder::AomAv1 => "aomenc",
+        VideoEncoder::VpxStandalone => "vpxenc",
+        VideoEncoder::X265Standalone => "x265",
         _ => unreachable!("validated av1an encoder"),
     }
 }
@@ -32,18 +38,21 @@ pub(super) fn binary(encoder: VideoEncoder) -> &'static str {
 pub(super) fn chunk_extension(encoder: VideoEncoder) -> &'static str {
     match encoder {
         VideoEncoder::X264 => "264",
+        VideoEncoder::X265Standalone => "hevc",
         _ => "ivf",
     }
 }
 
 pub(in crate::jobs) fn uses_mkvmerge(encoder: VideoEncoder, settings: &EncodeSettings) -> bool {
-    encoder == VideoEncoder::X264
-        || settings.av1an_options.unwrap_or_default().concat_method
-            == media_core::Av1anConcatMethod::Mkvmerge
+    matches!(
+        encoder,
+        VideoEncoder::X264 | VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
+    ) || settings.av1an_options.unwrap_or_default().concat_method
+        == media_core::Av1anConcatMethod::Mkvmerge
 }
 
 pub(super) fn video_extension(encoder: VideoEncoder, settings: &EncodeSettings) -> &'static str {
-    if encoder == VideoEncoder::X264 || uses_mkvmerge(encoder, settings) {
+    if uses_mkvmerge(encoder, settings) {
         "mkv"
     } else {
         "ivf"
@@ -77,6 +86,34 @@ pub(super) fn parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString
             // av1an's x264 driver emits raw Annex B and supplies --stitchable.
             args
         }
+        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+            let args = super::super::encode::standalone_aom_vpx_arguments(plan, settings);
+            // av1an supplies its own output, input pipe, pass count and IVF
+            // container. Keep the validated rate, profile, color and quality.
+            without_pairs(
+                args,
+                &[],
+                &[
+                    "--ivf",
+                    "--output=-",
+                    "--passes=1",
+                    "-",
+                    "--i420",
+                    "--i422",
+                    "--i444",
+                ],
+            )
+            .into_iter()
+            .filter(|arg| {
+                !arg.to_string_lossy().starts_with("--width=")
+                    && !arg.to_string_lossy().starts_with("--height=")
+            })
+            .collect()
+        }
+        VideoEncoder::X265Standalone => {
+            let args = super::super::encode::standalone_x265_arguments(plan, settings);
+            without_pairs(args, &["--input", "--output", "--fps"], &["--y4m"])
+        }
         _ => unreachable!("validated av1an encoder"),
     };
     super::grain::parameters(&mut args, settings);
@@ -84,6 +121,13 @@ pub(super) fn parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString
         match settings.encoder {
             encoder if encoder.is_svt() => args.extend(["--lp".into(), threads.to_string().into()]),
             VideoEncoder::X264 => args.extend(["--threads".into(), threads.to_string().into()]),
+            VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
+                args.push(format!("--threads={threads}").into())
+            }
+            VideoEncoder::X265Standalone if threads > 0 => {
+                args.extend(["--pools".into(), threads.to_string().into()])
+            }
+            VideoEncoder::X265Standalone => {}
             _ => unreachable!("validated av1an encoder"),
         }
     }
@@ -124,5 +168,73 @@ mod tests {
         );
         assert_eq!(chunk_extension(settings.encoder), "264");
         assert_eq!(video_extension(settings.encoder, &settings), "mkv");
+    }
+
+    #[test]
+    fn new_child_encoders_keep_quality_and_metadata_but_leave_io_to_av1an() {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"0"},
+            "streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,
+                "pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0",
+                "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
+                "color_transfer":"bt709","color_range":"tv"}]
+        })).unwrap();
+        for (family, route, tool, chunk, expected_quality) in [
+            (
+                VideoEncoder::AomAv1,
+                "aom",
+                "aomenc",
+                "ivf",
+                "--cq-level=23",
+            ),
+            (
+                VideoEncoder::VpxStandalone,
+                "vpx",
+                "vpxenc",
+                "ivf",
+                "--cq-level=23",
+            ),
+            (
+                VideoEncoder::X265Standalone,
+                "x265",
+                "x265",
+                "hevc",
+                "--crf",
+            ),
+        ] {
+            let settings = EncodeSettings {
+                backend: media_core::EncodeBackend::Av1an,
+                encoder: family,
+                crf: 23,
+                preset: 5,
+                ..Default::default()
+            };
+            let plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+            let args = parameters(&plan, &settings);
+            let args: Vec<_> = args.iter().map(|value| value.to_str().unwrap()).collect();
+            assert_eq!(name(family), route);
+            assert_eq!(binary(family), tool);
+            assert_eq!(chunk_extension(family), chunk);
+            assert!(args.contains(&expected_quality), "{family:?}: {args:?}");
+            assert!(!args.iter().any(|arg| {
+                [
+                    "--output=-",
+                    "--passes=1",
+                    "-",
+                    "--input",
+                    "--output",
+                    "--fps",
+                    "--y4m",
+                ]
+                .contains(arg)
+            }));
+            if family == VideoEncoder::VpxStandalone {
+                assert!(args.contains(&"--codec=vp9"));
+                assert_eq!(video_extension(family, &settings), "mkv");
+            }
+            if family == VideoEncoder::X265Standalone {
+                assert_eq!(video_extension(family, &settings), "mkv");
+            }
+        }
     }
 }

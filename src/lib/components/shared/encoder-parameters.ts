@@ -1,3 +1,4 @@
+import { extraEncoderParameters } from './extra-encoder-parameters';
 import type {
   EncoderParameter,
   EncoderParameterCatalog,
@@ -11,7 +12,7 @@ const x264Names = new Set(
   ),
 );
 const svtNames = new Set(
-  'tune aq-mode ac-bias tx-bias sharpness sharp-tx max-tx-size alt-ssim-tuning complex-hvs variance-boost-strength variance-octile variance-boost-curve qp-scale-compress-strength luminance-qp-bias chroma-qm-min chroma-qm-max hbd-mds enable-qm qm-min qm-max enable-variance-boost min-qp max-qp startup-qp-offset enable-dlf enable-tf tf-strength kf-tf-strength noise-adaptive-filtering cdef-scaling enable-cdef enable-restoration noise noise-chroma noise-chroma-from-luma noise-size noise-norm-strength adaptive-film-grain scm fast-decode enable-overlays lookahead hierarchical-levels'.split(
+  'tune keyint aq-mode ac-bias tx-bias sharpness sharp-tx max-tx-size alt-ssim-tuning complex-hvs variance-boost-strength variance-octile variance-boost-curve qp-scale-compress-strength luminance-qp-bias chroma-qm-min chroma-qm-max hbd-mds enable-qm qm-min qm-max enable-variance-boost min-qp max-qp startup-qp-offset enable-dlf enable-tf tf-strength kf-tf-strength noise-adaptive-filtering cdef-scaling enable-cdef enable-restoration noise noise-chroma noise-chroma-from-luma noise-size noise-norm-strength adaptive-film-grain scm fast-decode enable-overlays lookahead hierarchical-levels'.split(
     ' ',
   ),
 );
@@ -82,6 +83,7 @@ const x264Ranges: Record<string, [number, number]> = {
 };
 const svtRanges: Record<string, [number, number]> = {
   tune: [0, 5],
+  keyint: [1, 10000],
   'aq-mode': [0, 2],
   'ac-bias': [0, 8],
   'tx-bias': [0, 3],
@@ -172,7 +174,7 @@ export function parameterError(
     encoder?.startsWith('svtAv1') ||
     catalog?.encoder === 'x264' ||
     catalog?.encoder.startsWith('svtAv1');
-  const maximum = native ? 64 : 16;
+  const maximum = native || extraEncoderParameters[encoder || catalog?.encoder || ''] ? 64 : 16;
   if (values.length > maximum || new Set(values.map((value) => value.name)).size !== values.length)
     return `Choose each parameter once, with at most ${maximum} overrides.`;
   for (const value of values) {
@@ -181,6 +183,12 @@ export function parameterError(
       if (!spec) return `${value.name} is unavailable in this installed encoder catalog.`;
       if (!validCatalogValue(spec, value.value))
         return `${spec.label} needs ${spec.choices.length ? spec.choices.join(', ') : `${spec.minimumValue || spec.minimum} through ${spec.maximumValue || spec.maximum}`}.`;
+      continue;
+    }
+    if (encoder && extraEncoderParameters[encoder]) {
+      const spec = extraEncoderParameters[encoder].find((spec) => spec.name === value.name);
+      if (!spec || !validCatalogValue(spec, value.value))
+        return `${value.name} has an invalid value for this encoder.`;
       continue;
     }
     if (encoder === 'x264' || encoder?.startsWith('svtAv1')) {

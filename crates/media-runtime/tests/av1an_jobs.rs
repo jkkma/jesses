@@ -34,6 +34,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::env::var_os("JESSES_KEEP_TEST_FIXTURES").is_some() {
+            return;
+        }
         // The test exclusively owns this fresh directory and every file in it.
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -125,6 +128,32 @@ async fn synthesize(path: &Path, size: &str, frames: u32) {
     );
 }
 
+async fn synthesize_hdr10(path: &Path, frames: u32) {
+    let filter = "testsrc2=size=128x96:rate=24000/1001,format=yuv420p10le,setparams=range=limited:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc";
+    let generated = output(
+        command("ffmpeg")
+            .await
+            .args([
+                "-v", "error", "-nostdin", "-n", "-f", "lavfi", "-i", filter,
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                "-map", "0:v", "-map", "1:a", "-frames:v", &frames.to_string(),
+                "-t", &(f64::from(frames) * 1001.0 / 24000.0).to_string(),
+                "-c:v", "libx265", "-preset", "ultrafast",
+                "-x265-params", "log-level=error:pools=none:frame-threads=1:bframes=0:hdr10=1:chromaloc=0:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=200,142",
+                "-c:a", "pcm_s16le", "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                "-color_range", "tv", "-chroma_sample_location", "left",
+            ])
+            .arg(path),
+    )
+    .await;
+    assert!(
+        generated.status.success(),
+        "HDR fixture: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+}
+
 fn request(input: &Path, output: &Path, preset: u8) -> EncodeRequest {
     EncodeRequest {
         source: RemuxRequest {
@@ -192,6 +221,32 @@ async fn probe(path: &Path) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+async fn probe_first_video_frame(path: &Path) -> Value {
+    let captured = output(
+        command("ffprobe")
+            .await
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-read_intervals",
+                "%+#1",
+                "-of",
+                "json",
+            ])
+            .arg(path),
+    )
+    .await;
+    assert!(
+        captured.status.success(),
+        "Frame probe: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    serde_json::from_slice(&captured.stdout).unwrap()
 }
 
 fn assert_no_partial_output(root: &Path) {
@@ -322,6 +377,376 @@ async fn av1an_x264_keeps_timing_color_audio_and_source() {
     assert_eq!(streams[0]["codec_name"], "pcm_s16le");
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert_no_partial_output(&fixture.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, aomenc, vpxenc, x265, mkvmerge, VapourSynth and L-SMASH on PATH"]
+async fn av1an_aom_vpx_x265_publish_complete_timed_video() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("additional encoders source.mkv");
+    synthesize(&input, "128x96", 16).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (encoder, codec, preset) in [
+        (media_core::VideoEncoder::AomAv1, "av1", 8),
+        (media_core::VideoEncoder::VpxStandalone, "vp9", 5),
+        (media_core::VideoEncoder::X265Standalone, "hevc", 0),
+    ] {
+        let output = fixture.0.join(format!("{codec}-av1an.mkv"));
+        let mut request = request(&input, &output, preset);
+        request.settings.encoder = encoder;
+        request.settings.crf = 32;
+        request.settings.parameters = match encoder {
+            media_core::VideoEncoder::AomAv1 => vec![
+                media_core::EncoderParameter {
+                    name: "sharpness".into(),
+                    value: "2".into(),
+                },
+                media_core::EncoderParameter {
+                    name: "tune".into(),
+                    value: "psnr".into(),
+                },
+            ],
+            media_core::VideoEncoder::VpxStandalone => vec![media_core::EncoderParameter {
+                name: "tune".into(),
+                value: "ssim".into(),
+            }],
+            media_core::VideoEncoder::X265Standalone => vec![
+                media_core::EncoderParameter {
+                    name: "deblock".into(),
+                    value: "-1:1".into(),
+                },
+                media_core::EncoderParameter {
+                    name: "me".into(),
+                    value: "hex".into(),
+                },
+                media_core::EncoderParameter {
+                    name: "sao".into(),
+                    value: "0".into(),
+                },
+            ],
+            _ => unreachable!(),
+        };
+        request.settings.av1an_options = Some(media_core::Av1anOptions {
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            maximum_chunk_frames: 8,
+            minimum_scene_frames: 1,
+            ..Default::default()
+        });
+        let submitted = manager.start_encode(request).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(
+            finished.state,
+            JobState::Succeeded,
+            "{encoder:?}: {finished:#?}"
+        );
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], codec);
+        assert_eq!(video["nb_read_frames"], "16");
+        assert_eq!(video["r_frame_rate"], "24000/1001");
+        assert_eq!(video["pix_fmt"], "yuv420p10le");
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires AOM/VPX, FFmpeg, FFprobe, av1an/VapourSynth and mkvmerge"]
+async fn aom_vpx_non_420_outputs_preserve_frame_count_and_timing() {
+    use media_core::{Av1anPixelFormat as Pixel, VideoEncoder};
+    let fixture = Fixture::new();
+    let input = fixture.0.join("non420 source.mkv");
+    synthesize(&input, "128x96", 16).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (encoder, backend, format, codec, pixel) in [
+        (
+            VideoEncoder::AomAv1,
+            EncodeBackend::Standalone,
+            Pixel::Yuv422p10le,
+            "av1",
+            "yuv422p10le",
+        ),
+        (
+            VideoEncoder::AomAv1,
+            EncodeBackend::Av1an,
+            Pixel::Yuv422p10le,
+            "av1",
+            "yuv422p10le",
+        ),
+        (
+            VideoEncoder::AomAv1,
+            EncodeBackend::Standalone,
+            Pixel::Yuv444p10le,
+            "av1",
+            "yuv444p10le",
+        ),
+        (
+            VideoEncoder::AomAv1,
+            EncodeBackend::Av1an,
+            Pixel::Yuv444p10le,
+            "av1",
+            "yuv444p10le",
+        ),
+        (
+            VideoEncoder::VpxStandalone,
+            EncodeBackend::Standalone,
+            Pixel::Yuv444p10le,
+            "vp9",
+            "yuv444p10le",
+        ),
+        (
+            VideoEncoder::VpxStandalone,
+            EncodeBackend::Av1an,
+            Pixel::Yuv444p10le,
+            "vp9",
+            "yuv444p10le",
+        ),
+    ] {
+        let output = fixture
+            .0
+            .join(format!("{encoder:?}-{backend:?}-{pixel}.mkv"));
+        let mut selected = request(
+            &input,
+            &output,
+            if encoder == VideoEncoder::AomAv1 {
+                8
+            } else {
+                5
+            },
+        );
+        selected.settings.backend = backend;
+        selected.settings.encoder = encoder;
+        selected.settings.crf = 32;
+        if backend == EncodeBackend::Av1an {
+            selected.settings.av1an_options = Some(media_core::Av1anOptions {
+                pixel_format: Some(format),
+                split_method: media_core::Av1anSplitMethod::FixedChunks,
+                maximum_chunk_frames: 8,
+                minimum_scene_frames: 1,
+                ..Default::default()
+            });
+        } else {
+            selected.settings.output_pixel_format = Some(format);
+        }
+        let submitted = manager.start_encode(selected).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(
+            finished.state,
+            JobState::Succeeded,
+            "{encoder:?} {backend:?} {pixel}: {finished:#?}"
+        );
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], codec);
+        assert_eq!(video["pix_fmt"], pixel);
+        assert_eq!(video["nb_read_frames"], "16");
+        assert_eq!(video["r_frame_rate"], "24000/1001");
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, x265, mkvmerge, and av1an/VapourSynth for the parallel route"]
+async fn x265_standalone_and_av1an_preserve_hdr10_static_metadata() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("hdr10 source.mkv");
+    synthesize_hdr10(&input, 16).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for backend in [EncodeBackend::Standalone, EncodeBackend::Av1an] {
+        let output = fixture.0.join(format!("x265-{backend:?}.mkv"));
+        let mut selected = request(&input, &output, 0);
+        selected.settings.backend = backend;
+        selected.settings.encoder = media_core::VideoEncoder::X265Standalone;
+        selected.settings.crf = 28;
+        if backend == EncodeBackend::Av1an {
+            selected.settings.av1an_options = Some(media_core::Av1anOptions {
+                split_method: media_core::Av1anSplitMethod::FixedChunks,
+                maximum_chunk_frames: 8,
+                minimum_scene_frames: 1,
+                ..Default::default()
+            });
+        }
+        let submitted = manager.start_encode(selected).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(
+            finished.state,
+            JobState::Succeeded,
+            "{backend:?}: {finished:#?}"
+        );
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], "hevc");
+        assert_eq!(video["nb_read_frames"], "16");
+        assert_eq!(video["r_frame_rate"], "24000/1001");
+        assert_eq!(video["pix_fmt"], "yuv420p10le");
+        assert_eq!(video["color_primaries"], "bt2020");
+        assert_eq!(video["color_transfer"], "smpte2084");
+        assert_eq!(video["color_space"], "bt2020nc");
+        let first = probe_first_video_frame(&output).await;
+        let side = first["frames"][0]["side_data_list"].as_array().unwrap();
+        assert!(
+            side.iter()
+                .any(|entry| entry["side_data_type"] == "Mastering display metadata")
+        );
+        assert!(
+            side.iter()
+                .any(|entry| entry["side_data_type"] == "Content light level metadata")
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a compatible AOM build, FFmpeg, FFprobe, mkvmerge, and av1an/VapourSynth for the parallel route"]
+async fn aom_standalone_and_av1an_preserve_hdr10_static_metadata() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("hdr10 aom source.mkv");
+    synthesize_hdr10(&input, 16).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for backend in [EncodeBackend::Standalone, EncodeBackend::Av1an] {
+        let output = fixture.0.join(format!("aom-{backend:?}.mkv"));
+        let mut selected = request(&input, &output, 8);
+        selected.settings.backend = backend;
+        selected.settings.encoder = media_core::VideoEncoder::AomAv1;
+        selected.settings.crf = 32;
+        if backend == EncodeBackend::Av1an {
+            selected.settings.av1an_options = Some(media_core::Av1anOptions {
+                split_method: media_core::Av1anSplitMethod::FixedChunks,
+                maximum_chunk_frames: 8,
+                minimum_scene_frames: 1,
+                ..Default::default()
+            });
+        }
+        let submitted = manager.start_encode(selected).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(
+            finished.state,
+            JobState::Succeeded,
+            "{backend:?}: {finished:#?}"
+        );
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], "av1");
+        assert_eq!(video["nb_read_frames"], "16");
+        assert_eq!(video["r_frame_rate"], "24000/1001");
+        assert_eq!(video["pix_fmt"], "yuv420p10le");
+        assert_eq!(video["color_primaries"], "bt2020");
+        assert_eq!(video["color_transfer"], "smpte2084");
+        assert_eq!(video["color_space"], "bt2020nc");
+        let first = probe_first_video_frame(&output).await;
+        let side = first["frames"][0]["side_data_list"].as_array().unwrap();
+        assert!(
+            side.iter()
+                .any(|entry| entry["side_data_type"] == "Mastering display metadata")
+        );
+        assert!(
+            side.iter()
+                .any(|entry| entry["side_data_type"] == "Content light level metadata")
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires standalone aomenc and SVT-AV1, FFmpeg, FFprobe and JESSES_GRAV1SYNTH"]
+async fn standalone_aom_and_svt_use_requested_grain_sources() {
+    use media_core::{Av1anGrainSettings, VideoEncoder};
+    const TABLE: &str = "filmgrn1\nE 0 18446744073709551615 1 10956 1\n\tp 0 6 0 8 1 1 0 0 0 0 0 0\n\tsY 14  0 5 20 4 39 4 59 4 78 4 98 4 118 4 137 4 157 4 177 4 196 4 216 5 235 5 255 5\n\tsCb 0\n\tsCr 0\n\tcY\n\tcCb 0\n\tcCr 0\n";
+    let fixture = Fixture::new();
+    let input = fixture.0.join("grain source.mkv");
+    synthesize(&input, "128x96", 16).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (name, encoder, strength, table) in [
+        ("aom-numeric", VideoEncoder::AomAv1, 8, None),
+        ("aom-table", VideoEncoder::AomAv1, 0, Some(TABLE)),
+        ("svt-table", VideoEncoder::SvtAv1, 0, Some(TABLE)),
+    ] {
+        let output = fixture.0.join(format!("{name}.mkv"));
+        let mut selected = request(
+            &input,
+            &output,
+            if encoder == VideoEncoder::AomAv1 {
+                8
+            } else {
+                10
+            },
+        );
+        selected.settings.backend = EncodeBackend::Standalone;
+        selected.settings.encoder = encoder;
+        selected.settings.film_grain = strength;
+        if let Some(table) = table {
+            selected.settings.av1an_grain = Some(Av1anGrainSettings {
+                table: Some(table.into()),
+                denoise: false,
+                denoise_strength: 4,
+            });
+        }
+        let submitted = manager.start_encode(selected).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(finished.state, JobState::Succeeded, "{name}: {finished:#?}");
+        let inspected = probe(&output).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], "av1", "{name}");
+        assert_eq!(video["nb_read_frames"], "16", "{name}");
+        assert_eq!(video["r_frame_rate"], "24000/1001", "{name}");
+        let inspected_table = fixture.0.join(format!("{name}-headers.tbl"));
+        let inspector = std::env::var_os("JESSES_GRAV1SYNTH")
+            .expect("JESSES_GRAV1SYNTH points to the installed grav1synth executable");
+        let headers = self::output(
+            std::process::Command::new(inspector)
+                .arg("inspect")
+                .arg(&output)
+                .arg("--output")
+                .arg(&inspected_table),
+        )
+        .await;
+        assert!(
+            headers.status.success(),
+            "{name} grain-header inspection: {}",
+            String::from_utf8_lossy(&headers.stderr)
+        );
+        let table_text = std::fs::read_to_string(&inspected_table).unwrap();
+        assert!(
+            table_text.starts_with("filmgrn1\n") && table_text.contains("\nE "),
+            "{name} has no readable film-grain headers"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        assert_no_partial_output(&fixture.0);
+    }
     manager.shutdown().await;
 }
 

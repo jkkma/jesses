@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "sourceBuiltOutputs": ["plugins/fft3dfilter.dll", "plugins/MiscFilters.dll"],
+  "inputs": {
+    "vapoursynth": {
+      "revision": "acabf605b2205b32d65859bb2736405719d2fafd",
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
+      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
+      "sourceUrl": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
+      "sourceSha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7"
+    },
+    "znedi3": {
+      "revision": "r3.3",
+      "url": "https://github.com/sekrit-twc/znedi3/releases/download/r3.3/znedi3_r3.3.7z",
+      "sha256": "2f6512a971cbc94660b716f9689ee9a55ab6d9fd29484ea62d92a20151d56fd6",
+      "sourceUrl": "https://api.github.com/repos/sekrit-twc/znedi3/zipball/r3.3",
+      "sourceSha256": "f90b5d781821e9854ed8130ac53e051b2412b5312ec2cd2ec0aed24b4b2a6788",
+      "members": {
+        "plugins/znedi3.dll": {
+          "member": "vsznedi3.dll",
+          "sha256": "5c1dd6cc681bb1a812b0285349179e185f2f5962e816810e963af8a3b018a9aa"
+        },
+        "plugins/nnedi3_weights.bin": {
+          "member": "nnedi3_weights.bin",
+          "sha256": "27f382430435bb7613deb1c52f3c79c300c9869812cfe29079432a9c82251d42"
+        }
+      }
+    },
+    "eedi3": {
+      "revision": "r8",
+      "url": "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-EEDI3/releases/download/r8/EEDI3-r8.7z",
+      "sha256": "fa8515e0aa711ca979a87d812860c8582c7789fd805df2be10760748c0a9c486",
+      "sourceUrl": "https://api.github.com/repos/HomeOfVapourSynthEvolution/VapourSynth-EEDI3/zipball/r8",
+      "sourceSha256": "e821b3a7c8ff834ff2a39d09cb5120d3735642c569c50e792f4dabfa76356d5d",
+      "members": {
+        "plugins/EEDI3m.dll": {
+          "member": "EEDI3m.dll",
+          "sha256": "8fc1a433112707164c1a87d2c9e78709822b7ca89325f0d691d36337f6bf9051"
+        }
+      }
+    },
+    "fft3dfilter": {
+      "revision": "R2",
+      "url": "https://github.com/myrsloik/VapourSynth-FFT3DFilter/releases/download/R2/FFT3DFilter-r2.7z",
+      "sha256": "ebc2c2d8a437c8ecae656778221882d6fe2b5b7723404dd57b1e2b092962eb09",
+      "sourceUrl": "https://api.github.com/repos/myrsloik/VapourSynth-FFT3DFilter/zipball/R2",
+      "sourceSha256": "4a37f6953a52b7f6e1f8ecb08f907601b0a85a3a5f9d8cd2227c727c25b8a639",
+      "members": {
+        "plugins/fft3dfilter.dll": {
+          "member": "x64/fft3dfilter.dll",
+          "sha256": "6f4299318e8879d74b46b2516b95bf0dd170749a4ed42534a5d3c485eb2ab2ef"
+        }
+      }
+    },
+    "fmtconv": {
+      "revision": "r30",
+      "url": "https://github.com/EleonoreMizo/fmtconv/releases/download/r30/fmtconv-r30.zip",
+      "sha256": "f35dba222f2a4d998cd5f777e14382d21337f86fec8ba38832d577ad5795f2e6",
+      "sourceUrl": "https://github.com/EleonoreMizo/fmtconv/releases/download/r30/fmtconv-r30.zip",
+      "sourceSha256": "f35dba222f2a4d998cd5f777e14382d21337f86fec8ba38832d577ad5795f2e6",
+      "members": {
+        "plugins/fmtconv.dll": {
+          "member": "win64/fmtconv.dll",
+          "sha256": "ddbe77e0b09d745608202c9fbca2c70d0c26e0428b27b15b92dfd2cad87f1898"
+        }
+      }
+    },
+    "temporalsoften2": {
+      "revision": "v1",
+      "url": "https://github.com/dubhatervapoursynth/vapoursynth-temporalsoften2/releases/download/v1/vapoursynth-temporalsoften2-v1-win64.7z",
+      "sha256": "67d2826fbcf0dd62d7dcda6f07c28137f2ef075b6bad49aa36453ae2855f453f",
+      "sourceUrl": "https://api.github.com/repos/dubhatervapoursynth/vapoursynth-temporalsoften2/zipball/v1",
+      "sourceSha256": "9d178a608ba78f2067820531db48b4540cf890872fad903c7754202fc7897912",
+      "members": {
+        "plugins/libtemporalsoften2.dll": {
+          "member": "libtemporalsoften2.dll",
+          "sha256": "9a3dd72e9b91916ee23fbad8107a73f5e573cda2343f15a23195aa0b1c54a1b6"
+        }
+      }
+    },
+    "miscfilters": {
+      "revision": "R2",
+      "url": "https://github.com/vapoursynth/vs-miscfilters-obsolete/releases/download/R2/miscfilters-r2.7z",
+      "sha256": "54cf54c4d66151c01c1c663ed0d47ca99c7f1b0a94927bd99b35362c02172bd2",
+      "sourceUrl": "https://api.github.com/repos/vapoursynth/vs-miscfilters-obsolete/zipball/R2",
+      "sourceSha256": "90bb7ac0fe56c22fafebcb6446de71292995ef0e38928621f4fa67a56dd27cff",
+      "members": {
+        "plugins/MiscFilters.dll": {
+          "member": "win64/MiscFilters.dll",
+          "sha256": "33d911c2f5fd59d33cabb9056348f821421fd18afc0754e8a29ebfe3a35047ab"
+        }
+      }
+    },
+    "mvtools": {
+      "revision": "v24",
+      "url": "https://github.com/dubhatervapoursynth/vapoursynth-mvtools/releases/download/v24/vapoursynth-mvtools-v24-win64.7z",
+      "sha256": "b9883003eed100d4ffd44344b658554076b89da6d45041b378e675720426bc95",
+      "sourceUrl": "https://api.github.com/repos/dubhatervapoursynth/vapoursynth-mvtools/zipball/v24",
+      "sourceSha256": "ce31a9dd35db59199ee6a6934371ea042fea65763d883ba9afbc9c5e536655d3",
+      "members": {
+        "plugins/mvtools.dll": {
+          "member": "libmvtools.dll",
+          "sha256": "530a2f003901a7c0749b0b3797c2a2d2c9b12a2b87c4ca4e9d4ec7937260f091"
+        }
+      }
+    },
+    "removegrainvs": {
+      "revision": "R1",
+      "url": "https://github.com/vapoursynth/vs-removegrain/releases/download/R1/removegrain-r1.7z",
+      "sha256": "dc408c560de537d273e78607a776f357ba80d9a7a0074d3c10bc9f3e3376d35f",
+      "sourceUrl": "https://api.github.com/repos/vapoursynth/vs-removegrain/zipball/R1",
+      "sourceSha256": "7184c1a45f292fe0aa5611720618875cbdc842dc706fb3ac7e141a9002023efa",
+      "members": {
+        "plugins/RemoveGrainVS.dll": {
+          "member": "win64/RemoveGrainVS.dll",
+          "sha256": "eed537d5f0de88fc4d5acac1d3dde16b3c81524565fd1fe5e4322bd91117c3fe"
+        }
+      }
+    },
+    "havsfunc": {
+      "revision": "5baf9c2a1dac9da4de182cf3a4e12041c3e0d48b",
+      "url": "https://api.github.com/repos/HomeOfVapourSynthEvolution/havsfunc/zipball/5baf9c2a1dac9da4de182cf3a4e12041c3e0d48b",
+      "sha256": "566ee9f600279e26b3eb18348ed83ef9343845ddcebf485db47d8eaa3cbe3a17",
+      "sourceUrl": "https://api.github.com/repos/HomeOfVapourSynthEvolution/havsfunc/zipball/5baf9c2a1dac9da4de182cf3a4e12041c3e0d48b",
+      "sourceSha256": "566ee9f600279e26b3eb18348ed83ef9343845ddcebf485db47d8eaa3cbe3a17",
+      "member": "HomeOfVapourSynthEvolution-havsfunc-5baf9c2/havsfunc/havsfunc.py",
+      "memberSha256": "95f7342271e688e20845aaaa47d548ed6aede274a514bac666145d5514d0fe58"
+    },
+    "vsutil": {
+      "revision": "0.8.0",
+      "url": "https://files.pythonhosted.org/packages/35/89/daadc3c87b3c0f1f5ca36fd900222ea4c023af6a4acefd033ef7f55df3b5/vsutil-0.8.0-py3-none-any.whl",
+      "sha256": "b14751680f1aa47a8671a943932e160fc3b6029b3e60227875fd73d7a47dac86",
+      "sourceUrl": "https://files.pythonhosted.org/packages/f2/dc/95df63612bd0a95d7a06a1c51dde3ca0f4ae697d9e231c2345390ff9638c/vsutil-0.8.0.tar.gz",
+      "sourceSha256": "e01831203dfb9c3af86a101fba5e7fe04e3686bddec94bb3057ca73e84c98768",
+      "members": [
+        "vsutil/__init__.py",
+        "vsutil/_metadata.py",
+        "vsutil/clips.py",
+        "vsutil/func.py",
+        "vsutil/info.py",
+        "vsutil/py.typed",
+        "vsutil/types.py"
+      ]
+    },
+    "fftw": {
+      "revision": "3.3.5",
+      "url": "https://fftw.org/pub/fftw/fftw-3.3.5-dll64.zip",
+      "sha256": "cfd88dc0e8d7001115ea79e069a2c695d52c8947f5b4f3b7ac54a192756f439f",
+      "sourceUrl": "https://fftw.org/fftw-3.3.5.tar.gz",
+      "sourceSha256": "8ecfe1b04732ec3f5b7d279fdb8efcad536d555f9d1e8fabd027037d45ea8bcf",
+      "members": {
+        "runtime/libfftw3f-3.dll": {
+          "member": "libfftw3f-3.dll",
+          "sha256": "42ca18fff35dd12890e04478bc990005b3969cb744f6843976bd436ccd7f0a4c"
+        }
+      }
+    }
+  },
+  "outputs": {
+    "plugins/znedi3.dll": "5c1dd6cc681bb1a812b0285349179e185f2f5962e816810e963af8a3b018a9aa",
+    "plugins/nnedi3_weights.bin": "27f382430435bb7613deb1c52f3c79c300c9869812cfe29079432a9c82251d42",
+    "plugins/EEDI3m.dll": "8fc1a433112707164c1a87d2c9e78709822b7ca89325f0d691d36337f6bf9051",
+    "runtime/libfftw3f-3.dll": "42ca18fff35dd12890e04478bc990005b3969cb744f6843976bd436ccd7f0a4c",
+    "plugins/fmtconv.dll": "ddbe77e0b09d745608202c9fbca2c70d0c26e0428b27b15b92dfd2cad87f1898",
+    "plugins/libtemporalsoften2.dll": "9a3dd72e9b91916ee23fbad8107a73f5e573cda2343f15a23195aa0b1c54a1b6",
+    "plugins/mvtools.dll": "530a2f003901a7c0749b0b3797c2a2d2c9b12a2b87c4ca4e9d4ec7937260f091",
+    "plugins/RemoveGrainVS.dll": "eed537d5f0de88fc4d5acac1d3dde16b3c81524565fd1fe5e4322bd91117c3fe",
+    "qtgmc-deps.zip": "96bd4b581b38e0ff4729c167fb438932e7b5382c1862e28eb47becdb1c827e12"
+  }
+}

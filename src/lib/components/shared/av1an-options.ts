@@ -87,9 +87,11 @@ export function av1anError(
   if (
     draft.pixelFormat !== undefined &&
     !(
-      encoder === 'x264'
+      encoder === 'x264' || encoder === 'x265Standalone' || encoder === 'aomAv1'
         ? ['yuv420p', 'yuv420p10le', 'yuv422p', 'yuv422p10le', 'yuv444p', 'yuv444p10le']
-        : ['yuv420p', 'yuv420p10le']
+        : encoder === 'vpxStandalone'
+          ? ['yuv420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le']
+          : ['yuv420p', 'yuv420p10le']
     ).includes(draft.pixelFormat)
   )
     return 'Choose a supported output pixel format for the selected encoder.';
@@ -99,7 +101,7 @@ export function av1anError(
   if (hdr)
     return 'Quality targeting currently requires SDR. These metric pipelines are not qualified for HDR sources.';
   const q = draft.target;
-  const maximumCrf = encoder === 'x264' ? 51 : 63;
+  const maximumCrf = encoder === 'x264' || encoder === 'x265Standalone' ? 51 : 63;
   if (
     !whole(q.minimumScoreTenths, 0, 1000) ||
     !whole(q.maximumScoreTenths, q.minimumScoreTenths, 1000) ||
@@ -136,7 +138,9 @@ export function selectedAv1an(
   const { targetEnabled, target, ...options } = draft;
   return {
     ...options,
-    ...(encoder === 'x264' ? { concatMethod: 'mkvmerge' as const } : {}),
+    ...(['x264', 'x265Standalone', 'vpxStandalone'].includes(encoder)
+      ? { concatMethod: 'mkvmerge' as const }
+      : {}),
     ...(targetEnabled ? { targetQuality: { ...target } } : {}),
   };
 }

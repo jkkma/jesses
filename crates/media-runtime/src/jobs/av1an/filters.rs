@@ -1,7 +1,8 @@
-//! Custom pixel filters run through a native FFmpeg argv value on the verified
-//! lossless preparation path. Timeline, geometry and file I/O belong to other
-//! typed controls and cannot be hidden in a filter expression.
-use media_core::{AppError, EncodeBackend, EncodeSettings};
+//! Custom pixel filters run through a native FFmpeg argv value. The standalone
+//! producer applies them before encoding; av1an prepares one verified lossless
+//! source so scene detection and quality references see the same pixels.
+//! Timeline, geometry and file I/O belong to other typed controls.
+use media_core::{AppError, EncodeSettings};
 
 pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     let filters = &settings.av1an_filters;
@@ -10,15 +11,12 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
     }
     let invalid = || {
         AppError::new(
-            "AV1AN_FILTER_INVALID",
+            "VIDEO_FILTER_INVALID",
             "Use up to 16 pixel-filter rows (4096 characters each). Geometry, timing, external file access and filter graphs must use the dedicated controls.",
             None,
         )
     };
-    if settings.backend != EncodeBackend::Av1an
-        || filters.len() > 16
-        || filters.iter().map(String::len).sum::<usize>() > 16384
-    {
+    if filters.len() > 16 || filters.iter().map(String::len).sum::<usize>() > 16384 {
         return Err(invalid());
     }
     for filter in filters {
@@ -128,10 +126,10 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use media_core::EncodeBackend;
     #[test]
     fn permits_pixel_expressions_but_rejects_hidden_io_and_timeline_changes() {
         let mut settings = EncodeSettings {
-            backend: EncodeBackend::Av1an,
             av1an_filters: vec![
                 "eq=contrast=1.1:saturation=0.9".into(),
                 "unsharp=5:5:0.4".into(),
@@ -139,6 +137,8 @@ mod tests {
             ],
             ..Default::default()
         };
+        assert!(validate(&settings).is_ok());
+        settings.backend = EncodeBackend::Standalone;
         assert!(validate(&settings).is_ok());
         for filter in [
             "movie=/tmp/input",

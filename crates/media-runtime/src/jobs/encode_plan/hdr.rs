@@ -2,6 +2,7 @@
 //! precision for mastering display values; comparison accounts for one AV1 step.
 use media_core::AppError;
 use serde_json::Value;
+use std::ffi::OsString;
 
 use super::unsupported;
 
@@ -75,6 +76,41 @@ impl Mastering {
         )
     }
 
+    /// x265's HEVC SEI parser takes integer chromaticities in 0.00002 units
+    /// and integer luminances in 0.0001 cd/m² units.
+    pub fn x265_argument(&self) -> String {
+        let v = self.values;
+        let xy = |index: usize| (v[index] * 50_000.0).round() as u32;
+        let luminance = |index: usize| (v[index] * 10_000.0).round() as u32;
+        format!(
+            "G({},{})B({},{})R({},{})WP({},{})L({},{})",
+            xy(2),
+            xy(3),
+            xy(4),
+            xy(5),
+            xy(0),
+            xy(1),
+            xy(6),
+            xy(7),
+            luminance(8),
+            luminance(9)
+        )
+    }
+
+    pub fn mkvmerge_arguments(&self) -> Vec<OsString> {
+        let v = self.values;
+        vec![
+            "--chromaticity-coordinates".into(),
+            format!("0:{},{},{},{},{},{}", v[0], v[1], v[2], v[3], v[4], v[5]).into(),
+            "--white-color-coordinates".into(),
+            format!("0:{},{}", v[6], v[7]).into(),
+            "--max-luminance".into(),
+            format!("0:{}", v[8]).into(),
+            "--min-luminance".into(),
+            format!("0:{}", v[9]).into(),
+        ]
+    }
+
     fn matches(&self, actual: &Self, encoded: bool) -> bool {
         self.values
             .iter()
@@ -92,6 +128,27 @@ impl Mastering {
                 };
                 (a - b).abs() <= tolerance + 1e-10
             })
+    }
+}
+
+#[cfg(test)]
+mod formatting_tests {
+    use super::*;
+
+    #[test]
+    fn x265_uses_hevc_fixed_point_mastering_units() {
+        let mastering = Mastering::parse(&serde_json::json!({
+            "red_x":"34000/50000", "red_y":"16000/50000",
+            "green_x":"13250/50000", "green_y":"34500/50000",
+            "blue_x":"7500/50000", "blue_y":"3000/50000",
+            "white_point_x":"15635/50000", "white_point_y":"16450/50000",
+            "max_luminance":"10000000/10000", "min_luminance":"1/10000"
+        }))
+        .unwrap();
+        assert_eq!(
+            mastering.x265_argument(),
+            "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+        );
     }
 }
 

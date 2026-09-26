@@ -1,10 +1,82 @@
 use super::*;
 use std::io::{Read, Write};
-pub(super) const TABLE_NAME: &str = "jesses-grain.tbl";
+pub(in crate::jobs) const TABLE_NAME: &str = "jesses-grain.tbl";
+
+/// Standalone encoders may open a grain table while denying write sharing on
+/// Windows. Keep a read-only identity guard during encoding and retain the
+/// reserved temporary's identity for safe cleanup afterward.
+pub(in crate::jobs) struct StandaloneTable {
+    temporary: Temporary,
+    guard: Option<Source>,
+}
+
+impl StandaloneTable {
+    pub(in crate::jobs) fn path(&self) -> &Path {
+        &self.temporary.path
+    }
+}
+
+impl Drop for StandaloneTable {
+    fn drop(&mut self) {
+        self.guard.take();
+        if self.temporary.reopen_after_path_writer().is_ok() {
+            let _ = self.temporary.cleanup();
+        }
+    }
+}
+
+pub(in crate::jobs) fn stage_standalone(
+    output: &Path,
+    attempt_id: &str,
+    settings: &EncodeSettings,
+) -> Result<Option<StandaloneTable>, AppError> {
+    let Some(table) = settings
+        .av1an_grain
+        .as_ref()
+        .and_then(|grain| grain.table.as_ref())
+    else {
+        return Ok(None);
+    };
+    validate(settings)?;
+    let mut temporary = Temporary::create_extension(output, &format!("{attempt_id}-grain"), "tbl")?;
+    let mut writer = temporary.clone_file()?;
+    writer
+        .write_all(table.as_bytes())
+        .and_then(|_| writer.sync_all())
+        .map_err(|error| {
+            files::error(
+                "GRAIN_TABLE_WRITE_FAILED",
+                error.to_string(),
+                &temporary.path,
+            )
+        })?;
+    drop(writer);
+    temporary.close_for_path_writer()?;
+    let mut staged = StandaloneTable {
+        temporary,
+        guard: None,
+    };
+    let guard = Source::open(staged.path())?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(staged.path())
+        .and_then(|file| file.take(262145).read_to_end(&mut bytes))
+        .map_err(|error| {
+            files::error("GRAIN_TABLE_UNREADABLE", error.to_string(), staged.path())
+        })?;
+    if bytes != table.as_bytes() {
+        return Err(files::error(
+            "GRAIN_TABLE_WRITE_FAILED",
+            "The staged grain table differs from the immutable job settings.",
+            staged.path(),
+        ));
+    }
+    guard.verify()?;
+    staged.guard = Some(guard);
+    Ok(Some(staged))
+}
 
 pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
-    if settings.backend == media_core::EncodeBackend::Av1an
-        && settings.encoder.is_svt()
+    if settings.encoder.is_svt()
         && settings.parameters.iter().any(|value| {
             value.name == "noise"
                 && value
@@ -28,8 +100,8 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
         return Ok(());
     };
     let invalid = |message| AppError::new("ENCODE_SETTINGS_INVALID", message, None);
-    if settings.backend != media_core::EncodeBackend::Av1an || !settings.encoder.is_svt() {
-        return Err(invalid("AV1AN film-grain options require an SVT encoder."));
+    if !(settings.encoder.is_svt() || settings.encoder == media_core::VideoEncoder::AomAv1) {
+        return Err(invalid("Film-grain tables require SVT-AV1 or AOM."));
     }
     if !(1..=16).contains(&grain.denoise_strength) {
         return Err(invalid(
@@ -81,7 +153,7 @@ pub(super) fn stage(work: &Path, settings: &EncodeSettings) -> Result<Option<Sou
             .and_then(|_| writer.sync_all())
             .map_err(|e| files::error("GRAIN_TABLE_WRITE_FAILED", e.to_string(), &path))?;
     }
-    // SVT opens tables with deny-write sharing on Windows. Release our writer
+    // Encoders can open tables with deny-write sharing on Windows. Release our writer
     // before retaining a read-only identity guard for all encoder children.
     drop(writer);
     drop(file);
@@ -101,7 +173,43 @@ pub(super) fn stage(work: &Path, settings: &EncodeSettings) -> Result<Option<Sou
     Ok(Some(guard))
 }
 
-pub(super) fn parameters(args: &mut Vec<OsString>, settings: &EncodeSettings) {
+pub(in crate::jobs) fn aom_parameters(settings: &EncodeSettings) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if settings.encoder == media_core::VideoEncoder::AomAv1 {
+        if settings
+            .av1an_grain
+            .as_ref()
+            .is_some_and(|grain| grain.table.is_some())
+        {
+            args.push(format!("--film-grain-table={TABLE_NAME}").into());
+            if let Some(grain) = settings.av1an_grain.as_ref().filter(|grain| grain.denoise) {
+                args.push(format!("--denoise-noise-level={}", grain.denoise_strength).into());
+                args.push("--enable-dnl-denoising=1".into());
+            }
+        } else if settings.film_grain > 0 {
+            args.push(format!("--denoise-noise-level={}", settings.film_grain).into());
+            args.push(
+                format!(
+                    "--enable-dnl-denoising={}",
+                    u8::from(
+                        settings
+                            .av1an_grain
+                            .as_ref()
+                            .is_some_and(|grain| grain.denoise)
+                    )
+                )
+                .into(),
+            );
+        }
+    }
+    args
+}
+
+pub(in crate::jobs) fn parameters(args: &mut Vec<OsString>, settings: &EncodeSettings) {
+    if settings.encoder == media_core::VideoEncoder::AomAv1 {
+        args.extend(aom_parameters(settings));
+        return;
+    }
     let Some(grain) = &settings.av1an_grain else {
         return;
     };
@@ -149,6 +257,9 @@ mod tests {
         assert!(validate(&settings).is_err());
         settings.parameters[0].value = "0".into();
         assert!(validate(&settings).is_ok());
+        settings.backend = media_core::EncodeBackend::Standalone;
+        settings.parameters[0].value = "50".into();
+        assert!(validate(&settings).is_err());
     }
 
     #[test]

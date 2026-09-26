@@ -14,6 +14,7 @@
     removeParameterPreset,
   } from '$lib/ipc/client';
   import { parameterError } from './encoder-parameters';
+  import EncoderCommandEditor from './EncoderCommandEditor.svelte';
   let {
     encoder,
     backend,
@@ -29,6 +30,14 @@
   } = $props();
   let expanded = $state(false);
   let catalog = $state<EncoderParameterCatalog | null>(null);
+  let search = $state('');
+  const visibleParameters = $derived(
+    (catalog?.parameters ?? []).filter((spec) =>
+      `${spec.name} ${spec.label} ${spec.group}`
+        .toLowerCase()
+        .includes(search.trim().toLowerCase()),
+    ),
+  );
   let busy = $state(false);
   let error = $state<string | null>(null);
   let name = $state('');
@@ -93,6 +102,7 @@
       catalog = null;
       error = null;
       selectedPreset = '';
+      search = '';
       if (open) void load();
     });
     return () => {
@@ -176,11 +186,16 @@
     </p>
     {#if busy}<p role="status">Checking the installed encoder catalog…</p>{:else if catalog}
       <p class="small-muted">{catalog.route}: {catalog.toolVersion}</p>
+      <EncoderCommandEditor {value} {catalog} {disabled} {onchange} />
+      {#if catalog.parameters.length > 8}<label class="parameter-search"
+          >Find a parameter
+          <input type="search" bind:value={search} placeholder="Name or category" {disabled} />
+        </label>{/if}
       <fieldset {disabled}>
         <legend>Validated encoder overrides</legend>
-        {#each catalog.parameters as spec, index (spec.name)}
+        {#each visibleParameters as spec, index (spec.name)}
           {@const current = value.find((value) => value.name === spec.name)}
-          {#if index === 0 || catalog.parameters[index - 1].group !== spec.group}
+          {#if index === 0 || visibleParameters[index - 1].group !== spec.group}
             <h4>{spec.group || 'Advanced'}</h4>
           {/if}
           <div class="parameter-row">
@@ -234,11 +249,11 @@
         {/each}
         {#if !catalog.parameters.length}<p>
             This build advertises none of the qualified overrides.
-          </p>{/if}
-        <button type="button" onclick={() => onchange([])} disabled={disabled || !value.length}
-          >Clear overrides</button
-        >
+          </p>{:else if !visibleParameters.length}<p>No matching parameters.</p>{/if}
       </fieldset>
+      <button type="button" onclick={() => onchange([])} disabled={disabled || !value.length}
+        >Clear overrides</button
+      >
       {#each catalog.notes as note}<p class="small-muted">{note}</p>{/each}
       <div class="preset-controls">
         <label
@@ -309,6 +324,13 @@
   fieldset {
     border: 1px solid var(--border);
     padding: 10px;
+    max-block-size: 28rem;
+    overflow-y: auto;
+  }
+  .parameter-search {
+    display: grid;
+    gap: 6px;
+    margin-top: 12px;
   }
   .parameter-row {
     display: grid;

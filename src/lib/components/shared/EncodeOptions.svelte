@@ -112,7 +112,7 @@
     </p>
   </div>
 {/if}
-{#if isSvtEncoder(encoder)}<div class="grain-settings full-width">
+{#if isSvtEncoder(encoder) || encoder === 'aomAv1'}<div class="grain-settings full-width">
     <div class="field encode-field">
       <label for={`${idPrefix}-grain`}>Film grain synthesis</label>
       <input
@@ -130,22 +130,22 @@
           : '0 keeps synthesis off and encodes source texture. 1–50 adds synthesized grain with encoder denoising disabled. This does not exactly restore the original grain.'}
       </p>
     </div>
-    <div class="field">
-      <label class="fallback-choice" for={`${idPrefix}-hdr-fallback`}>
-        <input
-          id={`${idPrefix}-hdr-fallback`}
-          type="checkbox"
-          bind:checked={hdr10Fallback}
-          {disabled}
-        />
-        <span>Allow HDR10 fallback</span>
-      </label>
-      <p>
-        Preserve static HDR in HDR10 output. Checking this explicitly allows Dolby Vision and HDR10+
-        dynamic metadata to be discarded when a compatible HDR10 base is available. Unsupported HDR
-        sources are rejected.
-      </p>
-    </div>
+    {#if isSvtEncoder(encoder)}<div class="field">
+        <label class="fallback-choice" for={`${idPrefix}-hdr-fallback`}>
+          <input
+            id={`${idPrefix}-hdr-fallback`}
+            type="checkbox"
+            bind:checked={hdr10Fallback}
+            {disabled}
+          />
+          <span>Allow HDR10 fallback</span>
+        </label>
+        <p>
+          Preserve static HDR in HDR10 output. Checking this explicitly allows Dolby Vision and
+          HDR10+ dynamic metadata to be discarded when a compatible HDR10 base is available.
+          Unsupported HDR sources are rejected.
+        </p>
+      </div>{/if}
   </div>
 {/if}
 

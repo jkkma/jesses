@@ -7,7 +7,7 @@
     runImageJob,
     isDesktop,
   } from '$lib/ipc/client';
-  import type { MediaFile, ImageOutput, ImageResult } from '$lib/ipc/generated';
+  import type { MediaFile, ImageOutput, ImagePixelFormat, ImageResult } from '$lib/ipc/generated';
   import { errorMessage, fileName } from '$lib/components/shared/format';
   let { files, onimport }: { files: MediaFile[]; onimport: (paths: string[]) => void } = $props();
   let mode = $state<'import' | 'export'>('import');
@@ -19,6 +19,7 @@
   let start = $state(0);
   let count = $state(1);
   let format = $state<ImageOutput>('png');
+  let pixelFormat = $state<ImagePixelFormat | ''>('');
   let resize = $state(false);
   let width = $state(1280);
   let directoryName = $state('frames');
@@ -99,6 +100,9 @@
             format,
             outputPath: output,
             width: resize ? width : null,
+            ...(pixelFormat && (format === 'png' || format === 'pngSequence')
+              ? { pixelFormat }
+              : {}),
           },
           active.signal,
         );
@@ -201,6 +205,15 @@
             ></select
           ></label
         >
+        {#if format === 'png' || format === 'pngSequence'}<label
+            >PNG color depth<select bind:value={pixelFormat} disabled={pending}
+              ><option value="">Automatic</option><option value="rgb24">RGB · 8-bit</option><option
+                value="rgba">RGBA · 8-bit with alpha</option
+              ><option value="rgb48">RGB · 16-bit</option><option value="rgba64"
+                >RGBA · 16-bit with alpha</option
+              ></select
+            ></label
+          >{/if}
         <label class="compact-field"
           >First frame (from zero)<input
             type="number"

@@ -25,6 +25,9 @@ import time
 STARTUP_TIMEOUT = 45
 SECONDARY_TIMEOUT = 15
 POLL_SECONDS = 0.2
+WINDOW_STABLE_SECONDS = 3.0
+WINDOW_RESPONSE_TIMEOUT_MS = 500
+WINDOW_TITLE = "jesses"
 
 
 class CheckFailed(RuntimeError):
@@ -169,6 +172,71 @@ def lock_is_held(lock: Path) -> bool:
     return False
 
 
+def main_window(pid: int, *, require_response: bool = True) -> dict | None:
+    """Find this process's responsive Tauri main HWND, even when launched hidden.
+
+    The harness hides windows on the operator's desktop. IsWindowVisible would
+    therefore reject a healthy app; a title, positive client area and WM_NULL
+    response prove that its top-level UI thread has finished creating a window.
+    """
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetClientRect.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+    matches = []
+
+    @callback_type
+    def collect(hwnd, _):
+        owner = wintypes.DWORD()
+        if user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner)) and owner.value == pid:
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                title = ctypes.create_unicode_buffer(length + 1)
+                if user32.GetWindowTextW(hwnd, title, len(title)) and title.value.casefold() == WINDOW_TITLE:
+                    rect = wintypes.RECT()
+                    if user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                        width = rect.right - rect.left
+                        height = rect.bottom - rect.top
+                        if width > 0 and height > 0:
+                            reply = ctypes.c_size_t()
+                            # WM_NULL, SMTO_BLOCK | SMTO_ABORTIFHUNG: bound a
+                            # stalled startup instead of hanging the test host.
+                            responsive = bool(user32.SendMessageTimeoutW(
+                                hwnd, 0, 0, 0, 0x0001 | 0x0002,
+                                WINDOW_RESPONSE_TIMEOUT_MS, ctypes.byref(reply),
+                            ))
+                            matches.append({
+                                "handle": int(hwnd),
+                                "title": title.value,
+                                "clientWidth": width,
+                                "clientHeight": height,
+                                "visible": bool(user32.IsWindowVisible(hwnd)),
+                                "responsive": responsive,
+                            })
+        return True
+
+    if not user32.EnumWindows(collect, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if len(matches) != 1:
+        return None
+    return matches[0] if matches[0]["responsive"] or not require_response else None
+
+
 def seed_history(persist: Path) -> dict:
     history = persist / "data/jobs/jobs.json"
     history.parent.mkdir(parents=True)
@@ -207,37 +275,63 @@ def preserved_history(path: Path, expected: dict) -> bytes | None:
     return content
 
 
-def await_primary(process: subprocess.Popen, persist: Path, expected: dict, previous_write: int) -> bytes:
+def await_primary(process: subprocess.Popen, persist: Path, expected: dict, previous_write: int) -> tuple[bytes, dict]:
     history = persist / "data/jobs/jobs.json"
     lock = persist / "data/jobs/jobs.lock"
     deadline = time.monotonic() + STARTUP_TIMEOUT
+    ready_since = None
+    ready_handle = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise CheckFailed("primary exited before acquiring its history lock")
+            raise CheckFailed(f"primary exited with code {process.returncode} before its main window became ready")
         content = preserved_history(history, expected)
+        window = main_window(process.pid)
         # JobManager rewrites restored history before completing startup. A
         # lock alone can still expose the seed or the previous session's bytes.
         if (
             content is not None
             and history.stat().st_mtime_ns != previous_write
             and lock_is_held(lock)
+            and window is not None
         ):
-            return content
+            if ready_handle != window["handle"]:
+                ready_handle = window["handle"]
+                ready_since = time.monotonic()
+            if time.monotonic() - ready_since >= WINDOW_STABLE_SECONDS:
+                current_window = main_window(process.pid)
+                if process.poll() is not None or current_window is None or current_window["handle"] != ready_handle:
+                    raise CheckFailed("primary main window did not survive startup")
+                return content, window
+        else:
+            ready_since = None
+            ready_handle = None
         time.sleep(POLL_SECONDS)
-    raise CheckFailed("primary did not preserve history and acquire its lock")
+    raise CheckFailed(
+        f"primary did not preserve history, hold its lock, and present a responsive main window within {STARTUP_TIMEOUT} seconds"
+    )
 
 
 def secondary_exits(process: subprocess.Popen, primary: subprocess.Popen, history: Path, lock: Path, before: bytes) -> int:
-    try:
-        exit_code = process.wait(timeout=SECONDARY_TIMEOUT)
-    except subprocess.TimeoutExpired as error:
-        raise CheckFailed("second launch did not exit promptly") from error
+    deadline = time.monotonic() + SECONDARY_TIMEOUT
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            raise CheckFailed("second launch did not exit promptly")
+        if primary.poll() is not None:
+            raise CheckFailed("primary exited during second launch")
+        if main_window(primary.pid) is None:
+            raise CheckFailed("primary main window disappeared or stopped responding during second launch")
+        if main_window(process.pid, require_response=False) is not None:
+            raise CheckFailed("second launch created another main window")
+        time.sleep(POLL_SECONDS)
+    exit_code = process.returncode
     if exit_code != 0:
         raise CheckFailed("second launch did not exit successfully")
     if primary.poll() is not None:
         raise CheckFailed("primary exited during second launch")
     if not lock_is_held(lock):
         raise CheckFailed("primary no longer holds the history lock")
+    if main_window(primary.pid) is None:
+        raise CheckFailed("primary main window disappeared or stopped responding during second launch")
     if history.read_bytes() != before:
         raise CheckFailed("second launch changed saved history bytes")
     return exit_code
@@ -281,10 +375,10 @@ def run(executable: Path, root: Path) -> int:
         lock = persist / "data/jobs/jobs.lock"
         expected = seed_history(persist)
 
-        step = "primary-lock-and-preserved-history"
+        step = "primary-responsive-main-window-lock-and-preserved-history"
         previous_write = history.stat().st_mtime_ns
         primary = start(first, "primary", root, env, owned, results)
-        before = await_primary(primary, persist, expected, previous_write)
+        before, results[-1]["mainWindow"] = await_primary(primary, persist, expected, previous_write)
         receipt["checks"].append(step)
 
         for role, launcher in (("current", current), ("other-version", second)):
@@ -301,10 +395,11 @@ def run(executable: Path, root: Path) -> int:
             raise CheckFailed("primary exit changed synthetic history bytes")
         receipt["checks"].append(step)
 
-        step = "restart-other-version-acquires-lock"
+        step = "restart-other-version-responsive-main-window-and-lock"
         previous_write = history.stat().st_mtime_ns
         restarted = start(second, "restart", root, env, owned, results)
-        if await_primary(restarted, persist, expected, previous_write) != before:
+        after, results[-1]["mainWindow"] = await_primary(restarted, persist, expected, previous_write)
+        if after != before:
             raise CheckFailed("restart changed saved history bytes")
         receipt["checks"].append(step)
         receipt["historySha256"] = hashlib.sha256(before).hexdigest()

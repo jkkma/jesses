@@ -2,6 +2,7 @@
 use super::*;
 use media_core::{EncodeBackend, EncoderParameterCatalog, EncoderParameterSpec, VideoEncoder};
 mod catalog;
+mod extra_catalog;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ValueKind {
@@ -92,43 +93,9 @@ fn specs(encoder: VideoEncoder) -> Vec<Spec> {
                 1,
             ),
         ],
-        VideoEncoder::X265Standalone => vec![
-            item("ref", "Reference frames", "--ref", 1, 6),
-            item(
-                "bframes",
-                "Maximum consecutive B-frames",
-                "--bframes",
-                0,
-                16,
-            ),
-            item("b-adapt", "B-frame adaptation", "--b-adapt", 0, 2),
-            item("aq-mode", "Adaptive quantization mode", "--aq-mode", 0, 4),
-            item("sao", "Sample adaptive offset (0 off, 1 on)", "--sao", 0, 1),
-            item(
-                "cutree",
-                "CU-tree rate control (0 off, 1 on)",
-                "--cutree",
-                0,
-                1,
-            ),
-        ],
-        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => vec![
-            item("aq-mode", "Adaptive quantization mode", "--aq-mode", 0, 4),
-            item(
-                "lag-in-frames",
-                "Lookahead frames",
-                "--lag-in-frames",
-                0,
-                25,
-            ),
-            item(
-                "auto-alt-ref",
-                "Alternate reference frames",
-                "--auto-alt-ref",
-                0,
-                1,
-            ),
-        ],
+        VideoEncoder::X265Standalone => extra_catalog::x265(),
+        VideoEncoder::AomAv1 => extra_catalog::aom(),
+        VideoEncoder::VpxStandalone => extra_catalog::vpx(),
         VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => vec![
             item("bf", "B-frames", "-bf", 0, 4),
             item(
@@ -241,23 +208,27 @@ pub(crate) fn validate_values(
     backend: EncodeBackend,
     parameters: &[media_core::EncoderParameter],
 ) -> Result<(), AppError> {
-    let maximum = if encoder.is_svt() || encoder == VideoEncoder::X264 {
-        64
-    } else {
-        16
-    };
+    let maximum = if !encoder.is_ffmpeg() { 64 } else { 16 };
     if parameters.len() > maximum {
         return Err(error(format!(
             "At most {maximum} encoder overrides are allowed."
         )));
     }
     if backend == EncodeBackend::Av1an
-        && !encoder.is_svt()
-        && encoder != VideoEncoder::X264
+        && !matches!(
+            encoder,
+            VideoEncoder::SvtAv1
+                | VideoEncoder::SvtAv1FiveFish
+                | VideoEncoder::SvtAv1Hdr
+                | VideoEncoder::X264
+                | VideoEncoder::AomAv1
+                | VideoEncoder::VpxStandalone
+                | VideoEncoder::X265Standalone
+        )
         && !parameters.is_empty()
     {
         return Err(error(
-            "Av1an overrides require a supported SVT or x264 encoder.",
+            "Av1an overrides require a supported standalone encoder.",
         ));
     }
     let mut names = std::collections::HashSet::new();
@@ -314,7 +285,27 @@ pub(super) fn arguments(settings: &EncodeSettings) -> Vec<OsString> {
             .iter()
             .find(|value| value.name == spec.name)
         {
-            args.extend([spec.flag.into(), value.value.clone().into()]);
+            if settings.encoder == VideoEncoder::AomAv1 && spec.name == "disable-kf" {
+                args.push("--disable-kf".into());
+            } else if matches!(
+                settings.encoder,
+                VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
+            ) {
+                args.push(format!("{}={}", spec.flag, value.value).into());
+            } else if settings.encoder == VideoEncoder::X265Standalone
+                && matches!(spec.name, "sao" | "cutree")
+            {
+                args.push(
+                    if value.value == "0" {
+                        format!("--no-{}", spec.name)
+                    } else {
+                        spec.flag.into()
+                    }
+                    .into(),
+                );
+            } else {
+                args.extend([spec.flag.into(), value.value.clone().into()]);
+            }
         }
     }
     args
@@ -336,12 +327,16 @@ pub(super) fn x265_suffix(settings: &EncodeSettings) -> String {
 }
 
 fn advertised(help: &str, spec: &Spec, encoder: VideoEncoder) -> bool {
+    let wanted = if encoder == VideoEncoder::X265 {
+        "-x265-params"
+    } else {
+        spec.flag
+    };
     help.split_whitespace().any(|word| {
-        word == if encoder == VideoEncoder::X265 {
-            "-x265-params"
-        } else {
-            spec.flag
-        }
+        word.split('/').any(|alias| {
+            let flag = alias.split('=').next().unwrap_or(alias);
+            flag == wanted || flag.replace("[no-]", "") == wanted
+        })
     })
 }
 
@@ -430,9 +425,20 @@ pub(crate) async fn catalog(
 ) -> Result<EncoderParameterCatalog, AppError> {
     let _permit = crate::analysis::permit(&cancel).await?;
     check_cancel(&cancel)?;
-    if backend == EncodeBackend::Av1an && !encoder.is_svt() && encoder != VideoEncoder::X264 {
+    if backend == EncodeBackend::Av1an
+        && !matches!(
+            encoder,
+            VideoEncoder::SvtAv1
+                | VideoEncoder::SvtAv1FiveFish
+                | VideoEncoder::SvtAv1Hdr
+                | VideoEncoder::X264
+                | VideoEncoder::AomAv1
+                | VideoEncoder::VpxStandalone
+                | VideoEncoder::X265Standalone
+        )
+    {
         return Err(error(
-            "Choose a supported SVT or x264 encoder for av1an parameters.",
+            "Choose a supported standalone encoder for av1an parameters.",
         ));
     }
     let path = crate::discovery::find_video_encoder(encoder)
@@ -486,7 +492,7 @@ pub(crate) async fn catalog(
         ]
     } else {
         vec![
-            if encoder == VideoEncoder::X264 {
+            if matches!(encoder, VideoEncoder::X264 | VideoEncoder::X265Standalone) {
                 "--fullhelp"
             } else {
                 "--help"
@@ -533,7 +539,7 @@ pub(crate) async fn catalog(
             example: spec.example.into(),
         })
         .collect();
-    Ok(EncoderParameterCatalog{encoder,backend,route:if encoder.is_ffmpeg(){"FFmpeg library"}else{"Standalone encoder CLI"}.into(),tool_path:path.to_string_lossy().into_owned(),tool_version:identity.lines().find(|line|!line.is_empty()).unwrap_or("unknown").into(),parameters,notes:vec!["The encoder speed preset applies first. Explicit overrides apply afterward. Missing overrides retain that build's preset defaults.".into(),"Only catalog values are accepted. Input/output paths, timing, source filters, primary quality and pass mode, and process flags remain application-controlled.".into(),if encoder==VideoEncoder::X265 {"Nested libx265 parameters receive a bounded real encoding probe before execution."} else {"Every requested flag must be advertised by the selected installed build before execution."}.into()]})
+    Ok(EncoderParameterCatalog{encoder,backend,route:if encoder.is_ffmpeg(){"FFmpeg library"}else if backend == EncodeBackend::Av1an {"av1an child encoder CLI"} else {"Standalone encoder CLI"}.into(),tool_path:path.to_string_lossy().into_owned(),tool_version:identity.lines().find(|line|!line.is_empty()).unwrap_or("unknown").into(),parameters,notes:vec!["The encoder speed preset applies first. Explicit overrides apply afterward. Missing overrides retain that build's preset defaults.".into(),"Only catalog values are accepted. Input/output paths, timing, source filters, primary quality and pass mode, and process flags remain application-controlled.".into(),if encoder==VideoEncoder::X265 {"Nested libx265 parameters receive a bounded real encoding probe before execution."} else {"Every requested flag must be advertised by the selected installed build before execution."}.into()]})
 }
 
 #[cfg(test)]
@@ -589,6 +595,21 @@ mod tests {
             arguments(&svt),
             vec![OsString::from("--enable-tf"), OsString::from("0")]
         );
+        let aom = setting(VideoEncoder::AomAv1, "disable-kf", "1");
+        assert!(validate(&aom).is_ok());
+        assert_eq!(arguments(&aom), vec![OsString::from("--disable-kf")]);
+        assert!(validate(&setting(VideoEncoder::AomAv1, "disable-kf", "0")).is_err());
+        for (encoder, name, value) in [
+            (VideoEncoder::AomAv1, "kf-min-dist", "12"),
+            (VideoEncoder::AomAv1, "kf-max-dist", "240"),
+            (VideoEncoder::AomAv1, "tile-columns", "1"),
+            (VideoEncoder::VpxStandalone, "kf-max-dist", "240"),
+            (VideoEncoder::VpxStandalone, "tile-rows", "0"),
+            (VideoEncoder::SvtAv1, "keyint", "240"),
+        ] {
+            let settings = setting(encoder, name, value);
+            assert!(validate(&settings).is_ok(), "{encoder:?} {name}");
+        }
     }
 
     #[test]
@@ -596,7 +617,7 @@ mod tests {
         let x264 = specs(VideoEncoder::X264);
         let svt = specs(VideoEncoder::SvtAv1);
         assert_eq!(x264.len(), 31);
-        assert_eq!(svt.len(), 43);
+        assert_eq!(svt.len(), 44);
         for spec in x264.iter().chain(&svt) {
             assert!(spec.flag.starts_with("--"));
             assert!(valid_value(spec, spec.example), "{} example", spec.name);
@@ -692,6 +713,59 @@ mod tests {
             );
             assert!(validate(&settings).is_ok());
         }
+    }
+
+    #[test]
+    fn extra_native_help_aliases_and_boolean_arguments_match_cli_syntax() {
+        for (encoder, name, help) in [
+            (
+                VideoEncoder::AomAv1,
+                "sharpness",
+                "--sharpness=<arg> Sharpness",
+            ),
+            (VideoEncoder::VpxStandalone, "tune", "--tune=<arg> Tuning"),
+            (VideoEncoder::X265Standalone, "tune", "-t/--tune <string>"),
+            (VideoEncoder::X265Standalone, "sao", "--[no-]sao Enable SAO"),
+        ] {
+            let spec = specs(encoder).into_iter().find(|s| s.name == name).unwrap();
+            assert!(advertised(help, &spec, encoder));
+            assert!(!advertised(&format!("{}-other", spec.flag), &spec, encoder));
+        }
+        for value in ["0", "1"] {
+            let settings = setting(VideoEncoder::X265Standalone, "sao", value);
+            assert!(validate(&settings).is_ok());
+            assert_eq!(
+                arguments(&settings),
+                [OsString::from(if value == "0" {
+                    "--no-sao"
+                } else {
+                    "--sao"
+                })]
+            );
+        }
+        assert!(validate(&setting(VideoEncoder::X265Standalone, "deblock", "-1:1")).is_ok());
+        assert!(validate(&setting(VideoEncoder::X265Standalone, "psy-rd", "1.5")).is_ok());
+        assert!(validate(&setting(VideoEncoder::AomAv1, "tune", "psnr")).is_ok());
+        assert_eq!(
+            arguments(&setting(VideoEncoder::AomAv1, "tune", "psnr")),
+            [OsString::from("--tune=psnr")]
+        );
+        assert!(
+            validate(&setting(
+                VideoEncoder::VpxStandalone,
+                "tune-content",
+                "screen"
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate(&setting(
+                VideoEncoder::VpxStandalone,
+                "tune",
+                "psnr --output bad"
+            ))
+            .is_err()
+        );
     }
 
     #[tokio::test]

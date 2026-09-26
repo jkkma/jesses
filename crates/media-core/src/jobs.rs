@@ -125,6 +125,10 @@ pub struct EncodeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub av1an_options: Option<crate::Av1anOptions>,
+    /// Explicit encoded video format. Omission keeps the historical encoder default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_pixel_format: Option<crate::Av1anPixelFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub av1an_grain: Option<crate::Av1anGrainSettings>,
@@ -199,6 +203,7 @@ impl Default for EncodeSettings {
             temporal: None,
             parameters: Vec::new(),
             av1an_options: None,
+            output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
             rate_control: None,

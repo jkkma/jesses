@@ -1,23 +1,29 @@
-# av1an with SVT-AV1 and x264
+# av1an encoder routes
 
-The av1an workflow uses the selected mainline, 5fish, or HDR SVT-AV1 build, or
-the selected x264 executable. It does not substitute another build when the
-configured executable has the wrong identity. x264 chunks are raw H.264 and
-require mkvmerge to make the timed video intermediate; SVT chunks use IVF with
-FFmpeg concatenation by default. The final mux retains selected tracks and
-publishes only after complete frame, timing, color, audio, and metadata checks.
+The av1an workflow uses the selected mainline, 5fish, or HDR SVT-AV1 build,
+x264, aomenc, vpxenc for VP9, or x265. It does not substitute another build
+when the configured executable has the wrong identity. x264 and x265 write raw
+chunks and require mkvmerge to make a timed video intermediate. vpxenc also
+uses mkvmerge to assign exact rational timing to its VP9 chunks. SVT and AOM
+use IVF with FFmpeg concatenation by default. The final mux retains selected
+tracks and publishes only after complete frame, timing, color, audio, and
+metadata checks.
 
 The av1an controls include encoder threads (0 asks the encoder to choose),
 1–10 chunk attempts, FFmpeg or mkvmerge concatenation where supported, and
-explicit output pixel format. SVT accepts 8-bit or 10-bit 4:2:0. x264 accepts
-8-bit or 10-bit 4:2:0, 4:2:2, or 4:4:4 when the installed binary advertises
-the selected depth and chroma format. x264 always uses mkvmerge because raw
-H.264 chunks have no packet timestamps for FFmpeg's concat path. The per-chunk
-quality target uses SVT's CRF 1–63 or x264's CRF 0–51 bounds. Saved jobs retain
-the original settings and selected tool identities. The advanced catalog has
-43 SVT and 31 x264 controls, filtered against the selected executable's help.
+explicit output pixel format. SVT accepts 8-bit or 10-bit 4:2:0; AOM and VP9
+also accept 4:4:4, and AOM additionally accepts 4:2:2. x264 and x265 accept
+4:2:2 or 4:4:4 where the installed binary advertises the selected depth and
+chroma format. The per-chunk quality target uses SVT's
+CRF 1–63, AOM/VP9's quantizer 0–63, or x264/x265's CRF 0–51 bounds. Saved jobs
+retain the original settings and selected tool identities. The advanced
+catalog is filtered against the selected executable's help.
 It supports signed values, decimals, paired values, and listed tune combinations.
-Input/output paths and timing remain owned by the workflow.
+Input/output paths and timing remain owned by the workflow. Preserved HDR10
+with tagged, limited-range 10-bit BT.2020/PQ input is supported by x265 and
+AOM. x265 emits mastering and content-light SEI; AOM's static HDR metadata
+is attached to Matroska using mkvmerge, so that tool is required for the AOM
+HDR route. Other HDR sources still require an explicit SDR tone map.
 
 Quality targeting requires SDR output; scoring preserved HDR remains
 unqualified. Custom encoder paths and file-reading filter expressions are not
@@ -33,10 +39,11 @@ an installed av1an advertising the FFmpeg 9 compatibility fix. The rebuilt,
 pinned engine passed a native Segment job; older engines receive an actionable
 compatibility error before encoding.
 
-SVT can use a validated inline film-grain table or numeric grain synthesis.
-The table is saved as part of the immutable request, staged in the owned
-workspace, and checked again on recovery. Optional denoising before a table
-uses hqdn3d; it is separate from the encoder's grain controls. Custom pixel
+SVT and AOM can use a validated inline film-grain table or numeric grain synthesis.
+The table is saved as part of the immutable request. AV1AN stages it in the owned
+workspace and checks it again on recovery; standalone encodes stage a guarded
+temporary table for the encoder's lifetime. Optional denoising before an SVT table
+uses hqdn3d in AV1AN; AOM uses its own denoise-noise-level option when selected. Custom pixel
 filters are restricted to an allowlist and run once into a verified lossless
 prepared source shared by scene detection, chunks, and quality references.
 Matroska output can include a JSON attachment of the encode settings. The
@@ -84,3 +91,11 @@ The 720p source's full SHA-256 and byte count were unchanged after the
 real-media runs. Rust workspace tests and the exercised native integration
 tests passed. These checks do not qualify every pixel format, metric, plugin, SVT
 build, package installation, or long-duration recovery scenario.
+
+Additional native checks on 2026-09-26 used generated 16-frame 24000/1001 fps
+sources. AV1AN AOM, VP9, and x265 jobs each retained all frames and selected
+source tracks. Standalone and AV1AN AOM 4:2:2/4:4:4, and VP9 4:4:4, produced
+the requested 10-bit decoded formats. Standalone and AV1AN AOM/x265 preserved
+tagged HDR10 color plus readable mastering and content-light metadata on the
+first decoded frame. Standalone AOM numeric grain and AOM/SVT table encodes
+produced readable AV1 film-grain headers. Each check kept source bytes intact.

@@ -19,11 +19,38 @@ destination pathname. The completed elementary stream, timing wrapper, selected
 track mux and final container are checked before the app publishes with a
 no-replace operation. A pre-existing destination is never overwritten.
 
+The same bounded custom pixel-filter rows are available in Quick Convert and
+Batch for standalone and av1an jobs. They run after the typed temporal, color,
+geometry and subtitle controls. Standalone decoding applies the filters to the
+frames sent to the encoder; av1an prepares one lossless filtered source for its
+scene detection, chunks and quality reference. Command preview shows the same
+filter argument used by execution. File-reading, graph, timing and geometry
+filters are rejected because their separate controls carry the needed
+validation. The saved `av1anFilters` field remains accepted for both routes.
+
+Tagged 8/10/12-bit planar 4:2:0, 4:2:2 and 4:4:4 input can be explicitly
+converted to the selected encoder output format. Tagged packed YUYV/UYVY
+4:2:2 is also accepted. Full-range opaque RGB24/BGR24, planar GBR at 8, 10,
+12 or 16 bits, and RGB48 input require BT.709 primaries/transfer and GBR
+identity signaling. They are explicitly converted to BT.709 YUV at a supported
+8- or 10-bit output depth; SVT output uses limited range. Every decoded source
+frame and encoded frame is checked against its own pixel-format and color plan.
+
+For video with transparency, 8-bit RGBA or YUVA420P input can use the FFmpeg
+VP9 route with explicit **YUVA420P** output to a new `.mkv` or `.webm` file.
+The same route accepts a tagged VP9 alpha video as input. It uses the libvpx
+decoder for alpha, checks every output frame's alpha coverage and opacity,
+and checks the final container's alpha flag; lossless output also requires
+byte-exact decoded alpha. Temporal and custom pixel filters, subtitle burn-in,
+and other alpha formats are not supported on this route. Other encoders require
+an opaque source or deliberate compositing before encoding.
+
 The installed executable must advertise every requested input depth, rate-control
 mode, pass-statistics switch and lossless setting. x265 boolean switches such as
-`--[no-]lossless` are recognized from its full help. The direct AOM, VPX and x265
-routes currently preserve validated SDR 4:2:0 input; HDR input requires the
-explicit HDR/HLG-to-SDR plan. Dynamic HDR is never silently discarded.
+`--[no-]lossless` are recognized from its full help. Tagged limited-range 10-bit
+BT.2020/PQ HDR10 input with verified static metadata can be preserved by AOM and
+x265; other non-SVT HDR input requires explicit HDR/HLG-to-SDR tone mapping.
+Dynamic HDR is never silently discarded.
 
 ## Rate control and lossless
 
