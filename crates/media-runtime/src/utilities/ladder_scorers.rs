@@ -1,5 +1,6 @@
 //! Metric scorers for aligned, frame-counted ladder samples. The two image
-//! metrics use the installed CPU VapourSynth plugins; XPSNR uses FFmpeg.
+//! metrics use an optional probed Vship GPU plugin or the CPU VapourSynth
+//! plugins; XPSNR uses FFmpeg.
 use super::*;
 
 pub(super) enum Scorer {
@@ -8,6 +9,7 @@ pub(super) enum Scorer {
         environment: ChildEnvironment,
         cwd: PathBuf,
         metric: LadderMetric,
+        gpu_plugin: Option<PathBuf>,
     },
     Xpsnr {
         ffmpeg: PathBuf,
@@ -19,6 +21,16 @@ fn scorer_error(code: &str, detail: impl Into<String>, path: &Path) -> AppError 
 }
 
 impl Scorer {
+    pub(super) fn has_gpu(&self) -> bool {
+        matches!(
+            self,
+            Self::Python {
+                gpu_plugin: Some(_),
+                ..
+            }
+        )
+    }
+
     pub(super) async fn prepare(
         metric: LadderMetric,
         ffmpeg: &Path,
@@ -74,6 +86,7 @@ impl Scorer {
             let av1an = tool("av1an", "VapourSynth ladder scorer discovery").await?;
             let packaged = crate::bundled_tools::av1an_runtime(&av1an)
                 .map_err(|detail| scorer_error("UTILITY_SCORER_UNAVAILABLE", detail, &av1an))?;
+            let bundled = packaged.is_some();
             let (cwd, plugins) = if let Some(plugins) = packaged {
                 let cwd = plugins.ancestors().nth(3).ok_or_else(|| {
                     scorer_error(
@@ -152,12 +165,39 @@ impl Scorer {
                     &executable,
                 ));
             }
+            let candidate = plugins.join("optional-plugins/libvship_VULKAN.dll");
+            let gpu_plugin = if bundled && candidate.is_file() {
+                let program = gpu_probe(metric, &candidate);
+                let tested = run_capture_with_environment(
+                    &CommandSpec {
+                        executable: executable.clone(),
+                        args: vec!["-I".into(), "-B".into(), "-c".into(), program.into()],
+                        cwd: Some(cwd.clone()),
+                    },
+                    cancel.clone(),
+                    128 * 1024,
+                    Duration::from_secs(45),
+                    Some(&environment),
+                )
+                .await;
+                check_cancel(cancel)?;
+                tested
+                    .ok()
+                    .filter(|result| {
+                        result.status.success()
+                            && String::from_utf8_lossy(&result.stdout).contains("JESSES_VSHIP_OK")
+                    })
+                    .map(|_| candidate)
+            } else {
+                None
+            };
             let _ = work;
             Ok(Some(Self::Python {
                 executable,
                 environment,
                 cwd,
                 metric,
+                gpu_plugin,
             }))
         }
     }
@@ -169,6 +209,7 @@ impl Scorer {
         expected_frames: u64,
         work: &Path,
         cancel: &watch::Receiver<bool>,
+        force_cpu: bool,
     ) -> Result<Option<f64>, AppError> {
         match self {
             Self::Xpsnr { ffmpeg } => {
@@ -179,6 +220,7 @@ impl Scorer {
                 environment,
                 cwd,
                 metric,
+                gpu_plugin,
             } => {
                 let script = work.join(format!(
                     "scorer-{}.py",
@@ -186,7 +228,18 @@ impl Scorer {
                 ));
                 // L-SMASH writes index files to cachedir. Keep them at the
                 // scratch root so Scratch's owned-file cleanup removes them.
-                let source = python_script(*metric, reference, candidate, work, expected_frames)?;
+                let source = python_script(
+                    *metric,
+                    reference,
+                    candidate,
+                    work,
+                    expected_frames,
+                    if force_cpu {
+                        None
+                    } else {
+                        gpu_plugin.as_deref()
+                    },
+                )?;
                 fs::write(&script, source).map_err(|cause| {
                     scorer_error("UTILITY_SCORER_FAILED", cause.to_string(), &script)
                 })?;
@@ -269,12 +322,30 @@ fn metric_name(metric: LadderMetric) -> &'static str {
     }
 }
 
+fn gpu_probe(metric: LadderMetric, plugin: &Path) -> String {
+    let literal = serde_json::to_string(&plugin.to_string_lossy().to_string())
+        .expect("a filesystem path can be serialized as JSON text");
+    let score = match metric {
+        LadderMetric::Ssimulacra2 => {
+            "core.vship.SSIMULACRA2(ref, dist, numStream=1), '_SSIMULACRA2'"
+        }
+        LadderMetric::ButteraugliInf => {
+            "core.vship.BUTTERAUGLI(ref, dist, distmap=1, intensity_multiplier=203.0, numStream=1), '_BUTTERAUGLI_INFNorm'"
+        }
+        _ => unreachable!(),
+    };
+    format!(
+        "import math\nimport vapoursynth as vs\ncore = vs.core\ncore.std.LoadPlugin(path={literal})\nref = core.std.BlankClip(width=192, height=128, format=vs.YUV444P10, length=2, color=[256,512,512])\ndist = core.std.BlankClip(ref, color=[264,520,520])\nclip, name = {score}\nwith clip.get_frame(0) as frame:\n    value = float(frame.props[name])\n    assert math.isfinite(value), value\n    print('JESSES_VSHIP_OK', value)\n"
+    )
+}
+
 fn python_script(
     metric: LadderMetric,
     reference: &Path,
     candidate: &Path,
     cache: &Path,
     expected: u64,
+    gpu_plugin: Option<&Path>,
 ) -> Result<String, AppError> {
     let literal = |path: &Path| {
         serde_json::to_string(&path.to_string_lossy().to_string())
@@ -286,9 +357,14 @@ fn python_script(
         literal(candidate)?,
         literal(cache)?
     );
+    if let Some(plugin) = gpu_plugin {
+        script.push_str(&format!("core.std.LoadPlugin(path={})\n", literal(plugin)?));
+    }
     script.push_str("\ndef open_video(path):\n    return core.lsmas.LWLibavSource(source=path, cachedir=CACHE)\nref = open_video(REF)\ndist = open_video(DIST)\nif ref.num_frames != EXPECTED or dist.num_frames != EXPECTED:\n    raise RuntimeError('scorer inputs changed frame count')\n");
     match metric {
+        LadderMetric::Ssimulacra2 if gpu_plugin.is_some() => script.push_str("\nscored = core.vship.SSIMULACRA2(reference=ref, distorted=dist, numStream=4)\nNAMES = ('_SSIMULACRA2',)\n"),
         LadderMetric::Ssimulacra2 => script.push_str("\nif hasattr(core.vszip, 'SSIMULACRA2'):\n    scored = core.vszip.SSIMULACRA2(reference=ref, distorted=dist)\nelse:\n    scored = core.vszip.Metrics(reference=ref, distorted=dist, mode=0)\nNAMES = ('SSIMULACRA2', '_SSIMULACRA2')\n"),
+        LadderMetric::ButteraugliInf if gpu_plugin.is_some() => script.push_str("\nscored = core.vship.BUTTERAUGLI(reference=ref, distorted=dist, distmap=1, intensity_multiplier=203.0, numStream=4)\nNAMES = ('_BUTTERAUGLI_INFNorm',)\n"),
         LadderMetric::ButteraugliInf => script.push_str("\ndef rgb(clip):\n    matrix = {1:'709',5:'470bg',6:'170m'}.get(int(clip.get_frame(0).props.get('_Matrix', 1)), '709')\n    return core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=matrix)\nscored = core.julek.Butteraugli(reference=rgb(ref), distorted=rgb(dist), distmap=1, intensity_target=203.0)\nNAMES = ('_FrameButteraugli',)\n"),
         _ => unreachable!(),
     }

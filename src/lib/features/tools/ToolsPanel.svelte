@@ -12,6 +12,7 @@
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import PreferencesPanel from './PreferencesPanel.svelte';
+  import { appVersion } from '../../app-version';
   import type { ToolInfo } from '$lib/ipc/generated';
   import { getStorageLocations } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
@@ -68,19 +69,23 @@
   <section class="panel tool-detection">
     <div class="section-heading">
       <span class="heading-with-icon"
-        ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Tool detection</span></span
+        ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Tool readiness</span></span
       ><span class="small-muted"
         >{desktop && loading
           ? 'Checking local tools…'
           : desktop && !checked
-            ? 'Tools have not been checked'
+            ? 'Tools not checked'
             : desktop && tools.length
               ? `${available} / ${tools.length} available`
               : desktop
-                ? 'Local environment'
+                ? 'No tool results'
                 : 'Desktop required'}</span
       >
     </div>
+    <p class="tool-guidance">
+      Tool availability varies by workflow. A missing tool affects only the features that depend on
+      it.
+    </p>
     {#if !desktop}
       <div class="tools-empty">
         <FolderSearch size={34} strokeWidth={1.2} aria-hidden="true" />
@@ -93,37 +98,49 @@
     {:else if loading && !tools.length}
       <div class="tools-empty" role="status">
         <LoaderCircle size={25} class="spinning" aria-hidden="true" />
-        <h2>Checking local tools…</h2>
-        <p>Reading executable locations and versions.</p>
+        <h2>Checking tools…</h2>
+        <p>Checking the required media tools and additional capabilities.</p>
       </div>
     {:else if tools.length}
       <div class="tools-table-scroll">
         <table class="tools-table">
-          <thead><tr><th>Tool</th><th>Status</th><th>Version & location</th></tr></thead><tbody>
+          <thead><tr><th>Tool</th><th>Status</th><th>Diagnostics</th></tr></thead><tbody>
             {#each tools as tool (tool.id)}
               <tr
                 ><td><strong>{tool.name}</strong><span class="tool-id mono">{tool.id}</span></td><td
                   ><span class:available={tool.available} class="tool-status"
-                    >{#if !checked && loading}<LoaderCircle
+                    >{#if loading}<LoaderCircle
                         size={13}
                         class="spinning"
                         aria-hidden="true"
-                      />Checking…{:else if !checked}<Info size={13} aria-hidden="true" />Not checked{:else if tool.available}<Check
+                      />{checked ? 'Refreshing…' : 'Checking…'}{:else if !checked}<Info
                         size={13}
                         aria-hidden="true"
-                      />Available{:else}<CircleAlert size={13} aria-hidden="true" />Not found{/if}</span
+                      />Not checked{:else if tool.available}<Check
+                        size={13}
+                        aria-hidden="true"
+                      />Available{:else}<CircleAlert size={13} aria-hidden="true" />{tool.path
+                        ? 'Check failed'
+                        : 'Not found'}{/if}</span
                   ></td
                 ><td
-                  ><span class="tool-version mono"
-                    >{!checked
-                      ? 'Awaiting detection'
-                      : (tool.version ?? 'Version unavailable')}</span
-                  ><span class="tool-path mono" title={tool.path ?? undefined}
-                    >{!checked
-                      ? 'Executable location and version are not known yet.'
-                      : (tool.path ?? tool.detail ?? 'No executable detected')}</span
-                  >{#if tool.path && tool.detail}<span class="tool-detail">{tool.detail}</span
-                    >{/if}</td
+                  ><details class="tool-diagnostics">
+                    <summary>Show details</summary>
+                    <dl>
+                      <div>
+                        <dt>Version</dt>
+                        <dd class="mono">{tool.version ?? 'Unavailable'}</dd>
+                      </div>
+                      <div>
+                        <dt>Location</dt>
+                        <dd class="mono">{tool.path ?? 'Not detected'}</dd>
+                      </div>
+                      {#if tool.detail}<div>
+                          <dt>Detection</dt>
+                          <dd>{tool.detail}</dd>
+                        </div>{/if}
+                    </dl>
+                  </details></td
                 ></tr
               >
             {/each}
@@ -139,44 +156,26 @@
     {/if}
     <div class="panel-footnote">
       <Info size={14} aria-hidden="true" /><span
-        >Detection reports the current environment. Tools are not downloaded or installed
-        automatically.</span
+        >Open a row’s details first. If a Windows package is missing a bundled file, repair or
+        reinstall Jesses, then choose Check again. If a configured override fails, correct that path
+        and recheck.</span
       >
     </div>
   </section>
   {#if desktop}
     <PreferencesPanel />
-    <details class="panel optional-panel scorer-panel">
-      <summary class="section-heading">
+    <section class="panel scorer-panel">
+      <div class="section-heading">
         <span class="heading-with-icon"
-          ><Wrench size={15} aria-hidden="true" /><span class="eyebrow"
-            >Optional Vulkan quality scorer</span
-          ></span
-        >
-        <span class="small-muted">Advanced setup</span>
-      </summary>
-      <div class="scorer-content">
-        <p>
-          Vship can accelerate av1an SSIMULACRA2 and Butteraugli probes in an external portable
-          VapourSynth runtime. From a source checkout, run:
-        </p>
-        <code class="setup-command mono"
-          >pwsh -File scripts/install-vship.ps1 -PortableRuntime
-          &lt;external-portable-vapoursynth-dir&gt; -Activate</code
-        >
-        <p class="small-muted">
-          The installer verifies pinned hashes, the x64 VapourSynth ABI, and real finite metric
-          results on the current GPU before activation. Manifest-verified application bundles keep
-          their packaged CPU vszip and Julek scorers and are not modified by this installer.
-        </p>
-        <a
-          href="https://github.com/jkkma/jesses/blob/main/docs/windows-av1an-package.md"
-          target="_blank"
-          rel="noreferrer"
-          class="text-button">Open setup guide<ExternalLink size={13} aria-hidden="true" /></a
+          ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Quality scoring</span></span
         >
       </div>
-    </details>
+      <p class="scorer-summary">
+        Windows packages include Vship and CPU quality scorers. Jesses checks GPU support for
+        SSIMULACRA2 and Butteraugli jobs and uses CPU scoring when the GPU check fails. No extra
+        setup is needed for the Windows package.
+      </p>
+    </section>
     <details class="panel optional-panel storage-panel" open={storageError !== null}>
       <summary class="section-heading"
         ><span class="eyebrow">Application storage</span><span class="small-muted"
@@ -205,7 +204,7 @@
   {/if}
   <section class="panel about-panel">
     <div>
-      <div class="brand-wordmark">jesses<span class="version-tag">1.0.0</span></div>
+      <div class="brand-wordmark">jesses<span class="version-tag">{appVersion}</span></div>
       <p>Desktop media encoding, muxing, and analysis.</p>
       <span class="small-muted">Created by jkkma.</span>
     </div>
@@ -238,22 +237,41 @@
   .storage-error {
     padding: 14px;
   }
-  .scorer-content {
-    padding: 14px;
-    display: grid;
-    gap: 10px;
-  }
-  .scorer-content p {
+  .tool-guidance,
+  .scorer-summary {
     margin: 0;
+    padding: 0 17px 13px;
+    color: var(--muted-foreground);
+    font-size: 11px;
+    line-height: 1.55;
   }
-  .setup-command {
-    display: block;
-    padding: 0.75rem;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--muted);
+  .tool-detection .section-heading > :global(.small-muted) {
+    max-width: 55%;
+    text-align: right;
+  }
+  .tool-diagnostics summary {
+    cursor: pointer;
+    color: var(--muted-foreground);
+    font-size: 10px;
+  }
+  .tool-diagnostics dl {
+    margin: 8px 0 0;
+    display: grid;
+    gap: 7px;
+  }
+  .tool-diagnostics dl > div {
+    display: grid;
+    gap: 2px;
+  }
+  .tool-diagnostics dt {
+    color: var(--muted-foreground);
+    font-size: 9px;
+  }
+  .tool-diagnostics dd {
+    margin: 0;
     overflow-wrap: anywhere;
-    user-select: all;
+    font-size: 10px;
+    line-height: 1.45;
   }
   .optional-panel {
     margin-top: 12px;
@@ -279,16 +297,15 @@
   .tools-table td {
     padding-block: 10px;
   }
-  .tool-path,
-  .tool-detail {
-    margin-top: 3px;
-  }
   .about-panel {
     margin-top: 12px;
     padding: 14px 17px;
   }
   .about-panel p {
     margin-top: 6px;
+  }
+  .scorer-panel {
+    margin-top: 12px;
   }
   @media (max-width: 800px) {
     .storage-locations div {

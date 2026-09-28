@@ -256,18 +256,37 @@ test('desktop import retains good files through errors, deduplicates, and expose
   await page.getByRole('button', { name: 'Dismiss import errors' }).click();
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  await expect(page.getByText('ffprobe test version', { exact: true })).toBeVisible();
-  await expect(page.getByText('Install the standalone encoder.')).toBeVisible();
-  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
-    'SVT-AV1 5fish test version',
-  );
-  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-5fish' })).toContainText(
-    'C:\\tools\\5fish\\SvtAv1EncApp.exe',
-  );
-  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText('Not found');
-  await expect(page.getByRole('row').filter({ hasText: 'svt-av1-hdr' })).toContainText(
-    'Install the HDR build in its own tool location.',
-  );
+  const ffprobeRow = page
+    .getByRole('row')
+    .filter({ has: page.getByText('FFprobe', { exact: true }) });
+  await ffprobeRow.getByText('Show details').click();
+  await expect(ffprobeRow.getByText('ffprobe test version', { exact: true })).toBeVisible();
+
+  const standaloneRow = page
+    .getByRole('row')
+    .filter({ has: page.getByText('SVT-AV1', { exact: true }) });
+  await standaloneRow.getByText('Show details').click();
+  await expect(
+    standaloneRow.getByText('Install the standalone encoder.', { exact: true }),
+  ).toBeVisible();
+
+  const fiveFishRow = page
+    .getByRole('row')
+    .filter({ has: page.getByText('SVT-AV1 5fish', { exact: true }) });
+  await fiveFishRow.getByText('Show details').click();
+  await expect(fiveFishRow.getByText('SVT-AV1 5fish test version', { exact: true })).toBeVisible();
+  await expect(
+    fiveFishRow.getByText('C:\\tools\\5fish\\SvtAv1EncApp.exe', { exact: true }),
+  ).toBeVisible();
+
+  const hdrRow = page
+    .getByRole('row')
+    .filter({ has: page.getByText('SVT-AV1-HDR', { exact: true }) });
+  await expect(hdrRow).toContainText('Not found');
+  await hdrRow.getByText('Show details').click();
+  await expect(
+    hdrRow.getByText('Install the HDR build in its own tool location.', { exact: true }),
+  ).toBeVisible();
 });
 
 test('palette survives dark OS theme and minimum-size layout remains usable', async ({ page }) => {

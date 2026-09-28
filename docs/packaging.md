@@ -46,10 +46,19 @@ separate verified merge. The Julek recipe trims checkout paths from MSVC
 The next verified merge adds QTGMC's Python modules and native plugin closure,
 retaining corresponding sources and evaluating all six supported presets.
 See the portable av1an build document for both extension recipes.
+The final merge includes the pinned Vship Vulkan plugin outside VapourSynth's
+automatic plugin directory. Jesses checks a real metric in an isolated process
+before enabling it for an image-metric job; a failed GPU probe keeps the CPU
+scorers selected. The runtime and its corresponding sources remain covered by
+the package manifest.
 Linux also has retained standalone x264/mainline SVT
 source recipes and historical native package evidence, described in the Linux
 build document. Linux packaging, including av1an, is deferred and is not part of
 the active Windows release gate.
+
+Windows x64 also includes `mkvmerge` for Matroska muxing, chunk timing and metadata
+transfer, with its pinned sources, dependency notices and verified delivery.
+No separate MKVToolNix installation is needed for these packaged workflows.
 
 Windows x64 also has pinned standalone `aomenc`, `vpxenc` and `x265` deliveries.
 With a verified media delivery and isolated compiler, build each encoder into

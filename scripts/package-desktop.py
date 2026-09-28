@@ -1,7 +1,7 @@
 """Assemble and verify unsigned desktop artifacts without touching user data.
 
-Uses only the Python standard library. Media tools remain external: none are
-copied from a developer's PATH or private tool installation into a package.
+Uses only the Python standard library. Media tools are accepted only from an
+explicit package delivery, never a developer's PATH or private tool installation.
 """
 
 import argparse

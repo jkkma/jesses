@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 from urllib.request import Request, urlopen
 
@@ -217,6 +218,82 @@ def stage_av1an(delivery: Path, tools_root: Path, target: str) -> dict:
     return runtime.stage(delivery, tools_root, target, package.inventory)
 
 
+def verify_mkvmerge_notices(licenses: list[dict]) -> None:
+    notice_lock = json.loads((ROOT / "scripts/package-mkvmerge-notices-lock.json").read_text(encoding="utf-8"))
+    expected = notice_lock.get("licenses")
+    if (notice_lock.get("schemaVersion") != 1 or
+            notice_lock.get("packageLockSha256") != digest(ROOT / "scripts/package-mkvmerge-windows-lock.json") or
+            not isinstance(expected, list) or len(expected) != 76 or
+            len({record["path"] for record in expected}) != len(expected) or
+            licenses != expected):
+        raise ValueError("The mkvmerge notice inventory differs from its independent lock.")
+
+
+def stage_mkvmerge(delivery: Path, tools_root: Path, target: str) -> dict:
+    if target != "x86_64-pc-windows-msvc":
+        raise ValueError("The pinned mkvmerge delivery requires Windows x64.")
+    spec = importlib.util.spec_from_file_location("mkvmerge_builder", ROOT / "scripts/build-package-mkvmerge.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    lock = json.loads(builder.LOCK.read_text(encoding="utf-8"))
+    receipt_path = delivery / "build-provenance.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if (receipt.get("schemaVersion") != 1 or receipt.get("target") != target or
+            receipt.get("lockSha256") != builder.digest(builder.LOCK) or
+            receipt.get("buildRecipeSha256") != builder.digest(ROOT / "scripts/build-package-mkvmerge.py") or
+            receipt.get("binaryPackages") != lock["packages"]):
+        raise ValueError("The mkvmerge delivery differs from its pinned recipe and binary packages.")
+    expected_runtime = {record["path"]: record for record in lock["files"]}
+    tool = receipt["tool"]
+    if (tool.get("id") != "mkvmerge" or tool.get("path") != "mkvmerge.exe" or
+            tool.get("sha256") != expected_runtime["mkvmerge.exe"]["sha256"] or
+            tool.get("version") != lock["versionLine"] or
+            tool.get("package") != expected_runtime["mkvmerge.exe"]["package"]):
+        raise ValueError("The pinned mkvmerge executable identity changed.")
+    if {item["path"]: item for item in receipt["supportFiles"]} != {
+            name: {"path": name, "sha256": record["sha256"], "package": record["package"]}
+            for name, record in expected_runtime.items() if name != "mkvmerge.exe"}:
+        raise ValueError("The mkvmerge DLL closure differs from its lock.")
+    if receipt["nativeDependencies"] != [{"path": record["path"], "imports": record["imports"]} for record in lock["files"]]:
+        raise ValueError("The mkvmerge native import closure changed.")
+    source_records = [receipt["source"], *receipt["additionalSources"]]
+    if len(source_records) != len(lock["sources"]) or {
+            record["base"]: record for record in source_records} != {
+            item["base"]: {**item, "path": "sources/" + item["filename"]} for item in lock["sources"]}:
+        raise ValueError("The mkvmerge source package closure differs from its lock.")
+    inputs = {item["path"]: item["sha256"] for item in receipt["buildInputs"]}
+    if inputs != {
+            "build/build-package-mkvmerge.py": builder.digest(ROOT / "scripts/build-package-mkvmerge.py"),
+            "build/package-mkvmerge-windows-lock.json": builder.digest(builder.LOCK)}:
+        raise ValueError("The mkvmerge build recipe or lock is missing from its delivery.")
+    verify_mkvmerge_notices(receipt["licenses"])
+    if not receipt["qualificationFiles"]:
+        raise ValueError("The mkvmerge notices or native qualification are missing.")
+    expected = {"build-provenance.json": builder.digest(receipt_path)}
+    for record in [tool, *receipt["supportFiles"], *source_records, *receipt["licenses"],
+                   *receipt["buildInputs"], *receipt["qualificationFiles"]]:
+        builder.member_path(record["path"])
+        if record["path"] in expected:
+            raise ValueError("The mkvmerge receipt repeats a payload record.")
+        expected[record["path"]] = record["sha256"]
+    actual = {record["path"]: record["sha256"] for record in builder.records(delivery)}
+    if actual != expected:
+        raise ValueError("The mkvmerge delivery inventory differs from its source and build receipt.")
+    builder.verify_imports(lock["files"], delivery)
+    with tempfile.TemporaryDirectory(prefix="jesses-mkvmerge-stage-") as scratch:
+        builder.qualify(delivery, Path(scratch) / "qualification", lock["versionLine"])
+    shutil.copytree(delivery, tools_root / "mkvmerge")
+    def prefix(record):
+        return {**record, "path": "mkvmerge/" + record["path"]}
+    return {**prefix(tool), "source": prefix(receipt["source"]),
+            "additionalSources": [prefix(item) for item in receipt["additionalSources"]],
+            "licenses": [prefix(item) for item in receipt["licenses"]],
+            "buildInputs": [prefix(item) for item in receipt["buildInputs"]],
+            "supportFiles": [prefix(item) for item in receipt["supportFiles"]],
+            "qualificationFiles": [prefix(item) for item in receipt["qualificationFiles"]],
+            "buildProvenance": {"path": "mkvmerge/build-provenance.json", "sha256": builder.digest(receipt_path)}}
+
+
 def stage_standalone(delivery: Path, tools_root: Path, target: str, identifier: str) -> dict:
     spec = importlib.util.spec_from_file_location("desktop_package", ROOT / "scripts/package-desktop.py")
     package = importlib.util.module_from_spec(spec)
@@ -297,7 +374,7 @@ def download(url: str, expected: str, cache: Path) -> Path:
     return cached
 
 
-def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None) -> Path:
+def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None, mkvmerge_build: Path | None = None) -> Path:
     host = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "x86_64-unknown-linux-gnu" if sys.platform == "linux" else "unsupported"
     if target != host or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise ValueError("Stage and verify tools on the matching Windows x64 or Linux x64 host.")
@@ -372,12 +449,14 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
     for identifier, delivery in (("aom", aom_build), ("vpx", vpx_build), ("x265", x265_build)):
         if delivery is not None:
             staged.append(stage_extra_encoder(delivery.absolute(), tools_root, target, identifier))
+    if mkvmerge_build is not None:
+        staged.append(stage_mkvmerge(mkvmerge_build.absolute(), tools_root, target))
     available = {tool["id"] for tool in staged}
     if "av1an" in available:
         available.update(("VapourSynth", "L-SMASH Works"))
     manifest = {"schemaVersion": 1, "target": target, "tools": staged,
                 "binaryManifestSha256": digest(forks_path), "sourceManifestSha256": digest(sources_path),
-                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "aomenc", "vpxenc", "x265", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
+                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
     (tools_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     config = destination / "tauri-tools.conf.json"
     config.write_text(json.dumps({"bundle": {"resources": {str(tools_root): "resources/tools/"}}}, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -396,8 +475,9 @@ def main() -> None:
     parser.add_argument("--aom-build", type=Path, help="Verified standalone AOM delivery")
     parser.add_argument("--vpx-build", type=Path, help="Verified standalone VPX delivery")
     parser.add_argument("--x265-build", type=Path, help="Verified standalone x265 delivery")
+    parser.add_argument("--mkvmerge-build", type=Path, help="Verified source-complete Windows mkvmerge CLI and DLL delivery")
     args = parser.parse_args()
-    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build, args.aom_build, args.vpx_build, args.x265_build)}")
+    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build, args.aom_build, args.vpx_build, args.x265_build, args.mkvmerge_build)}")
 
 
 if __name__ == "__main__":

@@ -142,25 +142,34 @@ after adding the plugins. Every probe must preserve the complete Python/runtime
 inventory. These component gates supplement the application's native export
 checks; they do not qualify optional external readers or GPU plugins.
 
-On Windows, `scripts/install-vship.ps1` can stage the pinned Vship 5.1.1 x64
-Vulkan plugin, its complete source archive and license in the application's
-per-user tools directory. It first invokes the plugin directly through the
-selected private VSPipe runtime and requires finite SSIMULACRA2 and Butteraugli
-results. `-Activate` copies that verified binary into only that portable
-runtime's private plugin folder and confirms av1an discovers
-`com.lumen.vship`; it does not register VapourSynth or modify a system Python
-installation. A missing Vulkan loader, ABI mismatch, unsupported GPU, changed
-hash or failed metric leaves the CPU vszip/Julek scorer path intact and reports
-the capability failure explicitly. Run it from a source checkout for an
-external portable runtime:
+Windows packages include the pinned Vship 5.1.1 x64 Vulkan plugin, its complete
+source archive and MIT license. `build-package-vship.py` verifies the locked
+downloads; `package-av1an-vship.py` merges the delivery after CPU scorers and
+QTGMC. The DLL lives in `vapoursynth/optional-plugins`, outside automatic plugin
+loading, and is covered by the complete runtime hash inventory.
+
+For an SSIMULACRA2 or Butteraugli job, Jesses first loads Vship in an isolated
+VSPipe process and requires a finite result from actual frames. A successful
+probe enables the plugin only in that job's child environment. A missing Vulkan
+loader, ABI mismatch, unsupported GPU, failed metric or probe timeout keeps the
+CPU vszip/Julek scorer selected. Package builds and CPU-only machines do not
+require Vulkan. No manual setup or system Python changes are needed.
+
+Job logs identify the selected scorer. GPU and CPU implementations can produce
+different values, so saved av1an searches keep their original scorer when resumed.
+Existing CPU-scored jobs remain on CPU after an upgrade. A GPU-scored search
+requires the same plugin bytes and a working GPU to resume. If GPU scoring fails
+on an actual CRF ladder sample, Jesses discards the partial scores and rescores
+every rung on CPU so the recommendation never mixes scoring implementations.
+
+For developers using a separate external portable runtime, the optional
+`scripts/install-vship.ps1` installer remains available from a source checkout:
 
 ```powershell
 pwsh -File scripts/install-vship.ps1 -PortableRuntime <external-portable-vapoursynth-dir> -Activate
 ```
 
-The installer refuses reparse targets, destination escapes, existing different
-plugins and manifest-verified application bundles. Adding an unlisted DLL to a
-bundle would invalidate its source-complete runtime manifest, so bundled builds
-retain their packaged CPU scorers unless Vship is added by the package recipe
-and manifest itself. Consult a package's manifest and capability result before
-selecting an optional reader or metric.
+That external-runtime installer refuses reparse targets, destination escapes,
+existing different plugins and manifest-verified application bundles. Packaged
+Vship is supplied by the package recipe and requires no post-install mutation.
+Consult a package's manifest before selecting an optional external reader.

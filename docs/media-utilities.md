@@ -31,9 +31,10 @@ Use **Check utility tools** in the Utilities screen after installing a tool or l
 
 FFmpeg, FFprobe, and `mkvmerge` can use the absolute executable overrides `JESSES_FFMPEG`, `JESSES_FFPROBE`, and `JESSES_MKVMERGE`. Otherwise utilities use verified packaged tools when present, then native executables found through absolute `PATH` entries. `grav1synth` uses absolute `PATH` entries.
 
-The Windows package recipe includes the CPU quality scorers and QTGMC dependencies
-in its verified AV1AN runtime. BestSource remains an optional external reader for
-padded-cadence repair. `mkvmerge`, OCR tools and `grav1synth` remain external tools.
+The Windows package includes `mkvmerge`, the CPU quality scorers, Vship GPU scoring
+and QTGMC dependencies. GPU scoring is checked for each job and uses the CPU when
+the GPU probe fails. BestSource remains an optional external reader for
+padded-cadence repair. OCR tools and `grav1synth` remain external tools.
 
 On Windows, Subtitle Edit `seconv` and Tesseract are discovered first in these stable per-user locations:
 

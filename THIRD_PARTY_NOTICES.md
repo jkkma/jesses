@@ -58,11 +58,21 @@ are compiled locally with only Windows system DLL imports; the scorer delivery
 and merged av1an receipt retain their source, build and payload hashes. See
 `scripts/package-av1an-scorers-lock.json` for exact component identities.
 
-The optional per-user Windows GPU scorer is Vship 5.1.1's prebuilt x64 Vulkan
+The packaged Windows GPU scorer is Vship 5.1.1's prebuilt x64 Vulkan
 plugin under the MIT license. Its binary and complete tagged source archive are
-hash-pinned by `scripts/vship-windows-lock.json`; the installer retains the
-archive and upstream license beside the managed binary before activating it in
-one selected portable VapourSynth runtime.
+hash-pinned by `scripts/vship-windows-lock.json`. The package retains the archive
+and upstream license, and loads the plugin only after a successful per-job GPU
+probe. CPU scorers remain available when Vulkan scoring is unavailable.
+
+The Windows package includes MKVToolNix mkvmerge 97.0 under GPL version 2 or
+later. Its pinned MSYS2 build ships with its complete runtime DLL closure,
+corresponding source packages, MSYS2 build recipes, and original notices under
+`resources/tools/mkvmerge`. These include Qt, Boost, libEBML, libMatroska,
+compression, text and audio libraries, and the GCC/MinGW runtime sources.
+Each component retains its own license and any applicable runtime exception.
+Exact package versions, payload hashes, source hashes and dependency checks
+are recorded in `scripts/package-mkvmerge-windows-lock.json` and the bundled
+build provenance.
 
 The Linux package recipe compiles standalone x264 and mainline SVT-AV1 from the
 same pinned sources and retains their notices. Ordinary glibc/compiler shared

@@ -240,6 +240,21 @@ impl JobManager {
         let configured = settings.av1an_options.unwrap_or_default();
         options::validate_plugin(&version_text, configured, source_filter.is_some())
             .map_err(|message| files::error("AV1AN_DEPENDENCY_MISSING", message, executable))?;
+        let previous_scorer = recovery.scorer_identity().await?;
+        let scorer_selection = if let Some(target) = configured.target_quality {
+            metrics::select_bundled_vship(
+                executable,
+                &launch.executable,
+                &mut launch.environment,
+                &work,
+                target,
+                previous_scorer.as_ref(),
+                cancel,
+            )
+            .await?
+        } else {
+            None
+        };
         options::capabilities(
             &launch.executable,
             ffmpeg,
@@ -255,7 +270,17 @@ impl JobManager {
             .find(|v| !v.is_empty())
             .unwrap_or("unknown av1an version")
             .to_owned();
-        recovery.version(version_text).await?;
+        // A resumed target search must keep the same scorer implementation.
+        // The GPU plugin's verified bytes are part of the recovery identity;
+        // CPU jobs retain the prior version identity and remain resumable.
+        let recovery_version = scorer_selection
+            .as_ref()
+            .and_then(|selection| selection.gpu_sha256.as_deref())
+            .map_or_else(
+                || version_text.clone(),
+                |sha256| recovery::version_with_vship(&version_text, sha256),
+            );
+        recovery.version(recovery_version).await?;
         recovery.verify_segments(ffmpeg, input, cancel).await?;
         let prepared_scenes = if recovery.resume_chunks {
             None
@@ -286,6 +311,9 @@ impl JobManager {
             append_log(snapshot, format!("av1an selected encoder: {}", encoder.display()));
             append_log(snapshot, format!("av1an: {} parallel workers; {} source chunks, {:?} splitting, maximum {} frames (0 means unlimited). Workspace: {}", settings.workers, options::chunk_method(configured), configured.split_method, configured.maximum_chunk_frames, work.display()));
             if let Some(target) = configured.target_quality {
+                if let Some(selection) = &scorer_selection {
+                    append_log(snapshot, format!("Quality scorer: {}.", selection.detail));
+                }
                 append_log(snapshot, format!("{} target {:.1}–{:.1}, mean score at {}×{}, CRF {}–{}, at most {} probes, sampling every {} frame(s). A search may finish outside the requested score range when its bounds/probes are exhausted.", metrics::label(target.metric), f64::from(target.minimum_score_tenths)/10.0, f64::from(target.maximum_score_tenths)/10.0, target.probe_width, target.probe_height, target.minimum_crf, target.maximum_crf, target.probes, target.probing_rate));
                 if source_filter.is_some() { append_log(snapshot, "Quality target: probe encodes and reference scoring use the same validated trim, temporal, tone-map, framing, and aspect-ratio filter chain as final chunks.".into()); }
                 else { append_log(snapshot, "Quality target: probe encodes and reference scoring read the same verified lossless processed source as final chunks.".into()); }

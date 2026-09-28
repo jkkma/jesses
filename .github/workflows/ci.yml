@@ -57,6 +57,11 @@ jobs:
       - name: Verify Windows package isolation checks
         if: runner.os == 'Windows'
         run: python scripts/test-qualify-windows-clean.py
+      - name: Verify packaged MKVToolNix and optional GPU scorers
+        if: runner.os == 'Windows'
+        run: |
+          python scripts/test-package-mkvmerge.py
+          python scripts/test-package-vship.py
       - name: Verify the mainline SVT source installer
         if: runner.os == 'Linux'
         run: python3 scripts/test-ci-install-svt.py

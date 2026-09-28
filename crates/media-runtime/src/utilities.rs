@@ -4066,6 +4066,80 @@ fn recommended_ladder_crf(
         .max()
 }
 
+// Keep every candidate until scoring is complete. If a GPU invocation fails on
+// a real frame, restart the entire ladder on CPU so no rung mixes backends and
+// recommendations compare scores produced by the same implementation.
+async fn score_ladder_rungs(
+    metric: LadderMetric,
+    scorer: &ladder_scorers::Scorer,
+    inputs: &[Vec<(PathBuf, PathBuf, u64)>],
+    rungs: &mut [CrfLadderRung],
+    work: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    let (scores, retried_on_cpu) = score_ladder_inputs_with(
+        metric,
+        scorer.has_gpu(),
+        inputs,
+        cancel,
+        |reference, candidate, frames, force_cpu| async move {
+            scorer
+                .score(&reference, &candidate, frames, work, cancel, force_cpu)
+                .await
+        },
+    )
+    .await?;
+    for (rung, score) in rungs.iter_mut().zip(scores) {
+        rung.score = score;
+    }
+    Ok(retried_on_cpu)
+}
+
+async fn score_ladder_inputs_with<F, Fut>(
+    metric: LadderMetric,
+    has_gpu: bool,
+    inputs: &[Vec<(PathBuf, PathBuf, u64)>],
+    cancel: &watch::Receiver<bool>,
+    mut score_input: F,
+) -> Result<(Vec<Option<f64>>, bool), AppError>
+where
+    F: FnMut(PathBuf, PathBuf, u64, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<f64>, AppError>>,
+{
+    let mut force_cpu = false;
+    loop {
+        let attempt = async {
+            let mut all_scores = Vec::with_capacity(inputs.len());
+            for rung in inputs {
+                let mut scores = Vec::with_capacity(rung.len());
+                for (reference, candidate, frames) in rung {
+                    check_cancel(cancel)?;
+                    let score =
+                        score_input(reference.clone(), candidate.clone(), *frames, force_cpu)
+                            .await?;
+                    scores.push((score, *frames));
+                }
+                all_scores.push(aggregate_score(metric, &scores));
+            }
+            Ok::<_, AppError>(all_scores)
+        }
+        .await;
+        match attempt {
+            Ok(all_scores) => {
+                return Ok((all_scores, force_cpu && has_gpu));
+            }
+            Err(cause) => {
+                check_cancel(cancel)?;
+                if !force_cpu && has_gpu {
+                    force_cpu = true;
+                    continue;
+                }
+                return Err(cause);
+            }
+        }
+    }
+}
+
 async fn run_crf_ladder(
     request: CrfLadderRequest,
     cancel: &watch::Receiver<bool>,
@@ -4245,11 +4319,13 @@ async fn run_crf_ladder(
         });
     }
     let mut rungs = Vec::with_capacity(crfs.len());
+    let mut scoring_inputs = Vec::with_capacity(crfs.len());
     for crf in crfs {
         let mut bytes = 0_u64;
         let mut seconds = 0.0;
         let mut encode_seconds = 0.0;
         let mut scores = Vec::new();
+        let mut rung_inputs = Vec::with_capacity(prepared.len());
         for (index, sample) in prepared.iter().enumerate() {
             check_cancel(cancel)?;
             let candidate = scratch
@@ -4331,20 +4407,10 @@ async fn run_crf_ladder(
                 .await?;
                 scores.push((quality.score, sample.frames));
             } else if request.metric != LadderMetric::None {
-                let score = scorer
-                    .as_ref()
-                    .expect("prepared scorer for selected metric")
-                    .score(
-                        &sample.reference,
-                        &candidate,
-                        sample.frames,
-                        &scratch.path,
-                        cancel,
-                    )
-                    .await?;
-                scores.push((score, sample.frames));
+                rung_inputs.push((sample.reference.clone(), candidate, sample.frames));
             }
         }
+        scoring_inputs.push(rung_inputs);
         let score = aggregate_score(request.metric, &scores);
         let bitrate_kbps = if seconds > 0.0 {
             bytes as f64 * 8.0 / seconds / 1000.0
@@ -4372,6 +4438,30 @@ async fn run_crf_ladder(
             encode_seconds,
         });
     }
+    let mut score_diagnostic = None;
+    if let Some(scorer) = scorer.as_ref() {
+        let retried_on_cpu = score_ladder_rungs(
+            request.metric,
+            scorer,
+            &scoring_inputs,
+            &mut rungs,
+            &scratch.path,
+            cancel,
+        )
+        .await?;
+        if matches!(
+            request.metric,
+            LadderMetric::Ssimulacra2 | LadderMetric::ButteraugliInf
+        ) {
+            score_diagnostic = Some(if retried_on_cpu {
+                "Vship Vulkan GPU scoring failed on an encoded sample. Every rung was rescored from its first frame with the CPU scorer; no GPU and CPU scores were mixed."
+            } else if scorer.has_gpu() {
+                "Every ladder rung was scored with Vship Vulkan GPU."
+            } else {
+                "Every ladder rung was scored with the CPU VapourSynth scorer."
+            });
+        }
+    }
     source.verify()?;
     if fingerprint(&source)? != source_fingerprint {
         return Err(error(
@@ -4383,6 +4473,16 @@ async fn run_crf_ladder(
     check_cancel(cancel)?;
     let recommended_crf = recommended_ladder_crf(request.metric, threshold, &rungs);
     let sampled_seconds = prepared.iter().map(|sample| sample.seconds).sum::<f64>();
+    let mut diagnostics = vec![
+        "Only the selected FFmpeg wrapper preset, CRF, and pixel format are represented. Audio, subtitles, attachments, chapters, production encode filters, standalone-encoder-only settings, and container overhead do not transfer into this ladder.".into(),
+        match threshold {
+            Some(value) => format!("The recommendation is the highest tested CRF meeting the selected metric threshold ({value}); Butteraugli distance qualifies at or below it, while quality scores qualify at or above it."),
+            None => "No score threshold was selected, so no CRF recommendation was made.".into(),
+        },
+    ];
+    if let Some(diagnostic) = score_diagnostic {
+        diagnostics.push(diagnostic.into());
+    }
     Ok(UtilityResult::CrfLadder(CrfLadderResult {
         encoder: request.encoder,
         preset: request.preset,
@@ -4396,13 +4496,7 @@ async fn run_crf_ladder(
         recommended_crf,
         source_fingerprint,
         message: "Each rung encoded the same lossless, frame-counted samples. Size and bitrate are measured video-only; whole-file size is a projection and can move with unsampled scene complexity.".into(),
-        diagnostics: vec![
-            "Only the selected FFmpeg wrapper preset, CRF, and pixel format are represented. Audio, subtitles, attachments, chapters, production encode filters, standalone-encoder-only settings, and container overhead do not transfer into this ladder.".into(),
-            match threshold {
-                Some(value) => format!("The recommendation is the highest tested CRF meeting the selected metric threshold ({value}); Butteraugli distance qualifies at or below it, while quality scores qualify at or above it."),
-                None => "No score threshold was selected, so no CRF recommendation was made.".into(),
-            },
-        ],
+        diagnostics,
     }))
 }
 
@@ -4432,6 +4526,93 @@ pub async fn run_utility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_gpu_sample_restarts_all_ladder_scores_on_cpu() {
+        let (_sender, cancel) = watch::channel(false);
+        let inputs = vec![
+            vec![
+                (PathBuf::from("ref-a"), PathBuf::from("candidate-a"), 2),
+                (PathBuf::from("ref-b"), PathBuf::from("candidate-b"), 2),
+            ],
+            vec![(PathBuf::from("ref-c"), PathBuf::from("candidate-c"), 2)],
+        ];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (scores, retried) = score_ladder_inputs_with(
+            LadderMetric::Ssimulacra2,
+            true,
+            &inputs,
+            &cancel,
+            move |_, candidate, _, force_cpu| {
+                let recorded = recorded.clone();
+                async move {
+                    let name = candidate.to_string_lossy().into_owned();
+                    recorded.lock().unwrap().push((name.clone(), force_cpu));
+                    if !force_cpu && name == "candidate-b" {
+                        return Err(error(
+                            "UTILITY_SCORER_FAILED",
+                            "GPU failed",
+                            Some(&candidate),
+                        ));
+                    }
+                    Ok(Some(if force_cpu {
+                        match name.as_str() {
+                            "candidate-a" => 10.0,
+                            "candidate-b" => 20.0,
+                            _ => 30.0,
+                        }
+                    } else {
+                        99.0
+                    }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(retried);
+        assert_eq!(scores, vec![Some(15.0), Some(30.0)]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("candidate-a".into(), false),
+                ("candidate-b".into(), false),
+                ("candidate-a".into(), true),
+                ("candidate-b".into(), true),
+                ("candidate-c".into(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_gpu_scoring_does_not_start_cpu_retry() {
+        let (sender, cancel) = watch::channel(false);
+        let inputs = vec![vec![(PathBuf::from("ref"), PathBuf::from("candidate"), 1)]];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let result = score_ladder_inputs_with(
+            LadderMetric::Ssimulacra2,
+            true,
+            &inputs,
+            &cancel,
+            move |_, candidate, _, _| {
+                let recorded = recorded.clone();
+                let sender = sender.clone();
+                async move {
+                    recorded.fetch_add(1, Ordering::Relaxed);
+                    sender.send(true).unwrap();
+                    Err(error(
+                        "UTILITY_SCORER_FAILED",
+                        "interrupted",
+                        Some(&candidate),
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn film_stock_modifiers_expand_only_advertised_applicable_bases() {

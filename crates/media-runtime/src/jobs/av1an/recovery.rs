@@ -580,6 +580,40 @@ pub(in crate::jobs) struct PreparedSource {
     pub decoded_identity: String,
 }
 
+const VSHIP_ACTIVE_PREFIX: &str = "JESSES_VSHIP_VULKAN_ACTIVE_SHA256:";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ScorerIdentity {
+    Cpu,
+    Vship { sha256: String },
+}
+
+impl ScorerIdentity {
+    fn from_version(version: &str) -> Result<Self, String> {
+        let mut markers = version
+            .lines()
+            .filter_map(|line| line.strip_prefix(VSHIP_ACTIVE_PREFIX));
+        let Some(sha256) = markers.next() else {
+            return Ok(Self::Cpu);
+        };
+        if markers.next().is_some()
+            || sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("The saved Vship scorer identity is invalid.".into());
+        }
+        Ok(Self::Vship {
+            sha256: sha256.to_owned(),
+        })
+    }
+}
+
+pub(super) fn version_with_vship(base: &str, sha256: &str) -> String {
+    format!("{base}\n{VSHIP_ACTIVE_PREFIX}{sha256}")
+}
+
 fn source_matches_attempt(
     manifest: &Manifest,
     root: &Path,
@@ -1223,6 +1257,17 @@ impl Recovery {
         })
         .await
     }
+    pub(super) async fn scorer_identity(&self) -> Result<Option<ScorerIdentity>, AppError> {
+        self.with(|w| {
+            w.manifest
+                .av1an_version
+                .as_deref()
+                .map(ScorerIdentity::from_version)
+                .transpose()
+                .map_err(|message| error(&w.root, message))
+        })
+        .await
+    }
     pub(in crate::jobs) async fn checkpoint(
         &self,
         required: bool,
@@ -1545,6 +1590,58 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scorer_identity_reads_legacy_cpu_and_hash_bound_gpu_versions() {
+        let base = "av1an 0.5.2\ncom.lumen.vship : Not found";
+        assert_eq!(
+            ScorerIdentity::from_version(base).unwrap(),
+            ScorerIdentity::Cpu
+        );
+        let sha256 = "a".repeat(64);
+        let gpu = version_with_vship(base, &sha256);
+        assert_eq!(
+            ScorerIdentity::from_version(&gpu).unwrap(),
+            ScorerIdentity::Vship {
+                sha256: sha256.clone()
+            }
+        );
+        assert!(ScorerIdentity::from_version(&version_with_vship(base, "bad")).is_err());
+        assert!(
+            ScorerIdentity::from_version(&format!("{gpu}\n{VSHIP_ACTIVE_PREFIX}{sha256}")).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_cpu_scorer_receipt_cannot_be_rebound_to_vship() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let base = "av1an 0.5.2\ncom.lumen.vship : Not found";
+        workspace.manifest.av1an_version = Some(base.into());
+        workspace.save().unwrap();
+        let recovery = Recovery {
+            root: workspace.root.clone(),
+            finalizing: false,
+            resume_chunks: true,
+            inner: Arc::new(StdMutex::new(workspace)),
+        };
+        assert_eq!(
+            recovery.scorer_identity().await.unwrap(),
+            Some(ScorerIdentity::Cpu)
+        );
+        assert!(
+            recovery
+                .version(version_with_vship(base, &"a".repeat(64)))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            recovery.scorer_identity().await.unwrap(),
+            Some(ScorerIdentity::Cpu)
+        );
+        drop(recovery);
+        drop(intermediate);
+    }
 
     // Concurrent Windows fixtures can observe the same clock timestamp.
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);

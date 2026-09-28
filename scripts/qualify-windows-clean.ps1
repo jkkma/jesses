@@ -701,7 +701,8 @@ try {
         (Join-Path $packageRoot "resources\tools\svt-av1\SvtAv1EncApp.exe"),
         (Join-Path $packageRoot "resources\tools\svt-av1-5fish\SvtAv1EncApp.exe"),
         (Join-Path $packageRoot "resources\tools\svt-av1-hdr\SvtAv1EncApp.exe"),
-        (Join-Path $packageRoot "resources\tools\av1an\av1an.exe")
+        (Join-Path $packageRoot "resources\tools\av1an\av1an.exe"),
+        (Join-Path $packageRoot "resources\tools\mkvmerge\mkvmerge.exe")
     )) { Get-PeMachine $binary | Out-Null }
 
     $identity = Set-ProgramReadOnly $packageRoot $package.records (Join-Path $logs "program-acl.log")
@@ -766,7 +767,7 @@ try {
     $parsedDiscovery = $discovery.stdout | ConvertFrom-Json
     $discovered = @()
     foreach ($entry in $parsedDiscovery) { $discovered += $entry }
-    $requiredTools = @("ffmpeg", "ffprobe", "x264", "svt-av1", "av1an", "svt-av1-5fish", "svt-av1-hdr")
+    $requiredTools = @("ffmpeg", "ffprobe", "x264", "svt-av1", "av1an", "svt-av1-5fish", "svt-av1-hdr", "mkvmerge")
     $discoverySummary = @()
     $packagePrefix = [System.IO.Path]::GetFullPath($packageRoot).TrimEnd("\") + "\"
     foreach ($toolId in $requiredTools) {
@@ -799,11 +800,14 @@ try {
     $ffprobe = Join-Path $packageRoot "resources\tools\ffmpeg\ffprobe.exe"
     $x264 = Join-Path $packageRoot "resources\tools\x264\x264.exe"
     $svt = Join-Path $packageRoot "resources\tools\svt-av1\SvtAv1EncApp.exe"
+    $mkvmerge = Join-Path $packageRoot "resources\tools\mkvmerge\mkvmerge.exe"
     $source = Join-Path $work "generated.y4m"
     $h264 = Join-Path $work "x264.h264"
     $av1 = Join-Path $work "svt-av1.ivf"
     $h264Frames = Join-Path $work "x264.framemd5"
     $av1Frames = Join-Path $work "svt-av1.framemd5"
+    $matroska = Join-Path $work "x264.mkv"
+    $matroskaFrames = Join-Path $work "x264-matroska.framemd5"
 
     $commands += Invoke-CleanProcess $ffmpeg @("-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=24", "-frames:v", "8", "-pix_fmt", "yuv420p", $source) $work $cleanEnvironment (Join-Path $logs "fixture-generate.log") 120
     $commands += Invoke-CleanProcess $x264 @("--demuxer", "y4m", "--frames", "8", "--preset", "ultrafast", "--output", $h264, $source) $work $cleanEnvironment (Join-Path $logs "x264-encode.log") 120
@@ -814,6 +818,10 @@ try {
     $commands += $av1Probe
     $commands += Invoke-CleanProcess $ffmpeg @("-hide_banner", "-loglevel", "error", "-i", $h264, "-f", "framemd5", $h264Frames) $work $cleanEnvironment (Join-Path $logs "x264-decode.log") 120
     $commands += Invoke-CleanProcess $ffmpeg @("-hide_banner", "-loglevel", "error", "-i", $av1, "-f", "framemd5", $av1Frames) $work $cleanEnvironment (Join-Path $logs "svt-av1-decode.log") 120
+    $commands += Invoke-CleanProcess $mkvmerge @("--ui-language", "en", "--output", $matroska, "--default-duration", "0:24fps", $h264) $work $cleanEnvironment (Join-Path $logs "mkvmerge-mux.log") 120
+    $matroskaProbe = Invoke-CleanProcess $ffprobe @("-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,nb_read_frames,avg_frame_rate", "-of", "json", $matroska) $work $cleanEnvironment (Join-Path $logs "mkvmerge-probe.log") 120
+    $commands += $matroskaProbe
+    $commands += Invoke-CleanProcess $ffmpeg @("-hide_banner", "-loglevel", "error", "-i", $matroska, "-f", "framemd5", $matroskaFrames) $work $cleanEnvironment (Join-Path $logs "mkvmerge-decode.log") 120
 
     $h264Info = @((($h264Probe.stdout | ConvertFrom-Json).streams))[0]
     $av1Info = @((($av1Probe.stdout | ConvertFrom-Json).streams))[0]
@@ -826,10 +834,18 @@ try {
     $h264FrameCount = @([System.IO.File]::ReadAllLines($h264Frames) | Where-Object { -not $_.StartsWith("#") -and -not [string]::IsNullOrWhiteSpace($_) }).Count
     $av1FrameCount = @([System.IO.File]::ReadAllLines($av1Frames) | Where-Object { -not $_.StartsWith("#") -and -not [string]::IsNullOrWhiteSpace($_) }).Count
     if ($h264FrameCount -ne 8 -or $av1FrameCount -ne 8) { throw "Decoded frame checksums did not contain eight frames per output." }
+    $matroskaInfo = @((($matroskaProbe.stdout | ConvertFrom-Json).streams))[0]
+    if ($matroskaInfo.codec_name -ne "h264" -or [int]$matroskaInfo.width -ne 64 -or [int]$matroskaInfo.height -ne 64 -or [int]$matroskaInfo.nb_read_frames -ne 8 -or $matroskaInfo.avg_frame_rate -ne "24/1") {
+        throw "The packaged mkvmerge did not preserve eight 64x64 H.264 frames at 24 fps."
+    }
+    $originalPixels = @([System.IO.File]::ReadAllLines($h264Frames) | Where-Object { -not $_.StartsWith("#") -and -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Split(',')[-1].Trim() })
+    $muxedPixels = @([System.IO.File]::ReadAllLines($matroskaFrames) | Where-Object { -not $_.StartsWith("#") -and -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Split(',')[-1].Trim() })
+    if ($muxedPixels.Count -ne 8 -or ($originalPixels -join ',') -ne ($muxedPixels -join ',')) { throw "The packaged mkvmerge changed the decoded video frames." }
     $receipt.media = [ordered]@{
         source = [ordered]@{ generated = $true; width = 64; height = 64; frames = 8; sha256 = Get-Sha256 $source }
         x264 = [ordered]@{ codec = "h264"; framesDecoded = $h264FrameCount; outputSha256 = Get-Sha256 $h264; decodedFramesSha256 = Get-Sha256 $h264Frames }
         svtAv1 = [ordered]@{ codec = "av1"; framesDecoded = $av1FrameCount; outputSha256 = Get-Sha256 $av1; decodedFramesSha256 = Get-Sha256 $av1Frames }
+        mkvmerge = [ordered]@{ codec = "h264"; framesDecoded = $muxedPixels.Count; frameRate = "24/1"; decodedPixelsPreserved = $true; outputSha256 = Get-Sha256 $matroska }
     }
     $receipt.commands = @($commands | ForEach-Object {
         [ordered]@{ executable = $_.executable; arguments = $_.arguments; exitCode = $_.exitCode; elapsedMilliseconds = $_.elapsedMilliseconds; log = $_.log }
@@ -848,6 +864,7 @@ try {
         "bundled-discovery-with-cleared-environment",
         "generated-x264-encode-decode",
         "generated-svt-av1-encode-decode",
+        "bundled-mkvmerge-mux-timing-and-pixels",
         "package-payloads-unchanged",
         "source-archive-unchanged"
     )

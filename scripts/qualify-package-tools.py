@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)
     parser.add_argument("--require-media", action="store_true")
-    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an", "aomenc", "vpxenc", "x265"])
+    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge"])
     args = parser.parse_args()
     probe = args.probe.resolve(strict=True)
     resources = comparable_path(args.resources)

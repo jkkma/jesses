@@ -4,7 +4,7 @@ Use `scripts/qualify-windows-clean.ps1` for the Windows x64 portable ZIP. The
 runner verifies the archive manifest and payload hashes, extracts into a
 Scoop-shaped disposable tree, and makes the program tree read/execute-only. Its
 persisted `jesses-data` target remains writable. It then uses a native discovery
-probe and packaged FFmpeg, x264, and SVT-AV1 binaries with a cleared environment,
+probe and packaged FFmpeg, x264, SVT-AV1 and mkvmerge binaries with a cleared environment,
 a system-only `PATH`, and a new profile. The media checks generate their own
 eight-frame source; no source media is read or changed.
 
@@ -88,8 +88,9 @@ python scripts\test-qualify-windows-clean.py
 ```
 
 Passing checks cover exact archive integrity, packaged discovery of FFmpeg,
-FFprobe, x264, mainline SVT-AV1, av1an, and both SVT forks, WebView2 presence,
-generated x264/SVT-AV1 encode and decode, writable persisted data, read-only
+FFprobe, x264, mainline SVT-AV1, av1an, both SVT forks and mkvmerge, WebView2 presence,
+generated x264/SVT-AV1 encode and decode, Matroska muxing with preserved frame
+timing and decoded pixels, writable persisted data, read-only
 program resources, and unchanged package/archive bytes. The runner does not cover
 Scoop PATH registration, the Scoop update/uninstall lifecycle, native GUI use,
 real-media preservation, cancellation or recovery, GPU encoders, AOM, or x265.

@@ -67,6 +67,8 @@ jobs:
       - run: python scripts/test-package-av1an.py
       - run: python scripts/test-package-av1an-scorers.py
       - run: python scripts/test-package-av1an-qtgmc.py
+      - run: python scripts/test-package-vship.py
+      - run: python scripts/test-package-mkvmerge.py
       - name: Verify Linux FFmpeg package recipes
         if: runner.os == 'Linux'
         run: python scripts/test-package-ffmpeg-linux.py
@@ -123,12 +125,23 @@ jobs:
         run: |
           python scripts/build-package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-qtgmc" --cache "$RUNNER_TEMP/jesses-qtgmc-cache"
           python scripts/package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-av1an-qtgmc" --av1an-build "$RUNNER_TEMP/jesses-av1an-scorers/delivery" --qtgmc-build "$RUNNER_TEMP/jesses-qtgmc/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Package pinned Windows mkvmerge
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/build-package-mkvmerge.py --destination "$RUNNER_TEMP/jesses-mkvmerge"
+      - name: Include optional Vulkan scoring with per-job CPU fallback
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/jesses-vship-cache"
+          python scripts/build-package-vship.py --destination "$RUNNER_TEMP/jesses-vship" --cache "$RUNNER_TEMP/jesses-vship-cache"
+          python scripts/package-av1an-vship.py --av1an-build "$RUNNER_TEMP/jesses-av1an-qtgmc/delivery" --vship-build "$RUNNER_TEMP/jesses-vship/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64" --destination "$RUNNER_TEMP/jesses-av1an-vship"
       - name: Stage verified tools and complete source archives
         shell: bash
         run: |
           standalone_args=()
           if [ "$RUNNER_OS" = Windows ]; then
-            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-x264/delivery" --svt-build "$RUNNER_TEMP/jesses-svt/delivery" --av1an-build "$RUNNER_TEMP/jesses-av1an-qtgmc/delivery" --aom-build "$RUNNER_TEMP/jesses-aom/delivery" --vpx-build "$RUNNER_TEMP/jesses-vpx/delivery" --x265-build "$RUNNER_TEMP/jesses-x265/delivery")
+            standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-x264/delivery" --svt-build "$RUNNER_TEMP/jesses-svt/delivery" --av1an-build "$RUNNER_TEMP/jesses-av1an-vship/delivery" --aom-build "$RUNNER_TEMP/jesses-aom/delivery" --vpx-build "$RUNNER_TEMP/jesses-vpx/delivery" --x265-build "$RUNNER_TEMP/jesses-x265/delivery" --mkvmerge-build "$RUNNER_TEMP/jesses-mkvmerge/delivery")
           else
             standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-standalone-linux/x264/delivery" --svt-build "$RUNNER_TEMP/jesses-standalone-linux/svt-av1/delivery")
           fi
@@ -139,7 +152,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265
+          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265 --require-tool mkvmerge
       - name: Verify Linux bundled discovery with external tools unavailable
         if: runner.os == 'Linux'
         shell: bash
@@ -199,7 +212,7 @@ jobs:
         run: |
           suffix=""
           standalone_args=(--require-tool x264 --require-tool svt-av1)
-          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265); fi
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265 --require-tool mkvmerge); fi
           python scripts/verify-bundle-resources.py --packages "$RUNNER_TEMP/jesses-packages" --probe "$CARGO_TARGET_DIR/debug/examples/package_tools$suffix" --destination "$RUNNER_TEMP/jesses-extracted-bundles" --require-media "${standalone_args[@]}"
       - name: Retain native gate evidence
         if: always()
@@ -218,6 +231,9 @@ jobs:
             ${{ runner.temp }}/jesses-av1an-scorers/**/*.log
             ${{ runner.temp }}/jesses-qtgmc/**/*.log
             ${{ runner.temp }}/jesses-av1an-qtgmc/**/*.log
+            ${{ runner.temp }}/jesses-vship/**/*.log
+            ${{ runner.temp }}/jesses-av1an-vship/**/*.log
+            ${{ runner.temp }}/jesses-mkvmerge/**/qualification/*.json
             ${{ runner.temp }}/jesses-appimage-repair/restoration.json
             ${{ runner.temp }}/jesses-appimage-repair/*.log
             ${{ runner.temp }}/jesses-appimage-repair/original/*.AppImage

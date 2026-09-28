@@ -1,6 +1,7 @@
 //! Exercise the actual scorer API before admitting a target-quality job.
 use super::*;
 use media_core::{Av1anTargetMetric, Av1anTargetQuality};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 
 pub(super) fn cli(metric: Av1anTargetMetric) -> &'static str {
@@ -182,16 +183,30 @@ fn dependency_error(metric: Av1anTargetMetric, diagnostic: &str, executable: &Pa
     )
 }
 
-// The program is fixed application code; no user paths or expressions enter it.
-const SCRIPT_PREFIX: &str = r#"import math
+// The program is fixed application code; only validated probe dimensions and
+// the pinned optional plugin path enter it.
+fn script_prefix(width: u16, height: u16) -> String {
+    format!(
+        "import math
 import vapoursynth as vs
 core = vs.core
-reference = core.std.BlankClip(width=192, height=128, format=vs.YUV444P10, length=2, color=[256, 512, 512])
+reference = core.std.BlankClip(width={width}, height={height}, format=vs.YUV444P10, length=2, color=[256, 512, 512])
 reference = core.std.SetFrameProps(reference, _Matrix=1, _Transfer=1, _Primaries=1, _ColorRange=1)
 distorted = core.std.BlankClip(reference, color=[264, 520, 520])
-"#;
+"
+    )
+}
 
 fn script(metric: Av1anTargetMetric) -> String {
+    script_with_plugin(metric, None, 192, 128)
+}
+
+fn script_with_plugin(
+    metric: Av1anTargetMetric,
+    plugin: Option<&Path>,
+    width: u16,
+    height: u16,
+) -> String {
     let scorer = match metric {
         Av1anTargetMetric::Ssimulacra2 => {
             r#"if hasattr(core, 'vship'):
@@ -221,9 +236,203 @@ else:
         }
         Av1anTargetMetric::Vmaf => unreachable!("VMAF uses FFmpeg"),
     };
+    let load = plugin.map_or_else(String::new, |path| {
+        let literal = serde_json::to_string(&path.to_string_lossy().to_string())
+            .expect("a filesystem path can be serialized as JSON text");
+        format!("core.std.LoadPlugin(path={literal})\nassert hasattr(core, 'vship'), 'Vship failed to register'\n")
+    });
     format!(
-        "{SCRIPT_PREFIX}{scorer}with result.get_frame(0) as frame:\n    values = [float(frame.props[key]) for key in props]\n    assert all(math.isfinite(value) for value in values), values\n    print('JESSES_SCORER_OK', values)\nreference.set_output()\n"
+        "{}{load}{scorer}with result.get_frame(0) as frame:\n    values = [float(frame.props[key]) for key in props]\n    assert all(math.isfinite(value) for value in values), values\n    print('JESSES_SCORER_OK', values)\nreference.set_output()\n",
+        script_prefix(width, height)
     )
+}
+
+/// The package keeps Vship out of the autoload tree. Try it in a disposable
+/// child first; only a finite real score and av1an's own discovery permit the
+/// final av1an process to inherit the optional plugin directory.
+pub(super) struct VshipSelection {
+    pub(super) gpu_sha256: Option<String>,
+    pub(super) detail: &'static str,
+}
+
+fn scorer_binding(
+    previous: Option<&recovery::ScorerIdentity>,
+    candidate_sha256: Option<&str>,
+) -> Result<bool, &'static str> {
+    match previous {
+        Some(recovery::ScorerIdentity::Cpu) => Ok(false),
+        Some(recovery::ScorerIdentity::Vship { sha256 }) => match candidate_sha256 {
+            Some(current) if current == sha256 => Ok(true),
+            Some(_) => Err(
+                "The saved Vship GPU scorer differs from the current bundled DLL. Resume requires the same scorer bytes.",
+            ),
+            None => Err(
+                "The saved Vship GPU scorer is unavailable. Resume cannot switch to CPU scores.",
+            ),
+        },
+        None => Ok(candidate_sha256.is_some()),
+    }
+}
+
+pub(super) async fn select_bundled_vship(
+    av1an: &Path,
+    launched_av1an: &Path,
+    environment: &mut supervisor::ChildEnvironment,
+    work: &Path,
+    target: Av1anTargetQuality,
+    previous: Option<&recovery::ScorerIdentity>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<VshipSelection>, AppError> {
+    let metric = target.metric;
+    if !matches!(
+        metric,
+        Av1anTargetMetric::Ssimulacra2 | Av1anTargetMetric::Butteraugli
+    ) {
+        return Ok(None);
+    }
+    if matches!(previous, Some(recovery::ScorerIdentity::Cpu)) {
+        return Ok(Some(VshipSelection {
+            gpu_sha256: None,
+            detail: "CPU vszip/Julek (resuming CPU scorer history)",
+        }));
+    }
+    let fallback = |detail| {
+        scorer_binding(previous, None)
+            .map_err(|message| files::error("RECOVERY_INVALID", message, work))?;
+        Ok(Some(VshipSelection {
+            gpu_sha256: None,
+            detail,
+        }))
+    };
+    let Some(frameserver) = crate::bundled_tools::av1an_runtime(av1an)
+        .map_err(|detail| files::error("BUNDLED_TOOL_INVALID", detail, av1an))?
+    else {
+        return if previous.is_some() {
+            fallback("CPU vszip/Julek (Vship bundle unavailable)")
+        } else {
+            Ok(None)
+        };
+    };
+    let plugin = frameserver.join("optional-plugins/libvship_VULKAN.dll");
+    if !plugin.is_file() {
+        return if previous.is_some() {
+            fallback("CPU vszip/Julek (Vship bundle unavailable)")
+        } else {
+            Ok(None)
+        };
+    }
+    let bytes = std::fs::read(&plugin)
+        .map_err(|error| files::error("BUNDLED_TOOL_INVALID", error.to_string(), &plugin))?;
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    scorer_binding(previous, Some(&sha256))
+        .map_err(|message| files::error("RECOVERY_INVALID", message, work))?;
+    let executable = frameserver.join(if cfg!(windows) {
+        "vspipe.exe"
+    } else {
+        "vspipe"
+    });
+    let path = work.join(format!(
+        "metric-gpu-check-{}.vpy",
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        open.share_mode(1);
+    }
+    let file = open
+        .open(&path)
+        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &path))?;
+    let mut probe = Script {
+        path,
+        file: Some(file),
+    };
+    probe
+        .file
+        .as_mut()
+        .unwrap()
+        .write_all(
+            script_with_plugin(
+                metric,
+                Some(&plugin),
+                target.probe_width,
+                target.probe_height,
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &probe.path))?;
+    let tested = supervisor::run_capture_with_environment(
+        &CommandSpec {
+            executable,
+            args: vec![
+                "--info".into(),
+                probe.path.as_os_str().to_owned(),
+                "-".into(),
+            ],
+            cwd: Some(work.to_owned()),
+        },
+        cancel.clone(),
+        128 * 1024,
+        Duration::from_secs(45),
+        Some(environment),
+    )
+    .await;
+    check_cancel(cancel)?;
+    if !tested.is_ok_and(|result| {
+        result.status.success()
+            && (String::from_utf8_lossy(&result.stdout).contains("JESSES_SCORER_OK")
+                || String::from_utf8_lossy(&result.stderr).contains("JESSES_SCORER_OK"))
+    }) {
+        return fallback("CPU vszip/Julek (Vship capability probe unavailable)");
+    }
+    let optional = plugin
+        .parent()
+        .expect("Vship has an optional plugin parent");
+    let setting = environment
+        .variables
+        .iter_mut()
+        .find(|(name, _)| *name == "VAPOURSYNTH_EXTRA_PLUGIN_PATH");
+    if let Some((_, value)) = setting {
+        *value = Some(optional.as_os_str().to_owned());
+    } else {
+        environment.variables.push((
+            "VAPOURSYNTH_EXTRA_PLUGIN_PATH",
+            Some(optional.as_os_str().to_owned()),
+        ));
+    }
+    let discovered = supervisor::run_capture_with_environment(
+        &CommandSpec {
+            executable: launched_av1an.to_owned(),
+            args: vec!["--version".into()],
+            cwd: Some(work.to_owned()),
+        },
+        cancel.clone(),
+        128 * 1024,
+        Duration::from_secs(30),
+        Some(environment),
+    )
+    .await;
+    check_cancel(cancel)?;
+    let selected = discovered.is_ok_and(|result| {
+        result.status.success()
+            && found(&String::from_utf8_lossy(&result.stdout), "com.lumen.vship")
+    });
+    if !selected {
+        if let Some((_, value)) = environment
+            .variables
+            .iter_mut()
+            .find(|(name, _)| *name == "VAPOURSYNTH_EXTRA_PLUGIN_PATH")
+        {
+            *value = None;
+        }
+        return fallback("CPU vszip/Julek (av1an could not activate Vship)");
+    }
+    Ok(Some(VshipSelection {
+        gpu_sha256: Some(sha256),
+        detail: "Vship Vulkan GPU (finite frame probe and av1an discovery passed)",
+    }))
 }
 
 struct Script {
@@ -319,6 +528,87 @@ async fn check_vapoursynth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_probe_matches_target_frame_shape_and_stream_count() {
+        let plugin = Path::new("C:\\Vship\\libvship_VULKAN.dll");
+        for metric in [
+            Av1anTargetMetric::Ssimulacra2,
+            Av1anTargetMetric::Butteraugli,
+        ] {
+            let gpu = script_with_plugin(metric, Some(plugin), 1920, 1080);
+            assert!(gpu.contains("BlankClip(width=1920, height=1080"));
+            assert!(gpu.contains("numStream=4"));
+            assert!(gpu.contains("core.std.LoadPlugin(path="));
+            assert!(gpu.contains("assert hasattr(core, 'vship')"));
+            assert!(gpu.contains("JESSES_SCORER_OK"));
+        }
+        let cpu = script(Av1anTargetMetric::Ssimulacra2);
+        assert!(cpu.contains("BlankClip(width=192, height=128"));
+        assert!(!cpu.contains("LoadPlugin"));
+    }
+
+    #[tokio::test]
+    async fn recovery_pins_cpu_and_gpu_scorers_across_attempts() {
+        let cpu = recovery::ScorerIdentity::Cpu;
+        let old_sha = "a".repeat(64);
+        let other_sha = "b".repeat(64);
+        let gpu = recovery::ScorerIdentity::Vship {
+            sha256: old_sha.clone(),
+        };
+        // A newly available GPU must not change a CPU-scored recovery.
+        assert_eq!(scorer_binding(Some(&cpu), Some(&other_sha)), Ok(false));
+        assert_eq!(scorer_binding(Some(&gpu), Some(&old_sha)), Ok(true));
+        assert!(scorer_binding(Some(&gpu), Some(&other_sha)).is_err());
+        assert!(scorer_binding(Some(&gpu), None).is_err());
+
+        let (_owner, cancel) = watch::channel(false);
+        let mut environment = supervisor::ChildEnvironment::default();
+        let executable = std::env::current_exe().unwrap();
+        let target = Av1anTargetQuality {
+            metric: Av1anTargetMetric::Butteraugli,
+            minimum_score_tenths: 0,
+            maximum_score_tenths: 100,
+            minimum_crf: 10,
+            maximum_crf: 20,
+            probes: 1,
+            probing_rate: 1,
+            probe_width: 1920,
+            probe_height: 1080,
+        };
+        let selected = select_bundled_vship(
+            &executable,
+            &executable,
+            &mut environment,
+            Path::new("."),
+            target,
+            Some(&cpu),
+            &cancel,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(selected.gpu_sha256.is_none());
+        assert!(selected.detail.contains("resuming CPU scorer history"));
+        assert!(environment.variables.is_empty());
+        let unavailable = select_bundled_vship(
+            &executable,
+            &executable,
+            &mut environment,
+            Path::new("."),
+            target,
+            Some(&gpu),
+            &cancel,
+        )
+        .await;
+        assert!(
+            unavailable
+                .err()
+                .unwrap()
+                .message
+                .contains("cannot switch to CPU")
+        );
+    }
 
     #[test]
     fn metric_dependencies_and_reader_requirements_match_actual_engine() {

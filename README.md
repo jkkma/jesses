@@ -386,10 +386,10 @@ Butteraugli needs Julek with the corrected engine, or Vship. These two metrics
 require a VapourSynth source reader. Every-frame XPSNR uses the selected FFmpeg;
 sampled XPSNR needs vszip R7 or newer and a VapourSynth reader. Actual scorer
 checks run in the same selected child environment before encoding. Windows
-packaging builds CPU vszip and Julek from pinned sources alongside the portable
-frameserver. A separate managed installer can activate the pinned Vulkan Vship
-plugin only after real SSIMULACRA2 and Butteraugli checks; incompatible GPU,
-Vulkan, or VapourSynth combinations keep the CPU scorer available.
+packaging includes CPU vszip and Julek alongside the portable frameserver and
+the pinned Vulkan Vship plugin. Jesses checks the selected GPU metric in an
+isolated process before enabling Vship for the job; incompatible GPU, Vulkan,
+or VapourSynth combinations automatically use the packaged CPU scorer.
 L-SMASH-only scoring requires the corrected software-probe engine;
 missing dependencies or older incompatible engines produce an explicit error.
 VMAF and every-frame XPSNR also require the corrected FFmpeg metric engine, which
