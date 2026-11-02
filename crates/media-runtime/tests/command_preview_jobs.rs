@@ -64,6 +64,7 @@ async fn processed_av1an_preview_uses_one_prepared_source_and_original_mux() {
                 time: Some(VideoTimeTrim {
                     start_milliseconds: 250,
                     end_milliseconds: 1250,
+                    ..Default::default()
                 }),
             }),
             temporal: Some(TemporalSettings {

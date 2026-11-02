@@ -9,7 +9,7 @@ pub async fn preview_encode_plan(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<EncodeCommandPlan, AppError> {
     let _permit = crate::analysis::permit(&cancel).await?;
-    files::validate_request(&request.source)?;
+    files::validate_encode_request(&request.source, &request.settings)?;
     validate_settings(&request.settings)?;
     let source = Source::open(Path::new(&request.source.input_path))?;
     let output = files::output_path(&request.source, &source)?;
@@ -85,6 +85,7 @@ pub(super) async fn build(
     qtgmc: Option<&super::super::qtgmc::Prepared>,
     subtitles: &super::super::subtitles::Prepared,
     audio_filters: &std::collections::BTreeMap<u32, String>,
+    normalization: &super::super::audio::Normalization,
     rate: Option<&super::super::rate_control::Rate>,
     frames: usize,
     id: &str,
@@ -172,7 +173,9 @@ pub(super) async fn build(
         } else {
             source.path.clone()
         };
-        let source_filter = (!uses_prepared).then(|| plan.decoder_filter()).flatten();
+        let source_filter = (!uses_prepared)
+            .then(|| plan.av1an_decoder_filter())
+            .flatten();
         let arguments = super::super::av1an::arguments(
             &av1an_input,
             &video.path,
@@ -219,7 +222,7 @@ pub(super) async fn build(
                 aom_vpx::configure_producer_output(&mut producer.args, plan, settings);
             let mut args = consumer_arguments(plan, settings);
             if let Some(rate) = rate {
-                rate.arguments(&mut args, settings.encoder, pass);
+                rate.arguments_for_settings(&mut args, settings, pass);
             }
             let consumer = CommandSpec {
                 executable: encoder.to_owned(),
@@ -291,6 +294,7 @@ pub(super) async fn build(
     if let Some(trim) = trim {
         trim.apply_mux(&mut args, selected, audio_filters)?;
     }
+    normalization.apply_mux(&mut args, selected)?;
     subtitles.apply_mux(&mut args, selected);
     let attachment =
         super::encode_settings::SettingsAttachment::prepare(&temporary.path, id, settings)?;
