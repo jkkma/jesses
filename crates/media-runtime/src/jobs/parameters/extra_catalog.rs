@@ -153,7 +153,18 @@ pub(super) fn aom() -> Vec<Spec> {
         choice!(
             "tune",
             "Metric tuning",
-            &["psnr", "ssim", "iq", "ssimulacra2"]
+            &[
+                "psnr",
+                "ssim",
+                "iq",
+                "ssimulacra2",
+                "vmaf_with_preprocessing",
+                "vmaf_without_preprocessing",
+                "vmaf",
+                "vmaf_neg",
+                "butteraugli",
+                "vmaf_saliency_map"
+            ]
         ),
         number!("qm-min", "Minimum quantization matrix", 0, 15),
         number!("qm-max", "Maximum quantization matrix", 0, 15),

@@ -24,3 +24,28 @@ pub struct LoudnessResult {
     pub source_fingerprint: String,
     pub message: String,
 }
+
+/// The source encode dropdown targets; Off is represented by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum LoudnessTarget {
+    Lufs14,
+    Lufs16,
+    Lufs23,
+}
+
+impl LoudnessTarget {
+    pub fn lufs(self) -> i16 {
+        match self {
+            Self::Lufs14 => -14,
+            Self::Lufs16 => -16,
+            Self::Lufs23 => -23,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioNormalization {
+    pub target: LoudnessTarget,
+}

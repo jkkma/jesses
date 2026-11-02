@@ -11,6 +11,8 @@ pub enum ContainerFormat {
     Mp4,
     Mov,
     Webm,
+    M4a,
+    Ogg,
 }
 
 impl ContainerFormat {
@@ -20,6 +22,8 @@ impl ContainerFormat {
             Self::Mp4 => "mp4",
             Self::Mov => "mov",
             Self::Webm => "webm",
+            Self::M4a => "m4a",
+            Self::Ogg => "ogg",
         }
     }
 
@@ -29,6 +33,8 @@ impl ContainerFormat {
             Self::Mp4 => "mp4",
             Self::Mov => "mov",
             Self::Webm => "webm",
+            Self::M4a => "ipod",
+            Self::Ogg => "ogg",
         }
     }
 
@@ -38,6 +44,8 @@ impl ContainerFormat {
             "mp4" => Some(Self::Mp4),
             "mov" => Some(Self::Mov),
             "webm" => Some(Self::Webm),
+            "m4a" => Some(Self::M4a),
+            "ogg" | "opus" | "oga" => Some(Self::Ogg),
             _ => None,
         }
     }

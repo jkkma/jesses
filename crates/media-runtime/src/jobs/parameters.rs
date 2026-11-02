@@ -3,6 +3,7 @@ use super::*;
 use media_core::{EncodeBackend, EncoderParameterCatalog, EncoderParameterSpec, VideoEncoder};
 mod catalog;
 mod extra_catalog;
+mod source_specs;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ValueKind {
@@ -62,64 +63,139 @@ const fn item(
     }
 }
 
-fn specs(encoder: VideoEncoder) -> Vec<Spec> {
-    match encoder {
-        VideoEncoder::X264 => catalog::x264(),
-        VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-            catalog::svt()
+fn merged(mut first: Vec<Spec>, rest: Vec<Spec>) -> Vec<Spec> {
+    for spec in rest {
+        if !first.iter().any(|old| old.name == spec.name) {
+            first.push(spec);
         }
-        VideoEncoder::X265 => vec![
-            item("ref", "Reference frames", "ref", 1, 6),
-            item("bframes", "Maximum consecutive B-frames", "bframes", 0, 16),
-            item("b-adapt", "B-frame adaptation", "b-adapt", 0, 2),
-            item("aq-mode", "Adaptive quantization mode", "aq-mode", 0, 4),
-            item("sao", "Sample adaptive offset (0 off, 1 on)", "sao", 0, 1),
-            item(
-                "cutree",
-                "CU-tree rate control (0 off, 1 on)",
-                "cutree",
-                0,
-                1,
-            ),
-        ],
-        VideoEncoder::Vp9 => vec![
-            item("aq-mode", "Adaptive quantization mode", "-aq-mode", 0, 4),
-            item("lag-in-frames", "Lookahead frames", "-lag-in-frames", 0, 25),
-            item(
-                "auto-alt-ref",
-                "Alternate reference frames (0 off, 1 on)",
-                "-auto-alt-ref",
-                0,
-                1,
-            ),
-        ],
-        VideoEncoder::X265Standalone => extra_catalog::x265(),
-        VideoEncoder::AomAv1 => extra_catalog::aom(),
+    }
+    first
+}
+
+fn specs(encoder: VideoEncoder) -> Vec<Spec> {
+    let mut values = match encoder {
+        VideoEncoder::X264 => merged(catalog::x264(), source_specs::native_x264()),
+        VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+            merged(catalog::svt(), source_specs::native_svt())
+        }
+        VideoEncoder::X265 => merged(
+            source_specs::library_x265(),
+            vec![item("b-adapt", "B-frame adaptation", "b-adapt", 0, 2)],
+        ),
+        VideoEncoder::Vp9 => source_specs::library_vpx(),
+        VideoEncoder::X265Standalone => merged(extra_catalog::x265(), source_specs::native_x265()),
+        VideoEncoder::AomAv1 => merged(extra_catalog::aom(), source_specs::native_aom()),
         VideoEncoder::VpxStandalone => extra_catalog::vpx(),
-        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => vec![
-            item("bf", "B-frames", "-bf", 0, 4),
-            item(
-                "rc-lookahead",
-                "Rate-control lookahead",
-                "-rc-lookahead",
-                0,
-                32,
-            ),
-            item(
-                "spatial-aq",
-                "Spatial adaptive quantization",
-                "-spatial-aq",
-                0,
-                1,
-            ),
-            item(
-                "temporal-aq",
-                "Temporal adaptive quantization",
-                "-temporal-aq",
-                0,
-                1,
-            ),
-        ],
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => Vec::new(),
+    };
+    for spec in &mut values {
+        if let Some((group, description)) = source_specs::source_text(encoder, spec.name) {
+            spec.group = group;
+            spec.description = description;
+        }
+    }
+    values
+}
+
+/// Library controls used by the ladder share the source-checked scalar catalog
+/// with regular encoding. Resource paths, HDR metadata and grain are typed jobs.
+fn library_specs(encoder: media_core::LadderEncoder) -> Vec<Spec> {
+    use media_core::LadderEncoder as L;
+    match encoder {
+        L::H264 => source_specs::library_x264(),
+        L::Hevc => merged(
+            source_specs::library_x265(),
+            vec![item("b-adapt", "B-frame adaptation", "b-adapt", 0, 2)],
+        ),
+        L::Av1 => merged(source_specs::library_svt(), catalog::svt()),
+        L::Vp9 => source_specs::library_vpx(),
+        L::AomAv1 => source_specs::library_aom(),
+        L::H264Nvenc | L::HevcNvenc => Vec::new(),
+    }
+}
+
+pub(crate) fn library_parameter(
+    encoder: media_core::LadderEncoder,
+    value: &media_core::EncoderParameter,
+) -> Result<media_core::EncoderParameter, AppError> {
+    encoder.require_cpu_encoding()?;
+    let spec = library_specs(encoder)
+        .into_iter()
+        .find(|spec| spec.name == value.name)
+        .ok_or_else(|| {
+            error(format!(
+                "{} is not a supported scalar control for this library encoder.",
+                value.name
+            ))
+        })?;
+    let normalized = if matches!(spec.kind, ValueKind::PairWhole | ValueKind::PairDecimal) {
+        value.value.replace(',', ":")
+    } else {
+        value.value.clone()
+    };
+    if !valid_value(&spec, &normalized)
+        || (encoder == media_core::LadderEncoder::Hevc
+            && spec.name == "qcomp"
+            && normalized.parse::<f64>().is_ok_and(|value| value < 0.5))
+    {
+        return Err(error(format!(
+            "{} has an invalid value for this library encoder.",
+            value.name
+        )));
+    }
+    if matches!(
+        value.name.as_str(),
+        "drop-threshold" | "lossless" | "highbitdepth"
+    ) && normalized != "0"
+    {
+        return Err(error(
+            "Frame dropping, lossless and bit-depth changes must use the job's typed settings; a CRF ladder keeps its sample frame count and format fixed.",
+        ));
+    }
+    if matches!(value.name.as_str(), "rc" | "tune")
+        && matches!(normalized.as_str(), "constqp" | "cbr" | "lossless")
+    {
+        return Err(error(
+            "This value changes the ladder's CRF rate-control mode. Choose a regular encoding job for that mode.",
+        ));
+    }
+    Ok(media_core::EncoderParameter {
+        name: value.name.clone(),
+        value: normalized,
+    })
+}
+
+pub(crate) fn library_arguments(
+    encoder: media_core::LadderEncoder,
+    values: &[media_core::EncoderParameter],
+) -> Vec<OsString> {
+    use media_core::LadderEncoder as L;
+    if values.is_empty() && encoder != L::Av1 {
+        return Vec::new();
+    }
+    if matches!(encoder, L::H264 | L::Hevc | L::Av1 | L::AomAv1) {
+        let flag = match encoder {
+            L::H264 => "-x264-params",
+            L::Hevc => "-x265-params",
+            L::Av1 => "-svtav1-params",
+            _ => "-aom-params",
+        };
+        let mut parameters = values
+            .iter()
+            .map(|item| format!("{}={}", item.name, item.value.replace(':', ",")))
+            .collect::<Vec<_>>();
+        if encoder == L::Av1 {
+            // Bound utility resource use just as ordinary standalone workers do.
+            // SVT4.2 high-bit-depth mode decision plus overlays can crash with
+            // parallel short clips; level1 preserves both selected controls.
+            parameters.insert(0, "lp=1".into());
+        }
+        vec![flag.into(), parameters.join(":").into()]
+    } else {
+        values
+            .iter()
+            .flat_map(|item| [format!("-{}", item.name).into(), item.value.clone().into()])
+            .collect()
     }
 }
 
@@ -199,8 +275,119 @@ fn valid_value(spec: &Spec, value: &str) -> bool {
     }
 }
 
+/// SVT4.2's high-bit-depth mode decision plus overlays crashes in parallel
+/// short-clip execution. Both features remain enabled with one processing lane.
+pub(in crate::jobs) fn requires_serial_svt(settings: &EncodeSettings) -> bool {
+    settings.encoder.is_svt()
+        && ["hbd-mds", "enable-overlays"].iter().all(|name| {
+            settings
+                .parameters
+                .iter()
+                .any(|value| value.name == *name && value.value == "1")
+        })
+}
+
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
-    validate_values(settings.encoder, settings.backend, &settings.parameters)
+    validate_values(settings.encoder, settings.backend, &settings.parameters)?;
+    if settings.encoder.is_svt()
+        && settings
+            .parameters
+            .iter()
+            .any(|value| value.name == "hbd-mds" && value.value == "1")
+        && settings
+            .output_pixel_format
+            .or_else(|| {
+                settings
+                    .av1an_options
+                    .and_then(|options| options.pixel_format)
+            })
+            .is_some_and(|format| !format.ffmpeg().contains("10"))
+    {
+        return Err(error(
+            "SVT hbd-mds=1 requires 10-bit output. Choose a 10-bit output format or remove that content-preset override before queueing.",
+        ));
+    }
+    if let Some(quantizer) = settings.constant_quantizer
+        && (quantizer > 51
+            || !matches!(
+                settings.encoder,
+                VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+            )
+            || settings.lossless
+            || settings.rate_control.is_some())
+    {
+        return Err(error(
+            "Constant quantizer requires NVENC, a QP from 0 through 51, and no lossless or target-bitrate/size mode.",
+        ));
+    }
+    for parameter in &settings.parameters {
+        match (parameter.name.as_str(), parameter.value.as_str()) {
+            ("drop-threshold", value) if value != "0" => {
+                return Err(error(
+                    "Frame dropping would violate the job's planned frame count; drop-threshold must be 0.",
+                ));
+            }
+            ("lossless", value) if (value == "1") != settings.lossless => {
+                return Err(error(
+                    "Set lossless through the main encoding control so the planned verification matches the encoder.",
+                ));
+            }
+            ("rc", "constqp")
+                if !settings.lossless
+                    && settings.constant_quantizer.is_none()
+                    && !settings.source_nvenc_quality =>
+            {
+                return Err(error(
+                    "constqp requires the job's constant-quantizer or lossless mode; primary quality is controlled by the encoding settings.",
+                ));
+            }
+            ("rc", "vbr" | "cbr") if settings.constant_quantizer.is_some() => {
+                return Err(error(
+                    "The selected rate-control override conflicts with the job's constant-quantizer mode.",
+                ));
+            }
+            ("rc", "cbr") if settings.rate_control.is_none() && !settings.source_nvenc_quality => {
+                return Err(error(
+                    "CBR requires a target bitrate or size in the main encoding settings.",
+                ));
+            }
+            ("tune", "lossless") if !settings.lossless && !settings.source_nvenc_quality => {
+                return Err(error(
+                    "Select lossless mode before using the lossless encoder tune.",
+                ));
+            }
+            ("highbitdepth", "1")
+                if !matches!(
+                    settings.output_pixel_format,
+                    Some(
+                        media_core::Av1anPixelFormat::Yuv420p10le
+                            | media_core::Av1anPixelFormat::Yuv422p10le
+                            | media_core::Av1anPixelFormat::Yuv444p10le
+                    )
+                ) =>
+            {
+                return Err(error(
+                    "highbitdepth requires an explicitly planned 10-bit output pixel format.",
+                ));
+            }
+            ("vbr-corpus-complexity-lap", value)
+                if value != "0"
+                    && !matches!(
+                        settings.rate_control,
+                        Some(media_core::VideoRateControl::Bitrate {
+                            two_pass: false,
+                            ..
+                        })
+                    ) =>
+            {
+                return Err(error(
+                    "Corpus complexity requires single-pass target-bitrate mode.",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_values(
@@ -208,7 +395,8 @@ pub(crate) fn validate_values(
     backend: EncodeBackend,
     parameters: &[media_core::EncoderParameter],
 ) -> Result<(), AppError> {
-    let maximum = if !encoder.is_ffmpeg() { 64 } else { 16 };
+    encoder.require_cpu_encoding()?;
+    let maximum = 64;
     if parameters.len() > maximum {
         return Err(error(format!(
             "At most {maximum} encoder overrides are allowed."
@@ -240,6 +428,12 @@ pub(crate) fn validate_values(
                 "{} was supplied more than once.",
                 value.name
             )));
+        }
+        if matches!(encoder, VideoEncoder::X265 | VideoEncoder::X265Standalone)
+            && spec.name == "qcomp"
+            && value.value.parse::<f64>().is_ok_and(|value| value < 0.5)
+        {
+            return Err(error("x265 qcomp requires a decimal from 0.5 through 1."));
         }
         if !valid_value(&spec, &value.value) {
             return Err(error(format!(
@@ -292,8 +486,13 @@ pub(super) fn arguments(settings: &EncodeSettings) -> Vec<OsString> {
                 VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
             ) {
                 args.push(format!("{}={}", spec.flag, value.value).into());
-            } else if settings.encoder == VideoEncoder::X265Standalone
-                && matches!(spec.name, "sao" | "cutree")
+            } else if (settings.encoder == VideoEncoder::X265Standalone
+                && matches!(spec.name, "sao" | "cutree" | "rc-grain" | "hdr10-opt"))
+                || (settings.encoder == VideoEncoder::X264
+                    && matches!(
+                        spec.name,
+                        "cabac" | "8x8dct" | "psy" | "dct-decimate" | "mbtree"
+                    ))
             {
                 args.push(
                     if value.value == "0" {
@@ -312,32 +511,85 @@ pub(super) fn arguments(settings: &EncodeSettings) -> Vec<OsString> {
 }
 
 pub(super) fn x265_suffix(settings: &EncodeSettings) -> String {
-    arguments(settings)
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            format!(
-                ":{}={}",
-                pair[0].to_string_lossy(),
-                pair[1].to_string_lossy()
-            )
+    specs(settings.encoder)
+        .into_iter()
+        .filter_map(|spec| {
+            settings
+                .parameters
+                .iter()
+                .find(|value| value.name == spec.name)
+                .map(|value| format!(":{}={}", spec.name, value.value.replace(':', ",")))
         })
         .collect()
 }
 
 fn advertised(help: &str, spec: &Spec, encoder: VideoEncoder) -> bool {
-    let wanted = if encoder == VideoEncoder::X265 {
-        "-x265-params"
-    } else {
-        spec.flag
-    };
+    if encoder == VideoEncoder::X265 {
+        return help.split_whitespace().any(|word| word == "-x265-params");
+    }
+    // These are FFmpeg's generic video codec options, absent from encoder-only help.
+    if encoder.is_ffmpeg() && matches!(spec.name, "g" | "bf" | "refs" | "qmin" | "qmax") {
+        return true;
+    }
+    let wanted = spec.flag.trim_end_matches(":v");
     help.split_whitespace().any(|word| {
         word.split('/').any(|alias| {
             let flag = alias.split('=').next().unwrap_or(alias);
-            flag == wanted || flag.replace("[no-]", "") == wanted
+            flag == wanted
+                || flag.replace("[no-]", "") == wanted
+                || (encoder == VideoEncoder::X264
+                    && flag
+                        .strip_prefix("--no-")
+                        .is_some_and(|name| wanted.strip_prefix("--") == Some(name)))
         })
     })
+}
+
+fn installed_choices<'a>(help: &str, spec: &'a Spec, encoder: VideoEncoder) -> Vec<&'a str> {
+    if !matches!(spec.kind, ValueKind::Choice | ValueKind::ChoiceList) {
+        return Vec::new();
+    }
+    let wanted = spec.flag.trim_end_matches(":v");
+    let lines = help.lines().collect::<Vec<_>>();
+    let start = lines.iter().position(|line| {
+        line.split_whitespace()
+            .any(|word| word.split('=').next() == Some(wanted))
+    });
+    let Some(start) = start else {
+        return spec.choices.to_vec();
+    };
+    let block = lines[start + 1..]
+        .iter()
+        .take_while(|line| !line.trim_start().starts_with('-'))
+        .copied()
+        .collect::<Vec<_>>();
+    let advertised = if encoder.is_ffmpeg() {
+        block
+            .iter()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let name = fields.next()?;
+                fields.next()?.parse::<i64>().ok()?;
+                Some(name)
+            })
+            .collect::<Vec<_>>()
+    } else if matches!(encoder, VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone) {
+        block
+            .iter()
+            .flat_map(|line| line.split(|c: char| c.is_whitespace() || c == ','))
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if advertised.is_empty() {
+        return spec.choices.to_vec();
+    }
+    spec.choices
+        .iter()
+        .copied()
+        .filter(|choice| advertised.contains(choice))
+        .collect()
 }
 
 pub(super) async fn check_help(
@@ -347,6 +599,11 @@ pub(super) async fn check_help(
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     validate(settings)?;
+    if settings.constant_quantizer.is_some() && !help.split_whitespace().any(|word| word == "-qp") {
+        return Err(error(
+            "The installed NVENC wrapper does not advertise the explicit -qp control.",
+        ));
+    }
     for value in &settings.parameters {
         let spec = specs(settings.encoder)
             .into_iter()
@@ -358,6 +615,17 @@ pub(super) async fn check_help(
                 settings.encoder.name(),
                 spec.flag
             )));
+        }
+        if matches!(spec.kind, ValueKind::Choice | ValueKind::ChoiceList) {
+            let choices = installed_choices(help, &spec, settings.encoder);
+            if !value.value.split(',').all(|part| choices.contains(&part)) {
+                return Err(error(format!(
+                    "The installed {} does not advertise {}={} among this build's supported choices.",
+                    settings.encoder.name(),
+                    spec.name,
+                    value.value
+                )));
+            }
         }
     }
     if settings.encoder == VideoEncoder::X265 && !settings.parameters.is_empty() {
@@ -423,6 +691,7 @@ pub(crate) async fn catalog(
     backend: EncodeBackend,
     cancel: watch::Receiver<bool>,
 ) -> Result<EncoderParameterCatalog, AppError> {
+    encoder.require_cpu_encoding()?;
     let _permit = crate::analysis::permit(&cancel).await?;
     check_cancel(&cancel)?;
     if backend == EncodeBackend::Av1an
@@ -531,9 +800,18 @@ pub(crate) async fn catalog(
             minimum: spec.min.max(0).min(u16::MAX.into()) as u16,
             maximum: spec.max.max(0).min(u16::MAX.into()) as u16,
             value_kind: spec.kind.name().into(),
-            minimum_value: spec.min.to_string(),
+            minimum_value: if spec.name == "qcomp"
+                && matches!(encoder, VideoEncoder::X265 | VideoEncoder::X265Standalone)
+            {
+                "0.5".into()
+            } else {
+                spec.min.to_string()
+            },
             maximum_value: spec.max.to_string(),
-            choices: spec.choices.iter().map(|choice| (*choice).into()).collect(),
+            choices: installed_choices(&help, spec, encoder)
+                .into_iter()
+                .map(String::from)
+                .collect(),
             group: spec.group.into(),
             description: spec.description.into(),
             example: spec.example.into(),
@@ -616,8 +894,8 @@ mod tests {
     fn native_catalogs_have_typed_examples_and_no_path_parameters() {
         let x264 = specs(VideoEncoder::X264);
         let svt = specs(VideoEncoder::SvtAv1);
-        assert_eq!(x264.len(), 31);
-        assert_eq!(svt.len(), 44);
+        assert_eq!(x264.len(), 37);
+        assert_eq!(svt.len(), 45);
         for spec in x264.iter().chain(&svt) {
             assert!(spec.flag.starts_with("--"));
             assert!(valid_value(spec, spec.example), "{} example", spec.name);
@@ -766,6 +1044,157 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn every_fork_catalog_row_has_an_explicit_scalar_or_typed_resource_disposition() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/nmkoder-encoder-catalog.json"
+        ))
+        .unwrap();
+        let mut total = 0;
+        let mut scalar = 0;
+        let mut resources = 0;
+        let mut excluded_hardware = 0;
+        for catalog in fixture["catalogs"].as_array().unwrap() {
+            let file = catalog["sourceFile"].as_str().unwrap();
+            let name = Path::new(file).file_stem().unwrap().to_str().unwrap();
+            let library = catalog["sourceWrapper"] == "ffmpeg";
+            if matches!(name, "H264Nvenc" | "H265Nvenc") {
+                excluded_hardware += catalog["options"].as_array().unwrap().len();
+                continue;
+            }
+            let values = if library {
+                library_specs(match name {
+                    "Libx264" => media_core::LadderEncoder::H264,
+                    "Libx265" => media_core::LadderEncoder::Hevc,
+                    "LibSvtAv1" => media_core::LadderEncoder::Av1,
+                    "LibAomAv1" => media_core::LadderEncoder::AomAv1,
+                    "LibVpx" => media_core::LadderEncoder::Vp9,
+                    "H264Nvenc" => media_core::LadderEncoder::H264Nvenc,
+                    "H265Nvenc" => media_core::LadderEncoder::HevcNvenc,
+                    _ => panic!("unmapped source catalog {name}"),
+                })
+            } else {
+                specs(match name {
+                    "X264" => VideoEncoder::X264,
+                    "X265" => VideoEncoder::X265Standalone,
+                    "SvtAv1" => VideoEncoder::SvtAv1,
+                    "AomAv1" => VideoEncoder::AomAv1,
+                    "Vpx" => VideoEncoder::VpxStandalone,
+                    _ => panic!("unmapped source catalog {name}"),
+                })
+            };
+            for row in catalog["options"].as_array().unwrap() {
+                total += 1;
+                let key = row["option"].as_str().unwrap();
+                if let Some(spec) = values.iter().find(|spec| spec.name == key) {
+                    scalar += 1;
+                    if let Some(bounds) = row["rangeBounds"].as_array() {
+                        for bound in bounds {
+                            let value = bound.as_str().unwrap();
+                            if matches!(spec.kind, ValueKind::Whole | ValueKind::Decimal) {
+                                assert!(
+                                    valid_value(spec, value),
+                                    "{file}/{key}: source bound {value} must be represented"
+                                );
+                            }
+                        }
+                    }
+                    assert!(
+                        valid_value(spec, spec.example) || spec.example.is_empty(),
+                        "{file}/{key} example: {}",
+                        spec.example
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            (name, key),
+                            (
+                                "SvtAv1",
+                                "fgs-table" | "dolby-vision-rpu" | "hdr10plus-json"
+                            ) | ("X265" | "Libx265", "master-display" | "max-cll")
+                                | ("LibSvtAv1", "film-grain" | "film-grain-denoise")
+                                | ("LibAomAv1", "denoise-noise-level" | "enable-dnl-denoising")
+                        ),
+                        "{file}/{key} has no disposition"
+                    );
+                    resources += 1;
+                }
+            }
+        }
+        assert_eq!(total + excluded_hardware, 375);
+        assert_eq!(resources, 11);
+        assert_eq!(scalar + resources, total);
+        assert_eq!(excluded_hardware, 67);
+    }
+
+    #[test]
+    fn expanded_scalar_catalogs_preserve_cli_and_nested_value_semantics() {
+        for name in ["cabac", "8x8dct", "psy", "dct-decimate", "mbtree"] {
+            for value in ["0", "1"] {
+                let setting = setting(VideoEncoder::X264, name, value);
+                assert!(validate(&setting).is_ok());
+                assert_eq!(
+                    arguments(&setting),
+                    [OsString::from(format!(
+                        "--{}{name}",
+                        if value == "0" { "no-" } else { "" }
+                    ))]
+                );
+                assert!(advertised(
+                    &format!("--no-{name}"),
+                    &specs(VideoEncoder::X264)
+                        .into_iter()
+                        .find(|spec| spec.name == name)
+                        .unwrap(),
+                    VideoEncoder::X264
+                ));
+            }
+        }
+        let pair = setting(VideoEncoder::X265, "deblock", "-2:1");
+        assert!(validate(&pair).is_ok());
+        assert_eq!(x265_suffix(&pair), ":deblock=-2,1");
+        assert!(validate(&setting(VideoEncoder::X265, "qcomp", "0.49")).is_err());
+        assert!(validate(&setting(VideoEncoder::X265, "qcomp", "0.5")).is_ok());
+        assert!(validate(&setting(VideoEncoder::Vp9, "drop-threshold", "1")).is_err());
+        assert!(validate(&setting(VideoEncoder::Vp9, "drop-threshold", "0")).is_ok());
+        assert!(validate(&setting(VideoEncoder::H264Nvenc, "rc", "cbr")).is_err());
+        assert_eq!(
+            validate(&setting(VideoEncoder::H264Nvenc, "rc", "cbr"))
+                .unwrap_err()
+                .code,
+            "HARDWARE_ENCODING_UNSUPPORTED"
+        );
+        for encoder in [
+            media_core::LadderEncoder::H264,
+            media_core::LadderEncoder::Hevc,
+        ] {
+            let parameter = media_core::EncoderParameter {
+                name: "deblock".into(),
+                value: "-2,1".into(),
+            };
+            let normalized = library_parameter(encoder, &parameter).unwrap();
+            assert_eq!(normalized.value, "-2:1");
+            let args = library_arguments(encoder, &[normalized]);
+            assert_eq!(args[1], "deblock=-2,1");
+        }
+    }
+
+    #[test]
+    fn svt_high_bit_depth_preset_constraint_is_rejected_before_queueing() {
+        let mut settings = setting(VideoEncoder::SvtAv1, "hbd-mds", "1");
+        settings.parameters.push(media_core::EncoderParameter {
+            name: "enable-overlays".into(),
+            value: "1".into(),
+        });
+        assert!(requires_serial_svt(&settings));
+        settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p);
+        assert!(validate(&settings).unwrap_err().message.contains("10-bit"));
+        settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p10le);
+        validate(&settings).unwrap();
+        settings.parameters.pop();
+        assert!(!requires_serial_svt(&settings));
     }
 
     #[tokio::test]

@@ -155,6 +155,17 @@ pub struct Av1anOptions {
     #[serde(skip_serializing_if = "is_false")]
     #[ts(optional, as = "Option<_>")]
     pub attach_settings: bool,
+    /// Source UI leaves search bounds, probe count/sampling/resolution and
+    /// statistic/parameter-copy policy to the qualified AV1AN engine.
+    #[serde(skip_serializing_if = "is_false")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_target_defaults: bool,
+    /// Source UI derives chunk length from typed output rate/keyframe seconds
+    /// and leaves scene-only defaults to the engine. Explicit native options
+    /// retain their historical meaning when this compatibility marker is false.
+    #[serde(skip_serializing_if = "is_false")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_workflow: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub target_quality: Option<Av1anTargetQuality>,
@@ -176,6 +187,8 @@ impl Default for Av1anOptions {
             scene_detection_slices: default_scene_slices(),
             concat_method: Av1anConcatMethod::Ffmpeg,
             attach_settings: false,
+            source_target_defaults: false,
+            source_workflow: false,
             target_quality: None,
         }
     }

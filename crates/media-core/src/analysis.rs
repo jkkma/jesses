@@ -57,3 +57,46 @@ pub struct AutoCropResult {
     pub source_fingerprint: String,
     pub message: String,
 }
+
+/// Read-only keyframe lookup at or before the requested source position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyframeSnapRequest {
+    pub input_path: String,
+    pub video_stream_index: u32,
+    pub position_seconds: f64,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyframeSnapResult {
+    pub position_seconds: Option<f64>,
+    pub source_fingerprint: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDetectionRequest {
+    pub input_path: String,
+    pub video_stream_index: u32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum DetectedFieldOrder {
+    Progressive,
+    TopFirst,
+    BottomFirst,
+    Undetermined,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDetectionResult {
+    pub order: DetectedFieldOrder,
+    pub telecined: bool,
+    pub sampled_frames: u32,
+    pub top_first_frames: u32,
+    pub bottom_first_frames: u32,
+    pub progressive_frames: u32,
+    pub undetermined_frames: u32,
+    pub field_gap_ratio: Option<f64>,
+    pub source_fingerprint: String,
+    pub evidence: String,
+}

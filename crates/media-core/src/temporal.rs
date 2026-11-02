@@ -11,6 +11,7 @@ pub enum DeinterlaceMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum QtgmcPreset {
+    VeryFast,
     Faster,
     #[default]
     Fast,
@@ -18,6 +19,7 @@ pub enum QtgmcPreset {
     Slow,
     Slower,
     VerySlow,
+    Placebo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -27,9 +29,31 @@ pub enum FieldOrder {
     BottomFirst,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum DeinterlaceEngine {
+    #[default]
+    Bwdif,
+    Yadif,
+}
+impl DeinterlaceEngine {
+    pub const fn ffmpeg(self) -> &'static str {
+        match self {
+            Self::Bwdif => "bwdif",
+            Self::Yadif => "yadif",
+        }
+    }
+}
+fn default_deinterlace_engine(value: &DeinterlaceEngine) -> bool {
+    *value == DeinterlaceEngine::Bwdif
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DeinterlaceSettings {
+    #[serde(default, skip_serializing_if = "default_deinterlace_engine")]
+    #[ts(optional, as = "Option<_>")]
+    pub engine: DeinterlaceEngine,
     pub mode: DeinterlaceMode,
     pub field_order: FieldOrder,
 }
@@ -94,6 +118,8 @@ pub enum ResizeFilter {
     Nearest,
     Bilinear,
     Bicubic,
+    Spline,
+    Area,
     #[default]
     Lanczos,
 }
@@ -125,6 +151,15 @@ pub struct TemporalSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_deinterlace_requests_default_to_bwdif_and_yadif_is_explicit() {
+        let old = serde_json::json!({"mode":"bob","fieldOrder":"topFirst"});
+        let mut settings: DeinterlaceSettings = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(settings.engine, DeinterlaceEngine::Bwdif);
+        assert_eq!(serde_json::to_value(settings).unwrap(), old);
+        settings.engine = DeinterlaceEngine::Yadif;
+        assert_eq!(serde_json::to_value(settings).unwrap()["engine"], "yadif");
+    }
 
     #[test]
     fn old_temporal_json_keeps_bwdif_and_omits_new_workflows() {

@@ -65,15 +65,28 @@ impl Default for QualityOptions {
 pub struct QualityRequest {
     pub reference_path: String,
     pub reference_stream_index: u32,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub reference_start_frame: u32,
     pub candidate_path: String,
     pub candidate_stream_index: u32,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub candidate_start_frame: u32,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub frame_count: u32,
+    /// Compare the complete paired decoded timelines, without estimating count.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[ts(optional, as = "Option<_>")]
+    pub full_source: bool,
     pub metric: QualityMetric,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub options: Option<QualityOptions>,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

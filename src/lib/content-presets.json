@@ -1,0 +1,236 @@
+{
+  "x264": [
+    {
+      "name": "Grainy Film / Analogue Transfer",
+      "description": "35mm and 16mm scans, VHS, Hi8 and other tape captures - sources where the grain is part of the picture rather than something to clean off. Filters and quantises so the noise survives the loop instead of being averaged into mush, and gives the grain-heavy scenes more of the budget.",
+      "parameters": [
+        {
+          "name": "deblock",
+          "value": "-2,-2"
+        },
+        {
+          "name": "dct-decimate",
+          "value": "0"
+        },
+        {
+          "name": "psy-rd",
+          "value": "1.1,0.15"
+        },
+        {
+          "name": "aq-strength",
+          "value": "0.6"
+        },
+        {
+          "name": "qcomp",
+          "value": "0.70"
+        }
+      ]
+    },
+    {
+      "name": "Anime / Cel Animation",
+      "description": "Cel-style 2D and modern digital anime: hard line art, large flat colour fields, long held frames and gradients that band easily. Exploits the held cels, smooths the blocking that shows in flat fills, and puts bits where this content bands first.",
+      "parameters": [
+        {
+          "name": "bframes",
+          "value": "8"
+        },
+        {
+          "name": "b-adapt",
+          "value": "2"
+        },
+        {
+          "name": "ref",
+          "value": "8"
+        },
+        {
+          "name": "deblock",
+          "value": "1,1"
+        },
+        {
+          "name": "aq-mode",
+          "value": "2"
+        },
+        {
+          "name": "aq-strength",
+          "value": "1.3"
+        },
+        {
+          "name": "chroma-qp-offset",
+          "value": "-2"
+        },
+        {
+          "name": "psy-rd",
+          "value": "0.6,0.0"
+        }
+      ]
+    }
+  ],
+  "x265": [
+    {
+      "name": "Grainy Film / 35mm Scan",
+      "description": "Scanned 35mm and grain-heavy live action at a generous CRF: keeps the film grain the encoder's own filters are built to average away, and steadies the quantiser so it does not visibly breathe from shot to shot.",
+      "parameters": [
+        {
+          "name": "sao",
+          "value": "0"
+        },
+        {
+          "name": "deblock",
+          "value": "-2,-2"
+        },
+        {
+          "name": "psy-rd",
+          "value": "2.5"
+        },
+        {
+          "name": "rdoq-level",
+          "value": "1"
+        },
+        {
+          "name": "psy-rdoq",
+          "value": "2.0"
+        },
+        {
+          "name": "aq-strength",
+          "value": "0.7"
+        },
+        {
+          "name": "qcomp",
+          "value": "0.7"
+        },
+        {
+          "name": "cutree",
+          "value": "0"
+        },
+        {
+          "name": "rc-grain",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "name": "Anime / Cel Animation",
+      "description": "Modern digital anime and cel-style 2D: clean line art, large flat colour fields and gradients that band easily, with cels held across several frames. Keeps the lines sharp, the fills clean and the held frames cheap.",
+      "parameters": [
+        {
+          "name": "aq-mode",
+          "value": "4"
+        },
+        {
+          "name": "aq-strength",
+          "value": "1.3"
+        },
+        {
+          "name": "psy-rd",
+          "value": "1.0"
+        },
+        {
+          "name": "rdoq-level",
+          "value": "1"
+        },
+        {
+          "name": "bframes",
+          "value": "8"
+        },
+        {
+          "name": "rc-lookahead",
+          "value": "40"
+        },
+        {
+          "name": "cbqpoffs",
+          "value": "-2"
+        },
+        {
+          "name": "crqpoffs",
+          "value": "-2"
+        },
+        {
+          "name": "selective-sao",
+          "value": "2"
+        },
+        {
+          "name": "tu-intra-depth",
+          "value": "2"
+        }
+      ]
+    }
+  ],
+  "svtAv1": [
+    {
+      "name": "Anime / Cel Animation",
+      "description": "Modern digital anime and cel-style 2D: clean line art, big flat colour fields, and gradients that band easily. Keeps the lines sharp, deblocks more accurately, and spends extra bits on the dark scenes that band worst.",
+      "parameters": [
+        {
+          "name": "tune",
+          "value": "0"
+        },
+        {
+          "name": "variance-boost-strength",
+          "value": "1"
+        },
+        {
+          "name": "noise-adaptive-filtering",
+          "value": "4"
+        },
+        {
+          "name": "enable-dlf",
+          "value": "2"
+        },
+        {
+          "name": "luminance-qp-bias",
+          "value": "25"
+        },
+        {
+          "name": "chroma-qm-min",
+          "value": "10"
+        },
+        {
+          "name": "enable-overlays",
+          "value": "1"
+        },
+        {
+          "name": "hbd-mds",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "name": "Game Capture / Gameplay",
+      "description": "Raw gameplay capture at 60fps or faster, at whatever size it is being encoded to - a 4K capture scaled down to 1080p or 720p included: sustained fast motion, hard-edged HUD text, and synthetic skies, fog and volumetrics that band badly. Keeps the screen content tools from misfiring on a HUD and taking a whole chunk with them.",
+      "parameters": [
+        {
+          "name": "tune",
+          "value": "0"
+        },
+        {
+          "name": "scm",
+          "value": "0"
+        },
+        {
+          "name": "variance-octile",
+          "value": "4"
+        },
+        {
+          "name": "luminance-qp-bias",
+          "value": "10"
+        },
+        {
+          "name": "enable-dlf",
+          "value": "2"
+        },
+        {
+          "name": "chroma-qm-min",
+          "value": "10"
+        },
+        {
+          "name": "enable-overlays",
+          "value": "1"
+        },
+        {
+          "name": "hbd-mds",
+          "value": "1"
+        }
+      ]
+    }
+  ]
+}

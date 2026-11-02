@@ -8,6 +8,7 @@ use ts_rs::TS;
 pub enum SubtitleMode {
     #[default]
     Copy,
+    MovText,
     SubRip,
     Ass,
     WebVtt,
@@ -21,4 +22,8 @@ pub struct SubtitleTrackSettings {
     pub stream_index: u32,
     #[serde(default)]
     pub mode: SubtitleMode,
+    /// Render this track as well as retaining its selected output mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<_>")]
+    pub burn_in: bool,
 }

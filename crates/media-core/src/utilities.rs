@@ -40,6 +40,17 @@ pub struct DeinterlaceExportRequest {
     pub qtgmc_preset: crate::QtgmcPreset,
 }
 
+/// A source-style automatic/explicit decision; no request means automatic
+/// mode should leave progressive or undetermined input alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeinterlaceResolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub request: Option<DeinterlaceExportRequest>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CadenceRepairExportRequest {
@@ -74,7 +85,40 @@ pub struct ColorMetadataTransferRequest {
     pub metadata_source_video_stream_index: u32,
     pub input_path: String,
     pub input_video_stream_index: u32,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub output_path: String,
+    #[serde(default = "enabled")]
+    #[ts(optional, as = "Option<_>")]
+    pub copy_color: bool,
+    #[serde(default = "enabled")]
+    #[ts(optional, as = "Option<_>")]
+    pub copy_hdr: bool,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub in_place: bool,
+}
+fn enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ColorMetadataInspectionRequest {
+    pub input_path: String,
+    pub video_stream_index: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ColorMetadataReport {
+    pub input_path: String,
+    pub video_stream_index: u32,
+    pub color: std::collections::BTreeMap<String, String>,
+    pub hdr: std::collections::BTreeMap<String, String>,
+    pub dolby_vision_profile: Option<u32>,
+    pub dolby_vision_compatibility: Option<u32>,
+    pub source_fingerprint: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -94,6 +138,15 @@ pub struct SubtitleOcrRequest {
     rename_all_fields = "camelCase"
 )]
 pub enum GrainRequest {
+    /// Denoise once into a verified lossless derivative, then measure source grain.
+    MeasureSource {
+        source_path: String,
+        output_table_path: String,
+        denoise_strength: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        denoised_output_path: Option<String>,
+    },
     Measure {
         source_path: String,
         denoised_path: String,
@@ -139,6 +192,25 @@ pub enum LadderEncoder {
     Hevc,
     Av1,
     Vp9,
+    AomAv1,
+    H264Nvenc,
+    HevcNvenc,
+}
+impl LadderEncoder {
+    pub fn is_hardware(self) -> bool {
+        matches!(self, Self::H264Nvenc | Self::HevcNvenc)
+    }
+    pub fn require_cpu_encoding(self) -> Result<(), crate::AppError> {
+        if self.is_hardware() {
+            Err(crate::AppError::new(
+                "HARDWARE_ENCODING_UNSUPPORTED",
+                "Jesses supports CPU video encoding only. This historical Sample Encodes hardware encoder is unsupported.",
+                None,
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -168,6 +240,48 @@ pub struct CrfLadderRequest {
     pub metric: LadderMetric,
     /// When absent, a documented metric default is used. Ignored for `none`.
     pub recommendation_threshold: Option<f64>,
+    /// Human-readable content-preset identity, retained with the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content_preset: Option<String>,
+    /// Encoder-native content controls; unsupported fork controls are reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, as = "Option<_>")]
+    pub parameters: Vec<crate::EncoderParameter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub vmaf_model: Option<crate::QualityVmafModel>,
+    /// A new directory for validated references and encoded samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub keep_samples_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UtilityBatchRequest {
+    pub requests: Vec<UtilityRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UtilityBatchEntry {
+    pub index: u32,
+    pub request: UtilityRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub result: Option<UtilityResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<crate::AppError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UtilityBatchResult {
+    pub entries: Vec<UtilityBatchEntry>,
+    pub completed: u32,
+    pub canceled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -227,10 +341,17 @@ pub struct SubtitleOcrResult {
 #[serde(rename_all = "camelCase")]
 pub struct GrainTableResult {
     pub output_path: String,
+    /// Measured table bytes only; a retained denoised video is separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub size_bytes: Option<String>,
     pub segment_count: u32,
     pub source_fingerprints: Vec<String>,
     pub message: String,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub denoised_output_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -249,6 +370,20 @@ pub struct CrfLadderResult {
     pub source_fingerprint: String,
     pub message: String,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content_preset: Option<String>,
+    #[serde(default)]
+    pub parameters: Vec<crate::EncoderParameter>,
+    #[serde(default)]
+    pub vmaf_model: crate::QualityVmafModel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub samples_directory: Option<String>,
+    /// Complete recursively measured retained directory, only on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub samples_size_bytes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -269,6 +404,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_color_transfer_defaults_to_copying_both_categories_to_a_new_file() {
+        let request:ColorMetadataTransferRequest=serde_json::from_value(serde_json::json!({"metadataSourcePath":"/donor.mkv","metadataSourceVideoStreamIndex":0,"inputPath":"/target.mkv","inputVideoStreamIndex":0,"outputPath":"/new.mkv"})).unwrap();
+        assert!(request.copy_color && request.copy_hdr);
+        assert!(!request.in_place);
+        let in_place:ColorMetadataTransferRequest=serde_json::from_value(serde_json::json!({"metadataSourcePath":"/donor.mkv","metadataSourceVideoStreamIndex":0,"inputPath":"/target.mkv","inputVideoStreamIndex":0,"inPlace":true,"copyColor":false,"copyHdr":true})).unwrap();
+        assert!(
+            in_place.output_path.is_empty()
+                && in_place.in_place
+                && !in_place.copy_color
+                && in_place.copy_hdr
+        );
+    }
+    #[test]
     fn externally_tagged_payloads_are_explicit_and_forward_readable() {
         let value = serde_json::to_value(UtilityRequest::Grain(GrainRequest::Apply {
             input_path: "in.mkv".into(),
@@ -283,4 +431,21 @@ mod tests {
         assert_eq!(value["request"]["operation"], "apply");
         assert_eq!(value["request"]["source"]["kind"], "photonNoise");
     }
+}
+
+/// Live status for one utility ticket. Terminal results remain authoritative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UtilityProgress {
+    pub row_index: Option<u32>,
+    pub row_count: u32,
+    pub completed_rows: u32,
+    /// running, succeeded, failed or skipped.
+    pub status: String,
+    pub phase: String,
+    pub message: String,
+    pub elapsed_seconds: f64,
+    pub progress_seconds: Option<f64>,
+    pub duration_seconds: Option<f64>,
+    pub estimated_remaining_seconds: Option<f64>,
 }

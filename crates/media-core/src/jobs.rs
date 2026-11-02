@@ -30,6 +30,9 @@ pub struct ExternalTrack {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub subtitle_mode: Option<crate::SubtitleMode>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<_>")]
+    pub subtitle_burn_in: bool,
     /// None preserves each tag/disposition; empty title or language clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -87,6 +90,14 @@ pub struct ExternalAudioSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub gain: Option<AudioGain>,
+    /// Measured two-pass normalization, performed over the immutable job span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub normalization: Option<crate::AudioNormalization>,
+}
+
+fn is_encode_video_mode(mode: &VideoMode) -> bool {
+    *mode == VideoMode::Encode
 }
 
 fn is_zero_offset(value: &i32) -> bool {
@@ -95,7 +106,29 @@ fn is_zero_offset(value: &i32) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct OutputMetadata {
+    /// Omission inherits the selected donor; an empty value clears the tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct EncodeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub encoding_preferences: Option<crate::EncodingPreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hdr_metadata: Option<crate::HdrMetadataSettings>,
+    /// Encode the selected video, copy it unchanged, or produce audio-only output.
+    #[serde(default, skip_serializing_if = "is_encode_video_mode")]
+    #[ts(optional, as = "Option<_>")]
+    pub video_mode: VideoMode,
     /// Additional audio, subtitles and attachments; picture processing stays
     /// with the primary video. Metadata and chapter donors are selected below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -113,6 +146,16 @@ pub struct EncodeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub chapters_source_path: Option<String>,
+    /// False selects the source UI's None donor. Omission preserves old jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub copy_metadata: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub copy_chapters: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_metadata: Option<OutputMetadata>,
     /// A real QuickTime tmcd data stream copied only into a final MOV file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -135,6 +178,10 @@ pub struct EncodeSettings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(optional, as = "Option<_>")]
     pub av1an_filters: Vec<String>,
+    /// Source rows are opaque FFmpeg graphs, with source per-chunk semantics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_filters: bool,
     /// Omission preserves constant-quality encoding and old saved jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -146,6 +193,10 @@ pub struct EncodeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub trim: Option<VideoTrim>,
+    /// Apply the fork's packet-granular copied-track seek window. This does not enable trimming.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_trim: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<crate::SubtitleTrackSettings>,
     /// Per-source framing, applied before video encoding.
@@ -161,6 +212,15 @@ pub struct EncodeSettings {
     #[serde(default = "default_workers")]
     pub workers: u8,
     pub video_stream_index: u32,
+    /// NVENC constant-QP mode. Omission preserves the historical CRF/CQ mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub constant_quantizer: Option<u8>,
+    /// Compatibility-only former hardware profile marker. Historical jobs
+    /// remain readable; active hardware video encoding is unsupported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_nvenc_quality: bool,
     pub crf: u8,
     pub preset: u8,
     /// Explicit codec lossless mode. Omission keeps historical lossy behavior.
@@ -194,11 +254,19 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            encoding_preferences: None,
+            constant_quantizer: None,
+            source_nvenc_quality: false,
+            hdr_metadata: None,
+            video_mode: VideoMode::Encode,
             external_tracks: Vec::new(),
             track_overrides: Vec::new(),
             track_order: Vec::new(),
             metadata_source_path: None,
             chapters_source_path: None,
+            copy_metadata: None,
+            copy_chapters: None,
+            output_metadata: None,
             mov_timecode_track: None,
             temporal: None,
             parameters: Vec::new(),
@@ -206,9 +274,11 @@ impl Default for EncodeSettings {
             output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
+            source_filters: false,
             rate_control: None,
             tone_map: None,
             trim: None,
+            source_trim: false,
             subtitles: Vec::new(),
             framing: VideoFraming::default(),
             audio: Vec::new(),
@@ -232,7 +302,79 @@ impl Default for EncodeSettings {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub enum VideoMode {
+    #[default]
+    Encode,
+    Copy,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ResizeMode {
+    #[default]
+    Fit,
+    Height,
+    Width,
+    Percent,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ResizeFill {
+    #[default]
+    Pad,
+    Crop,
+    Stretch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResizeSettings {
+    pub mode: ResizeMode,
+    pub width: u32,
+    pub height: u32,
+    pub percent: u32,
+    pub fill: ResizeFill,
+    pub modulus: u32,
+    pub allow_upscale: bool,
+    pub correct_aspect: bool,
+}
+
+impl Default for ResizeSettings {
+    fn default() -> Self {
+        Self {
+            mode: ResizeMode::Fit,
+            width: 1920,
+            height: 1080,
+            percent: 50,
+            fill: ResizeFill::Pad,
+            modulus: 2,
+            allow_upscale: false,
+            correct_aspect: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BorderRatio {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct VideoFraming {
+    /// Source-relative resize intent; takes precedence over legacy resize_width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub resize: Option<ResizeSettings>,
+    /// Pad to a target display ratio after resizing, before explicit borders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub border_ratio: Option<BorderRatio>,
     #[serde(default)]
     pub crop: CropSettings,
     /// Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
@@ -291,6 +433,22 @@ pub enum AudioChannels {
     Stereo,
     Surround51,
     Surround71,
+    /// A numeric source grid value with an explicit, non-guessing layout policy.
+    Explicit {
+        count: u8,
+        layout: AudioChannelLayoutPolicy,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioChannelLayoutPolicy {
+    /// Retain the probed source speaker layout; count must match the source.
+    Source,
+    /// Named mono/stereo/5.1/7.1 conversion; other counts require Source.
+    Standard,
+    /// Use the installed FFmpeg encoder's count default, qualified before execution.
+    FfmpegDefault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -305,6 +463,10 @@ pub struct AudioTrackSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub gain: Option<AudioGain>,
+    /// Measured two-pass normalization, performed over the immutable job span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub normalization: Option<crate::AudioNormalization>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -314,15 +476,39 @@ pub struct AudioTrackSettings {
     rename_all_fields = "camelCase"
 )]
 pub enum VideoRateControl {
-    Bitrate { bitrate_kbps: u32, two_pass: bool },
-    TargetSize { target_size_mib: u32 },
+    Bitrate {
+        bitrate_kbps: u32,
+        two_pass: bool,
+    },
+    TargetSize {
+        target_size_mib: u32,
+    },
+    /// Source UI MB is binary MiB; retain its exact tenth without floats.
+    TargetSizeDecimal {
+        target_size_tenths_mb: u32,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoTimeTrim {
     pub start_milliseconds: u32,
     pub end_milliseconds: u32,
+    #[serde(default, skip_serializing_if = "decode_from_start")]
+    #[ts(optional, as = "Option<_>")]
+    pub seek_strategy: VideoSeekStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoSeekStrategy {
+    InputSeek,
+    #[default]
+    DecodeFromStart,
+}
+
+fn decode_from_start(value: &VideoSeekStrategy) -> bool {
+    *value == VideoSeekStrategy::DecodeFromStart
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -392,11 +578,30 @@ pub enum VideoEncoder {
     AomAv1,
     X265Standalone,
     VpxStandalone,
+    /// Compatibility-only historical token; hardware encoding is unsupported.
     H264Nvenc,
+    /// Compatibility-only historical token; hardware encoding is unsupported.
     HevcNvenc,
 }
 
 impl VideoEncoder {
+    pub fn is_hardware(self) -> bool {
+        matches!(self, Self::H264Nvenc | Self::HevcNvenc)
+    }
+    pub fn require_cpu_encoding(self) -> Result<(), AppError> {
+        if self.is_hardware() {
+            Err(AppError::new(
+                "HARDWARE_ENCODING_UNSUPPORTED",
+                format!(
+                    "Jesses supports CPU video encoding only. {} is retained only to read historical jobs; choose a CPU encoder for a new encode.",
+                    self.name()
+                ),
+                None,
+            ))
+        } else {
+            Ok(())
+        }
+    }
     pub fn is_svt(self) -> bool {
         matches!(self, Self::SvtAv1 | Self::SvtAv1FiveFish | Self::SvtAv1Hdr)
     }
@@ -418,10 +623,7 @@ impl VideoEncoder {
     }
 
     pub fn is_ffmpeg(self) -> bool {
-        matches!(
-            self,
-            Self::X265 | Self::Vp9 | Self::H264Nvenc | Self::HevcNvenc
-        )
+        matches!(self, Self::X265 | Self::Vp9)
     }
 }
 
@@ -529,11 +731,22 @@ pub struct JobSnapshot {
     pub mux_request: Option<crate::MuxRequest>,
     #[serde(default)]
     pub encode_settings: Option<EncodeSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub edited_command: Option<crate::EditedCommand>,
     #[serde(default)]
     pub recovery: Option<Av1anRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub standalone_recovery: Option<StandaloneRecovery>,
+    /// Unique input file bytes observed when execution starts, as decimal text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub input_size_bytes: Option<String>,
+    /// Verified output file bytes captured only after successful publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub output_size_bytes: Option<String>,
     pub progress_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub logs: Vec<String>,
@@ -559,6 +772,8 @@ mod tests {
         assert_eq!(snapshot.recovery, None);
         assert_eq!(snapshot.standalone_recovery, None);
         assert_eq!(snapshot.mux_request, None);
+        assert_eq!(snapshot.input_size_bytes, None);
+        assert_eq!(snapshot.output_size_bytes, None);
         assert!(
             serde_json::to_value(&snapshot)
                 .unwrap()

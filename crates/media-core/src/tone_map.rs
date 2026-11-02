@@ -38,10 +38,18 @@ fn manual_peak(value: &ToneMapPeakMode) -> bool {
     *value == ToneMapPeakMode::Manual
 }
 
+fn legacy_workflow(value: &bool) -> bool {
+    !*value
+}
+
 /// Explicit HDR-to-SDR rendering. Omission preserves the original color workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ToneMapSettings {
+    /// Source UI permits a compatible HDR10 base-layer CPU fallback.
+    #[serde(default, skip_serializing_if = "legacy_workflow")]
+    #[ts(optional, as = "Option<_>")]
+    pub source_workflow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub algorithm: Option<ToneMapAlgorithm>,

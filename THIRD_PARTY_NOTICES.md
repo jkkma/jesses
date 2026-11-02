@@ -10,6 +10,12 @@ and adapted for the jesses theme. Its MIT notice is preserved in
 Frontend and Rust dependency versions are recorded in `pnpm-lock.yaml` and
 `Cargo.lock`. Their respective licenses continue to apply.
 
+The native HDR metadata parsers `dolby_vision` 3.4.0 and `hdr10plus` 2.1.5
+are Copyright (c) 2026 and 2025 quietvoid, respectively, and licensed under MIT. Their notices are
+preserved in `licenses/dolby-vision-MIT.txt` and `licenses/hdr10plus-MIT.txt`.
+These exact Rust dependency versions are pinned in Cargo.toml and Cargo.lock;
+metadata imports require no separate runtime CLI.
+
 The optional packaged SVT-AV1 5fish and SVT-AV1-HDR executables are separate
 upstream programs. Their BSD 3-Clause Clear, BSD 2-Clause and patent notices are
 included beside each executable under `resources/tools`, together with the
@@ -81,3 +87,16 @@ and av1an packaging are deferred.
 Builds without the optional
 tools manifest distribute no media executables. The manifest is the inventory of
 what a particular package actually contains.
+
+Image-sequence filename ordering uses ICU4X `icu_collator` and its compiled
+collation data, pinned to 2.3.0 alongside the workspace's existing ICU 2.3 locale
+infrastructure. These Unicode-3.0-licensed components retain their notice in
+`licenses/icu4x-Unicode-3.0.txt`; exact transitive versions are recorded in Cargo.lock.
+
+The optional packaged grav1synth provider is MIT-licensed rust-av/grav1synth at
+commit1044228cd411672b565e5762a9b3597f4dd163b0, including its embedded film-stock
+resources. It statically links private LGPL FFmpeg8.1 and BSD dav1d1.5.4.
+Complete pinned sources, locked Cargo vendor with original crate licenses,
+readable notices, build inputs and payload hashes accompany the provider.
+Windows also retains matching compiler/runtime sources and notices. See
+`scripts/grav1synth-lock.json` and `docs/grav1synth-provider.md`.
