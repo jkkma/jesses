@@ -3,6 +3,131 @@ use media_core::{
     Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSceneDetection, Av1anSplitMethod,
 };
 
+/// The fork captures -x before custom filters execute, including Split=None.
+/// Keep the incoming draft immutable so Saved/New settings preserve the source
+/// profile rather than converting its hidden defaults into explicit API values.
+pub(super) fn effective_chunks(
+    settings: &EncodeSettings,
+    typed_rate: (u32, u32),
+    source_height: u32,
+) -> Av1anOptions {
+    let mut options = settings.av1an_options.unwrap_or_default();
+    if options.source_workflow {
+        options.maximum_chunk_frames = super::super::encoding_preferences::keyframes_at_rate(
+            typed_rate,
+            settings
+                .encoding_preferences
+                .map_or(10, |value| value.keyframe_interval_seconds),
+        );
+        options.minimum_scene_frames = 24;
+        options.scene_detection = Av1anSceneDetection::Standard;
+        options.scene_downscale_height = (options.split_method == Av1anSplitMethod::SceneDetection)
+            .then(|| source_scene_height(source_height));
+    }
+    options
+}
+
+fn source_scene_height(height: u32) -> u16 {
+    let multiplier = match height {
+        4320.. => 0.1667f32,
+        2160.. => 0.3333,
+        1440.. => 0.5,
+        1080.. => 0.6667,
+        900.. => 0.7083,
+        720.. => 0.75,
+        _ => 1.0,
+    };
+    ((height as f32 * multiplier).round_ties_even() as u32).clamp(360, 2160) as u16 / 2 * 2
+}
+
+pub(in crate::jobs) fn source_resamples(settings: &EncodeSettings, source: (u32, u32)) -> bool {
+    if !settings
+        .av1an_options
+        .is_some_and(|options| options.source_workflow)
+    {
+        return false;
+    }
+    let Some(temporal) = settings.temporal else {
+        return false;
+    };
+    let Some(output) = temporal.frame_rate else {
+        return false;
+    };
+    let mut rate = f64::from(source.0) / f64::from(source.1);
+    if temporal
+        .deinterlace
+        .map(|value| value.mode)
+        .or_else(|| temporal.qtgmc.map(|value| value.mode))
+        == Some(media_core::DeinterlaceMode::Bob)
+    {
+        rate *= 2.0;
+    }
+    let target = f64::from(output.numerator) / f64::from(output.denominator);
+    target > 0.01 && (rate - target).abs() > rate.max(target) * 0.0001
+}
+
+pub(super) fn effective_target(
+    options: Av1anOptions,
+    encoder: media_core::VideoEncoder,
+    source_dimensions: (u32, u32),
+) -> Option<media_core::Av1anTargetQuality> {
+    let mut target = options.target_quality?;
+    if options.source_target_defaults {
+        if matches!(
+            target.metric,
+            media_core::Av1anTargetMetric::Vmaf | media_core::Av1anTargetMetric::Ssimulacra2
+        ) {
+            target.minimum_score_tenths = (target.minimum_score_tenths / 10) * 10;
+        }
+        target.maximum_score_tenths = target.minimum_score_tenths;
+        target.minimum_crf = 15;
+        target.maximum_crf = match encoder {
+            media_core::VideoEncoder::X264 | media_core::VideoEncoder::X265Standalone => 35,
+            media_core::VideoEncoder::AomAv1 | media_core::VideoEncoder::VpxStandalone => 55,
+            _ => 50,
+        };
+        target.probes = 4;
+        target.probing_rate = 1;
+        let dimensions = if matches!(
+            target.metric,
+            media_core::Av1anTargetMetric::Vmaf
+                | media_core::Av1anTargetMetric::Xpsnr
+                | media_core::Av1anTargetMetric::XpsnrWeighted
+        ) {
+            (1920, 1080)
+        } else {
+            source_dimensions
+        };
+        target.probe_width = u16::try_from(dimensions.0).expect("validated source dimensions");
+        target.probe_height = u16::try_from(dimensions.1).expect("validated source dimensions");
+    }
+    Some(target)
+}
+
+/// Qualified engine's scalar parser uses a 1% score tolerance (and replaces
+/// zero with 0.001). Keep its actual floating range in recovery validation.
+pub(super) fn source_score_range(target: media_core::Av1anTargetQuality) -> (f64, f64) {
+    let value = if matches!(
+        target.metric,
+        media_core::Av1anTargetMetric::Vmaf | media_core::Av1anTargetMetric::Ssimulacra2
+    ) {
+        f64::from(target.minimum_score_tenths / 10)
+    } else {
+        f64::from(target.minimum_score_tenths) / 10.0
+    };
+    let value = if value == 0.0 { 0.001 } else { value };
+    let tolerance = value * 0.01;
+    (value - tolerance, value + tolerance)
+}
+
+fn dependency_target(options: Av1anOptions) -> Option<media_core::Av1anTargetQuality> {
+    let mut target = options.target_quality?;
+    if options.source_target_defaults {
+        target.probing_rate = 1;
+    }
+    Some(target)
+}
+
 pub(in crate::jobs) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     let Some(options) = settings.av1an_options else {
         return Ok(());
@@ -13,16 +138,17 @@ pub(in crate::jobs) fn validate_settings(settings: &EncodeSettings) -> Result<()
             "Scene, chunk, and quality target settings belong to the av1an workflow.",
         ));
     }
-    if options.maximum_chunk_frames > 100_000
+    if (!options.source_workflow
+        && (options.maximum_chunk_frames > 100_000
+            || !(1..=100_000).contains(&options.minimum_scene_frames)
+            || (options.maximum_chunk_frames > 0
+                && options.minimum_scene_frames > options.maximum_chunk_frames)
+            || options
+                .scene_downscale_height
+                .is_some_and(|height| !(64..=4320).contains(&height) || height % 2 != 0)))
         || options.encoder_threads.is_some_and(|threads| threads > 64)
         || !(1..=10).contains(&options.max_tries)
         || !(1..=16).contains(&options.scene_detection_slices)
-        || !(1..=100_000).contains(&options.minimum_scene_frames)
-        || (options.maximum_chunk_frames > 0
-            && options.minimum_scene_frames > options.maximum_chunk_frames)
-        || options
-            .scene_downscale_height
-            .is_some_and(|height| !(64..=4320).contains(&height) || height % 2 != 0)
     {
         return Err(invalid(
             "Use encoder threads 0–64, chunk attempts 1–10, scene slices 1–16, maximum chunk length 0–100000 (0 disables), a minimum scene length of 1–100000 not exceeding an enabled chunk limit, and an even scene height of 64–4320 or original resolution.",
@@ -64,7 +190,7 @@ pub(in crate::jobs) fn validate_settings(settings: &EncodeSettings) -> Result<()
     } else {
         1
     };
-    if let Some(target) = options.target_quality
+    if let Some(target) = effective_target(options, settings.encoder, (1920, 1080))
         && (settings.lossless
             || target.minimum_score_tenths > target.maximum_score_tenths
             || target.maximum_score_tenths > 1000
@@ -80,9 +206,7 @@ pub(in crate::jobs) fn validate_settings(settings: &EncodeSettings) -> Result<()
             "Quality targets require an ordered score range from 0–100, encoder-specific ordered CRF bounds, 1–10 probes, frame sampling from 1–4, and even evaluation dimensions from 128–8192.",
         ));
     }
-    if options
-        .target_quality
-        .is_some_and(metrics::needs_vapoursynth)
+    if dependency_target(options).is_some_and(metrics::needs_vapoursynth)
         && plugin(options).is_none()
     {
         return Err(invalid(
@@ -121,15 +245,20 @@ pub(super) fn validate_plugin(
     {
         return Err("Segment reading requires av1an with the segment-ffmpeg9-v1 compatibility fix. Older engines use FFmpeg's removed -vsync option and cannot create source segments.".into());
     }
-    if let Some(target) = options.target_quality {
-        metrics::validate_plugin(version, target, requires_probe_filter)?;
+    if let Some(target) = dependency_target(options) {
+        if options.source_target_defaults && !version.contains("source-unfiltered-probes-v1") {
+            return Err("Source target defaults require av1an with source-unfiltered-probes-v1. This engine cannot preserve the source application's unfiltered probe/reference behavior while final chunk filters run.".into());
+        }
+        metrics::validate_plugin(
+            version,
+            target,
+            requires_probe_filter && !options.source_target_defaults,
+        )?;
     }
     if (matches!(
         options.chunk_method,
         Av1anChunkMethod::Select | Av1anChunkMethod::Hybrid
-    ) || options
-        .target_quality
-        .is_some_and(|target| target.probing_rate > 1))
+    ) || dependency_target(options).is_some_and(|target| target.probing_rate > 1))
         && !version.contains("ffmpeg9-passthrough-v1")
     {
         return Err("This selection requires av1an with the ffmpeg9-passthrough-v1 compatibility fix. Older select source pipes duplicate frames and older sampled probes use removed FFmpeg arguments.".into());
@@ -148,8 +277,17 @@ pub(super) fn validate_plugin(
     Ok(())
 }
 
-pub(super) fn append(args: &mut Vec<OsString>, settings: &EncodeSettings, params: &str) {
-    let options = settings.av1an_options.unwrap_or_default();
+pub(super) fn append(
+    args: &mut Vec<OsString>,
+    settings: &EncodeSettings,
+    plan: &Plan,
+    params: &str,
+) {
+    let options = effective_chunks(
+        settings,
+        plan.source_chunk_rate(),
+        plan.frame_dimensions(false).1,
+    );
     for (key, value) in [
         ("--chunk-method", chunk_method(options).to_owned()),
         (
@@ -161,17 +299,7 @@ pub(super) fn append(args: &mut Vec<OsString>, settings: &EncodeSettings, params
             }
             .into(),
         ),
-        (
-            "--sc-method",
-            if options.scene_detection == Av1anSceneDetection::Standard {
-                "standard"
-            } else {
-                "fast"
-            }
-            .into(),
-        ),
         ("--extra-split", options.maximum_chunk_frames.to_string()),
-        ("--min-scene-len", options.minimum_scene_frames.to_string()),
         (
             "--chunk-order",
             match options.chunk_order {
@@ -185,10 +313,46 @@ pub(super) fn append(args: &mut Vec<OsString>, settings: &EncodeSettings, params
     ] {
         args.extend([key.into(), value.into()]);
     }
-    if let Some(height) = options.scene_downscale_height {
+    if !options.source_workflow {
+        args.extend([
+            "--sc-method".into(),
+            if options.scene_detection == Av1anSceneDetection::Standard {
+                "standard"
+            } else {
+                "fast"
+            }
+            .into(),
+            "--min-scene-len".into(),
+            options.minimum_scene_frames.to_string().into(),
+        ]);
+    }
+    if (!options.source_workflow || options.split_method == Av1anSplitMethod::SceneDetection)
+        && let Some(height) = options.scene_downscale_height
+    {
         args.extend(["--sc-downscale-height".into(), height.to_string().into()]);
     }
     if let Some(target) = options.target_quality {
+        if options.source_target_defaults {
+            let score = if matches!(
+                target.metric,
+                media_core::Av1anTargetMetric::Vmaf | media_core::Av1anTargetMetric::Ssimulacra2
+            ) {
+                (target.minimum_score_tenths / 10).to_string()
+            } else {
+                format!("{:.1}", f64::from(target.minimum_score_tenths) / 10.0)
+            };
+            args.extend([
+                "--source-unfiltered-probes".into(),
+                "--target-metric".into(),
+                metrics::cli(target.metric).into(),
+                "--target-quality".into(),
+                score.into(),
+            ]);
+            if target.metric == media_core::Av1anTargetMetric::Vmaf {
+                args.extend(["--vmaf-threads".into(), "2".into()]);
+            }
+            return;
+        }
         for (key, value) in [
             ("--target-metric", metrics::cli(target.metric).into()),
             (
@@ -261,18 +425,29 @@ pub(super) async fn capabilities(
         "--chunk-order",
     ];
     if options.target_quality.is_some() {
-        required.extend([
-            "--target-metric",
-            "--target-quality",
-            "--qp-range",
-            "--probes",
-            "--probing-rate",
-            "--probe-res",
-            "--probing-stat",
-            "--probe-video-params",
-            "--vmaf-threads",
-            "--vmaf-filter",
-        ]);
+        required.extend(["--target-metric", "--target-quality"]);
+        if options.source_target_defaults {
+            required.push("--source-unfiltered-probes");
+        }
+        if !options.source_target_defaults {
+            required.extend([
+                "--target-metric",
+                "--target-quality",
+                "--qp-range",
+                "--probes",
+                "--probing-rate",
+                "--probe-res",
+                "--probing-stat",
+                "--probe-video-params",
+                "--vmaf-threads",
+                "--vmaf-filter",
+            ]);
+        } else if options
+            .target_quality
+            .is_some_and(|target| target.metric == media_core::Av1anTargetMetric::Vmaf)
+        {
+            required.push("--vmaf-threads");
+        }
     }
     if !help.status.success()
         || required
@@ -289,7 +464,7 @@ pub(super) async fn capabilities(
             executable,
         ));
     }
-    if let Some(target) = options.target_quality {
+    if let Some(target) = dependency_target(options) {
         metrics::check(ffmpeg, environment, work, target, cancel).await?;
     }
     Ok(())
@@ -298,6 +473,75 @@ pub(super) async fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_chunk_interval_uses_fork_rounding_bounds_and_ignores_hidden_drafts() {
+        let settings = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            av1an_options: Some(Av1anOptions {
+                source_workflow: true,
+                maximum_chunk_frames: 100001,
+                minimum_scene_frames: 0,
+                scene_downscale_height: Some(1),
+                scene_detection: Av1anSceneDetection::Fast,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_settings(&settings).unwrap();
+        for (rate, expected) in [
+            ((24000, 1001), 240),
+            ((30, 1), 300),
+            ((25, 20), 12),
+            ((27, 20), 14),
+            ((60, 1), 480),
+        ] {
+            let effective = effective_chunks(&settings, rate, 1080);
+            assert_eq!(effective.maximum_chunk_frames, expected, "{rate:?}");
+            assert_eq!(effective.minimum_scene_frames, 24);
+            assert_eq!(effective.scene_detection, Av1anSceneDetection::Standard);
+            assert_eq!(effective.scene_downscale_height, Some(720));
+        }
+        let mut explicit = settings.clone();
+        explicit.av1an_options.as_mut().unwrap().source_workflow = false;
+        assert!(validate_settings(&explicit).is_err());
+        explicit
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .maximum_chunk_frames = 0;
+        explicit
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .minimum_scene_frames = 1;
+        explicit
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .scene_downscale_height = None;
+        assert_eq!(
+            effective_chunks(&explicit, (60, 1), 1080),
+            explicit.av1an_options.unwrap()
+        );
+    }
+
+    #[test]
+    fn source_scene_height_matches_adaptive_even_source_thresholds() {
+        for (height, expected) in [
+            (64, 360),
+            (480, 480),
+            (720, 540),
+            (900, 636),
+            (1080, 720),
+            (1440, 720),
+            (2160, 720),
+            (4320, 720),
+            (16384, 2160),
+        ] {
+            assert_eq!(source_scene_height(height), expected, "{height}");
+        }
+    }
 
     #[test]
     fn svt_rejects_explicit_non_420_output() {
@@ -396,7 +640,7 @@ mod tests {
         let supported_version = concat!(
             "target-probe-filter-v1\n",
             "ffmpeg9-passthrough-v1\n",
-            "ffmpeg-metric-matrix-v1\n",
+            "ffmpeg-metric-matrix-v1\nxpsnr-signed-stats-v1\n",
             "lsmash-software-probes-v1\n",
             "systems.innocent.lsmas : Found",
         );

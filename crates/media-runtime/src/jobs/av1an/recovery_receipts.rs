@@ -36,6 +36,7 @@ pub(super) struct Expected<'a> {
     /// still must match that independently validated encoding plan verbatim.
     pub source_fps_num: u32,
     pub source_fps_den: u32,
+    pub ignore_frame_mismatch: bool,
     /// Bytes from the separately fingerprinted, tool-created loadscript.vpy.
     pub options: Av1anOptions,
     pub script_text: &'a str,
@@ -108,6 +109,8 @@ struct TargetQuality {
     vmaf_filter: Option<String>,
     #[serde(default)]
     ffmpeg_filter_args: Vec<String>,
+    #[serde(default)]
+    source_unfiltered_probes: bool,
     vmaf_threads: usize,
     model: Option<String>,
     probing_rate: u64,
@@ -140,7 +143,11 @@ impl TargetQuality {
         let Some(target) = expected.options.target_quality else {
             return self.matches_disabled_plan(expected);
         };
-        self.vmaf_res == format!("{}x{}", target.probe_width, target.probe_height)
+        if expected.options.source_target_defaults {
+            return self.matches_source_target_plan(expected);
+        }
+        !self.source_unfiltered_probes
+            && self.vmaf_res == format!("{}x{}", target.probe_width, target.probe_height)
             && self.probe_res
                 == Some((
                     u32::from(target.probe_width),
@@ -173,8 +180,43 @@ impl TargetQuality {
             && self.probing_statistic.name == "Mean"
             && self.probing_statistic.value.is_none()
     }
+    fn matches_source_target_plan(&self, expected: &Expected<'_>) -> bool {
+        let target =
+            super::options::effective_target(expected.options, expected.encoder, (1920, 1080))
+                .expect("source target configured");
+        self.source_unfiltered_probes
+            && self.vmaf_res == "1920x1080"
+            && self.probe_res.is_none()
+            && self.vmaf_scaler == "bicubic"
+            && self.vmaf_filter.is_none()
+            && self.matches_ffmpeg_filter(None)
+            && if target.metric == media_core::Av1anTargetMetric::Vmaf {
+                self.vmaf_threads == 2
+            } else {
+                self.vmaf_threads > 0
+            }
+            && self.model.is_none()
+            && self.probing_rate == 1
+            && self.probes == 4
+            && self.target == Some(super::options::source_score_range(target))
+            && self.metric == super::metrics::receipt(target.metric)
+            && self.min_q == u64::from(target.minimum_crf)
+            && self.max_q == u64::from(target.maximum_crf)
+            && self.interp_method.is_none()
+            && self.encoder == super::encoder::receipt_name(expected.encoder)
+            && self.pix_format.eq_ignore_ascii_case(expected.pixel_format)
+            && same_path(&self.temp, expected.chunks_directory)
+            && self.workers > 0
+            && self.video_params.is_none()
+            && !self.params_copied
+            && self.vspipe_args.is_empty()
+            && self.probing_vmaf_features == ["Default"]
+            && self.probing_statistic.name == "Automatic"
+            && self.probing_statistic.value.is_none()
+    }
     fn matches_disabled_plan(&self, expected: &Expected<'_>) -> bool {
-        self.vmaf_res == "1920x1080"
+        !self.source_unfiltered_probes
+            && self.vmaf_res == "1920x1080"
             && self.probe_res.is_none()
             && self.vmaf_scaler == "bicubic"
             && self.vmaf_filter.is_none()
@@ -437,6 +479,23 @@ fn scene_coverage(scenes: &[Scene], total: u64, max_length: Option<u64>) -> bool
     next == total
 }
 
+/// A probe can run before the executable queue is saved (Select/Hybrid).
+/// Recognize its disposable files only against a complete validated scene map.
+pub(super) fn target_scene_count(bytes: &[u8], total: u64, maximum: u32) -> Result<usize, String> {
+    let scenes: Scenes = parse(bytes, "scenes.json")?;
+    if scenes.frames != total
+        || !scene_coverage(&scenes.scenes, total, None)
+        || !scene_coverage(
+            &scenes.split_scenes,
+            total,
+            (maximum > 0).then_some(u64::from(maximum)),
+        )
+    {
+        return Err("Target probe scenes do not cover the validated source exactly".into());
+    }
+    Ok(scenes.split_scenes.len())
+}
+
 pub(super) fn validate(
     chunks_bytes: &[u8],
     scenes_bytes: &[u8],
@@ -521,12 +580,17 @@ fn validate_receipt_shapes(
             || chunk.passes != 1
             || chunk.video_params != expected.video_params
             || chunk.noise_size != (None, None)
-            || chunk.ignore_frame_mismatch
+            || chunk.ignore_frame_mismatch != expected.ignore_frame_mismatch
             || chunk.per_shot_target_quality_cq.is_some_and(|quality| {
                 !matches!(
                     expected.options.chunk_method,
                     Av1anChunkMethod::Select | Av1anChunkMethod::Hybrid
-                ) || expected.options.target_quality.is_none_or(|target| {
+                ) || super::options::effective_target(
+                    expected.options,
+                    expected.encoder,
+                    (1920, 1080),
+                )
+                .is_none_or(|target| {
                     !quality.is_finite()
                         || quality < f64::from(target.minimum_crf)
                         || quality > f64::from(target.maximum_crf)
@@ -823,6 +887,7 @@ video.set_output()
         }
         fn expected(&self) -> Expected<'_> {
             Expected {
+                ignore_frame_mismatch: false,
                 source: &self.source,
                 chunks_directory: &self.directory,
                 video_params: &self.params,
@@ -930,6 +995,49 @@ video.set_output()
         fixture.queue[0]["encoder"] = json!("x264");
         fixture.queue[0]["target_quality"]["pix_format"] = json!("YUV420P10LE");
         assert!(fixture.validate().is_err());
+    }
+
+    #[test]
+    fn source_target_receipts_require_engine_defaults_and_ignore_hidden_draft_values() {
+        let mut fixture = Fixture::new();
+        fixture.options.source_target_defaults = true;
+        fixture.options.target_quality = Some(media_core::Av1anTargetQuality {
+            metric: media_core::Av1anTargetMetric::XpsnrWeighted,
+            minimum_score_tenths: 400,
+            maximum_score_tenths: 0,
+            minimum_crf: 0,
+            maximum_crf: 0,
+            probes: 0,
+            probing_rate: 255,
+            probe_width: 1,
+            probe_height: 3,
+        });
+        for chunk in fixture.queue.as_array_mut().unwrap() {
+            chunk["target_quality"]["metric"] = json!("XPSNRWeighted");
+            chunk["target_quality"]["target"] = json!([39.6, 40.4]);
+            chunk["target_quality"]["source_unfiltered_probes"] = json!(true);
+        }
+        fixture.validate().unwrap();
+        let original = fixture.queue[0]["target_quality"].clone();
+        for (key, value) in [
+            ("probe_res", json!([1920, 1080])),
+            ("source_unfiltered_probes", json!(false)),
+            ("min_q", json!(1)),
+            ("max_q", json!(63)),
+            ("probes", json!(1)),
+            ("probing_rate", json!(2)),
+            ("vmaf_filter", json!("hue=s=0")),
+            ("video_params", json!(fixture.params)),
+            ("params_copied", json!(true)),
+            ("probing_statistic", json!({"name":"Mean","value":null})),
+        ] {
+            fixture.queue[0]["target_quality"] = original.clone();
+            fixture.queue[0]["target_quality"][key] = value;
+            assert!(
+                fixture.validate().is_err(),
+                "source target override {key} must be rejected"
+            );
+        }
     }
 
     #[test]

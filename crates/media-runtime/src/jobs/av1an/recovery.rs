@@ -2,7 +2,7 @@
 //! never sufficient authority to run saved commands or remove a directory.
 use super::*;
 use crate::jobs::files::WorkspaceLock;
-use media_core::{Av1anRecovery, RecoveryPhase};
+use media_core::{Av1anRecovery, RecoveryPhase, VideoEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -231,31 +231,90 @@ fn atomic(path: &Path, data: &[u8]) -> Result<(), AppError> {
         .create_new(true)
         .open(&temp)
         .map_err(|e| error(&temp, e.to_string()))?;
-    file.write_all(data)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| error(&temp, e.to_string()))?;
-    drop(file);
-    fs::rename(&temp, path).map_err(|e| error(path, e.to_string()))?;
-    #[cfg(unix)]
-    File::open(path.parent().expect("owned directory"))
-        .and_then(|f| f.sync_all())
-        .map_err(|e| error(path, e.to_string()))?;
-    Ok(())
+    let created = file_identity(&file).map_err(|e| error(&temp, e.to_string()))?;
+    let result = (|| {
+        file.write_all(data)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| error(&temp, e.to_string()))?;
+        drop(file);
+        fs::rename(&temp, path).map_err(|e| error(path, e.to_string()))?;
+        #[cfg(unix)]
+        File::open(path.parent().expect("owned directory"))
+            .and_then(|f| f.sync_all())
+            .map_err(|e| error(path, e.to_string()))?;
+        Ok(())
+    })();
+    if result.is_err() && identity(&temp).is_ok_and(|current| current == created) {
+        // A failed write must not strand our partial receipt as a foreign
+        // workspace artifact. Never adopt or remove another writer's file.
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Chunk {
     frames: u64,
     file: Stamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decoded_contract: Option<super::super::source_queue::ChunkContract>,
+}
+
+/// Immutable authority for an already sealed engine queue. New argv belongs
+/// to Manifest.settings/params/filter; it cannot rewrite these old commands.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QueueRecipe {
+    source: Stamp,
+    original_source: Option<Stamp>,
+    tools: Vec<Stamp>,
+    settings: EncodeSettings,
+    params: Vec<String>,
+    pixel_format: String,
+    fps_num: u32,
+    fps_den: u32,
+    source_rate: (u32, u32),
+    total_frames: u64,
+    source_filter: Option<String>,
+    /// Frozen per-chunk count policy, distinct from the current global concat flag.
+    #[serde(default)]
+    ignore_frame_mismatch: bool,
+}
+
+fn epoch_milliseconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| u64::try_from(value.as_millis()).ok())
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edited_command: Option<media_core::EditedCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restart_pending: bool,
+    /// Allows recovery from a crash between manifest reset and history commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_settings: Option<EncodeSettings>,
     version: u32,
     id: String,
     directory: Identity,
     request: RemuxRequest,
     settings: EncodeSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_recipe: Option<QueueRecipe>,
+    /// A source-created cut uses the same decoder pathname on New Settings,
+    /// while immutable variants retain both old and new bytes for rollback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    source_cut_slot: bool,
+    /// Exact next immutable cut admitted before an owned in-place slot write.
+    /// A crash can restore the committed variant without trusting partial bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_slot_write: Option<Stamp>,
     /// The source av1an reads. A frame-changing preprocessing workflow copies
     /// its verified lossless output to a stable path inside this workspace.
     source: Stamp,
@@ -266,6 +325,15 @@ struct Manifest {
     /// final audio/metadata mux when av1an reads a prepared video instead.
     #[serde(default)]
     original_source: Option<Stamp>,
+    /// The immutable user file remains authority when source AV1AN reads a cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_cut_original: Option<Stamp>,
+    /// Exact authorized New-settings digest; Saved can never authorize a cut replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_cut_rebind_pending: Option<String>,
+    /// Recipe/source/tool fields only: completed chunk receipts are never resurrected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_cut_committed_recipe: Option<Box<CommandRecipe>>,
     /// Decoded-pixel identity of a freshly regenerated prepared source. This
     /// prevents old chunks from surviving a plugin/filter output change while
     /// remaining independent of Matroska IDs and path spelling.
@@ -287,11 +355,147 @@ struct Manifest {
     script: Option<Stamp>,
     #[serde(default)]
     reader_cache: Option<Stamp>,
+    #[serde(default)]
+    concat_inputs: Vec<Stamp>,
+    /// Quiescent metric/probe files are disposable, never executable receipts.
+    /// Existing files must still match their sealed identities before removal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_artifacts: Vec<Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_scenes: Option<Stamp>,
     completed: BTreeMap<String, Chunk>,
     #[serde(default)]
     segments: Vec<Stamp>,
     intermediate: Identity,
     final_video: Option<Stamp>,
+}
+
+fn is_source_cut(settings: &EncodeSettings) -> bool {
+    settings.backend == media_core::EncodeBackend::Av1an
+        && settings.source_trim
+        && settings.trim.is_some()
+}
+fn source_workflow(settings: &EncodeSettings) -> bool {
+    settings.backend == media_core::EncodeBackend::Av1an
+        && settings
+            .av1an_options
+            .is_some_and(|options| options.source_workflow)
+}
+fn queue_settings(manifest: &Manifest) -> &EncodeSettings {
+    manifest
+        .queue_recipe
+        .as_ref()
+        .map_or(&manifest.settings, |recipe| &recipe.settings)
+}
+fn queue_rate(manifest: &Manifest) -> (u32, u32) {
+    manifest
+        .queue_recipe
+        .as_ref()
+        .map_or((manifest.fps_num, manifest.fps_den), |recipe| {
+            (recipe.fps_num, recipe.fps_den)
+        })
+}
+fn queue_frames(manifest: &Manifest) -> u64 {
+    manifest
+        .queue_recipe
+        .as_ref()
+        .map_or(manifest.total_frames, |recipe| recipe.total_frames)
+}
+fn queue_count_policy(manifest: &Manifest) -> super::super::source_queue::CountPolicy {
+    if manifest
+        .queue_recipe
+        .as_ref()
+        .is_some_and(|recipe| recipe.ignore_frame_mismatch)
+    {
+        super::super::source_queue::CountPolicy::SourceTypedResample
+    } else {
+        super::super::source_queue::CountPolicy::ExactSourceFrames
+    }
+}
+fn queue_options(manifest: &Manifest) -> media_core::Av1anOptions {
+    super::options::effective_chunks(queue_settings(manifest), queue_rate(manifest), 0)
+}
+fn cut_slot(root: &Path, original: &Path) -> PathBuf {
+    root.join(format!(
+        "source-cut.{}",
+        original
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mkv")
+    ))
+}
+fn write_cut_slot(
+    source: &Stamp,
+    path: &Path,
+    owner: &Identity,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Stamp, AppError> {
+    use std::io::{Seek, SeekFrom};
+    if identity(path)? != *owner || digest(&source.path, cancel)? != *source {
+        return Err(error(
+            path,
+            "The immutable cut or owned decoder slot changed before its authorized write.",
+        ));
+    }
+    let guard = Source::open(&source.path)?;
+    let mut input =
+        File::open(&source.path).map_err(|cause| error(&source.path, cause.to_string()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|cause| error(path, cause.to_string()))?;
+    output
+        .set_len(0)
+        .and_then(|()| output.seek(SeekFrom::Start(0)))
+        .map_err(|cause| error(path, cause.to_string()))?;
+    let mut buffer = [0u8; 65536];
+    loop {
+        if let Some(cancel) = cancel {
+            check_cancel(cancel)?;
+        }
+        let count = input
+            .read(&mut buffer)
+            .map_err(|cause| error(&source.path, cause.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|cause| error(path, cause.to_string()))?;
+    }
+    output
+        .sync_all()
+        .map_err(|cause| error(path, cause.to_string()))?;
+    drop(output);
+    guard.verify()?;
+    let actual = digest(path, cancel)?;
+    if actual.identity != *owner || actual.length != source.length || actual.sha256 != source.sha256
+    {
+        return Err(error(
+            path,
+            "The source decoder slot differs from its immutable cut receipt.",
+        ));
+    }
+    Ok(actual)
+}
+fn settings_digest(settings: &EncodeSettings) -> Result<String, AppError> {
+    serde_json::to_vec(settings)
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))
+}
+fn verify_source_cut_original(
+    manifest: &Manifest,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    if let Some(original) = &manifest.source_cut_original
+        && digest(&original.path, cancel)? != *original
+    {
+        return Err(error(
+            &original.path,
+            "The immutable original file changed; a copied-input job cannot adopt or resume this source.",
+        ));
+    }
+    Ok(())
 }
 
 fn default_pixel_format() -> String {
@@ -341,7 +545,8 @@ fn load(
         || manifest.id != id
         || manifest.directory != owner
         || manifest.request != *request
-        || manifest.settings != *settings
+        || (manifest.settings != *settings
+            && !(manifest.restart_pending && manifest.previous_settings.as_ref() == Some(settings)))
         || manifest.total_frames == 0
     {
         return Err(error(
@@ -350,6 +555,14 @@ fn load(
         ));
     }
     validate_layout(&root, &manifest)?;
+    for stamp in &manifest.concat_inputs {
+        if digest(&stamp.path, None)? != *stamp {
+            return Err(error(
+                &stamp.path,
+                "A saved concatenation control file changed.",
+            ));
+        }
+    }
     Ok((root, manifest))
 }
 
@@ -395,6 +608,55 @@ fn external_reader_cache_path(
 }
 
 fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
+    if source_workflow(&manifest.settings)
+        && manifest.queue.is_some()
+        && manifest.queue_recipe.is_none()
+    {
+        return Err(error(
+            root,
+            "The source queue has no sealed original recipe; New/Saved settings cannot infer authority from completion progress.",
+        ));
+    }
+    if manifest.queue_recipe.as_ref().is_some_and(|recipe| {
+        !source_workflow(&recipe.settings)
+            || recipe.total_frames == 0
+            || recipe.source.path != manifest.source.path
+    }) {
+        return Err(error(
+            root,
+            "The immutable source queue recipe has inconsistent source/ordinal authority.",
+        ));
+    }
+    if manifest.target_artifacts.is_empty() != manifest.target_scenes.is_none() {
+        return Err(error(
+            root,
+            "The metric target cache lacks its sealed scene authority.",
+        ));
+    }
+    if !manifest.target_artifacts.is_empty() {
+        let count = target_artifact_count(root, manifest)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for stamp in &manifest.target_artifacts {
+            let relative = stamp
+                .path
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .map(|value| value.replace('\\', "/"));
+            if relative
+                .as_deref()
+                .is_none_or(|relative| !is_target_artifact(relative, manifest, count))
+                || !seen.insert(&stamp.path)
+            {
+                return Err(error(root, "Unexpected metric target artifact location."));
+            }
+        }
+    }
+    if manifest.concat_inputs.iter().any(|stamp| {
+        stamp.path != root.join("chunks/options.json") && stamp.path != root.join("chunks/concat")
+    }) {
+        return Err(error(root, "Unexpected concatenation control location."));
+    }
     if manifest.prepared_identity.is_some() {
         if manifest.source.path != root.join("prepared.mkv")
             || manifest.original_source.is_none()
@@ -403,6 +665,17 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             return Err(error(
                 root,
                 "The prepared recovery source is outside its owned stable path or has inconsistent identity fields.",
+            ));
+        }
+    } else if manifest.source_cut_slot {
+        if manifest
+            .original_source
+            .as_ref()
+            .is_none_or(|original| manifest.source.path != cut_slot(root, &original.path))
+        {
+            return Err(error(
+                root,
+                "The source cut decoder slot is outside its exact owned path.",
             ));
         }
     } else if manifest.original_source.is_some() {
@@ -414,6 +687,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     let expected = [
         ("chunks/chunks.json", manifest.queue.as_ref()),
         ("chunks/scenes.json", manifest.scenes.as_ref()),
+        ("chunks/scenes.json", manifest.target_scenes.as_ref()),
         ("chunks/split/loadscript.vpy", manifest.script.as_ref()),
         (
             if super::encoder::video_extension(manifest.settings.encoder, &manifest.settings)
@@ -434,7 +708,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             ));
         }
     }
-    let options = manifest.settings.av1an_options.unwrap_or_default();
+    let options = queue_options(manifest);
     let expected_reader_cache = if manifest.queue.is_some() {
         super::recovery_receipts::reader_cache(options.chunk_method)
             .map(|reader| external_reader_cache_path(&root.join("chunks"), reader))
@@ -486,10 +760,10 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             || chunk.file.path
                 != root.join("chunks/encode").join(format!(
                     "{name}.{}",
-                    super::encoder::chunk_extension(manifest.settings.encoder)
+                    super::encoder::chunk_extension(queue_settings(manifest).encoder)
                 ))
             || chunk.frames == 0
-            || chunk.frames > manifest.total_frames
+            || chunk.frames > queue_frames(manifest)
             || (options.chunk_method != media_core::Av1anChunkMethod::Segment
                 && options.maximum_chunk_frames > 0
                 && chunk.frames > u64::from(options.maximum_chunk_frames))
@@ -501,7 +775,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
             .checked_add(chunk.frames)
             .ok_or_else(|| error(root, "Invalid completed frame count."))?;
     }
-    if completed > manifest.total_frames {
+    if completed > queue_frames(manifest) {
         return Err(error(root, "Completed chunk frames exceed the source."));
     }
     Ok(())
@@ -621,7 +895,12 @@ fn source_matches_attempt(
     prepared: Option<&PreparedSource>,
     cancel: Option<&watch::Receiver<bool>>,
 ) -> Result<bool, AppError> {
-    if let Some(prepared) = prepared {
+    if manifest.source_cut_slot {
+        Ok(prepared.is_none()
+            && manifest.original_source.as_ref() == Some(original_source)
+            && manifest.source.path == cut_slot(root, &original_source.path)
+            && digest(&manifest.source.path, cancel)? == manifest.source)
+    } else if let Some(prepared) = prepared {
         Ok(manifest.original_source.as_ref() == Some(original_source)
             && manifest.prepared_identity.as_deref() == Some(prepared.decoded_identity.as_str())
             && manifest.source.path == root.join("prepared.mkv")
@@ -708,18 +987,18 @@ impl Workspace {
             workspace: self.root.to_string_lossy().into_owned(),
             phase: self.manifest.phase,
             completed_frames: if self.manifest.phase == RecoveryPhase::Finalizing {
-                self.manifest.total_frames
+                queue_frames(&self.manifest)
             } else {
                 self.manifest.completed.values().map(|c| c.frames).sum()
             },
-            total_frames: self.manifest.total_frames,
+            total_frames: queue_frames(&self.manifest),
         }
     }
     fn receipts(&self) -> Result<super::recovery_receipts::Receipts, AppError> {
         let chunks = self.root.join("chunks");
         identity(&chunks)?;
         identity(&chunks.join("split"))?;
-        let options = self.manifest.settings.av1an_options.unwrap_or_default();
+        let options = queue_options(&self.manifest);
         let script_bytes = if super::options::plugin(options).is_some() {
             bytes(&chunks.join("split/loadscript.vpy"))?
         } else {
@@ -732,19 +1011,51 @@ impl Workspace {
             &bytes(&chunks.join("scenes.json"))?,
             &bytes(&chunks.join("done.json"))?,
             &super::recovery_receipts::Expected {
-                source: &self.manifest.source.path,
+                source: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(&self.manifest.source.path, |recipe| &recipe.source.path),
                 chunks_directory: &chunks,
-                video_params: &self.manifest.params,
-                encoder: self.manifest.settings.encoder,
-                pixel_format: &self.manifest.pixel_format,
-                total_frames: self.manifest.total_frames,
-                fps_num: self.manifest.fps_num,
-                fps_den: self.manifest.fps_den,
-                source_fps_num: self.source_rate.0,
-                source_fps_den: self.source_rate.1,
+                video_params: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(&self.manifest.params, |recipe| &recipe.params),
+                encoder: queue_settings(&self.manifest).encoder,
+                pixel_format: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(&self.manifest.pixel_format, |recipe| &recipe.pixel_format),
+                total_frames: queue_frames(&self.manifest),
+                fps_num: queue_rate(&self.manifest).0,
+                fps_den: queue_rate(&self.manifest).1,
+                source_fps_num: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(self.source_rate, |recipe| recipe.source_rate)
+                    .0,
+                source_fps_den: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(self.source_rate, |recipe| recipe.source_rate)
+                    .1,
+                ignore_frame_mismatch: self.manifest.queue_recipe.as_ref().map_or_else(
+                    || super::options::source_resamples(&self.manifest.settings, self.source_rate),
+                    |recipe| recipe.ignore_frame_mismatch,
+                ),
                 script_text,
                 options,
-                source_filter: self.manifest.source_filter.as_deref(),
+                source_filter: self
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(self.manifest.source_filter.as_deref(), |recipe| {
+                        recipe.source_filter.as_deref()
+                    }),
             },
         )
         .map_err(|e| error(&chunks, e))
@@ -762,7 +1073,7 @@ impl Workspace {
             Err(_) if !required => return Ok(()),
             Err(e) => return Err(e),
         };
-        if receipts.total_frames != self.manifest.total_frames
+        if receipts.total_frames != queue_frames(&self.manifest)
             || receipts.completed_frames > receipts.total_frames
             || receipts.queued_chunks == 0
             || receipts
@@ -784,6 +1095,47 @@ impl Workspace {
                 ));
             }
             *old = Some(stamp);
+        }
+        if source_workflow(&self.manifest.settings) && self.manifest.queue_recipe.is_none() {
+            self.manifest.queue_recipe = Some(QueueRecipe {
+                source: self.manifest.source.clone(),
+                original_source: self.manifest.original_source.clone(),
+                tools: self.manifest.tools.clone(),
+                settings: self.manifest.settings.clone(),
+                params: self.manifest.params.clone(),
+                pixel_format: self.manifest.pixel_format.clone(),
+                fps_num: self.manifest.fps_num,
+                fps_den: self.manifest.fps_den,
+                source_rate: self.source_rate,
+                total_frames: self.manifest.total_frames,
+                source_filter: self.manifest.source_filter.clone(),
+                ignore_frame_mismatch: super::options::source_resamples(
+                    &self.manifest.settings,
+                    self.source_rate,
+                ),
+            });
+        }
+        self.manifest.concat_inputs.clear();
+        for relative in ["chunks/options.json", "chunks/concat"] {
+            let path = self.root.join(relative);
+            if path.exists() {
+                if relative.ends_with("options.json") {
+                    let values: Vec<String> = serde_json::from_slice(&bytes(&path)?)
+                        .map_err(|cause| error(&path, cause.to_string()))?;
+                    if values.first().map(String::as_str) != Some("-o")
+                        || values
+                            .get(1)
+                            .is_none_or(|value| !Path::new(value).starts_with(&self.root))
+                        || values.last().map(String::as_str) != Some("]")
+                    {
+                        return Err(error(
+                            &path,
+                            "The concatenation options do not name an owned output.",
+                        ));
+                    }
+                }
+                self.manifest.concat_inputs.push(digest(&path, None)?);
+            }
         }
         if let Some(path) = &receipts.script_path {
             let stamp = digest(path, None)?;
@@ -882,7 +1234,7 @@ impl Workspace {
             let path = encode.join(format!(
                 "{}.{}",
                 chunk.name,
-                super::encoder::chunk_extension(self.manifest.settings.encoder)
+                super::encoder::chunk_extension(queue_settings(&self.manifest).encoder)
             ));
             // Once a completion receipt is observed, keep its file read-only
             // through concatenation. This closes the verification-to-reuse gap.
@@ -897,6 +1249,7 @@ impl Workspace {
             self.manifest.completed.insert(
                 chunk.name,
                 Chunk {
+                    decoded_contract: None,
                     frames: chunk.frames,
                     file: stamp,
                 },
@@ -906,11 +1259,33 @@ impl Workspace {
         Ok(())
     }
     fn verify_saved(&self, cancel: Option<&watch::Receiver<bool>>) -> Result<(), AppError> {
+        if let Some(recipe) = &self.manifest.queue_recipe {
+            for stamp in recipe.tools.iter().chain(std::iter::once(
+                recipe.original_source.as_ref().unwrap_or(&recipe.source),
+            )) {
+                if digest(&stamp.path, cancel)? != *stamp {
+                    return Err(error(
+                        &stamp.path,
+                        "An immutable source queue resource changed.",
+                    ));
+                }
+            }
+        }
+        if self.manifest.source_cut_slot
+            && self.manifest.source_slot_write.is_none()
+            && digest(&self.manifest.source.path, cancel)? != self.manifest.source
+        {
+            return Err(error(
+                &self.manifest.source.path,
+                "The sealed source cut decoder slot changed.",
+            ));
+        }
         for stamp in self
             .manifest
             .queue
             .iter()
             .chain(self.manifest.scenes.iter())
+            .chain(self.manifest.target_scenes.iter())
             .chain(self.manifest.script.iter())
             .chain(self.manifest.reader_cache.iter())
             .chain(self.manifest.segments.iter())
@@ -924,6 +1299,88 @@ impl Workspace {
                 ));
             }
         }
+        for stamp in &self.manifest.target_artifacts {
+            match fs::symlink_metadata(&stamp.path) {
+                Ok(_) if digest(&stamp.path, cancel)? != *stamp => {
+                    return Err(error(&stamp.path, "A sealed metric target cache changed."));
+                }
+                Ok(_) => {}
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cause) => return Err(error(&stamp.path, cause.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    fn target_artifacts(&self) -> Result<Vec<PathBuf>, AppError> {
+        let split = self.root.join("chunks/split");
+        if !split
+            .try_exists()
+            .map_err(|cause| error(&split, cause.to_string()))?
+        {
+            return Ok(Vec::new());
+        }
+        identity(&split)?;
+        let count = target_artifact_count(&self.root, &self.manifest)?;
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&split).map_err(|cause| error(&split, cause.to_string()))? {
+            let path = entry
+                .map_err(|cause| error(&split, cause.to_string()))?
+                .path();
+            let relative = format!(
+                "chunks/split/{}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            if is_target_artifact(&relative, &self.manifest, count) {
+                identity(&path)?;
+                if !fs::symlink_metadata(&path)
+                    .map_err(|cause| error(&path, cause.to_string()))?
+                    .is_file()
+                {
+                    return Err(error(
+                        &path,
+                        "A metric target artifact must be a regular file.",
+                    ));
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn seal_target_artifacts(&mut self) -> Result<(), AppError> {
+        self.verify_owner()?;
+        self.manifest.target_artifacts = self
+            .target_artifacts()?
+            .iter()
+            .map(|path| digest(path, None))
+            .collect::<Result<_, _>>()?;
+        if !self.manifest.target_artifacts.is_empty() {
+            let scenes = digest(&self.root.join("chunks/scenes.json"), None)?;
+            if self
+                .manifest
+                .target_scenes
+                .as_ref()
+                .is_some_and(|saved| *saved != scenes)
+            {
+                return Err(error(&scenes.path, "The target scene map changed."));
+            }
+            self.manifest.target_scenes = Some(scenes);
+        } else {
+            self.manifest.target_scenes = None;
+        }
+        Ok(())
+    }
+
+    fn remove_target_artifacts(&mut self) -> Result<(), AppError> {
+        self.verify_saved(None)?;
+        for path in self.target_artifacts()? {
+            self.verify_owner()?;
+            remove_tree(&path, &identity(&path)?, None)?;
+        }
+        self.manifest.target_artifacts.clear();
+        self.manifest.target_scenes = None;
         Ok(())
     }
     fn sanitize_done(&self) -> Result<(), AppError> {
@@ -939,7 +1396,7 @@ impl Workspace {
                 )
             })
             .collect();
-        atomic(&path,&serde_json::to_vec(&serde_json::json!({"frames":self.manifest.total_frames,"done":done,"audio_done":false})).expect("serializable receipts"))
+        atomic(&path,&serde_json::to_vec(&serde_json::json!({"frames":queue_frames(&self.manifest),"done":done,"audio_done":false})).expect("serializable receipts"))
     }
 
     fn prepare_video_only_resume(&self, queued_chunks: usize) -> Result<(), AppError> {
@@ -975,7 +1432,9 @@ impl Workspace {
                             .is_some_and(|name| {
                                 let extension = format!(
                                     ".{}",
-                                    super::encoder::chunk_extension(self.manifest.settings.encoder)
+                                    super::encoder::chunk_extension(
+                                        queue_settings(&self.manifest).encoder
+                                    )
                                 );
                                 let Some(index) = name.strip_suffix(&extension) else {
                                     return false;
@@ -1028,10 +1487,909 @@ impl Workspace {
     }
 }
 
+pub(in crate::jobs) struct OwnedRecovery {
+    workspace: Workspace,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::jobs) struct CommandRecipe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_recipe: Option<QueueRecipe>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    source_cut_slot: bool,
+    source: Stamp,
+    original_source: Option<Stamp>,
+    source_cut_original: Option<Stamp>,
+    prepared_identity: Option<String>,
+    tools: Vec<Stamp>,
+    external_sources: Vec<Stamp>,
+    settings: EncodeSettings,
+    params: Vec<String>,
+    pixel_format: String,
+    fps_num: u32,
+    fps_den: u32,
+    total_frames: u64,
+    source_filter: Option<String>,
+    edited_command: Option<media_core::EditedCommand>,
+}
+
+fn target_artifact_count(root: &Path, manifest: &Manifest) -> Result<usize, AppError> {
+    let options = queue_options(manifest);
+    if options.target_quality.is_none() {
+        return Ok(0);
+    }
+    let scenes = root.join("chunks/scenes.json");
+    if !scenes
+        .try_exists()
+        .map_err(|cause| error(&scenes, cause.to_string()))?
+    {
+        return Ok(0);
+    }
+    super::recovery_receipts::target_scene_count(
+        &bytes(&scenes)?,
+        queue_frames(manifest),
+        options.maximum_chunk_frames,
+    )
+    .map_err(|message| error(&scenes, message))
+}
+
+fn is_target_artifact(relative: &str, manifest: &Manifest, count: usize) -> bool {
+    use media_core::Av1anTargetMetric;
+    let options = queue_options(manifest);
+    let Some(target) =
+        super::options::effective_target(options, queue_settings(manifest).encoder, (1920, 1080))
+    else {
+        return false;
+    };
+    let Some(name) = relative.strip_prefix("chunks/split/") else {
+        return false;
+    };
+    if let Some(index) = name.strip_suffix(".json") {
+        return (target.metric == Av1anTargetMetric::Vmaf
+            || (matches!(
+                target.metric,
+                Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted
+            ) && target.probing_rate == 1))
+            && index
+                .parse::<usize>()
+                .is_ok_and(|value| value < count && value.to_string() == index);
+    }
+    let extension = match queue_settings(manifest).encoder {
+        VideoEncoder::X264 => ".264",
+        VideoEncoder::X265Standalone => ".hevc",
+        _ => ".ivf",
+    };
+    let Some((index, quality)) = name
+        .strip_prefix("v_")
+        .and_then(|name| name.strip_suffix(extension))
+        .and_then(|name| name.split_once('_'))
+    else {
+        return false;
+    };
+    let index_valid = index.len() == 5
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && index.parse::<usize>().is_ok_and(|value| value < count);
+    index_valid
+        && quality.parse::<f32>().is_ok_and(|value| {
+            let canonical = if value.fract().abs() < 1e-6 {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.2}")
+            };
+            value.is_finite()
+                && value >= f32::from(target.minimum_crf)
+                && value <= f32::from(target.maximum_crf)
+                && canonical == quality
+        })
+}
+
+fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
+    let count = manifest
+        .queue
+        .as_ref()
+        .map(|stamp| {
+            bytes(&stamp.path)
+                .and_then(|b| {
+                    serde_json::from_slice::<serde_json::Value>(&b)
+                        .map_err(|e| error(&stamp.path, e.to_string()))
+                })
+                .and_then(|v| {
+                    v.as_array()
+                        .map(Vec::len)
+                        .ok_or_else(|| error(&stamp.path, "Invalid saved queue."))
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let target_count = target_artifact_count(root, manifest)?;
+    fn visit(
+        root: &Path,
+        path: &Path,
+        manifest: &Manifest,
+        count: usize,
+        target_count: usize,
+    ) -> Result<(), AppError> {
+        identity(path)?;
+        for entry in fs::read_dir(path).map_err(|e| error(path, e.to_string()))? {
+            let path = entry.map_err(|e| error(path, e.to_string()))?.path();
+            let _ = identity(&path)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|e| error(&path, e.to_string()))?;
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| error(&path, e.to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let dirs = matches!(rel.as_str(), "chunks" | "chunks/encode" | "chunks/split");
+            let empty_launch = rel.strip_prefix("launch-").is_some_and(|n| {
+                n.split_once('-').is_some_and(|(p, n)| {
+                    !p.is_empty()
+                        && !n.is_empty()
+                        && p.bytes().chain(n.bytes()).all(|b| b.is_ascii_digit())
+                })
+            }) && metadata.is_dir()
+                && fs::read_dir(&path)
+                    .map_err(|e| error(&path, e.to_string()))?
+                    .next()
+                    .is_none();
+            let stamped = manifest
+                .segments
+                .iter()
+                .chain(manifest.reader_cache.iter())
+                .chain(manifest.script.iter())
+                .chain(manifest.concat_inputs.iter())
+                .any(|s| s.path == path);
+            let control = matches!(
+                rel.as_str(),
+                "manifest.json"
+                    | "workspace.lock"
+                    | "chunks/chunks.json"
+                    | "chunks/scenes.json"
+                    | "chunks/done.json"
+                    | "chunks/audio.mkv"
+                    | "chunks/log.log"
+                    | "chunks/split/cache.lwi"
+            );
+            let video = path == video_path(root, queue_settings(manifest));
+            let prepared = (manifest.prepared_identity.is_some()
+                && path == root.join("prepared.mkv"))
+                || (manifest.source_cut_slot && path == manifest.source.path);
+            let attempt = rel.starts_with(&format!("attempt-{}-attempt-", manifest.id))
+                && rel.ends_with(".partial.mkv")
+                && !rel.contains('/');
+            let chunk = rel.strip_prefix("chunks/encode/").is_some_and(|name| {
+                name.strip_suffix(&format!(
+                    ".{}",
+                    super::encoder::chunk_extension(queue_settings(manifest).encoder)
+                ))
+                .is_some_and(|n| {
+                    n.len() == 5
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && n.parse::<usize>().is_ok_and(|n| n < count)
+                })
+            });
+            let stats = rel.strip_prefix("chunks/split/").is_some_and(|n| {
+                n.split_once("_fpf").is_some_and(|(index, suffix)| {
+                    index.len() == 5
+                        && index.bytes().all(|b| b.is_ascii_digit())
+                        && index.parse::<usize>().is_ok_and(|n| n < count)
+                        && matches!(suffix, "" | ".log" | ".mbtree" | ".cutree" | ".temp")
+                })
+            });
+            if metadata.is_dir() {
+                if !dirs && !empty_launch {
+                    return Err(error(&path, "Foreign directory in recovery workspace."));
+                }
+                visit(root, &path, manifest, count, target_count)?;
+            } else if !metadata.is_file()
+                || !(stamped
+                    || control
+                    || video
+                    || prepared
+                    || attempt
+                    || chunk
+                    || stats
+                    || is_target_artifact(&rel, manifest, target_count))
+            {
+                return Err(error(
+                    &path,
+                    "Foreign artifact in recovery workspace; no files were deleted.",
+                ));
+            }
+        }
+        Ok(())
+    }
+    visit(root, root, manifest, count, target_count)
+}
+
+impl OwnedRecovery {
+    pub(in crate::jobs) fn open(
+        snapshot: &media_core::JobSnapshot,
+        require_source: bool,
+    ) -> Result<Self, AppError> {
+        let settings = snapshot
+            .encode_settings
+            .as_ref()
+            .ok_or_else(|| error(Path::new(""), "Missing encode settings."))?;
+        let locator = snapshot
+            .recovery
+            .as_ref()
+            .ok_or_else(|| error(Path::new(""), "Missing AV1AN recovery."))?;
+        let (root, manifest) = load(&snapshot.id, &snapshot.request, settings, locator)?;
+        let (directory, lock) = lock_workspace(&root)?;
+        let (_, current) = load(&snapshot.id, &snapshot.request, settings, locator)?;
+        if current != manifest {
+            return Err(error(&root, "Recovery changed while acquiring ownership."));
+        }
+        verify_action_tree(&root, &manifest)?;
+        let workspace = Workspace {
+            root,
+            source_rate: (manifest.fps_num, manifest.fps_den),
+            manifest,
+            segments_verified: false,
+            _tools: vec![],
+            _source: None,
+            chunks: vec![],
+            directory_guard: Some(directory),
+            lock: Some(lock),
+        };
+        workspace.verify_saved(None)?;
+        let video = video_path(&workspace.root, queue_settings(&workspace.manifest));
+        if identity(&video)? != workspace.manifest.intermediate {
+            return Err(error(&video, "The owned video intermediate changed."));
+        }
+        if (workspace.manifest.prepared_identity.is_some() || workspace.manifest.source_cut_slot)
+            && workspace.manifest.source_slot_write.is_none()
+            && digest(&workspace.manifest.source.path, None)? != workspace.manifest.source
+        {
+            return Err(error(&workspace.root, "The owned prepared source changed."));
+        }
+        if require_source {
+            verify_source_cut_original(&workspace.manifest, None)?;
+            let original = workspace
+                .manifest
+                .original_source
+                .as_ref()
+                .unwrap_or(&workspace.manifest.source);
+            if digest(&original.path, None)? != *original {
+                return Err(error(
+                    &original.path,
+                    "The original source changed; resume is unavailable.",
+                ));
+            }
+            if (workspace.manifest.prepared_identity.is_some()
+                || workspace.manifest.source_cut_slot)
+                && workspace.manifest.source_slot_write.is_none()
+                && digest(&workspace.manifest.source.path, None)? != workspace.manifest.source
+            {
+                return Err(error(&workspace.root, "The prepared source changed."));
+            }
+            verify_external_sources(&workspace.manifest, settings, None)?;
+        }
+        Ok(Self { workspace })
+    }
+    pub(in crate::jobs) fn encoded_stats(&self) -> Result<(u32, u64), AppError> {
+        let path = self.workspace.root.join("chunks/encode");
+        let mut total = 0u64;
+        let mut count = 0u32;
+        if path.exists() {
+            for entry in fs::read_dir(&path).map_err(|e| error(&path, e.to_string()))? {
+                let path = entry.map_err(|e| error(&path, e.to_string()))?.path();
+                identity(&path)?;
+                let length = fs::metadata(&path)
+                    .map_err(|e| error(&path, e.to_string()))?
+                    .len();
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| error(&path, "Chunk count overflow."))?;
+                total = total
+                    .checked_add(length)
+                    .ok_or_else(|| error(&path, "Encoded byte count overflow."))?;
+            }
+        }
+        Ok((count, total))
+    }
+    pub(in crate::jobs) fn times(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.workspace.manifest.created_at,
+            self.workspace.manifest.last_run_at,
+        )
+    }
+    pub(in crate::jobs) fn summary(&self) -> Av1anRecovery {
+        self.workspace.summary()
+    }
+    pub(in crate::jobs) fn settings(&self) -> &EncodeSettings {
+        &self.workspace.manifest.settings
+    }
+    pub(in crate::jobs) fn source_variant_settings(&self) -> Vec<EncodeSettings> {
+        let mut settings = vec![self.workspace.manifest.settings.clone()];
+        if let Some(recipe) = &self.workspace.manifest.queue_recipe {
+            settings.push(recipe.settings.clone());
+        }
+        settings
+    }
+    /// Only sealed file receipts enter this scan; done.json cannot introduce a
+    /// file or frame count here. New settings never adopt an unproved chunk.
+    pub(in crate::jobs) async fn seal_source_chunks(
+        &mut self,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if !source_workflow(&self.workspace.manifest.settings) {
+            return Ok(());
+        }
+        self.workspace.verify_saved(Some(cancel))?;
+        let tools = self
+            .workspace
+            .manifest
+            .queue_recipe
+            .as_ref()
+            .map_or(&self.workspace.manifest.tools, |recipe| &recipe.tools);
+        if tools.len() < 2 {
+            return Err(error(
+                &self.workspace.root,
+                "The saved source queue has no qualified FFmpeg pair.",
+            ));
+        }
+        for tool in tools {
+            if digest(&tool.path, Some(cancel))? != *tool {
+                return Err(error(&tool.path, "A frozen source queue tool changed."));
+            }
+        }
+        let (ffmpeg, ffprobe) = (tools[0].path.clone(), tools[1].path.clone());
+        let pending = self
+            .workspace
+            .manifest
+            .completed
+            .iter()
+            .filter(|(_, chunk)| chunk.decoded_contract.is_none())
+            .map(|(name, chunk)| (name.clone(), chunk.clone()))
+            .collect::<Vec<_>>();
+        for (name, chunk) in pending {
+            let policy = queue_count_policy(&self.workspace.manifest);
+            let contract = super::super::encode::boxed(|| {
+                super::super::source_queue::seal(
+                    &ffmpeg,
+                    &ffprobe,
+                    &chunk.file.path,
+                    chunk.frames,
+                    queue_settings(&self.workspace.manifest).encoder,
+                    policy,
+                    cancel,
+                )
+            })
+            .await?;
+            if contract.bytes != chunk.file.length
+                || format!(
+                    "{:x}",
+                    sha2::digest::Output::<Sha256>::from(contract.file_sha256)
+                ) != chunk.file.sha256
+            {
+                return Err(error(
+                    &chunk.file.path,
+                    "The decoded source chunk does not match its sealed byte receipt.",
+                ));
+            }
+            self.workspace.verify_saved(Some(cancel))?;
+            self.workspace
+                .manifest
+                .completed
+                .get_mut(&name)
+                .expect("owned completed chunk")
+                .decoded_contract = Some(contract);
+            self.workspace.save()?;
+        }
+        Ok(())
+    }
+    pub(in crate::jobs) fn command_recipe(&self) -> CommandRecipe {
+        let manifest = &self.workspace.manifest;
+        CommandRecipe {
+            queue_recipe: manifest.queue_recipe.clone(),
+            source_cut_slot: manifest.source_cut_slot,
+            source: manifest.source.clone(),
+            original_source: manifest.original_source.clone(),
+            source_cut_original: manifest.source_cut_original.clone(),
+            prepared_identity: manifest.prepared_identity.clone(),
+            tools: manifest.tools.clone(),
+            external_sources: manifest.external_sources.clone(),
+            settings: manifest.settings.clone(),
+            params: manifest.params.clone(),
+            pixel_format: manifest.pixel_format.clone(),
+            fps_num: manifest.fps_num,
+            fps_den: manifest.fps_den,
+            total_frames: manifest.total_frames,
+            source_filter: manifest.source_filter.clone(),
+            edited_command: manifest.edited_command.clone(),
+        }
+    }
+    pub(in crate::jobs) fn restore_command_recipe(
+        &mut self,
+        recipe: CommandRecipe,
+    ) -> Result<Av1anRecovery, AppError> {
+        if self.workspace.manifest.source_cut_slot && recipe.source_cut_slot {
+            let current = &self.workspace.manifest;
+            if identity(&current.source.path)? != recipe.source.identity {
+                return Err(error(
+                    &current.source.path,
+                    "The source decoder slot was replaced during review.",
+                ));
+            }
+            if current.source_slot_write.is_none()
+                && digest(&current.source.path, None)? != current.source
+            {
+                return Err(error(
+                    &current.source.path,
+                    "The sealed source decoder slot changed during review.",
+                ));
+            }
+            let original = recipe
+                .original_source
+                .as_ref()
+                .ok_or_else(|| {
+                    error(
+                        &current.source.path,
+                        "The committed source decoder slot has no immutable variant.",
+                    )
+                })?
+                .clone();
+            if digest(&current.source.path, None).ok().as_ref() != Some(&recipe.source) {
+                let path = current.source.path.clone();
+                self.workspace.manifest.source_slot_write = Some(original.clone());
+                self.workspace.save()?;
+                let restored = write_cut_slot(&original, &path, &recipe.source.identity, None)?;
+                self.workspace.manifest.source = restored;
+                self.workspace.manifest.source_slot_write = None;
+                self.workspace.save()?;
+            }
+        }
+        self.new_settings(&recipe.settings)?;
+        let manifest = &mut self.workspace.manifest;
+        manifest.queue_recipe = recipe.queue_recipe;
+        manifest.source_cut_slot = recipe.source_cut_slot;
+        manifest.source_slot_write = None;
+        manifest.source = recipe.source;
+        manifest.original_source = recipe.original_source;
+        manifest.source_cut_original = recipe.source_cut_original;
+        manifest.prepared_identity = recipe.prepared_identity;
+        manifest.tools = recipe.tools;
+        manifest.external_sources = recipe.external_sources;
+        if manifest.prepared_identity.is_some()
+            && digest(&manifest.source.path, None).ok().as_ref() != Some(&manifest.source)
+        {
+            manifest.source = manifest.original_source.take().ok_or_else(|| {
+                error(
+                    &self.workspace.root,
+                    "The prior prepared source has no immutable original authority.",
+                )
+            })?;
+            manifest.prepared_identity = None;
+        }
+        manifest.source_cut_rebind_pending = None;
+        manifest.source_cut_committed_recipe = None;
+        manifest.previous_settings = None;
+        manifest.restart_pending =
+            !(source_workflow(&manifest.settings) && manifest.queue.is_some());
+        manifest.params = recipe.params;
+        manifest.pixel_format = recipe.pixel_format;
+        manifest.fps_num = recipe.fps_num;
+        manifest.fps_den = recipe.fps_den;
+        manifest.total_frames = recipe.total_frames;
+        manifest.source_filter = recipe.source_filter;
+        manifest.edited_command = recipe.edited_command;
+        self.workspace.save()?;
+        Ok(self.workspace.summary())
+    }
+    pub(in crate::jobs) fn discard(mut self) -> Result<(), AppError> {
+        let w = &mut self.workspace;
+        w.verify_owner()?;
+        verify_action_tree(&w.root, &w.manifest)?;
+        drop(w.lock.take());
+        remove_tree(&w.root, &w.manifest.directory, w.directory_guard.take())
+    }
+    pub(in crate::jobs) fn reset_chunks(&mut self) -> Result<Av1anRecovery, AppError> {
+        let w = &mut self.workspace;
+        w.verify_owner()?;
+        verify_action_tree(&w.root, &w.manifest)?;
+        let encode = w.root.join("chunks/encode");
+        if encode.exists() {
+            remove_tree(&encode, &identity(&encode)?, None)?;
+            fs::create_dir(&encode).map_err(|e| error(&encode, e.to_string()))?;
+        }
+        w.manifest.completed.clear();
+        w.manifest.phase = RecoveryPhase::Encoding;
+        w.manifest.final_video = None;
+        let video = video_path(&w.root, queue_settings(&w.manifest));
+        if identity(&video)? != w.manifest.intermediate {
+            return Err(error(&video, "Video intermediate changed."));
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(&video)
+            .and_then(|f| f.set_len(0))
+            .map_err(|e| error(&video, e.to_string()))?;
+        if w.manifest.queue.is_some() {
+            w.sanitize_done()?;
+        }
+        w.save()?;
+        Ok(w.summary())
+    }
+    pub(in crate::jobs) fn new_settings(
+        &mut self,
+        settings: &EncodeSettings,
+    ) -> Result<Av1anRecovery, AppError> {
+        let committed = self
+            .workspace
+            .manifest
+            .source_cut_committed_recipe
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| self.command_recipe());
+        if source_workflow(&self.workspace.manifest.settings)
+            && source_workflow(settings)
+            && self.workspace.manifest.queue.is_some()
+        {
+            let w = &mut self.workspace;
+            w.verify_owner()?;
+            w.verify_saved(None)?;
+            verify_action_tree(&w.root, &w.manifest)?;
+            if w.manifest.queue_recipe.is_none()
+                || w.manifest
+                    .completed
+                    .values()
+                    .any(|chunk| chunk.decoded_contract.is_none())
+            {
+                return Err(error(
+                    &w.root,
+                    "Source New Settings requires its sealed original queue and decoded completed-chunk contracts.",
+                ));
+            }
+            w.manifest.source_cut_committed_recipe = Some(Box::new(committed));
+            w.manifest.source_cut_rebind_pending = Some(settings_digest(settings)?);
+            if w.manifest.previous_settings.is_none() {
+                w.manifest.previous_settings = Some(w.manifest.settings.clone());
+            }
+            w.manifest.settings = settings.clone();
+            w.manifest.edited_command = None;
+            w.manifest.phase = RecoveryPhase::Encoding;
+            w.manifest.final_video = None;
+            w.manifest.restart_pending = true;
+            w.save()?;
+            return Ok(w.summary());
+        }
+        let source_cut_transaction = self.workspace.manifest.source_cut_original.is_some()
+            || is_source_cut(&self.workspace.manifest.settings)
+            || is_source_cut(settings);
+        let cut_changed = (is_source_cut(&self.workspace.manifest.settings)
+            || is_source_cut(settings))
+            && (self.workspace.manifest.settings.trim != settings.trim
+                || self.workspace.manifest.settings.source_trim != settings.source_trim
+                || self.workspace.manifest.settings.video_stream_index
+                    != settings.video_stream_index);
+        self.reset_chunks()?;
+        let w = &mut self.workspace;
+        if source_cut_transaction {
+            w.manifest.source_cut_committed_recipe = Some(Box::new(committed));
+        }
+        if cut_changed || w.manifest.source_cut_rebind_pending.is_some() {
+            w.manifest.source_cut_rebind_pending = Some(settings_digest(settings)?);
+        }
+        let mut old_recipe = w.manifest.settings.clone();
+        let mut new_recipe = settings.clone();
+        for recipe in [&mut old_recipe, &mut new_recipe] {
+            recipe.crf = 0;
+            recipe.preset = 0;
+            recipe.svt_crf_quarter_steps = None;
+            recipe.svt_preset = None;
+            recipe.parameters.clear();
+            recipe.workers = 1;
+        }
+        let compatible = old_recipe == new_recipe;
+        let chunks = w.root.join("chunks");
+        if chunks.exists() {
+            remove_tree(&chunks, &identity(&chunks)?, None)?;
+        }
+        let old_video = video_path(&w.root, queue_settings(&w.manifest));
+        let next_video = video_path(&w.root, settings);
+        if old_video != next_video {
+            remove_tree(&old_video, &w.manifest.intermediate, None)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&next_video)
+                .map_err(|e| error(&next_video, e.to_string()))?;
+            drop(file);
+            w.manifest.intermediate = identity(&next_video)?;
+        }
+        if !compatible && w.manifest.original_source.is_some() {
+            let prepared = w.root.join("prepared.mkv");
+            remove_tree(&prepared, &identity(&prepared)?, None)?;
+            w.manifest.source = w.manifest.original_source.take().expect("saved original");
+            w.manifest.prepared_identity = None;
+        }
+        if w.manifest.previous_settings.is_none() {
+            w.manifest.previous_settings = Some(w.manifest.settings.clone());
+        }
+        w.manifest.settings = settings.clone();
+        w.manifest.edited_command = None;
+        w.manifest.queue = None;
+        w.manifest.scenes = None;
+        w.manifest.script = None;
+        w.manifest.reader_cache = None;
+        w.manifest.concat_inputs.clear();
+        w.manifest.target_artifacts.clear();
+        w.manifest.target_scenes = None;
+        w.manifest.segments.clear();
+        w.manifest.av1an_version = None;
+        w.manifest.restart_pending = true;
+        w.save()?;
+        Ok(w.summary())
+    }
+}
+
 impl Recovery {
+    pub(in crate::jobs) async fn seal_source_chunks(
+        &self,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        let pending = self
+            .with(|workspace| {
+                if !source_workflow(&workspace.manifest.settings) {
+                    return Ok(None);
+                }
+                workspace.verify_saved(None)?;
+                let tools = workspace
+                    .manifest
+                    .queue_recipe
+                    .as_ref()
+                    .map_or(&workspace.manifest.tools, |recipe| &recipe.tools);
+                if tools.len() < 2 {
+                    return Err(error(
+                        &workspace.root,
+                        "The source queue has no qualified FFmpeg pair.",
+                    ));
+                }
+                let policy = queue_count_policy(&workspace.manifest);
+                Ok(Some((
+                    tools[0].path.clone(),
+                    tools[1].path.clone(),
+                    queue_settings(&workspace.manifest).encoder,
+                    policy,
+                    workspace
+                        .manifest
+                        .completed
+                        .iter()
+                        .filter(|(_, chunk)| chunk.decoded_contract.is_none())
+                        .map(|(name, chunk)| (name.clone(), chunk.clone()))
+                        .collect::<Vec<_>>(),
+                )))
+            })
+            .await?;
+        let Some((ffmpeg, ffprobe, encoder, policy, pending)) = pending else {
+            return Ok(());
+        };
+        for (name, chunk) in pending {
+            let contract = super::super::encode::boxed(|| {
+                super::super::source_queue::seal(
+                    &ffmpeg,
+                    &ffprobe,
+                    &chunk.file.path,
+                    chunk.frames,
+                    encoder,
+                    policy,
+                    cancel,
+                )
+            })
+            .await?;
+            if contract.bytes != chunk.file.length
+                || format!(
+                    "{:x}",
+                    sha2::digest::Output::<Sha256>::from(contract.file_sha256)
+                ) != chunk.file.sha256
+            {
+                return Err(error(
+                    &chunk.file.path,
+                    "The decoded source chunk differs from its sealed byte receipt.",
+                ));
+            }
+            self.with(move |workspace| {
+                workspace.transaction(|workspace| {
+                    workspace.verify_saved(None)?;
+                    let current = workspace.manifest.completed.get_mut(&name).ok_or_else(|| {
+                        error(
+                            &workspace.root,
+                            "The source completed-chunk receipt disappeared.",
+                        )
+                    })?;
+                    if current.frames != chunk.frames || current.file != chunk.file {
+                        return Err(error(
+                            &chunk.file.path,
+                            "The source completed-chunk receipt changed during decode proof.",
+                        ));
+                    }
+                    current.decoded_contract = Some(contract);
+                    Ok(())
+                })
+            })
+            .await?;
+        }
+        Ok(())
+    }
+    pub(in crate::jobs) async fn source_regions(
+        &self,
+    ) -> Result<Option<(Arc<super::super::source_queue::Regions>, (u32, u32))>, AppError> {
+        self.with(|workspace| {
+            if !source_workflow(&workspace.manifest.settings) {
+                return Ok(None);
+            }
+            workspace.verify_saved(None)?;
+            let chunks = workspace
+                .manifest
+                .completed
+                .values()
+                .map(|chunk| {
+                    chunk.decoded_contract.clone().ok_or_else(|| {
+                        error(
+                            &chunk.file.path,
+                            "The source queue has an unsealed decoded chunk.",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let regions = super::super::source_queue::Regions::new(chunks)?;
+            if regions.source_frames() != queue_frames(&workspace.manifest) {
+                return Err(error(
+                    &workspace.root,
+                    "Decoded source chunks do not cover the complete frozen source ordinals.",
+                ));
+            }
+            Ok(Some((regions, queue_rate(&workspace.manifest))))
+        })
+        .await
+    }
+    pub(in crate::jobs) async fn queue_frame_count(&self) -> Result<usize, AppError> {
+        self.with(|workspace| {
+            usize::try_from(queue_frames(&workspace.manifest)).map_err(|_| {
+                error(
+                    &workspace.root,
+                    "The source queue frame count exceeds this platform.",
+                )
+            })
+        })
+        .await
+    }
+    pub(in crate::jobs) async fn source_join_inputs(
+        &self,
+    ) -> Result<
+        Option<(
+            Vec<super::source_queue_concat::SealedChunk>,
+            media_core::Av1anConcatMethod,
+            (u32, u32),
+            bool,
+        )>,
+        AppError,
+    > {
+        self.with(|workspace| {
+            if !source_workflow(&workspace.manifest.settings) {
+                return Ok(None);
+            }
+            workspace.verify_saved(None)?;
+            let chunks = workspace
+                .manifest
+                .completed
+                .values()
+                .map(|chunk| {
+                    let contract = chunk.decoded_contract.as_ref().ok_or_else(|| {
+                        error(
+                            &chunk.file.path,
+                            "The source join needs a decoded contract for every sealed chunk.",
+                        )
+                    })?;
+                    if contract.source_frames != chunk.frames
+                        || contract.bytes != chunk.file.length
+                        || format!(
+                            "{:x}",
+                            sha2::digest::Output::<Sha256>::from(contract.file_sha256)
+                        ) != chunk.file.sha256
+                    {
+                        return Err(error(
+                            &chunk.file.path,
+                            "The decoded contract differs from its immutable source chunk receipt.",
+                        ));
+                    }
+                    Ok(super::source_queue_concat::SealedChunk {
+                        path: chunk.file.path.clone(),
+                        bytes: contract.bytes,
+                        sha256: contract.file_sha256,
+                        source_frames: contract.source_frames,
+                        decoded_frames: contract.frames,
+                    })
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
+            let settings = &workspace.manifest.settings;
+            let method = if super::encoder::uses_mkvmerge(settings.encoder, settings) {
+                media_core::Av1anConcatMethod::Mkvmerge
+            } else {
+                media_core::Av1anConcatMethod::Ffmpeg
+            };
+            Ok(Some((
+                chunks,
+                method,
+                workspace.source_rate,
+                !super::options::source_resamples(settings, workspace.source_rate),
+            )))
+        })
+        .await
+    }
+    pub(in crate::jobs) async fn edited_command(
+        &self,
+    ) -> Result<Option<media_core::EditedCommand>, AppError> {
+        self.with(|workspace| Ok(workspace.manifest.edited_command.clone()))
+            .await
+    }
+
+    pub(in crate::jobs) async fn commit_source_cut_recipe(&self) -> Result<(), AppError> {
+        self.with(|workspace| {
+            workspace.transaction(|workspace| {
+                if workspace
+                    .manifest
+                    .source_cut_rebind_pending
+                    .as_ref()
+                    .is_some_and(|authorized| {
+                        settings_digest(&workspace.manifest.settings).as_ref().ok()
+                            != Some(authorized)
+                    })
+                {
+                    return Err(error(
+                        &workspace.root,
+                        "The pending cut no longer matches the authorized new settings.",
+                    ));
+                }
+                workspace.manifest.source_cut_rebind_pending = None;
+                workspace.manifest.source_cut_committed_recipe = None;
+                Ok(())
+            })
+        })
+        .await
+    }
+    pub(in crate::jobs) async fn confirm_edited_command(
+        &self,
+        command: Option<media_core::EditedCommand>,
+    ) -> Result<(), AppError> {
+        self.with(move |workspace| {
+            workspace.transaction(|workspace| {
+                if let Some(command) = &command {
+                    if let Some(params) = crate::jobs::command_edit::rebind::argument(
+                        &command.arguments,
+                        "av1an",
+                        "--video-params",
+                    )? {
+                        workspace.manifest.params =
+                            crate::jobs::command_edit::rebind::words(&params)?;
+                    }
+                    if let Some(format) = crate::jobs::command_edit::rebind::argument(
+                        &command.arguments,
+                        "av1an",
+                        "--pix-format",
+                    )? {
+                        workspace.manifest.pixel_format = format;
+                    }
+                    workspace.manifest.source_filter = crate::jobs::command_edit::rebind::argument(
+                        &command.arguments,
+                        "av1an",
+                        "--ffmpeg",
+                    )?
+                    .and_then(|value| value.strip_prefix("-vf ").map(str::to_owned));
+                }
+                workspace.manifest.edited_command = command;
+                workspace.manifest.source_cut_rebind_pending = None;
+                workspace.manifest.source_cut_committed_recipe = None;
+                Ok(())
+            })
+        })
+        .await
+    }
     /// Delete only the workspace bound to this saved job. Discarding progress
     /// intentionally does not read the original media or installed tools: a
     /// missing source must not prevent removal of an owned recovery directory.
+    #[cfg(test)]
     pub(in crate::jobs) async fn discard(
         id: &str,
         request: &RemuxRequest,
@@ -1097,11 +2455,21 @@ impl Recovery {
             .collect::<Vec<_>>();
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
         let pixel_format = plan.output_pixel_format.to_owned();
-        let source_filter = prepared.is_none().then(|| plan.decoder_filter()).flatten();
+        let source_filter =
+            if prepared.is_some() && settings.source_filters && plan.requires_qtgmc() {
+                plan.source_filter_rows_only()
+            } else {
+                prepared
+                    .is_none()
+                    .then(|| plan.av1an_decoder_filter())
+                    .flatten()
+            };
         tokio::task::spawn_blocking(move || {
             let original_source = digest(&source, Some(&cancel))?;
+            let source_cut_original=if is_source_cut(&settings){Some(digest(Path::new(&request.input_path),Some(&cancel))?)}else{None};
+            if let Some(original)=&source_cut_original{super::super::source_normalization::av1an_trim::verify_variant(&id,&request,&settings,&source,&original.sha256,original.length,&original_source.sha256,original_source.length)?;}
             let external_sources = external_source_stamps(&settings, Some(&cancel))?;
-            let tool_guards = tools
+            let mut tool_guards = tools
                 .iter()
                 .map(|path| Source::open(path))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1109,39 +2477,108 @@ impl Recovery {
                 .iter()
                 .map(|tool| digest(&tool.path, Some(&cancel)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (root, manifest, intermediate) = if let Some(locator) = locator {
-                let (root, manifest) = load(&id, &request, &settings, &locator)?;
-                let source_matches = source_matches_attempt(
+            let mut preparation_lock=None;
+            let (root, mut manifest, intermediate) = if let Some(locator) = locator {
+                let (root, mut manifest) = load(&id, &request, &settings, &locator)?;
+                if source_workflow(&settings)&&manifest.queue_recipe.is_some() {
+                    let owned=lock_workspace(&root)?;let(_,current)=load(&id,&request,&settings,&locator)?;
+                    if current!=manifest{return Err(error(&root,"The source queue changed while acquiring its preparation lock."));}preparation_lock=Some(owned);
+                    if let Some(recipe)=&manifest.queue_recipe {
+                        for tool in &recipe.tools {if digest(&tool.path,Some(&cancel))?!=*tool{return Err(error(&tool.path,"A frozen source queue tool changed."));}tool_guards.push(Source::open(&tool.path)?);}
+                    }
+                }
+                if manifest.restart_pending&&source_workflow(&settings)&&manifest.queue_recipe.is_some() {
+                    if manifest.source_cut_rebind_pending.as_ref()!=Some(&settings_digest(&settings)?) {
+                        return Err(error(&root,"The retained source queue is not authorized for these exact new settings."));
+                    }
+                    verify_source_cut_original(&manifest,Some(&cancel))?;
+                    if manifest.source_cut_slot&&is_source_cut(&settings) {
+                        if source_cut_original.as_ref().is_none_or(|original|manifest.source_cut_original.as_ref()!=Some(original)) {return Err(error(&root,"The original source changed before the authorized cut-slot replacement."));}
+                        if manifest.original_source.as_ref()!=Some(&original_source) {
+                            if digest(&manifest.source.path,Some(&cancel))?!=manifest.source {return Err(error(&manifest.source.path,"The owned cut decoder slot changed before New Settings."));}
+                            manifest.source_slot_write=Some(original_source.clone());
+                            atomic(&root.join("manifest.json"),&serde_json::to_vec(&manifest).map_err(|cause|error(&root,cause.to_string()))?)?;
+                            manifest.source=write_cut_slot(&original_source,&manifest.source.path,&manifest.source.identity,Some(&cancel))?;
+                            manifest.original_source=Some(original_source.clone());manifest.source_slot_write=None;
+                        }
+                    }
+                    manifest.settings=settings.clone();manifest.previous_settings=None;
+                    manifest.external_sources=external_sources.clone();manifest.tools=tool_stamps.clone();
+                    manifest.params=params.clone();manifest.pixel_format=pixel_format.clone();
+                    manifest.fps_num=fps_num;manifest.fps_den=fps_den;manifest.total_frames=frame_count as u64;
+                    manifest.source_filter=source_filter.clone();manifest.restart_pending=false;
+                    atomic(&root.join("manifest.json"),&serde_json::to_vec(&manifest).map_err(|cause|error(&root,cause.to_string()))?)?;
+                } else if manifest.restart_pending {
+                    let previous_video=video_path(&root,&manifest.settings);let requested_video=video_path(&root,&settings);
+                    if previous_video!=requested_video {
+                        remove_tree(&previous_video,&manifest.intermediate,None)?;
+                        let file=OpenOptions::new().write(true).create_new(true).open(&requested_video).map_err(|e|error(&requested_video,e.to_string()))?;
+                        drop(file);manifest.intermediate=identity(&requested_video)?;
+                    }
+                    manifest.settings=settings.clone();manifest.previous_settings=None;
+                    verify_source_cut_original(&manifest,Some(&cancel))?;
+                    let authorized_cut=if let Some(authorized)=&manifest.source_cut_rebind_pending {if *authorized!=settings_digest(&settings)?{return Err(error(&root,"The pending source-cut replacement is not authorized for these exact new settings."));}true}else{false};
+                    let saved_original = manifest.original_source.as_ref().unwrap_or(&manifest.source);
+                    if saved_original != &original_source && !authorized_cut { return Err(error(&root, "The original source changed before new-settings resume.")); }
+                    if authorized_cut&&is_source_cut(&settings)&&source_cut_original.is_none(){return Err(error(&root,"The new source-cut reader lacks immutable original authority."));}
+                    if let Some(original)=&source_cut_original {if manifest.source_cut_original.as_ref().is_some_and(|saved|saved!=original){return Err(error(&root,"The original user file changed before source-cut adoption."));}manifest.source_cut_original=Some(original.clone());}
+                    let (next_source, original, decoded) = if let Some(prepared) = &prepared {
+                        let stable = root.join("prepared.mkv");
+                        let reusable = manifest.prepared_identity.as_deref() == Some(prepared.decoded_identity.as_str())
+                            && manifest.source.path == stable && digest(&stable, Some(&cancel))? == manifest.source;
+                        let stamp = if reusable { manifest.source.clone() } else {
+                            if stable.exists() { remove_tree(&stable, &identity(&stable)?, None)?; }
+                            copy_prepared(&prepared.path, &stable, &cancel)?
+                        };
+                        (stamp, Some(original_source.clone()), Some(prepared.decoded_identity.clone()))
+                    } else {
+                        let stable = root.join("prepared.mkv");
+                        if stable.exists() { remove_tree(&stable, &identity(&stable)?, None)?; }
+                        (original_source.clone(), None, None)
+                    };
+                    manifest.source = next_source; manifest.original_source = original; manifest.prepared_identity = decoded;
+                    manifest.external_sources = external_sources.clone(); manifest.tools = tool_stamps.clone();
+                    manifest.params = params.clone(); manifest.pixel_format = pixel_format.clone();
+                    manifest.fps_num = fps_num; manifest.fps_den = fps_den; manifest.total_frames = frame_count as u64;
+                    manifest.source_filter = source_filter.clone(); manifest.restart_pending = false;
+                }
+                verify_source_cut_original(&manifest,Some(&cancel))?;
+                let source_matches = if source_workflow(&settings)&&manifest.queue_recipe.is_some(){
+                    if manifest.source_cut_slot&&is_source_cut(&settings)&&manifest.original_source.as_ref()!=Some(&original_source) {return Err(error(&root,"Saved Settings cannot adopt an arbitrary replacement cut."));}
+                    digest(&manifest.source.path,Some(&cancel))?==manifest.source
+                        &&manifest.original_source.as_ref().is_none_or(|source|digest(&source.path,Some(&cancel)).ok().as_ref()==Some(source))
+                }else{source_matches_attempt(
                     &manifest,
                     &root,
                     &original_source,
                     prepared.as_ref(),
                     Some(&cancel),
-                )?;
+                )?};
                 if !source_matches
                     || manifest.external_sources != external_sources
                     || !tool_contents_match(&manifest.tools, &tool_stamps)
-                    || manifest.params != params
-                    || manifest.pixel_format != pixel_format
+                    || (manifest.edited_command.is_none() && manifest.params != params)
+                    || (manifest.edited_command.is_none() && manifest.pixel_format != pixel_format)
                     || manifest.fps_num != fps_num
                     || manifest.fps_den != fps_den
                     || manifest.total_frames != frame_count as u64
-                    || manifest.source_filter != source_filter
+                    || (manifest.edited_command.is_none() && manifest.source_filter != source_filter)
                 {
                     return Err(error(
                         &root,
                         "Source content, prepared decoded pixels, selected tools, encoder parameters, or frame timing changed; this job cannot reuse old chunks.",
                     ));
                 }
-                if identity(&video_path(&root, &settings))? != manifest.intermediate {
+                if identity(&video_path(&root, queue_settings(&manifest)))? != manifest.intermediate {
                     return Err(error(&root, "The durable video intermediate was replaced."));
                 }
-                let intermediate = Temporary::durable(&video_path(&root, &settings), true)?;
+                let intermediate = Temporary::durable(&video_path(&root, queue_settings(&manifest)), true)?;
                 (root, manifest, intermediate)
             } else {
                 let root = root_for(&id, &request)?;
                 fs::create_dir(&root).map_err(|e| error(&root, e.to_string()))?;
                 let intermediate = Temporary::durable(&video_path(&root, &settings), false)?;
+                let source_cut_slot=source_workflow(&settings)&&is_source_cut(&settings)&&prepared.is_none();
                 let (source_stamp, saved_original, prepared_identity) =
                     if let Some(prepared) = &prepared {
                         (
@@ -1149,18 +2586,31 @@ impl Recovery {
                             Some(original_source),
                             Some(prepared.decoded_identity.clone()),
                         )
+                    } else if source_cut_slot {
+                        (copy_prepared(&source,&cut_slot(&root,&source),&cancel)?,Some(original_source),None)
                     } else {
                         (original_source, None, None)
                     };
                 let manifest = Manifest {
+                    edited_command: None,
+                    created_at: epoch_milliseconds(),
+                    last_run_at: None,
+                    restart_pending: false,
+                    previous_settings: None,
                     version: 1,
                     id,
                     directory: identity(&root)?,
                     request,
                     settings,
+                    queue_recipe:None,
+                    source_cut_slot,
+                    source_slot_write:None,
                     source: source_stamp,
                     external_sources,
                     original_source: saved_original,
+                    source_cut_original,
+                    source_cut_rebind_pending:None,
+                    source_cut_committed_recipe:None,
                     prepared_identity,
                     tools: tool_stamps,
                     params,
@@ -1175,6 +2625,9 @@ impl Recovery {
                     scenes: None,
                     script: None,
                     reader_cache: None,
+                    concat_inputs: Vec::new(),
+                    target_artifacts: Vec::new(),
+                    target_scenes: None,
                     segments: Vec::new(),
                     completed: BTreeMap::new(),
                     intermediate: identity(&intermediate.path)?,
@@ -1182,9 +2635,10 @@ impl Recovery {
                 };
                 (root, manifest, intermediate)
             };
+            manifest.last_run_at=epoch_milliseconds();
             let input = manifest.source.path.clone();
             let source_guard = Source::open(&input)?;
-            let (directory_guard, lock) = lock_workspace(&root)?;
+            let (directory_guard, lock) = match preparation_lock {Some(owned)=>owned,None=>lock_workspace(&root)?};
             let chunk_guards = manifest
                 .completed
                 .values()
@@ -1193,7 +2647,7 @@ impl Recovery {
                 .chain(manifest.reader_cache.iter().map(|stamp| &stamp.path))
                 .map(|path| Source::open(path))
                 .collect::<Result<Vec<_>, _>>()?;
-            let workspace = Workspace {
+            let mut workspace = Workspace {
                 root: root.clone(),
                 manifest,
                 source_rate: if prepared.is_some() {
@@ -1210,9 +2664,11 @@ impl Recovery {
             };
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
+            verify_action_tree(&workspace.root, &workspace.manifest)?;
             let resume_chunks=workspace.manifest.queue.is_some();
             let finalizing=workspace.manifest.phase==RecoveryPhase::Finalizing;
             if !finalizing {
+                workspace.remove_target_artifacts()?;
                 if resume_chunks {
                     workspace.sanitize_done()?;
                     let receipts = workspace.receipts()?;
@@ -1223,6 +2679,10 @@ impl Recovery {
                         Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
                         Err(cause) => return Err(error(&root,cause.to_string())),
                     }
+                    // Select/Hybrid can produce target probes before the queue
+                    // is saved. Their scene receipt is sealed for safe actions,
+                    // then regenerated with the discarded incomplete attempt.
+                    workspace.manifest.scenes = None;
                 }
                 intermediate.clone_file()?.set_len(0).map_err(|e|error(&intermediate.path,e.to_string()))?;
             }
@@ -1278,6 +2738,11 @@ impl Recovery {
         })
         .await
     }
+    /// Called only after the entire owned engine process tree has exited.
+    pub(super) async fn seal_target_artifacts(&self) -> Result<(), AppError> {
+        self.with(|workspace| workspace.transaction(|workspace| workspace.seal_target_artifacts()))
+            .await
+    }
     /// Hybrid and Segment create copied source segments. Fingerprint/lock each file at its
     /// first checkpoint, and independently compare their complete decoded pixel
     /// sequence to the source before reuse or publication. No size/count-only
@@ -1288,6 +2753,19 @@ impl Recovery {
         input: &Path,
         cancel: &watch::Receiver<bool>,
     ) -> Result<(), AppError> {
+        let queue_source = self
+            .with(|workspace| {
+                Ok(workspace.manifest.queue_recipe.as_ref().map(|recipe| {
+                    recipe
+                        .original_source
+                        .as_ref()
+                        .unwrap_or(&recipe.source)
+                        .path
+                        .clone()
+                }))
+            })
+            .await?;
+        let input = queue_source.as_deref().unwrap_or(input);
         let segments = self
             .with(|w| {
                 for guard in &w.chunks {
@@ -1438,8 +2916,10 @@ impl Recovery {
                 for chunk in &w.chunks {
                     chunk.verify()?;
                 }
-                w.manifest.final_video =
-                    Some(digest(&video_path(&w.root, &w.manifest.settings), None)?);
+                w.manifest.final_video = Some(digest(
+                    &video_path(&w.root, queue_settings(&w.manifest)),
+                    None,
+                )?);
                 w.manifest.phase = RecoveryPhase::Finalizing;
                 Ok(())
             })?;
@@ -1565,21 +3045,29 @@ impl JobManager {
             .map(|entry| entry.snapshot.clone())
             .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The job no longer exists.", None))?;
         tokio::task::spawn_blocking(move || {
-            let locator = snapshot.recovery.as_ref().ok_or_else(|| {
-                AppError::new(
-                    "RECOVERY_INVALID",
-                    "This job has no saved recovery workspace.",
-                    None,
-                )
-            })?;
-            let settings = snapshot.encode_settings.as_ref().ok_or_else(|| {
-                error(
-                    Path::new(&locator.workspace),
-                    "This is not an encoding job.",
-                )
-            })?;
-            let (_, manifest) = load(&snapshot.id, &snapshot.request, settings, locator)?;
-            verify_external_sources(&manifest, settings, None)?;
+            let owned = OwnedRecovery::open(&snapshot, true)?;
+            let settings = snapshot
+                .encode_settings
+                .as_ref()
+                .expect("verified saved settings");
+            if let Some(canonical) = super::super::source_normalization::prepare_recovery_action(
+                &snapshot.id,
+                &snapshot.request,
+                settings,
+                owned.settings(),
+            )? {
+                canonical.rebind(settings)?;
+            }
+            if let Some(cut) =
+                super::super::source_normalization::av1an_trim::prepare_recovery_action(
+                    &snapshot.id,
+                    &snapshot.request,
+                    settings,
+                    owned.settings(),
+                )?
+            {
+                cut.rebind(settings)?;
+            }
             Ok(())
         })
         .await
@@ -1587,9 +3075,108 @@ impl JobManager {
     }
 }
 
+/// Restore only the last committed recipe/source/tool fields after interruption
+/// during a source-cut New Settings review. Existing chunk files/receipts remain
+/// exactly as they are after the authorized reset; deleted chunks are not revived.
+pub(in crate::jobs) fn restore_interrupted_source_cut(
+    snapshot: &media_core::JobSnapshot,
+) -> Result<
+    Option<(
+        EncodeSettings,
+        Option<media_core::EditedCommand>,
+        Av1anRecovery,
+    )>,
+    AppError,
+> {
+    if snapshot.recovery.is_none() {
+        return Ok(None);
+    }
+    let root = root_for(&snapshot.id, &snapshot.request)?;
+    if !root
+        .join("manifest.json")
+        .try_exists()
+        .map_err(|cause| error(&root, cause.to_string()))?
+    {
+        return Ok(None);
+    }
+    let manifest: Manifest = serde_json::from_slice(&bytes(&root.join("manifest.json"))?)
+        .map_err(|cause| error(&root, cause.to_string()))?;
+    let Some(recipe) = manifest.source_cut_committed_recipe.clone() else {
+        return Ok(None);
+    };
+    if manifest.id != snapshot.id
+        || manifest.request != snapshot.request
+        || manifest.directory != identity(&root)?
+        || snapshot
+            .encode_settings
+            .as_ref()
+            .is_none_or(|settings| *settings != manifest.settings && *settings != recipe.settings)
+    {
+        return Err(error(
+            &root,
+            "Interrupted source-cut ownership does not match the saved job.",
+        ));
+    }
+    let mut current = snapshot.clone();
+    current.encode_settings = Some(manifest.settings.clone());
+    let mut owned = OwnedRecovery::open(&current, false)?;
+    let settings = recipe.settings.clone();
+    let command = recipe.edited_command.clone();
+    let summary = owned.restore_command_recipe(*recipe)?;
+    let keep = owned.source_variant_settings();
+    drop(owned);
+    super::super::source_normalization::av1an_trim::discard_variants_except(
+        &snapshot.id,
+        &snapshot.request,
+        &keep,
+    )?;
+    Ok(Some((settings, command, summary)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_failure_removes_only_its_uncommitted_receipt() {
+        const CHILD: &str = "JESSES_ATOMIC_RECEIPT_FAILURE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let target = root.join("done.json");
+            // Inject a real partial kernel write followed by EFBIG, confined
+            // to this subprocess so other tests retain their resource limits.
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let limit = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            }
+            assert!(atomic(&target, b"new receipt").is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"committed receipt");
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            return;
+        }
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("done.json"), b"committed receipt").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jobs::av1an::recovery::tests::atomic_write_failure_removes_only_its_uncommitted_receipt", "--nocapture"])
+            .env(CHILD, &fixture.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("done.json")).unwrap(),
+            b"committed receipt"
+        );
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
 
     #[test]
     fn scorer_identity_reads_legacy_cpu_and_hash_bound_gpu_versions() {
@@ -1677,14 +3264,25 @@ mod tests {
                 ..Default::default()
             };
             let manifest = Manifest {
+                edited_command: None,
+                created_at: None,
+                last_run_at: None,
+                restart_pending: false,
+                previous_settings: None,
                 version: 1,
                 id: "owned-job".into(),
                 directory: identity(&root).unwrap(),
                 request,
                 settings,
+                queue_recipe: None,
+                source_cut_slot: false,
+                source_slot_write: None,
                 source: digest(&source, None).unwrap(),
                 external_sources: vec![],
                 original_source: None,
+                source_cut_original: None,
+                source_cut_rebind_pending: None,
+                source_cut_committed_recipe: None,
                 prepared_identity: None,
                 tools: vec![],
                 params: vec![],
@@ -1699,6 +3297,9 @@ mod tests {
                 scenes: None,
                 script: None,
                 reader_cache: None,
+                concat_inputs: Vec::new(),
+                target_artifacts: Vec::new(),
+                target_scenes: None,
                 completed: BTreeMap::new(),
                 segments: Vec::new(),
                 intermediate: identity(&intermediate.path).unwrap(),
@@ -1726,6 +3327,215 @@ mod tests {
         }
     }
 
+    fn frozen_source_recipe(workspace: &Workspace, ignore_frame_mismatch: bool) -> QueueRecipe {
+        let manifest = &workspace.manifest;
+        QueueRecipe {
+            source: manifest.source.clone(),
+            original_source: manifest.original_source.clone(),
+            tools: manifest.tools.clone(),
+            settings: manifest.settings.clone(),
+            params: manifest.params.clone(),
+            pixel_format: manifest.pixel_format.clone(),
+            fps_num: manifest.fps_num,
+            fps_den: manifest.fps_den,
+            source_rate: workspace.source_rate,
+            total_frames: manifest.total_frames,
+            source_filter: manifest.source_filter.clone(),
+            ignore_frame_mismatch,
+        }
+    }
+
+    #[test]
+    fn source_queue_count_policy_is_frozen_independently_of_new_global_fps() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = fixture.workspace();
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            source_workflow: true,
+            ..Default::default()
+        });
+        workspace.manifest.queue_recipe = Some(frozen_source_recipe(&workspace, false));
+        workspace.manifest.settings.temporal = Some(media_core::TemporalSettings {
+            frame_rate: Some(media_core::FrameRate {
+                numerator: 30,
+                denominator: 1,
+            }),
+            ..Default::default()
+        });
+        assert!(super::super::options::source_resamples(
+            &workspace.manifest.settings,
+            (24, 1)
+        ));
+        assert!(matches!(
+            queue_count_policy(&workspace.manifest),
+            crate::jobs::source_queue::CountPolicy::ExactSourceFrames
+        ));
+        workspace
+            .manifest
+            .queue_recipe
+            .as_mut()
+            .unwrap()
+            .ignore_frame_mismatch = true;
+        workspace.manifest.settings.temporal = None;
+        assert!(!super::super::options::source_resamples(
+            &workspace.manifest.settings,
+            (24, 1)
+        ));
+        assert!(matches!(
+            queue_count_policy(&workspace.manifest),
+            crate::jobs::source_queue::CountPolicy::SourceTypedResample
+        ));
+    }
+
+    #[test]
+    fn canceled_partial_source_slot_restores_committed_bytes_for_same_process_retry() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = fixture.workspace();
+        let original = workspace.manifest.source.clone();
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            source_workflow: true,
+            chunk_method: media_core::Av1anChunkMethod::Select,
+            ..Default::default()
+        });
+        workspace.manifest.settings.source_trim = true;
+        workspace.manifest.settings.trim = Some(
+            serde_json::from_value(serde_json::json!({"startFrame":0,"endFrameExclusive":48}))
+                .unwrap(),
+        );
+        let old = fixture.0.join("old-cut.mkv");
+        let next = fixture.0.join("next-cut.mkv");
+        for (path, byte) in [(&old, 0x11u8), (&next, 0x22u8)] {
+            let mut file = File::create(path).unwrap();
+            for _ in 0..256 {
+                file.write_all(&[byte; 65536]).unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+        let (_sender, cancel) = watch::channel(false);
+        let slot = cut_slot(&workspace.root, &old);
+        workspace.manifest.source = copy_prepared(&old, &slot, &cancel).unwrap();
+        workspace.manifest.original_source = Some(digest(&old, None).unwrap());
+        workspace.manifest.source_cut_original = Some(original);
+        workspace.manifest.source_cut_slot = true;
+        let chunks = workspace.root.join("chunks");
+        fs::create_dir_all(chunks.join("split")).unwrap();
+        for name in ["chunks.json", "scenes.json"] {
+            fs::write(chunks.join(name), b"[]").unwrap();
+        }
+        workspace.manifest.queue = Some(digest(&chunks.join("chunks.json"), None).unwrap());
+        workspace.manifest.scenes = Some(digest(&chunks.join("scenes.json"), None).unwrap());
+        workspace.manifest.queue_recipe = Some(frozen_source_recipe(&workspace, false));
+        workspace.save().unwrap();
+        let old_settings = workspace.manifest.settings.clone();
+        let old_stamp = workspace.manifest.source.clone();
+        let mut owned = OwnedRecovery { workspace };
+        let mut next_settings = old_settings.clone();
+        next_settings.trim = Some(
+            serde_json::from_value(serde_json::json!({"startFrame":48,"endFrameExclusive":96}))
+                .unwrap(),
+        );
+        owned.new_settings(&next_settings).unwrap();
+        let next_stamp = digest(&next, None).unwrap();
+        owned.workspace.manifest.source_slot_write = Some(next_stamp.clone());
+        owned.workspace.save().unwrap();
+        let (sender, cancel) = watch::channel(false);
+        let observed = slot.clone();
+        let length = next_stamp.length;
+        let monitor = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                if fs::metadata(&observed)
+                    .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < length)
+                {
+                    sender.send_replace(true);
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        });
+        let error =
+            write_cut_slot(&next_stamp, &slot, &old_stamp.identity, Some(&cancel)).unwrap_err();
+        assert_eq!(error.code, "JOB_CANCELED");
+        assert!(monitor.join().unwrap());
+        assert_ne!(digest(&slot, None).unwrap(), old_stamp);
+        let snapshot:media_core::JobSnapshot=serde_json::from_value(serde_json::json!({"id":"owned-job","state":"canceled","request":owned.workspace.manifest.request,"encodeSettings":next_settings,"recovery":owned.summary(),"progressSeconds":null,"durationSeconds":null,"logs":[],"error":null,"logPath":null})).unwrap();
+        drop(owned);
+        let restored = restore_interrupted_source_cut(&snapshot).unwrap().unwrap();
+        assert_eq!(restored.0, old_settings);
+        assert_eq!(digest(&slot, None).unwrap(), old_stamp);
+        let mut saved = snapshot;
+        saved.encode_settings = Some(restored.0);
+        saved.recovery = Some(restored.2);
+        let owned = OwnedRecovery::open(&saved, true).unwrap();
+        assert!(!owned.workspace.manifest.restart_pending);
+        assert!(owned.workspace.manifest.source_slot_write.is_none());
+        assert!(
+            owned
+                .workspace
+                .manifest
+                .source_cut_committed_recipe
+                .is_none()
+        );
+        assert_eq!(fs::read(&old).unwrap(), fs::read(&slot).unwrap());
+    }
+
+    #[test]
+    fn new_settings_journal_keeps_old_and_new_history_coherent_and_preserves_compatible_preparation()
+     {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let original = workspace.manifest.source.clone();
+        let prepared = workspace.root.join("prepared.mkv");
+        fs::write(&prepared, b"verified decoded frames").unwrap();
+        workspace.manifest.source = digest(&prepared, None).unwrap();
+        workspace.manifest.original_source = Some(original);
+        workspace.manifest.prepared_identity = Some("verified decoded identity".into());
+        workspace.save().unwrap();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let locator = workspace.summary();
+        let root = workspace.root.clone();
+        let prepared_before = digest(&prepared, None).unwrap();
+        let snapshot:media_core::JobSnapshot=serde_json::from_value(serde_json::json!({"id":"owned-job","state":"stopped","request":request,"encodeSettings":settings,"recovery":locator,"progressSeconds":null,"durationSeconds":null,"logs":[],"error":null,"logPath":null})).unwrap();
+        drop(workspace);
+        drop(intermediate);
+        let mut owned = OwnedRecovery::open(&snapshot, true).unwrap();
+        let mut next = settings.clone();
+        next.crf = 31;
+        let updated = owned.new_settings(&next).unwrap();
+        assert_eq!(updated.completed_frames, 0);
+        drop(owned);
+        assert_eq!(digest(&prepared, None).unwrap(), prepared_before);
+        let (_, pending) = load("owned-job", &request, &next, &updated).unwrap();
+        assert!(pending.restart_pending);
+        assert_eq!(pending.previous_settings, Some(settings.clone()));
+        assert!(pending.completed.is_empty());
+        // A process can stop between manifest reset and durable history commit.
+        // Either coherent history side remains authorized, but no old chunks do.
+        load("owned-job", &request, &settings, &locator).unwrap();
+        let mut foreign = next.clone();
+        foreign.crf = 32;
+        assert!(load("owned-job", &request, &foreign, &updated).is_err());
+        let mut owned = OwnedRecovery::open(&snapshot, false).unwrap();
+        let mut trimmed = next.clone();
+        trimmed.trim = Some(media_core::VideoTrim {
+            start_frame: 1,
+            end_frame_exclusive: 24,
+            time: None,
+        });
+        owned.new_settings(&trimmed).unwrap();
+        assert!(!prepared.exists());
+        assert!(owned.workspace.manifest.prepared_identity.is_none());
+        assert!(owned.workspace.manifest.queue.is_none());
+        assert!(!root.join("chunks").exists());
+        drop(owned);
+        let owned = OwnedRecovery::open(&snapshot, false).unwrap();
+        let foreign = root.join("introduced-after-review.txt");
+        fs::write(&foreign, b"foreign").unwrap();
+        assert!(owned.discard().is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+    }
+
     #[tokio::test]
     async fn discard_requires_the_saved_owner_and_preserves_neighbor_without_source() {
         let fixture = Fixture::new();
@@ -1733,6 +3543,7 @@ mod tests {
         let external = fixture.0.join("external.mka");
         fs::write(&external, b"external bytes").unwrap();
         workspace.manifest.settings.external_tracks = vec![media_core::ExternalTrack {
+            subtitle_burn_in: false,
             offset_milliseconds: 0,
             subtitle_mode: None,
             title: None,
@@ -1862,6 +3673,156 @@ mod tests {
         current.swap(0, 1);
         current.pop();
         assert!(!tool_contents_match(&saved, &current));
+
+        // Canonical source-provider selection and engine compatibility updates
+        // must never silently reinterpret an existing saved job. The encoder
+        // and engine occupy separately stamped roles even if their names match.
+        for (role, replacement) in [
+            ("encoder", b"new HDR".as_slice()),
+            ("av1an", b"new engine".as_slice()),
+        ] {
+            for (name, _) in tools {
+                fs::copy(original.join(name), relocated.join(name)).unwrap();
+            }
+            fs::write(relocated.join(role), replacement).unwrap();
+            assert!(
+                !tool_contents_match(&saved, &stamps(&relocated)),
+                "changed {role} must fail saved-settings reuse"
+            );
+        }
+    }
+
+    #[test]
+    fn target_artifacts_require_metric_scene_bounds_and_sealed_identity() {
+        let fixture = Fixture::new();
+        let (mut workspace, _intermediate) = fixture.workspace();
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            source_target_defaults: true,
+            maximum_chunk_frames: 0,
+            target_quality: Some(media_core::Av1anTargetQuality {
+                metric: media_core::Av1anTargetMetric::XpsnrWeighted,
+                minimum_score_tenths: 350,
+                maximum_score_tenths: 350,
+                minimum_crf: 15,
+                maximum_crf: 50,
+                probes: 4,
+                probing_rate: 1,
+                probe_width: 1920,
+                probe_height: 1080,
+            }),
+            ..Default::default()
+        });
+        let split = workspace.root.join("chunks/split");
+        fs::create_dir_all(&split).unwrap();
+        fs::write(workspace.root.join("chunks/scenes.json"), br#"{"frames":48,"scenes":[{"start_frame":0,"end_frame":48,"zone_overrides":null}],"split_scenes":[{"start_frame":0,"end_frame":48,"zone_overrides":null}]}"#).unwrap();
+        let stats = split.join("0.json");
+        let probe = split.join("v_00000_32.50.ivf");
+        fs::write(&stats, b"partial disposable XPSNR stats").unwrap();
+        fs::write(&probe, b"partial disposable probe").unwrap();
+        verify_action_tree(&workspace.root, &workspace.manifest).unwrap();
+        workspace
+            .transaction(|workspace| workspace.seal_target_artifacts())
+            .unwrap();
+        assert_eq!(workspace.manifest.target_artifacts.len(), 2);
+        assert!(workspace.manifest.target_scenes.is_some());
+        assert!(workspace.manifest.queue.is_none());
+        assert!(workspace.manifest.scenes.is_none());
+        validate_layout(&workspace.root, &workspace.manifest).unwrap();
+        workspace.verify_saved(None).unwrap();
+        for foreign in [
+            "1.json",
+            "00.json",
+            "v_00001_32.50.ivf",
+            "v_00000_14.ivf",
+            "v_00000_51.ivf",
+            "v_00000_032.50.ivf",
+            "v_00000_32.5.ivf",
+            "v_00000_32.50.hevc",
+            "arbitrary.json",
+        ] {
+            let path = split.join(foreign);
+            fs::write(&path, b"foreign").unwrap();
+            assert!(
+                verify_action_tree(&workspace.root, &workspace.manifest).is_err(),
+                "adopted {foreign}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+        fs::write(&stats, b"replaced stats bytes").unwrap();
+        assert!(
+            workspace
+                .verify_saved(None)
+                .unwrap_err()
+                .message
+                .contains("metric target cache changed")
+        );
+        assert!(workspace.remove_target_artifacts().is_err());
+        assert!(probe.exists(), "cache mismatch must precede any deletion");
+        fs::remove_file(&stats).unwrap();
+        workspace.verify_saved(None).unwrap(); // Missing disposable files can be regenerated.
+        workspace.remove_target_artifacts().unwrap();
+        assert!(!probe.exists());
+        assert!(workspace.manifest.target_artifacts.is_empty());
+        fs::write(&stats, b"XPSNR file").unwrap();
+        workspace
+            .manifest
+            .settings
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .target_quality
+            .as_mut()
+            .unwrap()
+            .metric = media_core::Av1anTargetMetric::Ssimulacra2;
+        assert!(
+            verify_action_tree(&workspace.root, &workspace.manifest).is_err(),
+            "VS-only metric must not adopt FFmpeg stats"
+        );
+        workspace
+            .manifest
+            .settings
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .target_quality = None;
+        assert!(
+            verify_action_tree(&workspace.root, &workspace.manifest).is_err(),
+            "CRF-only job must not adopt target stats"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn target_probe_symlinks_never_authorize_outside_cache_cleanup() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let (mut workspace, _intermediate) = fixture.workspace();
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            source_target_defaults: true,
+            maximum_chunk_frames: 0,
+            target_quality: Some(media_core::Av1anTargetQuality {
+                metric: media_core::Av1anTargetMetric::Vmaf,
+                minimum_score_tenths: 950,
+                maximum_score_tenths: 950,
+                minimum_crf: 15,
+                maximum_crf: 50,
+                probes: 4,
+                probing_rate: 1,
+                probe_width: 1920,
+                probe_height: 1080,
+            }),
+            ..Default::default()
+        });
+        let split = workspace.root.join("chunks/split");
+        fs::create_dir_all(&split).unwrap();
+        fs::write(workspace.root.join("chunks/scenes.json"), br#"{"frames":48,"scenes":[{"start_frame":0,"end_frame":48,"zone_overrides":null}],"split_scenes":[{"start_frame":0,"end_frame":48,"zone_overrides":null}]}"#).unwrap();
+        let outside = fixture.0.join("outside.json");
+        fs::write(&outside, b"outside must survive").unwrap();
+        symlink(&outside, split.join("0.json")).unwrap();
+        assert!(verify_action_tree(&workspace.root, &workspace.manifest).is_err());
+        assert!(workspace.seal_target_artifacts().is_err());
+        assert!(workspace.remove_target_artifacts().is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside must survive");
     }
 
     #[test]
@@ -1897,6 +3858,7 @@ mod tests {
         fs::write(&external, b"external-a").unwrap();
         workspace.manifest.settings.external_tracks = vec![
             media_core::ExternalTrack {
+                subtitle_burn_in: false,
                 offset_milliseconds: 0,
                 subtitle_mode: None,
                 title: None,
@@ -1908,6 +3870,7 @@ mod tests {
                 stream_index: 0,
             },
             media_core::ExternalTrack {
+                subtitle_burn_in: false,
                 offset_milliseconds: 0,
                 subtitle_mode: None,
                 title: None,
@@ -1950,20 +3913,29 @@ mod tests {
     }
 
     #[test]
-    fn donor_only_sources_are_fingerprinted_for_av1an_resume() {
+    fn donor_and_hdr_resource_sources_are_fingerprinted_for_av1an_resume() {
         let fixture = Fixture::new();
         let (mut workspace, intermediate) = fixture.workspace();
         let metadata = fixture.0.join("metadata.mka");
         let chapters = fixture.0.join("chapters.mka");
         fs::write(&metadata, b"metadata donor").unwrap();
         fs::write(&chapters, b"chapter donor").unwrap();
+        let rpu = fixture.0.join("metadata.rpu");
+        let hdr_json = fixture.0.join("metadata.json");
+        fs::write(&rpu, b"rpu bytes").unwrap();
+        fs::write(&hdr_json, b"json bytes").unwrap();
+        workspace.manifest.settings.hdr_metadata = Some(media_core::HdrMetadataSettings {
+            dolby_vision_rpu_path: Some(rpu.to_string_lossy().into_owned()),
+            hdr10_plus_json_path: Some(hdr_json.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
         workspace.manifest.settings.metadata_source_path =
             Some(metadata.to_string_lossy().into_owned());
         workspace.manifest.settings.chapters_source_path =
             Some(chapters.to_string_lossy().into_owned());
         workspace.manifest.external_sources =
             external_source_stamps(&workspace.manifest.settings, None).unwrap();
-        assert_eq!(workspace.manifest.external_sources.len(), 2);
+        assert_eq!(workspace.manifest.external_sources.len(), 4);
         workspace.save().unwrap();
         let locator = workspace.summary();
         let request = workspace.manifest.request.clone();
@@ -1974,6 +3946,13 @@ mod tests {
         drop(intermediate);
         fs::write(&metadata, b"changed donor").unwrap();
         let (_, loaded) = load("owned-job", &request, &settings, &locator).unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+        fs::write(&metadata, b"metadata donor").unwrap();
+        verify_external_sources(&loaded, &settings, None).unwrap();
+        fs::write(&rpu, b"changed rpu bytes").unwrap();
+        assert!(verify_external_sources(&loaded, &settings, None).is_err());
+        fs::write(&rpu, b"rpu bytes").unwrap();
+        fs::write(&hdr_json, b"changed json bytes").unwrap();
         assert!(verify_external_sources(&loaded, &settings, None).is_err());
     }
 
@@ -2166,6 +4145,7 @@ mod tests {
             "00000".into(),
             Chunk {
                 frames: 24,
+                decoded_contract: None,
                 file: digest(&chunk, None).unwrap(),
             },
         );

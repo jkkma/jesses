@@ -4,6 +4,7 @@ use super::{encode::encoder_parameters, encode_plan::Plan, *};
 mod filters;
 mod grain;
 mod launcher;
+pub(super) use filters::rows as filter_rows;
 pub(super) use filters::validate as validate_filters;
 pub(super) use grain::stage_standalone as stage_standalone_grain_table;
 pub(super) use grain::validate as validate_grain;
@@ -15,10 +16,57 @@ pub(super) mod encoder;
 mod metrics;
 mod options;
 mod scenes;
+pub(super) mod source_queue_concat;
+pub(super) use options::source_resamples;
 pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
-pub(super) use recovery::{PreparedSource, Recovery};
+pub(super) use recovery::{
+    CommandRecipe, OwnedRecovery, PreparedSource, Recovery, restore_interrupted_source_cut,
+};
+
+/// Rebuild the complete decoded-region and join clock authority for either a
+/// freshly encoded stage or a sealed stage reused during Saved finalization.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::jobs) async fn verify_source_join(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    mkvmerge: Option<&Path>,
+    recovery: &Recovery,
+    video: &Temporary,
+    plan: &mut Plan,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<usize>, AppError> {
+    super::encode::boxed(|| recovery.seal_source_chunks(cancel)).await?;
+    let Some((regions, rate)) = recovery.source_regions().await? else {
+        return Ok(None);
+    };
+    let (chunks, method, source_rate, force_rate) =
+        recovery.source_join_inputs().await?.ok_or_else(|| {
+            files::error(
+                "RECOVERY_INVALID",
+                "The source join lost its sealed queue authority.",
+                &video.path,
+            )
+        })?;
+    let (header, clock) = super::encode::boxed(|| {
+        source_queue_concat::verify_with_clock(
+            ffmpeg,
+            ffprobe,
+            mkvmerge,
+            video,
+            &chunks,
+            method,
+            source_rate,
+            force_rate,
+            cancel,
+        )
+    })
+    .await?;
+    let regions = regions.with_reference_header(&header, clock)?;
+    plan.source_queue_regions(regions, rate);
+    Ok(plan.source_queue_frame_count())
+}
 
 pub(super) fn validate_encoder_path(
     encoder: &Path,
@@ -108,18 +156,25 @@ pub(super) fn arguments(
             .to_string()
             .into();
     }
-    options::append(&mut args, settings, &params);
+    options::append(&mut args, settings, plan, &params);
+    if options::source_resamples(settings, plan.source_av1an_input_rate()) {
+        args.push("--ignore-frame-mismatch".into());
+    }
     if resume {
         args.push("--resume".into());
     }
     if let Some(filter) = source_filter {
         // The generated filter contains only planner-owned labels, integers,
         // and fixed FFmpeg options. Paths never enter av1an's nested parser.
-        args.extend(["--ffmpeg".into(), format!("-vf {filter}").into()]);
-        if settings
-            .av1an_options
-            .is_some_and(|options| options.target_quality.is_some())
-        {
+        let nested = if settings.source_filters {
+            format!("-vf '{}'", filter.replace('\'', "'\\''"))
+        } else {
+            format!("-vf {filter}")
+        };
+        args.extend(["--ffmpeg".into(), nested.into()]);
+        if settings.av1an_options.is_some_and(|options| {
+            options.target_quality.is_some() && !options.source_target_defaults
+        }) {
             // Target probes encode through --ffmpeg. Score the reference after
             // the same deterministic processing so the search and final chunk
             // compare corresponding pixels, timing, color and geometry.
@@ -155,12 +210,14 @@ impl JobManager {
         mkvmerge: Option<&Path>,
         recovery: &Recovery,
         video: &Temporary,
-        plan: &Plan,
+        plan: &mut Plan,
         settings: &EncodeSettings,
         cancel: &watch::Receiver<bool>,
         log_path: &Path,
         frame_count: usize,
-    ) -> Result<(), AppError> {
+        dynamic_hdr: &super::dynamic_hdr::Resources,
+        post_mux: Option<CommandSpec>,
+    ) -> Result<bool, AppError> {
         validate_encoder_path(encoder, settings)?;
         if plan.is_hdr10()
             && settings
@@ -237,9 +294,19 @@ impl JobManager {
             String::from_utf8_lossy(&version.stdout),
             String::from_utf8_lossy(&version.stderr)
         );
-        let configured = settings.av1an_options.unwrap_or_default();
-        options::validate_plugin(&version_text, configured, source_filter.is_some())
-            .map_err(|message| files::error("AV1AN_DEPENDENCY_MISSING", message, executable))?;
+        let mut configured = options::effective_chunks(
+            settings,
+            plan.source_chunk_rate(),
+            plan.frame_dimensions(false).1,
+        );
+        configured.target_quality =
+            options::effective_target(configured, settings.encoder, plan.frame_dimensions(false));
+        options::validate_plugin(
+            &version_text,
+            configured,
+            source_filter.is_some() && !configured.source_target_defaults,
+        )
+        .map_err(|message| files::error("AV1AN_DEPENDENCY_MISSING", message, executable))?;
         let previous_scorer = recovery.scorer_identity().await?;
         let scorer_selection = if let Some(target) = configured.target_quality {
             metrics::select_bundled_vship(
@@ -265,6 +332,7 @@ impl JobManager {
         )
         .await?;
         let _grain_table = grain::stage(&work, settings)?;
+        let _hdr_resources = dynamic_hdr.stage_av1an(&work)?;
         let version = version_text
             .lines()
             .find(|v| !v.is_empty())
@@ -314,9 +382,14 @@ impl JobManager {
                 if let Some(selection) = &scorer_selection {
                     append_log(snapshot, format!("Quality scorer: {}.", selection.detail));
                 }
+                if configured.source_target_defaults {
+                    append_log(snapshot,format!("Source target defaults: {} scalar target {:.1}; encoder search {}–{}, probes4, sampling1, probe resolution=input {}×{}, metric resolution={}×{}, Automatic statistic, built-in encoder probe parameters. Hidden draft values are ignored.",metrics::label(target.metric),f64::from(target.minimum_score_tenths)/10.0,target.minimum_crf,target.maximum_crf,plan.frame_dimensions(false).0,plan.frame_dimensions(false).1,target.probe_width,target.probe_height));
+                    if source_filter.is_some(){append_log(snapshot,"Source target probes read the unfiltered input; final chunk filters are intentionally omitted from probe/reference arguments, matching the source application.".into());}
+                } else {
                 append_log(snapshot, format!("{} target {:.1}–{:.1}, mean score at {}×{}, CRF {}–{}, at most {} probes, sampling every {} frame(s). A search may finish outside the requested score range when its bounds/probes are exhausted.", metrics::label(target.metric), f64::from(target.minimum_score_tenths)/10.0, f64::from(target.maximum_score_tenths)/10.0, target.probe_width, target.probe_height, target.minimum_crf, target.maximum_crf, target.probes, target.probing_rate));
                 if source_filter.is_some() { append_log(snapshot, "Quality target: probe encodes and reference scoring use the same validated trim, temporal, tone-map, framing, and aspect-ratio filter chain as final chunks.".into()); }
                 else { append_log(snapshot, "Quality target: probe encodes and reference scoring read the same verified lossless processed source as final chunks.".into()); }
+                }
                 if target.probing_rate > 1 { append_log(snapshot, "Quality target warning: sampled-frame scores may differ from scoring every frame; the target is not a full-output quality measurement.".into()); }
             }
             if let Some(prepared) = &prepared_scenes {
@@ -391,27 +464,114 @@ impl JobManager {
         if let Some(prepared) = &prepared_scenes {
             args.extend(["--scenes".into(), prepared.path.as_os_str().to_owned()]);
         }
-        let result = supervisor::run_with_environment(
-            &CommandSpec {
-                executable: launch.executable.clone(),
-                args,
-                cwd: Some(work.clone()),
-            },
-            cancel.clone(),
-            sender,
-            log_path,
-            Duration::from_secs(24 * 60 * 60),
-            Some(&launch.environment),
-            Some(&pause),
-        )
+        let native_command = CommandSpec {
+            executable: launch.executable.clone(),
+            args,
+            cwd: Some(work.clone()),
+        };
+        let mut generated = super::command_edit::format_command(&native_command);
+        if let Some(mut mux) = post_mux {
+            for argument in &mut mux.args {
+                if argument == video.path.as_os_str() {
+                    *argument = av1an_output.as_os_str().to_owned();
+                }
+            }
+            generated.push_str(" &&\n");
+            generated.push_str(&super::command_edit::format_command(&mux));
+        }
+        let saved = recovery.edited_command().await?;
+        let output = self
+            .list_jobs()
+            .await
+            .into_iter()
+            .find(|job| job.id == id)
+            .map(|job| PathBuf::from(job.request.output_path))
+            .ok_or_else(|| files::error("JOB_NOT_FOUND", "The edited job disappeared.", input))?;
+        let initial = saved
+            .as_ref()
+            .map(|saved| {
+                super::command_edit::rebind::rebind(
+                    saved,
+                    &generated,
+                    &work,
+                    &output,
+                    id,
+                    recovery.resume_chunks,
+                )
+            })
+            .transpose()?
+            .unwrap_or_else(|| generated.clone());
+        let reviewed = self
+            .review_command_initial(id, "av1an", &generated, &initial, &output, cancel)
+            .await?;
+        let command = reviewed.or_else(|| {
+            saved.map(|_| media_core::EditedCommand {
+                generated: generated.clone(),
+                arguments: initial,
+            })
+        });
+        let edited = command
+            .as_ref()
+            .is_some_and(|command| command.arguments != generated.trim());
+        if let Some(command) = &command {
+            recovery
+                .confirm_edited_command(edited.then(|| command.clone()))
+                .await?;
+            self.change(id, |snapshot| {
+                snapshot.edited_command = edited.then(|| command.clone())
+            })
+            .await;
+            let mut state = self.state.lock().await;
+            self.persist(&mut state).await?;
+        }
+        if command.is_none() {
+            recovery.commit_source_cut_recipe().await?;
+        }
+        let shell = edited
+            .then(|| {
+                super::command_edit::PreparedShell::new(
+                    &command.as_ref().expect("confirmed command").arguments,
+                    Some(work.clone()),
+                    log_path,
+                    Some(&launch.environment),
+                )
+            })
+            .transpose()?;
+        let execution = shell
+            .as_ref()
+            .map_or(&native_command, |shell| &shell.command);
+        let environment = shell
+            .as_ref()
+            .map_or(&launch.environment, |shell| &shell.environment);
+        let result = supervisor::with_console_profile(supervisor::ConsoleProfile::Av1an, || {
+            supervisor::run_with_environment(
+                execution,
+                cancel.clone(),
+                sender,
+                log_path,
+                Duration::from_secs(24 * 60 * 60),
+                Some(environment),
+                Some(&pause),
+            )
+        })
         .await;
         let _ = event_task.await;
+        recovery.seal_target_artifacts().await?;
         let stage_cleanup = launch.cleanup();
         drop(prepared_scenes);
+        if edited {
+            if let Some(staged) = &staged_video
+                && staged.exists()
+            {
+                let mut owned = Temporary::durable(staged, true)?;
+                owned.cleanup()?;
+            }
+            let _ = tokio::fs::remove_dir(&launch_directory).await;
+        }
         // The process has exited, so seal its last complete receipts even when
         // cancellation won. A crash before this point reuses only prior receipts.
         let checkpoint = recovery
-            .checkpoint(result.as_ref().is_ok_and(|result| result.status.success()))
+            .checkpoint(!edited && result.as_ref().is_ok_and(|result| result.status.success()))
             .await;
         match checkpoint {
             Ok(summary) => {
@@ -427,6 +587,11 @@ impl JobManager {
             Err(error) => return Err(error),
         }
         let result = result.map_err(|e| process_error(e, input))?;
+        if result.status.success()
+            && let Some(shell) = &shell
+        {
+            shell.verify()?;
+        }
         stage_cleanup?;
         if !result.status.success() {
             return Err(files::error(
@@ -437,6 +602,9 @@ impl JobManager {
                 ),
                 input,
             ));
+        }
+        if edited {
+            return Ok(true);
         }
         if let Some(staged) = &staged_video {
             let staged = staged.clone();
@@ -488,7 +656,32 @@ impl JobManager {
         }
         recovery.verify_segments(ffmpeg, input, cancel).await?;
         video.flush_nonempty_async().await?;
-        if encoder::video_extension(settings.encoder, settings) == "ivf" {
+        if settings.source_filters {
+            // Source graphs run inside each engine chunk. The queue/done
+            // receipts and engine FRAME MISMATCH gate retain frame authority;
+            // only the actual coded geometry/SAR is learned here, never by
+            // replaying arbitrary filters over the whole source.
+            let actual = super::probe(ffprobe, &video.path, cancel, Some(&[0])).await?;
+            let stream = actual.streams.first().ok_or_else(|| {
+                files::error(
+                    "ENCODE_VALIDATION_FAILED",
+                    "The filtered AV1AN output has no video stream.",
+                    &video.path,
+                )
+            })?;
+            plan.observe_source_filter_stream(stream, None)?;
+        }
+        if settings
+            .av1an_options
+            .is_some_and(|options| options.source_workflow)
+        {
+            verify_source_join(ffmpeg, ffprobe, mkvmerge, recovery, video, plan, cancel).await?;
+        }
+        if encoder::video_extension(settings.encoder, settings) == "ivf"
+            && !settings
+                .av1an_options
+                .is_some_and(|options| options.source_workflow)
+        {
             let mut file = video.clone_file()?;
             let geometry = (plan.width, plan.height);
             let rate = (plan.fps_num, plan.fps_den);
@@ -507,7 +700,8 @@ impl JobManager {
                 self.change(id, |snapshot| append_log(snapshot, format!("Corrected av1an IVF rate to {}/{} after checking all {frame_count} sequential frame records.", rate.0, rate.1))).await;
             }
         }
-        check_cancel(cancel)
+        check_cancel(cancel)?;
+        Ok(false)
     }
 }
 
@@ -634,6 +828,150 @@ fn normalize_ivf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use media_core::VideoEncoder;
+    #[test]
+    fn source_zero_quality_is_literal_and_distinct_from_explicit_lossless_for_all_adapters() {
+        let (document, _) = fixture_plan(0);
+        for backend in [
+            media_core::EncodeBackend::Standalone,
+            media_core::EncodeBackend::Av1an,
+        ] {
+            for encoder in [
+                VideoEncoder::SvtAv1,
+                VideoEncoder::X264,
+                VideoEncoder::X265Standalone,
+                VideoEncoder::AomAv1,
+                VideoEncoder::VpxStandalone,
+            ] {
+                let settings = EncodeSettings {
+                    encoder,
+                    backend,
+                    crf: 0,
+                    lossless: false,
+                    ..Default::default()
+                };
+                super::super::encode_plan::validate_settings(&settings).unwrap();
+                let plan =
+                    Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+                let args = if backend == media_core::EncodeBackend::Standalone {
+                    super::super::encode::consumer_arguments(&plan, &settings)
+                } else {
+                    encoder::parameters(&plan, &settings)
+                };
+                let args = args
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !args
+                        .iter()
+                        .any(|value| value == "--lossless" || value.starts_with("--lossless=")),
+                    "{encoder:?} {backend:?}: {args:?}"
+                );
+                let flag = if matches!(encoder, VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone)
+                {
+                    "--cq-level"
+                } else {
+                    "--crf"
+                };
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == flag && pair[1] == "0")
+                        || args.contains(&format!("{flag}=0")),
+                    "{encoder:?} {backend:?}: {args:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn source_target_defaults_omit_hidden_overrides_and_resolve_each_encoder_range() {
+        let (document, _) = fixture_plan(0);
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::X264,
+            VideoEncoder::X265Standalone,
+            VideoEncoder::AomAv1,
+            VideoEncoder::VpxStandalone,
+        ] {
+            let options = media_core::Av1anOptions {
+                source_target_defaults: true,
+                chunk_method: media_core::Av1anChunkMethod::Select,
+                target_quality: Some(media_core::Av1anTargetQuality {
+                    metric: media_core::Av1anTargetMetric::XpsnrWeighted,
+                    minimum_score_tenths: 400,
+                    maximum_score_tenths: 0,
+                    minimum_crf: 0,
+                    maximum_crf: 0,
+                    probes: 0,
+                    probing_rate: 255,
+                    probe_width: 1,
+                    probe_height: 3,
+                }),
+                ..Default::default()
+            };
+            let settings = EncodeSettings {
+                encoder,
+                backend: media_core::EncodeBackend::Av1an,
+                av1an_options: Some(options),
+                ..Default::default()
+            };
+            super::super::encode_plan::validate_settings(&settings).unwrap();
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            let args = arguments(
+                Path::new("/input.mkv"),
+                Path::new("/output.ivf"),
+                Path::new("/work"),
+                Path::new("/log"),
+                &plan,
+                &settings,
+                false,
+                Some("hue=s=0"),
+            );
+            for flag in [
+                "--qp-range",
+                "--probes",
+                "--probing-rate",
+                "--probe-res",
+                "--vmaf-res",
+                "--probing-stat",
+                "--probe-video-params",
+                "--vmaf-filter",
+            ] {
+                assert!(!args.iter().any(|arg| arg == flag), "{encoder:?}: {flag}");
+            }
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--target-quality" && pair[1] == "40.0")
+            );
+            assert!(
+                args.iter()
+                    .any(|argument| argument == "--source-unfiltered-probes")
+            );
+            let effective = options::effective_target(options, encoder, (128, 96)).unwrap();
+            assert_eq!(
+                (effective.minimum_crf, effective.maximum_crf),
+                (
+                    15,
+                    match encoder {
+                        VideoEncoder::X264 | VideoEncoder::X265Standalone => 35,
+                        VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => 55,
+                        _ => 50,
+                    }
+                )
+            );
+            assert_eq!(
+                (
+                    effective.probes,
+                    effective.probing_rate,
+                    effective.probe_width,
+                    effective.probe_height
+                ),
+                (4, 1, 1920, 1080)
+            );
+            assert_eq!(effective.maximum_score_tenths, 400);
+        }
+    }
     fn fixture_plan(index: u32) -> (Document, Plan) {
         let video = |index| serde_json::json!({"index":index,"codec_type":"video","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001","start_time":"0","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709","color_range":"tv","chroma_location":"left"});
         let document: Document = serde_json::from_value(
@@ -660,6 +998,83 @@ mod tests {
             validate_input(&document, &second).unwrap_err().code,
             "ENCODE_INPUT_UNSUPPORTED"
         );
+    }
+    #[test]
+    fn source_none_uses_frozen_typed_rate_and_omits_scene_only_flags() {
+        let (document, _) = fixture_plan(0);
+        let settings = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            source_filters: true,
+            av1an_filters: vec!["fps=12".into()],
+            temporal: Some(media_core::TemporalSettings {
+                frame_rate: Some(media_core::FrameRate {
+                    numerator: 30,
+                    denominator: 1,
+                }),
+                ..Default::default()
+            }),
+            encoding_preferences: Some(media_core::EncodingPreferences {
+                keyframe_interval_seconds: 2,
+                mp4_faststart: true,
+            }),
+            av1an_options: Some(media_core::Av1anOptions {
+                source_workflow: true,
+                split_method: media_core::Av1anSplitMethod::FixedChunks,
+                maximum_chunk_frames: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut plan =
+            Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+        plan.activate_temporal(240).unwrap();
+        assert_eq!(plan.source_chunk_rate(), (30, 1));
+        plan.apply_source_filter_contract(&super::super::source_filters::OutputContract {
+            width: 128,
+            height: 96,
+            sar: "1:1".into(),
+            numerator: 12,
+            denominator: 1,
+            frames: 120,
+        })
+        .unwrap();
+        let args = arguments(
+            Path::new("/source.mkv"),
+            Path::new("/out.ivf"),
+            Path::new("/work"),
+            Path::new("/log"),
+            &plan,
+            &settings,
+            false,
+            None,
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--extra-split", "60"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--split-method", "none"])
+        );
+        for flag in ["--sc-method", "--min-scene-len", "--sc-downscale-height"] {
+            assert!(!args.iter().any(|arg| arg == flag));
+        }
+        let legacy = EncodeSettings {
+            av1an_options: Some(media_core::Av1anOptions {
+                source_workflow: false,
+                ..settings.av1an_options.unwrap()
+            }),
+            ..settings
+        };
+        let args = arguments(
+            Path::new("/source.mkv"),
+            Path::new("/out.ivf"),
+            Path::new("/work"),
+            Path::new("/log"),
+            &plan,
+            &legacy,
+            false,
+            None,
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--extra-split", "0"]));
+        assert!(args.iter().any(|arg| arg == "--sc-downscale-height"));
     }
     #[test]
     fn cli_keeps_paths_separate_and_settings_explicit() {

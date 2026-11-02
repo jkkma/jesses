@@ -68,7 +68,9 @@ impl Launch {
             })?;
         let runtime = crate::bundled_tools::av1an_runtime(av1an)
             .map_err(|error| files::error("BUNDLED_TOOL_INVALID", error, av1an))?;
-        let mut directories = vec![selected, ffmpeg_parent, ffprobe_parent];
+        // A system encoder folder can also contain an older FFmpeg. Media
+        // tools must resolve to the same binaries checked/stamped by the job.
+        let mut directories = vec![ffmpeg_parent, ffprobe_parent, selected];
         if let Some(mkvmerge) = mkvmerge {
             let directory = mkvmerge
                 .parent()
@@ -86,6 +88,18 @@ impl Launch {
         if let Some(directory) = &runtime {
             directories.push(directory);
         }
+        for (name, tool) in [
+            ("ffmpeg", ffmpeg),
+            ("ffprobe", ffprobe),
+            (super::encoder::binary(family), encoder),
+        ]
+        .into_iter()
+        .chain(mkvmerge.map(|tool| ("mkvmerge", tool)))
+        {
+            verify_child_tool(&directories, name, tool)?;
+            #[cfg(windows)]
+            reject_system_shadow(tool)?;
+        }
         let mut path = std::env::join_paths(directories)
             .map_err(|e| files::error("AV1AN_ENCODER_PATH_UNSUPPORTED", e.to_string(), encoder))?;
         if let Some(inherited) = std::env::var_os("PATH") {
@@ -99,7 +113,6 @@ impl Launch {
         #[cfg(windows)]
         {
             use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
-            reject_system_shadow(encoder)?;
             // Rust's Windows process lookup searches the host executable folder
             // before inherited PATH. Stage an owned host image so a portable
             // av1an installation's sibling child cannot silently override selection.
@@ -198,6 +211,52 @@ impl Launch {
     }
 }
 
+fn verify_child_tool(directories: &[&Path], name: &str, selected: &Path) -> Result<(), AppError> {
+    let name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    let expected = selected
+        .canonicalize()
+        .map_err(|error| files::error("AV1AN_CHILD_TOOL_SHADOWED", error.to_string(), selected))?;
+    let resolved = directories
+        .iter()
+        .map(|directory| directory.join(&name))
+        .find(|path| {
+            let Ok(metadata) = path.metadata() else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        });
+    if resolved
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok())
+        .as_ref()
+        != Some(&expected)
+    {
+        return Err(files::error(
+            "AV1AN_CHILD_TOOL_SHADOWED",
+            format!(
+                "The AV1AN child name {name} would not resolve to its selected tool. Choose compatible canonical tool folders; conflicting sibling tools cannot silently replace a verified binary."
+            ),
+            resolved.as_deref().unwrap_or(selected),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for Launch {
     fn drop(&mut self) {
         let _ = self.cleanup();
@@ -230,7 +289,7 @@ fn reject_system_shadow(encoder: &Path) -> Result<(), AppError> {
             Ok(path) if path != selected => {
                 return Err(files::error(
                     "AV1AN_ENCODER_PATH_UNSUPPORTED",
-                    "A Windows system-directory encoder would override the selected encoder.",
+                    "A Windows system-directory tool would override the selected AV1AN child tool.",
                     &shadow,
                 ));
             }
@@ -251,6 +310,75 @@ fn reject_system_shadow(encoder: &Path) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_media_tools_precede_foreign_ffmpeg_beside_the_encoder() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "jesses-av1an-child-tools-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let media = root.join("media");
+        let encoder = root.join("encoder");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::create_dir(&encoder).unwrap();
+        let script = |path: &Path, identity: &str| {
+            std::fs::write(path, format!("#!/bin/sh\nprintf '%s' '{identity}'\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script(&media.join("ffmpeg"), "selected ffmpeg");
+        script(&media.join("ffprobe"), "selected ffprobe");
+        script(&encoder.join("x264"), "selected x264");
+        script(&encoder.join("ffmpeg"), "foreign ffmpeg");
+        let launch = Launch::prepare(
+            Path::new("/usr/bin/true"),
+            &encoder.join("x264"),
+            VideoEncoder::X264,
+            &media.join("ffmpeg"),
+            &media.join("ffprobe"),
+            None,
+            &root,
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("ffmpeg", "selected ffmpeg"),
+            ("ffprobe", "selected ffprobe"),
+            ("x264", "selected x264"),
+        ] {
+            let (_owner, cancel) = watch::channel(false);
+            let result = supervisor::run_capture_with_environment(
+                &CommandSpec {
+                    executable: name.into(),
+                    args: Vec::new(),
+                    cwd: Some(root.clone()),
+                },
+                cancel,
+                1024,
+                Duration::from_secs(10),
+                Some(&launch.environment),
+            )
+            .await
+            .unwrap();
+            assert!(result.status.success());
+            assert_eq!(result.stdout, expected.as_bytes());
+        }
+        script(&media.join("x264"), "foreign x264");
+        let error = Launch::prepare(
+            Path::new("/usr/bin/true"),
+            &encoder.join("x264"),
+            VideoEncoder::X264,
+            &media.join("ffmpeg"),
+            &media.join("ffprobe"),
+            None,
+            &root,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "AV1AN_CHILD_TOOL_SHADOWED");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn encoder_aliases_fail_before_av1an_can_choose_another_binary() {

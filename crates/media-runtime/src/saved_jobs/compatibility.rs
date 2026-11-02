@@ -658,6 +658,7 @@ impl Sidecar {
                     selected.push(stream.index);
                     if codec != AudioCodec::Copy || channels != AudioChannels::Preserve {
                         settings.audio.push(AudioTrackSettings {
+                            normalization: None,
                             stream_index: stream.index,
                             codec,
                             bitrate_kbps: bitrate,
@@ -687,6 +688,7 @@ impl Sidecar {
                                 return Err("The saved WebVTT conversion names a subtitle whose text format cannot be verified.".into());
                             }
                             settings.subtitles.push(SubtitleTrackSettings {
+                                burn_in: false,
                                 stream_index: stream.index,
                                 mode: SubtitleMode::WebVtt,
                             });

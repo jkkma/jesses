@@ -71,6 +71,14 @@ pub(super) fn validate_plugin(
     {
         return Err("VMAF and every-frame XPSNR targeting require av1an with the ffmpeg-metric-matrix-v1 compatibility fix. The older engine lets FFmpeg change the untagged Y4M reference's color matrix, producing incorrect probe scores.".into());
     }
+    if matches!(
+        target.metric,
+        Av1anTargetMetric::Xpsnr | Av1anTargetMetric::XpsnrWeighted
+    ) && target.probing_rate == 1
+        && !version.contains("xpsnr-signed-stats-v1")
+    {
+        return Err("Every-frame XPSNR targeting requires av1an with the xpsnr-signed-stats-v1 compatibility fix. The older engine rejects valid negative scores and skips negative frame statistics.".into());
+    }
     if needs_vapoursynth(target)
         && found(version, "systems.innocent.lsmas")
         && !found(version, "com.vapoursynth.ffms2")
@@ -688,11 +696,22 @@ mod tests {
                 .contains("ffmpeg-metric-matrix-v1")
             );
             validate_plugin(
-                "target-probe-filter-v1\nffmpeg-metric-matrix-v1",
+                "target-probe-filter-v1\nffmpeg-metric-matrix-v1\nxpsnr-signed-stats-v1",
                 checked,
                 false,
             )
             .unwrap();
+            if metric != Av1anTargetMetric::Vmaf {
+                assert!(
+                    validate_plugin(
+                        "target-probe-filter-v1\nffmpeg-metric-matrix-v1",
+                        checked,
+                        false,
+                    )
+                    .unwrap_err()
+                    .contains("xpsnr-signed-stats-v1")
+                );
+            }
         }
         for metric in [
             Av1anTargetMetric::Ssimulacra2,

@@ -280,6 +280,24 @@ fn atomic(path: &Path, value: &[u8]) -> Result<(), AppError> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum SourceQtgmc {
+    Deferred,
+    Rendered {
+        artifact: Stamp,
+        decoded_identity: String,
+    },
+}
+fn source_qtgmc_frames(value: &str) -> Option<u64> {
+    let (hash, frames) = value.strip_prefix("sha256:")?.split_once(";frames:")?;
+    (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(())?;
+    frames.parse::<u64>().ok().filter(|frames| *frames > 0)
+}
+fn source_qtgmc(settings: &EncodeSettings) -> bool {
+    settings.source_filters && settings.temporal.is_some_and(|value| value.qtgmc.is_some())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     id: String,
@@ -302,6 +320,10 @@ struct Manifest {
     video: Option<Stamp>,
     timed_video: Option<Stamp>,
     final_stage: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_filter_contract: Option<super::source_filters::OutputContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_qtgmc: Option<SourceQtgmc>,
 }
 
 struct Seed {
@@ -329,6 +351,8 @@ pub(super) struct Recovery {
     root: PathBuf,
     seed: Seed,
     manifest: Option<Manifest>,
+    source_filter_contract: Option<super::source_filters::OutputContract>,
+    source_qtgmc: Option<SourceQtgmc>,
     _tool_guards: Vec<Source>,
     directory_guard: Option<File>,
     lock: Option<WorkspaceLock>,
@@ -468,6 +492,63 @@ fn stats_path(manifest: &Manifest) -> Result<Option<PathBuf>, AppError> {
 }
 
 fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
+    match (&manifest.source_qtgmc, source_qtgmc(&manifest.settings)) {
+        (None, false) => {}
+        (Some(SourceQtgmc::Deferred), true)
+            if manifest.video.is_none() && manifest.stats.is_empty() => {}
+        (
+            Some(SourceQtgmc::Rendered {
+                artifact,
+                decoded_identity,
+            }),
+            true,
+        ) if artifact.length > 0
+            && artifact.sha256.len() == 64
+            && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && source_qtgmc_frames(decoded_identity).is_some_and(|frames| {
+                manifest
+                    .source_filter_contract
+                    .as_ref()
+                    .is_none_or(|contract| contract.frames == frames)
+            }) => {}
+        _ => {
+            return Err(error(
+                root,
+                "Invalid deferred/rendered source QTGMC receipt.",
+            ));
+        }
+    }
+
+    if let Some(contract) = &manifest.source_filter_contract {
+        if !(manifest.settings.source_filters
+            || manifest
+                .settings
+                .tone_map
+                .is_some_and(|tone| tone.source_workflow))
+            || contract.width == 0
+            || contract.height == 0
+            || contract.frames == 0
+            || contract.numerator == 0
+            || contract.denominator == 0
+            || !contract.sar.split_once(':').is_some_and(|(n, d)| {
+                n.parse::<u32>().is_ok_and(|value| value > 0)
+                    && d.parse::<u32>().is_ok_and(|value| value > 0)
+            })
+        {
+            return Err(error(root, "Invalid observed source filter contract."));
+        }
+    } else if (manifest.settings.source_filters
+        || manifest
+            .settings
+            .tone_map
+            .is_some_and(|tone| tone.source_workflow))
+        && manifest.video.is_some()
+    {
+        return Err(error(
+            root,
+            "The completed source filter checkpoint lacks its observed contract.",
+        ));
+    }
     let mut known = vec![root.join("manifest.json"), root.join("workspace.lock")];
     if let Some(stats) = stats_path(manifest)? {
         known.push(stats);
@@ -699,6 +780,8 @@ impl Recovery {
                 recovery: Self {
                     root,
                     seed,
+                    source_filter_contract: manifest.source_filter_contract.clone(),
+                    source_qtgmc: manifest.source_qtgmc.clone(),
                     manifest: Some(manifest),
                     _tool_guards: tool_guards,
                     directory_guard: Some(directory_guard),
@@ -715,6 +798,8 @@ impl Recovery {
                 root,
                 seed,
                 manifest: None,
+                source_filter_contract: None,
+                source_qtgmc: source_qtgmc(settings).then_some(SourceQtgmc::Deferred),
                 _tool_guards: tool_guards,
                 directory_guard: None,
                 lock: None,
@@ -728,6 +813,98 @@ impl Recovery {
 
     pub fn phase(&self) -> Option<StandaloneRecoveryPhase> {
         self.manifest.as_ref().map(|manifest| manifest.phase)
+    }
+    pub fn source_filter_contract(&self) -> Option<&super::source_filters::OutputContract> {
+        self.source_filter_contract.as_ref()
+    }
+    pub fn remember_source_filter_contract(
+        &mut self,
+        contract: super::source_filters::OutputContract,
+    ) -> Result<(), AppError> {
+        if !(self.seed.settings.source_filters
+            || self
+                .seed
+                .settings
+                .tone_map
+                .is_some_and(|tone| tone.source_workflow))
+        {
+            return Err(error(
+                &self.root,
+                "A legacy job cannot acquire a source filter contract.",
+            ));
+        }
+        if self
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.video.is_some())
+            && self.source_filter_contract.as_ref() != Some(&contract)
+        {
+            return Err(error(
+                &self.root,
+                "A completed source filter contract changed.",
+            ));
+        }
+        self.source_filter_contract = Some(contract);
+        Ok(())
+    }
+
+    pub async fn remember_source_qtgmc(
+        &mut self,
+        path: &Path,
+        decoded_identity: String,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if !source_qtgmc(&self.seed.settings) || source_qtgmc_frames(&decoded_identity).is_none() {
+            return Err(error(
+                &self.root,
+                "A source QTGMC receipt requires its exact decoded-frame identity.",
+            ));
+        }
+        let path = path.to_owned();
+        let canceled = cancel.clone();
+        let artifact = tokio::task::spawn_blocking(move || digest(&path, Some(&canceled)))
+            .await
+            .map_err(|cause| error(&self.root, cause.to_string()))??;
+        self.source_qtgmc = Some(SourceQtgmc::Rendered {
+            artifact,
+            decoded_identity,
+        });
+        if let Some(manifest) = &mut self.manifest {
+            manifest.source_qtgmc = self.source_qtgmc.clone();
+            self.save()?;
+        }
+        Ok(())
+    }
+    pub async fn verify_source_qtgmc(
+        &self,
+        path: &Path,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        let Some(SourceQtgmc::Rendered { artifact, .. }) = &self.source_qtgmc else {
+            return Err(error(
+                &self.root,
+                "The source QTGMC cache has no real rendered receipt.",
+            ));
+        };
+        if artifact.path != path {
+            return Err(error(
+                path,
+                "The source QTGMC cache path differs from its rendered receipt.",
+            ));
+        }
+        let expected = artifact.clone();
+        let path = path.to_owned();
+        let canceled = cancel.clone();
+        let actual = tokio::task::spawn_blocking(move || digest(&path, Some(&canceled)))
+            .await
+            .map_err(|cause| error(&self.root, cause.to_string()))??;
+        if actual != expected {
+            return Err(error(
+                &actual.path,
+                "The source QTGMC cache changed after rendering was sealed.",
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_workspace(&mut self, initial: StandaloneRecoveryPhase) -> Result<(), AppError> {
@@ -755,6 +932,8 @@ impl Recovery {
             video: None,
             timed_video: None,
             final_stage: None,
+            source_filter_contract: self.source_filter_contract.clone(),
+            source_qtgmc: self.source_qtgmc.clone(),
         };
         self.directory_guard = Some(directory_guard);
         self.lock = Some(lock);
@@ -816,7 +995,18 @@ impl Recovery {
         let (label, extension) = match phase {
             StandaloneRecoveryPhase::VideoComplete => ("video", self.seed.video_extension.as_str()),
             StandaloneRecoveryPhase::TimingWrapComplete => ("timed", "mkv"),
-            StandaloneRecoveryPhase::Finalizing => ("final", "mkv"),
+            StandaloneRecoveryPhase::Finalizing => (
+                "final",
+                if source
+                    .path
+                    .extension()
+                    .is_some_and(|extension| extension == "mov")
+                {
+                    "mov"
+                } else {
+                    "mkv"
+                },
+            ),
             StandaloneRecoveryPhase::PassOneComplete => {
                 return Err(error(&self.root, "Invalid video checkpoint phase."));
             }
@@ -906,6 +1096,8 @@ impl Recovery {
             StandaloneRecoveryPhase::PassOneComplete => unreachable!(),
         }
         manifest.phase = phase;
+        manifest.source_filter_contract = self.source_filter_contract.clone();
+        manifest.source_qtgmc = self.source_qtgmc.clone();
         self.save()?;
         Ok(self.summary().expect("checkpoint summary"))
     }
@@ -1133,6 +1325,32 @@ pub(super) fn discover_locator(
     })
 }
 
+/// Discard only the job-bound owned tree; original media/tools are unnecessary.
+pub(super) fn discard(
+    id: &str,
+    request: &RemuxRequest,
+    settings: &EncodeSettings,
+    locator: &StandaloneRecovery,
+) -> Result<(), AppError> {
+    discover_locator(id, request, settings, Some(locator))?;
+    let root = root_for(id, request)?;
+    let (guard, lock) = lock_workspace(&root)?;
+    let mut lock = Some(lock);
+    let manifest: Manifest = serde_json::from_slice(&bytes(&root.join("manifest.json"))?)
+        .map_err(|error| self::error(&root, error.to_string()))?;
+    if manifest.id != id
+        || manifest.request != *request
+        || manifest.settings != *settings
+        || manifest.directory != identity(&root)?
+    {
+        return Err(error(&root, "Recovery bindings changed before discard."));
+    }
+    validate_layout(&root, &manifest)?;
+    remove_owned_contents(&root, &manifest, &mut lock)?;
+    drop(guard);
+    remove_exact(&root, &manifest.directory, true)
+}
+
 pub(super) fn validate_locator(
     id: &str,
     request: &RemuxRequest,
@@ -1214,6 +1432,8 @@ mod tests {
                 },
                 manifest: None,
                 _tool_guards: vec![tool_guard],
+                source_filter_contract: None,
+                source_qtgmc: None,
                 directory_guard: None,
                 lock: None,
             }
@@ -1233,6 +1453,48 @@ mod tests {
             // The nonce-qualified directory and every file in it belong to this test.
             let _ = fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_source_qtgmc_requires_a_real_cache_receipt_and_rejects_changed_bytes() {
+        let fixture = Fixture::new();
+        let mut recovery = fixture.recovery(false, "mkv");
+        recovery.seed.settings.source_filters = true;
+        recovery.seed.settings.temporal = Some(media_core::TemporalSettings {
+            qtgmc: Some(media_core::QtgmcSettings {
+                mode: media_core::DeinterlaceMode::Frame,
+                field_order: media_core::FieldOrder::TopFirst,
+                preset: media_core::QtgmcPreset::Fast,
+            }),
+            ..Default::default()
+        });
+        recovery.source_qtgmc = Some(SourceQtgmc::Deferred);
+        let cache = fixture.directory.join("owned-render.mkv");
+        fs::write(&cache, b"actual lossless cache").unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        assert!(recovery.verify_source_qtgmc(&cache, &cancel).await.is_err());
+        recovery
+            .remember_source_qtgmc(
+                &cache,
+                format!("sha256:{};frames:4", "a".repeat(64)),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let Some(SourceQtgmc::Rendered { artifact, .. }) = &recovery.source_qtgmc else {
+            panic!("real receipt")
+        };
+        assert_eq!(
+            artifact.sha256,
+            format!("{:x}", Sha256::digest(b"actual lossless cache"))
+        );
+        recovery.verify_source_qtgmc(&cache, &cancel).await.unwrap();
+        fs::write(&cache, b"mutate lossless cache").unwrap();
+        assert!(recovery.verify_source_qtgmc(&cache, &cancel).await.is_err());
+        fs::write(&cache, b"actual lossless cache").unwrap();
+        recovery.verify_source_qtgmc(&cache, &cancel).await.unwrap();
+        fs::remove_file(&cache).unwrap();
+        assert!(recovery.verify_source_qtgmc(&cache, &cancel).await.is_err());
     }
 
     #[test]
@@ -1385,6 +1647,7 @@ mod tests {
         let settings = EncodeSettings {
             external_tracks: vec![
                 media_core::ExternalTrack {
+                    subtitle_burn_in: false,
                     offset_milliseconds: 0,
                     subtitle_mode: None,
                     title: None,
@@ -1396,6 +1659,7 @@ mod tests {
                     stream_index: 0,
                 },
                 media_core::ExternalTrack {
+                    subtitle_burn_in: false,
                     offset_milliseconds: 0,
                     subtitle_mode: None,
                     title: None,
@@ -1463,13 +1727,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn donor_only_sources_are_fingerprinted_for_standalone_resume() {
+    async fn donor_and_hdr_resource_sources_are_fingerprinted_for_standalone_resume() {
         let fixture = Fixture::new();
         let metadata = fixture.directory.join("metadata.mka");
         let chapters = fixture.directory.join("chapters.mka");
         fs::write(&metadata, b"metadata donor").unwrap();
         fs::write(&chapters, b"chapter donor").unwrap();
+        let rpu = fixture.directory.join("metadata.rpu");
+        let hdr_json = fixture.directory.join("metadata.json");
+        fs::write(&rpu, b"rpu bytes").unwrap();
+        fs::write(&hdr_json, b"json bytes").unwrap();
         let settings = EncodeSettings {
+            hdr_metadata: Some(media_core::HdrMetadataSettings {
+                dolby_vision_rpu_path: Some(rpu.to_string_lossy().into_owned()),
+                hdr10_plus_json_path: Some(hdr_json.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
             metadata_source_path: Some(metadata.to_string_lossy().into_owned()),
             chapters_source_path: Some(chapters.to_string_lossy().into_owned()),
             ..Default::default()
@@ -1505,11 +1778,18 @@ mod tests {
                 .unwrap()
                 .external_sources
                 .len(),
-            2
+            4
         );
         drop(prepared);
         assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
         fs::write(&chapters, b"changed chapter donor").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
+        fs::write(&chapters, b"chapter donor").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
+        fs::write(&rpu, b"changed rpu bytes").unwrap();
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
+        fs::write(&rpu, b"rpu bytes").unwrap();
+        fs::write(&hdr_json, b"changed json bytes").unwrap();
         assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
     }
 
@@ -1541,6 +1821,7 @@ mod tests {
         fs::write(&external, b"external bytes").unwrap();
         let mut recovery = fixture.recovery(false, "mkv");
         recovery.seed.settings.external_tracks = vec![media_core::ExternalTrack {
+            subtitle_burn_in: false,
             offset_milliseconds: 0,
             subtitle_mode: None,
             title: None,

@@ -6,6 +6,17 @@ use media_core::{AppError, EncodeSettings};
 
 pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     let filters = &settings.av1an_filters;
+    if settings.source_filters {
+        return if filters.iter().any(|filter| filter.contains('\0')) {
+            Err(AppError::new(
+                "VIDEO_FILTER_INVALID",
+                "An FFmpeg filter cannot contain a NUL character.",
+                None,
+            ))
+        } else {
+            Ok(())
+        };
+    }
     if filters.is_empty() {
         return Ok(());
     }
@@ -123,6 +134,16 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
     Ok(())
 }
 
+/// The source keeps each row verbatim and strips only blank/short chain entries.
+pub(in crate::jobs) fn rows(settings: &EncodeSettings) -> Vec<String> {
+    settings
+        .av1an_filters
+        .iter()
+        .filter(|filter| !settings.source_filters || filter.trim().encode_utf16().count() > 2)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +174,31 @@ mod tests {
             settings.av1an_filters = vec![filter.into()];
             assert!(validate(&settings).is_err(), "{filter}");
         }
+    }
+
+    #[test]
+    fn source_rows_preserve_arbitrary_graphs_order_and_verbatim_values() {
+        let mut settings = EncodeSettings {
+            source_filters: true,
+            av1an_filters: vec![
+                " ".into(),
+                "ab".into(),
+                "  [in]scale=80:48,setsar=2[out]  ".into(),
+                "fps=12,tmix=frames=3".into(),
+                "drawtext=text='a b':x=10".into(),
+            ],
+            ..Default::default()
+        };
+        validate(&settings).unwrap();
+        assert_eq!(rows(&settings), settings.av1an_filters[2..]);
+        settings.av1an_filters = vec!["éé".into(), "🧪".into(), "negate".into()];
+        assert_eq!(rows(&settings), vec!["negate".to_owned()]);
+        settings.av1an_filters = std::iter::repeat_n("negate".into(), 20).collect();
+        validate(&settings).unwrap();
+        settings.av1an_filters.push("hue=\0".into());
+        assert!(validate(&settings).is_err());
+        settings.source_filters = false;
+        settings.av1an_filters = vec!["scale=80:48".into()];
+        assert!(validate(&settings).is_err());
     }
 }

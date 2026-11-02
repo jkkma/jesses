@@ -994,6 +994,8 @@ async fn qualify_options(
     }
     if transformed {
         original_request.settings.framing = VideoFraming {
+            resize: None,
+            border_ratio: None,
             crop: CropSettings {
                 top: 8,
                 right: 8,
@@ -1009,6 +1011,7 @@ async fn qualify_options(
             },
         };
         original_request.settings.audio = vec![AudioTrackSettings {
+            normalization: None,
             stream_index: 1,
             codec: if hdr {
                 AudioCodec::Aac

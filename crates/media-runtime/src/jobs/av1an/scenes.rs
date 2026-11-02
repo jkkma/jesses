@@ -256,15 +256,20 @@ pub(super) async fn prepare(
         };
         let environment = environment.clone();
         let cancel = cancel.clone();
+        let pause = supervisor::scoped_pause();
         tasks.spawn(async move {
-            let run = supervisor::run_capture_with_environment(
+            let execution = supervisor::run_capture_with_environment(
                 &spec,
                 cancel,
                 256 * 1024,
                 Duration::from_secs(15 * 60),
                 Some(&environment),
-            )
-            .await
+            );
+            let run = if let Some(control) = pause {
+                supervisor::with_pause(control, execution).await
+            } else {
+                execution.await
+            }
             .map_err(|error| process_error(error, &spec.executable))?;
             if !run.status.success() {
                 return Err(failure(

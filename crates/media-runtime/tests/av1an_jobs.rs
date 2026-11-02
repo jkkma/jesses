@@ -1085,3 +1085,348 @@ async fn canceling_running_av1an_stops_workers_and_releases_output_handles() {
     // Failed-job chunk diagnostics may be retained by the app; the test owns them.
     std::fs::remove_dir_all(&fixture.0).expect("Canceled workers must release all fixture handles");
 }
+
+async fn stopped_action_job(manager: &JobManager, input: &Path, output: &Path) -> JobSnapshot {
+    let mut encode = request(input, output, 5);
+    encode.settings.encoder = media_core::VideoEncoder::X264;
+    encode.settings.crf = 23;
+    encode.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(encode).await.unwrap();
+    wait_for(manager, &submitted.id, |job| {
+        job.state.is_terminal()
+            || job
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.completed_frames >= 48)
+    })
+    .await;
+    manager.stop_job(submitted.id.clone()).await.unwrap();
+    let stopped = wait_for(manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+    for _ in 0..100 {
+        if manager
+            .list_av1an_recoveries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.job.id == submitted.id)
+        {
+            return stopped;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let root = PathBuf::from(&stopped.recovery.as_ref().unwrap().workspace);
+    fn tree(root: &Path) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let p = entry.unwrap().path();
+            eprintln!("recovery artifact {}", p.display());
+            if p.is_dir() {
+                tree(&p)
+            }
+        }
+    }
+    tree(&root);
+    panic!("inactive workspace did not pass owned recovery enumeration");
+}
+
+#[tokio::test]
+#[ignore = "requires real FFmpeg9, av1an, x264 and VapourSynth/L-SMASH"]
+async fn source_recovery_chunk_delete_and_both_resume_settings_preserve_original() {
+    use media_core::Av1anRecoveryAction as Action;
+    let fixture = Fixture::new();
+    let input = fixture.0.join("actions-source.mkv");
+    synthesize(&input, "640x360", 288).await;
+    let before = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let output = fixture.0.join("saved.mkv");
+    let stopped = stopped_action_job(&manager, &input, &output).await;
+    let entries = manager.list_av1an_recoveries().await.unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.job.id == stopped.id)
+        .unwrap();
+    assert!(entry.chunk_count > 0);
+    assert!(entry.encoded_bytes.parse::<u64>().unwrap() > 0);
+    assert!(entry.created_at.is_some());
+    assert!(entry.last_run_at >= entry.created_at);
+    let root = PathBuf::from(&stopped.recovery.as_ref().unwrap().workspace);
+    let scenes = std::fs::read(root.join("chunks/scenes.json")).unwrap();
+    let queue = std::fs::read(root.join("chunks/chunks.json")).unwrap();
+    let script = std::fs::read(root.join("chunks/split/loadscript.vpy")).unwrap();
+    let result = manager
+        .av1an_recovery_action(Action::DeleteChunks {
+            id: stopped.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.jobs[0].recovery.as_ref().unwrap().completed_frames,
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.join("chunks/scenes.json")).unwrap(),
+        scenes
+    );
+    assert_eq!(
+        std::fs::read(root.join("chunks/chunks.json")).unwrap(),
+        queue
+    );
+    assert_eq!(
+        std::fs::read(root.join("chunks/split/loadscript.vpy")).unwrap(),
+        script
+    );
+    assert_eq!(
+        std::fs::read_dir(root.join("chunks/encode"))
+            .unwrap()
+            .count(),
+        0
+    );
+    manager
+        .av1an_recovery_action(Action::ResumeSaved {
+            id: stopped.id.clone(),
+        })
+        .await
+        .unwrap();
+    let finished = wait_for(&manager, &stopped.id, |job| job.state.is_terminal()).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert_eq!(finished.encode_settings, stopped.encode_settings);
+    let next_output = fixture.0.join("new-settings.mkv");
+    let stopped = stopped_action_job(&manager, &input, &next_output).await;
+    let root = PathBuf::from(&stopped.recovery.as_ref().unwrap().workspace);
+    let old_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let old_chunks: Vec<_> = old_manifest["completed"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(n, c)| (n.clone(), c["file"]["sha256"].clone()))
+        .collect();
+    assert!(!old_chunks.is_empty());
+    let mut settings = stopped.encode_settings.clone().unwrap();
+    settings.crf = 17;
+    settings
+        .av1an_options
+        .as_mut()
+        .unwrap()
+        .maximum_chunk_frames = 24;
+    let action = manager
+        .av1an_recovery_action(Action::ResumeNew {
+            id: stopped.id.clone(),
+            settings: settings.clone().into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(action.jobs[0].request, stopped.request);
+    assert_eq!(action.jobs[0].encode_settings.as_ref(), Some(&settings));
+    let partial = wait_for(&manager, &stopped.id, |job| {
+        job.state.is_terminal()
+            || job
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.completed_frames >= 48)
+    })
+    .await;
+    assert!(
+        !partial.state.is_terminal(),
+        "new settings must exercise a real stopped/resumable workspace: {partial:#?}"
+    );
+    manager.stop_job(stopped.id.clone()).await.unwrap();
+    let again = wait_for(&manager, &stopped.id, |job| job.state.is_terminal()).await;
+    assert_eq!(again.state, JobState::Stopped, "{again:#?}");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["settings"]["crf"], 17);
+    assert_ne!(manifest["params"], old_manifest["params"]);
+    assert_eq!(
+        manifest["settings"]["av1anOptions"]["maximumChunkFrames"],
+        24
+    );
+    let fresh_queue: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("chunks/chunks.json")).unwrap()).unwrap();
+    assert!(fresh_queue.as_array().unwrap().len() > 7);
+    for (name, hash) in old_chunks {
+        if let Some(next) = manifest["completed"].get(&name) {
+            assert_ne!(
+                next["file"]["sha256"], hash,
+                "incompatible old chunk was reused"
+            );
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    manager
+        .av1an_recovery_action(Action::ResumeSaved {
+            id: stopped.id.clone(),
+        })
+        .await
+        .unwrap();
+    let finished = wait_for(&manager, &stopped.id, |job| job.state.is_terminal()).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert_eq!(finished.encode_settings.as_ref(), Some(&settings));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    assert_eq!(
+        probe(&next_output).await["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["codec_type"] == "video")
+            .unwrap()["nb_read_frames"],
+        "288"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires real FFmpeg9, av1an, x264 and VapourSynth/L-SMASH"]
+async fn source_recovery_actions_reject_active_foreign_links_and_changed_resume_sources() {
+    use media_core::Av1anRecoveryAction as Action;
+    let fixture = Fixture::new();
+    let input = fixture.0.join("guarded-source.mkv");
+    synthesize(&input, "640x360", 288).await;
+    let before = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut encode = request(&input, &fixture.0.join("guarded.mkv"), 5);
+    encode.settings.encoder = media_core::VideoEncoder::X264;
+    encode.settings.crf = 23;
+    encode.settings.av1an_options = Some(media_core::Av1anOptions {
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        ..Default::default()
+    });
+    let submitted = manager.start_encode(encode).await.unwrap();
+    wait_for(&manager, &submitted.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|r| r.completed_frames >= 48)
+    })
+    .await;
+    assert!(
+        manager
+            .av1an_recovery_action(Action::DeleteChunks {
+                id: submitted.id.clone()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .av1an_recovery_action(Action::ClearAll {
+                ids: vec![submitted.id.clone()]
+            })
+            .await
+            .is_err()
+    );
+    manager.stop_job(submitted.id.clone()).await.unwrap();
+    let stopped = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(stopped.state, JobState::Stopped);
+    let root = PathBuf::from(&stopped.recovery.as_ref().unwrap().workspace);
+    let foreign = root.join("foreign.txt");
+    std::fs::write(&foreign, b"preserve foreign").unwrap();
+    for action in [
+        Action::DeleteChunks {
+            id: stopped.id.clone(),
+        },
+        Action::DeleteEncode {
+            id: stopped.id.clone(),
+        },
+        Action::ResumeSaved {
+            id: stopped.id.clone(),
+        },
+    ] {
+        assert!(manager.av1an_recovery_action(action).await.is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"preserve foreign");
+    }
+    std::fs::remove_file(&foreign).unwrap();
+    let sentinel = fixture.0.join("outside.txt");
+    std::fs::write(&sentinel, b"outside").unwrap();
+    #[cfg(unix)]
+    {
+        let link = root.join("outside-link");
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+        assert!(
+            manager
+                .av1an_recovery_action(Action::DeleteEncode {
+                    id: stopped.id.clone()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside");
+        std::fs::remove_file(link).unwrap();
+    }
+    let mut changed = before.clone();
+    changed.push(0);
+    std::fs::write(&input, &changed).unwrap();
+    assert!(
+        manager
+            .av1an_recovery_action(Action::ResumeSaved {
+                id: stopped.id.clone()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .av1an_recovery_action(Action::ResumeNew {
+                id: stopped.id.clone(),
+                settings: stopped.encode_settings.unwrap().into()
+            })
+            .await
+            .is_err()
+    );
+    manager
+        .av1an_recovery_action(Action::DeleteEncode {
+            id: stopped.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!root.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), changed);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside");
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires real FFmpeg9, av1an, x264 and VapourSynth/L-SMASH"]
+async fn source_recovery_clear_all_preflights_exact_reviewed_set_and_handles_moved_original() {
+    use media_core::Av1anRecoveryAction as Action;
+    let fixture = Fixture::new();
+    let input = fixture.0.join("clear-source.mkv");
+    synthesize(&input, "640x360", 288).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let first = stopped_action_job(&manager, &input, &fixture.0.join("first.mkv")).await;
+    let second = stopped_action_job(&manager, &input, &fixture.0.join("second.mkv")).await;
+    let roots: Vec<_> = [&first, &second]
+        .into_iter()
+        .map(|j| PathBuf::from(&j.recovery.as_ref().unwrap().workspace))
+        .collect();
+    let foreign = roots[1].join("foreign.txt");
+    std::fs::write(&foreign, b"foreign").unwrap();
+    let ids = vec![first.id.clone(), second.id.clone()];
+    assert!(
+        manager
+            .av1an_recovery_action(Action::ClearAll { ids: ids.clone() })
+            .await
+            .is_err()
+    );
+    assert!(roots.iter().all(|r| r.join("manifest.json").exists()));
+    std::fs::remove_file(foreign).unwrap();
+    let moved = fixture.0.join("moved-original.mkv");
+    std::fs::rename(&input, &moved).unwrap();
+    assert_eq!(manager.list_av1an_recoveries().await.unwrap().len(), 2);
+    let result = manager
+        .av1an_recovery_action(Action::ClearAll { ids })
+        .await
+        .unwrap();
+    assert_eq!(result.jobs.len(), 2);
+    assert!(result.jobs.iter().all(|job| job.recovery.is_none()));
+    assert!(roots.iter().all(|r| !r.exists()));
+    assert_eq!(std::fs::read(&moved).unwrap(), original);
+    assert!(manager.list_av1an_recoveries().await.unwrap().is_empty());
+    manager.shutdown().await;
+}

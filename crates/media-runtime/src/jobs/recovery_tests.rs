@@ -177,6 +177,7 @@ async fn history_capacity_never_prunes_recoverable_work() {
                 EncodeBackend::Av1an
             };
             state.entries.push(Entry {
+                command_review: None,
                 pause: Default::default(),
                 snapshot: JobSnapshot {
                     id: format!("saved-{index}"),
@@ -184,8 +185,11 @@ async fn history_capacity_never_prunes_recoverable_work() {
                     request: request.source.clone(),
                     mux_request: None,
                     encode_settings: Some(settings),
+                    edited_command: None,
                     recovery: (!standalone).then(|| fixture.recovery()),
                     standalone_recovery: standalone.then(|| fixture.standalone_recovery()),
+                    input_size_bytes: None,
+                    output_size_bytes: None,
                     progress_seconds: None,
                     duration_seconds: None,
                     logs: vec![],

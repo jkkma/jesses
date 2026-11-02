@@ -44,6 +44,14 @@ pub(super) fn chunk_extension(encoder: VideoEncoder) -> &'static str {
 }
 
 pub(in crate::jobs) fn uses_mkvmerge(encoder: VideoEncoder, settings: &EncodeSettings) -> bool {
+    if settings
+        .av1an_options
+        .is_some_and(|options| options.source_workflow)
+    {
+        return encoder == VideoEncoder::X265Standalone
+            || settings.av1an_options.unwrap_or_default().concat_method
+                == media_core::Av1anConcatMethod::Mkvmerge;
+    }
     matches!(
         encoder,
         VideoEncoder::X264 | VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
@@ -52,7 +60,12 @@ pub(in crate::jobs) fn uses_mkvmerge(encoder: VideoEncoder, settings: &EncodeSet
 }
 
 pub(super) fn video_extension(encoder: VideoEncoder, settings: &EncodeSettings) -> &'static str {
-    if uses_mkvmerge(encoder, settings) {
+    if uses_mkvmerge(encoder, settings)
+        || (encoder == VideoEncoder::X264
+            && settings
+                .av1an_options
+                .is_some_and(|options| options.source_workflow))
+    {
         "mkv"
     } else {
         "ivf"
@@ -117,9 +130,19 @@ pub(super) fn parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString
         _ => unreachable!("validated av1an encoder"),
     };
     super::grain::parameters(&mut args, settings);
-    if let Some(threads) = settings.av1an_options.unwrap_or_default().encoder_threads {
+    super::super::dynamic_hdr::Resources::parameters(&mut args, settings);
+    let selected_threads = settings.av1an_options.unwrap_or_default().encoder_threads;
+    let threads = if super::super::parameters::requires_serial_svt(settings) {
+        Some(1)
+    } else {
+        selected_threads
+    };
+    if let Some(threads) = threads {
         match settings.encoder {
-            encoder if encoder.is_svt() => args.extend(["--lp".into(), threads.to_string().into()]),
+            encoder if encoder.is_svt() => {
+                args = without_pairs(args, &["--lp"], &[]);
+                args.extend(["--lp".into(), threads.to_string().into()]);
+            }
             VideoEncoder::X264 => args.extend(["--threads".into(), threads.to_string().into()]),
             VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone => {
                 args.push(format!("--threads={threads}").into())
@@ -235,6 +258,35 @@ mod tests {
             if family == VideoEncoder::X265Standalone {
                 assert_eq!(video_extension(family, &settings), "mkv");
             }
+        }
+    }
+    #[test]
+    fn unsafe_svt_pair_keeps_both_controls_and_caps_requested_parallelism() {
+        let document: Document = serde_json::from_value(serde_json::json!({"format":{"start_time":"0"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0","chroma_location":"left","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}]})).unwrap();
+        let settings = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            av1an_options: Some(media_core::Av1anOptions {
+                encoder_threads: Some(4),
+                ..Default::default()
+            }),
+            parameters: ["hbd-mds", "enable-overlays"]
+                .into_iter()
+                .map(|name| media_core::EncoderParameter {
+                    name: name.into(),
+                    value: "1".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+        let args = parameters(&plan, &settings);
+        assert_eq!(args.iter().filter(|value| *value == "--lp").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--lp", "1"]));
+        for name in ["--hbd-mds", "--enable-overlays"] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == name && pair[1] == "1")
+            );
         }
     }
 }
