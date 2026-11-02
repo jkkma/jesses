@@ -1,277 +1,384 @@
-import { expect, test, type Page } from '@playwright/test';
-import type { MediaFile, UserPreferences } from '../../src/lib/ipc/generated';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
-type MetadataMock = {
-  pickFiles: (paths: string[]) => void;
-};
-
-async function desktopMock(page: Page, files: [string, MediaFile][], pickerPaths: string[]) {
-  await page.addInitScript(
-    ({ files, pickerPaths }) => {
-      const host = globalThis as unknown as Record<string, unknown>;
-      const knownFiles = new Map(files);
-      let selectedPaths = pickerPaths;
-      let nextCallback = 0;
-      let nextEvent = 0;
-      const callbacks = new Map<number, (value: unknown) => void>();
-      let prefs: UserPreferences = {
-        general: { defaultOutputDirectory: '', recursiveImport: false },
-        recentPaths: [],
-        revision: 0,
-      };
-      host.__metadataMock = {
-        pickFiles: (paths) => (selectedPaths = paths),
-      } satisfies MetadataMock;
-      host.isTauri = true;
-      host.__TAURI_INTERNALS__ = {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: (callback: (value: unknown) => void) => {
-          const id = ++nextCallback;
-          callbacks.set(id, callback);
-          return id;
-        },
-        unregisterCallback: (id: number) => callbacks.delete(id),
-        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          if (command === 'plugin:dialog|open') return selectedPaths;
-          if (command === 'plugin:event|listen') {
-            callbacks.set(payload.handler as number, () => undefined);
-            return ++nextEvent;
-          }
-          if (command === 'plugin:event|unlisten') return;
-          if (command === 'get_capabilities') return [];
-          if (command === 'subscribe_jobs') {
-            (payload.channel as { onmessage: (value: unknown[]) => void }).onmessage([]);
-            return;
-          }
-          if (command === 'get_preferences') return structuredClone(prefs);
-          if (command === 'remember_recent_media') {
-            prefs = {
-              ...prefs,
-              recentPaths: [...(payload.paths as string[]), ...prefs.recentPaths].slice(0, 15),
-              revision: prefs.revision + 1,
-            };
-            return structuredClone(prefs);
-          }
-          if (command === 'probe_media') {
-            const value = knownFiles.get(payload.path as string);
-            if (value) return value;
-            throw {
-              code: 'FILE_NOT_FOUND',
-              message: 'The selected file is unavailable.',
-              path: payload.path,
-            };
-          }
-          throw new Error(`Unexpected command: ${command}`);
-        },
-      };
-    },
-    { files, pickerPaths },
-  );
-}
-
-function media(path: string, streams: Record<string, unknown>[], metadata = {}): MediaFile {
-  return {
-    id: path,
-    path,
-    name: path.split(/[\\/]/).at(-1)!,
-    sizeBytes: '9007199254740993',
-    durationSeconds: 123.45,
-    format: 'matroska,webm',
-    streams,
-    ...metadata,
-  } as unknown as MediaFile;
-}
-
-async function importFile(page: Page) {
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-}
-
-test('inspector preserves exact stream and container metadata, including absent and unknown values', async ({
+// The old expandable metadata inspector is not in the fork. Keep the source's
+// track identities/descriptions and editable title/language request assertions;
+// detailed probe metadata remains covered by native media/probe tests.
+test('Track List describes source streams and metadata edits retain their indices', async ({
   page,
 }) => {
-  const path = 'C:\\media\\metadata-sample.mkv';
-  const fixture = media(
-    path,
-    [
-      {
-        index: 0,
-        kind: 'video',
-        codec: 'h264',
-        codecLongName: 'H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10',
-        profile: 'High',
-        bitRate: '9007199254740995',
-        durationSeconds: 123.4,
-        width: 720,
-        height: 480,
-        sampleAspectRatio: '8:9',
-        displayAspectRatio: '4:3',
-        rotationDegrees: '90',
-        frameRate: '24000/1001',
-        averageFrameRate: '24000/1001',
-        nominalFrameRate: '30000/1001',
-        fieldOrder: 'progressive',
-        pixelFormat: 'yuv420p10le',
-        bitDepth: 10,
-        colorPrimaries: 'bt2020',
-        colorTransfer: 'smpte2084',
-        colorSpace: 'bt2020nc',
-        colorRange: 'tv',
-        hdrFormat: 'HDR / PQ',
-        hasHdrStaticMetadata: true,
-        dynamicHdrFormats: ['HDR10+'],
-        isDefault: true,
-        sampleRate: null,
-        channels: null,
-        channelLayout: null,
-        language: 'eng',
-        title: 'Main feature',
-      },
-      {
-        index: 2,
-        kind: 'audio',
-        codec: 'dts',
-        codecLongName: 'DCA (DTS Coherent Acoustics)',
-        profile: 'DTS-HD MA',
-        bitRate: '1500000',
-        sampleRate: 48000,
-        channels: 6,
-        channelLayout: '5.1(side)',
-        language: 'eng',
-        title: 'Commentary',
-        isDefault: false,
-        width: null,
-        height: null,
-        frameRate: null,
-        sampleAspectRatio: null,
-        displayAspectRatio: null,
-        rotationDegrees: undefined,
-        fieldOrder: undefined,
-        pixelFormat: undefined,
-        bitDepth: undefined,
-        colorPrimaries: undefined,
-        colorTransfer: undefined,
-        colorSpace: undefined,
-        colorRange: undefined,
-        hdrFormat: undefined,
-        hasHdrStaticMetadata: undefined,
-        dynamicHdrFormats: undefined,
-      },
-      {
-        index: 4,
-        kind: 'subtitle',
-        codec: 'hdmv_pgs_subtitle',
-        codecLongName: 'HDMV Presentation Graphic Stream subtitles',
-        language: 'jpn',
-        title: 'Japanese',
-        isDefault: false,
-      },
-      {
-        index: 5,
-        kind: 'subtitle',
-        codec: 'subrip',
-        codecLongName: 'SubRip subtitle',
-        language: 'eng',
-        title: 'English',
-      },
-      {
-        index: 6,
-        kind: 'subtitle',
-        codec: 'vendor_subtitle',
-      },
-      {
-        index: 7,
-        kind: 'attachment',
-        codec: 'ttf',
-        codecLongName: 'TrueType Font',
-        attachmentFilename: 'captions-font.ttf',
-        attachmentMimeType: 'application/x-truetype-font',
-      },
-      { index: 9, kind: 'data', codec: 'scte_35', codecLongName: 'SCTE 35 section' },
-    ],
-    {
-      title: 'Evening feature',
-      language: 'eng',
-      bitRate: '18014398509481987',
-    },
-  );
-  await desktopMock(page, [[path, fixture]], [path]);
-  await page.goto('/');
-  await importFile(page);
+  await installSourceEncodeFixture(page);
+  const video = {
+    ...source.streams[0],
+    index: 0,
+    width: 720,
+    height: 480,
+    frameRate: '24000/1001',
+    language: 'eng',
+    title: 'Main feature',
+  };
+  const audio = {
+    ...source.streams[1],
+    index: 2,
+    codec: 'dts',
+    channelLayout: '5.1(side)',
+    language: 'eng',
+    title: 'Commentary',
+  };
+  const subtitle = {
+    ...source.streams[2],
+    index: 4,
+    codec: 'hdmv_pgs_subtitle',
+    language: 'jpn',
+    title: 'Japanese',
+  };
+  const unknown = {
+    ...source.streams[2],
+    index: 6,
+    codec: 'vendor_subtitle',
+    language: null,
+    title: null,
+  };
+  const attachment = {
+    ...source.streams[2],
+    index: 7,
+    kind: 'attachment',
+    codec: 'ttf',
+    attachmentFilename: 'captions-font.ttf',
+    language: null,
+    title: null,
+  };
+  const fixture = {
+    ...source,
+    sizeBytes: '9007199254740993',
+    streams: [video, audio, subtitle, unknown, attachment],
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), fixture);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
   await expect(
-    page.getByRole('heading', { name: 'metadata-sample.mkv', exact: true }),
+    tracks.getByRole('option', { name: /Video \(H264\).*720x480.*Main feature/ }),
   ).toBeVisible();
-
-  const fileDisclosure = page
-    .locator('details')
-    .filter({ has: page.getByText('More file metadata', { exact: true }) });
-  await expect(fileDisclosure).not.toHaveAttribute('open', '');
-  await expect(page.getByText('File size (exact bytes)', { exact: true })).toBeHidden();
-  await fileDisclosure.locator('summary').click();
-  const fileMetadata = page.locator('details').filter({
-    has: page.getByText('File size (exact bytes)', { exact: true }),
-  });
-  await expect(fileMetadata.getByText('Evening feature', { exact: true })).toBeVisible();
-  await expect(fileMetadata.getByText('123.45 s', { exact: true })).toBeVisible();
-  await expect(fileMetadata.getByText('18014398509481987 bit/s', { exact: true })).toBeVisible();
-  await expect(fileMetadata.getByText('9007199254740993', { exact: true })).toBeVisible();
-
-  const video = page.locator('.stream-card').filter({ hasText: '#0' });
-  await expect(video.locator('details')).not.toHaveAttribute('open', '');
-  await video.getByText('More stream metadata', { exact: true }).click();
-  const averageRate = video.getByText('24000/1001', { exact: true });
-  await expect(averageRate).toHaveCount(2);
-  await expect(averageRate.first()).toBeVisible();
-  await expect(averageRate.nth(1)).toBeVisible();
-  await expect(video.getByText('30000/1001', { exact: true })).toBeVisible();
-  await expect(video.getByText('8:9', { exact: true })).toBeVisible();
-  await expect(video.getByText('90°', { exact: true })).toBeVisible();
-  await expect(video.getByText('123.4 s', { exact: true })).toBeVisible();
-  await expect(video.getByText('9007199254740995 bit/s', { exact: true })).toBeVisible();
-  await expect(video.getByText('Yes', { exact: true })).toBeVisible();
-
-  const audio = page.locator('.stream-card').filter({ hasText: '#2' });
-  await audio.getByText('More stream metadata', { exact: true }).click();
-  await expect(audio.getByText('dts', { exact: true })).toBeVisible();
-  await expect(audio.getByText('DTS-HD MA', { exact: true })).toBeVisible();
-  await expect(audio.getByText('5.1(side)', { exact: true })).toBeVisible();
-  await expect(audio.getByText('No', { exact: true })).toBeVisible();
-  await expect(audio.getByText('Not reported', { exact: true })).toBeVisible();
-
-  const pgs = page.locator('.stream-card').filter({ hasText: '#4' });
-  await pgs.getByText('More stream metadata', { exact: true }).click();
-  await expect(pgs.getByText('Bitmap', { exact: true })).toBeVisible();
-  const text = page.locator('.stream-card').filter({ hasText: '#5' });
-  await text.getByText('More stream metadata', { exact: true }).click();
-  await expect(text.getByText('Text', { exact: true })).toBeVisible();
-  const unknownSubtitle = page.locator('.stream-card').filter({ hasText: '#6' });
-  await unknownSubtitle.getByText('More stream metadata', { exact: true }).click();
-  await expect(unknownSubtitle.getByText('Unknown', { exact: true })).toBeVisible();
-
-  const attachment = page.locator('.stream-card').filter({ hasText: '#7' });
-  await attachment.getByText('More stream metadata', { exact: true }).click();
-  await expect(attachment.getByText('captions-font.ttf', { exact: true })).toBeVisible();
-  await expect(attachment.getByText('application/x-truetype-font', { exact: true })).toBeVisible();
-  await expect(page.locator('.stream-card').filter({ hasText: '#9' })).toContainText('data');
+  await expect(tracks.getByRole('option', { name: /Audio \(DTS\).*Commentary/ })).toBeVisible();
+  await expect(tracks.getByRole('option', { name: /Subtitles \(PGS\).*Japanese/ })).toBeVisible();
+  await expect(tracks.getByRole('option', { name: /vendor_subtitle/ })).toBeVisible();
+  await expect(tracks.getByRole('option', { name: /captions-font.ttf/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Title for track 2').fill('Director commentary');
+  await quick.getByLabel('Language for track 2').fill('fra');
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/metadata');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
+  );
+  expect(request.source.streamIndices).toEqual([0, 2, 4, 6, 7]);
+  expect(request.settings.trackOverrides).toContainEqual(
+    expect.objectContaining({ streamIndex: 2, title: 'Director commentary', language: 'fra' }),
+  );
 });
 
-test('audio-only sources do not show video thumbnail controls', async ({ page }) => {
-  const path = 'C:\\media\\voice-note.m4a';
-  const fixture = media(path, [
-    {
-      index: 0,
-      kind: 'audio',
-      codec: 'aac',
-      codecLongName: 'AAC (Advanced Audio Coding)',
-      sampleRate: 44100,
-      channels: 2,
-      channelLayout: 'stereo',
-      language: null,
-      title: null,
+test('audio-only input disables thumbnail requests on Track List', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const fixture = {
+    ...source,
+    id: 'audio-only',
+    path: '/media/voice.m4a',
+    name: 'voice.m4a',
+    streams: source.streams.filter((stream) => stream.kind === 'audio'),
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), fixture);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await expect(page.getByRole('button', { name: 'Show next thumbnail' })).toBeDisabled();
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'preview_frame').length,
+    ),
+  ).toBe(0);
+});
+
+test('Output File metadata starts from the loaded file, retains edits across tabs and resets after removal', async ({
+  page,
+}) => {
+  if (process.env.JESSES_CAPTURE_UI) await page.setViewportSize({ width: 800, height: 720 });
+  await installSourceEncodeFixture(page);
+  const first = { ...source, title: 'Original title', language: 'eng' };
+  const second = {
+    ...source,
+    id: 'second',
+    path: '/other/second.mkv',
+    name: 'second.mkv',
+    title: 'Second title',
+    language: 'jpn',
+  };
+  await page.evaluate(
+    ({ first, second }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [first.path, second.path];
+      host.__mediaByPath = { [first.path]: first, [second.path]: second };
     },
-  ]);
-  await desktopMock(page, [[path, fixture]], [path]);
-  await page.goto('/');
-  await importFile(page);
-  await expect(page.getByRole('heading', { name: 'voice-note.m4a', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Video thumbnail & scrubbing' })).toHaveCount(0);
+    { first, second },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  const title = quick.getByLabel('Title for output file');
+  const language = quick.getByLabel('Language for output file');
+  await expect(title).toHaveValue('Original title');
+  await expect(language).toHaveValue('eng');
+  const sizes = await title.evaluate((element) => {
+    const row = element.closest('tr')!;
+    return {
+      title: element.getBoundingClientRect().width,
+      language: row
+        .querySelector<HTMLInputElement>('[aria-label="Language for output file"]')!
+        .getBoundingClientRect().width,
+      scrolls: document.documentElement.scrollWidth > innerWidth,
+    };
+  });
+  expect(sizes.language).toBeLessThanOrEqual(100);
+  expect(sizes.title).toBeGreaterThan(sizes.language * 2);
+  expect(sizes.scrolls).toBe(false);
+  if (process.env.JESSES_CAPTURE_UI)
+    await page.screenshot({
+      path: 'target/migration-validation/frontend/metadata-output-file-800.png',
+    });
+  await title.fill('Edited title');
+  await language.fill('spa');
+  await quick.getByLabel('Apply the titles and languages below').uncheck();
+  await expect(title).toBeDisabled();
+  await quick.getByRole('tab', { name: 'Video', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Apply the titles and languages below').check();
+  await expect(title).toHaveValue('Edited title');
+  await expect(language).toHaveValue('spa');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await expect(title).toHaveValue('Second title');
+  await expect(language).toHaveValue('jpn');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /second.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.evaluate((first) => {
+    const host = globalThis as any;
+    host.__pickerPaths = [first.path];
+    host.__mediaByPath[first.path] = first;
+  }, first);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await expect(title).toHaveValue('Original title');
+  await expect(language).toHaveValue('eng');
+});
+
+test('source None donors and Output File clear values map separately from unchecked Apply', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const media = { ...source, title: 'Original', language: 'eng' };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), media);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Copy Metadata From').selectOption('');
+  await quick.getByLabel('Copy Chapters From').selectOption('');
+  await quick.getByLabel('Title for output file').fill('   ');
+  await quick.getByLabel('Language for output file').fill('  fra  ');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(1);
+  let requests = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request),
+  );
+  expect(requests[0].settings).toMatchObject({
+    copyMetadata: false,
+    copyChapters: false,
+    outputMetadata: { title: '', language: 'fra' },
+  });
+  expect(requests[0].settings.metadataSourcePath).toBeUndefined();
+  expect(requests[0].settings.chaptersSourcePath).toBeUndefined();
+  await quick.getByLabel('Copy Metadata From').selectOption('/media/input.mkv');
+  await quick.getByLabel('Copy Chapters From').selectOption('/media/input.mkv');
+  await quick.getByLabel('Apply the titles and languages below').uncheck();
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  requests = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request),
+  );
+  expect(requests[1].settings).toMatchObject({
+    metadataSourcePath: '/media/input.mkv',
+    chaptersSourcePath: '/media/input.mkv',
+  });
+  expect(requests[1].settings.copyMetadata).toBeUndefined();
+  expect(requests[1].settings.copyChapters).toBeUndefined();
+  expect(requests[1].settings.outputMetadata).toBeUndefined();
+  expect(
+    (requests[1].settings.trackOverrides ?? []).some(
+      (item: any) => 'title' in item || 'language' in item,
+    ),
+  ).toBe(false);
+});
+
+test('Quick batch defaults to each source donor, respects None, and excludes the metadata grid', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = { ...source, title: 'First' };
+  const second = {
+    ...source,
+    id: 'second',
+    path: '/other/second.mkv',
+    name: 'second.mkv',
+    title: 'Second',
+  };
+  await page.evaluate(
+    ({ first, second }) => {
+      const h = globalThis as any;
+      h.__pickerPaths = [first.path, second.path];
+      h.__mediaByPath = { [first.path]: first, [second.path]: second };
+    },
+    { first, second },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Title for output file').fill('Do not batch this title');
+  await quick.getByLabel('Title for track 1').fill('Do not batch this track title');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await expect(quick.getByLabel('Copy Metadata From')).toHaveValue('current');
+  await expect(quick.getByLabel('Copy Chapters From')).toHaveValue('current');
+  await expect(quick.getByLabel('Title for output file')).toHaveCount(0);
+  await quick.getByLabel('Copy Metadata From').selectOption('');
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const preview = calls.find((c: any) => c.command === 'preview_encode_batch').payload.request;
+  expect(preview.copyMetadata).toBe(false);
+  expect(preview.copyChapters).toBeUndefined();
+  expect(preview.outputMetadata).toBeUndefined();
+  const requests = calls
+    .filter((c: any) => c.command === 'mock_start_encode')
+    .map((c: any) => c.payload.request);
+  for (const request of requests) {
+    expect(request.settings.copyMetadata).toBe(false);
+    expect(request.settings.metadataSourcePath).toBeUndefined();
+    expect(request.settings.chaptersSourcePath).toBe(request.source.inputPath);
+    expect(request.settings.outputMetadata).toBeUndefined();
+    expect(
+      (request.settings.trackOverrides ?? []).some(
+        (item: any) => 'title' in item || 'language' in item,
+      ),
+    ).toBe(false);
+  }
+  await quick.getByLabel('Copy Metadata From').selectOption('current');
+  await quick.getByLabel('Copy Chapters From').selectOption('');
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(4);
+  const secondRun = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .slice(2)
+      .map((c: any) => c.payload.request),
+  );
+  for (const request of secondRun) {
+    expect(request.settings.metadataSourcePath).toBe(request.source.inputPath);
+    expect(request.settings.copyMetadata).toBeUndefined();
+    expect(request.settings.copyChapters).toBe(false);
+    expect(request.settings.chaptersSourcePath).toBeUndefined();
+    expect(request.settings.outputMetadata).toBeUndefined();
+  }
+});
+
+test('copy-video conversion carries trimmed Output File metadata and explicit donor removal', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Copy Metadata From').selectOption('');
+  await quick.getByLabel('Copy Chapters From').selectOption('');
+  await quick.getByLabel('Title for output file').fill('  Copied Title  ');
+  await quick.getByLabel('Language for output file').fill('  jpn  ');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request.settings,
+      ),
+    )
+    .toMatchObject({
+      videoMode: 'copy',
+      copyMetadata: false,
+      copyChapters: false,
+      outputMetadata: { title: 'Copied Title', language: 'jpn' },
+    });
 });

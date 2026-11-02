@@ -1,0 +1,112 @@
+// Archived after the explicit CPU-only encoding request. Completed software proof remains under target/migration-validation/source-trim-20261101.
+#[tokio::test]
+#[ignore = "source NVENC command shape executed with explicit editor replacement libx264; no GPU qualification"]
+async fn source_nvenc_trim_command_uses_each_source_seek_strategy_with_copied_tracks() {
+    for mode in ["frames", "inputSeek", "decodeFromStart"] {
+        let f = Fixture::new();
+        let input = fixture(&f);
+        let out = f.0.join("edited-nvenc.mkv");
+        let trim = if mode == "frames" {
+            serde_json::from_value(json!({"startFrame":24,"endFrameExclusive":72})).unwrap()
+        } else {
+            serde_json::from_value(json!({"time":{"startMilliseconds":979,"endMilliseconds":2999,"seekStrategy":mode}})).unwrap()
+        };
+        let mut req = request(&input, &out, trim);
+        req.settings.encoder = VideoEncoder::H264Nvenc;
+        req.settings.source_nvenc_quality = true;
+        req.settings.preset = 0;
+        let manager = JobManager::new(f.0.join("logs"));
+        let (_owner, cancel) = tokio::sync::watch::channel(false);
+        let review = manager
+            .prepare_command_edit(
+                CommandEditRequest::Encode {
+                    request: Box::new(req),
+                },
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let program = review
+            .arguments
+            .replace("'h264_nvenc'", "'libx264'")
+            .replace("'p1'", "'ultrafast'")
+            .replace("'-cq'", "'-crf'");
+        assert_ne!(program, review.arguments);
+        let CommandEditResult::Encode { job } = manager
+            .confirm_command_edit(
+                CommandEditConfirmation {
+                    id: review.id,
+                    arguments: program.clone(),
+                },
+                cancel,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let result = terminal(&manager, &job.id).await;
+        manager.shutdown().await;
+        assert_eq!(result.state, JobState::Succeeded, "{mode}: {result:#?}");
+        let actual = probe(&out);
+        let video = packets(&actual, 1);
+        assert_eq!(video.len(), 48);
+        let reference = f.0.join("source-equivalent.mkv");
+        let mut a = args(&["-v", "error"]);
+        if mode == "inputSeek" {
+            a.extend(args(&["-ss", "0.979"]));
+        }
+        a.push("-i".into());
+        a.push(input.into());
+        a.extend(args(&[
+            "-map",
+            "0:s",
+            "-map",
+            "0:v",
+            "-map",
+            "0:a",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "copy",
+            "-c:s",
+            "copy",
+        ]));
+        if mode != "inputSeek" {
+            a.extend(args(&["-ss", "0.979"]));
+        }
+        a.extend(args(&["-t", "2.020"]));
+        if mode == "frames" {
+            a.extend(args(&["-frames:v", "48"]));
+        }
+        a.push(reference.clone().into());
+        let source_command = a.clone();
+        run("ffmpeg", a);
+        let expected = probe(&reference);
+        for index in [0, 2] {
+            let a = packets(&actual, index);
+            let b = packets(&expected, index);
+            assert_eq!(a.len(), b.len(), "{mode} track{index}");
+            for (a, b) in a.iter().zip(b) {
+                assert_eq!(a["data_hash"], b["data_hash"]);
+                for key in ["pts_time", "dts_time", "duration_time"] {
+                    assert!(
+                        (number(a, key) - number(b, key)).abs() < 0.0021,
+                        "{mode} {key}: {a:?} {b:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            (number(video[0], "pts_time") - number(packets(&expected, 1)[0], "pts_time")).abs()
+                < 0.0021,
+            "{mode}"
+        );
+        let proof = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/migration-validation/source-trim-20261101");
+        std::fs::create_dir_all(&proof).unwrap();
+        std::fs::write(proof.join(format!("nvenc-shape-{mode}.json")),serde_json::to_vec_pretty(&json!({"qualification":"NVENC command generated, explicitly edited to CPU libx264; no physical GPU proof","program":program,"sourceEquivalentArguments":source_command.iter().map(|value|value.to_string_lossy()).collect::<Vec<_>>(),"actual":actual,"expected":expected})).unwrap()).unwrap();
+    }
+}

@@ -1,0 +1,20 @@
+    #[test]
+    fn nvenc_source_target_size_uses_one_pass_vbr() {
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            let settings = EncodeSettings {
+                encoder,
+                rate_control: Some(VideoRateControl::TargetSizeDecimal {
+                    target_size_tenths_mb: 500,
+                }),
+                ..Default::default()
+            };
+            validate(&settings).unwrap();
+            let rate = Rate::resolve(&settings, 60.0, 0).unwrap().unwrap();
+            assert!(!rate.two_pass);
+            let mut args = vec!["output.mkv".into()];
+            rate.arguments(&mut args, encoder, 1);
+            for flag in ["-b:v", "-minrate", "-maxrate", "-bufsize"] {
+                assert!(args.iter().any(|arg| arg == flag));
+            }
+        }
+    }

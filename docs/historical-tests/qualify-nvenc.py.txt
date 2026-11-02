@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Prove NVENC build capabilities; optionally prove a diagnosed no-device error.
+
+A successful help check is never a positive NVIDIA hardware qualification.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+
+REQUIRED = {"h264_nvenc": {"yuv420p", "yuv444p"}, "hevc_nvenc": {"yuv420p", "yuv444p", "p010le"}}
+
+
+def help_capabilities(text, codec):
+    if not any(line.startswith(f"Encoder {codec} [") for line in text.splitlines()):
+        raise ValueError(f"The binary does not advertise {codec}.")
+    formats = next((line.split(":", 1)[1].split() for line in text.splitlines() if line.strip().startswith("Supported pixel formats:")), [])
+    if not REQUIRED[codec].issubset(formats):
+        raise ValueError(f"{codec} lacks required source pixel formats: {sorted(REQUIRED[codec] - set(formats))}")
+    if not {"-cq", "-preset", "-tune", "-rc", "-qp"}.issubset(text.split()):
+        raise ValueError(f"{codec} lacks required source quality/Advanced options.")
+    return formats
+
+
+def qualify(ffmpeg, no_device=False):
+    reports = []
+    for codec in REQUIRED:
+        result = subprocess.run([str(ffmpeg), "-hide_banner", "-h", f"encoder={codec}"], capture_output=True, text=True, timeout=15)
+        text = result.stdout + result.stderr
+        if result.returncode:
+            raise ValueError(f"{codec} help failed: {text[-1000:]}")
+        formats = help_capabilities(text, codec)
+        report = {"encoder": codec, "formats": formats, "helpSha256": hashlib.sha256(text.encode()).hexdigest(), "positiveGpuQualified": False}
+        if no_device:
+            attempts = []
+            for pixel in sorted(REQUIRED[codec]):
+                args = [str(ffmpeg), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "color=s=64x64:r=1:d=1", "-frames:v", "1", "-an", "-vf", f"format={pixel}", "-c:v", codec, "-preset", "p1", "-b:v", "0", "-cq", "22", "-f", "null", "-"]
+                probe = subprocess.run(args, capture_output=True, text=True, timeout=20)
+                diagnostic = probe.stderr
+                if not probe.returncode or not any(marker in diagnostic.lower() for marker in ("cannot load libcuda", "cannot load nvcuda", "no nvenc capable", "no capable devices", "cannot init cuda", "driver does not support", "minimum required nvidia driver", "cannot load libnvidia-encode", "cannot load nvencodeapi", "cuda_error_no_device", "no cuda capable")):
+                    raise ValueError(f"Expected a diagnosed NVIDIA device/driver absence for {codec}/{pixel}, got {probe.returncode}: {diagnostic[-2000:]}")
+                attempts.append({"pixelFormat": pixel, "argv": args[1:], "exitCode": probe.returncode, "diagnostic": diagnostic})
+            report["noDeviceProbes"] = attempts
+        reports.append(report)
+    return {"schemaVersion": 1, "ffmpegSha256": hashlib.file_digest(ffmpeg.open("rb"), "sha256").hexdigest(), "positiveGpuQualified": False, "encoders": reports}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ffmpeg", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expect-no-device", action="store_true")
+    args = parser.parse_args()
+    report = qualify(args.ffmpeg.resolve(strict=True), args.expect_no_device)
+    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"NVENC capability qualification passed: {args.output}; positive GPU execution remains unqualified.")
+
+
+if __name__ == "__main__":
+    main()

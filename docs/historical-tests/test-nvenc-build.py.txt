@@ -1,0 +1,65 @@
+"""NVENC source completeness, explicit feature admission and portable extraction."""
+import importlib.util
+import io
+import json
+from pathlib import Path
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HERE=Path(__file__).resolve().parent
+
+def module(name,path):
+    spec=importlib.util.spec_from_file_location(name,path);result=importlib.util.module_from_spec(spec);spec.loader.exec_module(result);return result
+
+LINUX=module("linux_nvenc",HERE/"build-package-ffmpeg-linux.py")
+WINDOWS=module("windows_nvenc",HERE/"build-package-ffmpeg.py")
+QUALIFY=module("qualify_nvenc",HERE/"qualify-nvenc.py")
+
+class NvencTests(unittest.TestCase):
+    def test_same_exact_header_source_and_every_original_notice_on_both_platforms(self):
+        linux=json.loads((HERE/"package-ffmpeg-linux-lock.json").read_text())
+        windows=json.loads((HERE/"package-ffmpeg-windows-lock.json").read_text())
+        item=next(item for item in linux["libraries"] if item["id"]=="nv-codec-headers")
+        self.assertEqual(item,windows["nvCodecHeaders"])
+        self.assertIn(item["gitCommit"],item["url"])
+        self.assertEqual(len(item["gitCommit"]),40)
+        self.assertEqual(len(item["sha256"]),64)
+        self.assertEqual(set(item["licenseFiles"]),{"README","include/ffnvcodec/dynlink_cuda.h","include/ffnvcodec/dynlink_cuviddec.h","include/ffnvcodec/dynlink_loader.h","include/ffnvcodec/dynlink_nvcuvid.h","include/ffnvcodec/nvEncodeAPI.h"})
+        for configure in [LINUX.CONFIGURE,WINDOWS.CONFIGURE]:
+            self.assertIn("--disable-autodetect",configure)
+            self.assertTrue({"--enable-nvenc","--enable-ffnvcodec"}.issubset(configure))
+
+    def test_advertised_name_without_formats_or_advanced_options_is_not_capability(self):
+        text="Encoder hevc_nvenc [NVIDIA NVENC]\nSupported pixel formats: yuv420p yuv444p p010le\n-cq -preset -tune -rc -qp\n"
+        self.assertIn("p010le",QUALIFY.help_capabilities(text,"hevc_nvenc"))
+        for bad in ["Codec 'hevc_nvenc' is not recognized",text.replace("p010le",""),text.replace("-cq","")]:
+            with self.assertRaises(ValueError):QUALIFY.help_capabilities(bad,"hevc_nvenc")
+
+    def test_actual_no_device_probe_does_not_misclassify_an_encoder_option_failure(self):
+        class Result:
+            returncode=0;stdout="";stderr=""
+        def invoke(args,**kwargs):
+            result=Result()
+            if "-h" in args:
+                codec=args[-1].split("=",1)[1]
+                result.stdout=f"Encoder {codec} [NVENC]\nSupported pixel formats: yuv420p yuv444p p010le\n-cq -preset -tune -rc -qp"
+            else:
+                result.returncode=1;result.stderr="Error setting option preset to value invalid"
+            return result
+        with tempfile.TemporaryDirectory() as temporary:
+            executable=Path(temporary)/"ffmpeg";executable.write_bytes(b"fixture")
+            with patch.object(QUALIFY.subprocess,"run",side_effect=invoke),self.assertRaises(ValueError):QUALIFY.qualify(executable,True)
+
+    def test_windows_source_extractor_rejects_links_and_traversal_after_hash_validation(self):
+        for name,kind in [("root/../../escape",tarfile.REGTYPE),("root/link",tarfile.SYMTYPE)]:
+            with tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary);archive=root/"headers.tar"
+                with tarfile.open(archive,"w") as bundle:
+                    member=tarfile.TarInfo(name);member.type=kind;member.size=0;member.linkname="outside";bundle.addfile(member,io.BytesIO())
+                item={"sha256":WINDOWS.digest(archive),"sourceRoot":"root","licenseFiles":[]}
+                with self.assertRaises(ValueError):WINDOWS.extract_nvcodec(archive,root/"out",item)
+                self.assertFalse((root/"escape").exists())
+
+if __name__=="__main__":unittest.main()

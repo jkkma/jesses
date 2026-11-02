@@ -1,0 +1,34 @@
+import {test,expect} from '@playwright/test';
+import {installSourceEncodeFixture} from './helpers/source-encode-fixture';
+
+const primary={id:'primary',path:'/media/primary.mkv',name:'primary.mkv',sizeBytes:'1000',durationSeconds:12,format:'matroska',streams:[
+ {index:0,kind:'video',codec:'h264',width:640,height:360,frameRate:'24/1',fieldOrder:'progressive',sampleRate:null,channels:null,language:'jpn',title:'Main picture'},
+ {index:1,kind:'video',codec:'h264',width:800,height:600,frameRate:'30/1',fieldOrder:'progressive',sampleRate:null,channels:null,language:'eng',title:'Alternate picture'},
+ {index:2,kind:'audio',codec:'aac',width:null,height:null,frameRate:null,fieldOrder:null,sampleRate:48000,channels:2,language:'eng',title:'Main voice'},
+]};
+const external={...primary,id:'external',path:'/media/external.mkv',name:'external.mkv',streams:[{...primary.streams[0],width:1280,height:720,title:'External picture'},{...primary.streams[2],index:1,title:'External voice'}]};
+
+async function load(page:import('@playwright/test').Page){
+ await installSourceEncodeFixture(page);
+ await page.evaluate(inputs=>{const h=globalThis as any;h.__pickerPaths=inputs.map(item=>item.path);h.__mediaByPath=Object.fromEntries(inputs.map(item=>[item.path,item]));},[primary,external]);
+ await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('option',{name:/primary.mkv/}).click();await page.getByRole('option',{name:/external.mkv/}).click({modifiers:['Control']});await page.getByRole('button',{name:'Load Tracks'}).click();
+ await page.getByRole('checkbox',{name:/Include .*External picture/}).check();
+}
+async function request(page:import('@playwright/test').Page){await page.getByRole('button',{name:'Run: Encode'}).click();await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.find((c:any)=>c.command==='mock_start_encode')?.payload.request)).toBeTruthy();return page.evaluate(()=> (globalThis as any).__sourceCalls.find((c:any)=>c.command==='mock_start_encode').payload.request);}
+
+test('source NVENC snapshots every checked primary/external video and retains source map order',async({page})=>{
+ await load(page);await page.getByRole('button',{name:'Quick Convert',exact:true}).click();const q=page.getByRole('region',{name:'Quick Convert',exact:true});
+ await expect(q.getByText('This encoder supports one selected video track per encode.')).toBeVisible();await q.getByLabel('Codec',{exact:true}).selectOption('h264Nvenc');
+ await expect(q.getByText('This encoder supports one selected video track per encode.')).toHaveCount(0);await q.getByLabel('Output Path',{exact:true}).fill('/media/all-pictures');
+ const result=await request(page);expect(result.source).toMatchObject({inputPath:primary.path,streamIndices:[0,1,2],outputPath:'/media/all-pictures.mkv'});expect(result.settings).toMatchObject({encoder:'h264Nvenc',sourceNvencQuality:true,videoStreamIndex:0});
+ expect(result.settings.externalTracks).toContainEqual(expect.objectContaining({inputPath:external.path,streamIndex:0}));expect(result.settings.trackOrder).toEqual([{streamIndex:0},{streamIndex:1},{streamIndex:2},{inputPath:external.path,streamIndex:0},{inputPath:external.path,streamIndex:1}]);
+});
+
+test('moving external video first rebases picture settings while retaining original source identities',async({page})=>{
+ await load(page);const tracks=page.getByRole('region',{name:'Track List'});await tracks.getByRole('listbox',{name:'Tracks'}).getByRole('option',{name:/External picture/}).click();for(let i=0;i<3;i++)await tracks.getByRole('button',{name:'Move track up'}).click();
+ await page.getByRole('button',{name:'Quick Convert',exact:true}).click();const q=page.getByRole('region',{name:'Quick Convert',exact:true});await q.getByLabel('Codec',{exact:true}).selectOption('hevcNvenc');await q.getByLabel('Output Path',{exact:true}).fill('/media/external-first');
+ const result=await request(page);expect(result.source).toMatchObject({inputPath:external.path,streamIndices:[0,1]});expect(result.settings).toMatchObject({encoder:'hevcNvenc',sourceNvencQuality:true,videoStreamIndex:0});
+ expect(result.settings.externalTracks).toEqual(expect.arrayContaining([{inputPath:primary.path,streamIndex:0,title:'Main picture',language:'jpn'},{inputPath:primary.path,streamIndex:1,title:'Alternate picture',language:'eng'},expect.objectContaining({inputPath:primary.path,streamIndex:2})]));
+ expect(result.settings.trackOrder).toEqual([{streamIndex:0},{inputPath:primary.path,streamIndex:0},{inputPath:primary.path,streamIndex:1},{inputPath:primary.path,streamIndex:2},{streamIndex:1}]);
+ expect(result.settings.framing.crop).toEqual({left:0,right:0,top:0,bottom:0});
+});

@@ -1,2165 +1,1363 @@
-import { expect, test, type Page } from '@playwright/test';
-import type {
-  BatchEncodeRequest,
-  EncodeRequest,
-  FolderScanResult,
-  JobSnapshot,
-  MediaFile,
-  MediaStream,
-} from '../../src/lib/ipc/generated';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
-const stream: MediaStream = {
-  index: 2,
-  kind: 'video',
-  codec: 'h264',
-  width: 1280,
-  height: 720,
-  frameRate: '24000/1001',
-  sampleRate: null,
-  channels: null,
-  language: null,
-  title: null,
-};
-const episode = (number: number): MediaFile => ({
-  id: `episode-${number}`,
-  path: `C:\\media\\Episode ${number}.mkv`,
-  name: `Episode ${number}.mkv`,
-  sizeBytes: '12345',
-  durationSeconds: 1400,
-  format: 'matroska',
-  streams: [
-    stream,
-    { ...stream, index: 11, kind: 'attachment', codec: 'ttf' },
-    { ...stream, index: 5, kind: 'audio', codec: 'aac', language: 'jpn', channels: 2 },
-    { ...stream, index: 8, kind: 'subtitle', codec: 'ass', language: 'eng' },
-    { ...stream, index: 9, title: 'Alternate video' },
-  ],
-});
-const episodes = [episode(1), episode(2)];
-type Mock = {
-  calls: { command: string; payload: Record<string, unknown> }[];
-  release: (key: string) => void;
-  pickFiles: (files: MediaFile[]) => void;
-  hold: (key: string) => void;
-};
-
-async function desktopMock(
-  page: Page,
-  options: {
-    scan?: FolderScanResult;
-    held?: string[];
-    invalidPath?: string;
-    queueFailure?: boolean;
-    lateTerminal?: boolean;
-    missing?: string;
-    files?: MediaFile[];
-    cancelFolder?: boolean;
-  } = {},
-) {
-  await page.addInitScript(
-    ({ initialFiles, options }) => {
-      const host = globalThis as unknown as Record<string, unknown>;
-      let pickedFiles = initialFiles;
-      const media = new Map(initialFiles.map((file) => [file.path, file]));
-      let jobs: JobSnapshot[] = [];
-      let channel: { onmessage: (jobs: JobSnapshot[]) => void } | undefined;
-      let callback = 0;
-      const held = new Set(options.held ?? []);
-      const waits = new Map<string, (() => void)[]>();
-      const wait = async (key: string) => {
-        if (held.has(key))
-          await new Promise<void>((resolve) =>
-            waits.set(key, [...(waits.get(key) ?? []), resolve]),
-          );
-      };
-      const calls: Mock['calls'] = [];
-      host.__batchMock = {
-        calls,
-        release: (key) => {
-          held.delete(key);
-          waits.get(key)?.forEach((resolve) => resolve());
-          waits.delete(key);
-        },
-        hold: (key) => held.add(key),
-        pickFiles: (files) => {
-          pickedFiles = files;
-          files.forEach((file) => media.set(file.path, file));
-        },
-      } satisfies Mock;
-      host.isTauri = true;
-      host.__TAURI_INTERNALS__ = {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: () => ++callback,
-        unregisterCallback: () => {},
-        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          calls.push({ command, payload });
-          if (command === 'get_completion_status')
-            return {
-              options: { notify: false, finishAction: 'none' },
-              armedJobs: 0,
-              secondsRemaining: null,
-              error: null,
-            };
-          if (command === 'get_capabilities')
-            return [
-              'ffmpeg',
-              'ffprobe',
-              'svt-av1',
-              'svt-av1-5fish',
-              'svt-av1-hdr',
-              'av1an',
-              'x264',
-              'aomenc',
-              'vpxenc',
-              'x265',
-              'mkvmerge',
-            ].map((id) => ({
-              id,
-              name: id,
-              available: options.missing !== id,
-              path: `C:\\tools\\${id}.exe`,
-              version: 'test',
-              detail: null,
-            }));
-          if (command === 'plugin:dialog|open') {
-            const config = payload.options as { directory?: boolean; title?: string };
-            if (config.directory)
-              return config.title?.includes('output')
-                ? 'C:\\exports'
-                : options.cancelFolder
-                  ? null
-                  : 'C:\\media';
-            return pickedFiles.map((file) => file.path);
-          }
-          if (command.startsWith('plugin:event|')) return ++callback;
-          if (command === 'subscribe_jobs') {
-            channel = payload.channel as typeof channel;
-            channel?.onmessage(jobs);
-            return;
-          }
-          if (command === 'scan_media_folder') {
-            await wait('scan');
-            return (
-              options.scan ?? {
-                paths: initialFiles.map((file) => file.path),
-                errors: [],
-                skippedCount: 0,
-                truncated: false,
-              }
-            );
-          }
-          if (command === 'probe_media') {
-            await wait(`probe:${payload.path}`);
-            const file = media.get(payload.path as string);
-            if (!file)
-              throw {
-                code: 'PROBE_FAILED',
-                message: 'This media could not be probed.',
-                path: payload.path,
-              };
-            return file;
-          }
-          if (command === 'preview_encode_batch') {
-            const request = payload.request as BatchEncodeRequest;
-            await wait('preview');
-            return {
-              items: request.inputs.map((input) => {
-                if (input.inputPath === options.invalidPath)
-                  return {
-                    inputPath: input.inputPath,
-                    outputPath: null,
-                    request: null,
-                    error: {
-                      code: 'UNSUPPORTED_SOURCE',
-                      message: 'This source has unsupported HDR metadata.',
-                      path: input.inputPath,
-                    },
-                  };
-                const sourceFile = input.inputPath.split('\\').at(-1)!;
-                const sourceDot = sourceFile.lastIndexOf('.');
-                const sourceName = sourceDot < 1 ? sourceFile : sourceFile.slice(0, sourceDot);
-                const sourceExtension = sourceDot < 1 ? '' : sourceFile.slice(sourceDot + 1);
-                const codec = {
-                  svtAv1: 'av1',
-                  svtAv1FiveFish: 'av1_5fish',
-                  svtAv1Hdr: 'av1_hdr',
-                  x264: 'x264',
-                  x265: 'x265',
-                  vp9: 'vp9',
-                  aomAv1: 'aom',
-                  x265Standalone: 'x265_standalone',
-                  vpxStandalone: 'vpx',
-                  h264Nvenc: 'h264_nvenc',
-                  hevcNvenc: 'hevc_nvenc',
-                }[request.encoder];
-                const quarterCrf = request.svtCrfQuarterSteps;
-                const crf =
-                  quarterCrf === undefined
-                    ? String(request.crf)
-                    : String(Math.floor(quarterCrf / 4)) + ['', '.25', '.5', '.75'][quarterCrf % 4];
-                const quality = request.lossless
-                  ? 'lossless'
-                  : request.rateControl?.mode === 'bitrate'
-                    ? `${request.rateControl.bitrateKbps}kbps${request.rateControl.twoPass ? '_2pass' : ''}`
-                    : request.rateControl?.mode === 'targetSize'
-                      ? `${request.rateControl.targetSizeMib}MiB`
-                      : crf;
-                const x26xPresets = [
-                  'ultrafast',
-                  'superfast',
-                  'veryfast',
-                  'faster',
-                  'fast',
-                  'medium',
-                  'slow',
-                  'slower',
-                  'veryslow',
-                  'placebo',
-                ];
-                const preset = ['x264', 'x265', 'x265Standalone'].includes(request.encoder)
-                  ? x26xPresets[request.preset]
-                  : request.svtPreset === undefined
-                    ? String(request.preset)
-                    : String(request.svtPreset);
-                const selectedVideo = media
-                  .get(input.inputPath)
-                  ?.streams.find(
-                    (candidate) =>
-                      candidate.kind === 'video' && candidate.index === input.videoStreamIndex,
-                  );
-                const tokens: Record<string, string> = {
-                  name: sourceName,
-                  ext: sourceExtension,
-                  index: String(request.inputs.indexOf(input) + 1).padStart(
-                    String(request.inputs.length).length,
-                    '0',
-                  ),
-                  codec,
-                  crf,
-                  quality,
-                  preset,
-                  width: String(selectedVideo?.width ?? ''),
-                  height: String(selectedVideo?.height ?? ''),
-                  date: request.namingDate ?? '',
-                };
-                const outputStem = (request.outputNameTemplate ?? '{name}_{codec}').replace(
-                  /\{([^{}]+)\}/g,
-                  (_match, token: string) => tokens[token.toLowerCase()] ?? token,
-                );
-                const extension = {
-                  matroska: 'mkv',
-                  mp4: 'mp4',
-                  webm: 'webm',
-                  mov: 'mov',
-                  mpegTs: 'ts',
-                  m2ts: 'm2ts',
-                }[request.outputContainer ?? 'matroska'];
-                const outputPath = `${request.outputDirectory}\\${outputStem}.${extension}`;
-                return {
-                  inputPath: input.inputPath,
-                  outputPath,
-                  request: {
-                    source: {
-                      inputPath: input.inputPath,
-                      outputPath,
-                      streamIndices: input.streamIndices,
-                    },
-                    settings: {
-                      videoStreamIndex: input.videoStreamIndex,
-                      crf: request.crf,
-                      ...(request.av1anOptions ? { av1anOptions: request.av1anOptions } : {}),
-                      ...(request.rateControl ? { rateControl: request.rateControl } : {}),
-                      preset: request.preset,
-                      lossless: request.lossless,
-                      ...(request.svtCrfQuarterSteps === undefined
-                        ? {}
-                        : { svtCrfQuarterSteps: request.svtCrfQuarterSteps }),
-                      ...(request.svtPreset === undefined ? {} : { svtPreset: request.svtPreset }),
-                      backend: request.backend,
-                      encoder: request.encoder,
-                      workers: request.workers,
-                      filmGrain: request.filmGrain,
-                      hdr10Fallback: request.hdr10Fallback,
-                      lineartPsyBias: request.lineartPsyBias,
-                      texturePsyBias: request.texturePsyBias,
-                      hdrTune: request.hdrTune,
-                      framing: input.framing,
-                      audio: input.audio,
-                      ...(input.trim ? { trim: input.trim } : {}),
-                      ...(input.toneMap ? { toneMap: input.toneMap } : {}),
-                    },
-                  },
-                  error: null,
-                };
-              }),
-            };
-          }
-          if (command === 'enqueue_encode_batch') {
-            const requests = payload.requests as EncodeRequest[];
-            const added = requests.map((request, index): JobSnapshot => ({
-              id: `batch-${jobs.length + index + 1}`,
-              state: 'queued',
-              request: request.source,
-              encodeSettings: request.settings,
-              progressSeconds: 0,
-              durationSeconds: 1400,
-              logs: [],
-              error: null,
-              recovery: null,
-              logPath: null,
-            }));
-            if (!options.queueFailure) {
-              jobs = [
-                ...added
-                  .map((job) => ({
-                    ...job,
-                    state: options.lateTerminal ? ('succeeded' as const) : job.state,
-                  }))
-                  .reverse(),
-                ...jobs,
-              ];
-              channel?.onmessage(jobs);
-            }
-            await wait('enqueue');
-            if (options.queueFailure)
-              throw {
-                code: 'DESTINATION_EXISTS',
-                message: 'A reviewed destination now exists.',
-                path: requests[0].source.outputPath,
-              };
-            return added;
-          }
-          if (command === 'cancel_all_jobs') {
-            jobs = jobs.map((job) => ({ ...job, state: 'canceled' }));
-            channel?.onmessage(jobs);
-            return jobs;
-          }
-          throw new Error(`Unexpected command: ${command}`);
-        },
-      };
-    },
-    { initialFiles: options.files ?? episodes, options },
-  );
-}
-
-async function calls(page: Page, command: string) {
-  return page.evaluate(
-    (name) =>
-      (globalThis as unknown as { __batchMock: Mock }).__batchMock.calls.filter(
-        (call) => call.command === name,
-      ),
-    command,
-  );
-}
-async function release(page: Page, key: string) {
-  await page.evaluate(
-    (name) => (globalThis as unknown as { __batchMock: Mock }).__batchMock.release(name),
-    key,
-  );
-}
-async function openBatch(page: Page) {
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'Episode 2.mkv', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
-}
-
-test('batch explains other operations without running them or expanding a reviewed selection', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const guidance = workspace.locator('details.batch-operation-guidance');
-  await expect(guidance.locator('summary')).toHaveText('Other operations');
-  await expect(guidance).toHaveJSProperty('open', false);
-  await guidance.locator('summary').click();
-  await expect(guidance).toContainText('joins and concatenation');
-  await expect(guidance).toContainText('file-list order');
-  await expect(guidance).toContainText('CRF ladders one source at a time');
-  await expect(guidance).toContainText('quality for a chosen source pair');
-  await expect(guidance).toContainText('bitrate charts one source at a time');
-  await expect(guidance).toContainText('CRF ladder results per source');
-  await guidance.locator('summary').click();
-
-  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(preview.inputs.map((input) => input.inputPath)).toEqual([episodes[0].path]);
-  const queue = workspace.getByRole('button', { name: 'Queue ready files', exact: true });
-  await expect(queue).toBeEnabled();
-
-  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Media utilities', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: /^Files/ }).click();
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await expect(queue).toBeEnabled();
-
-  for (const command of [
-    'begin_media_analysis',
-    'run_utility',
-    'analyze_quality',
-    'analyze_bitrate',
-  ])
-    expect(await calls(page, command)).toHaveLength(0);
-  expect(await calls(page, 'preview_encode_batch')).toHaveLength(1);
-
-  await queue.click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued).toHaveLength(1);
-  expect(queued.map((request) => request.source.inputPath)).toEqual([episodes[0].path]);
-  for (const command of [
-    'begin_media_analysis',
-    'run_utility',
-    'analyze_quality',
-    'analyze_bitrate',
-  ])
-    expect(await calls(page, command)).toHaveLength(0);
-});
-
-test('crop resize and borders batch preview retains each source framing and immutable queue history', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await second.locator('.episode-tracks > summary').click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  await second.getByText('Crop, resize & borders', { exact: true }).click();
-  await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
-  await first.getByLabel('Crop bottom (pixels)', { exact: true }).fill('40');
-  await first.getByLabel('Resize video', { exact: true }).check();
-  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
-  await first.getByLabel('Add black borders', { exact: true }).check();
-  await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
-  await first.getByLabel('Border bottom (pixels)', { exact: true }).fill('20');
-  await expect(first.getByLabel('Video dimensions', { exact: true })).toContainText(
-    'Picture 640 × 320 → Output 640 × 360',
-  );
-  await second.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
-  await second.getByLabel('Add black borders', { exact: true }).check();
-  await second.getByLabel('Border left (pixels)', { exact: true }).fill('20');
-  await expect(second.getByLabel('Video dimensions', { exact: true })).toContainText(
-    'Picture 1260 × 720 → Output 1280 × 720',
-  );
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(workspace.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'Picture width 640 px',
-  );
-  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(preview.inputs.map((input) => input.framing)).toEqual([
-    {
-      crop: { top: 40, right: 0, bottom: 40, left: 0 },
-      resizeWidth: 640,
-      borders: { top: 20, right: 0, bottom: 20, left: 0 },
-    },
-    {
-      crop: { top: 0, right: 0, bottom: 0, left: 20 },
-      resizeWidth: null,
-      borders: { top: 0, right: 0, bottom: 0, left: 20 },
-    },
-  ]);
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued.map((request) => request.settings.framing)).toEqual(
-    preview.inputs.map((input) => input.framing),
-  );
-  await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  await first.getByLabel('Crop top (pixels)', { exact: true }).fill('0');
-  await first.getByLabel('Border top (pixels)', { exact: true }).fill('0');
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
-    'Crop top 40, right 0, bottom 40, left 0 px · Picture width 640 px · Automatic height · Black borders top 20, right 0, bottom 20, left 0 px',
-  );
-  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
-});
-
-for (const edit of ['crop', 'width', 'resize', 'border', 'bordersEnabled']) {
-  test(`crop resize and borders batch ${edit} edit invalidates an outstanding preview`, async ({
-    page,
-  }) => {
-    await desktopMock(page, { held: ['preview'] });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-    await first.locator('.episode-tracks > summary').click();
-    await first.getByText('Crop, resize & borders', { exact: true }).click();
-    await first.getByLabel('Resize video', { exact: true }).check();
-    await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
-    await first.getByLabel('Add black borders', { exact: true }).check();
-    await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
-    if (edit === 'crop') await first.getByLabel('Crop bottom (pixels)', { exact: true }).fill('40');
-    if (edit === 'width')
-      await first.getByLabel('Picture width (pixels)', { exact: true }).fill('960');
-    if (edit === 'resize') await first.getByLabel('Resize video', { exact: true }).uncheck();
-    if (edit === 'border')
-      await first.getByLabel('Border bottom (pixels)', { exact: true }).fill('20');
-    if (edit === 'bordersEnabled')
-      await first.getByLabel('Add black borders', { exact: true }).uncheck();
-    await release(page, 'preview');
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeDisabled();
-    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-      'Review required before queueing',
-    );
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeEnabled();
-    expect(await calls(page, 'enqueue_encode_batch')).toHaveLength(0);
-  });
-}
-
-test('crop and resize default framing permits mixed source compatibility results in batch preview', async ({
-  page,
-}) => {
-  const odd = {
-    ...episodes[1],
-    streams: episodes[1].streams.map((stream) =>
-      stream.kind === 'video' ? { ...stream, width: 1279 } : stream,
-    ),
-  };
-  await desktopMock(page, { files: [episodes[0], odd], invalidPath: odd.path });
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await expect(workspace.getByRole('button', { name: 'Preview batch', exact: true })).toBeEnabled();
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    '1 ready / 2 reviewed',
-  );
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued.map((request) => request.source.inputPath)).toEqual([episodes[0].path]);
-});
-
-test('crop resize and borders batch rejects invalid per-file values before requesting preview', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  for (const edge of ['top', 'right', 'bottom', 'left']) {
-    for (const invalid of ['', '-2', '3', '2.5', '8192']) {
-      await first.getByLabel(`Crop ${edge} (pixels)`, { exact: true }).fill(invalid);
-      await expect(preview).toBeDisabled();
-    }
-    await first.getByLabel(`Crop ${edge} (pixels)`, { exact: true }).fill('0');
-  }
-  await first.getByLabel('Resize video', { exact: true }).check();
-  for (const invalid of ['', '63', '65', '640.5', '8194', '64']) {
-    await first.getByLabel('Picture width (pixels)', { exact: true }).fill(invalid);
-    await expect(preview).toBeDisabled();
-  }
-  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
-  await first.getByLabel('Add black borders', { exact: true }).check();
-  for (const edge of ['top', 'right', 'bottom', 'left']) {
-    for (const invalid of ['', '-2', '3', '2.5', '8192']) {
-      await first.getByLabel(`Border ${edge} (pixels)`, { exact: true }).fill(invalid);
-      await expect(preview).toBeDisabled();
-    }
-    await first.getByLabel(`Border ${edge} (pixels)`, { exact: true }).fill('0');
-  }
-  await first.getByLabel('Border right (pixels)', { exact: true }).fill('7552');
-  await expect(first.getByLabel('Video dimensions', { exact: true })).toContainText(
-    'Output 8192 × 360',
-  );
-  await expect(preview).toBeEnabled();
-  await first.getByLabel('Border left (pixels)', { exact: true }).fill('2');
-  await expect(preview).toBeDisabled();
-  await first.getByLabel('Add black borders', { exact: true }).uncheck();
-  await expect(preview).toBeEnabled();
-  expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
-});
-
-test('crop resize and border batch drafts restore per encoder and workflow with independent av1an framing', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  await first.getByLabel('Crop top (pixels)', { exact: true }).fill('40');
-  await first.getByLabel('Resize video', { exact: true }).check();
-  await first.getByLabel('Picture width (pixels)', { exact: true }).fill('640');
-  await first.getByLabel('Add black borders', { exact: true }).check();
-  await first.getByLabel('Border top (pixels)', { exact: true }).fill('20');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
-  await expect(first.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
-  await first.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
-  await first.getByLabel('Add black borders', { exact: true }).check();
-  await first.getByLabel('Border left (pixels)', { exact: true }).fill('40');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('0');
-  await expect(first.getByLabel('Add black borders', { exact: true })).not.toBeChecked();
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const chunked = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
+test('canceling the source image-sequence folder picker leaves import ready', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate(() => ((globalThis as any).__pickerPaths = []));
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await expect(page.getByRole('button', { name: 'Add Folder…' })).toBeEnabled();
   expect(
-    chunked.inputs.every(
-      (input) =>
-        input.framing.resizeWidth === null &&
-        Object.values(input.framing.crop).every((edge) => edge === 0) &&
-        Object.values(input.framing.borders).every((edge) => edge === 0),
-    ),
-  ).toBe(true);
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
-  await expect(first.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('20');
-  await expect(first.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('40');
-  await expect(first.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('0');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await expect(first.getByLabel('Crop top (pixels)', { exact: true })).toHaveValue('40');
-  await expect(first.getByLabel('Picture width (pixels)', { exact: true })).toHaveValue('640');
-  await expect(first.getByLabel('Border top (pixels)', { exact: true })).toHaveValue('20');
-  await expect(first.getByLabel('Border left (pixels)', { exact: true })).toHaveValue('0');
-  await expect(
-    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-});
-
-for (const variant of ['svtAv1FiveFish', 'svtAv1Hdr'] as const) {
-  test(`SVT fork ${variant} batch snapshots retain reviewed controls and output names`, async ({
-    page,
-  }) => {
-    await desktopMock(page);
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    const fiveFish = variant === 'svtAv1FiveFish';
-    if (fiveFish)
-      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-    const selector = workspace.getByLabel('Video encoder', {
-      exact: true,
-    });
-    await selector.selectOption(variant);
-    await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue(fiveFish ? '18' : '30');
-    await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('2');
-    if (fiveFish) {
-      await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('5');
-      await expect(workspace.getByLabel('Texture psy bias', { exact: true })).toHaveValue('4');
-      await workspace.getByLabel('Texture psy bias', { exact: true }).fill('6');
-    } else {
-      await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('filmGrain');
-      await workspace.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
-    }
-    await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeEnabled();
-    const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-      .request as BatchEncodeRequest;
-    expect(preview).toMatchObject({
-      backend: fiveFish ? 'av1an' : 'standalone',
-      encoder: variant,
-      crf: fiveFish ? 18 : 30,
-      preset: 2,
-      lineartPsyBias: fiveFish ? 5 : 0,
-      texturePsyBias: fiveFish ? 6 : 0,
-      hdrTune: 'visualQuality',
-      filmGrain: 0,
-      hdr10Fallback: false,
-    });
-    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-      `Episode 1_av1_${fiveFish ? '5fish' : 'hdr'}.mkv`,
-    );
-    await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-    const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
-      .requests as EncodeRequest[];
-    expect(requests).toHaveLength(2);
-    for (const request of requests)
-      expect(request.settings).toMatchObject({
-        encoder: preview.encoder,
-        crf: preview.crf,
-        preset: preview.preset,
-        lineartPsyBias: preview.lineartPsyBias,
-        texturePsyBias: preview.texturePsyBias,
-        hdrTune: preview.hdrTune,
-      });
-    await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-    await selector.selectOption('svtAv1');
-    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-    const job = page.getByRole('article', { name: 'Job batch-2', exact: true });
-    await job.getByText('Saved settings and log', { exact: true }).click();
-    await expect(job).toContainText(fiveFish ? 'av1an / SVT-AV1 5fish' : 'Standalone SVT-AV1-HDR');
-    await expect(job).toContainText(fiveFish ? 'Lineart 5 · Texture 6' : 'HDR tune visual quality');
-    expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(requests);
-  });
-
-  test(`SVT fork ${variant} batch requires its exact tool`, async ({ page }) => {
-    await desktopMock(page, {
-      missing: variant === 'svtAv1FiveFish' ? 'svt-av1-5fish' : 'svt-av1-hdr',
-    });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
-    await expect(
-      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-    ).toBeEnabled();
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(variant);
-    await expect(
-      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-    ).toBeDisabled();
-    await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(variant);
-    await expect(
-      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-    ).toBeDisabled();
-  });
-}
-
-for (const control of ['Lineart psy bias', 'Texture psy bias', 'HDR tune'] as const) {
-  test(`SVT fork batch invalidates a deferred preview after editing ${control}`, async ({
-    page,
-  }) => {
-    await desktopMock(page, { held: ['preview'] });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    await workspace
-      .getByLabel('Video encoder', { exact: true })
-      .selectOption(control === 'HDR tune' ? 'svtAv1Hdr' : 'svtAv1FiveFish');
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
-    if (control === 'HDR tune')
-      await workspace.getByLabel(control, { exact: true }).selectOption('visualQuality');
-    else await workspace.getByLabel(control, { exact: true }).fill('7');
-    await release(page, 'preview');
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeDisabled();
-    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-      'Review required before queueing',
-    );
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeEnabled();
-    const latest = (await calls(page, 'preview_encode_batch'))[1].payload
-      .request as BatchEncodeRequest;
-    if (control === 'HDR tune') expect(latest.hdrTune).toBe('visualQuality');
-    else
-      expect(control === 'Lineart psy bias' ? latest.lineartPsyBias : latest.texturePsyBias).toBe(
-        7,
-      );
-  });
-}
-
-test('SVT fork batch preserves independent standalone and av1an build choices and per-build source drafts', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1FiveFish');
-  await workspace.getByLabel('Lineart psy bias', { exact: true }).fill('7');
-  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await expect(
-    workspace.getByLabel('Video encoder', { exact: true }).locator('option[value="x264"]'),
-  ).toHaveCount(1);
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
-  await workspace.getByLabel('HDR tune', { exact: true }).selectOption('visualQuality');
-  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('3');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
-  await expect(workspace.getByLabel('Video encoder', { exact: true })).toHaveValue(
-    'svtAv1FiveFish',
-  );
-  await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveValue('7');
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(workspace.getByLabel('Lineart psy bias', { exact: true })).toHaveCount(0);
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(workspace.getByLabel('Video encoder', { exact: true })).toHaveValue('svtAv1Hdr');
-  await expect(workspace.getByLabel('HDR tune', { exact: true })).toHaveValue('visualQuality');
-  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('3');
-});
-
-test('x264 batch defaults and copied tracks become immutable reviewed H.264 queue requests', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('10');
-  await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
-  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('5');
-  await expect(
-    workspace.getByLabel('Preset', { exact: true }).locator('option:checked'),
-  ).toHaveText('medium');
-  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
-  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
-  for (const invalid of ['-1', '52', '23.5', '']) {
-    await workspace.getByLabel('CRF', { exact: true }).fill(invalid);
-    await expect(
-      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-    ).toBeDisabled();
-  }
-  for (const valid of ['0', '51', '23']) {
-    await workspace.getByLabel('CRF', { exact: true }).fill(valid);
-    await expect(
-      workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-    ).toBeEnabled();
-  }
-  await workspace
-    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
-    .first()
-    .click();
-  await workspace.getByLabel('Video stream for Episode 1.mkv', { exact: true }).selectOption('9');
-  await workspace
-    .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
-    .uncheck();
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const preview = page.getByRole('region', { name: 'Batch output preview' });
-  await expect(preview).toContainText('2 ready / 2 reviewed');
-  await expect(preview).toContainText('Episode 1_x264.mkv');
-  await expect(preview).toContainText('Episode 2_x264.mkv');
-  const settings = {
-    crf: 23,
-    preset: 5,
-    lossless: false,
-    backend: 'standalone',
-    encoder: 'x264',
-    workers: 2,
-    filmGrain: 0,
-    hdr10Fallback: false,
-    lineartPsyBias: 0,
-    texturePsyBias: 0,
-    hdrTune: 'visualQuality',
-  };
-  const reviewedRequest = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(reviewedRequest.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-  expect(reviewedRequest).toEqual({
-    outputContainer: 'matroska',
-    outputDirectory: 'C:\\exports',
-    outputNameTemplate: '{name}_{codec}',
-    namingDate: reviewedRequest.namingDate,
-    ...settings,
-    inputs: [
-      {
-        inputPath: episodes[0].path,
-        videoStreamIndex: 9,
-        streamIndices: [9, 8, 11],
-        framing: {
-          crop: { top: 0, right: 0, bottom: 0, left: 0 },
-          resizeWidth: null,
-          borders: { top: 0, right: 0, bottom: 0, left: 0 },
-        },
-        audio: [],
-      },
-      {
-        inputPath: episodes[1].path,
-        videoStreamIndex: 2,
-        streamIndices: [2, 5, 8, 11],
-        framing: {
-          crop: { top: 0, right: 0, bottom: 0, left: 0 },
-          resizeWidth: null,
-          borders: { top: 0, right: 0, bottom: 0, left: 0 },
-        },
-        audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
-      },
-    ],
-  });
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued).toEqual([
-    {
-      source: {
-        inputPath: episodes[0].path,
-        outputPath: 'C:\\exports\\Episode 1_x264.mkv',
-        streamIndices: [9, 8, 11],
-      },
-      settings: {
-        ...settings,
-        videoStreamIndex: 9,
-        framing: {
-          crop: { top: 0, right: 0, bottom: 0, left: 0 },
-          resizeWidth: null,
-          borders: { top: 0, right: 0, bottom: 0, left: 0 },
-        },
-        audio: [],
-      },
-    },
-    {
-      source: {
-        inputPath: episodes[1].path,
-        outputPath: 'C:\\exports\\Episode 2_x264.mkv',
-        streamIndices: [2, 5, 8, 11],
-      },
-      settings: {
-        ...settings,
-        videoStreamIndex: 2,
-        framing: {
-          crop: { top: 0, right: 0, bottom: 0, left: 0 },
-          resizeWidth: null,
-          borders: { top: 0, right: 0, bottom: 0, left: 0 },
-        },
-        audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
-      },
-    },
-  ]);
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  const job = page.getByRole('article', { name: 'Job batch-2', exact: true });
-  await job.getByText('Saved settings and log', { exact: true }).click();
-  await expect(job).toContainText('H.264 encode');
-  await expect(job).toContainText(
-    'Standalone x264 · H.264 · Source bit depth · CRF 23 · Preset medium',
-  );
-  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
-});
-
-test('filename templates preview reviewed tokens and edits invalidate the snapshot', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const template = workspace.getByLabel('Filename template', { exact: true });
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  const queue = workspace.getByRole('button', { name: 'Queue ready files', exact: true });
-  await expect(template).toHaveValue('{name}_{codec}');
-  await expect(template).toHaveAttribute('maxlength', '512');
-  await expect(workspace).toContainText(
-    'Tokens: {name}, {ext}, {index}, {codec}, {crf}, {quality}, {preset}, {width}, {height}, {date}.',
-  );
-  await preview.click();
-  await expect(queue).toBeEnabled();
-
-  await template.fill('{INDEX}_{NAME}_{quality}_{preset}_{width}x{height}_{date}');
-  await expect(queue).toBeDisabled();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'Review required before queueing',
-  );
-  await preview.click();
-  const request = (await calls(page, 'preview_encode_batch'))[1].payload
-    .request as BatchEncodeRequest;
-  expect(request.outputNameTemplate).toBe(
-    '{INDEX}_{NAME}_{quality}_{preset}_{width}x{height}_{date}',
-  );
-  expect(request.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    `1_Episode 1_30_2_1280x720_${request.namingDate}.mkv`,
-  );
-
-  await template.fill('');
-  await expect(preview).toBeDisabled();
-  await expect(workspace).toContainText('Enter a filename template before previewing.');
-});
-
-test('x264 batch encoder switches restore source choices and common settings while av1an stays SVT', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await workspace.getByLabel('CRF', { exact: true }).fill('29');
-  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
-  await workspace.getByLabel('Select Episode 2.mkv', { exact: true }).uncheck();
-  await workspace
-    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
-    .first()
-    .click();
-  await workspace
-    .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
-    .uncheck();
-  await encoder.selectOption('x264');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
-  await expect(
-    workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
-  ).toBeChecked();
-  await workspace.getByLabel('CRF', { exact: true }).fill('19');
-  await workspace.getByLabel('Preset', { exact: true }).selectOption('8');
-  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).uncheck();
-  await encoder.selectOption('svtAv1Hdr');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
-  await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('8');
-  await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).toBeChecked();
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
-  // Restoring a previously deselected source keeps its controls lazy; open it
-  // before inspecting the saved per-workflow stream choices.
-  await workspace
-    .locator('article.episode')
-    .filter({ hasText: 'Episode 1.mkv' })
-    .locator('.episode-tracks > summary')
-    .click();
-  await expect(
-    workspace.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }),
-  ).not.toBeChecked();
-  await encoder.selectOption('x264');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(encoder).toHaveValue('svtAv1Hdr');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('30');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(
-    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeEnabled();
-  expect((await calls(page, 'preview_encode_batch'))[0].payload.request).toMatchObject({
-    backend: 'av1an',
-    encoder: 'svtAv1Hdr',
-    crf: 30,
-    filmGrain: 0,
-  });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
-  await expect(encoder).toHaveValue('x264');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('19');
-  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('8');
-  await expect(workspace.getByLabel('Select Episode 1.mkv', { exact: true })).not.toBeChecked();
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
-  await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-  await expect(encoder).toHaveValue('x264');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('23');
-  await expect(workspace.getByLabel('Preset', { exact: true })).toHaveValue('5');
-  await encoder.selectOption('svtAv1Hdr');
-  await expect(workspace.getByLabel('CRF', { exact: true })).toHaveValue('29');
-});
-
-test('x264 batch keeps HDR failures visible while queueing only reviewed SDR requests', async ({
-  page,
-}) => {
-  await desktopMock(page, {
-    invalidPath: episodes[1].path,
-    files: [
-      episodes[0],
-      { ...episodes[1], streams: [{ ...stream, bitDepth: 10, colorTransfer: 'smpte2084' }] },
-    ],
-  });
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(
-    workspace.getByText(/x264 needs explicit HDR-to-SDR tone mapping for this episode\./, {
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).toHaveCount(0);
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    '1 ready / 2 reviewed',
-  );
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'unsupported HDR metadata',
-  );
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
-    .requests as EncodeRequest[];
-  expect(requests).toHaveLength(1);
-  expect(requests[0]).toMatchObject({
-    source: { inputPath: episodes[0].path },
-    settings: { encoder: 'x264', backend: 'standalone', filmGrain: 0, hdr10Fallback: false },
-  });
-  await expect(workspace.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
-});
-
-test('x264 switching away and back invalidates an outstanding batch preview', async ({ page }) => {
-  await desktopMock(page, { held: ['preview'] });
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await release(page, 'preview');
-  await expect(
-    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).not.toContainText(
-    '_av1_hdr.mkv',
-  );
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(
-    workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeEnabled();
-  expect(
-    (await calls(page, 'preview_encode_batch')).map(
-      ({ payload }) => (payload.request as BatchEncodeRequest).encoder,
-    ),
-  ).toEqual(['svtAv1Hdr', 'x264']);
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    '_x264.mkv',
-  );
-});
-
-for (const missing of ['x264', 'svt-av1-hdr'] as const) {
-  test(`x264 batch uses independent discovery gates when ${missing} is missing`, async ({
-    page,
-  }) => {
-    await desktopMock(page, { missing });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-    await expect(preview).toBeEnabled({ enabled: missing === 'x264' });
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-    await expect(preview).toBeEnabled({ enabled: missing === 'svt-av1-hdr' });
-  });
-}
-
-test('folder import passes recursion and reports scan limits, skipped entries, and individual probe failures', async ({
-  page,
-}) => {
-  const broken = 'C:\\media\\broken.mkv';
-  await desktopMock(page, {
-    scan: {
-      paths: [episodes[0].path, broken, episodes[0].path, episodes[1].path],
-      errors: [
-        {
-          code: 'SCAN_ERROR',
-          message: 'Cannot read protected folder.',
-          path: 'C:\\media\\protected',
-        },
-      ],
-      skippedCount: 7,
-      truncated: true,
-    },
-  });
-  await page.goto('/');
-  await page.getByLabel('Include subfolders').check();
-  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Episode 2.mkv', exact: true })).toBeVisible();
-  expect((await calls(page, 'scan_media_folder'))[0].payload).toEqual({
-    request: { path: 'C:\\media', recursive: true },
-  });
-  expect((await calls(page, 'probe_media')).map((call) => call.payload.path)).toEqual([
-    episodes[0].path,
-    broken,
-    episodes[1].path,
-  ]);
-  await expect(page.getByRole('alert')).toContainText('Cannot read protected folder.');
-  await expect(page.getByRole('alert')).toContainText('This media could not be probed.');
-  await expect(page.getByText(/7 entries skipped.*Scan truncated/)).toBeVisible();
-});
-
-test('stopping a scan discards its late result', async ({ page }) => {
-  await desktopMock(page, { held: ['scan'] });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
-  await expect.poll(() => calls(page, 'scan_media_folder').then((value) => value.length)).toBe(1);
-  await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-  await release(page, 'scan');
-  await expect(page.getByText(/Stopped importing. Completed files are kept/)).toBeVisible();
-  expect(await calls(page, 'probe_media')).toHaveLength(0);
-  await expect(page.getByRole('button', { name: 'Add folder', exact: true })).toBeEnabled();
-});
-
-test('an old stopped probe cannot add files or finish a newer import', async ({ page }) => {
-  const third = episode(3);
-  await desktopMock(page, { held: [`probe:${episodes[1].path}`, `probe:${third.path}`] });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
-  await expect.poll(() => calls(page, 'probe_media').then((value) => value.length)).toBe(2);
-  await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-  await page.evaluate(
-    (file) => (globalThis as unknown as { __batchMock: Mock }).__batchMock.pickFiles([file]),
-    third,
-  );
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect.poll(() => calls(page, 'probe_media').then((value) => value.length)).toBe(3);
-  await release(page, `probe:${episodes[1].path}`);
-  await expect(page.getByRole('button', { name: 'Stop import', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Episode 2.mkv/ })).toHaveCount(0);
-  await release(page, `probe:${third.path}`);
-  await expect(page.getByRole('heading', { name: third.name, exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: /^Episode 1.mkv/ })).toBeVisible();
-});
-
-test('batch defaults preserve original per-file stream indices and keep attachments last', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  await expect(page.getByLabel('CRF', { exact: true })).toHaveValue('30');
-  await expect(page.getByLabel('Preset', { exact: true })).toHaveValue('2');
-  await page
-    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
-    .first()
-    .click();
-  await page.getByLabel('Video stream for Episode 1.mkv', { exact: true }).selectOption('9');
-  await page.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }).uncheck();
-  await page.getByLabel('CRF', { exact: true }).fill('27');
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    '2 ready / 2 reviewed',
-  );
-  const reviewedRequest = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(reviewedRequest.namingDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-  expect({ request: reviewedRequest }).toEqual({
-    request: {
-      outputContainer: 'matroska',
-      outputDirectory: 'C:\\exports',
-      outputNameTemplate: '{name}_{codec}',
-      namingDate: reviewedRequest.namingDate,
-      crf: 27,
-      preset: 2,
-      lossless: false,
-      svtCrfQuarterSteps: 108,
-      svtPreset: 2,
-      backend: 'standalone',
-      encoder: 'svtAv1Hdr',
-      workers: 2,
-      filmGrain: 0,
-      hdr10Fallback: false,
-      lineartPsyBias: 0,
-      texturePsyBias: 0,
-      hdrTune: 'filmGrain',
-      inputs: [
-        {
-          inputPath: episodes[0].path,
-          videoStreamIndex: 9,
-          streamIndices: [9, 8, 11],
-          framing: {
-            crop: { top: 0, right: 0, bottom: 0, left: 0 },
-            resizeWidth: null,
-            borders: { top: 0, right: 0, bottom: 0, left: 0 },
-          },
-          audio: [],
-        },
-        {
-          inputPath: episodes[1].path,
-          videoStreamIndex: 2,
-          streamIndices: [2, 5, 8, 11],
-          framing: {
-            crop: { top: 0, right: 0, bottom: 0, left: 0 },
-            resizeWidth: null,
-            borders: { top: 0, right: 0, bottom: 0, left: 0 },
-          },
-          audio: [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
-        },
-      ],
-    },
-  });
-  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
-    .requests as EncodeRequest[];
-  expect(requests.map((request) => request.source.streamIndices)).toEqual([
-    [9, 8, 11],
-    [2, 5, 8, 11],
-  ]);
-  await expect(page.getByLabel('Select Episode 1.mkv', { exact: true })).not.toBeChecked();
-  await expect(page.getByLabel('Select Episode 2.mkv', { exact: true })).not.toBeChecked();
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Stop queue', exact: true })).toBeVisible();
-});
-
-test('invalid preview rows remain visible and only ready requests enter one batch command', async ({
-  page,
-}) => {
-  await desktopMock(page, { invalidPath: episodes[1].path });
-  await openBatch(page);
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'unsupported HDR metadata',
-  );
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    '1 ready / 2 reviewed',
-  );
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'A failed file does not stop later files; Stop queue cancels the current file and every waiting file.',
-  );
-  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toHaveLength(1);
-  await expect(page.getByLabel('Select Episode 2.mkv', { exact: true })).toBeChecked();
-});
-
-test('draft edits discard late preview replies and require review again', async ({ page }) => {
-  await desktopMock(page, { held: ['preview'] });
-  await openBatch(page);
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect
-    .poll(() => calls(page, 'preview_encode_batch').then((value) => value.length))
-    .toBe(1);
-  await page.getByLabel('CRF', { exact: true }).fill('23');
-  await release(page, 'preview');
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).not.toContainText(
-    '_av1_hdr.mkv',
-  );
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
-  await page.getByLabel('Output folder', { exact: true }).fill('C:\\other');
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-  await page.getByLabel('Output folder', { exact: true }).fill('C:\\exports');
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-});
-
-test('removing a source invalidates a pending preview while common settings survive tab navigation', async ({
-  page,
-}) => {
-  await desktopMock(page, { held: ['preview'] });
-  await openBatch(page);
-  await page.getByLabel('CRF', { exact: true }).fill('25');
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await page.getByRole('button', { name: /^Files/ }).click();
-  await page.getByRole('button', { name: 'Remove Episode 2.mkv', exact: true }).click();
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await release(page, 'preview');
-  await expect(page.getByLabel('CRF', { exact: true })).toHaveValue('25');
-  await expect(page.getByLabel('Output folder', { exact: true })).toHaveValue('C:\\exports');
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-  await expect(page.getByLabel('Select Episode 2.mkv', { exact: true })).toHaveCount(0);
-});
-
-test('duplicate clicks submit once and late queued replies do not regress terminal snapshots', async ({
-  page,
-}) => {
-  await desktopMock(page, { held: ['enqueue'], lateTerminal: true });
-  await openBatch(page);
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const queue = page.getByRole('button', { name: 'Queue ready files', exact: true });
-  await expect(queue).toBeEnabled();
-  await queue.evaluate((button: HTMLButtonElement) => {
-    button.click();
-    button.click();
-  });
-  await expect(page.getByRole('button', { name: 'Queueing…', exact: true })).toBeDisabled();
-  expect(await calls(page, 'enqueue_encode_batch')).toHaveLength(1);
-  await release(page, 'enqueue');
-  await expect(page.getByText('Succeeded', { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Stop queue', exact: true })).toHaveCount(0);
-  await expect(page.getByLabel('Select Episode 1.mkv', { exact: true })).not.toBeChecked();
-});
-
-test('a destination admission failure preserves selections and requires a fresh preview', async ({
-  page,
-}) => {
-  await desktopMock(page, { queueFailure: true });
-  await openBatch(page);
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('Preview the batch again before retrying.');
-  await expect(page.getByLabel('Select Episode 1.mkv', { exact: true })).toBeChecked();
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-});
-
-test('missing tools and invalid settings block batch preparation; defaults can be restored', async ({
-  page,
-}) => {
-  await desktopMock(page, { missing: 'svt-av1-hdr' });
-  await openBatch(page);
-  await expect(page.getByRole('button', { name: 'Preview batch', exact: true })).toBeDisabled();
-  await expect(
-    page
-      .getByText(
-        'Install FFmpeg, FFprobe, standalone SVT-AV1-HDR, then refresh Tools & settings.',
-        {
-          exact: true,
-        },
-      )
-      .last(),
-  ).toBeVisible();
-  await page.getByLabel('CRF', { exact: true }).fill('64');
-  await page.getByLabel('Preset', { exact: true }).selectOption('8');
-  await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-  await expect(page.getByLabel('CRF', { exact: true })).toHaveValue('30');
-  await expect(page.getByLabel('Preset', { exact: true })).toHaveValue('2');
-});
-
-test('a batch selects at most 100 imported episodes and the minimum-width layout stays within the window', async ({
-  page,
-}) => {
-  const many = Array.from({ length: 101 }, (_, index) => episode(index + 1));
-  await desktopMock(page, { files: many });
-  await page.setViewportSize({ width: 760, height: 600 });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Episode 101.mkv', exact: true })).toBeVisible();
-  // Hidden Batch does not mount hundreds of closed episode control trees.
-  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(0);
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await expect(page.getByRole('checkbox', { name: /^Select /, checked: true })).toHaveCount(100);
-  await expect(page.getByLabel('Select Episode 101.mkv', { exact: true })).toBeDisabled();
-  const first = page.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  const toggle = first.locator('.episode-tracks > summary');
-  await toggle.click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(1);
-  await first.getByLabel('Crop left (pixels)', { exact: true }).fill('20');
-  await toggle.click();
-  await expect(page.locator('.episode-tracks .episode-framing')).toHaveCount(0);
-  await page.getByRole('button', { name: 'Choose output folder', exact: true }).click();
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const request = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(request.inputs).toHaveLength(100);
-  expect(request.inputs[0].framing.crop.left).toBe(20);
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
-  await toggle.click();
-  await first.getByText('Crop, resize & borders', { exact: true }).click();
-  await expect(first.getByLabel('Crop left (pixels)', { exact: true })).toHaveValue('20');
-  // Expanding display-only controls does not invalidate the reviewed request.
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeEnabled();
-  await toggle.click();
-
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  await page.screenshot({ path: test.info().outputPath('minimum-width.png'), fullPage: true });
-});
-
-test('browser sample remains available for inspection but cannot become a batch encode', async ({
-  page,
-}) => {
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Load sample', exact: true }).click();
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await expect(page.getByLabel('Select Coastal walk.mkv', { exact: true })).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Preview batch', exact: true })).toBeDisabled();
-});
-
-test('canceling a native folder picker restores import controls without scanning', async ({
-  page,
-}) => {
-  await desktopMock(page, { cancelFolder: true });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Add folder', exact: true })).toBeEnabled();
-  await expect(page.getByRole('button', { name: 'Stop import', exact: true })).toHaveCount(0);
-  expect(await calls(page, 'scan_media_folder')).toHaveLength(0);
-});
-
-test('invalid CRF, empty destination, and empty selection block otherwise available preview', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const preview = page.getByRole('button', { name: 'Preview batch', exact: true });
-  await expect(preview).toBeEnabled();
-  await page.getByLabel('CRF', { exact: true }).fill('0');
-  await expect(preview).toBeDisabled();
-  await page.getByLabel('CRF', { exact: true }).fill('25.2');
-  await expect(preview).toBeDisabled();
-  await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-  await expect(preview).toBeEnabled();
-  await page.getByLabel('Output folder', { exact: true }).fill('   ');
-  await expect(preview).toBeDisabled();
-  await page.getByLabel('Output folder', { exact: true }).fill('C:\\exports');
-  await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
-  await expect(preview).toBeDisabled();
-  expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
-});
-
-test('a late batch reply clears submitted rows while preserving a newly imported selection', async ({
-  page,
-}) => {
-  await desktopMock(page, { held: ['enqueue'] });
-  await openBatch(page);
-  await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  await page.getByRole('button', { name: /^Files/ }).click();
-  const third = episode(3);
-  await page.evaluate(
-    (file) => (globalThis as unknown as { __batchMock: Mock }).__batchMock.pickFiles([file]),
-    third,
-  );
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: third.name, exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  await release(page, 'enqueue');
-  await expect(page.getByLabel('Select Episode 1.mkv', { exact: true })).not.toBeChecked();
-  await expect(page.getByLabel('Select Episode 3.mkv', { exact: true })).toBeChecked();
-  await expect(page.getByRole('button', { name: 'Queue ready files', exact: true })).toBeDisabled();
-  expect(await calls(page, 'enqueue_encode_batch')).toHaveLength(1);
-});
-
-for (const setting of ['grain', 'fallback', 'backend', 'workers'] as const) {
-  test(`changing ${setting} invalidates a late batch preview and preserves the submitted settings`, async ({
-    page,
-  }) => {
-    await desktopMock(page, { held: ['preview'] });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    if (setting === 'workers')
-      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-    await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect
-      .poll(() => calls(page, 'preview_encode_batch').then((items) => items.length))
-      .toBe(1);
-    const original = (await calls(page, 'preview_encode_batch'))[0].payload;
-    if (setting === 'grain')
-      await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('10');
-    if (setting === 'fallback')
-      await workspace.getByLabel('Allow HDR10 fallback', { exact: true }).check();
-    if (setting === 'backend')
-      await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-    if (setting === 'workers')
-      await workspace.getByLabel('Parallel chunks', { exact: true }).fill('4');
-    await release(page, 'preview');
-    await expect(
-      page.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeDisabled();
-    expect((await calls(page, 'preview_encode_batch'))[0].payload).toEqual(original);
-    await page.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-    const submitted = (await calls(page, 'enqueue_encode_batch'))[0].payload
-      .requests as EncodeRequest[];
-    expect(submitted).toHaveLength(2);
-    for (const request of submitted) {
-      expect(request.settings).toMatchObject({
-        backend: setting === 'backend' || setting === 'workers' ? 'av1an' : 'standalone',
-        encoder: 'svtAv1Hdr',
-        workers: setting === 'workers' ? 4 : 2,
-        filmGrain: setting === 'grain' ? 10 : 0,
-        hdr10Fallback: setting === 'fallback',
-        lineartPsyBias: 0,
-        texturePsyBias: 0,
-        hdrTune: 'filmGrain',
-      });
-    }
-    await page.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-    expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(submitted);
-    await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveValue('0');
-    await expect(workspace.getByLabel('Allow HDR10 fallback', { exact: true })).not.toBeChecked();
-    await expect(workspace.getByLabel('Encode backend', { exact: true })).toHaveValue(
-      setting === 'backend' || setting === 'workers' ? 'av1an' : 'standalone',
-    );
-  });
-}
-
-test('batch validates grain and requires av1an only when selected', async ({ page }) => {
-  await desktopMock(page, { missing: 'av1an' });
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const preview = page.getByRole('button', { name: 'Preview batch', exact: true });
-  for (const invalid of ['-1', '51', '1.5', '']) {
-    await workspace.getByLabel('Film grain synthesis', { exact: true }).fill(invalid);
-    await expect(preview).toBeDisabled();
-  }
-  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('0');
-  await expect(preview).toBeEnabled();
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(preview).toBeDisabled();
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
-  await expect(preview).toBeEnabled();
-});
-
-test('batch rejects invalid parallel chunk counts before native preview', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const preview = page.getByRole('button', { name: 'Preview batch', exact: true });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  for (const invalid of ['0', '65', '2.5', '']) {
-    await workspace.getByLabel('Parallel chunks', { exact: true }).fill(invalid);
-    await expect(preview).toBeDisabled();
-  }
-  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('2');
-  await expect(preview).toBeEnabled();
-  expect(await calls(page, 'preview_encode_batch')).toHaveLength(0);
-});
-
-test('batch audio converts independently per source and queues reviewed immutable settings', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await second.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
-  await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
-  await first.getByLabel('Audio channels', { exact: true }).selectOption('stereo');
-  await expect(second.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(preview.inputs.map((input) => input.audio)).toEqual([
-    [{ streamIndex: 5, codec: 'opus', bitrateKbps: 192, channels: 'stereo' }],
-    [{ streamIndex: 5, codec: 'copy', bitrateKbps: 128, channels: 'preserve' }],
-  ]);
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued.map((request) => request.settings.audio)).toEqual(
-    preview.inputs.map((input) => input.audio),
-  );
-  await workspace.getByRole('button', { name: 'Select up to 100', exact: true }).click();
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Current encode job' })).toContainText(
-    'Audio #5 → Opus 192 kb/s · stereo',
-  );
-  expect((await calls(page, 'enqueue_encode_batch'))[0].payload.requests).toEqual(queued);
-});
-
-for (const edit of ['codec', 'bitrate', 'channels', 'selection'] as const) {
-  test(`batch audio ${edit} changes discard an outstanding preview`, async ({ page }) => {
-    await desktopMock(page, { held: ['preview'] });
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-    await first.locator('.episode-tracks > summary').click();
-    await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect.poll(() => calls(page, 'preview_encode_batch')).toHaveLength(1);
-    if (edit === 'codec')
-      await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
-    if (edit === 'bitrate') await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
-    if (edit === 'channels')
-      await first.getByLabel('Audio channels', { exact: true }).selectOption('mono');
-    if (edit === 'selection')
-      await first
-        .getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true })
-        .uncheck();
-    await release(page, 'preview');
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeDisabled();
-    await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-      'Review required before queueing',
-    );
-    await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-    await expect(
-      workspace.getByRole('button', { name: 'Queue ready files', exact: true }),
-    ).toBeEnabled();
-  });
-}
-
-test('batch audio drafts are isolated by encoder and workflow, with av1an conversion', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
-  await first.getByLabel('Audio bitrate', { exact: true }).fill('192');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
-  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(preview.inputs.map((input) => input.audio[0].codec)).toEqual(['aac', 'copy']);
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('standalone');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
-  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('192');
-});
-
-test('AV1AN batch applies saved audio conversion only to new source drafts', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  let workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  let first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('opus');
-  await first.getByLabel('Audio bitrate', { exact: true }).fill('160');
-  await first.getByLabel('Audio channels', { exact: true }).selectOption('surround51');
-  await expect
-    .poll(async () =>
-      page.evaluate(
-        () => JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}').audio,
+    await page.evaluate(() =>
+      (globalThis as any).__sourceCalls.some(
+        (c: any) => c.command === 'scan_media_folder' || c.command === 'import_image_sequence',
       ),
+    ),
+  ).toBe(false);
+});
+
+test('source batch retains all 101 inputs in order without a UI selection cap', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const inputs = Array.from({ length: 101 }, (_, index) => ({
+    ...source,
+    id: `source-${index}`,
+    path: `/media/clip-${String(index).padStart(3, '0')}.mkv`,
+    name: `clip-${String(index).padStart(3, '0')}.mkv`,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  }));
+  await page.evaluate((inputs) => {
+    const host = globalThis as any;
+    host.__pickerPaths = inputs.map((item) => item.path);
+    host.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+  }, inputs);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /clip-100.mkv/ })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+              .length,
+        ),
+      { timeout: 15000 },
     )
-    .toEqual({ codec: 'opus', bitrateKbps: 160, channels: 'surround51' });
-  await openBatch(page);
-  workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
-  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveValue('160');
-  await expect(first.getByLabel('Audio channels', { exact: true })).toHaveValue('surround51');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const reviewed = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(reviewed.inputs.map((input) => input.audio[0])).toEqual(
-    Array(2).fill({ streamIndex: 5, codec: 'opus', bitrateKbps: 160, channels: 'surround51' }),
-  );
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('copy');
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await expect(first.getByLabel('Audio codec', { exact: true })).toHaveValue('opus');
-});
-
-test('batch invalid audio blocks preview only for selected source tracks', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('aac');
-  await first.getByLabel('Audio bitrate', { exact: true }).fill('');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await expect(preview).toBeDisabled();
-  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).uncheck();
-  await expect(preview).toBeEnabled();
-  await workspace.getByLabel('Select Episode 1.mkv', { exact: true }).check();
-  await first.locator('.episode-tracks > summary').click();
-  await expect(preview).toBeDisabled();
-  await first.getByLabel('Include audio stream #5 from Episode 1.mkv', { exact: true }).uncheck();
-  await expect(preview).toBeEnabled();
-  await preview.click();
-  const request = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(request.inputs[0].audio).toEqual([]);
-  expect(request.inputs[0].streamIndices).toEqual([2, 8, 11]);
-});
-
-test('batch queues reviewed FLAC and MP3 settings independently per file', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const first = workspace.locator('article.episode').filter({ hasText: 'Episode 1.mkv' });
-  const second = workspace.locator('article.episode').filter({ hasText: 'Episode 2.mkv' });
-  await first.locator('.episode-tracks > summary').click();
-  await second.locator('.episode-tracks > summary').click();
-  await first.getByLabel('Audio codec', { exact: true }).selectOption('flac');
-  await expect(first.getByLabel('Audio bitrate', { exact: true })).toHaveCount(0);
-  await second.getByLabel('Audio codec', { exact: true }).selectOption('mp3');
-  await second.getByLabel('Audio bitrate', { exact: true }).selectOption('192');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const preview = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(preview.inputs.map((input) => input.audio[0].codec)).toEqual(['flac', 'mp3']);
-  expect(preview.inputs.map((input) => input.audio[0].bitrateKbps)).toEqual([128, 192]);
-  await workspace.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued.map((request) => request.settings.audio)).toEqual(
-    preview.inputs.map((input) => input.audio),
-  );
-});
-
-for (const encoder of ['x265', 'vp9'] as const) {
-  test(`${encoder} batch uses encoder quality limits and snapshots reviewed codec requests`, async ({
-    page,
-  }) => {
-    await desktopMock(page);
-    await openBatch(page);
-    const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
-    const quality = workspace.getByLabel('CRF', { exact: true });
-    await expect(quality).toHaveValue(encoder === 'x265' ? '28' : '32');
-    await expect(workspace.getByLabel('Preset', { exact: true }).locator('option')).toHaveCount(
-      encoder === 'x265' ? 10 : 6,
-    );
-    await expect(workspace.getByLabel('Film grain synthesis', { exact: true })).toHaveCount(0);
-    const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-    await quality.fill(encoder === 'x265' ? '52' : '64');
-    await expect(preview).toBeDisabled();
-    await quality.fill('30');
-    await preview.click();
-    const reviewed = page.getByRole('region', { name: 'Batch output preview' });
-    await expect(reviewed).toContainText(`Episode 1_${encoder}.mkv`);
-    await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-    const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload as {
-      requests: EncodeRequest[];
+    .toBe(101);
+  const result = await page.evaluate(() => {
+    const calls = (globalThis as any).__sourceCalls;
+    return {
+      preview: calls
+        .find((c: any) => c.command === 'preview_encode_batch')
+        .payload.request.inputs.map((item: any) => item.inputPath),
+      started: calls
+        .filter((c: any) => c.command === 'mock_start_encode')
+        .map((c: any) => c.payload.request.source.inputPath),
     };
-    expect(queued.requests).toHaveLength(2);
-    for (const request of queued.requests)
-      expect(request.settings).toMatchObject({
-        encoder,
-        crf: 30,
-        backend: 'standalone',
-        filmGrain: 0,
-        hdr10Fallback: false,
-      });
+  });
+  expect(result.preview).toEqual(inputs.map((item) => item.path));
+  expect(result.started).toEqual(inputs.map((item) => item.path));
+});
+
+test('mixed batch refreshes tracks per file and skips picture analysis for nonvideo inputs', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const audio = {
+    ...source,
+    id: 'audio',
+    path: '/media/audio.mka',
+    name: 'audio.mka',
+    streams: [source.streams[1]],
+  };
+  const subtitle = {
+    ...source,
+    id: 'subtitle',
+    path: '/media/subtitle.mks',
+    name: 'subtitle.mks',
+    streams: [source.streams[2]],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, audio, subtitle],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*Audio/ }).uncheck();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Crop').selectOption('automatic');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(3);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const inputs = calls.find((c: any) => c.command === 'preview_encode_batch').payload.request
+    .inputs;
+  expect(inputs.map((item: any) => item.streamIndices)).toEqual([[0, 1, 2], [1], [2]]);
+  expect(inputs.map((item: any) => item.videoMode ?? 'encode')).toEqual(['encode', 'drop', 'drop']);
+  expect(inputs.slice(1).every((item: any) => !item.temporal && !item.toneMap)).toBe(true);
+  expect(
+    calls
+      .filter((c: any) => c.command === 'detect_crop')
+      .map((c: any) => c.payload.request.inputPath),
+  ).toEqual([first.path]);
+});
+
+test('source batch checks known tracks anew and maps data and attachments only to their supported containers', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const extra = [
+    { ...source.streams[2], index: 3, kind: 'data', codec: 'bin_data' },
+    { ...source.streams[2], index: 4, kind: 'attachment', codec: 'ttf' },
+    { ...source.streams[2], index: 5, codec: 'unknown' },
+    { ...source.streams[2], index: 6, kind: 'data', codec: null, codecTag: 'gpmd' },
+  ];
+  const media = {
+    ...source,
+    streams: [
+      ...source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+      ),
+      ...extra,
+    ],
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), media);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*Audio/ }).uncheck();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container').selectOption('matroska');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(1);
+  await quick.getByLabel('Container').selectOption('mov');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const previews = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'preview_encode_batch')
+      .map((c: any) => c.payload.request.inputs[0].streamIndices),
+  );
+  expect(previews).toEqual([
+    [0, 1, 2, 4],
+    [0, 1, 2, 3, 6],
+  ]);
+  const log = page.getByRole('log', { name: 'Recent activity' });
+  await expect(log).toContainText('2 data tracks left out: MKV cannot store data streams.');
+  await expect(log).toContainText(
+    '1 attachment track left out: MOV cannot store attachment streams.',
+  );
+});
+
+test('an audio-only first file does not discard video from a later batch file', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const audio = {
+    ...source,
+    id: 'audio',
+    path: '/media/audio.mka',
+    name: 'audio.mka',
+    streams: [source.streams[1]],
+  };
+  const video = {
+    ...source,
+    id: 'video',
+    path: '/media/video.mkv',
+    name: 'video.mkv',
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [audio, video],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const inputs = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'preview_encode_batch')
+        .payload.request.inputs,
+  );
+  expect(inputs.map((item: any) => item.videoMode ?? 'encode')).toEqual(['drop', 'encode']);
+  expect(inputs.map((item: any) => item.streamIndices)).toEqual([[1], [0, 1, 2]]);
+});
+
+test('an entirely nonvideo batch runs without the selected video encoder or picture analysis', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    (globalThis as any).__unavailableTools = ['svt-av1', 'x264', 'x265', 'vpxenc', 'aomenc'];
+  });
+  await installSourceEncodeFixture(page);
+  const audio = {
+    ...source,
+    id: 'audio',
+    path: '/media/audio.mka',
+    name: 'audio.mka',
+    streams: [source.streams[1]],
+  };
+  const subtitle = {
+    ...source,
+    id: 'subtitle',
+    path: '/media/subtitle.mks',
+    name: 'subtitle.mks',
+    streams: [source.streams[2]],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [audio, subtitle],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1');
+  await quick.getByLabel('Crop').selectOption('automatic');
+  await expect(page.getByRole('button', { name: 'Run Batch: Encode' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  expect(
+    calls.filter((c: any) => c.command === 'detect_crop' || c.command === 'resolve_deinterlace'),
+  ).toHaveLength(0);
+  expect(
+    calls
+      .find((c: any) => c.command === 'preview_encode_batch')
+      .payload.request.inputs.map((input: any) => input.videoMode),
+  ).toEqual(['drop', 'drop']);
+});
+
+test('batch freezes audio and picture settings while preview is pending, with per-source channel scaling', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = {
+    ...first,
+    id: 'second',
+    path: '/media/second.mkv',
+    name: 'second.mkv',
+    streams: first.streams.map((stream) =>
+      stream.kind === 'audio' ? { ...stream, channels: 6 } : stream,
+    ),
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Quality', { exact: true }).fill('32');
+  await quick.getByRole('tab', { name: 'Audio' }).click();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('aac');
+  await quick.getByLabel('Channels').selectOption('preserve');
+  await quick.getByLabel('Bitrate (Kbps)').fill('128');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'preview_encode_batch'),
+      ),
+    )
+    .toBe(true);
+  await expect(page.getByRole('button', { name: 'Run Batch: Encode' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('flac');
+  await quick.getByRole('tab', { name: 'Video' }).click();
+  await quick.getByLabel('Quality', { exact: true }).fill('40');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdBatchPreview = null;
+    h.__releaseBatch();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const requests = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request),
+  );
+  expect(requests.map((request: any) => request.settings.crf)).toEqual([32, 32]);
+  expect(requests.map((request: any) => request.settings.audio[0])).toMatchObject([
+    { codec: 'aac', channels: 'preserve', bitrateKbps: 128 },
+    { codec: 'aac', channels: 'preserve', bitrateKbps: 256 },
+  ]);
+});
+
+test('source frame trim and automatic crop are snapshotted for each batch input', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('button', { name: 'Configure…' }).first().click();
+  const trim = page.getByRole('dialog', { name: 'Configure Trim' });
+  await trim.getByLabel('Mode').selectOption('frames');
+  await trim.getByLabel('Start', { exact: true }).fill('24');
+  await trim.getByLabel('End', { exact: true }).fill('72');
+  await trim.getByRole('button', { name: 'OK' }).click();
+  await quick.getByLabel('Crop').selectOption('automatic');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const inputs = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'preview_encode_batch')
+        .payload.request.inputs,
+  );
+  expect(inputs.map((item: any) => item.trim)).toMatchObject([
+    { startFrame: 24, endFrameExclusive: 72 },
+    { startFrame: 24, endFrameExclusive: 72 },
+  ]);
+  expect(inputs.map((item: any) => item.framing.crop)).toEqual([
+    { top: 2, right: 0, bottom: 2, left: 0 },
+    { top: 2, right: 0, bottom: 2, left: 0 },
+  ]);
+});
+
+test('a crop that does not fit one batch input fails only that input', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = {
+    ...first,
+    id: 'small',
+    path: '/media/small.mkv',
+    name: 'small.mkv',
+    streams: first.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, width: 20, height: 20 } : stream,
+    ),
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Crop').selectOption('manual');
+  await quick.getByRole('button', { name: 'Configure…' }).nth(1).click();
+  const crop = page.getByRole('dialog', { name: 'Configure Crop' });
+  await crop.getByLabel('Left').fill('40');
+  await crop.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+          .payload.request.source.inputPath,
+    ),
+  ).toBe(first.path);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /small.mkv/ })).toContainText('Failed');
+});
+
+test('batch retains the selected resize and border intent for each source', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = {
+    ...first,
+    id: 'second',
+    path: '/media/second.mkv',
+    name: 'second.mkv',
+    streams: first.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, width: 640, height: 480 } : stream,
+    ),
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await q.getByLabel('Resize').selectOption('custom');
+  await q.getByRole('button', { name: 'Configure…' }).nth(1).click();
+  const d = page.getByRole('dialog', { name: 'Configure Resize' });
+  await d.getByLabel('Mode').selectOption('width');
+  await d.getByLabel('Width', { exact: true }).fill('320');
+  await d.getByRole('button', { name: 'OK' }).click();
+  await q.getByLabel('Borders').selectOption('16:9');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const frames = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings.framing),
+  );
+  expect(frames).toMatchObject([
+    { resize: { mode: 'width', width: 320 }, borderRatio: { width: 16, height: 9 } },
+    { resize: { mode: 'width', width: 320 }, borderRatio: { width: 16, height: 9 } },
+  ]);
+});
+
+test('batch freezes decimal target size for every input even if the draft changes during preview', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Quality Mode').selectOption('targetSize');
+  await quick.getByLabel('Quality', { exact: true }).fill('50.1');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'preview_encode_batch'),
+      ),
+    )
+    .toBe(true);
+  await quick.getByLabel('Quality', { exact: true }).fill('75.2');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdBatchPreview = null;
+    h.__releaseBatch();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const rates = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings.rateControl),
+  );
+  expect(rates).toEqual([
+    { mode: 'targetSizeDecimal', targetSizeTenthsMb: 501 },
+    { mode: 'targetSizeDecimal', targetSizeTenthsMb: 501 },
+  ]);
+});
+
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} batch carries selected audio codecs independently to each file`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    const first = {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+      ),
+    };
+    const second = {
+      ...first,
+      id: 'second',
+      path: '/media/second.mkv',
+      name: 'second.mkv',
+      streams: first.streams.map((stream) =>
+        stream.kind === 'audio' ? { ...stream, index: 4 } : stream,
+      ),
+    };
+    await page.evaluate(
+      (inputs) => {
+        const h = globalThis as any;
+        h.__pickerPaths = inputs.map((item) => item.path);
+        h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      },
+      [first, second],
+    );
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    await region
+      .getByRole('tab', { name: workflow === 'AV1AN' ? 'Audio & Tracks' : 'Audio' })
+      .click();
+    for (const [index, codec] of ['flac', 'mp3', 'opus'].entries()) {
+      await region.getByLabel('Codec', { exact: true }).selectOption(codec);
+      await page
+        .getByRole('button', {
+          name: workflow === 'AV1AN' ? 'Run Batch: AV1AN encode' : 'Run Batch: Encode',
+          exact: true,
+        })
+        .click();
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (globalThis as any).__sourceCalls.filter(
+                (c: any) => c.command === 'mock_start_encode',
+              ).length,
+          ),
+        )
+        .toBe((index + 1) * 2);
+    }
+    const audio = await page.evaluate(() =>
+      (globalThis as any).__sourceCalls
+        .filter((c: any) => c.command === 'mock_start_encode')
+        .map((c: any) => c.payload.request.settings.audio[0]),
+    );
+    expect(audio.map((track: any) => [track.streamIndex, track.codec])).toEqual([
+      [1, 'flac'],
+      [4, 'flac'],
+      [1, 'mp3'],
+      [4, 'mp3'],
+      [1, 'opus'],
+      [4, 'opus'],
+    ]);
   });
 }
 
-test('batch exposes direct encoders and blocks unsupported NVENC two-pass and target-size requests', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await expect(encoder.locator('option[value="aomAv1"]')).toHaveText('AOM · AV1');
-  await expect(encoder.locator('option[value="vpxStandalone"]')).toHaveText('VP9 · vpxenc');
-  await expect(encoder.locator('option[value="x265Standalone"]')).toHaveText('x265 · HEVC');
-  await encoder.selectOption('x265Standalone');
-  await workspace.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const request = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(request).toMatchObject({
-    encoder: 'x265Standalone',
-    backend: 'standalone',
-    lossless: false,
-  });
-  await expect(page.getByRole('region', { name: 'Batch output preview' })).toContainText(
-    'Episode 1_x265_standalone.mkv',
-  );
-
-  await encoder.selectOption('hevcNvenc');
-  await workspace.getByLabel('Rate control', { exact: true }).selectOption('bitrate');
-  await expect(workspace).toContainText('NVENC bitrate mode is one pass');
-  await expect(
-    workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-  ).toBeDisabled();
-  await workspace.getByLabel('Two passes', { exact: true }).uncheck();
-  await expect(workspace.getByRole('button', { name: 'Preview batch', exact: true })).toBeEnabled();
-  await workspace.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
-  await expect(workspace).toContainText('NVENC does not support target-size mode');
-  await expect(
-    workspace.getByRole('button', { name: 'Preview batch', exact: true }),
-  ).toBeDisabled();
-});
-
-test('frame trim batch keeps per-source intervals and invalidates reviewed output after edits', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace
-    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
-    .first()
-    .click();
-  await workspace.getByLabel('Trim video interval', { exact: true }).first().check();
-  await workspace.getByLabel('Start frame', { exact: true }).fill('12');
-  await workspace.getByLabel('End frame (excluded)', { exact: true }).fill('36');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await expect(preview).toBeDisabled();
-  await workspace.getByLabel('Audio codec', { exact: true }).first().selectOption('flac');
-  await preview.click();
-  const request = (await calls(page, 'preview_encode_batch'))[0].payload as {
-    request: BatchEncodeRequest;
-  };
-  expect(request.request.inputs[0].trim).toEqual({ startFrame: 12, endFrameExclusive: 36 });
-  expect(request.request.inputs[1].trim).toBeUndefined();
-  const reviewed = page.getByRole('region', { name: 'Batch output preview' });
-  await expect(reviewed).toContainText('2 ready / 2 reviewed');
-  await workspace.getByLabel('End frame (excluded)', { exact: true }).fill('48');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  await page.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload as {
-    requests: EncodeRequest[];
-  };
-  expect(queued.requests[0].settings.trim).toEqual({ startFrame: 12, endFrameExclusive: 48 });
-  expect(queued.requests[1].settings.trim).toBeUndefined();
-});
-
-test('rate control batch propagates file-size targets and invalidates the reviewed request', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Rate control', { exact: true }).selectOption('targetSize');
-  await workspace.getByLabel('Target file size (MiB)', { exact: true }).fill('700');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await preview.click();
-  const submitted = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(submitted.rateControl).toEqual({ mode: 'targetSize', targetSizeMib: 700 });
-  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
-  await expect(reviewed).toContainText('Target 700 MiB');
-  await workspace.getByLabel('Target file size (MiB)', { exact: true }).fill('800');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued).toHaveLength(2);
-  expect(queued.map((request) => request.settings.rateControl)).toEqual(
-    Array(2).fill({ mode: 'targetSize', targetSizeMib: 800 }),
-  );
-});
-
-test('tone mapping batch keeps per-file HDR choices and invalidates its reviewed request', async ({
-  page,
-}) => {
-  const files = [
-    {
-      ...episodes[0],
-      streams: episodes[0].streams.map((stream) =>
-        stream.kind === 'video'
-          ? {
-              ...stream,
-              pixelFormat: 'yuv420p10le',
-              bitDepth: 10,
-              colorPrimaries: 'bt2020',
-              colorTransfer: 'arib-std-b67',
-              colorSpace: 'bt2020nc',
-              colorRange: 'tv',
-              hdrFormat: 'HLG',
-            }
-          : stream,
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} batch freezes each source encoder selection and quality for both files`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    const first = {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
       ),
+    };
+    const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+    await page.evaluate(
+      (inputs) => {
+        const h = globalThis as any;
+        h.__pickerPaths = inputs.map((item) => item.path);
+        h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      },
+      [first, second],
+    );
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    const codecs =
+      workflow === 'AV1AN'
+        ? ['svtAv1', 'aomAv1', 'vpxStandalone', 'x264', 'x265Standalone']
+        : ['svtAv1', 'aomAv1', 'vpxStandalone', 'x264', 'x265Standalone'];
+    for (const [index, codec] of codecs.entries()) {
+      await region
+        .getByLabel(workflow === 'AV1AN' ? 'Encoder' : 'Codec', { exact: true })
+        .selectOption(codec);
+      await region.getByLabel('Quality', { exact: true }).fill('20');
+      await page
+        .getByRole('button', {
+          name: workflow === 'AV1AN' ? 'Run Batch: AV1AN encode' : 'Run Batch: Encode',
+          exact: true,
+        })
+        .click();
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (globalThis as any).__sourceCalls.filter(
+                (c: any) => c.command === 'mock_start_encode',
+              ).length,
+          ),
+        )
+        .toBe((index + 1) * 2);
+    }
+    const requests = await page.evaluate(() =>
+      (globalThis as any).__sourceCalls
+        .filter((c: any) => c.command === 'mock_start_encode')
+        .map((c: any) => c.payload.request),
+    );
+    expect(
+      requests.map((item: any) => [
+        item.settings.encoder,
+        item.settings.crf,
+        item.source.inputPath,
+      ]),
+    ).toEqual(
+      codecs.flatMap((codec) => [
+        [codec, 20, first.path],
+        [codec, 20, second.path],
+      ]),
+    );
+  });
+}
+
+test('Quick batch sends the chosen HDR tone curve to every source', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video'
+        ? {
+            ...stream,
+            fieldOrder: 'progressive',
+            codec: 'hevc',
+            pixelFormat: 'yuv420p10le',
+            bitDepth: 10,
+            colorPrimaries: 'bt2020',
+            colorTransfer: 'smpte2084',
+            colorSpace: 'bt2020nc',
+            colorRange: 'tv',
+            hdrFormat: 'HDR / PQ',
+          }
+        : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
     },
-    episodes[1],
-  ];
-  await desktopMock(page, { files });
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace
-    .getByText('Video, audio & source tracks · 3 selected', { exact: true })
-    .first()
-    .click();
-  await workspace.getByLabel('HDR / HLG to SDR', { exact: true }).first().check();
-  await workspace.getByLabel('Tone mapping curve', { exact: true }).selectOption('mobius');
-  await workspace.getByLabel('Signal peak (nits)', { exact: true }).fill('1200');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await preview.click();
-  const submitted = (
-    (await calls(page, 'preview_encode_batch'))[0].payload as { request: BatchEncodeRequest }
-  ).request;
-  expect(submitted.inputs[0].toneMap).toEqual({
-    algorithm: 'mobius',
-    sourcePeakNits: 1200,
-    hdr10BaseLayer: false,
-    backend: 'auto',
-    peakMode: 'measured',
-  });
-  expect(submitted.inputs[1].toneMap).toBeUndefined();
-  const reviewed = page.getByRole('region', { name: 'Batch output preview' });
-  await expect(reviewed).toContainText('Mobius · Auto · measured peak (fallback 1200 nits)');
-  await workspace.getByLabel('Signal peak (nits)', { exact: true }).fill('1000');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued[0].settings.toneMap).toEqual({
-    algorithm: 'mobius',
-    sourcePeakNits: 1000,
-    hdr10BaseLayer: false,
-    backend: 'auto',
-    peakMode: 'measured',
-  });
-  expect(queued[1].settings.toneMap).toBeUndefined();
-});
-
-test('av1an scene batch settings invalidate review and preserve queued target parameters', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
-  await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
-  await workspace.getByLabel('Target perceptual quality', { exact: true }).check();
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await preview.click();
-  const first = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(first.av1anOptions).toMatchObject({
-    chunkMethod: 'bestsource',
-    targetQuality: { minimumScoreTenths: 950 },
-  });
-  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
-  await workspace.getByLabel('Chunk order', { exact: true }).selectOption('sequential');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const requests = (await calls(page, 'enqueue_encode_batch'))[0].payload
-    .requests as EncodeRequest[];
-  expect(requests).toHaveLength(2);
-  for (const request of requests)
-    expect(request.settings.av1anOptions).toMatchObject({
-      chunkMethod: 'bestsource',
-      chunkOrder: 'sequential',
-      targetQuality: { minimumScoreTenths: 950 },
-    });
-});
-
-test('av1an x264 batch preserves explicit options and invalidates review when changed', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  const encoder = workspace.getByLabel('Video encoder', { exact: true });
-  await expect(encoder.locator('option')).toHaveCount(7);
-  await encoder.selectOption('x264');
-  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
-  await workspace.getByLabel('Output pixel format', { exact: true }).selectOption('yuv422p');
-  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('64');
-  await workspace.getByLabel('Encoder threads', { exact: true }).fill('0');
-  await workspace.getByLabel('Chunk attempts', { exact: true }).fill('4');
-  await workspace.getByLabel('Attach encoding settings to the output', { exact: true }).check();
-  await workspace.getByLabel('Output container', { exact: true }).selectOption('mp4');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await expect(preview).toBeDisabled();
-  await workspace.getByLabel('Output container', { exact: true }).selectOption('matroska');
-  await expect(preview).toBeEnabled();
-  await preview.click();
-  const first = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(first).toMatchObject({
-    backend: 'av1an',
-    encoder: 'x264',
-    workers: 64,
-    av1anOptions: {
-      pixelFormat: 'yuv422p',
-      encoderThreads: 0,
-      maxTries: 4,
-      attachSettings: true,
-    },
-  });
-  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeEnabled();
-  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toHaveValue('mkvmerge');
-  await expect(workspace.getByLabel('Join chunks with', { exact: true })).toBeDisabled();
-  await workspace.getByLabel('Chunk attempts', { exact: true }).fill('5');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  const second = (await calls(page, 'preview_encode_batch'))[1].payload
-    .request as BatchEncodeRequest;
-  expect(second.av1anOptions?.concatMethod).toBe('mkvmerge');
-  expect(second.av1anOptions?.maxTries).toBe(5);
-  await reviewed.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued).toHaveLength(2);
-  for (const request of queued)
-    expect(request.settings.av1anOptions).toMatchObject({
-      encoderThreads: 0,
-      maxTries: 5,
-      concatMethod: 'mkvmerge',
-      attachSettings: true,
-    });
-});
-
-test('SVT av1an grain changes invalidate batch review and stay out of x264 requests', async ({
-  page,
-}) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await workspace.locator('details.grain > summary').click();
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await preview.click();
-  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeEnabled();
-  await workspace.getByLabel('Use encoder denoised picture', { exact: true }).check();
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await preview.click();
-  const second = (await calls(page, 'preview_encode_batch'))[1].payload
-    .request as BatchEncodeRequest;
-  expect(second.av1anGrain).toEqual({ table: null, denoise: true, denoiseStrength: 4 });
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(workspace.locator('details.grain')).toHaveCount(0);
-  await preview.click();
-  const third = (await calls(page, 'preview_encode_batch'))[2].payload
-    .request as BatchEncodeRequest;
-  expect(third.av1anGrain).toBeUndefined();
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await workspace.locator('details.grain > summary').click();
-  await expect(workspace.getByLabel('Use encoder denoised picture', { exact: true })).toBeChecked();
-});
-
-test('AV1AN custom filters invalidate batch preview and remain per encoder', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  const workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await workspace.locator('details.filters > summary').click();
-  const filters = workspace.getByLabel('Pixel filters · one chain per line', { exact: true });
-  await filters.fill('eq=contrast=1.05');
-  const preview = workspace.getByRole('button', { name: 'Preview batch', exact: true });
-  await preview.click();
-  const reviewed = workspace.getByRole('region', { name: 'Batch output preview' });
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeEnabled();
-  await filters.fill('eq=contrast=1.10');
-  await expect(
-    reviewed.getByRole('button', { name: 'Queue ready files', exact: true }),
-  ).toBeDisabled();
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await workspace.locator('details.filters > summary').click();
-  await expect(
-    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
-  ).toHaveValue('');
-  await workspace
-    .getByLabel('Pixel filters · one chain per line', { exact: true })
-    .fill('unsharp=5:5:0.3');
-  await preview.click();
-  const second = (await calls(page, 'preview_encode_batch'))[1].payload
-    .request as BatchEncodeRequest;
-  expect(second.av1anFilters).toEqual(['unsharp=5:5:0.3']);
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1Hdr');
-  await workspace.locator('details.filters > summary').click();
-  await expect(
-    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
-  ).toHaveValue('eq=contrast=1.10');
-});
-
-test('AV1AN batch restores infrastructure preferences and reset clears them', async ({ page }) => {
-  await desktopMock(page);
-  await openBatch(page);
-  let workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await workspace.getByLabel('Parallel chunks', { exact: true }).fill('6');
-  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
-  await workspace.getByLabel('Source reader', { exact: true }).selectOption('bestsource');
-  await workspace.getByLabel('Encoder threads', { exact: true }).fill('2');
-  await workspace.locator('details.filters > summary').click();
-  await workspace
-    .getByLabel('Pixel filters · one chain per line', { exact: true })
-    .fill('unsharp=5:5:0.3');
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Tone Mapping').selectOption('reinhard');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
   await expect
-    .poll(async () =>
+    .poll(() =>
       page.evaluate(
-        () => JSON.parse(localStorage.getItem('jesses.av1an.preferences.v1') ?? '{}').workers,
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
       ),
     )
-    .toBe(6);
-  await openBatch(page);
-  workspace = page.getByRole('region', { name: 'Batch encode workspace' });
-  await workspace.getByLabel('Encode backend', { exact: true }).selectOption('av1an');
-  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('6');
-  await workspace.getByText('Scenes and quality targeting', { exact: true }).click();
-  await expect(workspace.getByLabel('Source reader', { exact: true })).toHaveValue('bestsource');
-  await expect(workspace.getByLabel('Encoder threads', { exact: true })).toHaveValue('2');
-  await workspace.locator('details.filters > summary').click();
-  await expect(
-    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
-  ).toHaveValue('unsharp=5:5:0.3');
-  await workspace.getByRole('button', { name: 'Reset batch settings', exact: true }).click();
-  await expect(workspace.getByLabel('Parallel chunks', { exact: true })).toHaveValue('2');
-  await expect(
-    workspace.getByLabel('Pixel filters · one chain per line', { exact: true }),
-  ).toHaveValue('');
+    .toBe(2);
+  const tones = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings.toneMap),
+  );
+  expect(tones).toMatchObject([{ algorithm: 'reinhard' }, { algorithm: 'reinhard' }]);
 });
+
+test('Quick batch freezes source HDR metadata grid in both per-file requests', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video'
+        ? {
+            ...stream,
+            fieldOrder: 'progressive',
+            codec: 'hevc',
+            pixelFormat: 'yuv420p10le',
+            bitDepth: 10,
+            colorPrimaries: 'bt2020',
+            colorTransfer: 'smpte2084',
+            colorSpace: 'bt2020nc',
+            colorRange: 'tv',
+            hdrFormat: 'HDR / PQ',
+          }
+        : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('x265Standalone');
+  await quick.getByLabel('Tone Mapping').selectOption('off');
+  await quick.getByRole('tab', { name: 'Advanced' }).click();
+  await quick.getByRole('tab', { name: 'HDR Metadata' }).click();
+  await quick.getByLabel('max-cll value').fill('1000,400');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const metadata = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings.hdrMetadata),
+  );
+  expect(metadata).toEqual([
+    { contentLight: { maxContent: 1000, maxAverage: 400 } },
+    { contentLight: { maxContent: 1000, maxAverage: 400 } },
+  ]);
+});
+
+test('AV1AN batch freezes the chosen target metric and source defaults for both files', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Quality Mode').selectOption('vmaf');
+  await av.getByLabel('Quality', { exact: true }).fill('93');
+  await page.getByRole('button', { name: 'Run Batch: AV1AN encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'preview_encode_batch'),
+      ),
+    )
+    .toBe(true);
+  await av.getByLabel('Quality', { exact: true }).fill('90');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdBatchPreview = null;
+    h.__releaseBatch();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const options = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings.av1anOptions),
+  );
+  expect(options).toMatchObject([
+    {
+      sourceWorkflow: true,
+      sourceTargetDefaults: true,
+      targetQuality: { metric: 'vmaf', minimumScoreTenths: 930, maximumScoreTenths: 930 },
+    },
+    {
+      sourceWorkflow: true,
+      sourceTargetDefaults: true,
+      targetQuality: { metric: 'vmaf', minimumScoreTenths: 930, maximumScoreTenths: 930 },
+    },
+  ]);
+});
+
+test('AV1AN batch freezes source worker, split and custom-filter settings', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByLabel('Workers', { exact: true }).fill('3');
+  await av.getByLabel('Split Method').selectOption('fixedChunks');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await av.getByRole('button', { name: 'Add', exact: true }).click();
+  await av.getByLabel('Filter 1').fill('hflip');
+  await page.getByRole('button', { name: 'Run Batch: AV1AN encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const settings = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request.settings),
+  );
+  expect(settings).toMatchObject([
+    { workers: 3, av1anFilters: ['hflip'], av1anOptions: { splitMethod: 'fixedChunks' } },
+    { workers: 3, av1anFilters: ['hflip'], av1anOptions: { splitMethod: 'fixedChunks' } },
+  ]);
+});
+
+test('AV1AN batch carries source grain synthesis only for compatible encoders', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Grain Synthesis').selectOption('encoder');
+  await av.getByLabel('Grain synthesis strength').fill('12');
+  await page.getByRole('button', { name: 'Run Batch: AV1AN encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  await av.getByLabel('Encoder').selectOption('x264');
+  await page.getByRole('button', { name: 'Run Batch: AV1AN encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(4);
+  const grain = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => [c.payload.request.settings.encoder, c.payload.request.settings.filmGrain]),
+  );
+  expect(grain).toEqual([
+    ['svtAv1', 12],
+    ['svtAv1', 12],
+    ['x264', 0],
+    ['x264', 0],
+  ]);
+});
+
+test('batch preparation failure stays on its input while later files run', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      h.__batchPreviewItemError = 0;
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+          .payload.request.source.inputPath,
+    ),
+  ).toBe(second.path);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Failed');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Done');
+});
+
+test('a late encode completion cannot mark a removed and reimported file done', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      h.__holdTerminal = true;
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(1);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.evaluate(() => ((globalThis as any).__pickerPaths = ['/media/input.mkv']));
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Import 1 File' })
+    .getByRole('button', { name: 'Add to file list' })
+    .click();
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdTerminal = false;
+    h.__testJobs = h.__testJobs.map((job: any) => ({ ...job, state: 'succeeded' }));
+    h.__emitJobs();
+  });
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Done');
+  await expect(page.getByRole('option', { name: /input.mkv/ })).not.toContainText('Done');
+});
+
+test('fixed-image batch reports the audio-only item and continues to a later video', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const audio = {
+    ...source,
+    id: 'audio',
+    path: '/media/audio.mka',
+    name: 'audio.mka',
+    streams: [source.streams[1]],
+  };
+  const video = {
+    ...source,
+    id: 'video',
+    path: '/media/video.mkv',
+    name: 'video.mkv',
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [audio, video],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Quick Convert', exact: true })
+    .getByLabel('Codec', { exact: true })
+    .selectOption('png');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_image_execution')
+            .length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_image_execution')
+          .payload.request.inputPath,
+    ),
+  ).toBe(video.path);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /audio.mka/ })).toContainText('Failed');
+  await expect(page.getByRole('option', { name: /video.mkv/ })).toContainText('Done');
+});
+
+for (const kind of ['encode', 'image'] as const) {
+  test(`${kind} batch stop during analysis registration cancels before preview and permits retry`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+      ),
+    });
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+    if (kind === 'image')
+      await page
+        .getByRole('region', { name: 'Quick Convert', exact: true })
+        .getByLabel('Codec', { exact: true })
+        .selectOption('png');
+    await page.evaluate(() => {
+      const h = globalThis as any;
+      h.__holdAnalysis = new Promise((resolve) => (h.__releaseAnalysis = resolve));
+    });
+    const baseline = await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'begin_media_analysis')
+          .length,
+    );
+    await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__sourceCalls.filter(
+              (c: any) => c.command === 'begin_media_analysis',
+            ).length,
+        ),
+      )
+      .toBeGreaterThan(baseline);
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await page.evaluate(() => {
+      const h = globalThis as any;
+      h.__holdAnalysis = null;
+      h.__releaseAnalysis();
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__sourceCalls.filter(
+              (c: any) => c.command === 'cancel_media_analysis',
+            ).length,
+        ),
+      )
+      .toBeGreaterThan(0);
+    const before = await page.evaluate(() => (globalThis as any).__sourceCalls);
+    expect(before.filter((c: any) => c.command === 'prepare_command_edit')).toHaveLength(0);
+    await expect(page.getByRole('button', { name: 'Run Batch: Encode' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+    const execution = kind === 'image' ? 'mock_image_execution' : 'mock_start_encode';
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (execution) =>
+            (globalThis as any).__sourceCalls.filter((c: any) => c.command === execution).length,
+          execution,
+        ),
+      )
+      .toBe(1);
+  });
+
+  test(`${kind} batch stop during native preview cancels its analysis and ignores a late reply`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    const media = {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+      ),
+    };
+    const inputs =
+      kind === 'encode'
+        ? Array.from({ length: 101 }, (_, index) => ({
+            ...media,
+            id: `input-${index}`,
+            path: `/media/cancel-${index}.mkv`,
+            name: `cancel-${index}.mkv`,
+            streams: index % 2 ? [media.streams[1]] : media.streams,
+          }))
+        : [media];
+    await page.evaluate((inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    }, inputs);
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+    if (kind === 'image')
+      await page
+        .getByRole('region', { name: 'Quick Convert', exact: true })
+        .getByLabel('Codec', { exact: true })
+        .selectOption('png');
+    await page.evaluate((kind) => {
+      const h = globalThis as any;
+      if (kind === 'image')
+        h.__holdBatchResolution = new Promise((resolve) => (h.__releaseBatch = resolve));
+      else h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
+    }, kind);
+    const command = kind === 'image' ? 'resolve_batch_output_paths' : 'preview_encode_batch';
+    await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (command) => (globalThis as any).__sourceCalls.some((c: any) => c.command === command),
+          command,
+        ),
+      )
+      .toBe(true);
+    const id = await page.evaluate(
+      (command) =>
+        (globalThis as any).__sourceCalls.find((c: any) => c.command === command).payload.id,
+      command,
+    );
+    expect(id).toBeTruthy();
+    if (kind === 'encode') {
+      const snapshot = await page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'preview_encode_batch')
+            .payload.request.inputs,
+      );
+      expect(snapshot.map((item: any) => item.inputPath)).toEqual(
+        inputs.map((input) => input.path),
+      );
+      expect(snapshot.filter((item: any) => item.videoMode === 'drop')).toHaveLength(50);
+    }
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (id) =>
+            (globalThis as any).__sourceCalls.some(
+              (c: any) => c.command === 'cancel_media_analysis' && c.payload.id === id,
+            ),
+          id,
+        ),
+      )
+      .toBe(true);
+    await page.evaluate(() => {
+      const h = globalThis as any;
+      h.__holdBatchResolution = null;
+      h.__holdBatchPreview = null;
+      h.__releaseBatch();
+    });
+    await expect(page.getByRole('button', { name: 'Run Batch: Encode' })).toBeEnabled();
+    expect(
+      await page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'prepare_command_edit')
+            .length,
+      ),
+    ).toBe(0);
+    await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+    const execution = kind === 'image' ? 'mock_image_execution' : 'mock_start_encode';
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            (execution) =>
+              (globalThis as any).__sourceCalls.filter((c: any) => c.command === execution).length,
+            execution,
+          ),
+        { timeout: 15000 },
+      )
+      .toBe(inputs.length);
+  });
+}

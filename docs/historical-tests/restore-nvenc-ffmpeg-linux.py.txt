@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Add pinned NVENC headers using verified existing Linux codec intermediates.
+
+The normal full source builder remains the clean rebuild recipe. This bounded
+qualification driver preserves the prior delivery, reuses its unchanged codec
+prefix and FFmpeg source/object tree, and writes a distinct complete delivery.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("linux_ffmpeg", HERE / "build-package-ffmpeg-linux.py")
+BUILD = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(BUILD)
+
+
+def verified(delivery, item):
+    path = delivery / BUILD.relative(item["path"])
+    if not path.is_file() or path.is_symlink() or BUILD.digest(path) != item["sha256"]:
+        raise ValueError(f"Prior delivery integrity failed: {path}")
+    return path
+
+
+def prefix_records(prefix):
+    return [{"path": path.relative_to(prefix).as_posix(), "sha256": BUILD.digest(path)} for path in sorted(prefix.rglob("*")) if path.is_file()]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--previous-build", type=Path, required=True)
+    parser.add_argument("--build-directory", type=Path, required=True)
+    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--jobs", type=int, default=4)
+    args = parser.parse_args()
+    previous = args.previous_build.resolve(strict=True)
+    original = previous / "delivery"
+    receipt = json.loads((original / "build-provenance.json").read_text())
+    if receipt["target"] != BUILD.TARGET:
+        raise ValueError("The previous delivery has a different target.")
+    old_lock = json.loads((original / "build/package-ffmpeg-linux-lock.json").read_text())
+    lock = json.loads(BUILD.LOCK.read_text())
+    old_libraries = old_lock["libraries"]
+    if lock["ffmpeg"] != old_lock["ffmpeg"] or lock["buildTools"] != old_lock["buildTools"] or [item for item in lock["libraries"] if item["id"] != "nv-codec-headers"] != old_libraries:
+        raise ValueError("Only the pinned NVENC header input may differ from the prior source lock.")
+    for item in [receipt["source"], *receipt["additionalSources"], *receipt["tools"], *receipt["licenses"], *receipt["buildInputs"]]:
+        verified(original, item)
+    source = previous / "work/ffmpeg" / lock["ffmpeg"]["sourceRoot"]
+    if (source / "RELEASE").read_text().strip() != lock["ffmpeg"]["version"]:
+        raise ValueError("The reused FFmpeg source tree has a different release.")
+    prefix = previous / "prefix"
+    before = prefix_records(prefix)
+    builder = BUILD.Builder(args.build_directory, args.cache, args.jobs)
+    builder.prefix = prefix
+    for key, value in {"CPPFLAGS": f"-I{prefix}/include", "LDFLAGS": f"-L{prefix}/lib", "PKG_CONFIG_LIBDIR": f"{prefix}/lib/pkgconfig"}.items():
+        builder.env[key] = value
+    for directory in ("sources", "licenses"):
+        shutil.copytree(original / directory, builder.delivery / directory, dirs_exist_ok=True, copy_function=os.link)
+    for item in receipt["buildInputs"]:
+        path = verified(original, item)
+        shutil.copy2(path, builder.delivery / "build" / ("baseline-" + path.name))
+    shutil.copy2(original / "build-provenance.json", builder.delivery / "build/baseline-provenance.json")
+    builder.sources = [receipt["source"], *receipt["additionalSources"]]
+    builder.licenses = receipt["licenses"].copy()
+    headers = next(item for item in lock["libraries"] if item["id"] == "nv-codec-headers")
+    header_source = builder.source(headers)
+    builder.library("nv-codec-headers", header_source)
+    tools, flags = builder.ffmpeg(source, lock["ffmpeg"]["version"])
+    builder.run([BUILD.sys.executable, HERE / "qualify-nvenc.py", "--ffmpeg", builder.delivery / "ffmpeg", "--output", builder.delivery / "build/nvenc-no-device.json", "--expect-no-device"], timeout=120)
+    for item in before:
+        if BUILD.digest(prefix / item["path"]) != item["sha256"]:
+            raise ValueError(f"An existing reused codec prefix input changed: {item['path']}")
+    (builder.delivery / "build/reused-prefix.json").write_text(json.dumps({"previousBuild": str(previous), "unchangedInputs": before}, indent=2) + "\n")
+    builder.finish(lock, tools, flags)
+    print(f"Prior delivery preserved: {original}")
+
+
+if __name__ == "__main__":
+    main()

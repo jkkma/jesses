@@ -1,0 +1,10 @@
+
+## NVENC
+
+H.264 NVENC and HEVC NVENC use FFmpeg's NVIDIA encoders. Discovery alone is not
+enough: admission performs a bounded one-frame encoder initialization with the
+selected depth and lossless mode. Missing hardware, an incompatible driver, or an
+unsupported codec/depth combination returns `NVENC_HARDWARE_UNAVAILABLE` with the
+driver's final diagnostic before source encoding begins. The qualification host
+has an AMD Radeon 880M, so the retained evidence covers this negative gate; a
+successful NVIDIA encode still requires qualification on compatible hardware.

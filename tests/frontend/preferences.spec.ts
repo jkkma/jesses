@@ -1,5 +1,4 @@
 import { test, expect, type Page } from '@playwright/test';
-import { showAllEncodeSettings } from './helpers/encode-settings';
 import type { UserPreferences, SavePreferencesRequest } from '../../src/lib/ipc/generated';
 
 async function setup(page: Page) {
@@ -47,6 +46,29 @@ async function setup(page: Page) {
           return;
         }
         if (command === 'get_storage_locations') return [['Preferences', 'C:\\data\\config']];
+        if (command === 'list_av1an_recoveries') return [];
+        if (command === 'resolve_output_path') {
+          const request = payload.request as any;
+          const name =
+            String(request.inputPath)
+              .split(/[\\/]/)
+              .at(-1)
+              ?.replace(/\.[^.]+$/, '') ?? '';
+          const stem =
+            request.outputStem ?? `${request.defaultOutputDirectory || 'C:\\media'}\\${name}`;
+          const ext =
+            request.target.kind === 'container'
+              ? request.target.format === 'matroska'
+                ? 'mkv'
+                : request.target.format
+              : 'gif';
+          return {
+            outputStem: stem,
+            outputPath: `${stem}.${ext}`,
+            isDirectory: false,
+            numbered: false,
+          };
+        }
         if (command === 'get_preferences') return structuredClone(prefs);
         if (command === 'save_preferences') {
           const request = JSON.parse(JSON.stringify(payload.request)) as SavePreferencesRequest;
@@ -132,117 +154,82 @@ async function count(page: Page, command: string) {
   );
 }
 
-test('preferences persist, recent media reopens, and new destinations use the saved folder', async ({
+// The fork uses a Recent menu and autosaves Settings on blur. The old import,
+// clear-history and recursive-folder controls are not source screens.
+async function openRecent(page: Page, path: string) {
+  await page.getByText('Recent…', { exact: true }).click();
+  await page.getByRole('button', { name: path, exact: true }).click();
+}
+
+test('saved output folder applies to new sources without rewriting an existing draft', async ({
   page,
 }) => {
   await setup(page);
   await page.goto('/');
-  await expect(
-    page.getByRole('checkbox', { name: 'Include subfolders', exact: true }),
-  ).toBeChecked();
-  await page.getByLabel('Recent media', { exact: true }).selectOption('C:\\media\\sample.mkv');
-  await page.getByRole('button', { name: 'Open recent', exact: true }).click();
+  await openRecent(page, 'C:\\media\\sample.mkv');
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await showAllEncodeSettings(page);
-  await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
-    'C:\\exports\\sample_av1_hdr.mkv',
-  );
-  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  await page.getByLabel('Default output folder', { exact: true }).fill('D:\\new exports');
-  await page.getByRole('button', { name: 'Save preferences', exact: true }).click();
-  await expect(page.getByText('Preferences saved.', { exact: false })).toBeVisible();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await expect(quick.getByLabel('Output Path', { exact: true })).toHaveValue('C:\\exports\\sample');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const folder = page.getByPlaceholder('Leave empty to save next to the source file');
+  await folder.fill('D:\\new exports');
+  await folder.blur();
+  await expect.poll(() => count(page, 'save_preferences')).toBe(1);
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await showAllEncodeSettings(page);
-  await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
-    'C:\\exports\\sample_av1_hdr.mkv',
-  );
+  await expect(quick.getByLabel('Output Path', { exact: true })).toHaveValue('C:\\exports\\sample');
   await page.reload();
-  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  await expect(page.getByLabel('Default output folder', { exact: true })).toHaveValue(
-    'D:\\new exports',
-  );
-  await page.getByRole('button', { name: 'Files 0', exact: true }).click();
-  await page.getByLabel('Recent media', { exact: true }).selectOption('C:\\media\\sample.mkv');
-  await page.getByRole('button', { name: 'Open recent', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(folder).toHaveValue('D:\\new exports');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await openRecent(page, 'C:\\media\\sample.mkv');
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await showAllEncodeSettings(page);
-  await expect(page.getByRole('textbox', { name: 'Encode destination', exact: true })).toHaveValue(
-    'D:\\new exports\\sample_av1_hdr.mkv',
+  await expect(quick.getByLabel('Output Path', { exact: true })).toHaveValue(
+    'D:\\new exports\\sample',
   );
 });
 
-test('import waits for explicit Apply and removes an unavailable recent only after open fails', async ({
-  page,
-}) => {
+test('an unavailable recent is forgotten only after opening it fails', async ({ page }) => {
   await setup(page);
   await page.goto('/');
-  await page.getByLabel('Recent media', { exact: true }).selectOption('C:\\offline\\missing.mkv');
-  await page.getByRole('button', { name: 'Open recent', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('recent media is unavailable');
+  expect(await count(page, 'save_preferences')).toBe(0);
+  await openRecent(page, 'C:\\offline\\missing.mkv');
+  await expect.poll(() => count(page, 'save_preferences')).toBe(1);
+  await page.getByText('Recent…', { exact: true }).click();
   await expect(
-    page
-      .getByLabel('Recent media', { exact: true })
-      .locator('option[value="C:\\\\offline\\\\missing.mkv"]'),
+    page.getByRole('button', { name: 'C:\\offline\\missing.mkv', exact: true }),
   ).toHaveCount(0);
-  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  await page.getByRole('button', { name: 'Import saved preferences', exact: true }).click();
   await expect(
-    page.getByRole('heading', { name: 'Review preferences', exact: true }),
+    page.getByRole('button', { name: 'C:\\media\\sample.mkv', exact: true }),
   ).toBeVisible();
-  expect(await count(page, 'save_preferences')).toBe(1);
-  await expect(page.getByText('12 unsupported keys skipped', { exact: false })).toBeVisible();
-  await page.getByRole('button', { name: 'Apply imported preferences', exact: true }).click();
-  await expect(page.getByLabel('Default output folder', { exact: true })).toHaveValue(
-    'D:\\imported',
+});
+
+test('reopening a loaded recent selects it without duplicate probing', async ({ page }) => {
+  await setup(page);
+  await page.goto('/');
+  await openRecent(page, 'C:\\media\\sample.mkv');
+  await openRecent(page, 'C:\\media\\second.mkv');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toBeVisible();
+  await openRecent(page, 'C:\\media\\sample.mkv');
+  await expect(page.getByRole('option', { name: /sample.mkv/ })).toHaveAttribute(
+    'aria-selected',
+    'true',
   );
-  expect(await count(page, 'save_preferences')).toBe(2);
-  await page.getByRole('button', { name: 'Clear recent media', exact: true }).click();
-  await expect(page.getByText('Recent-media history cleared.', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Files 0', exact: true }).click();
-  await expect(page.getByLabel('Recent media', { exact: true })).toHaveCount(0);
-});
-
-test('reopening an already loaded recent file selects it without duplicating or probing it', async ({
-  page,
-}) => {
-  await setup(page);
-  await page.goto('/');
-  for (const path of ['C:\\media\\sample.mkv', 'C:\\media\\second.mkv', 'C:\\media\\sample.mkv']) {
-    await page.getByLabel('Recent media', { exact: true }).selectOption(path);
-    await page.getByRole('button', { name: 'Open recent', exact: true }).click();
-    await expect(
-      page.getByRole('button', {
-        name: path.endsWith('second.mkv') ? /^second\.mkv/ : /^sample\.mkv/,
-      }),
-    ).toHaveAttribute('aria-pressed', 'true');
-  }
   expect(await count(page, 'probe_media')).toBe(2);
-  await expect(page.getByRole('button', { name: 'Files 2', exact: true })).toBeVisible();
+  await expect(page.getByRole('option', { name: /sample.mkv/ })).toHaveCount(1);
 });
 
-test('clearing recent media preserves unsaved general edits until Save', async ({ page }) => {
+test('source settings save the chosen default folder on blur', async ({ page }) => {
   await setup(page);
   await page.goto('/');
-  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  const folder = page.getByLabel('Default output folder', { exact: true });
-  const recursive = page.getByRole('checkbox', {
-    name: 'Include subfolders when adding a folder',
-    exact: true,
-  });
-  await expect(folder).toHaveValue('C:\\exports');
-  await folder.fill('D:\\unsaved exports');
-  await recursive.uncheck();
-  await page.getByRole('button', { name: 'Clear recent media', exact: true }).click();
-  await expect(page.getByText('Recent-media history cleared.', { exact: true })).toBeVisible();
-  await expect(folder).toHaveValue('D:\\unsaved exports');
-  await expect(recursive).not.toBeChecked();
-  const before = await page.evaluate(() => JSON.parse(localStorage.getItem('preferences-test')!));
-  expect(before.general).toEqual({ defaultOutputDirectory: 'C:\\exports', recursiveImport: true });
-  expect(before.recentPaths).toEqual([]);
-  await page.getByRole('button', { name: 'Save preferences', exact: true }).click();
-  await expect(page.getByText('Preferences saved.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const folder = page.getByPlaceholder('Leave empty to save next to the source file');
+  await folder.fill('D:\\renders');
+  await folder.blur();
+  await expect.poll(() => count(page, 'save_preferences')).toBe(1);
   await page.reload();
-  await page.getByRole('button', { name: 'Tools & settings', exact: true }).click();
-  await expect(folder).toHaveValue('D:\\unsaved exports');
-  await expect(recursive).not.toBeChecked();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(folder).toHaveValue('D:\\renders');
+  await expect(page.getByRole('button', { name: 'Save preferences', exact: true })).toHaveCount(0);
 });

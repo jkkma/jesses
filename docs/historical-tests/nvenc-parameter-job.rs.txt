@@ -1,0 +1,58 @@
+#[tokio::test]
+#[ignore = "requires FFmpeg advertising both NVENC wrappers; success additionally requires NVIDIA hardware"]
+async fn nvenc_constant_qp_is_admitted_and_hardware_failures_publish_nothing() {
+    let directory = Fixture::new();
+    let input = source(&directory.0).await;
+    let before = Sha256::digest(std::fs::read(&input).unwrap());
+    let manager = JobManager::new(directory.0.join("logs"));
+    for encoder in [
+        media_core::VideoEncoder::H264Nvenc,
+        media_core::VideoEncoder::HevcNvenc,
+    ] {
+        let output = directory.0.join(format!("qp-{encoder:?}.mkv"));
+        let request = media_runtime::EncodeRequest {
+            source: RemuxRequest {
+                input_path: input.to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0],
+            },
+            settings: media_core::EncodeSettings {
+                encoder,
+                constant_quantizer: Some(23),
+                preset: 0,
+                ..Default::default()
+            },
+        };
+        let mut invalid = request.clone();
+        invalid.settings.constant_quantizer = Some(52);
+        assert!(manager.start_encode(invalid).await.is_err());
+        assert!(!output.exists());
+        let job = manager.start_encode(request).await.unwrap();
+        let result = finish(&manager, &job.id).await;
+        if result.state == JobState::Succeeded {
+            let mut command = args(&[
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "json",
+            ]);
+            command.push(output.as_os_str().into());
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&tool("ffprobe", command).await).unwrap();
+            assert_eq!(metadata["streams"][0]["nb_read_frames"], "48");
+            eprintln!("{encoder:?}: actual ConstantQP output qualified");
+        } else {
+            assert_eq!(result.state, JobState::Failed, "{result:?}");
+            assert_eq!(result.error.unwrap().code, "NVENC_HARDWARE_UNAVAILABLE");
+            assert!(!output.exists());
+            eprintln!("{encoder:?}: negative hardware gate qualified; no GPU-positive claim");
+        }
+        assert_eq!(before, Sha256::digest(std::fs::read(&input).unwrap()));
+    }
+    manager.shutdown().await;
+}

@@ -10,7 +10,6 @@ async function setup(page: Page, hold = false) {
       state.__qualityMock = mock;
       state.isTauri = true;
       let callback = 0;
-      let picker = 0;
       state.__TAURI_INTERNALS__ = {
         metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
         transformCallback: () => ++callback,
@@ -24,7 +23,18 @@ async function setup(page: Page, hold = false) {
             return;
           }
           if (command === 'plugin:dialog|open')
-            return [picker++ === 0 ? 'C:\\media\\reference.mkv' : 'C:\\media\\candidate.mkv'];
+            return ['C:\\media\\reference.mkv', 'C:\\media\\candidate.mkv'];
+          if (command === 'list_av1an_recoveries') return [];
+          if (command === 'resolve_output_path') {
+            const request = payload.request as any,
+              stem = request.outputStem ?? String(request.inputPath).replace(/\.[^.]+$/, '');
+            return {
+              outputStem: stem,
+              outputPath: `${stem}.mkv`,
+              isDirectory: false,
+              numbered: false,
+            };
+          }
           if (command === 'plugin:dialog|save') return 'C:\\reports\\quality.csv';
           if (command === 'export_analysis')
             return (payload.request as { outputPath: string }).outputPath;
@@ -60,7 +70,9 @@ async function setup(page: Page, hold = false) {
               });
             const request = payload.request as QualityRequest;
             const step = request.options?.subsample ?? 1;
-            const frameCount = Math.ceil(request.frameCount / step);
+            const frameCount = Math.ceil(
+              (request.fullSource ? 48 : (request.frameCount ?? 48)) / step,
+            );
             return {
               metric: request.metric,
               frameCount,
@@ -96,8 +108,11 @@ async function setup(page: Page, hold = false) {
     { hold },
   );
   await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'reference.mkv', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Add Files…', exact: true }).click();
+  await page.getByRole('option', { name: /reference.mkv/ }).click();
+  await page.getByRole('option', { name: /candidate.mkv/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks', exact: true }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
 }
 const calls = (page: Page, command: string) =>
   page.evaluate(
@@ -107,144 +122,103 @@ const calls = (page: Page, command: string) =>
       ),
     command,
   );
-test('quality comparison uses explicit source indices and intervals with keyboard score inspection', async ({
+// The fork's Get Metrics compares complete loaded sources and reports in the
+// log. The retired frame-range inspector, score graph and CSV export are not
+// source controls; preserve request, option, cancellation and partial-result checks.
+async function configure(page: Page) {
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Get Metrics/ })
+    .click();
+  return page.getByRole('dialog', { name: 'Quality Metrics' });
+}
+
+test('Get Metrics uses the original source video indices for full-source comparison', async ({
   page,
 }) => {
   await setup(page);
   expect(await calls(page, 'analyze_quality')).toHaveLength(0);
-  await page.getByRole('button', { name: /Compare video quality/ }).click();
-  const region = page.getByRole('region', { name: 'Quality comparison', exact: true });
-  await region.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
-  await expect(region).toContainText('candidate.mkv');
-  await region.getByLabel('Reference video', { exact: true }).selectOption('4');
-  await region.getByLabel('Candidate video', { exact: true }).selectOption('4');
-  await region.getByLabel('Reference start frame', { exact: true }).fill('48');
-  await region.getByLabel('Candidate start frame', { exact: true }).fill('12');
-  await region.getByLabel('Frames to compare', { exact: true }).fill('2');
-  await region.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
-  await expect(region.getByRole('img', { name: 'SSIM score by frame' })).toBeVisible();
+  const d = await configure(page);
+  await d.getByLabel('Encoded (Low Quality)').selectOption('C:\\media\\candidate.mkv');
+  await d.getByLabel('Reference (Source)').selectOption('C:\\media\\reference.mkv');
+  await d.getByLabel('VMAF', { exact: true }).uncheck();
+  await d.getByLabel('SSIM', { exact: true }).check();
+  await d.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Metrics calculation' }).click();
+  await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(1);
   expect((await calls(page, 'analyze_quality'))[0].payload.request).toEqual({
     referencePath: 'C:\\media\\reference.mkv',
-    referenceStreamIndex: 4,
-    referenceStartFrame: 48,
+    referenceStreamIndex: 0,
     candidatePath: 'C:\\media\\candidate.mkv',
-    candidateStreamIndex: 4,
-    candidateStartFrame: 12,
-    frameCount: 2,
+    candidateStreamIndex: 0,
+    referenceStartFrame: 0,
+    candidateStartFrame: 0,
+    frameCount: 0,
+    fullSource: true,
     metric: 'ssim',
     options: { alignment: 'none', vmafModel: 'standard', subsample: 1, fixFrameRate: false },
   });
-  await region.getByRole('slider', { name: 'Inspect comparison frame' }).focus();
-  await page.keyboard.press('End');
-  await expect(region).toContainText('Frame 1: 0.980000');
-  await region.getByRole('button', { name: 'Export CSV', exact: true }).click();
-  await expect(region.getByRole('status')).toContainText('Saved: C:\\reports\\quality.csv');
-  const exported = (await calls(page, 'export_analysis'))[0].payload.request as {
-    format: string;
-    report: { request: QualityRequest; result: QualityResult };
-  };
-  expect(exported.format).toBe('csv');
-  expect(exported.report.request).toEqual(
-    (await calls(page, 'analyze_quality'))[0].payload.request,
-  );
-  expect(exported.report.result.points).toEqual([
-    { frame: 0, score: 1 },
-    { frame: 1, score: 0.98 },
-  ]);
-  await region.getByLabel('Frames to compare', { exact: true }).fill('60001');
-  await expect(
-    region.getByRole('button', { name: 'Compare selected frames', exact: true }),
-  ).toBeDisabled();
-  await expect(region.getByRole('img')).toHaveCount(0);
-  await expect(region.getByRole('button', { name: 'Export CSV', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText('SSIM: 0.9900');
 });
-test('closing cancels comparison and suppresses late scores', async ({ page }) => {
+
+test('Stop cancels a running metric and suppresses its late result', async ({ page }) => {
   await setup(page, true);
-  const disclosure = page.getByRole('button', { name: /Compare video quality/ });
-  await disclosure.click();
-  await page.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
-  await page.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
+  const d = await configure(page);
+  await d.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Metrics calculation' }).click();
   await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(1);
-  await disclosure.click();
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect
     .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
     .toBeGreaterThan(0);
-  await page.evaluate(() =>
-    (globalThis as unknown as { __qualityMock: Mock }).__qualityMock.release?.(),
+  await page.evaluate(() => (globalThis as any).__qualityMock.release?.());
+  await expect(page.getByRole('button', { name: 'Run: Metrics calculation' })).toBeEnabled();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).not.toContainText(
+    'VMAF: 0.9900',
   );
-  await disclosure.click();
-  await expect(page.getByRole('img', { name: 'SSIM score by frame' })).toHaveCount(0);
-  await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
-test('alignment, VMAF model, sampling and fixed-rate settings reach the immutable export', async ({
+test('source alignment, VMAF model and subsampling reach both immutable metric requests', async ({
   page,
 }) => {
   await setup(page);
-  await page.getByRole('button', { name: /Compare video quality/ }).click();
-  const region = page.getByRole('region', { name: 'Quality comparison', exact: true });
-  await region.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
-  await region.getByRole('checkbox', { name: 'VMAF', exact: true }).check();
-  await region.getByText('Alignment and sampling', { exact: true }).click();
-  await region
-    .getByLabel('Reference alignment', { exact: true })
-    .selectOption('cropAndResizeReference');
-  await region.getByLabel('VMAF model', { exact: true }).selectOption('fourK');
-  await region.getByLabel('Score every Nth frame', { exact: true }).fill('5');
-  await region.getByLabel('Pair by frame number when timestamps differ').check();
-  await region.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
+  const d = await configure(page);
+  await d.getByLabel('SSIM', { exact: true }).check();
+  await d.getByLabel('Alignment', { exact: true }).selectOption('cropAndResizeReference');
+  await d.getByLabel('VMAF Model', { exact: true }).selectOption('fourK');
+  await d.getByLabel('Subsampling', { exact: true }).selectOption('5');
+  await d.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Metrics calculation' }).click();
   await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(2);
-  expect(
-    (await calls(page, 'analyze_quality')).map(
-      (call) => (call.payload.request as QualityRequest).metric,
-    ),
-  ).toEqual(['ssim', 'vmaf']);
-  const request = (await calls(page, 'analyze_quality'))[1].payload.request as QualityRequest;
-  expect(request.options).toEqual({
-    alignment: 'cropAndResizeReference',
-    vmafModel: 'fourK',
-    subsample: 5,
-    fixFrameRate: true,
-  });
-  await region.getByRole('button', { name: /VMAF: 0.990/ }).click();
-  await region.getByRole('slider', { name: 'Inspect comparison frame' }).focus();
-  await page.keyboard.press('End');
-  await expect(region).toContainText('Frame 235: 0.980');
-  await region.getByRole('button', { name: 'Export CSV', exact: true }).click();
-  const exported = (await calls(page, 'export_analysis'))[0].payload.request as {
-    report: { request: QualityRequest };
-  };
-  expect(exported.report.request).toEqual(request);
-  await region.getByLabel('VMAF model', { exact: true }).selectOption('negative');
-  await expect(region.getByRole('button', { name: 'Export CSV', exact: true })).toHaveCount(0);
-  await region.getByLabel('Score every Nth frame', { exact: true }).fill('1001');
-  await expect(
-    region.getByRole('button', { name: 'Compare selected frames', exact: true }),
-  ).toBeDisabled();
+  const requests = (await calls(page, 'analyze_quality')).map(
+    (c) => c.payload.request as QualityRequest,
+  );
+  expect(requests.map((r) => r.metric)).toEqual(['vmaf', 'ssim']);
+  for (const request of requests)
+    expect(request.options).toEqual({
+      alignment: 'cropAndResizeReference',
+      vmafModel: 'fourK',
+      subsample: 5,
+      fixFrameRate: false,
+    });
 });
 
-test('canceling a later metric preserves only completed score and its export', async ({ page }) => {
+test('stopping a later metric keeps completed log output without adding a late score', async ({
+  page,
+}) => {
   await setup(page, true);
-  await page.getByRole('button', { name: /Compare video quality/ }).click();
-  const region = page.getByRole('region', { name: 'Quality comparison', exact: true });
-  await region.getByRole('button', { name: 'Choose candidate video', exact: true }).click();
-  await region.getByRole('checkbox', { name: 'PSNR', exact: true }).check();
-  await region.getByRole('button', { name: 'Compare selected frames', exact: true }).click();
+  const d = await configure(page);
+  await d.getByLabel('SSIM', { exact: true }).check();
+  await d.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Metrics calculation' }).click();
   await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(1);
-  await page.evaluate(() =>
-    (globalThis as unknown as { __qualityMock: Mock }).__qualityMock.release?.(),
-  );
+  await page.evaluate(() => (globalThis as any).__qualityMock.release?.());
   await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(2);
-  await region.getByRole('button', { name: 'Cancel comparison', exact: true }).click();
-  await expect(region.getByRole('alert')).toContainText('1 completed score remains available');
-  await page.evaluate(() =>
-    (globalThis as unknown as { __qualityMock: Mock }).__qualityMock.release?.(),
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await page.evaluate(() => (globalThis as any).__qualityMock.release?.());
+  await expect(page.getByRole('button', { name: 'Run: Metrics calculation' })).toBeEnabled();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText('VMAF: 0.9900');
+  await expect(page.getByRole('log', { name: 'Recent activity' })).not.toContainText(
+    'SSIM: 0.9900',
   );
-  await expect(region).toContainText('SSIM: 0.990000');
-  await expect(region).not.toContainText('PSNR: 0.990');
-  await region.getByRole('button', { name: 'Export CSV', exact: true }).click();
-  const exported = (await calls(page, 'export_analysis'))[0].payload.request as {
-    report: { request: QualityRequest };
-  };
-  expect(exported.report.request.metric).toBe('ssim');
 });

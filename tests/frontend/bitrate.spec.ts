@@ -20,6 +20,23 @@ async function setup(page: Page, hold = false) {
           mock.calls.push({ command, payload });
           if (command.startsWith('plugin:event|')) return ++callback;
           if (command === 'get_capabilities' || command === 'list_jobs') return [];
+          if (command === 'list_av1an_recoveries') return [];
+          if (command === 'resolve_output_path') {
+            const request = payload.request as any,
+              stem = request.outputStem ?? 'C:\\media\\sample';
+            const ext =
+              request.target.kind === 'container'
+                ? request.target.format === 'matroska'
+                  ? 'mkv'
+                  : request.target.format
+                : 'gif';
+            return {
+              outputStem: stem,
+              outputPath: `${stem}.${ext}`,
+              isDirectory: false,
+              numbered: false,
+            };
+          }
           if (command === 'subscribe_jobs') {
             (payload.channel as { onmessage: (jobs: unknown[]) => void }).onmessage([]);
             return;
@@ -92,8 +109,8 @@ async function setup(page: Page, hold = false) {
     { hold },
   );
   await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'sample.mkv', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Add Files…', exact: true }).click();
+  await page.getByRole('button', { name: 'Load Tracks', exact: true }).click();
 }
 
 const calls = (page: Page, command: string) =>
@@ -105,48 +122,49 @@ const calls = (page: Page, command: string) =>
     command,
   );
 
-test('bitrate analysis stays lazy and uses original stream identities with adjustable windows', async ({
+// The fork exposes Read Bitrates and Show Bitrate Chart in Utilities. Its
+// chart uses one-second windows; the old adjustable-window inspector and SVG
+// export controls are not source screens.
+test('Read Bitrates stays lazy and analyzes the selected original stream identity', async ({
   page,
 }) => {
   await setup(page);
   expect(await calls(page, 'analyze_bitrate')).toHaveLength(0);
-  await page.getByRole('button', { name: 'Bitrate analysis', exact: true }).click();
-  await page.getByLabel('Bitrate stream', { exact: true }).selectOption('3');
-  await page.getByLabel('Bitrate window', { exact: true }).selectOption('5');
-  await page.getByRole('button', { name: 'Analyze bitrate', exact: true }).click();
-  await expect(page.getByRole('img', { name: /Packet bitrate over/ })).toBeVisible();
+  await page.getByRole('checkbox', { name: /Include .*Video/ }).uncheck();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Read Bitrates/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate reading' }).click();
+  await expect.poll(async () => (await calls(page, 'analyze_bitrate')).length).toBe(1);
   const [call] = await calls(page, 'analyze_bitrate');
   expect(call.payload.request).toEqual({
     inputPath: 'C:\\media\\sample.mkv',
     streamIndex: 3,
-    windowSeconds: 5,
+    windowSeconds: 1,
   });
-  await page.getByRole('slider', { name: 'Inspect bitrate window' }).focus();
-  await page.keyboard.press('End');
-  await expect(page.getByText(/5.00–10.00 s/)).toBeVisible();
-  await page.getByRole('button', { name: 'Export SVG', exact: true }).click();
-  expect(await calls(page, 'export_analysis')).toHaveLength(0);
-  await expect(page.getByRole('alert')).toHaveCount(0);
-  await page.getByLabel('Bitrate window', { exact: true }).selectOption('10');
-  await expect(page.getByRole('img', { name: /Packet bitrate over/ })).toHaveCount(0);
-  expect(await calls(page, 'analyze_bitrate')).toHaveLength(1);
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'Stream #3 (audio) - Bitrate: 8000 kbps - Size: 1.9 MB (20000.0%)',
+  );
 });
 
-test('closing cancels a packet scan and discards a late completion', async ({ page }) => {
+test('Stop cancels a packet scan and discards a late chart completion', async ({ page }) => {
   await setup(page, true);
-  const disclosure = page.getByRole('button', { name: 'Bitrate analysis', exact: true });
-  await disclosure.click();
-  await page.getByRole('button', { name: 'Analyze bitrate', exact: true }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Show Bitrate Chart/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate chart' }).click();
   await expect.poll(async () => (await calls(page, 'analyze_bitrate')).length).toBe(1);
-  await disclosure.click();
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect
     .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
     .toBeGreaterThan(0);
   await page.evaluate(() =>
     (globalThis as unknown as { __bitrateMock: Mock }).__bitrateMock.release?.(),
   );
-  await disclosure.click();
-  await expect(page.getByRole('button', { name: 'Analyze bitrate', exact: true })).toBeEnabled();
-  await expect(page.getByRole('img', { name: /Packet bitrate over/ })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Bitrate Chart' })).toHaveCount(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
 });

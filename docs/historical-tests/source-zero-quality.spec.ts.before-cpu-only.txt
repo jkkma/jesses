@@ -1,0 +1,59 @@
+import {expect,test} from '@playwright/test';
+import {installSourceEncodeFixture,source} from './helpers/source-encode-fixture';
+
+for(const workflow of ['Quick Convert','AV1AN'] as const){
+  test(`${workflow} keeps quality zero distinct from the explicit native lossless setting`,async({page})=>{
+    await installSourceEncodeFixture(page);
+    await page.evaluate(media=>(globalThis as any).__setSourceMedia(media),{...source,streams:source.streams.map(stream=>stream.kind==='video'?{...stream,fieldOrder:'progressive'}:stream)});
+    await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('button',{name:'Load Tracks'}).click();await page.getByRole('button',{name:workflow,exact:true}).click();
+    const region=page.getByRole('region',{name:workflow,exact:true});
+    const codecs=workflow==='AV1AN'?['svtAv1','aomAv1','vpxStandalone','x264','x265Standalone']:['svtAv1','aomAv1','vpxStandalone','x264','x265Standalone','h264Nvenc','hevcNvenc'];
+    for(const [index,codec] of codecs.entries()){
+      await region.getByLabel(workflow==='AV1AN'?'Encoder':'Codec',{exact:true}).selectOption(codec);await region.getByLabel('Quality',{exact:true}).fill('0');
+      await page.getByRole('button',{name:workflow==='AV1AN'?'Run: AV1AN encode':'Run: Encode',exact:true}).click();
+      await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').length)).toBe(index+1);
+    }
+    const settings=await page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').map((c:any)=>c.payload.request.settings));
+    expect(settings.map((item:any)=>item.crf)).toEqual(codecs.map(()=>0));
+    expect(settings.map((item:any)=>item.lossless)).toEqual(codecs.map(()=>false));
+    expect(settings.map((item:any)=>item.sourceNvencQuality??false)).toEqual(codecs.map(codec=>codec.endsWith('Nvenc')));
+  });
+}
+
+test('NVENC zero and the source Advanced tune override survive the frozen batch snapshot',async({page})=>{
+  await installSourceEncodeFixture(page);
+  const first={...source,streams:source.streams.map(stream=>stream.kind==='video'?{...stream,fieldOrder:'progressive'}:stream)};const second={...first,id:'second',path:'/media/second.mkv',name:'second.mkv'};
+  await page.evaluate(inputs=>{const h=globalThis as any;h.__pickerPaths=inputs.map(item=>item.path);h.__mediaByPath=Object.fromEntries(inputs.map(item=>[item.path,item]));},[first,second]);
+  await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('combobox',{name:'Mode',exact:true}).selectOption('batch');await page.getByRole('button',{name:'Quick Convert',exact:true}).click();
+  const quick=page.getByRole('region',{name:'Quick Convert',exact:true});await quick.getByLabel('Codec',{exact:true}).selectOption('h264Nvenc');await quick.getByLabel('Quality',{exact:true}).fill('0');await quick.getByRole('tab',{name:'Advanced'}).click();await quick.getByLabel('tune value').fill('hq');
+  await page.getByRole('button',{name:'Run Batch: Encode'}).click();await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').length)).toBe(2);
+  const settings=await page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').map((c:any)=>c.payload.request.settings));
+  for(const item of settings)expect(item).toMatchObject({crf:0,lossless:false,sourceNvencQuality:true,parameters:[{name:'tune',value:'hq'}]});
+});
+
+test('AV1AN source quality targets submit each selected metric and score',async({page})=>{
+  await installSourceEncodeFixture(page);
+  await page.evaluate(media=>(globalThis as any).__setSourceMedia(media),{...source,streams:source.streams.map(stream=>stream.kind==='video'?{...stream,fieldOrder:'progressive'}:stream)});
+  await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('button',{name:'Load Tracks'}).click();await page.getByRole('button',{name:'AV1AN',exact:true}).click();const av=page.getByRole('region',{name:'AV1AN',exact:true});
+  const cases=[['vmaf','95',950],['ssimulacra2','80',800],['butteraugli','4',40],['xpsnrWeighted','40',400]] as const;
+  for(const [index,[metric,score]] of cases.entries()){
+    await av.getByLabel('Quality Mode').selectOption(metric);await av.getByLabel('Quality',{exact:true}).fill(score);await page.getByRole('button',{name:'Run: AV1AN encode'}).click();
+    await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').length)).toBe(index+1);
+  }
+  const options=await page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').map((c:any)=>c.payload.request.settings.av1anOptions));
+  expect(options.every((item:any)=>item.sourceTargetDefaults===true)).toBe(true);
+  const targets=options.map((item:any)=>item.targetQuality);
+  expect(targets.map((target:any)=>[target.metric,target.minimumScoreTenths,target.maximumScoreTenths])).toEqual(cases.map(([metric,,score])=>[metric,score,score]));
+});
+
+test('NVENC batch carries source Advanced constant quantizer to every input',async({page})=>{
+  await installSourceEncodeFixture(page);const first={...source,streams:source.streams.map(stream=>stream.kind==='video'?{...stream,fieldOrder:'progressive'}:stream)};const second={...first,id:'second',path:'/media/second.mkv',name:'second.mkv'};
+  await page.evaluate(inputs=>{const h=globalThis as any;h.__pickerPaths=inputs.map(item=>item.path);h.__mediaByPath=Object.fromEntries(inputs.map(item=>[item.path,item]));},[first,second]);await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('combobox',{name:'Mode',exact:true}).selectOption('batch');await page.getByRole('button',{name:'Quick Convert',exact:true}).click();const q=page.getByRole('region',{name:'Quick Convert',exact:true});await q.getByLabel('Codec',{exact:true}).selectOption('h264Nvenc');await q.getByRole('tab',{name:'Advanced'}).click();await q.getByLabel('rc value').fill('constqp');await page.getByRole('button',{name:'Run Batch: Encode'}).click();
+  await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').length)).toBe(2);const settings=await page.evaluate(()=> (globalThis as any).__sourceCalls.filter((c:any)=>c.command==='mock_start_encode').map((c:any)=>c.payload.request.settings));
+  expect(settings).toMatchObject([{crf:18,sourceNvencQuality:true,parameters:[{name:'rc',value:'constqp'}]},{crf:18,sourceNvencQuality:true,parameters:[{name:'rc',value:'constqp'}]}]);expect(settings.every((item:any)=>item.constantQuantizer===undefined)).toBe(true);
+});
+
+test('NVENC Advanced rate-control choice remains available with source bitrate mode',async({page})=>{
+  await installSourceEncodeFixture(page);await page.getByRole('button',{name:'Add Files…'}).click();await page.getByRole('button',{name:'Load Tracks'}).click();await page.getByRole('button',{name:'Quick Convert',exact:true}).click();const q=page.getByRole('region',{name:'Quick Convert',exact:true});await q.getByLabel('Codec',{exact:true}).selectOption('h264Nvenc');await q.getByLabel('Quality Mode').selectOption('bitrate');await q.getByLabel('Quality',{exact:true}).fill('1500');await q.getByRole('tab',{name:'Advanced'}).click();await q.getByLabel('rc value').fill('constqp');await page.getByRole('button',{name:'Run: Encode'}).click();await expect.poll(()=>page.evaluate(()=> (globalThis as any).__sourceCalls.some((c:any)=>c.command==='mock_start_encode'))).toBe(true);
+  const settings=await page.evaluate(()=> (globalThis as any).__sourceCalls.find((c:any)=>c.command==='mock_start_encode').payload.request.settings);expect(settings).toMatchObject({sourceNvencQuality:true,rateControl:{mode:'bitrate',bitrateKbps:1500},parameters:[{name:'rc',value:'constqp'}]});expect(settings.constantQuantizer).toBeUndefined();
+});

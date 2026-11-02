@@ -1,120 +1,272 @@
-import { test, expect, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
-type Call = { command: string; payload: Record<string, unknown> };
+// The fork exposes full-source PNG/JPEG sequences in Quick Convert, rather
+// than the former Jesses-only Utilities still-frame exporter. Preserve the
+// pixel-format request assertions on the source's actual controls.
+test('PNG sequence sends RGBA 16-bit and JPEG uses its own YUV format', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
 
-async function setup(page: Page) {
-  await page.addInitScript(() => {
-    const state = globalThis as unknown as Record<string, unknown>;
-    const calls: Call[] = [];
-    state.__imageCalls = calls;
-    state.isTauri = true;
-    let sequence = 0;
-    state.__TAURI_INTERNALS__ = {
-      metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-      transformCallback: () => ++sequence,
-      unregisterCallback: () => {},
-      invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-        calls.push({ command, payload });
-        if (command.startsWith('plugin:event|')) return ++sequence;
-        if (command === 'get_capabilities' || command === 'list_jobs') return [];
-        if (command === 'subscribe_jobs') {
-          (payload.channel as { onmessage: (jobs: unknown[]) => void }).onmessage([]);
-          return;
-        }
-        if (command === 'get_preferences' || command === 'remember_recent_media')
-          return {
-            version: 1,
-            general: { recursiveImport: false, defaultOutputDirectory: null },
-            recentPaths: [],
-          };
-        if (command === 'plugin:dialog|open') return ['C:\\media\\source.mkv'];
-        if (command === 'plugin:dialog|save') return 'C:\\output\\frame.png';
-        if (command === 'begin_media_analysis') return 'image-' + ++sequence;
-        if (command === 'cancel_media_analysis') return;
-        if (command === 'probe_media')
-          return {
-            id: payload.path,
-            path: payload.path,
-            name: 'source.mkv',
-            sizeBytes: '10000',
-            durationSeconds: 12,
-            format: 'matroska',
-            streams: [
-              {
-                index: 2,
-                kind: 'video',
-                codec: 'h264',
-                width: 320,
-                height: 180,
-                frameRate: '24/1',
-                sampleRate: null,
-                channels: null,
-                language: null,
-                title: null,
-              },
-            ],
-          };
-        if (command === 'run_image_job')
-          return {
-            outputPath: 'C:\\output\\frame.png',
-            frameCount: 1,
-            width: 320,
-            height: 180,
-            notes: [],
-          };
-        if (command === 'get_completion_status')
-          return {
-            options: { notify: false, finishAction: 'none' },
-            armedJobs: 0,
-            secondsRemaining: null,
-            error: null,
-          };
-        throw new Error('Unexpected command ' + command);
-      },
-    };
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'source.mkv', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
-  await page.getByText('Images and sequences', { exact: true }).click();
-  const region = page.getByRole('region', { name: 'Images and sequences', exact: true });
-  await region.getByRole('combobox', { name: 'Operation', exact: true }).selectOption('export');
-  return region;
-}
-
-async function submittedImages(page: Page) {
-  return page.evaluate(() =>
-    (globalThis as unknown as { __imageCalls: Call[] }).__imageCalls.filter(
-      (call) => call.command === 'run_image_job',
+  await quick.getByLabel('Codec', { exact: true }).selectOption('png');
+  await quick.getByLabel('Color Format').selectOption('rgba64');
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/png-frames');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter(
+            (call: any) => call.command === 'mock_image_execution',
+          ).length,
+      ),
+    )
+    .toBe(1);
+  let calls = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls.filter(
+      (call: any) => call.command === 'mock_image_execution',
     ),
   );
-}
-
-test('explicit 16-bit RGBA PNG is submitted and JPEG ignores PNG-only depth', async ({ page }) => {
-  const region = await setup(page);
-  await region
-    .getByRole('combobox', { name: 'PNG color depth', exact: true })
-    .selectOption('rgba64');
-  await region.getByRole('button', { name: 'Export', exact: true }).click();
-  await expect.poll(async () => (await submittedImages(page)).length).toBe(1);
-  expect((await submittedImages(page))[0].payload.request).toMatchObject({
+  expect(calls[0].payload.request).toMatchObject({
     operation: 'export',
-    inputPath: 'C:\\media\\source.mkv',
-    streamIndex: 2,
-    format: 'png',
+    inputPath: '/media/input.mkv',
+    streamIndex: 0,
+    format: 'pngSequence',
+    fullSource: true,
+    outputPath: '/media/png-frames',
     pixelFormat: 'rgba64',
   });
 
-  await region.getByRole('combobox', { name: 'Output', exact: true }).selectOption('jpeg');
-  await expect(region.getByRole('combobox', { name: 'PNG color depth', exact: true })).toHaveCount(
-    0,
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeEnabled();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('jpg');
+  const color = quick.getByLabel('Color Format');
+  await expect(color.locator('option').allTextContents()).resolves.toEqual([
+    'YUV - 4:2:0 - 8 bit',
+    'YUV - 4:2:2 - 8 bit',
+    'YUV - 4:4:4 - 8 bit',
+  ]);
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/jpeg-frames');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter(
+            (call: any) => call.command === 'mock_image_execution',
+          ).length,
+      ),
+    )
+    .toBe(2);
+  calls = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls.filter(
+      (call: any) => call.command === 'mock_image_execution',
+    ),
   );
-  await region.getByRole('button', { name: 'Export', exact: true }).click();
-  await expect.poll(async () => (await submittedImages(page)).length).toBe(2);
-  expect((await submittedImages(page))[1].payload.request).toMatchObject({
+  expect(calls[1].payload.request).toMatchObject({
     operation: 'export',
-    format: 'jpeg',
+    format: 'jpegSequence',
+    fullSource: true,
+    outputPath: '/media/jpeg-frames',
+    pixelFormat: 'yuv420p',
+    quality: 3,
   });
-  expect((await submittedImages(page))[1].payload.request).not.toHaveProperty('pixelFormat');
+  expect(calls[1].payload.request.pixelFormat).not.toBe('rgba64');
+});
+
+test('explicit image export freezes all input identities and source metadata before resolution', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = { ...source, title: 'Original', language: 'eng' };
+  const donor = { ...source, id: 'donor', path: '/other/donor.mkv', name: 'donor.mkv' };
+  await page.evaluate(
+    ({ first, donor }) => {
+      const h = globalThis as any;
+      h.__pickerPaths = [first.path, donor.path];
+      h.__mediaByPath = { [first.path]: first, [donor.path]: donor };
+    },
+    { first, donor },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('png');
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Copy Metadata From').selectOption('/other/donor.mkv');
+  await quick.getByLabel('Copy Chapters From').selectOption('');
+  await quick.getByLabel('Title for output file').fill('  Image title  ');
+  await quick.getByLabel('Language for output file').fill(' jpn ');
+  await quick.getByLabel('Title for track 1').fill('Dub');
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/images');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdResolution = new Promise((resolve) => (h.__releaseResolution = resolve));
+  });
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await quick.getByLabel('Title for output file').fill('New draft');
+  await page.evaluate(() => (globalThis as any).__releaseResolution());
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_image_execution')
+            ?.payload.request,
+      ),
+    )
+    .toBeTruthy();
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_image_execution')
+        .payload.request,
+  );
+  expect(request.processing.metadata).toEqual({
+    inputs: ['/media/input.mkv', '/other/donor.mkv'],
+    options: {
+      sourceInput: 1,
+      attachmentInputs: [],
+      title: 'Image title',
+      language: 'jpn',
+      tracks: [
+        { title: '', language: '' },
+        { title: 'Dub', language: 'eng' },
+        { title: 'Subtitles', language: 'eng' },
+      ],
+      audioDispositions: [true],
+      subtitleDispositions: [true],
+    },
+  });
+  expect(request.processing.metadata.options.chaptersInput).toBeUndefined();
+  await expect(quick.getByLabel('Title for output file')).toHaveValue('New draft');
+  await quick.getByLabel('Apply the titles and languages below').uncheck();
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_image_execution')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const secondRequest = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_image_execution')[1]
+        .payload.request,
+  );
+  expect(secondRequest.processing.metadata.options.tracks).toEqual([]);
+  expect(secondRequest.processing.metadata.options.title).toBeUndefined();
+  expect(secondRequest.processing.metadata.options.language).toBeUndefined();
+});
+
+test('image batch freezes per-source metadata donors and suppresses the editable grid', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const second = { ...source, id: 'second', path: '/other/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    ({ first, second }) => {
+      const h = globalThis as any;
+      h.__pickerPaths = [first.path, second.path];
+      h.__mediaByPath = { [first.path]: first, [second.path]: second };
+    },
+    { first: source, second },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('png');
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Title for output file').fill('Not a batch override');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await expect(quick.getByLabel('Copy Metadata From')).toHaveValue('current');
+  await quick.getByLabel('Copy Chapters From').selectOption('');
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_image_execution')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const requests = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_image_execution')
+      .map((c: any) => c.payload.request),
+  );
+  for (const request of requests) {
+    expect(request.processing.metadata).toEqual({
+      inputs: [request.inputPath],
+      options: {
+        sourceInput: 0,
+        attachmentInputs: [],
+        tracks: [],
+        audioDispositions: [true],
+        subtitleDispositions: [true],
+      },
+    });
+  }
+  await quick.getByLabel('Copy Metadata From').selectOption('');
+  await quick.getByLabel('Copy Chapters From').selectOption('current');
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_image_execution')
+            .length,
+      ),
+    )
+    .toBe(4);
+  const secondRun = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_image_execution')
+      .slice(2)
+      .map((c: any) => c.payload.request),
+  );
+  for (const request of secondRun) {
+    expect(request.processing.metadata).toEqual({
+      inputs: [request.inputPath],
+      options: {
+        chaptersInput: 0,
+        attachmentInputs: [],
+        tracks: [],
+        audioDispositions: [true],
+        subtitleDispositions: [true],
+      },
+    });
+  }
+});
+
+test('shared footer follows image and video codec plus mux/batch mode transitions', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeVisible();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('png');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Run Batch: Encode', exact: true })).toBeVisible();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('svtAv1');
+  await expect(page.getByRole('button', { name: 'Run Batch: Encode', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('mux');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeVisible();
 });

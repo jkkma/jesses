@@ -1,0 +1,86 @@
+    #[test]
+    fn source_hevc_nvenc_p010_menu_uses_exact_ten_bit_semiplanar_packing() {
+        let document=source();
+        let settings=EncodeSettings {encoder:VideoEncoder::HevcNvenc,preset:0,
+            output_pixel_format:Some(media_core::Av1anPixelFormat::Yuv420p10le),..Default::default()};
+        validate_settings(&settings).unwrap();
+        let plan=Plan::build(&document,&document.selected(&[0]).unwrap(),&settings).unwrap();
+        assert_eq!(plan.output_pixel_format,"yuv420p10le");
+        assert_eq!(plan.output_bit_depth(),10);
+        let arguments=super::super::encode::consumer_arguments(&plan,&settings);
+        assert!(arguments.windows(2).any(|pair|pair[0]=="-pix_fmt"&&pair[1]=="+p010le"));
+        assert!(arguments.iter().any(|argument|argument.to_string_lossy().starts_with("format=p010le,")));
+    }
+    #[test]
+    fn nvenc_constant_quantizer_is_typed_and_uses_its_own_rate_control() {
+        let document = source();
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            for quantizer in [0, 23, 51] {
+                let settings = EncodeSettings {
+                    encoder,
+                    constant_quantizer: Some(quantizer),
+                    crf: 200,
+                    preset: 0,
+                    ..Default::default()
+                };
+                validate_settings(&settings).unwrap();
+                let plan =
+                    Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+                let arguments = super::super::encode::consumer_arguments(&plan, &settings);
+                assert!(arguments.windows(2).any(|pair| pair == ["-rc", "constqp"]));
+                assert!(
+                    arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == "-qp" && pair[1] == quantizer.to_string().as_str())
+                );
+                assert!(
+                    !arguments
+                        .iter()
+                        .any(|value| value == "-cq" || value == "-crf")
+                );
+            }
+            let valid = EncodeSettings {
+                encoder,
+                constant_quantizer: Some(23),
+                ..Default::default()
+            };
+            for invalid in [
+                EncodeSettings {
+                    constant_quantizer: Some(52),
+                    ..valid.clone()
+                },
+                EncodeSettings {
+                    lossless: true,
+                    ..valid.clone()
+                },
+                EncodeSettings {
+                    rate_control: Some(media_core::VideoRateControl::Bitrate {
+                        bitrate_kbps: 1000,
+                        two_pass: false,
+                    }),
+                    ..valid.clone()
+                },
+                EncodeSettings {
+                    encoder: VideoEncoder::X264,
+                    ..valid.clone()
+                },
+                EncodeSettings {
+                    parameters: vec![media_core::EncoderParameter {
+                        name: "rc".into(),
+                        value: "vbr".into(),
+                    }],
+                    ..valid.clone()
+                },
+            ] {
+                assert!(validate_settings(&invalid).is_err(), "{invalid:?}");
+            }
+            validate_settings(&EncodeSettings {
+                parameters: vec![media_core::EncoderParameter {
+                    name: "rc".into(),
+                    value: "constqp".into(),
+                }],
+                ..valid
+            })
+            .unwrap();
+        }
+    }

@@ -1,0 +1,628 @@
+//! Source NVENC runs one FFmpeg process. Its frame limit can end shared demux
+//! before a copied stream's tail, so validate the complete emitted contiguous
+//! source subsequence rather than inventing an independent packet count.
+use super::{
+    audio, check_cancel,
+    external_tracks::ExternalTracks,
+    metadata::{Document, Stream},
+    mux, probe, process_error,
+    source_normalization::aac,
+};
+use crate::supervisor::{self, CommandSpec};
+use media_core::{AppError, EncodeSettings, SubtitleMode, VideoSeekStrategy};
+use std::{collections::BTreeMap, path::Path, sync::mpsc, time::Duration};
+use tokio::sync::watch;
+#[derive(Clone, Copy)]
+struct Clock {
+    origin: usize,
+    priming: f64,
+}
+struct Evidence {
+    clocks: Vec<usize>,
+    start: Option<f64>,
+    end: Option<f64>,
+    count: u64,
+}
+fn fail(message: impl Into<String>) -> AppError {
+    AppError::new("SOURCE_NVENC_VALIDATION_FAILED", message, None)
+}
+fn same(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= 0.002,
+        (None, None) => true,
+        _ => false,
+    }
+}
+#[derive(serde::Deserialize)]
+struct Priming {
+    index: u32,
+    initial_padding: Option<u64>,
+    sample_rate: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct PrimingDocument {
+    streams: Vec<Priming>,
+}
+async fn priming(
+    ffprobe: &Path,
+    output: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<BTreeMap<u32, f64>, AppError> {
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args: [
+                "-v",
+                "error",
+                "-protocol_whitelist",
+                "file",
+                "-show_entries",
+                "stream=index,initial_padding,sample_rate",
+                "-of",
+                "json",
+                "-i",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .chain([output.as_os_str().to_owned()])
+            .collect(),
+            cwd: None,
+        },
+        cancel.clone(),
+        512 * 1024,
+        Duration::from_secs(60),
+    )
+    .await
+    .map_err(|error| process_error(error, output))?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(fail("AAC CodecDelay metadata could not be read."));
+    }
+    let document: PrimingDocument =
+        serde_json::from_slice(&result.stdout).map_err(|error| fail(error.to_string()))?;
+    Ok(document
+        .streams
+        .into_iter()
+        .filter_map(|stream| {
+            let padding = stream.initial_padding?;
+            let rate = stream.sample_rate?.parse::<f64>().ok()?;
+            (padding > 0 && rate > 0.0).then_some((stream.index, padding as f64 / rate))
+        })
+        .collect())
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn verify(
+    ffprobe: &Path,
+    primary: &Path,
+    output: &Path,
+    selected: &[&Stream],
+    artifact: &mut Document,
+    expected: &mut Document,
+    settings: &EncodeSettings,
+    external: &ExternalTracks,
+    window: Option<(f64, f64)>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let primary_document = probe(ffprobe, primary, cancel, None).await?;
+    let pads = priming(ffprobe, output, cancel).await?;
+    let first_video = selected
+        .iter()
+        .position(|stream| stream.codec_type.as_deref() == Some("video"))
+        .and_then(|position| artifact.streams.get(position))
+        .ok_or_else(|| fail("The source NVENC output has no first picture."))?;
+    let video_start = first_video
+        .packet_start_time
+        .or_else(|| {
+            first_video
+                .start_time
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| fail("The source NVENC picture has no finite output clock."))?;
+    let mut origins = vec![video_start];
+    // FFmpeg quantizes the first sought encoded picture to its encoder frame
+    // time base. FFmpeg9 retains the next tick; older builds can start at zero.
+    // These are fixed one-frame alternatives, not independent track offsets.
+    if let Some(frame) = first_video
+        .avg_frame_rate
+        .as_deref()
+        .or(first_video.r_frame_rate.as_deref())
+        .and_then(|rate| rate.split_once('/'))
+        .and_then(|(n, d)| Some(d.parse::<f64>().ok()? / n.parse::<f64>().ok()?))
+        .filter(|frame| frame.is_finite() && *frame > 0.0)
+    {
+        let origin = video_start - frame;
+        if origin >= -0.002 {
+            origins.push(origin);
+        }
+    }
+    for padding in pads.values() {
+        for origin in [video_start + padding, video_start - padding] {
+            if origin >= -0.002
+                && !origins
+                    .iter()
+                    .any(|candidate| (origin - candidate).abs() < 0.000001)
+            {
+                origins.push(origin);
+            }
+        }
+    }
+    let mut consensus: Vec<usize> = (0..origins.len()).collect();
+    let mux_settings = external.mux_settings(settings);
+    let output_seek = settings.trim.is_some_and(|trim| {
+        trim.time
+            .is_none_or(|time| time.seek_strategy == VideoSeekStrategy::DecodeFromStart)
+    });
+    let ffmpeg = super::discover("ffmpeg", cancel).await?;
+    for (position, stream) in selected.iter().enumerate() {
+        check_cancel(cancel)?;
+        let copied = match stream.codec_type.as_deref() {
+            Some("audio") => {
+                !audio::converted(&mux_settings).any(|track| track.stream_index == stream.index)
+            }
+            Some("subtitle") => !mux_settings.subtitles.iter().any(|track| {
+                track.stream_index == stream.index && track.mode != SubtitleMode::Copy
+            }),
+            Some("data") => true,
+            _ => false,
+        };
+        if !copied {
+            continue;
+        }
+        let (path, document, index) = external.source_track(stream.index).map_or(
+            (primary, &primary_document, stream.index),
+            |(path, document, index)| (path, document, index),
+        );
+        let original = document
+            .streams
+            .iter()
+            .find(|candidate| candidate.index == index)
+            .ok_or_else(|| fail("A copied source track disappeared."))?;
+        let source_origin = document
+            .format
+            .as_ref()
+            .and_then(|format| format.start_time.as_deref())
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let offset = external.offset_seconds(stream.index);
+        let start = window.map_or(0.0, |(start, _)| start);
+        let clock = source_origin + start - offset;
+        let padding = if stream.codec_name.as_deref() == Some("aac") {
+            pads.get(&(position as u32)).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let mut clocks = Vec::new();
+        for origin in &consensus {
+            clocks.push(Clock {
+                origin: *origin,
+                priming: 0.0,
+            });
+            if padding > 0.0 {
+                clocks.push(Clock {
+                    origin: *origin,
+                    priming: -padding,
+                });
+                clocks.push(Clock {
+                    origin: *origin,
+                    priming: padding,
+                });
+            }
+        }
+        let source_spec = if aac::needed(document, original) {
+            CommandSpec {
+                executable: ffmpeg.clone(),
+                args: aac::filtered_args(path, index, 0.0),
+                cwd: None,
+            }
+        } else {
+            mux::packet_spec(ffprobe, path, index)
+        };
+        let evidence = sequence(
+            &source_spec,
+            aac::needed(document, original),
+            ffprobe,
+            output,
+            position as u32,
+            path,
+            clock,
+            &origins,
+            clocks,
+            stream.codec_type.as_deref() == Some("subtitle"),
+            output_seek,
+            window,
+            source_origin,
+            offset,
+            cancel,
+        )
+        .await?;
+        if evidence.count == 0 && stream.codec_type.as_deref() != Some("subtitle") {
+            return Err(fail("The copied media track contains no source packets."));
+        }
+        if evidence.count > 0 {
+            consensus.retain(|origin| evidence.clocks.contains(origin));
+            if consensus.is_empty() {
+                return Err(fail(
+                    "Copied source tracks do not share the planned mux clock and explicit CodecDelay.",
+                ));
+            }
+        }
+        let expected_stream = expected
+            .streams
+            .iter_mut()
+            .find(|candidate| candidate.index == stream.index)
+            .ok_or_else(|| fail("A copied expected stream is missing."))?;
+        expected_stream.nb_read_packets = (evidence.count > 0).then(|| evidence.count.to_string());
+        expected_stream.packet_start_time = evidence.start;
+        expected_stream.start_time = evidence.start.map(|time| time.to_string());
+        expected_stream.duration = Some(evidence.end.unwrap_or(0.0).to_string());
+        expected_stream.tags.retain(|key,_|!super::metadata::is_derived_stream_tag(key));
+        // FFprobe's AAC header includes CodecDelay; complete packet proof above is
+        // the authority for actual packet start, not a replacement for that proof.
+        artifact.streams[position].packet_start_time = evidence.start;
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+async fn sequence(
+    source_spec: &CommandSpec,
+    filtered_aac: bool,
+    ffprobe: &Path,
+    output: &Path,
+    output_index: u32,
+    source: &Path,
+    clock: f64,
+    origins: &[f64],
+    mut clocks: Vec<Clock>,
+    subtitle: bool,
+    output_seek: bool,
+    window: Option<(f64, f64)>,
+    source_origin: f64,
+    offset: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Evidence, AppError> {
+    let origins = origins.to_vec();
+    let (sender, receiver) = mpsc::sync_channel(16);
+    let output_spec = mux::packet_spec(ffprobe, output, output_index);
+    let observed = supervisor::run_streaming_stdout(
+        &output_spec,
+        cancel.clone(),
+        8192,
+        Duration::from_secs(86400),
+        move |reader| {
+            mux::packets(reader, |packet| {
+                sender
+                    .send(packet)
+                    .map_err(|_| "Copied source comparison stopped.".to_owned())
+            })
+        },
+    );
+    let original = supervisor::run_streaming_stdout(
+        source_spec,
+        cancel.clone(),
+        8192,
+        Duration::from_secs(86400),
+        move |reader| {
+            let mut next = receiver.recv().ok();
+            let mut started = false;
+            let mut start = None;
+            let mut end = None;
+            let mut count = 0;
+            let mut accept = |packet: mux::Packet| -> Result<(), String> {
+                let Some(actual) = next.as_ref() else {
+                    return Ok(());
+                };
+                let eligible = packet.pts.is_some_and(|pts| {
+                    window.is_none_or(|(start, end)| {
+                        let pts = pts - source_origin + offset;
+                        (!output_seek || pts >= start - 0.002) && pts < end + 0.002
+                    })
+                });
+                let matches = |candidate: &Clock| {
+                    let shift = origins[candidate.origin] + candidate.priming - clock;
+                    let shifted = |time: Option<f64>| {
+                        time.map(|time| {
+                            if subtitle {
+                                (time + shift).max(0.0)
+                            } else {
+                                time + shift
+                            }
+                        })
+                    };
+                    eligible
+                        && packet.hash == actual.hash
+                        && packet.size == actual.size
+                        && same(packet.duration, actual.duration)
+                        && same(shifted(packet.pts), actual.pts)
+                        && same(shifted(packet.dts), actual.dts)
+                };
+                if !started {
+                    if !clocks.iter().any(matches) {
+                        return Ok(());
+                    }
+                    started = true;
+                    start = actual.pts;
+                }
+                clocks.retain(matches);
+                if clocks.is_empty() {
+                    return Err("A copied source packet changed payload, order, duration or the shared seek clock.".into());
+                }
+                if let Some(time) = actual
+                    .pts
+                    .zip(actual.duration)
+                    .map(|(pts, duration)| pts + duration)
+                {
+                    end = Some(end.map_or(time, |old: f64| old.max(time)));
+                }
+                count += 1;
+                next = receiver.recv().ok();
+                Ok(())
+            };
+            if filtered_aac {
+                aac::framehash(reader, &mut accept)?;
+            } else {
+                mux::packets(reader, &mut accept)?;
+            }
+            if next.is_some() {
+                return Err(
+                    "A copied output packet has no contiguous seek-eligible original access unit."
+                        .into(),
+                );
+            }
+            Ok(Evidence {
+                clocks: clocks.iter().map(|clock| clock.origin).collect(),
+                start,
+                end,
+                count,
+            })
+        },
+    );
+    let (observed, original) = tokio::join!(Box::pin(observed), Box::pin(original));
+    let observed = observed.map_err(|error| process_error(error, output))?;
+    let original = original.map_err(|error| process_error(error, source))?;
+    if !observed.status.success()
+        || !original.status.success()
+        || !observed.stderr.is_empty()
+        || !original.stderr.is_empty()
+        || observed.value != original.value.count
+    {
+        return Err(fail(
+            "The complete source NVENC copied-packet sequence failed validation.",
+        ));
+    }
+    Ok(original.value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use media_core::{EncodeBackend, VideoEncoder};
+    use std::{
+        ffi::OsString,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-artifacts/source-nvenc-clock")
+                .join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("Retained {}", self.0.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(Into::into).collect()
+    }
+    fn run(name: &str, args: Vec<OsString>) -> Vec<u8> {
+        let tool = std::env::var_os(format!("JESSES_{}", name.to_uppercase()))
+            .unwrap_or_else(|| name.into());
+        let result = std::process::Command::new(tool)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    }
+    fn fixture(f: &Fixture) -> PathBuf {
+        let captions = f.0.join("captions.srt");
+        std::fs::write(&captions,"1\n00:00:00,000 --> 00:00:02,500\nCrossing\n\n2\n00:00:02,800 --> 00:00:03,500\nLater\n").unwrap();
+        let source = f.0.join("source.mkv");
+        let mut a = args(&[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=96x64:r=24:d=4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=4",
+            "-i",
+        ]);
+        a.push(captions.into());
+        a.extend(args(&[
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "2:s",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "ass",
+        ]));
+        a.push(source.clone().into());
+        run("ffmpeg", a);
+        source
+    }
+    fn settings(mode: &str) -> EncodeSettings {
+        EncodeSettings{backend:EncodeBackend::Standalone,encoder:VideoEncoder::H264Nvenc,source_nvenc_quality:true,source_trim:true,trim:Some(serde_json::from_value(if mode=="frames"{serde_json::json!({"startFrame":24,"endFrameExclusive":72})}else{serde_json::json!({"time":{"startMilliseconds":979,"endMilliseconds":2999,"seekStrategy":mode}})}).unwrap()),..Default::default()}
+    }
+    fn command(input: &Path, output: &Path, mode: &str) -> Vec<OsString> {
+        let mut a = args(&["-v", "error"]);
+        if mode == "inputSeek" {
+            a.extend(args(&["-ss", "0.979"]));
+        }
+        a.push("-i".into());
+        a.push(input.into());
+        a.extend(args(&[
+            "-map",
+            "0:s",
+            "-map",
+            "0:v",
+            "-map",
+            "0:a",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "copy",
+            "-c:s",
+            "copy",
+        ]));
+        if mode != "inputSeek" {
+            a.extend(args(&["-ss", "0.979"]));
+        }
+        a.extend(args(&["-t", "2.020"]));
+        if mode == "frames" {
+            a.extend(args(&["-frames:v", "48"]));
+        }
+        a.push(output.into());
+        a
+    }
+    async fn check(input: &Path, output: &Path, settings: &EncodeSettings) -> Result<(), AppError> {
+        let (_owner, cancel) = watch::channel(false);
+        let ffprobe = super::super::discover("ffprobe", &cancel).await?;
+        let document = probe(&ffprobe, input, &cancel, None).await?;
+        let mut actual = probe(&ffprobe, output, &cancel, None).await?;
+        let mut expected = document.clone();
+        let selected = document.selected(&[2, 0, 1])?;
+        verify(
+            &ffprobe,
+            input,
+            output,
+            &selected,
+            &mut actual,
+            &mut expected,
+            settings,
+            &ExternalTracks::default(),
+            Some((0.979, 2.999)),
+            &cancel,
+        )
+        .await
+    }
+    #[tokio::test]
+    #[ignore = "real source single-process CPU substituted command; no NVIDIA hardware qualification"]
+    async fn source_single_process_packet_clock_accepts_all_three_seek_modes() {
+        for mode in ["frames", "inputSeek", "decodeFromStart"] {
+            let f = Fixture::new();
+            let source = fixture(&f);
+            let output = f.0.join("output.mkv");
+            let a = command(&source, &output, mode);
+            run("ffmpeg", a.clone());
+            check(&source, &output, &settings(mode))
+                .await
+                .unwrap_or_else(|error| panic!("{mode}: {error:?}"));
+            let mut p = args(&[
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_packets",
+                "-show_data_hash",
+                "sha256",
+                "-of",
+                "json",
+            ]);
+            p.push(output.into());
+            let actual: serde_json::Value = serde_json::from_slice(&run("ffprobe", p)).unwrap();
+            let proof = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/migration-validation/source-trim-20261101");
+            std::fs::create_dir_all(&proof).unwrap();
+            std::fs::write(proof.join(format!("source-single-process-{mode}.json")),serde_json::to_vec_pretty(&serde_json::json!({"qualification":"Exact source single-process command with explicit software libx264; no physical NVENC proof","sourceEquivalentArguments":a.iter().map(|value|value.to_string_lossy()).collect::<Vec<_>>(),"actual":actual})).unwrap()).unwrap();
+        }
+    }
+    #[tokio::test]
+    #[ignore = "real packet corruption/offset rejection against source single-process output"]
+    async fn source_single_process_packet_clock_rejects_interior_drop_and_wrong_track_offset() {
+        let f = Fixture::new();
+        let source = fixture(&f);
+        let output = f.0.join("valid.mkv");
+        run("ffmpeg", command(&source, &output, "decodeFromStart"));
+        check(&source, &output, &settings("decodeFromStart"))
+            .await
+            .unwrap();
+        let dropped = f.0.join("dropped.mkv");
+        let mut a = args(&["-v", "error", "-copyts", "-i"]);
+        a.push(output.clone().into());
+        a.extend(args(&[
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-bsf:a",
+            "noise=drop='eq(n,20)'",
+            "-avoid_negative_ts",
+            "disabled",
+        ]));
+        a.push(dropped.clone().into());
+        run("ffmpeg", a);
+        assert!(
+            check(&source, &dropped, &settings("decodeFromStart"))
+                .await
+                .is_err()
+        );
+        let wrong = f.0.join("wrong-offset.mkv");
+        let mut a = args(&["-v", "error", "-copyts", "-i"]);
+        a.push(output.clone().into());
+        a.extend(args(&["-itsoffset", "0.100", "-i"]));
+        a.push(output.into());
+        a.extend(args(&[
+            "-map",
+            "0:0",
+            "-map",
+            "0:1",
+            "-map",
+            "1:2",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "disabled",
+        ]));
+        a.push(wrong.clone().into());
+        run("ffmpeg", a);
+        assert!(
+            check(&source, &wrong, &settings("decodeFromStart"))
+                .await
+                .is_err()
+        );
+    }
+}

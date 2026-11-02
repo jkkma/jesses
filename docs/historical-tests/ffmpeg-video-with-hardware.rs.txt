@@ -1,0 +1,659 @@
+//! FFmpeg library encoders consume validated Y4M (rawvideo for VP9 alpha) and emit timed MKV
+//! through the supervisor's already-owned output handle.
+use std::ffi::OsString;
+
+use media_core::{EncodeSettings, VideoEncoder};
+
+use super::Plan;
+
+const X265_PRESETS: [&str; 10] = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+];
+
+pub(super) fn library(encoder: VideoEncoder) -> &'static str {
+    match encoder {
+        VideoEncoder::X265 => "libx265",
+        VideoEncoder::Vp9 => "libvpx-vp9",
+        VideoEncoder::H264Nvenc => "h264_nvenc",
+        VideoEncoder::HevcNvenc => "hevc_nvenc",
+        _ => unreachable!("FFmpeg video encoder"),
+    }
+}
+
+pub(super) fn encoder_pixel_format(encoder: VideoEncoder, depth: u8) -> &'static str {
+    if matches!(encoder, VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc) && depth == 10 {
+        "p010le"
+    } else if depth == 10 {
+        "yuv420p10le"
+    } else {
+        "yuv420p"
+    }
+}
+
+pub(super) fn output_format(plan: &Plan) -> &'static str {
+    if matches!(
+        plan.encoder,
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+    ) && !plan.output_pixel_format.starts_with("yuv444") {
+        encoder_pixel_format(plan.encoder, plan.output_bit_depth())
+    } else {
+        plan.output_pixel_format
+    }
+}
+
+pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+    let alpha = settings.encoder == VideoEncoder::Vp9 && plan.output_pixel_format == "yuva420p";
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "warning",
+        "-xerror",
+        "-protocol_whitelist",
+        "pipe",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    // Output options follow the pipe input, below.
+    if alpha {
+        args.extend([
+            "-f".into(),
+            "rawvideo".into(),
+            "-pixel_format".into(),
+            "yuva420p".into(),
+            "-video_size".into(),
+            format!("{}x{}", plan.width, plan.height).into(),
+            "-framerate".into(),
+            format!("{}/{}", plan.fps_num, plan.fps_den).into(),
+        ]);
+    } else {
+        args.extend([
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "-chroma_sample_location".into(),
+            plan.chroma.into(),
+        ]);
+    }
+    args.extend(
+        [
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            library(settings.encoder),
+            "-pix_fmt",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>(),
+    );
+    // The '+' prevents FFmpeg from choosing an alternative pixel format when
+    // the installed encoder cannot produce the source's validated bit depth.
+    let encoder_format = output_format(plan);
+    args.push(format!("+{encoder_format}").into());
+    args.extend([
+        // Y4M carries pixel depth/range but not all colorimetry. Reattach the
+        // validated tags without transforming samples or allowing auto-scale.
+        "-vf".into(),
+        format!(
+            "{}setsar={},setparams=field_mode=prog:range={}:color_primaries={}:color_trc={}:colorspace={}",
+            if encoder_format == plan.output_pixel_format {
+                String::new()
+            } else {
+                format!("format={encoder_format},")
+            },
+            plan.output_sar(),
+            if plan.full_range { "full" } else { "limited" },
+            plan.primaries,
+            plan.transfer,
+            plan.matrix
+        )
+        .into(),
+        "-color_primaries".into(),
+        plan.primaries.to_string().into(),
+        "-color_trc".into(),
+        plan.transfer.to_string().into(),
+        "-colorspace".into(),
+        plan.matrix.to_string().into(),
+        "-color_range".into(),
+        if plan.full_range { "pc" } else { "tv" }.into(),
+        "-chroma_sample_location".into(),
+        plan.chroma.into(),
+    ]);
+    if let Some(frames) = super::super::encoding_preferences::keyframes(plan, settings) {
+        args.extend(["-g".into(), frames.to_string().into()]);
+    }
+    match settings.encoder {
+        VideoEncoder::X265 => {
+            if !settings.lossless {
+                args.extend(["-crf".into(), settings.crf.to_string().into()]);
+            }
+            args.extend([
+                "-preset".into(),
+                X265_PRESETS[usize::from(settings.preset)].into(),
+                // Disable unmanaged external side effects such as CSV/stats files.
+                // All options are fixed scalars; no input path reaches this parser.
+                "-x265-params".into(),
+                format!(
+                    "pools=4:frame-threads=2:log-level=warning{}{}{}",
+                    if settings.lossless { ":lossless=1" } else { "" },
+                    super::super::parameters::x265_suffix(settings),
+                    plan.ffmpeg_x265_hdr_suffix()
+                )
+                .into(),
+            ]);
+        }
+        VideoEncoder::Vp9 => {
+            if !settings.lossless {
+                args.extend(["-crf".into(), settings.crf.to_string().into()]);
+            }
+            args.extend([
+                "-b:v".into(),
+                "0".into(),
+                "-lossless".into(),
+                if settings.lossless { "1" } else { "0" }.into(),
+                "-deadline".into(),
+                "good".into(),
+                "-cpu-used".into(),
+                settings.preset.to_string().into(),
+                "-row-mt".into(),
+                "1".into(),
+                "-threads".into(),
+                "4".into(),
+                "-profile:v".into(),
+                match (
+                    plan.output_pixel_format.starts_with("yuv444"),
+                    plan.output_bit_depth(),
+                ) {
+                    (false, 8) => "0",
+                    (true, 8) => "1",
+                    (false, _) => "2",
+                    (true, _) => "3",
+                }
+                .into(),
+            ]);
+            if alpha {
+                args.extend([
+                    "-auto-alt-ref".into(),
+                    "0".into(),
+                    "-metadata:s:v:0".into(),
+                    "alpha_mode=1".into(),
+                ]);
+            }
+        }
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+            const PRESETS: [&str; 7] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"];
+            args.extend([
+                "-preset".into(),
+                PRESETS[usize::from(settings.preset)].into(),
+            ]);
+            if settings.source_nvenc_quality {
+                if settings.rate_control.is_some() {
+                    // The resolved bitrate/size defaults are inserted before Advanced.
+                } else if settings.crf == 0 {
+                    args.extend(["-tune".into(), "lossless".into()]);
+                } else {
+                    args.extend([
+                        "-b:v".into(),
+                        "0".into(),
+                        "-cq".into(),
+                        settings.crf.to_string().into(),
+                    ]);
+                }
+            } else if settings.lossless {
+                args.extend([
+                    "-tune".into(),
+                    "lossless".into(),
+                    "-rc".into(),
+                    "constqp".into(),
+                    "-qp".into(),
+                    "0".into(),
+                ]);
+            } else if let Some(quantizer) = settings.constant_quantizer {
+                args.extend([
+                    "-rc".into(),
+                    "constqp".into(),
+                    "-qp".into(),
+                    quantizer.to_string().into(),
+                ]);
+            } else {
+                args.extend([
+                    "-rc".into(),
+                    "vbr".into(),
+                    "-cq".into(),
+                    settings.crf.to_string().into(),
+                    "-b:v".into(),
+                    "0".into(),
+                ]);
+            }
+        }
+        _ => unreachable!("FFmpeg video encoder"),
+    }
+    if matches!(
+        settings.encoder,
+        VideoEncoder::Vp9 | VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+    ) && !(settings.source_nvenc_quality && settings.rate_control.is_some())
+    {
+        args.extend(super::super::parameters::arguments(settings));
+    }
+    args.extend(
+        [
+            "-fps_mode",
+            "passthrough",
+            "-avoid_negative_ts",
+            "disabled",
+            "-progress",
+            "pipe:2",
+            "-nostats",
+            "-f",
+            "matroska",
+            "pipe:1",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    args
+}
+
+pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> Result<(), String> {
+    let name = library(encoder);
+    let has_encoder = help
+        .lines()
+        .any(|line| line.starts_with(&format!("Encoder {name} [")));
+    let has_format = help
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Supported pixel formats:"))
+        .is_some_and(|formats| formats.split_whitespace().any(|value| value == format));
+    let options: &[&str] = match encoder {
+        VideoEncoder::X265 => &["-crf", "-preset", "-x265-params"],
+        VideoEncoder::Vp9 if format == "yuva420p" => &[
+            "-crf",
+            "-cpu-used",
+            "-deadline",
+            "-row-mt",
+            "-lossless",
+            "-auto-alt-ref",
+        ],
+        VideoEncoder::Vp9 => &["-crf", "-cpu-used", "-deadline", "-row-mt", "-lossless"],
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+            &["-cq", "-preset", "-tune", "-rc", "-qp"]
+        }
+        _ => unreachable!("FFmpeg video encoder"),
+    };
+    if !has_encoder
+        || !has_format
+        || options
+            .iter()
+            .any(|option| !help.split_whitespace().any(|word| word == *option))
+    {
+        return Err(format!(
+            "FFmpeg must include {name} with {format} output and the required quality/speed options. The source bit depth will not be reduced."
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn hardware_probe_arguments(
+    encoder: VideoEncoder,
+    depth: u8,
+    lossless: bool,
+    constant_quantizer: Option<u8>,
+    source_lossless_tune: bool,
+) -> Vec<OsString> {
+    let format = encoder_pixel_format(encoder, depth);
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=64x64:r=1:d=1",
+        "-frames:v",
+        "1",
+        "-an",
+        "-vf",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.extend([
+        format!("format={format}").into(),
+        "-c:v".into(),
+        library(encoder).into(),
+        "-preset".into(),
+        "p1".into(),
+    ]);
+    if source_lossless_tune {
+        args.extend(["-tune".into(), "lossless".into()]);
+    } else if lossless {
+        args.extend([
+            "-tune".into(),
+            "lossless".into(),
+            "-rc".into(),
+            "constqp".into(),
+            "-qp".into(),
+            "0".into(),
+        ]);
+    } else if let Some(quantizer) = constant_quantizer {
+        args.extend([
+            "-rc".into(),
+            "constqp".into(),
+            "-qp".into(),
+            quantizer.to_string().into(),
+        ]);
+    } else {
+        args.extend([
+            "-rc".into(),
+            "vbr".into(),
+            "-cq".into(),
+            "23".into(),
+            "-b:v".into(),
+            "0".into(),
+        ]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+    args
+}
+
+pub(super) fn hardware_probe_for_settings(settings: &EncodeSettings, depth: u8) -> Vec<OsString> {
+    let mut args = hardware_probe_arguments(
+        settings.encoder,
+        depth,
+        settings.lossless,
+        settings.constant_quantizer,
+        settings.source_nvenc_quality && settings.crf == 0 && settings.rate_control.is_none(),
+    );
+    if settings.source_nvenc_quality {
+        let mut at = 0;
+        while at + 1 < args.len() {
+            if matches!(args[at].to_str(), Some("-rc" | "-qp" | "-cq" | "-b:v")) {
+                args.drain(at..at + 2);
+            } else {
+                at += 1;
+            }
+        }
+        let mut defaults = if settings.rate_control.is_some() {
+            vec![
+                "-b:v".into(),
+                "128000".into(),
+                "-minrate".into(),
+                "32k".into(),
+                "-maxrate".into(),
+                "256k".into(),
+                "-bufsize".into(),
+                "128k".into(),
+            ]
+        } else if settings.crf == 0 {
+            Vec::new()
+        } else {
+            vec![
+                "-b:v".into(),
+                "0".into(),
+                "-cq".into(),
+                settings.crf.to_string().into(),
+            ]
+        };
+        defaults.extend(super::super::parameters::arguments(settings));
+        let before_output = args.len() - 3;
+        args.splice(before_output..before_output, defaults);
+    }
+    args
+}
+
+pub(super) fn hardware_probe_for_plan(settings:&EncodeSettings,plan:&Plan)->Vec<OsString>{
+    let mut args=hardware_probe_for_settings(settings,plan.output_bit_depth());
+    if let Some(index)=args.iter().position(|value|value=="-vf"){args[index+1]=format!("format={}",output_format(plan)).into();}
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_hevc_p010_probe_uses_ten_bit_semiplanar_input() {
+        let arguments = hardware_probe_arguments(VideoEncoder::HevcNvenc, 10, false, None, false);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "-vf" && pair[1] == "format=p010le")
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "-c:v" && pair[1] == "hevc_nvenc")
+        );
+    }
+
+    #[test]
+    fn missing_library_or_depth_is_rejected_instead_of_falling_back() {
+        let help = "Encoder libx265 [HEVC]:\n Supported pixel formats: yuv420p\n -crf -preset -x265-params";
+        assert!(validate_help(help, VideoEncoder::X265, "yuv420p").is_ok());
+        assert!(validate_help(help, VideoEncoder::X265, "yuv420p10le").is_err());
+        assert!(validate_help(help, VideoEncoder::Vp9, "yuv420p").is_err());
+        assert!(validate_help("Codec not recognized", VideoEncoder::Vp9, "yuv420p").is_err());
+    }
+}
+
+#[cfg(test)]
+mod constant_qp_tests {
+    use super::*;
+    #[test]
+    fn hardware_initialization_probes_the_selected_constant_quantizer() {
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            for quantizer in [0, 23, 51] {
+                let arguments = hardware_probe_arguments(encoder, 8, false, Some(quantizer), false);
+                assert!(arguments.windows(2).any(|pair| pair == ["-rc", "constqp"]));
+                assert!(
+                    arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == "-qp" && pair[1] == quantizer.to_string().as_str())
+                );
+                assert!(!arguments.iter().any(|value| value == "-cq"));
+            }
+        }
+    }
+
+    #[test]
+    fn source_zero_quality_only_adds_lossless_tune_before_advanced_and_keeps_legacy_qp_distinct() {
+        let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":48,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"4/1","time_base":"1/1000","start_time":"0","color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"}],"format":{"start_time":"0","duration":"1"}})).unwrap();
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            let settings = EncodeSettings {
+                encoder,
+                crf: 0,
+                preset: 6,
+                lossless: false,
+                source_nvenc_quality: true,
+                source_trim: false,
+                parameters: vec![media_core::EncoderParameter {
+                    name: "tune".into(),
+                    value: "ull".into(),
+                }],
+                ..Default::default()
+            };
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            let generated = arguments(&plan, &settings);
+            let tunes: Vec<_> = generated
+                .windows(2)
+                .filter(|pair| pair[0] == "-tune")
+                .map(|pair| pair[1].to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(tunes, ["lossless", "ull"]);
+            assert!(
+                !generated
+                    .iter()
+                    .any(|value| matches!(value.to_str(), Some("-rc" | "-qp" | "-cq" | "-b:v")))
+            );
+            let probe = hardware_probe_for_settings(&settings, 8);
+            assert!(probe.windows(2).any(|pair| pair == ["-tune", "lossless"]));
+            assert!(
+                !probe
+                    .iter()
+                    .any(|value| matches!(value.to_str(), Some("-rc" | "-qp" | "-cq" | "-b:v")))
+            );
+            assert_eq!(
+                probe
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-tune")
+                    .map(|pair| pair[1].to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["lossless", "ull"]
+            );
+            for overrides in [
+                Vec::new(),
+                vec![media_core::EncoderParameter {
+                    name: "rc".into(),
+                    value: "constqp".into(),
+                }],
+                vec![media_core::EncoderParameter {
+                    name: "tune".into(),
+                    value: "lossless".into(),
+                }],
+                vec![media_core::EncoderParameter {
+                    name: "rc".into(),
+                    value: "cbr".into(),
+                }],
+            ] {
+                let positive = EncodeSettings {
+                    crf: 23,
+                    parameters: overrides.clone(),
+                    ..settings.clone()
+                };
+                let plan =
+                    Plan::build(&document, &document.selected(&[0]).unwrap(), &positive).unwrap();
+                for program in [
+                    arguments(&plan, &positive),
+                    hardware_probe_for_settings(&positive, 8),
+                ] {
+                    assert!(program.windows(2).any(|pair| pair == ["-b:v", "0"]));
+                    assert!(program.windows(2).any(|pair| pair == ["-cq", "23"]));
+                    assert!(!program.iter().any(|value| value == "-qp"));
+                    let expected = super::super::super::parameters::arguments(&positive);
+                    for pair in expected.chunks_exact(2) {
+                        let at = program
+                            .windows(2)
+                            .position(|candidate| candidate == pair)
+                            .unwrap();
+                        let cq = program.iter().position(|value| value == "-cq").unwrap();
+                        assert!(at > cq);
+                    }
+                    assert_eq!(
+                        program.windows(2).filter(|pair| pair[0] == "-rc").count(),
+                        if overrides.first().is_some_and(|value| value.name == "rc") {
+                            1
+                        } else {
+                            0
+                        }
+                    );
+                }
+                let legacy = EncodeSettings {
+                    source_nvenc_quality: false,
+                    source_trim: false,
+                    ..positive
+                };
+                if overrides.first().is_some_and(|value| {
+                    matches!(value.value.as_str(), "constqp" | "cbr" | "lossless")
+                }) {
+                    assert!(
+                        Plan::build(&document, &document.selected(&[0]).unwrap(), &legacy).is_err()
+                    );
+                }
+            }
+            let legacy = EncodeSettings {
+                source_nvenc_quality: false,
+                source_trim: false,
+                lossless: true,
+                parameters: Vec::new(),
+                ..settings.clone()
+            };
+            let legacy_plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &legacy).unwrap();
+            let legacy = arguments(&legacy_plan, &legacy);
+            assert!(legacy.windows(2).any(|pair| pair == ["-rc", "constqp"]));
+            assert!(legacy.windows(2).any(|pair| pair == ["-qp", "0"]));
+            let mut invalid = settings;
+            invalid.constant_quantizer = Some(1);
+            assert!(Plan::build(&document, &document.selected(&[0]).unwrap(), &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn source_bitrate_and_size_defaults_precede_advanced_rc_without_quality_or_qp_inference() {
+        let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":48,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"4/1","time_base":"1/1000","start_time":"0","color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"}],"format":{"start_time":"0","duration":"60"}})).unwrap();
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            for control in [
+                media_core::VideoRateControl::Bitrate {
+                    bitrate_kbps: 512,
+                    two_pass: false,
+                },
+                media_core::VideoRateControl::TargetSizeDecimal {
+                    target_size_tenths_mb: 50,
+                },
+            ] {
+                for advanced in [
+                    Vec::new(),
+                    vec![media_core::EncoderParameter {
+                        name: "rc".into(),
+                        value: "constqp".into(),
+                    }],
+                ] {
+                    let settings = EncodeSettings {
+                        encoder,
+                        source_nvenc_quality: true,
+                        source_trim: false,
+                        crf: 0,
+                        rate_control: Some(control),
+                        parameters: advanced.clone(),
+                        ..Default::default()
+                    };
+                    let plan = Plan::build(&document, &document.selected(&[0]).unwrap(), &settings)
+                        .unwrap();
+                    let rate = super::super::super::rate_control::Rate::resolve(&settings, 60.0, 0)
+                        .unwrap()
+                        .unwrap();
+                    let mut generated = arguments(&plan, &settings);
+                    rate.arguments_for_settings(&mut generated, &settings, 1);
+                    for flag in ["-cq", "-qp", "-tune"] {
+                        assert!(!generated.iter().any(|value| value == flag));
+                    }
+                    for flag in ["-b:v", "-minrate", "-maxrate", "-bufsize"] {
+                        assert_eq!(generated.iter().filter(|value| *value == flag).count(), 1);
+                    }
+                    if advanced.is_empty() {
+                        assert!(!generated.iter().any(|value| value == "-rc"));
+                    } else {
+                        let rc = generated.iter().position(|value| value == "-rc").unwrap();
+                        let buffer = generated
+                            .iter()
+                            .position(|value| value == "-bufsize")
+                            .unwrap();
+                        assert!(rc > buffer);
+                        assert_eq!(generated[rc + 1], "constqp");
+                    }
+                    let probe = hardware_probe_for_settings(&settings, 8);
+                    assert!(!probe.iter().any(|value| value == "-cq" || value == "-qp"));
+                    if !advanced.is_empty() {
+                        assert!(probe.windows(2).any(|pair| pair == ["-rc", "constqp"]));
+                    }
+                }
+            }
+        }
+    }
+}

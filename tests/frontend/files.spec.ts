@@ -1,463 +1,98 @@
-import { expect, test, type Page } from '@playwright/test';
-import type { FolderScanResult, MediaFile, UserPreferences } from '../../src/lib/ipc/generated';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
-const videoStream = {
-  index: 0,
-  kind: 'video' as const,
-  codec: 'ffv1',
-  width: 320,
-  height: 180,
-  frameRate: '24/1',
-  sampleRate: null,
-  channels: null,
-  language: null,
-  title: null,
-};
-
-function media(id: string, path: string): MediaFile {
-  return {
-    id,
-    path,
-    name: path.split(/[\\/]/).at(-1)!,
-    sizeBytes: '1024',
-    durationSeconds: 1,
-    format: 'matroska',
-    streams: [videoStream],
-  };
-}
-
-type FilesMock = {
-  calls: { command: string; payload: Record<string, unknown> }[];
-  drop: (paths: string[]) => void;
-  dropReady: () => boolean;
-  pickFiles: (paths: string[]) => void;
-  release: (key: string) => void;
-};
-
-async function desktopMock(
-  page: Page,
-  options: {
-    files: [string, MediaFile][];
-    folders?: string[];
-    scans?: [string, FolderScanResult][];
-    pickerPaths?: string[];
-    unreadable?: string[];
-    held?: string[];
-  },
-) {
-  await page.addInitScript(
-    ({ options }) => {
-      const host = globalThis as unknown as Record<string, unknown>;
-      let pickerPaths = options.pickerPaths ?? [];
-      const knownFiles = new Map(options.files);
-      const folders = new Set(options.folders ?? []);
-      const scans = new Map(options.scans ?? []);
-      const unreadable = new Set(options.unreadable ?? []);
-      const held = new Set(options.held ?? []);
-      const waits = new Map<string, (() => void)[]>();
-      const callbacks = new Map<number, (value: unknown) => void>();
-      const calls: FilesMock['calls'] = [];
-      let nextCallback = 0;
-      let nextEvent = 0;
-      let dragDrop: ((value: unknown) => void) | undefined;
-      let prefs: UserPreferences = {
-        general: { defaultOutputDirectory: '', recursiveImport: true },
-        recentPaths: [],
-        revision: 0,
-      };
-      const wait = async (key: string) => {
-        if (held.has(key))
-          await new Promise<void>((resolve) =>
-            waits.set(key, [...(waits.get(key) ?? []), resolve]),
-          );
-      };
-      const remember = (paths: string[]) => {
-        const key = (path: string) =>
-          path
-            .replace(/^\\\\\?\\UNC\\/i, '\\\\')
-            .replace(/^\\\\\?\\/i, '')
-            .replaceAll('/', '\\')
-            .replace(/\\+$/, '')
-            .toLowerCase();
-        const seen = new Set<string>();
-        prefs = {
-          ...prefs,
-          recentPaths: [...paths, ...prefs.recentPaths]
-            .filter((path) => {
-              const normalized = key(path);
-              if (seen.has(normalized)) return false;
-              seen.add(normalized);
-              return true;
-            })
-            .slice(0, 15),
-          revision: prefs.revision + 1,
-        };
-        return structuredClone(prefs);
-      };
-      host.__filesMock = {
-        calls,
-        drop: (paths) => {
-          if (!dragDrop) throw new Error('Drag/drop listener is not ready.');
-          dragDrop({
-            event: 'tauri://drag-drop',
-            id: 1,
-            payload: { paths, position: { x: 10, y: 10 } },
-          });
-        },
-        dropReady: () => dragDrop !== undefined,
-        pickFiles: (paths) => (pickerPaths = paths),
-        release: (key) => {
-          held.delete(key);
-          waits.get(key)?.forEach((resolve) => resolve());
-          waits.delete(key);
-        },
-      } satisfies FilesMock;
-      host.isTauri = true;
-      host.__TAURI_INTERNALS__ = {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: (callback: (value: unknown) => void) => {
-          const id = ++nextCallback;
-          callbacks.set(id, callback);
-          return id;
-        },
-        unregisterCallback: (id: number) => callbacks.delete(id),
-        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          calls.push({ command, payload });
-          if (command === 'plugin:event|listen') {
-            if (payload.event === 'tauri://drag-drop')
-              dragDrop = callbacks.get(payload.handler as number);
-            return ++nextEvent;
-          }
-          if (command === 'plugin:event|unlisten') return;
-          if (command === 'plugin:dialog|open') return pickerPaths;
-          if (command === 'get_capabilities') return [];
-          if (command === 'subscribe_jobs') {
-            (payload.channel as { onmessage: (value: unknown[]) => void }).onmessage([]);
-            return;
-          }
-          if (command === 'get_completion_status')
-            return {
-              options: { notify: false, finishAction: 'none' },
-              armedJobs: 0,
-              secondsRemaining: null,
-              error: null,
-            };
-          if (command === 'get_preferences') return structuredClone(prefs);
-          if (command === 'remember_recent_media') return remember(payload.paths as string[]);
-          if (command === 'save_preferences') {
-            const request = payload.request as {
-              general: UserPreferences['general'];
-              recentPaths: string[] | null;
-            };
-            prefs = {
-              ...prefs,
-              general: request.general,
-              recentPaths: request.recentPaths ?? prefs.recentPaths,
-              revision: prefs.revision + 1,
-            };
-            return structuredClone(prefs);
-          }
-          if (command === 'recent_path_is_folder') {
-            const path = payload.path as string;
-            await wait(`classify:${path}`);
-            if (folders.has(path)) return true;
-            if (knownFiles.has(path) || unreadable.has(path)) return false;
-            throw {
-              code: 'RECENT_MEDIA_UNAVAILABLE',
-              message: 'The dropped path is unavailable.',
-              path,
-            };
-          }
-          if (command === 'scan_media_folder') {
-            const request = payload.request as { path: string };
-            await wait(`scan:${request.path}`);
-            const result = scans.get(request.path);
-            if (!result)
-              throw {
-                code: 'FOLDER_UNREADABLE',
-                message: 'The dropped folder could not be read.',
-                path: request.path,
-              };
-            return result;
-          }
-          if (command === 'probe_media') {
-            const path = payload.path as string;
-            await wait(`probe:${path}`);
-            if (unreadable.has(path))
-              throw {
-                code: 'FILE_UNREADABLE',
-                message: 'The dropped file could not be read.',
-                path,
-              };
-            const value = knownFiles.get(path);
-            if (value) return value;
-            throw { code: 'FILE_NOT_FOUND', message: 'The dropped file is unavailable.', path };
-          }
-          throw new Error(`Unexpected command: ${command}`);
-        },
-      };
+test('mixed import retains valid Unicode media, reports failures and deduplicates Windows aliases', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const canonical = 'C:\\Media Files\\café 東京.mkv';
+  const alias = 'c:\\media files\\CAFÉ 東京.MKV';
+  const shortAlias = 'C:\\MEDIAF~1\\CAFE~1.MKV';
+  const broken = 'C:\\Media Files\\broken.mkv';
+  const media = { ...source, id: 'same-canonical-media', path: canonical, name: 'café 東京.mkv' };
+  await page.evaluate(
+    ({ canonical, alias, shortAlias, broken, media }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [canonical, alias, shortAlias, broken];
+      host.__mediaByPath = { [canonical]: media, [shortAlias]: media };
+      host.__probeFailures = [broken];
     },
-    { options },
+    { canonical, alias, shortAlias, broken, media },
   );
-}
-
-async function calls(page: Page, command: string) {
-  return page.evaluate(
-    (name) =>
-      (globalThis as unknown as { __filesMock: FilesMock }).__filesMock.calls.filter(
-        (call) => call.command === name,
-      ),
-    command,
+  await page.getByRole('button', { name: 'Add Files…', exact: true }).click();
+  await expect(page.getByRole('option', { name: /café 東京.mkv/ })).toHaveCount(1);
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'Invalid media fixture.',
   );
-}
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  expect(
+    calls.filter((c: any) => c.command === 'probe_media').map((c: any) => c.payload.path),
+  ).toEqual([canonical, shortAlias, broken]);
+  await page.getByRole('button', { name: 'Load Tracks', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: /Include .*Audio/ })).toBeVisible();
+});
 
-async function drop(page: Page, paths: string[]) {
+test('copy conversion keeps colliding stream indices source-scoped and preserves reordered tracks', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const external = {
+    ...source,
+    id: 'external',
+    path: '/other/commentary.mka',
+    name: 'commentary.mka',
+    streams: [{ ...source.streams[1], title: 'External commentary' }],
+  };
+  await page.evaluate(
+    ({ first, external }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [first.path, external.path];
+      host.__mediaByPath = { [first.path]: first, [external.path]: external };
+    },
+    { first: source, external },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('option', { name: /commentary.mka/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await tracks
+    .getByRole('listbox', { name: 'Tracks' })
+    .getByRole('option', { name: /External commentary/ })
+    .click();
+  await tracks.getByRole('button', { name: 'Move track up' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await quick.getByRole('tab', { name: 'Audio' }).click();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
   await expect
     .poll(() =>
-      page.evaluate(() =>
-        (globalThis as unknown as { __filesMock: FilesMock }).__filesMock.dropReady(),
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request,
       ),
     )
-    .toBe(true);
-  await page.evaluate(
-    (value) => (globalThis as unknown as { __filesMock: FilesMock }).__filesMock.drop(value),
-    paths,
+    .toBeTruthy();
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
   );
-}
-
-async function release(page: Page, key: string) {
-  await page.evaluate(
-    (value) => (globalThis as unknown as { __filesMock: FilesMock }).__filesMock.release(value),
-    key,
+  expect(request.source).toMatchObject({ inputPath: '/media/input.mkv', streamIndices: [0, 1, 2] });
+  expect(request.settings.externalTracks).toContainEqual(
+    expect.objectContaining({ inputPath: '/other/commentary.mka', streamIndex: 1 }),
   );
-}
-
-async function pickFiles(page: Page, paths: string[]) {
-  await page.evaluate(
-    (value) => (globalThis as unknown as { __filesMock: FilesMock }).__filesMock.pickFiles(value),
-    paths,
+  const order = request.settings.trackOrder;
+  const externalPosition = order.findIndex(
+    (track: any) => track.inputPath === '/other/commentary.mka' && track.streamIndex === 1,
   );
-}
-
-test('search narrows the file list without changing the selected source or imported files', async ({
-  page,
-}) => {
-  const first = media('first', 'C:\\media\\Travel\\Coastal walk.mkv');
-  const second = media('second', 'C:\\media\\Archive\\café 東京.mkv');
-  await desktopMock(page, {
-    files: [
-      [first.path, first],
-      [second.path, second],
-    ],
-    pickerPaths: [first.path, second.path],
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  const library = page.getByRole('region', { name: 'Imported media', exact: true });
-  const inspector = page.getByRole('complementary', { name: 'Media inspector' });
-  await library.getByRole('button', { name: /^Coastal walk.mkv/ }).click();
-  const search = page.getByRole('searchbox', { name: 'Search source files' });
-  await search.fill('  ARCHIVE  ');
-  await expect(library.locator('.file-select')).toHaveCount(1);
-  await expect(library.locator('.file-select')).toContainText(second.name);
-  await expect(library.getByRole('status')).toHaveText('1 of 2 shown');
-  await expect(inspector.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
-  await search.fill('東京');
-  await expect(library.locator('.file-select')).toContainText(second.name);
-  await search.fill('no such file');
-  await expect(library.getByText('No matching files', { exact: true })).toBeVisible();
-  await expect(library.locator('.file-select')).toHaveCount(0);
-  await library.getByRole('button', { name: 'Clear search', exact: true }).focus();
-  await page.keyboard.press('Enter');
-  await expect(search).toHaveValue('');
-  await expect(library.locator('.file-select')).toHaveCount(2);
-  await expect(library.getByRole('button', { name: /^Coastal walk.mkv/ })).toHaveAttribute(
-    'aria-pressed',
-    'true',
+  const subtitlePosition = order.findIndex(
+    (track: any) => !track.inputPath && track.streamIndex === 2,
   );
-  await search.fill('archive');
-  await page.getByRole('button', { name: 'Convert a file', exact: false }).click();
-  await expect(
-    page
-      .getByRole('region', { name: 'Quick Convert workspace', exact: true })
-      .locator('.output-source'),
-  ).toContainText(first.name);
-  await page.getByRole('button', { name: /^Files/ }).click();
-  await expect(search).toHaveValue('archive');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(search).toHaveValue('');
-  await expect(library.locator('.file-select')).toHaveCount(2);
-});
-
-test('mixed file and folder drops scan folders, retain per-entry errors, and preserve long Unicode paths', async ({
-  page,
-}) => {
-  const firstFolder = 'C:\\drop\\set-a';
-  const secondFolder = 'C:\\drop\\set-b';
-  const firstNested = 'C:\\drop\\set-a\\Episode 01.mkv';
-  const secondNested = 'C:\\drop\\set-b\\Episode 02.mkv';
-  const longUnicode = `C:\\drop\\${'非常に長い名前'.repeat(40)}\\café 東京.mkv`;
-  const unreadable = 'C:\\drop\\unreadable.mkv';
-  await desktopMock(page, {
-    files: [
-      [firstNested, media('episode-1', firstNested)],
-      [secondNested, media('episode-2', secondNested)],
-      [longUnicode, media('unicode-long', longUnicode)],
-    ],
-    folders: [firstFolder, secondFolder],
-    scans: [
-      [firstFolder, { paths: [firstNested], errors: [], skippedCount: 0, truncated: false }],
-      [
-        secondFolder,
-        {
-          paths: [secondNested],
-          errors: [
-            {
-              code: 'FOLDER_ENTRY_UNREADABLE',
-              message: 'A protected child could not be read.',
-              path: `${secondFolder}\\protected`,
-            },
-          ],
-          skippedCount: 1,
-          truncated: false,
-        },
-      ],
-    ],
-    unreadable: [unreadable],
-  });
-  await page.goto('/');
-  await drop(page, [firstFolder, longUnicode, secondFolder, unreadable]);
-
-  await expect(page.getByRole('button', { name: 'Files 3', exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Episode 02.mkv', exact: true })).toBeVisible();
-  await expect(page.getByRole('alert')).toContainText('A protected child could not be read.');
-  await expect(page.getByRole('alert')).toContainText('The dropped file could not be read.');
-  expect((await calls(page, 'scan_media_folder')).map((call) => call.payload.request)).toEqual([
-    { path: firstFolder, recursive: true },
-    { path: secondFolder, recursive: true },
-  ]);
-  expect((await calls(page, 'probe_media')).map((call) => call.payload.path)).toContain(
-    longUnicode,
-  );
-  const remembered = (await calls(page, 'remember_recent_media')).at(-1)!.payload.paths as string[];
-  expect(remembered.slice(0, 2)).toEqual([firstFolder, secondFolder]);
-  expect(remembered).toContain(longUnicode);
-});
-
-test('Windows spelling aliases are queued once and canonical media identity deduplicates short aliases', async ({
-  page,
-}) => {
-  const canonical = 'C:\\Media Files\\Café 東京.mkv';
-  const caseAlias = 'c:\\media files\\CAFÉ 東京.MKV';
-  const verbatimAlias = '\\\\?\\C:\\MEDIA FILES\\CAFÉ 東京.MKV';
-  const shortAlias = 'C:\\MEDIAF~1\\CAFÉ東~1.MKV';
-  const value = media('canonical-media-id', canonical);
-  await desktopMock(page, {
-    files: [
-      [canonical, value],
-      [caseAlias, value],
-      [verbatimAlias, value],
-      [shortAlias, value],
-    ],
-    pickerPaths: [canonical, caseAlias, verbatimAlias, shortAlias],
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-
-  await expect(page.getByRole('button', { name: 'Files 1', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Remove Café 東京.mkv', exact: true })).toHaveCount(
-    1,
-  );
-  expect((await calls(page, 'probe_media')).map((call) => call.payload.path)).toEqual([
-    canonical,
-    shortAlias,
-  ]);
-});
-
-test('stopping a dropped folder scan suppresses its late result and restores import controls', async ({
-  page,
-}) => {
-  const folder = 'C:\\drop\\slow-folder';
-  const nested = `${folder}\\Episode.mkv`;
-  await desktopMock(page, {
-    files: [[nested, media('slow-episode', nested)]],
-    folders: [folder],
-    scans: [[folder, { paths: [nested], errors: [], skippedCount: 0, truncated: false }]],
-    held: [`scan:${folder}`],
-  });
-  await page.goto('/');
-  await drop(page, [folder]);
-  await expect.poll(() => calls(page, 'scan_media_folder').then((value) => value.length)).toBe(1);
-  await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-  await release(page, `scan:${folder}`);
-
-  await expect(page.getByText(/Stopped importing. Completed files are kept/)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Add folder', exact: true })).toBeEnabled();
-  expect(await calls(page, 'probe_media')).toHaveLength(0);
-  expect(await calls(page, 'remember_recent_media')).toHaveLength(0);
-});
-
-test('stopping during dropped-file classification never starts its probe after the classifier settles', async ({
-  page,
-}) => {
-  const stopped = 'C:\\drop\\stopped.mkv';
-  const replacement = 'C:\\drop\\replacement.mkv';
-  await desktopMock(page, {
-    files: [
-      [stopped, media('stopped', stopped)],
-      [replacement, media('replacement', replacement)],
-    ],
-    pickerPaths: [replacement],
-    held: [`classify:${stopped}`],
-  });
-  await page.goto('/');
-  await drop(page, [stopped]);
-  await expect
-    .poll(() => calls(page, 'recent_path_is_folder').then((value) => value.length))
-    .toBe(1);
-  await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'replacement.mkv', exact: true })).toBeVisible();
-  await release(page, `classify:${stopped}`);
-
-  await expect.poll(() => calls(page, 'probe_media').then((value) => value.length)).toBe(1);
-  expect((await calls(page, 'probe_media')).map((call) => call.payload.path)).toEqual([
-    replacement,
-  ]);
-  await expect(page.getByRole('button', { name: 'Files 1', exact: true })).toBeVisible();
-});
-
-test('a stopped slow probe cannot reorder completed paths above a newer import in recents', async ({
-  page,
-}) => {
-  const completed = 'C:\\drop\\completed-before-stop.mkv';
-  const stopped = 'C:\\drop\\stopped-late.mkv';
-  const replacement = 'C:\\drop\\newer.mkv';
-  await desktopMock(page, {
-    files: [
-      [completed, media('completed', completed)],
-      [stopped, media('stopped', stopped)],
-      [replacement, media('replacement', replacement)],
-    ],
-    pickerPaths: [completed, stopped],
-    held: [`probe:${stopped}`],
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect.poll(() => calls(page, 'probe_media').then((value) => value.length)).toBe(2);
-  await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-  await pickFiles(page, [replacement]);
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: 'newer.mkv', exact: true })).toBeVisible();
-  await release(page, `probe:${stopped}`);
-
-  await expect
-    .poll(() => calls(page, 'remember_recent_media').then((value) => value.length))
-    .toBe(2);
-  const recentOptions = page.getByLabel('Recent media', { exact: true }).locator('option');
-  await expect(recentOptions).toHaveCount(3);
-  await expect(recentOptions.nth(1)).toHaveText(replacement);
-  await expect(recentOptions.nth(2)).toHaveText(completed);
-  await expect(page.getByRole('button', { name: 'Files 2', exact: true })).toBeVisible();
-  await expect(page.getByText('stopped-late.mkv', { exact: true })).toHaveCount(0);
+  expect(externalPosition).toBeGreaterThanOrEqual(0);
+  expect(subtitlePosition).toBeGreaterThanOrEqual(0);
+  expect(externalPosition).toBeLessThan(subtitlePosition);
 });

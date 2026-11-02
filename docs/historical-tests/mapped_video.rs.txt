@@ -1,0 +1,732 @@
+//! Additional Quick NVENC pictures are encoded at their original map positions.
+//! The first picture retains the existing prepared/verified encoder pipeline.
+use super::*;
+use sha2::{Digest, Sha256};
+
+pub(super) enum ExtraEncoding<'a> {
+    Copy,
+    Encode(Option<&'a rate_control::Rate>),
+}
+
+pub(super) fn enabled(settings: &EncodeSettings) -> bool {
+    settings.backend == media_core::EncodeBackend::Standalone
+        && matches!(
+            settings.encoder,
+            VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
+        )
+}
+pub(super) fn indices(
+    selected: &[&metadata::Stream],
+    plan: &Plan,
+    settings: &EncodeSettings,
+) -> Vec<u32> {
+    if !enabled(settings) {
+        return Vec::new();
+    }
+    selected
+        .iter()
+        .filter(|stream| {
+            stream.codec_type.as_deref() == Some("video") && stream.index != plan.video_index
+        })
+        .map(|stream| stream.index)
+        .collect()
+}
+pub(super) fn validate_selection(
+    selected: &[&metadata::Stream],
+    plan: &Plan,
+    settings: &EncodeSettings,
+) -> Result<(), AppError> {
+    if !enabled(settings) {
+        return Ok(());
+    }
+    if selected
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .is_none_or(|stream| stream.index != plan.video_index)
+    {
+        return Err(AppError::new(
+            "STREAM_SELECTION_INVALID",
+            "The first mapped video must own the picture settings for this Quick NVENC run.",
+            None,
+        ));
+    }
+    for stream in selected
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+    {
+        dimensions(stream)?;
+    }
+    Ok(())
+}
+fn dimensions(stream: &metadata::Stream) -> Result<(u32, u32), AppError> {
+    match (stream.width, stream.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Ok((width, height)),
+        _ => Err(AppError::new(
+            "ENCODE_INPUT_UNSUPPORTED",
+            "A mapped video has no usable dimensions.",
+            None,
+        )),
+    }
+}
+pub(super) fn specs<'a>(
+    selected: &[&metadata::Stream],
+    plan: &'a Plan,
+    settings: &EncodeSettings,
+) -> Result<Vec<metadata::EncodedVideo<'a>>, AppError> {
+    let mut result = vec![metadata::EncodedVideo {
+        index: plan.video_index,
+        codec: plan.output_codec(),
+        dimensions: (plan.width, plan.height),
+    }];
+    for stream in selected.iter().filter(|stream| {
+        enabled(settings)
+            && stream.codec_type.as_deref() == Some("video")
+            && stream.index != plan.video_index
+    }) {
+        result.push(metadata::EncodedVideo {
+            index: stream.index,
+            codec: plan.output_codec(),
+            dimensions: dimensions(stream)?,
+        });
+    }
+    Ok(result)
+}
+
+pub(super) fn append(
+    args: &mut Vec<OsString>,
+    selected: &[&metadata::Stream],
+    plan: &Plan,
+    settings: &EncodeSettings,
+    mode: ExtraEncoding<'_>,
+) {
+    let ExtraEncoding::Encode(rate) = mode else {
+        return;
+    };
+    if !enabled(settings) {
+        return;
+    }
+    let mut options = ffmpeg_video::arguments(plan, settings);
+    if let Some(rate) = rate {
+        rate.arguments_for_settings(&mut options, settings, 1);
+    }
+    append_options(args, selected, plan, &options);
+}
+fn append_options(
+    args: &mut Vec<OsString>,
+    selected: &[&metadata::Stream],
+    plan: &Plan,
+    options: &[OsString],
+) {
+    let start = options
+        .iter()
+        .position(|value| value == "-c:v")
+        .expect("encoder codec option");
+    let mut video_ordinal = 0;
+    let mut encoded = false;
+    for stream in selected {
+        if stream.codec_type.as_deref() != Some("video") {
+            continue;
+        }
+        if stream.index != plan.video_index {
+            let mut at = start;
+            while at + 1 < options.len() {
+                let key = options[at].to_str().expect("generated encoder option");
+                if key == "-nostats" {
+                    at += 1;
+                    continue;
+                }
+                let value = options[at + 1].clone();
+                if !matches!(
+                    key,
+                    "-vf"
+                        | "-color_primaries"
+                        | "-color_trc"
+                        | "-colorspace"
+                        | "-color_range"
+                        | "-chroma_sample_location"
+                        | "-avoid_negative_ts"
+                        | "-progress"
+                        | "-f"
+                ) {
+                    let key = if key.ends_with(":v") {
+                        format!("{key}:{video_ordinal}")
+                    } else {
+                        format!("{key}:v:{video_ordinal}")
+                    };
+                    args.extend([key.into(), value]);
+                }
+                at += 2;
+            }
+            args.extend([
+                format!("-enc_time_base:v:{video_ordinal}").into(),
+                stream.time_base.as_deref().unwrap_or("0").into(),
+            ]);
+            let mut filter = String::new();
+            if let Some(trim) = plan.trim {
+                let (start, end) = if let Some(time) = trim.time {
+                    (
+                        f64::from(time.start_milliseconds) / 1000.0,
+                        f64::from(time.end_milliseconds) / 1000.0,
+                    )
+                } else {
+                    (
+                        f64::from(trim.start_frame) * plan.frame_seconds(),
+                        f64::from(trim.end_frame_exclusive) * plan.frame_seconds(),
+                    )
+                };
+                filter = format!("trim=start={start:.9}:end={end:.9},setpts=PTS-{start:.9}/TB,");
+            }
+            filter.push_str(&format!("format={}", ffmpeg_video::output_format(plan)));
+            args.extend([format!("-filter:v:{video_ordinal}").into(), filter.into()]);
+            encoded = true;
+        }
+        video_ordinal += 1;
+    }
+    if encoded {
+        args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FrameStamp {
+    best_effort_timestamp_time: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    pix_fmt: Option<String>,
+}
+struct Clock {
+    count: u64,
+    digest: [u8; 32],
+    start: f64,
+}
+fn canonical_pixel(value: &str) -> &str {
+    match value {
+        "yuvj420p" => "yuv420p",
+        "yuvj422p" => "yuv422p",
+        "yuvj444p" => "yuv444p",
+        "p010le" => "yuv420p10le",
+        other => other,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn clock(
+    ffprobe: &Path,
+    path: &Path,
+    index: u32,
+    dimensions: (u32, u32),
+    pixel: Option<&str>,
+    tick: f64,
+    offset: f64,
+    interval: Option<(f64, f64)>,
+    origin: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Clock, AppError> {
+    let spec = CommandSpec {
+        executable: ffprobe.to_owned(),
+        args: [
+            "-v",
+            "error",
+            "-err_detect",
+            "explode",
+            "-protocol_whitelist",
+            "file",
+            "-select_streams",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([index.to_string().into()])
+        .chain(
+            [
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time,width,height,pix_fmt",
+                "-of",
+                "json",
+                "-i",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .chain([path.as_os_str().to_owned()])
+        .collect(),
+        cwd: None,
+    };
+    let wanted = pixel.map(str::to_owned);
+    let output = supervisor::run_streaming_stdout(
+        &spec,
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(86400),
+        move |reader| {
+            let mut count = 0_u64;
+            let mut hash = Sha256::new();
+            let mut failure = None;
+            let mut previous = None;
+            let mut first = None;
+            frame_scan::parse::<FrameStamp>(reader, |frame| {
+                if failure.is_some() {
+                    return;
+                }
+                let Some(time) = frame
+                    .best_effort_timestamp_time
+                    .as_deref()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite())
+                else {
+                    failure =
+                        Some("A mapped video frame has no finite decoded timestamp.".to_owned());
+                    return;
+                };
+                if (frame.width, frame.height) != (Some(dimensions.0), Some(dimensions.1)) {
+                    failure = Some("A mapped video changed dimensions.".into());
+                    return;
+                }
+                if wanted.as_deref().is_some_and(|wanted| {
+                    frame
+                        .pix_fmt
+                        .as_deref()
+                        .is_none_or(|actual| canonical_pixel(actual) != canonical_pixel(wanted))
+                }) {
+                    failure =
+                        Some("A mapped video changed the selected pixel format/depth.".into());
+                    return;
+                }
+                let mut time = time + offset;
+                if let Some((start, end)) = interval {
+                    if time < start - 0.0000005 || time >= end - 0.0000005 {
+                        return;
+                    }
+                    time -= start;
+                }
+                time += origin;
+                if previous.is_some_and(|previous| time <= previous) {
+                    failure = Some("A mapped video has unordered decoded timestamps.".into());
+                    return;
+                }
+                previous = Some(time);
+                let ticks = (time / tick).round();
+                if !ticks.is_finite() || ticks < i64::MIN as f64 || ticks > i64::MAX as f64 {
+                    failure = Some("A mapped video timestamp exceeds its validated clock.".into());
+                    return;
+                }
+                first.get_or_insert(time);
+                hash.update((ticks as i64).to_le_bytes());
+                count += 1;
+            })?;
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            if count == 0 {
+                return Err("A mapped video has no decoded frames in the chosen interval.".into());
+            }
+            Ok(Clock {
+                count,
+                digest: hash.finalize().into(),
+                start: first.expect("decoded frame"),
+            })
+        },
+    )
+    .await
+    .map_err(|cause| process_error(cause, path))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(files::error(
+            "ENCODE_VALIDATION_FAILED",
+            "An additional mapped video did not decode completely without errors.",
+            path,
+        ));
+    }
+    Ok(output.value)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn verify(
+    ffprobe: &Path,
+    source: &Path,
+    output: &Path,
+    selected: &[&metadata::Stream],
+    artifact: &mut Document,
+    plan: &Plan,
+    settings: &EncodeSettings,
+    external: &external_tracks::ExternalTracks,
+    expected: &mut Document,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    for (position, stream) in selected.iter().enumerate().filter(|(_, stream)| {
+        enabled(settings)
+            && stream.codec_type.as_deref() == Some("video")
+            && stream.index != plan.video_index
+    }) {
+        let actual = artifact.streams.get(position).ok_or_else(|| {
+            files::error(
+                "ENCODE_VALIDATION_FAILED",
+                "An additional mapped video is absent.",
+                output,
+            )
+        })?;
+        let tick = actual
+            .time_base
+            .as_deref()
+            .and_then(|value| value.split_once('/'))
+            .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                files::error(
+                    "ENCODE_VALIDATION_FAILED",
+                    "An additional mapped video has no usable output time base.",
+                    output,
+                )
+            })?;
+        let (input, original) = external
+            .audio_source(stream.index)
+            .unwrap_or((source, *stream));
+        let interval = plan.trim.map(|trim| {
+            if let Some(time) = trim.time {
+                (
+                    f64::from(time.start_milliseconds) / 1000.0,
+                    f64::from(time.end_milliseconds) / 1000.0,
+                )
+            } else {
+                (
+                    f64::from(trim.start_frame) * plan.frame_seconds(),
+                    f64::from(trim.end_frame_exclusive) * plan.frame_seconds(),
+                )
+            }
+        });
+        let dimensions = (
+            stream.width.ok_or_else(|| {
+                files::error(
+                    "ENCODE_INPUT_UNSUPPORTED",
+                    "An additional video has no width.",
+                    input,
+                )
+            })?,
+            stream.height.ok_or_else(|| {
+                files::error(
+                    "ENCODE_INPUT_UNSUPPORTED",
+                    "An additional video has no height.",
+                    input,
+                )
+            })?,
+        );
+        let before = Box::pin(clock(
+            ffprobe,
+            input,
+            original.index,
+            dimensions,
+            None,
+            tick,
+            external.offset_seconds(stream.index),
+            interval,
+            plan.output_origin,
+            cancel,
+        ))
+        .await?;
+        let after = Box::pin(clock(
+            ffprobe,
+            output,
+            position as u32,
+            dimensions,
+            Some(plan.output_pixel_format),
+            tick,
+            0.0,
+            None,
+            0.0,
+            cancel,
+        ))
+        .await?;
+        if before.count != after.count || before.digest != after.digest {
+            return Err(files::error(
+                "ENCODE_VALIDATION_FAILED",
+                "An additional mapped video changed frame count or decoded timestamps/offset.",
+                output,
+            ));
+        }
+        artifact.streams[position].packet_start_time = Some(after.start);
+        let expected = expected
+            .streams
+            .iter_mut()
+            .find(|candidate| candidate.index == stream.index)
+            .expect("selected mapped stream");
+        expected.packet_start_time = Some(before.start);
+        expected.start_time = Some(before.start.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn run(tool: &Path, args: &[OsString]) {
+        let output = std::process::Command::new(tool)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires FFmpeg/FFprobe and CPU libx264; no NVIDIA execution is claimed"]
+    async fn production_scoped_mux_keeps_first_packets_and_validates_every_extra_frame_and_offset()
+    {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-artifacts/source-command-edit")
+            .join(format!("mapped-mux-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ffmpeg =
+            PathBuf::from(std::env::var_os("JESSES_FFMPEG").unwrap_or_else(|| "ffmpeg".into()));
+        let ffprobe =
+            PathBuf::from(std::env::var_os("JESSES_FFPROBE").unwrap_or_else(|| "ffprobe".into()));
+        let source_path = root.join("source.mkv");
+        let external_path = root.join("external.mkv");
+        let values = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let mut args = values(&[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=4:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=96x64:rate=5:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=1",
+            "-map",
+            "0:v",
+            "-map",
+            "1:v",
+            "-map",
+            "2:a",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "-threads",
+            "1",
+            "-y",
+        ]);
+        args.push(source_path.as_os_str().to_owned());
+        run(&ffmpeg, &args);
+        let mut args = values(&[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=80x48:rate=4:duration=1",
+            "-c:v",
+            "ffv1",
+            "-threads",
+            "1",
+            "-y",
+        ]);
+        args.push(external_path.as_os_str().to_owned());
+        run(&ffmpeg, &args);
+        let (_owner, cancel) = watch::channel(false);
+        let document = probe(&ffprobe, &source_path, &cancel, Some(&[0, 1, 2]))
+            .await
+            .unwrap();
+        let path = external_path.to_string_lossy().into_owned();
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::H264Nvenc,
+            source_nvenc_quality: true,
+            crf: 22,
+            preset: 0,
+            external_tracks: vec![media_core::ExternalTrack {
+                input_path: path.clone(),
+                stream_index: 0,
+                offset_milliseconds: 250,
+                title: Some("外部".into()),
+                language: Some("fra".into()),
+                audio: None,
+                subtitle_mode: None,
+                subtitle_burn_in: false,
+                default: None,
+                forced: None,
+            }],
+            track_order: vec![
+                media_core::EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 2,
+                },
+                media_core::EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 0,
+                },
+                media_core::EncodeTrackRef {
+                    input_path: Some(path),
+                    stream_index: 0,
+                },
+                media_core::EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 1,
+                },
+            ],
+            framing: media_core::VideoFraming {
+                crop: media_core::CropSettings {
+                    left: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let request = RemuxRequest {
+            input_path: source_path.to_string_lossy().into_owned(),
+            output_path: root.join("output.mkv").to_string_lossy().into_owned(),
+            stream_indices: vec![0, 1, 2],
+        };
+        let source = Source::open(Path::new(&request.input_path)).unwrap();
+        let external = external_tracks::ExternalTracks::prepare(
+            &source, &request, &settings, &document, &ffprobe, &cancel,
+        )
+        .await
+        .unwrap();
+        let mut expected = external.extend_document(&document, &settings);
+        let indices = external
+            .output_indices(&document, request.stream_indices.clone(), &settings)
+            .unwrap();
+        let before_document = expected.clone();
+        let selected = before_document.selected(&indices).unwrap();
+        let plan = Plan::build(
+            &document,
+            &document.selected(&request.stream_indices).unwrap(),
+            &settings,
+        )
+        .unwrap();
+        validate_selection(&selected, &plan, &settings).unwrap();
+        let intermediate = root.join("first.mkv");
+        let mut args = values(&["-v", "error", "-i"]);
+        args.push(source_path.as_os_str().to_owned());
+        args.extend(values(&[
+            "-map",
+            "0:0",
+            "-vf",
+            "crop=32:48:32:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-bf",
+            "0",
+            "-y",
+        ]));
+        args.push(intermediate.as_os_str().to_owned());
+        run(&ffmpeg, &args);
+        let output = root.join("output.mkv");
+        let mut args = mux_args(
+            &source_path,
+            &intermediate,
+            &output,
+            &selected,
+            &plan,
+            &settings,
+            &external,
+            ExtraEncoding::Encode(None),
+        );
+        // Only this test substitutes a software codec. Production has no fallback.
+        for value in &mut args {
+            if value == "h264_nvenc" {
+                *value = "libx264".into();
+            } else if value == "p1" {
+                *value = "ultrafast".into();
+            } else if let Some(text) = value.to_str().filter(|v| v.starts_with("-cq:v:")) {
+                *value = text.replacen("-cq", "-crf", 1).into();
+            }
+        }
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "copy"));
+        assert!(!args.iter().any(|arg| arg == "-c:v:0"));
+        run(&ffmpeg, &args);
+        let mut artifact = probe(&ffprobe, &output, &cancel, None).await.unwrap();
+        verify(
+            &ffprobe,
+            &source_path,
+            &output,
+            &selected,
+            &mut artifact,
+            &plan,
+            &settings,
+            &external,
+            &mut expected,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let selected = expected.selected(&indices).unwrap();
+        metadata::verify_encoded_videos(
+            &expected,
+            &selected,
+            &artifact,
+            &specs(&selected, &plan, &settings).unwrap(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        super::super::super::mux::verify_shifted_packets(
+            &ffprobe,
+            &intermediate,
+            0,
+            &output,
+            1,
+            0.0,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                artifact.streams[1].width,
+                artifact.streams[2].width,
+                artifact.streams[3].width
+            ),
+            (Some(32), Some(80), Some(96))
+        );
+        // Reusing a wrong source offset or stale dimensions must fail the full
+        // frame validator even though all files remain decodable H.264.
+        let mut wrong = expected.clone();
+        let wrong_selected = wrong.selected(&indices).unwrap();
+        let mut shifted_plan = plan.clone();
+        shifted_plan.output_origin = 0.1;
+        assert!(verify(
+            &ffprobe,
+            &source_path,
+            &output,
+            &wrong_selected,
+            &mut artifact,
+            &shifted_plan,
+            &settings,
+            &external,
+            &mut expected,
+            &cancel
+        )
+        .await
+        .is_err());
+        wrong.streams[1].width = Some(88);
+        let wrong_selected = wrong.selected(&indices).unwrap();
+        assert!(verify(
+            &ffprobe,
+            &source_path,
+            &output,
+            &wrong_selected,
+            &mut artifact,
+            &plan,
+            &settings,
+            &external,
+            &mut expected,
+            &cancel
+        )
+        .await
+        .is_err());
+        external.verify().unwrap();
+        source.verify().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

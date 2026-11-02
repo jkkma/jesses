@@ -1,269 +1,402 @@
-import { expect, test, type Page } from '@playwright/test';
-import type { JobSnapshot, MediaFile, MediaStream, MuxRequest } from '../../src/lib/ipc/generated';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture } from './helpers/source-encode-fixture';
 
-function stream(index: number, kind: string, title: string | null): MediaStream {
-  return {
-    index,
-    kind,
-    codec:
-      kind === 'video'
-        ? 'ffv1'
-        : kind === 'audio'
-          ? 'flac'
-          : kind === 'subtitle'
-            ? 'subrip'
-            : 'ttf',
-    width: kind === 'video' ? 320 : null,
-    height: kind === 'video' ? 180 : null,
-    frameRate: kind === 'video' ? '24/1' : null,
-    sampleRate: kind === 'audio' ? 48000 : null,
-    channels: kind === 'audio' ? 2 : null,
-    language: kind === 'audio' ? 'eng' : null,
-    title,
-  };
-}
-const media: MediaFile[] = [
-  {
+test('selected tracks with colliding indices retain independent metadata, order and source owners', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const first = {
     id: 'picture',
-    path: 'C:\\media\\picture.mkv',
+    path: '/media/picture.mkv',
     name: 'picture.mkv',
-    sizeBytes: '10000',
+    sizeBytes: '1000',
     durationSeconds: 12,
     format: 'matroska',
-    streams: [stream(0, 'video', 'Picture'), stream(8, 'attachment', 'Font')],
-  },
-  {
+    streams: [
+      {
+        index: 0,
+        kind: 'video',
+        codec: 'h264',
+        width: 640,
+        height: 360,
+        frameRate: '24/1',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: 'Picture',
+      },
+    ],
+  };
+  const second = {
     id: 'sound',
-    path: "C:\\media\\音声's $.mka",
-    name: "音声's $.mka",
-    sizeBytes: '2000',
+    path: '/media/voice.mka',
+    name: 'voice.mka',
+    sizeBytes: '1000',
     durationSeconds: 12,
     format: 'matroska',
-    streams: [stream(0, 'audio', 'Original sound')],
-  },
-  {
-    id: 'captions',
-    path: 'C:\\media\\captions.srt',
-    name: 'captions.srt',
-    sizeBytes: '300',
-    durationSeconds: 12,
-    format: 'srt',
-    streams: [stream(0, 'subtitle', null)],
-  },
-];
-type Call = { command: string; payload: Record<string, unknown> };
-type Mock = { calls: Call[]; fail: (value: boolean) => void };
-async function setup(page: Page, options: { terminalReply?: boolean } = {}) {
-  await page.addInitScript(
-    ({ media, terminalReply }) => {
-      const state = globalThis as unknown as Record<string, unknown>;
-      let callback = 0;
-      const calls: Call[] = [];
-      let fail = false;
-      let jobs: JobSnapshot[] = [];
-      let channel: { onmessage: (jobs: JobSnapshot[]) => void } | undefined;
-      state.__muxMock = {
-        calls,
-        fail: (value) => {
-          fail = value;
-        },
-      } satisfies Mock;
-      state.isTauri = true;
-      state.__TAURI_INTERNALS__ = {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: () => ++callback,
-        unregisterCallback: () => {},
-        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          calls.push({
-            command,
-            payload: structuredClone(command === 'subscribe_jobs' ? {} : payload),
-          });
-          if (command.startsWith('plugin:event|')) return ++callback;
-          if (command === 'get_capabilities')
-            return ['ffmpeg', 'ffprobe'].map((id) => ({
-              id,
-              name: id,
-              available: true,
-              path: `C:\\tools\\${id}.exe`,
-              version: 'fixture',
-              detail: null,
-            }));
-          if (command === 'plugin:dialog|open') return media.map((file) => file.path);
-          if (command === 'plugin:dialog|save') return "C:\\exports\\combined's $.mkv";
-          if (command === 'probe_media') return media.find((file) => file.path === payload.path);
-          if (command === 'list_jobs') return jobs;
-          if (command === 'subscribe_jobs') {
-            channel = payload.channel as typeof channel;
-            channel?.onmessage(jobs);
-            return;
-          }
-          if (command === 'start_mux') {
-            if (fail)
-              throw {
-                code: 'OUTPUT_EXISTS',
-                message: 'Choose a destination that does not exist.',
-                path: null,
-              };
-            const request = structuredClone(payload.request) as MuxRequest;
-            const first = request.tracks[0].sourceId;
-            const job: JobSnapshot = {
-              id: `mux-${jobs.length + 1}`,
-              state: 'succeeded',
-              request: {
-                inputPath: request.sources.find((source) => source.id === first)!.inputPath,
-                outputPath: request.outputPath,
-                streamIndices: request.tracks
-                  .filter((track) => track.sourceId === first)
-                  .map((track) => track.streamIndex),
-              },
-              muxRequest: request,
-              encodeSettings: null,
-              progressSeconds: 12,
-              durationSeconds: 12,
-              logs: ['Verified all packet payloads.'],
-              error: null,
-              recovery: null,
-              logPath: null,
-            };
-            jobs = [job, ...jobs];
-            channel?.onmessage(jobs);
-            return terminalReply ? { ...job, state: 'queued' } : job;
-          }
-          if (command === 'get_completion_status')
-            return {
-              options: { notify: false, finishAction: 'none' },
-              armedJobs: 0,
-              secondsRemaining: null,
-              error: null,
-            };
-          throw new Error(`Unexpected command ${command}`);
-        },
-      };
+    streams: [
+      {
+        index: 0,
+        kind: 'audio',
+        codec: 'aac',
+        width: null,
+        height: null,
+        frameRate: null,
+        sampleRate: 48000,
+        channels: 2,
+        language: 'eng',
+        title: 'Voice',
+      },
+    ],
+  };
+  await page.evaluate(
+    ({ first, second }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [first.path, second.path];
+      host.__mediaByPath = { [first.path]: first, [second.path]: second };
     },
-    { media, terminalReply: options.terminalReply ?? false },
+    { first, second },
   );
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: media[2].name, exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Remux', exact: true }).click();
-  await page.getByLabel('Combine tracks from multiple files').check();
-}
-async function submitted(page: Page) {
-  return page.evaluate(() =>
-    (globalThis as unknown as { __muxMock: Mock }).__muxMock.calls
-      .filter((call) => call.command === 'start_mux')
-      .map((call) => call.payload.request as MuxRequest),
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /picture.mkv/ }).click();
+  await page.getByRole('option', { name: /voice.mka/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await tracks
+    .getByRole('listbox', { name: 'Tracks' })
+    .getByRole('option', { name: /Voice/ })
+    .click();
+  await tracks.getByRole('button', { name: 'Move track up' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await quick.getByRole('tab', { name: 'Audio' }).click();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick.getByLabel('Copy Metadata From').selectOption('/media/voice.mka');
+  await quick.getByLabel('Copy Chapters From').selectOption('/media/picture.mkv');
+  const voice = quick.getByRole('row').filter({ hasText: 'voice.mka #0' });
+  await voice.getByLabel('Title for track 0').fill("Dub's ${title} 日本語");
+  await voice.getByLabel('Language for track 0').fill('spa');
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/combined');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request,
+      ),
+    )
+    .toBeTruthy();
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
   );
-}
-
-test('combined remux maps colliding stream indices by source, preserves order and saves independent owners and edits', async ({
-  page,
-}) => {
-  await setup(page, { terminalReply: true });
-  // The first imported source initializes the independent combined draft.
-  await expect(page.getByLabel('Use source picture.mkv')).toBeChecked();
-  await expect(page.getByLabel(`Use source ${media[1].name}`)).not.toBeChecked();
-  await page.getByLabel(`Use source ${media[1].name}`).check();
-  await page.getByLabel('Use source captions.srt').check();
-  await page
-    .getByLabel(`Title for ${media[1].name} #0`, { exact: true })
-    .fill("Dub's ${title} 日本語");
-  await page.getByLabel(`Language for ${media[1].name} #0`, { exact: true }).fill('spa');
-  await page.getByLabel(`Default for ${media[1].name} #0`, { exact: true }).selectOption('yes');
-  await page.getByLabel('Forced for captions.srt #0', { exact: true }).selectOption('yes');
-  await page.getByRole('button', { name: `Move ${media[1].name} #0 up`, exact: true }).click();
-  await page.getByLabel('Container metadata from').selectOption('sound');
-  await page.getByLabel('Chapters from').selectOption('picture');
-  await page.getByRole('button', { name: 'Choose combined destination', exact: true }).click();
-  await page.getByRole('button', { name: 'Start combined remux', exact: true }).click();
-  await expect(page.getByText('Succeeded', { exact: true })).toBeVisible();
-  const [request] = await submitted(page);
-  expect(request.sources.map((source) => source.id)).toEqual(['picture', 'sound', 'captions']);
-  expect(request.tracks.map((track) => [track.sourceId, track.streamIndex])).toEqual([
-    ['sound', 0],
-    ['picture', 0],
-    ['captions', 0],
-    ['picture', 8],
+  expect(request.source).toMatchObject({
+    inputPath: '/media/picture.mkv',
+    outputPath: '/media/combined.mkv',
+    streamIndices: [0],
+  });
+  expect(request.settings.externalTracks).toContainEqual(
+    expect.objectContaining({
+      inputPath: '/media/voice.mka',
+      streamIndex: 0,
+      title: "Dub's ${title} 日本語",
+      language: 'spa',
+    }),
+  );
+  expect(request.settings.trackOrder).toEqual([
+    { inputPath: '/media/voice.mka', streamIndex: 0 },
+    { streamIndex: 0 },
   ]);
-  expect(request.tracks[0]).toEqual({
-    sourceId: 'sound',
-    streamIndex: 0,
-    title: "Dub's ${title} 日本語",
-    language: 'spa',
-    default: true,
-    forced: null,
+  expect(request.settings).toMatchObject({
+    metadataSourcePath: '/media/voice.mka',
+    chaptersSourcePath: '/media/picture.mkv',
   });
-  expect(request.tracks[2].forced).toBe(true);
-  expect(request).toMatchObject({
-    metadataSourceId: 'sound',
-    chaptersSourceId: 'picture',
-    outputPath: "C:\\exports\\combined's $.mkv",
-  });
-  await page.getByLabel(`Title for ${media[1].name} #0`, { exact: true }).fill('Second draft');
-  await page.getByLabel('Combined destination').fill('C:\\exports\\second.mkv');
-  await page.getByRole('button', { name: 'Start combined remux', exact: true }).click();
-  const history = page.getByRole('article', { name: 'Job mux-1', exact: true });
-  await history.getByText('Saved settings and log', { exact: true }).click();
-  await expect(history.getByText('3 sources · 4 selected tracks', { exact: true })).toBeVisible();
-  await expect(history.getByText(/Dub's \$\{title\} 日本語/)).toBeVisible();
-  expect((await submitted(page))[0]).toEqual(request);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /picture.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await expect(
+    quick.getByRole('row').filter({ hasText: 'voice.mka #0' }).getByLabel('Title for track 0'),
+  ).toHaveValue("Dub's ${title} 日本語");
 });
 
-test('removing another source preserves remaining track choices and edits while attachment order stays valid', async ({
+test('copy maps multiple checked primary and external video tracks in source order', async ({
   page,
 }) => {
-  await setup(page);
-  await page.getByLabel(`Use source ${media[1].name}`).check();
-  await page.getByLabel('Use source captions.srt').check();
-  await page.getByLabel(`Title for ${media[1].name} #0`, { exact: true }).fill('Keep my edit');
-  await page.getByLabel('Include captions.srt #0', { exact: true }).uncheck();
-  await page.getByLabel('Chapters from').selectOption('');
+  await installSourceEncodeFixture(page);
+  const first = {
+    id: 'picture',
+    path: '/media/picture.mkv',
+    name: 'picture.mkv',
+    sizeBytes: '1000',
+    durationSeconds: 12,
+    format: 'matroska',
+    streams: [
+      {
+        index: 0,
+        kind: 'video',
+        codec: 'h264',
+        width: 640,
+        height: 360,
+        frameRate: '24/1',
+        fieldOrder: 'progressive',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: 'Main picture',
+      },
+      {
+        index: 1,
+        kind: 'video',
+        codec: 'h264',
+        width: 640,
+        height: 360,
+        frameRate: '24/1',
+        fieldOrder: 'progressive',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: 'Alternate picture',
+      },
+    ],
+  };
+  const second = {
+    ...first,
+    id: 'external',
+    path: '/media/external.mkv',
+    name: 'external.mkv',
+    streams: [{ ...first.streams[0], title: 'External picture' }],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /picture.mkv/ }).click();
+  await page.getByRole('option', { name: /external.mkv/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*External picture/ }).check();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await expect(
-    page.getByRole('button', { name: 'Move picture.mkv #8 up', exact: true }),
-  ).toBeDisabled();
-  await page.getByLabel('Use source picture.mkv').uncheck();
-  await expect(page.getByLabel(`Title for ${media[1].name} #0`, { exact: true })).toHaveValue(
-    'Keep my edit',
+    quick.getByText('This encoder supports one selected video track per encode.'),
+  ).toBeVisible();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await page.getByRole('button', { name: 'Run: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
   );
-  await expect(page.getByLabel('Include captions.srt #0', { exact: true })).not.toBeChecked();
-  await expect(page.getByLabel('Container metadata from')).toHaveValue('sound');
-  await expect(page.getByLabel('Chapters from')).toHaveValue('');
-  await page.getByLabel('Combine tracks from multiple files').uncheck();
-  await page.getByLabel('Combine tracks from multiple files').check();
-  await expect(page.getByLabel(`Title for ${media[1].name} #0`, { exact: true })).toHaveValue(
-    'Keep my edit',
+  expect(request.source.streamIndices).toEqual([0, 1]);
+  expect(request.settings.externalTracks).toContainEqual(
+    expect.objectContaining({ inputPath: second.path, streamIndex: 0 }),
   );
-  await page.getByRole('button', { name: 'Start combined remux', exact: true }).click();
-  expect((await submitted(page))[0]).toMatchObject({
-    metadataSourceId: 'sound',
-    chaptersSourceId: null,
-    tracks: [{ sourceId: 'sound', streamIndex: 0, title: 'Keep my edit' }],
-  });
+  expect(request.settings.trackOrder).toEqual([
+    { streamIndex: 0 },
+    { streamIndex: 1 },
+    { inputPath: second.path, streamIndex: 0 },
+  ]);
 });
 
-test('combined validation and runtime refusal keep drafts editable and never submit an empty media selection', async ({
+test('Strip Video ignores checked external video before validating a retained subtitle', async ({
   page,
 }) => {
-  await setup(page);
-  await page.setViewportSize({ width: 760, height: 650 });
-  await page.getByLabel('Include picture.mkv #0', { exact: true }).uncheck();
-  await expect(
-    page.getByRole('button', { name: 'Start combined remux', exact: true }),
-  ).toBeDisabled();
-  await page.getByLabel(`Use source ${media[1].name}`).check();
-  const language = page.getByLabel(`Language for ${media[1].name} #0`, { exact: true });
-  await language.fill('english');
-  await expect(
-    page.getByRole('button', { name: 'Start combined remux', exact: true }),
-  ).toBeDisabled();
-  await language.fill('');
-  await page.evaluate(() => (globalThis as unknown as { __muxMock: Mock }).__muxMock.fail(true));
-  await page.getByRole('button', { name: 'Start combined remux', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('Choose a destination that does not exist.');
-  await expect(language).toHaveValue('');
-  await expect(language).toBeEnabled();
-  expect((await submitted(page))[0].tracks[0].language).toBe('');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
-    true,
+  await installSourceEncodeFixture(page);
+  const first = {
+    id: 'first',
+    path: '/media/first.mkv',
+    name: 'first.mkv',
+    sizeBytes: '1000',
+    durationSeconds: 12,
+    format: 'matroska',
+    streams: [
+      {
+        index: 0,
+        kind: 'video',
+        codec: 'h264',
+        width: 640,
+        height: 360,
+        frameRate: '24/1',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: 'Main picture',
+      },
+      {
+        index: 1,
+        kind: 'subtitle',
+        codec: 'subrip',
+        width: null,
+        height: null,
+        frameRate: null,
+        sampleRate: null,
+        channels: null,
+        language: 'eng',
+        title: 'Caption',
+      },
+    ],
+  };
+  const second = {
+    ...first,
+    id: 'external',
+    path: '/media/external.mkv',
+    name: 'external.mkv',
+    streams: [{ ...first.streams[0], title: 'External picture' }],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /first.mkv/ }).click();
+  await page.getByRole('option', { name: /external.mkv/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*External picture/ }).check();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Quick Convert', exact: true })
+    .getByLabel('Codec', { exact: true })
+    .selectOption('drop');
+  await expect(page.getByRole('button', { name: 'Run: Encode' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Run: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
+  );
+  expect(request.source.streamIndices).toEqual([1]);
+  expect(request.settings.externalTracks ?? []).toEqual([]);
+  expect(request.settings.trackOrder).toEqual([{ streamIndex: 1 }]);
+});
+
+test('MOV maps checked external data and drops an incompatible attachment before ordering metadata', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const base = {
+    index: 0,
+    kind: 'video',
+    codec: 'h264',
+    width: 640,
+    height: 360,
+    frameRate: '24/1',
+    fieldOrder: 'progressive',
+    sampleRate: null,
+    channels: null,
+    language: null,
+    title: 'Picture',
+  };
+  const first = {
+    id: 'first',
+    path: '/media/first.mkv',
+    name: 'first.mkv',
+    sizeBytes: '1000',
+    durationSeconds: 12,
+    format: 'matroska',
+    streams: [
+      base,
+      { ...base, index: 2, kind: 'attachment', codec: 'ttf', title: 'Font' },
+      {
+        ...base,
+        index: 3,
+        kind: 'audio',
+        codec: 'aac',
+        channels: 2,
+        sampleRate: 48000,
+        title: 'Audio',
+      },
+    ],
+  };
+  const second = {
+    ...first,
+    id: 'external',
+    path: '/media/data.mov',
+    name: 'data.mov',
+    streams: [
+      { ...base, index: 0, kind: 'data', codec: null, codecTag: 'gpmd', title: 'Telemetry' },
+    ],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /first.mkv/ }).click();
+  await page.getByRole('option', { name: /data.mov/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await quick.getByLabel('Container').selectOption('mov');
+  await quick.getByRole('tab', { name: 'Metadata' }).click();
+  await quick
+    .getByRole('row')
+    .filter({ hasText: 'first.mkv #3' })
+    .getByLabel('Title for track 3')
+    .fill('Main audio');
+  await quick
+    .getByRole('row')
+    .filter({ hasText: 'data.mov #0' })
+    .getByLabel('Title for track 0')
+    .fill('GPS');
+  await page.getByRole('button', { name: 'Run: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const request = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
+        .request,
+  );
+  expect(request.source.streamIndices).toEqual([0, 3]);
+  expect(request.settings.trackOrder).toEqual([
+    { streamIndex: 0 },
+    { streamIndex: 3 },
+    { inputPath: second.path, streamIndex: 0 },
+  ]);
+  expect(request.settings.trackOverrides).toContainEqual(
+    expect.objectContaining({ streamIndex: 3, title: 'Main audio' }),
+  );
+  expect(request.settings.externalTracks).toContainEqual(
+    expect.objectContaining({ inputPath: second.path, streamIndex: 0, title: 'GPS' }),
+  );
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    '1 attachment track left out: MOV cannot store attachment streams.',
   );
 });

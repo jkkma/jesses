@@ -1,772 +1,187 @@
-import { expect, test, type Page } from '@playwright/test';
-import { showAllEncodeSettings } from './helpers/encode-settings';
-import { extraEncoderParameters } from '../../src/lib/components/shared/extra-encoder-parameters';
-import type { BatchEncodeRequest, EncodeRequest, MediaFile } from '../../src/lib/ipc/generated';
+import { expect, test } from '@playwright/test';
+import { installSourceEncodeFixture } from './helpers/source-encode-fixture';
 
-const source: MediaFile = {
-  id: 'subtitle-source',
-  path: 'C:\\media\\captions.mkv',
-  name: 'captions.mkv',
-  sizeBytes: '1000',
-  durationSeconds: 12,
-  format: 'matroska',
-  streams: [
-    {
-      index: 2,
-      kind: 'video',
-      codec: 'h264',
-      width: 320,
-      height: 180,
-      frameRate: '24/1',
-      sampleRate: null,
-      channels: null,
-      language: null,
-      title: null,
-    },
-    ...[7, 9].map((index) => ({
-      index,
-      kind: 'subtitle' as const,
-      codec: 'ass',
-      width: null,
-      height: null,
-      frameRate: null,
-      sampleRate: null,
-      channels: null,
-      language: 'eng',
-      title: `Captions ${index}`,
-    })),
-  ],
-};
-type Call = { command: string; payload: Record<string, unknown> };
-async function mock(page: Page, corruptPresets = false) {
-  await page.addInitScript(
-    ({ source, corruptPresets, extraEncoderParameters }) => {
-      const state = globalThis as unknown as Record<string, unknown>;
-      const calls: Call[] = [];
-      state.__subtitleCalls = calls;
-      let nextId = 0;
-      let presets: import('../../src/lib/ipc/generated').EncoderParameterPreset[] = [];
-      state.isTauri = true;
-      state.__TAURI_INTERNALS__ = {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: () => ++nextId,
-        unregisterCallback: () => {},
-        invoke: async (command: string, payload: Record<string, unknown> = {}) => {
-          calls.push({ command, payload });
-          if (command.startsWith('plugin:event|')) return ++nextId;
-          if (command === 'get_capabilities')
-            return [
-              'ffmpeg',
-              'ffprobe',
-              'svt-av1',
-              'svt-av1-5fish',
-              'svt-av1-hdr',
-              'x264',
-              'av1an',
-              'mkvmerge',
-              'aomenc',
-              'vpxenc',
-              'x265',
-            ].map((id) => ({
-              id,
-              name: id,
-              available: true,
-              path: `C:\\tools\\${id}.exe`,
-              version: 'mock',
-              detail: null,
-            }));
-          if (command === 'begin_media_analysis') return `analysis-${++nextId}`;
-          if (command === 'cancel_media_analysis') return;
-          if (command === 'get_parameter_presets') {
-            if (corruptPresets)
-              throw { message: 'Preferences could not be read. Existing files were preserved.' };
-            return structuredClone(presets);
-          }
-          if (command === 'save_parameter_preset' || command === 'remove_parameter_preset') {
-            const item =
-              payload.request as import('../../src/lib/ipc/generated').EncoderParameterPreset;
-            presets = presets.filter(
-              (value) =>
-                value.name !== item.name ||
-                value.encoder !== item.encoder ||
-                value.backend !== item.backend,
-            );
-            if (command === 'save_parameter_preset') presets.push(structuredClone(item));
-            return structuredClone(presets);
-          }
-          if (command === 'get_encoder_parameters') {
-            const request = payload.request as { encoder: string; backend: string };
-            return {
-              ...request,
-              route: request.encoder === 'x265' ? 'FFmpeg library' : 'Standalone encoder CLI',
-              toolPath: 'C:\\tools\\encoder.exe',
-              toolVersion: 'qualified test build',
-              parameters:
-                extraEncoderParameters[request.encoder] ||
-                (request.backend === 'av1an' && request.encoder === 'x264'
-                  ? [
-                      {
-                        name: 'tune',
-                        label: 'Tune',
-                        argument: '--tune',
-                        minimum: 0,
-                        maximum: 0,
-                        valueKind: 'choiceList',
-                        minimumValue: '',
-                        maximumValue: '',
-                        choices: ['film', 'grain'],
-                        group: 'Psychovisual',
-                        description: 'Source tuning',
-                        example: 'film',
-                      },
-                      {
-                        name: 'psy-rd',
-                        label: 'Psycho-visual RD',
-                        argument: '--psy-rd',
-                        minimum: 0,
-                        maximum: 10,
-                        valueKind: 'pairDecimal',
-                        minimumValue: '0',
-                        maximumValue: '10',
-                        choices: [],
-                        group: 'Psychovisual',
-                        description: 'Rate distortion and trellis tuning',
-                        example: '1.0:0.0',
-                      },
-                      {
-                        name: 'pbratio',
-                        label: 'P-to-B QP ratio',
-                        argument: '--pbratio',
-                        minimum: 1,
-                        maximum: 10,
-                        valueKind: 'decimal',
-                        minimumValue: '1',
-                        maximumValue: '10',
-                        choices: [],
-                        group: 'Rate control',
-                        description: 'B-frame quantizer ratio',
-                        example: '1.30',
-                      },
-                    ]
-                  : request.backend === 'av1an' && request.encoder.startsWith('svtAv1')
-                    ? [
-                        {
-                          name: 'aq-mode',
-                          label: 'Adaptive quantization mode',
-                          argument: '--aq-mode',
-                          minimum: 0,
-                          maximum: 2,
-                          valueKind: 'whole',
-                          minimumValue: '0',
-                          maximumValue: '2',
-                          choices: [],
-                          group: 'Quantization',
-                          description: 'Adaptive quantization',
-                          example: '2',
-                        },
-                        {
-                          name: 'complex-hvs',
-                          label: 'Complex visual model',
-                          argument: '--complex-hvs',
-                          minimum: 0,
-                          maximum: 1,
-                          valueKind: 'whole',
-                          minimumValue: '0',
-                          maximumValue: '1',
-                          choices: [],
-                          group: 'Psychovisual',
-                          description: 'Perceptual detail model',
-                          example: '1',
-                        },
-                        {
-                          name: 'noise',
-                          label: 'Noise override',
-                          argument: '--noise',
-                          minimum: 0,
-                          maximum: 200,
-                          valueKind: 'whole',
-                          minimumValue: '0',
-                          maximumValue: '200',
-                          choices: [],
-                          group: 'Film grain',
-                          description: 'Advanced grain source',
-                          example: '10',
-                        },
-                      ]
-                    : [
-                        {
-                          name: 'ref',
-                          label: 'Reference frames',
-                          argument: request.encoder === 'x265' ? 'ref' : '--ref',
-                          minimum: 1,
-                          maximum: request.encoder === 'x264' ? 16 : 6,
-                          valueKind: 'whole',
-                          minimumValue: '1',
-                          maximumValue: request.encoder === 'x264' ? '16' : '6',
-                          choices: [],
-                          group: 'General',
-                          description: 'Reference frames',
-                          example: '3',
-                        },
-                      ]),
-              notes: ['Speed preset first; overrides afterward.'],
-            };
-          }
-          if (command === 'preview_encode_plan') {
-            const request = payload.request as EncodeRequest;
-            return new Promise((resolve) => {
-              state.__resolvePlan = () =>
-                resolve({
-                  request,
-                  sourceFingerprint: 'fixture-hash',
-                  outputFrameCount: '288',
-                  outputFrameRate: '24/1',
-                  notes: ['Temporary paths belong to this preview.'],
-                  stages: [
-                    {
-                      label: 'Video encoder',
-                      executable: 'C:\\tools\\encoder.exe',
-                      arguments: [
-                        '--ref',
-                        request.settings.parameters?.[0]?.value ?? '1',
-                        '--source-label',
-                        request.source.inputPath,
-                      ],
-                      workingDirectory: null,
-                      notes: [],
-                    },
-                  ],
-                });
-            });
-          }
-          if (command === 'get_storage_locations') return [];
-          if (command === 'read_av1an_grain_table') return 'filmgrn1\nE 0 100 1 2 1\n';
-          if (command === 'plugin:dialog|open')
-            return (payload.options as { directory?: boolean })?.directory
-              ? 'C:\\output'
-              : [source.path];
-          if (command === 'import_paths') return { files: [source], errors: [] };
-          if (command === 'probe_media') return source;
-          if (command === 'list_jobs') return [];
-          if (command === 'subscribe_jobs') {
-            (payload.channel as { onmessage: (jobs: unknown[]) => void }).onmessage([]);
-            return;
-          }
-          if (command === 'preview_encode_batch') {
-            const request = payload.request as BatchEncodeRequest;
-            return {
-              items: request.inputs.map((input) => ({
-                inputPath: input.inputPath,
-                outputPath: 'C:\\output\\captions.mkv',
-                error: null,
-                request: {
-                  source: {
-                    inputPath: input.inputPath,
-                    outputPath: 'C:\\output\\captions.mkv',
-                    streamIndices: input.streamIndices,
-                  },
-                  settings: {
-                    ...request,
-                    videoStreamIndex: input.videoStreamIndex,
-                    audio: input.audio,
-                    framing: input.framing,
-                    subtitles: input.subtitles,
-                    parameters: request.parameters,
-                  },
-                },
-              })),
-            };
-          }
-          if (
-            command === 'start_encode' ||
-            command === 'enqueue_encode' ||
-            command === 'enqueue_encode_batch'
-          ) {
-            const jobs = (
-              (payload.requests as EncodeRequest[]) ?? [payload.request as EncodeRequest]
-            ).map((request) => ({
-              id: `job-${++nextId}`,
-              state: 'queued',
-              request: request.source,
-              encodeSettings: request.settings,
-              progressSeconds: 0,
-              durationSeconds: 12,
-              logs: [],
-              error: null,
-              recovery: null,
-              logPath: null,
-            }));
-            return command === 'enqueue_encode_batch' ? jobs : jobs[0];
-          }
-          if (command === 'get_completion_status')
-            return {
-              options: { notify: false, finishAction: 'none' },
-              armedJobs: 0,
-              secondsRemaining: null,
-              error: null,
-            };
-          throw new Error(`Unexpected command: ${command}`);
-        },
-      };
-    },
-    { source, corruptPresets, extraEncoderParameters },
-  );
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Add files', exact: true }).first().click();
-  await expect(page.getByRole('heading', { name: source.name, exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
-  await showAllEncodeSettings(page);
-}
-const calls = (page: Page, command: string) =>
-  page.evaluate(
-    (command) =>
-      (globalThis as unknown as { __subtitleCalls: Call[] }).__subtitleCalls.filter(
-        (call) => call.command === command,
+test('AV1AN source argument grid freezes the selected encoder override before asynchronous resolution', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Encoder', { exact: true }).selectOption('x264');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await av.getByLabel('tune value').fill('4');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__holdResolution = new Promise((resolve) => (h.__releaseResolution = resolve));
+  });
+  await page.getByRole('button', { name: 'Run: AV1AN encode', exact: true }).click();
+  await expect(av.getByLabel('tune value')).toBeDisabled();
+  await page.evaluate(() => (globalThis as any).__releaseResolution());
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request.settings.parameters,
       ),
-    command,
-  );
-
-test('extra AV1AN encoders retain text, signed and decimal overrides through queue admission', async ({
-  page,
-}) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await showAllEncodeSettings(page);
-  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  for (const [encoder, draft, expected] of [
-    [
-      'x265Standalone',
-      '--tune grain --deblock -1:1 --psy-rd 1.5 --no-sao',
-      [
-        { name: 'tune', value: 'grain' },
-        { name: 'deblock', value: '-1:1' },
-        { name: 'psy-rd', value: '1.5' },
-        { name: 'sao', value: '0' },
-      ],
-    ],
-    [
-      'aomAv1',
-      '--tune=psnr --sharpness=2',
-      [
-        { name: 'tune', value: 'psnr' },
-        { name: 'sharpness', value: '2' },
-      ],
-    ],
-    [
-      'vpxStandalone',
-      '--tune ssim --auto-alt-ref 4',
-      [
-        { name: 'tune', value: 'ssim' },
-        { name: 'auto-alt-ref', value: '4' },
-      ],
-    ],
-  ] as const) {
-    await workspace.getByLabel('Video encoder', { exact: true }).selectOption(encoder);
-    const advanced = workspace
-      .locator('details')
-      .filter({ has: page.getByText('Advanced encoder parameters', { exact: true }) });
-    if ((await advanced.getAttribute('open')) === null)
-      await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
-    await workspace.getByText('Edit encoder arguments as text', { exact: true }).click();
-    await workspace.getByRole('button', { name: 'Edit current arguments', exact: true }).click();
-    await workspace.getByLabel('Editable encoder arguments', { exact: true }).fill(draft);
-    await workspace.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-    const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
-    await expect(queue).toBeEnabled();
-    await queue.click();
-    const request = (await calls(page, 'enqueue_encode')).at(-1)?.payload.request as EncodeRequest;
-    expect(request.settings.encoder).toBe(encoder);
-    expect(request.settings.parameters).toEqual(expected);
-  }
+    )
+    .toEqual([{ name: 'tune', value: '4' }]);
+  await av.getByLabel('tune value').fill('2');
+  await expect(av.getByLabel('tune value')).toHaveValue('2');
 });
 
-test('bare AOM keyframe switch round-trips as a single enabled override', async ({ page }) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await showAllEncodeSettings(page);
-  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('aomAv1');
-  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
-  await workspace.getByText('Edit encoder arguments as text', { exact: true }).click();
-  await workspace.getByRole('button', { name: 'Edit current arguments', exact: true }).click();
-  const editor = workspace.getByLabel('Editable encoder arguments', { exact: true });
-  await editor.fill('--disable-kf');
-  await workspace.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(
-    workspace.getByLabel('Disable automatic keyframes value', { exact: true }),
-  ).toHaveValue('1');
-
-  await workspace.getByRole('button', { name: 'Edit current arguments', exact: true }).click();
-  await expect(editor).toHaveValue('--disable-kf');
-  await editor.fill('--disable-kf=0');
-  await workspace.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(workspace.getByRole('alert')).toContainText('Disable automatic keyframes needs');
-  await expect(
-    workspace.getByLabel('Disable automatic keyframes value', { exact: true }),
-  ).toHaveValue('1');
-
-  await workspace.getByRole('button', { name: 'Add to queue', exact: true }).click();
-  const request = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(request.settings.parameters).toEqual([{ name: 'disable-kf', value: '1' }]);
-});
-
-test('text encoder edits apply atomically and reject paths, duplicates and stale drafts', async ({
-  page,
-}) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await quick.getByText('Advanced encoder parameters', { exact: true }).click();
-  await quick.getByText('Edit encoder arguments as text', { exact: true }).click();
-  await quick.getByRole('button', { name: 'Edit current arguments', exact: true }).click();
-  const editor = quick.getByLabel('Editable encoder arguments', { exact: true });
-  await editor.fill('--ref=3');
-  await quick.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(quick.getByLabel('Reference frames value', { exact: true })).toHaveValue('3');
-  await quick.getByRole('button', { name: 'Edit current arguments', exact: true }).click();
-  await editor.fill('--output "C:\\media\\source.mkv"');
-  await quick.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(quick.getByRole('alert')).toContainText('not an editable option');
-  await expect(quick.getByLabel('Reference frames value', { exact: true })).toHaveValue('3');
-  await editor.fill('--ref 2 --ref 4');
-  await quick.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(quick.getByRole('alert')).toContainText('appears more than once');
-  await editor.fill('--ref 4');
-  await quick.getByLabel('Reference frames value', { exact: true }).fill('5');
-  await expect(
-    quick.getByRole('button', { name: 'Apply encoder arguments', exact: true }),
-  ).toBeDisabled();
-  await quick.getByRole('button', { name: 'Reload current arguments', exact: true }).click();
-  await editor.fill('');
-  await quick.getByRole('button', { name: 'Apply encoder arguments', exact: true }).click();
-  await expect(quick.getByLabel('Override Reference frames', { exact: true })).not.toBeChecked();
-});
-
-test('qualified parameter presets stay separate across encoders and apply after speed defaults', async ({
-  page,
-}) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await quick.getByText('Advanced encoder parameters', { exact: true }).click();
-  await quick.getByLabel('Override Reference frames', { exact: true }).check();
-  await quick.getByLabel('Reference frames value', { exact: true }).fill('17');
-  await expect(quick.getByRole('button', { name: 'Start encode', exact: true })).toBeDisabled();
-  await quick.getByLabel('Reference frames value', { exact: true }).fill('3');
-  await quick.getByLabel('Parameter preset name', { exact: true }).fill('Animation');
-  await quick.getByRole('button', { name: 'Save parameter preset', exact: true }).click();
-  await expect(quick.getByLabel('Saved parameter preset', { exact: true })).toHaveValue(
-    'Animation',
-  );
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x265');
-  await expect(
-    quick.getByLabel('Saved parameter preset', { exact: true }).locator('option'),
-  ).toHaveCount(1);
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await expect(quick.getByLabel('Reference frames value', { exact: true })).toHaveValue('3');
-  await quick.getByRole('button', { name: 'Clear overrides', exact: true }).click();
-  await quick.getByLabel('Saved parameter preset', { exact: true }).selectOption('Animation');
-  await quick.getByRole('button', { name: 'Apply parameter preset', exact: true }).click();
-  await expect(quick.getByLabel('Reference frames value', { exact: true })).toHaveValue('3');
-  await quick.getByRole('button', { name: 'Start encode', exact: true }).click();
-  const request = (await calls(page, 'start_encode'))[0].payload.request as EncodeRequest;
-  expect(request.settings.parameters).toEqual([{ name: 'ref', value: '3' }]);
-  await quick.getByLabel('Reference frames value', { exact: true }).fill('4');
-  expect(request.settings.parameters).toEqual([{ name: 'ref', value: '3' }]);
-});
-
-test('AV1AN x264 exposes named tune and decimal pair overrides in the queued request', async ({
-  page,
-}) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await showAllEncodeSettings(page);
-  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await workspace.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
+test('a late argument catalog cannot replace the newly selected encoder grid', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Encoder', { exact: true }).selectOption('x264');
+  await page.evaluate(() => {
+    (globalThis as any).__holdCatalogs = true;
+  });
+  await av.getByRole('tab', { name: 'Advanced' }).click();
   await expect
-    .poll(async () => (await calls(page, 'get_encoder_parameters')).at(-1)?.payload.request)
-    .toEqual({
-      encoder: 'x264',
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__pendingCatalogs?.some((p: any) => p.request.encoder === 'x264') ??
+          false,
+      ),
+    )
+    .toBe(true);
+  await av.getByRole('tab', { name: 'Video', exact: true }).click();
+  await av.getByLabel('Encoder', { exact: true }).selectOption('aomAv1');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__pendingCatalogs?.some((p: any) => p.request.encoder === 'aomAv1') ??
+          false,
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(() => {
+    const pending = (globalThis as any).__pendingCatalogs;
+    const result = (encoder: string, name: string) => ({
+      encoder,
       backend: 'av1an',
+      route: 'test',
+      toolPath: '/bin/test',
+      toolVersion: 'test',
+      notes: [],
+      parameters: [
+        {
+          name,
+          label: name,
+          argument: `--${name}`,
+          minimum: 0,
+          maximum: 5,
+          valueKind: 'integer',
+          minimumValue: '0',
+          maximumValue: '5',
+          choices: [],
+          group: 'Arguments',
+          description: name,
+          example: '0',
+        },
+      ],
     });
-  await workspace.getByLabel('Override Tune', { exact: true }).check();
-  await workspace.getByLabel('Tune value', { exact: true }).fill('grain');
-  await workspace.getByLabel('Override Psycho-visual RD', { exact: true }).check();
-  await workspace.getByLabel('Psycho-visual RD value', { exact: true }).fill('1.2:0.1500');
-  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
-  await expect(queue).toBeDisabled();
-  await workspace.getByLabel('Psycho-visual RD value', { exact: true }).fill('1.2:0.15');
-  await workspace.getByLabel('Override P-to-B QP ratio', { exact: true }).check();
-  await workspace.getByLabel('P-to-B QP ratio value', { exact: true }).fill('1.30');
-  await expect(queue).toBeEnabled();
-  await queue.click();
-  const request = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(request.settings).toMatchObject({ backend: 'av1an', encoder: 'x264' });
-  expect(request.settings.parameters).toEqual([
-    { name: 'tune', value: 'grain' },
-    { name: 'psy-rd', value: '1.2:0.15' },
-    { name: 'pbratio', value: '1.30' },
-  ]);
+    pending
+      .find((p: any) => p.request.encoder === 'aomAv1')
+      .resolve(result('aomAv1', 'new-option'));
+    pending.find((p: any) => p.request.encoder === 'x264').resolve(result('x264', 'old-option'));
+  });
+  await expect(av.getByLabel('new-option value')).toBeVisible();
+  await expect(av.getByLabel('old-option value')).toHaveCount(0);
 });
 
-test('AV1AN SVT accepts adaptive quantization and complex visual-model overrides', async ({
-  page,
-}) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await showAllEncodeSettings(page);
-  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
-  await workspace.getByLabel('Override Adaptive quantization mode', { exact: true }).check();
-  await workspace.getByLabel('Adaptive quantization mode value', { exact: true }).fill('3');
-  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
-  await expect(queue).toBeDisabled();
-  await workspace.getByLabel('Adaptive quantization mode value', { exact: true }).fill('2');
-  await workspace.getByLabel('Override Complex visual model', { exact: true }).check();
-  await workspace.getByLabel('Complex visual model value', { exact: true }).fill('1');
-  await expect(queue).toBeEnabled();
-  await queue.click();
-  const request = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(request.settings.parameters).toEqual([
-    { name: 'aq-mode', value: '2' },
-    { name: 'complex-hvs', value: '1' },
-  ]);
-});
-
-test('AV1AN blocks conflicting SVT grain sources before queueing', async ({ page }) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'av1an', exact: true }).click();
-  await showAllEncodeSettings(page);
-  const workspace = page.getByRole('region', { name: 'av1an workspace', exact: true });
-  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('8');
-  await workspace.getByText('Advanced encoder parameters', { exact: true }).click();
-  await workspace.getByLabel('Override Noise override', { exact: true }).check();
-  await workspace.getByLabel('Noise override value', { exact: true }).fill('10');
-  const queue = workspace.getByRole('button', { name: 'Add to queue', exact: true });
-  await expect(queue).toBeDisabled();
-  await expect(workspace.getByRole('alert')).toContainText(
-    'Use one grain source: a grain table, film-grain synthesis, or the advanced noise override.',
-  );
-  await workspace.getByLabel('Film grain synthesis', { exact: true }).fill('0');
-  await expect(queue).toBeEnabled();
-});
-
-test('command preview cancels on edits and discards late replies before showing native argument arrays', async ({
-  page,
-}) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  const button = quick.getByRole('button', { name: 'Preview command plan', exact: true });
-  await button.click();
-  await expect(
-    quick.getByRole('button', { name: 'Cancel command preview', exact: true }),
-  ).toBeVisible();
-  await quick
-    .getByLabel('Encode destination', { exact: true })
-    .fill('C:\\output\\changed $ % 空.mkv');
+test('AV1AN VP9 alpha retains the selected pixel format in its WEBM request', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Encoder', { exact: true }).selectOption('vpxStandalone');
+  await av.getByLabel('Color Format').selectOption('yuva420p');
+  await av.getByLabel('Container').selectOption('webm');
+  await page.getByRole('button', { name: 'Run: AV1AN encode', exact: true }).click();
   await expect
-    .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
-    .toBeGreaterThan(0);
-  await page.evaluate(() =>
-    (globalThis as unknown as { __resolvePlan: () => void }).__resolvePlan(),
-  );
-  await expect(quick.getByText('Validated plan:', { exact: false })).toHaveCount(0);
-  await button.click();
-  await expect.poll(async () => (await calls(page, 'preview_encode_plan')).length).toBe(2);
-  await page.evaluate(() =>
-    (globalThis as unknown as { __resolvePlan: () => void }).__resolvePlan(),
-  );
-  await expect(
-    quick.getByText('Validated plan: 288 frames at 24/1 fps.', { exact: true }),
-  ).toBeVisible();
-  await quick.getByText('1. Video encoder', { exact: true }).click();
-  const argv = quick.getByLabel('Video encoder argument array', { exact: true });
-  await expect(argv).toHaveAttribute('readonly', '');
-  expect(JSON.parse(await argv.inputValue())).toContain(source.path);
-  await quick.getByLabel('Encode destination', { exact: true }).fill('C:\\output\\new.mkv');
-  await expect(quick.getByText('Validated plan:', { exact: false })).toHaveCount(0);
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request.settings,
+      ),
+    )
+    .toMatchObject({ encoder: 'vpxStandalone', av1anOptions: { pixelFormat: 'yuva420p' } });
 });
 
-test('batch parameter changes invalidate review while queued values remain frozen', async ({
+test('batch AV1AN freezes the source argument grid into each per-file request', async ({
   page,
 }) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  const batch = page.getByRole('region', { name: 'Batch encode workspace', exact: true });
-  await batch.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await batch.getByRole('button', { name: 'Choose output folder', exact: true }).click();
-  const preview = batch.getByRole('button', { name: 'Preview batch', exact: true });
-  const queue = batch.getByRole('button', { name: 'Queue ready files', exact: true });
-  await preview.click();
-  await queue.click();
-  const original = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests;
-  await batch.getByLabel('Select captions.mkv', { exact: true }).check();
-  await preview.click();
-  await batch.getByText('Advanced encoder parameters', { exact: true }).click();
-  await batch.getByLabel('Override Reference frames', { exact: true }).check();
-  await batch.getByLabel('Reference frames value', { exact: true }).fill('4');
-  await expect(queue).toBeDisabled();
-  await preview.click();
-  await queue.click();
-  const submitted = await calls(page, 'enqueue_encode_batch');
-  expect(submitted[0].payload.requests).toEqual(original);
-  expect((submitted[1].payload.requests as EncodeRequest[])[0].settings.parameters).toEqual([
-    { name: 'ref', value: '4' },
+  await installSourceEncodeFixture(page);
+  const first = {
+    id: 'first',
+    path: '/media/first.mkv',
+    name: 'first.mkv',
+    sizeBytes: '1000',
+    durationSeconds: 12,
+    format: 'matroska',
+    streams: [
+      {
+        index: 0,
+        kind: 'video',
+        codec: 'h264',
+        width: 640,
+        height: 360,
+        frameRate: '24/1',
+        fieldOrder: 'progressive',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: null,
+      },
+    ],
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    ({ first, second }) => {
+      const h = globalThis as any;
+      h.__pickerPaths = [first.path, second.path];
+      h.__mediaByPath = { [first.path]: first, [second.path]: second };
+    },
+    { first, second },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Encoder', { exact: true }).selectOption('x264');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await av.getByLabel('tune value').fill('4');
+  await page.getByRole('button', { name: 'Run Batch: AV1AN encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const requests = await page.evaluate(() =>
+    (globalThis as any).__sourceCalls
+      .filter((c: any) => c.command === 'mock_start_encode')
+      .map((c: any) => c.payload.request),
+  );
+  expect(requests.map((request: any) => request.source.inputPath)).toEqual([
+    '/media/first.mkv',
+    '/media/second.mkv',
   ]);
-});
-
-test('standalone output format and custom filters survive quick preview and queue snapshots', async ({
-  page,
-}) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await quick.getByLabel('Output pixel format', { exact: true }).selectOption('yuv444p10le');
-  await quick.getByText('Custom video filters', { exact: false }).click();
-  const filters = quick.getByLabel('Pixel filters · one chain per line', { exact: true });
-  await filters.fill('eq=contrast=1.10');
-  await quick.getByRole('button', { name: 'Preview command plan', exact: true }).click();
-  await expect.poll(async () => (await calls(page, 'preview_encode_plan')).length).toBe(1);
-  const preview = (await calls(page, 'preview_encode_plan'))[0].payload.request as EncodeRequest;
-  expect(preview.settings).toMatchObject({
-    outputPixelFormat: 'yuv444p10le',
-    av1anFilters: ['eq=contrast=1.10'],
-  });
-  await page.evaluate(() =>
-    (globalThis as unknown as { __resolvePlan: () => void }).__resolvePlan(),
-  );
-  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(queued.settings).toMatchObject({
-    outputPixelFormat: 'yuv444p10le',
-    av1anFilters: ['eq=contrast=1.10'],
-  });
-  await quick.getByLabel('Output pixel format', { exact: true }).selectOption('yuv420p');
-  await filters.fill('hue=s=0');
-  expect(queued.settings).toMatchObject({
-    outputPixelFormat: 'yuv444p10le',
-    av1anFilters: ['eq=contrast=1.10'],
-  });
-});
-
-test('VP9 alpha selection requires a Matroska or WebM destination in Quick Convert', async ({
-  page,
-}) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('vp9');
-  await quick.getByLabel('Output pixel format', { exact: true }).selectOption('yuva420p');
-  await expect(
-    quick.getByText('Requires an alpha-bearing RGBA or YUVA source.', { exact: false }),
-  ).toBeVisible();
-  await quick.getByLabel('Output container', { exact: true }).selectOption('mp4');
-  await expect(
-    quick
-      .getByRole('alert')
-      .filter({ hasText: 'VP9 alpha requires a Matroska or WebM destination.' }),
-  ).toBeVisible();
-  await expect(quick.getByRole('button', { name: 'Add to queue', exact: true })).toBeDisabled();
-  await quick.getByLabel('Output container', { exact: true }).selectOption('webm');
-  await expect(quick.getByRole('alert').filter({ hasText: 'VP9 alpha requires' })).toHaveCount(0);
-  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(queued.settings.outputPixelFormat).toBe('yuva420p');
-  expect(queued.source.outputPath).toMatch(/\.webm$/);
-});
-
-test('Batch preview rejects VP9 alpha in MP4 and retains WebM alpha output', async ({ page }) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  const batch = page.getByRole('region', { name: 'Batch encode workspace', exact: true });
-  await batch.getByLabel('Video encoder', { exact: true }).selectOption('vp9');
-  await batch.getByRole('button', { name: 'Choose output folder', exact: true }).click();
-  await batch.getByLabel('Output pixel format', { exact: true }).selectOption('yuva420p');
-  await batch.getByLabel('Output container', { exact: true }).selectOption('mp4');
-  await expect(
-    batch
-      .getByRole('alert')
-      .filter({ hasText: 'VP9 alpha requires a Matroska or WebM destination.' }),
-  ).toBeVisible();
-  await expect(batch.getByRole('button', { name: 'Preview batch', exact: true })).toBeDisabled();
-  await batch.getByLabel('Output container', { exact: true }).selectOption('webm');
-  await batch.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const reviewed = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(reviewed.outputContainer).toBe('webm');
-  expect(reviewed.outputPixelFormat).toBe('yuva420p');
-});
-
-test('batch review and queue preserve standalone output format and filter settings', async ({
-  page,
-}) => {
-  await mock(page);
-  await page.getByRole('button', { name: 'Batch encode', exact: true }).click();
-  const batch = page.getByRole('region', { name: 'Batch encode workspace', exact: true });
-  await batch.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await batch.getByRole('button', { name: 'Choose output folder', exact: true }).click();
-  await batch.getByLabel('Output pixel format', { exact: true }).selectOption('yuv422p10le');
-  await batch.getByText('Custom video filters', { exact: false }).click();
-  await batch
-    .getByLabel('Pixel filters · one chain per line', { exact: true })
-    .fill('eq=contrast=1.10');
-  await batch.getByRole('button', { name: 'Preview batch', exact: true }).click();
-  const reviewed = (await calls(page, 'preview_encode_batch'))[0].payload
-    .request as BatchEncodeRequest;
-  expect(reviewed).toMatchObject({
-    outputPixelFormat: 'yuv422p10le',
-    av1anFilters: ['eq=contrast=1.10'],
-  });
-  await batch.getByRole('button', { name: 'Queue ready files', exact: true }).click();
-  const queued = (await calls(page, 'enqueue_encode_batch'))[0].payload.requests as EncodeRequest[];
-  expect(queued[0].settings).toMatchObject({
-    outputPixelFormat: 'yuv422p10le',
-    av1anFilters: ['eq=contrast=1.10'],
-  });
-  await batch.getByLabel('Output pixel format', { exact: true }).selectOption('yuv420p');
-  expect(queued[0].settings.outputPixelFormat).toBe('yuv422p10le');
-});
-
-test('standalone AOM strength and SVT table are retained in queued settings', async ({ page }) => {
-  await mock(page);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('aomAv1');
-  await quick.getByLabel('Film grain synthesis', { exact: true }).fill('12');
-  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
-  const aom = (await calls(page, 'enqueue_encode'))[0].payload.request as EncodeRequest;
-  expect(aom.settings).toMatchObject({ backend: 'standalone', encoder: 'aomAv1', filmGrain: 12 });
-
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('svtAv1');
-  await quick.getByText('SVT grain analysis and tables', { exact: false }).click();
-  await quick.getByLabel('Grain delivery', { exact: true }).selectOption('table');
-  await quick.getByRole('button', { name: 'Choose grain table', exact: true }).click();
-  await expect(quick.getByLabel('Film grain synthesis', { exact: true })).toBeDisabled();
-  await quick.getByRole('button', { name: 'Add to queue', exact: true }).click();
-  const svt = (await calls(page, 'enqueue_encode'))[1].payload.request as EncodeRequest;
-  expect(svt.settings).toMatchObject({
-    backend: 'standalone',
-    encoder: 'svtAv1',
-    filmGrain: 0,
-    av1anGrain: { table: 'filmgrn1\nE 0 100 1 2 1\n', denoise: false, denoiseStrength: 4 },
-  });
-});
-
-test('unreadable Rust presets keep saving disabled and expose the preserved-file error', async ({
-  page,
-}) => {
-  await mock(page, true);
-  const quick = page.getByRole('region', { name: 'Quick Convert workspace', exact: true });
-  await quick.getByLabel('Video encoder', { exact: true }).selectOption('x264');
-  await quick.getByText('Advanced encoder parameters', { exact: true }).click();
-  await expect(
-    quick.getByRole('alert').filter({ hasText: 'Existing files were preserved.' }),
-  ).toBeVisible();
-  await quick.getByLabel('Parameter preset name', { exact: true }).fill('Cannot overwrite');
-  await expect(
-    quick.getByRole('button', { name: 'Save parameter preset', exact: true }),
-  ).toBeDisabled();
-  expect(await calls(page, 'save_parameter_preset')).toHaveLength(0);
-  expect(
-    await page.evaluate(() => localStorage.getItem('jesses.encoder-parameter-presets.v1')),
-  ).toBeNull();
+  for (const request of requests)
+    expect(request.settings.parameters).toEqual([{ name: 'tune', value: '4' }]);
 });
