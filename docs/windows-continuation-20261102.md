@@ -22,39 +22,39 @@ libplacebo processing remain in scope. At resume the parent observed about
 ## Qualification checklist
 
 - [x] Win32 console lifecycle, 12/12 actual cases; see the session handoff for
-  the receipt and limits.
+      the receipt and limits.
 - [x] Development-host frontend check/build and 279/279 Playwright tests at the
-  earlier snapshot; later changes require checks appropriate to those changes.
+      earlier snapshot; later changes require checks appropriate to those changes.
 - [x] Development-host desktop import, track/picker, CPU menu, compact/wide
-  layouts, Quick Convert, image sequence, AV1AN and Pause/Resume/Stop, including
-  independent output checks described in the handoff and below.
+      layouts, Quick Convert, image sequence, AV1AN and Pause/Resume/Stop, including
+      independent output checks described in the handoff and below.
 - [x] Physical Radeon 880M Spline processing and no-Vulkan explicit rejection
-  on the host; this is separate from final bundled-provider qualification.
+      on the host; this is separate from final bundled-provider qualification.
 - [x] Actual staged-provider recovery qualification: 13 applicable tests across
-  two compatible runs, including Select/Hybrid and hard crash. This is a
-  composite, **not a single all-green run**; see the native evidence below.
+      two compatible runs, including Select/Hybrid and hard crash. This is a
+      composite, **not a single all-green run**; see the native evidence below.
 - [x] Fresh grav source delivery, provenance and application grain/container
-  gates: final delivery passed 2/2 grain and 3/3 utility cases. Earlier failed
-  trees and diagnostic probes remain separate evidence.
+      gates: final delivery passed 2/2 grain and 3/3 utility cases. Earlier failed
+      trees and diagnostic probes remain separate evidence.
 - [x] Windows standalone, output, and remux/mux safety: 13/13 in three suites,
-  including the native AAC loop fixture. These are staged-provider results; final
-  package checks remain separate.
+      including the native AAC loop fixture. These are staged-provider results; final
+      package checks remain separate.
 - [x] Delivered-provider Dolby source matrix: 13 positive combinations and the
-  exact Spline no-device rejection independently verified; scoped to the staged
-  runtime, not the final portable package. See the aggregate below.
+      exact Spline no-device rejection independently verified; scoped to the staged
+      runtime, not the final portable package. See the aggregate below.
 - [x] Refreshed release app, full staging, portable ZIP, sanitized extracted
-  probes and `RestrictedHost` passed; receipts and scope below.
+      probes and `RestrictedHost` passed; receipts and scope below.
 - [x] Actual extracted portable GUI smoke using a fresh isolated profile: 12/12
-  tools reported, CPU encoder menu observed and Quick Convert plus AV1AN outputs
-  independently decoded. See evidence below.
+      tools reported, CPU encoder menu observed and Quick Convert plus AV1AN outputs
+      independently decoded. See evidence below.
 - [x] Disposable Scoop lifecycle and actual shim-launched media job, with
-  post-reinstall preference and history observations. RestrictedHost is not
-  FreshImage; the isolated Scoop adapter does not qualify user PATH registration.
+      post-reinstall preference and history observations. RestrictedHost is not
+      FreshImage; the isolated Scoop adapter does not qualify user PATH registration.
 - [ ] FreshImage qualification remains separate and unperformed.
 - [ ] Physical desktop Shift-held editing remains unverified: supported computer
-  use provides atomic chords, not a continuous hold across async preflight, and
-  the user cannot perform the hold now. Native and browser checks are separate
-  evidence; do not claim they establish that physical gesture or ask again now.
+      use provides atomic chords, not a continuous hold across async preflight, and
+      the user cannot perform the hold now. Native and browser checks are separate
+      evidence; do not claim they establish that physical gesture or ask again now.
 
 The native follow-up matrix is anchored to
 [source Dolby combinations](source-dolby-combinations.md): P8.1 CPU Hable and

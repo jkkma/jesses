@@ -807,7 +807,10 @@ pub(super) fn available(path: &Path) -> Result<u64, AppError> {
             return Err(invalid(path, std::io::Error::last_os_error().to_string()));
         }
         let value = unsafe { value.assume_init() };
-        Ok(value.f_bavail.saturating_mul(value.f_frsize))
+        // statvfs field widths differ between Unix platforms.
+        #[allow(clippy::useless_conversion)]
+        let bytes = u64::from(value.f_bavail).saturating_mul(u64::from(value.f_frsize));
+        Ok(bytes)
     }
     #[cfg(windows)]
     {

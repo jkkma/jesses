@@ -642,14 +642,14 @@
       audioCodec === 'copy'
         ? 'preserve'
         : count === undefined
-        ? audioChannels
-        : {
-            explicit: {
-              count,
-              layout:
-                count === stream?.channels && !!stream.channelLayout ? 'source' : 'ffmpegDefault',
-            },
-          };
+          ? audioChannels
+          : {
+              explicit: {
+                count,
+                layout:
+                  count === stream?.channels && !!stream.channelLayout ? 'source' : 'ffmpegDefault',
+              },
+            };
     const bitrate =
       row?.bitrate ??
       Math.round(audioBitrate * audioMultiplier(channelCount(channels, stream?.channels ?? null)));
