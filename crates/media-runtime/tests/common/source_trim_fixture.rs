@@ -25,7 +25,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() || std::env::var_os("JESSES_KEEP_TEST_ARTIFACTS").is_some() {
             eprintln!("Retained {}", self.0.display());
         } else {
             let _ = std::fs::remove_dir_all(&self.0);

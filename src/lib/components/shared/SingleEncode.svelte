@@ -569,7 +569,9 @@
   );
   let audioChannels = $state<AudioTrackDraft['channels']>(
     untrack(() => backend) === 'av1an'
-      ? (initialAv1anPreferences.audio?.channels ?? 'stereo')
+      ? initialAv1anPreferences.audio?.codec === 'copy'
+        ? 'preserve'
+        : (initialAv1anPreferences.audio?.channels ?? 'stereo')
       : 'stereo',
   );
   let audioBitrate = $state(
@@ -637,7 +639,9 @@
         : undefined;
     const count = row?.channels;
     const channels: AudioTrackDraft['channels'] =
-      count === undefined
+      audioCodec === 'copy'
+        ? 'preserve'
+        : count === undefined
         ? audioChannels
         : {
             explicit: {
@@ -3977,7 +3981,13 @@
           value={stripAudio ? 'strip' : audioCodec}
           onchange={(event) => {
             stripAudio = event.currentTarget.value === 'strip';
-            if (!stripAudio) audioCodec = event.currentTarget.value as AudioTrackDraft['codec'];
+            if (!stripAudio) {
+              audioCodec = event.currentTarget.value as AudioTrackDraft['codec'];
+              if (audioCodec === 'copy') {
+                audioChannels = 'preserve';
+                audioConfig = 'same';
+              }
+            }
           }}
           ><option value="copy">Copy Audio Without Re-Encoding</option><option value="strip"
             >Disable (Strip Audio)</option
@@ -4704,6 +4714,12 @@
     }
     .video-columns .form {
       row-gap: 2px;
+    }
+    /* Leave room for Windows native control metrics in the two-column form. */
+    .video-columns select,
+    .video-columns input:not([type='checkbox']),
+    .video-columns button {
+      padding-block: 4px;
     }
   }
   @media (max-width: 1050px) and (max-height: 750px) {

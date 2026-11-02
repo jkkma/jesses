@@ -25,6 +25,7 @@ pub(super) fn validate_encoder_path(encoder: &Path, family: VideoEncoder) -> Res
 pub(super) struct Launch {
     pub(super) executable: PathBuf,
     pub(super) environment: supervisor::ChildEnvironment,
+    _directory: std::fs::File,
     #[cfg(windows)]
     image: Option<std::fs::File>,
     #[cfg(windows)]
@@ -44,6 +45,7 @@ impl Launch {
         work: &Path,
     ) -> Result<Self, AppError> {
         validate_encoder_path(encoder, family)?;
+        let directory = recovery::launch_directory_guard(work)?;
         let selected = encoder.parent().expect("absolute encoder parent");
         let original = av1an.parent().expect("absolute av1an parent");
         let ffmpeg_parent = ffmpeg
@@ -141,6 +143,7 @@ impl Launch {
             let mut launch = Self {
                 executable,
                 environment,
+                _directory: directory,
                 image: Some(output),
                 identity,
                 staged: true,
@@ -190,6 +193,7 @@ impl Launch {
             Ok(Self {
                 executable: av1an.to_owned(),
                 environment,
+                _directory: directory,
             })
         }
     }
@@ -208,6 +212,13 @@ impl Launch {
             self.staged = false;
         }
         Ok(())
+    }
+
+    pub(super) fn retain_unsealed(&mut self) {
+        #[cfg(windows)]
+        {
+            self.staged = false;
+        }
     }
 }
 

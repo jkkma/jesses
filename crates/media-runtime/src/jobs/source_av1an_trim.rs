@@ -186,6 +186,23 @@ fn arguments(input: &Path, output: &Path, section: &Section) -> Vec<OsString> {
     ])
     .collect()
 }
+fn publish_source(temporary: &mut Temporary, output: &Path) -> Result<Source, AppError> {
+    let expected = file_identity(&temporary.clone_file()?)?;
+    temporary.publish(output)?;
+    // A Windows immutable Source cannot coexist with our writable reservation.
+    // Release only that completed temporary link, then bind the published name
+    // to the same file identity before accepting its read-only source guard.
+    temporary.cleanup()?;
+    let source = Source::open(output)?;
+    if identity(&source.path)? != expected {
+        return Err(invalid(
+            output,
+            "The published source-cut file was replaced.",
+        ));
+    }
+    source.verify()?;
+    Ok(source)
+}
 impl CutWorkspace {
     fn open(id: &str, request: &RemuxRequest, settings: &EncodeSettings) -> Result<Self, AppError> {
         Self::open_path(cut_root(id, request, settings)?, id, request)
@@ -512,8 +529,7 @@ impl Prepared {
             original.verify()?;
             workspace.verify()?;
             check_cancel(cancel)?;
-            temporary.publish(&source_path)?;
-            let cut = stamp(&Source::open(&source_path)?, cancel).await?;
+            let cut = stamp(&publish_source(&mut temporary, &source_path)?, cancel).await?;
             let complete = CutComplete {
                 cut,
                 tracks: proof.0,
@@ -746,4 +762,50 @@ pub(in crate::jobs) fn discard_variants_except(
         workspace.cleanup()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_cut_adopts_immutable_source_without_writable_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "jesses-source-cut-publish-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let output = root.join("cut.mkv");
+        let mut temporary = Temporary::create(&output, "cut").unwrap();
+        let partial = temporary.path.clone();
+        let mut writer = temporary.clone_file().unwrap();
+        writer.write_all(b"verified source-cut bytes").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        temporary.flush_nonempty().unwrap();
+        let original_identity = file_identity(&temporary.clone_file().unwrap()).unwrap();
+        let result = publish_source(&mut temporary, &output);
+        let adopted = result
+            .as_ref()
+            .map(|source| {
+                source.verify().unwrap();
+                assert_eq!(identity(&source.path).unwrap(), original_identity);
+                assert_eq!(
+                    fs::read(&source.path).unwrap(),
+                    b"verified source-cut bytes"
+                );
+                assert!(!partial.exists());
+            })
+            .map_err(|error| format!("{}: {}", error.code, error.message));
+        drop(result);
+        drop(temporary);
+        let _ = fs::remove_file(&partial);
+        fs::remove_file(&output).unwrap();
+        fs::remove_dir(&root).unwrap();
+        adopted.unwrap();
+    }
 }

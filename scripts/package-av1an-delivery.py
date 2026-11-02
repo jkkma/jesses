@@ -97,6 +97,13 @@ def qualify(directory, scratch, ffmpeg):
     return version.splitlines()[0]
 
 
+def shared_media_sources(provenance):
+    shared = [record for record in provenance["additionalSources"] if record.get("base") in SHARED_BASES]
+    if len(shared) != len(SHARED_BASES) or {record["base"] for record in shared} != SHARED_BASES:
+        raise ValueError("The decoder's shared static library sources are incomplete.")
+    return shared
+
+
 def finish(destination, media, compiler, provenance, lock, archives, python_sources, frameserver, decoder, plugin, engine, rust_version, scripts):
     directory = destination / "delivery"
     directory.mkdir()
@@ -152,9 +159,7 @@ def finish(destination, media, compiler, provenance, lock, archives, python_sour
     # Include the exact embedded runtime license in the notice index as well as
     # at its original runtime path.
     shutil.copy2(python / "LICENSE.txt", notices_dir / "Python-runtime-LICENSE.txt")
-    shared = [record for record in provenance["additionalSources"] if record["base"] in SHARED_BASES]
-    if len(shared) != len(SHARED_BASES):
-        raise ValueError("The decoder's shared static library sources are incomplete.")
+    shared = shared_media_sources(provenance)
     if any("[" + marker + "]" not in version for marker in lock["compatibilityMarkers"]):
         raise ValueError("The built engine is missing a locked compatibility fix.")
     source = next(record for record in additional if record.get("component") == "av1an")

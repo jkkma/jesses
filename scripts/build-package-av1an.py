@@ -6,7 +6,6 @@ global Python installation or system plugin directory is modified.
 """
 
 import argparse
-import concurrent.futures
 import json
 from pathlib import Path
 import shutil
@@ -26,6 +25,25 @@ def load(name, path):
     return module
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from error
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
+def build_components(components, destination, archives, compiler, cmake, rust, scripts, helper, *, jobs):
+    # One component at a time keeps the selected limit a total build budget.
+    frameserver = components.frameserver(destination / "frameserver", archives, compiler, jobs=jobs)
+    decoder = components.decoder(destination / "decoder", archives, compiler, helper, jobs=jobs)
+    plugin = components.lsmash(destination / "plugin", archives, compiler, cmake, decoder["prefix"], helper, jobs=jobs)
+    engine = components.av1an(destination / "engine", archives, rust, compiler, scripts, jobs=jobs)
+    return frameserver, decoder, plugin, engine
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
@@ -33,6 +51,7 @@ def main():
     parser.add_argument("--msys-root", type=Path, required=True)
     parser.add_argument("--rust-directory", type=Path)
     parser.add_argument("--cache", type=Path, default=Path("target/tool-download-cache"))
+    parser.add_argument("--jobs", type=positive_jobs, default=4, help="Maximum total concurrent compiler jobs (default: 4).")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise SystemExit("The portable av1an recipe currently targets Windows x64.")
@@ -67,14 +86,8 @@ def main():
     python_sources = [(record, stager.download(record["url"], record["sha256"], cache)) for record in lock["pythonSources"]]
     cmake_archive = stager.download(lock["cmakeWindows"]["url"], lock["cmakeWindows"]["sha256"], cache)
     cmake = support.unpack(cmake_archive, destination / "cmake") / "bin/cmake.exe"
-    # Independent native builds use four workers apiece and never share output.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        frameserver = pool.submit(components.frameserver, destination / "frameserver", archives, compiler)
-        decoder = pool.submit(components.decoder, destination / "decoder", archives, compiler, helper)
-        engine = pool.submit(components.av1an, destination / "engine", archives, rust, compiler, SCRIPTS)
-        decoder_result = decoder.result()
-        plugin = components.lsmash(destination / "plugin", archives, compiler, cmake, decoder_result["prefix"], helper)
-        frameserver_result, engine_result = frameserver.result(), engine.result()
+    frameserver_result, decoder_result, plugin, engine_result = build_components(
+        components, destination, archives, compiler, cmake, rust, SCRIPTS, helper, jobs=args.jobs)
     delivery.finish(destination, media, compiler, provenance, lock, archives, python_sources, frameserver_result, decoder_result, plugin, engine_result, rust_version, SCRIPTS)
 
 

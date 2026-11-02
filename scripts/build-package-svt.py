@@ -22,6 +22,16 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from error
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -35,6 +45,7 @@ def main():
     parser.add_argument("--ffmpeg-build", type=Path, required=True)
     parser.add_argument("--msys-root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=Path("target/tool-download-cache"))
+    parser.add_argument("--jobs", type=positive_jobs, default=4, help="Maximum concurrent compiler jobs (default: 4).")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise SystemExit("This driver currently builds Windows x64 SVT-AV1.")
@@ -92,7 +103,7 @@ def main():
     flags = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTING=OFF", "-DBUILD_APPS=ON", "-DNATIVE=OFF", "-DSVT_AV1_PGO=OFF", "-DCMAKE_EXE_LINKER_FLAGS=-static -static-libgcc -static-libstdc++", f'-DCMAKE_C_FLAGS=-ffile-prefix-map="{destination.as_posix()}"=.', f'-DCMAKE_CXX_FLAGS=-ffile-prefix-map="{destination.as_posix()}"=.']
     local_flags = [f"-DCMAKE_C_COMPILER={compiler / 'ucrt64/bin/gcc.exe'}", f"-DCMAKE_CXX_COMPILER={compiler / 'ucrt64/bin/g++.exe'}", f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}", f"-DCMAKE_ASM_NASM_COMPILER={compiler / 'usr/bin/nasm.exe'}"]
     with (destination / "build.log").open("x", encoding="utf-8") as output:
-        for command in [[str(cmake), "-S", str(source), "-B", str(build), *flags, *local_flags], [str(cmake), "--build", str(build), "--target", "SvtAv1EncApp", "--parallel", "4"]]:
+        for command in [[str(cmake), "-S", str(source), "-B", str(build), *flags, *local_flags], [str(cmake), "--build", str(build), "--target", "SvtAv1EncApp", "--parallel", str(args.jobs)]]:
             print("Building pinned mainline SVT-AV1", flush=True)
             subprocess.run(command, env=env, cwd=destination, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=1800)
     finish(destination, source, media, compiler, provenance, source_archive, source_record, cmake_record, flags)
@@ -118,7 +129,7 @@ def finish(destination, source, media, compiler, provenance, source_archive, sou
     shutil.copy2(__file__, delivery / Path(__file__).name)
     shutil.copy2(LOCK, delivery / LOCK.name)
     shutil.copy2(destination / cmake_record["root"] / "doc/cmake/LICENSE.rst", delivery / "CMake-LICENSE.rst")
-    runtime_sources = [record for record in provenance["additionalSources"] if record["base"] in {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
+    runtime_sources = [record for record in provenance["additionalSources"] if record.get("base") in {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
     if len(runtime_sources) != 4:
         raise ValueError("The shared runtime source closure is incomplete.")
     receipt = {"schemaVersion": 1, "target": provenance["target"], "tool": {"id": "svt-av1", "path": executable.name, "version": version, "sha256": digest(executable), "systemImports": imports}, "sharedMediaProvenanceSha256": digest(media / "build-provenance.json"), "source": {**source_record, "path": "source.tar.gz"}, "sourceCommit": source_record["commit"], "runtimeSources": runtime_sources, "configure": [flag for flag in flags if not flag.startswith(("-DCMAKE_C_FLAGS=", "-DCMAKE_CXX_FLAGS="))], "prefixMapping": "Build-directory paths are mapped to relative paths in compiler macros.", "cmakeInput": cmake_record, "licenses": [{"path": name, "sha256": digest(delivery / name)} for name in ("LICENSE.md", "LICENSE-BSD2.md", "PATENTS.md", "CMake-LICENSE.rst")], "buildInputs": [{"path": name, "sha256": digest(delivery / name)} for name in (Path(__file__).name, LOCK.name)]}

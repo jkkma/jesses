@@ -1062,7 +1062,8 @@ impl JobManager {
         request: media_core::ImageSequenceReleaseRequest,
         cache_root: PathBuf,
     ) -> Result<(), AppError> {
-        let state = self.state.clone().lock_owned().await;
+        let mut state = self.state.clone().lock_owned().await;
+        state.preflights.retain(|entry| !entry.task.is_finished());
         fn references(value: &serde_json::Value, path: &str) -> bool {
             match value {
                 serde_json::Value::String(value) => {

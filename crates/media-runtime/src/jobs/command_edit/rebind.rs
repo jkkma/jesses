@@ -293,30 +293,49 @@ mod tests {
     use super::*;
     #[test]
     fn owned_paths_rebind_only_in_matching_generated_argument_roles() {
-        let old = "(cd '/work/job' && '/work/job/launch-1/av1an' '-i' '/media/original.mkv' '-o' '/work/job/launch-1/encoded.mkv' '--temp' '/work/job/chunks' '--video-params' '--crf 30') && '/usr/bin/ffmpeg' '-i' '/work/job/launch-1/encoded.mkv' '/out/.jesses-id-attempt-1.partial.mkv'";
+        let root = if cfg!(windows) {
+            "C:/work/job"
+        } else {
+            "/work/job"
+        };
+        let output = if cfg!(windows) { "C:/out" } else { "/out" };
+        let old = format!(
+            "(cd '{root}' && '{root}/launch-1/av1an' '-i' '/media/original.mkv' '-o' '{root}/launch-1/encoded.mkv' '--temp' '{root}/chunks' '--video-params' '--crf 30') && '/usr/bin/ffmpeg' '-i' '{root}/launch-1/encoded.mkv' '{output}/.jesses-id-attempt-1.partial.mkv'"
+        );
         let new = old
             .replace("launch-1", "launch-2")
             .replace("attempt-1", "attempt-2");
         let saved = EditedCommand {
-            generated: old.into(),
+            generated: old.clone(),
             arguments: format!(
-                "{} && printf '%s' '/work/job/launch-1/encoded.mkv' '--resume'",
+                "{} && printf '%s' '{root}/launch-1/encoded.mkv' '--resume'",
                 old.replace("--crf 30", "--crf 22")
             ),
         };
         let actual = rebind(
             &saved,
             &new,
-            Path::new("/work/job"),
-            Path::new("/out/result.mkv"),
+            Path::new(root),
+            &Path::new(output).join("result.mkv"),
             "id",
             true,
         )
         .unwrap();
-        assert!(actual.contains("'/work/job/launch-2/av1an' '--resume'"));
-        assert!(actual.contains("'-o' '/work/job/launch-2/encoded.mkv'"));
-        assert!(actual.contains("'/out/.jesses-id-attempt-2.partial.mkv'"));
-        assert!(actual.ends_with("printf '%s' '/work/job/launch-1/encoded.mkv' '--resume'"));
+        assert!(actual.contains(&format!(
+            "{} {}",
+            quote(&format!("{root}/launch-2/av1an")),
+            quote("--resume")
+        )));
+        assert!(actual.contains(&format!(
+            "'-o' {}",
+            quote(&format!("{root}/launch-2/encoded.mkv"))
+        )));
+        assert!(actual.contains(&quote(&format!(
+            "{output}/.jesses-id-attempt-2.partial.mkv"
+        ))));
+        assert!(actual.ends_with(&format!(
+            "printf '%s' '{root}/launch-1/encoded.mkv' '--resume'"
+        )));
         assert_eq!(
             argument(&actual, "av1an", "--video-params")
                 .unwrap()

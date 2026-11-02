@@ -18,7 +18,7 @@ def load(name, path):
 support = load("av1an_package_support", Path(__file__).with_name("package-av1an-support.py"))
 
 
-def frameserver(destination, archives, compiler, *, msvc_root=None, sdk_root=None, sdk_version=None):
+def frameserver(destination, archives, compiler, *, msvc_root=None, sdk_root=None, sdk_version=None, jobs=4):
     destination.mkdir()
     source = support.unpack(archives["vapoursynth"], destination / "source")
     cython = support.unpack(archives["cython"], destination / "cython")
@@ -40,11 +40,11 @@ def frameserver(destination, archives, compiler, *, msvc_root=None, sdk_root=Non
     flags = ["--native-file", str(native), "--wrap-mode=nodownload", "-Db_vscrt=mt", "-Db_lto=false", "-Dc_args=" + mapped, "-Dcpp_args=" + mapped]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
         support.run([python, "-m", "mesonbuild.mesonmain", "setup", destination / "build", source, *flags], destination, env, log)
-        support.run([python, "-m", "mesonbuild.mesonmain", "compile", "-C", destination / "build", "-j", "4"], destination, env, log)
+        support.run([python, "-m", "mesonbuild.mesonmain", "compile", "-C", destination / "build", "-j", str(jobs)], destination, env, log)
     return {"source": source, "build": destination / "build", "compiler": compiler_receipt, "configure": [flag for flag in flags if not flag.startswith(("-Dc_args=", "-Dcpp_args=")) and flag != str(native)]}
 
 
-def decoder(destination, archives, compiler, media_helper):
+def decoder(destination, archives, compiler, media_helper, *, jobs=4):
     destination.mkdir()
     source = support.unpack(archives["decoderFfmpeg"], destination / "source")
     comparison = support.unpack(archives["diffutilsBuild"], destination / "diffutils", single_root=False) / "usr/bin"
@@ -56,12 +56,12 @@ def decoder(destination, archives, compiler, media_helper):
     env["JESSES_DIFFUTILS_BIN"] = str(comparison)
     flags = ["--prefix=" + prefix.as_posix(), "--disable-autodetect", "--disable-programs", "--disable-doc", "--disable-debug", "--disable-shared", "--enable-static", "--disable-muxers", "--disable-avdevice", "--disable-avfilter", "--disable-encoders", "--disable-filters", "--disable-devices", "--disable-network", "--enable-libdav1d", "--enable-libvpx", "--enable-zlib", "--disable-bzlib", "--disable-iconv", "--disable-lzma", "--disable-pthreads", "--enable-w32threads", "--pkg-config-flags=--static --dont-define-prefix", "--extra-ldflags=-static -static-libgcc -static-libstdc++", "--extra-cflags=-ffile-prefix-map=" + destination.as_posix() + "=."]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
-        for command in ["./configure " + shlex.join(flags), "make -j4", "make install-libs install-headers"]:
+        for command in ["./configure " + shlex.join(flags), f"make -j{jobs}", "make install-libs install-headers"]:
             support.run([compiler / "usr/bin/bash.exe", "--noprofile", "--norc", "-c", 'export PATH=/ucrt64/bin:/usr/bin; extra=$(cygpath -u "$JESSES_DIFFUTILS_BIN"); export PATH="$extra:$PATH"; ' + command], source, env, log)
     return {"prefix": prefix, "configure": [flag for flag in flags if not flag.startswith(("--prefix=", "--extra-cflags="))]}
 
 
-def lsmash(destination, archives, compiler, cmake, decoder_prefix, media_helper):
+def lsmash(destination, archives, compiler, cmake, decoder_prefix, media_helper, *, jobs=4):
     destination.mkdir()
     source = support.unpack(archives["lsmash"], destination / "source")
     for name, key in [("xxHash", "xxhash"), ("obuparse", "obuparse"), ("l-smash", "liblsmash")]:
@@ -76,11 +76,11 @@ def lsmash(destination, archives, compiler, cmake, decoder_prefix, media_helper)
     local = [f"-DFFMPEG_ROOT={decoder_prefix}", f"-DCMAKE_PREFIX_PATH={decoder_prefix};{compiler / 'ucrt64'}", f"-DCMAKE_C_COMPILER={compiler / 'ucrt64/bin/gcc.exe'}", f"-DCMAKE_CXX_COMPILER={compiler / 'ucrt64/bin/g++.exe'}", f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}", f"-DCMAKE_RC_COMPILER={compiler / 'ucrt64/bin/windres.exe'}", "-DCMAKE_C_FLAGS=-ffile-prefix-map=" + destination.as_posix() + "=."]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
         support.run([cmake, "-S", source, "-B", destination / "build", *flags, *[flag.replace("\\", "/") for flag in local]], destination, env, log)
-        support.run([cmake, "--build", destination / "build", "--target", "LSMASHSource", "--parallel", "4"], destination, env, log)
+        support.run([cmake, "--build", destination / "build", "--target", "LSMASHSource", "--parallel", str(jobs)], destination, env, log)
     return {"binary": destination / "build/LSMASHSource.dll", "configure": flags}
 
 
-def av1an(destination, archives, rust_directory, compiler, scripts):
+def av1an(destination, archives, rust_directory, compiler, scripts, *, jobs=4):
     destination.mkdir()
     source = support.unpack(archives["av1an"], destination / "source")
     patcher = load("av1an_patch", scripts / "patch-package-av1an.py")
@@ -88,7 +88,7 @@ def av1an(destination, archives, rust_directory, compiler, scripts):
     env, cl, _ = support.msvc_environment(compiler, rust_directory / "cargo.exe")
     env.pop("PYTHONPATH", None)
     env["PATH"] = os.pathsep.join(map(str, [rust_directory, cl.parent, compiler / "usr/bin", support.system32()]))
-    env.update(CARGO_HOME=str(destination / "cargo-home"), CARGO_TARGET_DIR=str(destination / "target"), CARGO_BUILD_JOBS="4", CARGO_PROFILE_RELEASE_STRIP="symbols", VERGEN_GIT_SHA="805dad69143fa0a81cfe2fb89c0b9e90a828ea72", VERGEN_IDEMPOTENT="1", RUSTFLAGS="--remap-path-prefix=" + str(destination) + "=. -C target-feature=+crt-static")
+    env.update(CARGO_HOME=str(destination / "cargo-home"), CARGO_TARGET_DIR=str(destination / "target"), CARGO_BUILD_JOBS=str(jobs), CARGO_PROFILE_RELEASE_STRIP="symbols", VERGEN_GIT_SHA="805dad69143fa0a81cfe2fb89c0b9e90a828ea72", VERGEN_IDEMPOTENT="1", RUSTFLAGS="--remap-path-prefix=" + str(destination) + "=. -C target-feature=+crt-static")
     (source / ".cargo").mkdir()
     with (destination / "vendor.log").open("x", encoding="utf-8") as log, (source / ".cargo/config.toml").open("x", encoding="utf-8") as config:
         import subprocess

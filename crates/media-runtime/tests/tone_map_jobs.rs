@@ -199,7 +199,6 @@ async fn selected_spline_uses_physical_vulkan_while_final_encoder_is_cpu() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 #[ignore = "set VK_DRIVER_FILES to an absent file; requires FFmpeg/FFprobe and x264"]
 async fn held_spline_remains_editable_without_vulkan_and_unchanged_execution_rejects_it() {
@@ -211,7 +210,16 @@ async fn held_spline_remains_editable_without_vulkan_and_unchanged_execution_rej
     let input = fixture.0.join("HDR input.mkv");
     synthesize(&input, 10, false, true, "128x96", 4, ("bt2020", "left")).await;
     let original = std::fs::read(&input).unwrap();
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let quote = |value: &str| {
+        #[cfg(unix)]
+        {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+        #[cfg(windows)]
+        {
+            format!("\"{}\"", value.replace('%', "%%").replace('"', "\"\""))
+        }
+    };
     let ffmpeg = std::env::var_os("JESSES_FFMPEG").unwrap();
     for edited in [false, true] {
         let destination = fixture.0.join(format!("held-{edited}.mkv"));

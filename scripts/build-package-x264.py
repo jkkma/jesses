@@ -27,11 +27,22 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from error
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--ffmpeg-build", type=Path, required=True)
     parser.add_argument("--msys-root", type=Path, required=True)
+    parser.add_argument("--jobs", type=positive_jobs, default=4, help="Maximum concurrent compiler jobs (default: 4).")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise SystemExit("This driver currently builds Windows x64 standalone x264.")
@@ -48,7 +59,7 @@ def main():
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
     helper.verify_compiler(compiler)
-    source_record = next(record for record in provenance["additionalSources"] if record["base"] == "mingw-w64-x264")
+    source_record = next(record for record in provenance["additionalSources"] if record.get("base") == "mingw-w64-x264")
     archive = media / source_record["path"]
     if source_record["sha256"] != SOURCE_SHA256 or digest(archive) != SOURCE_SHA256:
         raise ValueError("The shared x264 source differs from its pinned revision.")
@@ -82,7 +93,7 @@ def main():
     git_version = subprocess.check_output([str(git), "--version"], env=env, text=True).strip()
     env["PATH"] = os.pathsep.join(map(str, [compiler / "ucrt64/bin", compiler / "usr/bin", git.parent, Path(os.environ["SystemRoot"]) / "System32"]))
     git_posix = "/" + git.drive[0].lower() + git.parent.as_posix()[2:]
-    commands = ["./configure " + shlex.join(CONFIGURE), "make -j4"]
+    commands = ["./configure " + shlex.join(CONFIGURE), f"make -j{args.jobs}"]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
         for command in commands:
             print(command, flush=True)
@@ -104,7 +115,7 @@ def finish(destination, source, media, compiler, provenance, source_record, git_
         raise ValueError(f"x264 imports a non-system runtime: {imports}")
     shutil.copy2(source / "COPYING", delivery / "COPYING")
     shutil.copy2(__file__, delivery / "build-package-x264.py")
-    runtime_sources = [record for record in provenance["additionalSources"] if record["base"] in {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
+    runtime_sources = [record for record in provenance["additionalSources"] if record.get("base") in {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
     if len(runtime_sources) != 4:
         raise ValueError("The shared compiler/runtime source closure is incomplete.")
     receipt = {"schemaVersion": 1, "target": provenance["target"], "tool": {"id": "x264", "path": "x264.exe", "version": version, "sha256": digest(executable), "systemImports": imports}, "sharedMediaProvenanceSha256": digest(media / "build-provenance.json"), "source": source_record, "sourceCommit": COMMIT, "runtimeSources": runtime_sources, "configure": CONFIGURE, "gitVersion": git_version, "licenses": [{"path": "COPYING", "sha256": digest(delivery / "COPYING")}], "buildInputs": [{"path": "build-package-x264.py", "sha256": digest(delivery / "build-package-x264.py")}]}

@@ -1,5 +1,11 @@
 # Windows local validation handoff
 
+**Current status:** Work resumed on the user's instruction. Start with the
+[continuation ledger](windows-continuation-20261102.md) and
+[session handoff](windows-session-handoff-20261102.md). The original handoff and
+instructions below preserve their historical context; they are not current live
+process or qualification claims.
+
 Use the final pushed Jesses revision and record `git rev-parse HEAD` with the
 receipts. The native Windows console implementation and runnable fixture are
 present. **Native Windows execution has not been performed in the Linux

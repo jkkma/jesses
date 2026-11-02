@@ -175,6 +175,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let source = root.join("film.part.one.mkv");
         fs::write(&source, b"original").unwrap();
         let request = |stem: Option<String>, target| OutputPathRequest {

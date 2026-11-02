@@ -239,15 +239,7 @@ impl JobManager {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        tokio::fs::create_dir(&launch_directory)
-            .await
-            .map_err(|e| {
-                files::error(
-                    "OUTPUT_CREATE_FAILED",
-                    format!("Cannot reserve av1an workspace: {e}"),
-                    &work,
-                )
-            })?;
+        let reservation_guard = recovery.reserve_launch(&launch_directory).await?;
         let launch_executable = executable.to_owned();
         let launch_encoder = encoder.to_owned();
         let launch_work = launch_directory.clone();
@@ -256,6 +248,7 @@ impl JobManager {
         let launch_mkvmerge = mkvmerge.map(Path::to_owned);
         let launch_family = settings.encoder;
         let mut launch = tokio::task::spawn_blocking(move || {
+            let _reservation_guard = reservation_guard;
             launcher::Launch::prepare(
                 &launch_executable,
                 &launch_encoder,
@@ -268,6 +261,11 @@ impl JobManager {
         })
         .await
         .map_err(|e| files::error("AV1AN_STAGE_FAILED", e.to_string(), executable))??;
+        let staged_image = cfg!(windows).then_some(launch.executable.as_path());
+        if let Err(error) = recovery.seal_launch(&launch_directory, staged_image).await {
+            launch.retain_unsealed();
+            return Err(error);
+        }
         check_cancel(cancel)?;
         let version = supervisor::run_capture_with_environment(
             &CommandSpec {
@@ -558,6 +556,9 @@ impl JobManager {
         let _ = event_task.await;
         recovery.seal_target_artifacts().await?;
         let stage_cleanup = launch.cleanup();
+        // The image guard is released by cleanup; release the directory guard
+        // before Windows removes the exact now-empty launch directory below.
+        drop(launch);
         drop(prepared_scenes);
         if edited {
             if let Some(staged) = &staged_video
@@ -566,7 +567,7 @@ impl JobManager {
                 let mut owned = Temporary::durable(staged, true)?;
                 owned.cleanup()?;
             }
-            let _ = tokio::fs::remove_dir(&launch_directory).await;
+            recovery.retire_launch(&launch_directory).await?;
         }
         // The process has exited, so seal its last complete receipts even when
         // cancellation won. A crash before this point reuses only prior receipts.
@@ -640,7 +641,7 @@ impl JobManager {
             })??;
             let _ = tokio::fs::remove_file(staged_video.as_ref().unwrap()).await;
         }
-        let _ = tokio::fs::remove_dir(&launch_directory).await;
+        recovery.retire_launch(&launch_directory).await?;
         if matches!(
             configured.chunk_method,
             media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment

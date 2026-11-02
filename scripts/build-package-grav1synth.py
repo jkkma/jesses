@@ -6,6 +6,7 @@ compiler plus the Rust x86_64-pc-windows-gnu target. No system tool is installed
 no existing build directory is reused, and no FFmpeg9 runtime is substituted.
 """
 import argparse
+import difflib
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ import tarfile
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 LOCK = HERE / "grav1synth-lock.json"
+MANIFEST_SHA256 = "434378bf50e9ec3663f7826c75e92a7bde15a32eef508a477dec9cd13eccccd5"
 CONFIGURE = ["--disable-autodetect", "--disable-programs", "--disable-doc", "--disable-debug", "--disable-network", "--disable-encoders", "--disable-avdevice", "--disable-avfilter", "--disable-swscale", "--disable-swresample", "--disable-shared", "--enable-static", "--enable-pic", "--enable-libdav1d", "--disable-x86asm"]
 
 def module(path):
@@ -39,6 +41,63 @@ def environment(home):
     env = {key: value for key, value in os.environ.items() if key.upper() in keep}
     env.update(HOME=str(home), CARGO_HOME=str(home / "cargo"), LC_ALL="C", TZ="UTC", SOURCE_DATE_EPOCH="1789257600", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, CONFIG_SITE=os.devnull)
     return env
+
+
+def build_programs(msys):
+    if msys is None:
+        return ["meson"], "make"
+    return [str(msys / "ucrt64/bin/python.exe"), "-I", "-m", "mesonbuild.mesonmain"], str(msys / "usr/bin/make.exe")
+
+
+def rust_toolchain(version, windows):
+    # Cargo build scripts run on the host even with an explicit GNU target.
+    # Use the GNU host too, so the isolated GCC linker covers both stages.
+    return f"{version}-x86_64-pc-windows-gnu" if windows else version
+
+
+def windows_build_path(cargo_bin, msys, system_root):
+    # Rust's GNU host ships runtime DLLs too. GCC's subprocesses must find the
+    # verified compiler's matching DLLs before Rust's separate host runtimes.
+    return os.pathsep.join(map(str, [msys / "ucrt64/bin", msys / "usr/bin", cargo_bin, system_root / "System32"]))
+
+
+def verify_windows_imports(dependencies):
+    imports = {line.split("DLL Name:", 1)[1].strip().lower() for line in dependencies.splitlines() if "DLL Name:" in line}
+    allowed = {"advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "crypt32.dll", "gdi32.dll", "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "secur32.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "userenv.dll", "version.dll", "winmm.dll", "ws2_32.dll", "ucrtbase.dll", "normaliz.dll", "psapi.dll"}
+    if not imports or any(name not in allowed and not name.startswith("api-ms-win-") for name in imports):
+        raise ValueError(f"The Windows provider imports an unqualified runtime DLL: {sorted(imports)}")
+
+
+def bindgen_clang_args(msys, clang, env):
+    executable = clang / "clang.exe"
+    if not executable.is_file():
+        raise ValueError("The selected LIBCLANG_PATH must also contain native clang.exe.")
+    resource = Path(subprocess.check_output([str(executable), "-print-resource-dir"], env=env, text=True, timeout=20).strip())
+    includes = [resource / "include", msys / "ucrt64/include"]
+    if not (includes[0] / "stddef.h").is_file() or not all(path.is_dir() for path in includes):
+        raise ValueError("The selected native Clang or verified MinGW headers are missing.")
+    # A GNU Rust host does not imply a GNU default target in native libclang.
+    # Bindgen omits --target when Rust host == target, so provide it explicitly.
+    return shlex.join(["--target=x86_64-pc-windows-gnu", *[argument for path in includes for argument in ["-isystem", path.as_posix()]]])
+
+
+def isolate_workspace(source, inputs):
+    manifest = source / "Cargo.toml"
+    pristine = manifest.read_bytes()
+    if hashlib.sha256(pristine).hexdigest() != MANIFEST_SHA256:
+        raise ValueError("The pinned grav1synth Cargo manifest differs from the workspace patch guard.")
+    patched = pristine + b"\n[workspace]\n"
+    patch_text = "".join(difflib.unified_diff(
+        pristine.decode("utf-8").splitlines(keepends=True),
+        patched.decode("utf-8").splitlines(keepends=True),
+        fromfile="a/Cargo.toml", tofile="b/Cargo.toml",
+    ))
+    for name, payload in [("Cargo.pristine.toml", pristine), ("Cargo.workspace.toml", patched), ("Cargo-workspace.patch", patch_text.encode("utf-8"))]:
+        with (inputs / name).open("xb") as output:
+            output.write(payload)
+    manifest.write_bytes(patched)
+    return {"component": "grav1synth", "sourcePath": "Cargo.toml", "pristineSourceSha256": MANIFEST_SHA256, "patchedSourceSha256": hashlib.sha256(patched).hexdigest(), "patch": {"path": "build/Cargo-workspace.patch", "sha256": MEDIA.digest(inputs / "Cargo-workspace.patch")}, "workingManifest": {"path": "build/Cargo.workspace.toml", "sha256": hashlib.sha256(patched).hexdigest()}}
+
 
 def inventory(root):
     result = []
@@ -117,31 +176,41 @@ class Build:
         self.target = "x86_64-pc-windows-msvc" if self.windows else ("aarch64-apple-darwin" if platform.machine() == "arm64" else "x86_64-apple-darwin") if sys.platform == "darwin" else "x86_64-unknown-linux-gnu"
         self.rust_target = "x86_64-pc-windows-gnu" if self.windows else self.target
         self.lock = json.loads((self.inputs / "grav1synth-lock.json").read_text(encoding="utf-8"))
-        self.cargo = Path(subprocess.check_output(["rustup", "which", "--toolchain", self.lock["rustVersion"], "cargo"], text=True, timeout=20).strip())
+        self.toolchain = rust_toolchain(self.lock["rustVersion"], self.windows)
+        self.cargo = Path(subprocess.check_output(["rustup", "which", "--toolchain", self.toolchain, "cargo"], text=True, timeout=20).strip())
         self.env["PATH"] = str(self.cargo.parent) + os.pathsep + self.env.get("PATH", "")
         self.msys = msys.resolve(strict=True) if msys else None
+        self.meson, self.make = build_programs(self.msys if self.windows else None)
         if self.windows:
             if not self.msys:
                 raise ValueError("The verified isolated Windows compiler is required.")
             module(HERE / "build-package-ffmpeg.py").verify_compiler(self.msys)
-            self.env["PATH"] = os.pathsep.join(map(str, [self.cargo.parent, self.msys / "ucrt64/bin", self.msys / "usr/bin", Path(os.environ["SystemRoot"]) / "System32"]))
+            self.env["PATH"] = windows_build_path(self.cargo.parent, self.msys, Path(os.environ["SystemRoot"]))
             self.env.update(MSYSTEM="UCRT64", MSYS2_PATH_TYPE="strict", CHERE_INVOKING="1", CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=str(self.msys / "ucrt64/bin/gcc.exe"), PKG_CONFIG_ALLOW_CROSS="1")
             clang = Path(os.environ.get("LIBCLANG_PATH", str(Path(os.environ["ProgramFiles"]) / "LLVM/bin")))
             if not (clang / "libclang.dll").is_file():
                 raise ValueError("Set LIBCLANG_PATH to the native LLVM directory containing libclang.dll.")
             self.env["LIBCLANG_PATH"] = str(clang.resolve())
+            self.env["BINDGEN_EXTRA_CLANG_ARGS"] = bindgen_clang_args(self.msys, clang, self.env)
+            (self.inputs / "bindgen-environment.json").write_text(json.dumps({
+                "LIBCLANG_PATH": self.env["LIBCLANG_PATH"],
+                "BINDGEN_EXTRA_CLANG_ARGS": self.env["BINDGEN_EXTRA_CLANG_ARGS"],
+                "clangSha256": MEDIA.digest(clang / "clang.exe"),
+                "libclangSha256": MEDIA.digest(clang / "libclang.dll"),
+            }, indent=2) + "\n", encoding="utf-8")
         self.env.update(CARGO_BUILD_JOBS=str(jobs), CARGO_TARGET_DIR=str(self.root / "target"))
 
     def run(self, argv, cwd=None, capture=False, timeout=1200):
         with (self.root / "build.log").open("a", encoding="utf-8") as log:
             log.write(json.dumps({"argv": list(map(str, argv)), "cwd": str(cwd or self.root)}) + "\n")
             log.flush()
-            result = subprocess.run(list(map(str, argv)), cwd=cwd or self.root, env=self.env, stdout=subprocess.PIPE if capture else log, stderr=log, text=True, check=True, timeout=timeout)
+            result = subprocess.run(list(map(str, argv)), cwd=cwd or self.root, env=self.env, stdout=subprocess.PIPE if capture else log, stderr=log, text=True, encoding="utf-8", check=True, timeout=timeout)
             return result.stdout if capture else None
 
     def compile(self):
         archives = {name: MEDIA.download(record, self.cache) for name, record in self.lock.items() if name in {"source", "ffmpeg", "dav1d"}}
         source = MEDIA.extract(archives["source"], self.root / "source", self.lock["source"]["sourceRoot"])
+        workspace_patch = isolate_workspace(source, self.inputs)
         media = MEDIA.extract(archives["ffmpeg"], self.root / "ffmpeg", self.lock["ffmpeg"]["sourceRoot"])
         with tarfile.open(archives["dav1d"]) as outer:
             member = outer.getmember(self.lock["dav1d"]["embeddedArchive"])
@@ -154,9 +223,9 @@ class Build:
         embedded.write_bytes(payload)
         decoder = MEDIA.extract(embedded, self.root / "dav1d-source", self.lock["dav1d"]["sourceRoot"])
         prefix = self.root / "private-ffmpeg8"
-        self.run(["meson", "setup", self.root / "dav1d-build", decoder, f"--prefix={prefix.as_posix()}", "--libdir=lib", "--default-library=static", "--buildtype=release", "--wrap-mode=nodownload", "-Db_staticpic=true", "-Denable_tools=false", "-Denable_tests=false"])
-        self.run(["meson", "compile", "-C", self.root / "dav1d-build", "-j", self.jobs])
-        self.run(["meson", "install", "-C", self.root / "dav1d-build"])
+        self.run([*self.meson, "setup", self.root / "dav1d-build", decoder, f"--prefix={prefix.as_posix()}", "--libdir=lib", "--default-library=static", "--buildtype=release", "--wrap-mode=nodownload", "-Db_staticpic=true", "-Denable_tools=false", "-Denable_tests=false"])
+        self.run([*self.meson, "compile", "-C", self.root / "dav1d-build", "-j", self.jobs])
+        self.run([*self.meson, "install", "-C", self.root / "dav1d-build", "--no-rebuild"])
         self.env.update(PKG_CONFIG_PATH=str(prefix / "lib/pkgconfig"), PKG_CONFIG_LIBDIR=str(prefix / "lib/pkgconfig"))
         flags = [*CONFIGURE, f"--prefix={prefix.as_posix()}", "--pkg-config-flags=--static"]
         if self.windows:
@@ -164,7 +233,7 @@ class Build:
             self.run([self.msys / "usr/bin/bash.exe", "--noprofile", "--norc", "-c", "./configure " + shlex.join(flags)], media)
         else:
             self.run([media / "configure", *flags], media)
-        self.run(["make", f"-j{self.jobs}", "install"], media)
+        self.run([self.make, f"-j{self.jobs}", "install"], media)
         cargo_config = source / ".cargo/config.toml"
         cargo_config.parent.mkdir(exist_ok=True)
         config = self.run([self.cargo, "vendor", "--locked", "vendor"], source, capture=True, timeout=600)
@@ -172,9 +241,9 @@ class Build:
         if self.windows:
             self.env["RUSTFLAGS"] = "-C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
         self.run([self.cargo, "build", "--release", "--frozen", "--offline", "--target", self.rust_target, "--features", "ffmpeg/static"], source)
-        self.deliver(source, media, decoder, archives)
+        self.deliver(source, media, decoder, archives, workspace_patch)
 
-    def deliver(self, source, media, decoder, archives):
+    def deliver(self, source, media, decoder, archives, workspace_patch):
         delivery = self.root / "delivery"
         delivery.mkdir()
         executable = "grav1synth.exe" if self.windows else "grav1synth"
@@ -203,6 +272,9 @@ class Build:
         shutil.copy2(source / "Cargo.lock", build / "Cargo.lock")
         qualification = delivery / "qualification"
         qualification.mkdir()
+        for program in ["cargo", "rustc"]:
+            executable_path = self.cargo.parent / (program + (".exe" if self.windows else ""))
+            (qualification / f"{program}-version.txt").write_text(self.run([executable_path, "-Vv"], capture=True, timeout=20), encoding="utf-8")
         listed = self.run([delivery / executable, "presets"], capture=True, timeout=20)
         help_text = self.run([delivery / executable, "apply", "--help"], capture=True, timeout=20)
         if not all(f"  {name}  (" in listed for name in ["Super8", "MaxMid", "16mm", "Classic35", "Modern35"]) or not all(value in help_text for value in ["--preset", "--iso", "--replace"]):
@@ -213,10 +285,7 @@ class Build:
         if "avcodec" in dependencies or "avformat" in dependencies or "dav1d" in dependencies:
             raise ValueError("The provider unexpectedly depends on external media libraries.")
         if self.windows:
-            imports = {line.split("DLL Name:", 1)[1].strip().lower() for line in dependencies.splitlines() if "DLL Name:" in line}
-            allowed = {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "gdi32.dll", "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "secur32.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "userenv.dll", "version.dll", "winmm.dll", "ws2_32.dll", "ucrtbase.dll", "normaliz.dll", "psapi.dll"}
-            if not imports or any(name not in allowed and not name.startswith("api-ms-win-") for name in imports):
-                raise ValueError(f"The Windows provider imports an unqualified runtimeDLL: {sorted(imports)}")
+            verify_windows_imports(dependencies)
             compiler_lock = json.loads((HERE / "package-ffmpeg-windows-lock.json").read_text(encoding="utf-8"))
             runtime = [item for item in compiler_lock["linkedSources"] if item["base"] in {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
             if len(runtime) != 4:
@@ -231,6 +300,8 @@ class Build:
         (qualification / "dependencies.txt").write_text(dependencies, encoding="utf-8")
         shutil.copy2(self.root / "build.log", qualification / "build-commands.log")
         receipt = {"schemaVersion": 1, "target": self.target, "rustTarget": self.rust_target, "sourceCommit": self.lock["source"]["commit"], "tool": {"id": "grav1synth", "path": executable, "sha256": MEDIA.digest(delivery / executable), "version": "source " + self.lock["source"]["commit"]}, "source": records["source"], "additionalSources": [{**records["ffmpeg"], "id": "ffmpeg"}, {**records["dav1d"], "id": "dav1d"}, records["vendor"], *[item for name,item in records.items() if name.startswith("mingw-")]], "licenses": [{**item, "path": "licenses/" + item["path"]} for item in inventory(licenses)], "buildInputs": [{**item, "path": "build/" + item["path"]} for item in inventory(build)], "supportFiles": [], "qualificationFiles": [{**item, "path": "qualification/" + item["path"]} for item in inventory(qualification)], "qualification": {"presets": self.lock["presets"], "mediaWorkflows": "Run the application grain_provider and utility_containers tests against this delivery; CLI qualification alone does not establish media correctness."}, "configure": CONFIGURE}
+        receipt["sourcePatches"] = [workspace_patch]
+        receipt["rustToolchain"] = self.toolchain
         (delivery / "build-provenance.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         verify_delivery(delivery, self.target)
         print(f"Source-complete grav1synth delivery: {delivery}", flush=True)

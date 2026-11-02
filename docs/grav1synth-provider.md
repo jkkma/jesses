@@ -10,12 +10,17 @@ stock text files are embedded by `src/presets.rs` at compile time. Crates.io
 usable provider.
 
 Jesses builds the exact source with private static FFmpeg 8.1 and dav1d 1.5.4.
-The bindings locked by that source support FFmpeg 6–8.1; they cannot use the
-separate packaged FFmpeg 9 pair. The private build enables native decoders plus
-dav1d, so grain measurement retains actual FFV1/AV1 decoding. Optional library
+That source locks `ffmpeg-the-third` and `ffmpeg-sys-the-third` to
+`5.0.0+ffmpeg-8.1`; the recipe pins the matching private FFmpeg 8.1 source.
+It does not use the separate packaged FFmpeg 9 pair. Compatibility with FFmpeg 9
+has not been established by this qualification. The private build enables native
+decoders plus dav1d, so grain measurement retains actual FFV1/AV1 decoding. Optional library
 auto-detection, encoders, network access and standalone FFmpeg programs are
 disabled. The application's main FFmpeg/FFprobe selection remains independent.
-No upstream grav1synth source or embedded stock algorithm is patched.
+No grav1synth processing code or embedded stock algorithm is patched. The build
+adds an empty `[workspace]` table to the guarded working Cargo manifest so this
+standalone provider can build beneath Jesses's workspace. Its pristine and
+working manifests, exact patch and hashes are retained in the delivery.
 
 ## Build and package
 
@@ -28,11 +33,19 @@ python3 scripts/build-package-grav1synth.py \
 ```
 
 On Windows, first assemble the repository's isolated media compiler, install
-Rust's `x86_64-pc-windows-gnu` target and pass `--msys-root` to that compiler.
-`LIBCLANG_PATH` can select the native LLVM directory containing `libclang.dll`.
+the `1.98.1-x86_64-pc-windows-gnu` Rust toolchain into the selected isolated
+`RUSTUP_HOME`/`CARGO_HOME`, and pass `--msys-root` to that compiler. The recipe
+selects that exact GNU host for Cargo build scripts and the final GNU target;
+adding only a GNU standard-library target to an MSVC host is insufficient.
+`LIBCLANG_PATH` selects a native LLVM directory containing both `libclang.dll`
+and `clang.exe`. The recipe derives its resource headers from that exact Clang,
+adds only those and the verified MinGW headers for bindgen, and explicitly sets
+the GNU parsing target. Missing selected tools or headers fail before compilation.
 The independent provider executable uses GNU Rust/C tooling; the Jesses desktop
 continues to use its existing MSVC target. The recipe checks actual imports and
-refuses non-system runtime DLL dependencies.
+refuses non-system runtime DLL dependencies. The delivery records the selected
+Rust toolchain, full Cargo/rustc version output, native Clang/libclang hashes and
+the generated bindgen arguments.
 
 `scripts/grav1synth-lock.json` pins complete upstream archives, the embedded dav1d
 archive and the source's 14 stock names. Cargo vendoring preserves every locked

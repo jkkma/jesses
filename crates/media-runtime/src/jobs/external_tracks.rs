@@ -852,6 +852,15 @@ impl ExternalTracks {
         container: media_core::ContainerFormat,
     ) -> Result<(), AppError> {
         super::output_metadata::verify(settings, output)?;
+        let matroska_probe = matches!(
+            container,
+            media_core::ContainerFormat::Matroska | media_core::ContainerFormat::Webm
+        ) && output.format.as_ref().is_some_and(|format| {
+            matches!(
+                format.format_name.as_deref(),
+                Some("matroska,webm" | "matroska" | "webm")
+            )
+        });
         for (source, actual) in selected.iter().zip(&output.streams) {
             if let Some(options) = self.track_metadata(source.index, settings) {
                 for (key, expected) in [("title", &options.title), ("language", &options.language)]
@@ -868,26 +877,34 @@ impl ExternalTracks {
                         } else {
                             key
                         };
-                        let actual = actual
+                        let observed = actual
                             .tags
                             .iter()
                             .find(|(name, _)| name.eq_ignore_ascii_case(key))
-                            .map(|(_, value)| value.as_str())
-                            .filter(|value| !value.is_empty())
-                            .filter(|value| {
-                                !(iso
-                                    && expected.is_empty()
-                                    && matches!(
-                                        *value,
-                                        "VideoHandler"
-                                            | "SoundHandler"
-                                            | "SubtitleHandler"
-                                            | "TimeCodeHandler"
-                                            | "DataHandler"
-                                            | "und"
-                                    ))
-                            });
-                        if actual != (!expected.is_empty()).then_some(expected.as_str()) {
+                            .map(|(_, value)| value.as_str());
+                        let actual = observed.filter(|value| !value.is_empty()).filter(|value| {
+                            !(iso
+                                && expected.is_empty()
+                                && matches!(
+                                    *value,
+                                    "VideoHandler"
+                                        | "SoundHandler"
+                                        | "SubtitleHandler"
+                                        | "TimeCodeHandler"
+                                        | "DataHandler"
+                                        | "und"
+                                ))
+                        });
+                        // FFmpeg's Matroska demuxer suppresses language="und".
+                        // A missing TrackLanguage element instead defaults to
+                        // "eng" and is reported, so that case remains distinct.
+                        let omitted_undefined = matroska_probe
+                            && key == "language"
+                            && expected == "und"
+                            && observed.is_none();
+                        if !omitted_undefined
+                            && actual != (!expected.is_empty()).then_some(expected.as_str())
+                        {
                             return Err(AppError::new(
                                 "OUTPUT_VALIDATION_FAILED",
                                 "An explicit track title or language change was not retained.",
@@ -982,6 +999,102 @@ impl ExternalTracks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verify_track_language(
+        language: &str,
+        tags: serde_json::Value,
+        format: &str,
+        container: media_core::ContainerFormat,
+    ) -> Result<(), AppError> {
+        let source: Document = serde_json::from_value(serde_json::json!({
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+        }))
+        .unwrap();
+        let output: Document = serde_json::from_value(serde_json::json!({
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264", "tags": tags}],
+            "format": {"format_name": format}
+        }))
+        .unwrap();
+        let settings = EncodeSettings {
+            track_overrides: vec![EncodeTrackOverride {
+                stream_index: 0,
+                title: Some("Bento4 Video Handler".into()),
+                language: Some(language.into()),
+                default: None,
+                forced: None,
+            }],
+            ..Default::default()
+        };
+        ExternalTracks::default().verify_metadata_overrides(
+            &settings,
+            &[&source.streams[0]],
+            &output,
+            container,
+        )
+    }
+
+    #[test]
+    fn explicit_undefined_matroska_language_survives_ffprobe_tag_omission() {
+        for container in [
+            media_core::ContainerFormat::Matroska,
+            media_core::ContainerFormat::Webm,
+        ] {
+            verify_track_language(
+                "und",
+                serde_json::json!({"title": "Bento4 Video Handler"}),
+                "matroska,webm",
+                container,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn omitted_language_does_not_hide_explicit_language_or_title_changes() {
+        use media_core::ContainerFormat;
+        let title_only = serde_json::json!({"title": "Bento4 Video Handler"});
+        for language in ["eng", "jpn"] {
+            assert!(
+                verify_track_language(
+                    language,
+                    title_only.clone(),
+                    "matroska,webm",
+                    ContainerFormat::Matroska
+                )
+                .is_err()
+            );
+        }
+        for (tags, format, container) in [
+            (
+                serde_json::json!({"title": "Bento4 Video Handler", "language": ""}),
+                "matroska,webm",
+                ContainerFormat::Matroska,
+            ),
+            (
+                serde_json::json!({"title": "Bento4 Video Handler", "language": "eng"}),
+                "matroska,webm",
+                ContainerFormat::Matroska,
+            ),
+            (
+                serde_json::json!({"title": "Changed"}),
+                "matroska,webm",
+                ContainerFormat::Matroska,
+            ),
+            (
+                serde_json::json!({}),
+                "matroska,webm",
+                ContainerFormat::Matroska,
+            ),
+            (title_only.clone(), "unknown", ContainerFormat::Matroska),
+            (
+                serde_json::json!({"handler_name": "Bento4 Video Handler"}),
+                "mov,mp4,m4a,3gp,3g2,mj2",
+                ContainerFormat::Mp4,
+            ),
+        ] {
+            assert!(verify_track_language("und", tags, format, container).is_err());
+        }
+    }
 
     fn base_settings() -> EncodeSettings {
         EncodeSettings {

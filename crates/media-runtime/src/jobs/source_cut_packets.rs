@@ -157,26 +157,23 @@ async fn sequence(
     }
     Ok(expected.value)
 }
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn verify(
-    ffmpeg: &Path,
-    ffprobe: &Path,
-    source: &Path,
-    document: &Document,
+fn map_streams<'a>(
+    document: &'a Document,
+    actual: &'a Document,
     cut: &Path,
-    actual: &Document,
-    video_index: u32,
-    start: f64,
-    end: f64,
-    cancel: &watch::Receiver<bool>,
-) -> Result<(Vec<TrackProof>, f64), AppError> {
+) -> Result<Vec<(&'a metadata::Stream, &'a metadata::Stream)>, AppError> {
+    // FFprobe reports font attachments without a codec name. FFmpeg still
+    // copies their bytes, which metadata::verify binds by extradata hash/tags.
+    let copied = |stream: &metadata::Stream| {
+        stream.codec_name.is_some() || stream.codec_type.as_deref() == Some("attachment")
+    };
     let mut mapping = Vec::new();
     let mut cursor = 0;
     for stream in &actual.streams {
         while document
             .streams
             .get(cursor)
-            .is_some_and(|original| original.codec_name.is_none())
+            .is_some_and(|original| !copied(original))
         {
             cursor += 1;
         }
@@ -193,12 +190,25 @@ pub(super) async fn verify(
         mapping.push((original, stream));
         cursor += 1;
     }
-    if document.streams[cursor..]
-        .iter()
-        .any(|stream| stream.codec_name.is_some())
-    {
+    if document.streams[cursor..].iter().any(copied) {
         return Err(invalid(cut, "The cut omitted a known source stream."));
     }
+    Ok(mapping)
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn verify(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    source: &Path,
+    document: &Document,
+    cut: &Path,
+    actual: &Document,
+    video_index: u32,
+    start: f64,
+    end: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(Vec<TrackProof>, f64), AppError> {
+    let mapping = map_streams(document, actual, cut)?;
     let (original_video, cut_video) = mapping
         .iter()
         .find(|(original, _)| original.index == video_index)
@@ -329,4 +339,77 @@ pub(super) async fn verify(
         ));
     }
     Ok((proof, first_pts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn document(streams: Value) -> Document {
+        serde_json::from_value(json!({"streams": streams})).unwrap()
+    }
+
+    fn with_font() -> Document {
+        document(json!([
+            {"index": 0, "codec_type": "video", "codec_name": "av1", "nb_read_packets": "1"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "nb_read_packets": "1"},
+            {"index": 2, "codec_type": "subtitle", "codec_name": "ass"},
+            {"index": 3, "codec_type": "attachment", "extradata_hash": "SHA256:font",
+             "tags": {"filename": "font.ttf", "mimetype": "application/x-truetype-font"}}
+        ]))
+    }
+
+    #[test]
+    fn copied_codec_less_font_remains_in_mixed_stream_mapping() {
+        let original = with_font();
+        let actual = original.clone();
+        let mapped = map_streams(&original, &actual, Path::new("cut.mkv")).unwrap();
+        assert_eq!(mapped.len(), 4);
+        assert_eq!(mapped[3].0.extradata_hash, mapped[3].1.extradata_hash);
+        assert_eq!(mapped[3].0.tags["filename"], "font.ttf");
+        metadata::verify(
+            &original,
+            &original.streams.iter().collect::<Vec<_>>(),
+            &actual,
+        )
+        .unwrap();
+        let mut changed = actual;
+        changed.streams[3].extradata_hash = Some("SHA256:changed".into());
+        assert!(
+            metadata::verify(
+                &original,
+                &original.streams.iter().collect::<Vec<_>>(),
+                &changed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_cut_cannot_omit_or_add_codec_less_attachments() {
+        let original = with_font();
+        let mut omitted = original.clone();
+        omitted.streams.pop();
+        assert!(map_streams(&original, &omitted, Path::new("cut.mkv")).is_err());
+        let mut added = original.clone();
+        let mut extra = added.streams[3].clone();
+        extra.index = 4;
+        added.streams.push(extra);
+        assert!(map_streams(&original, &added, Path::new("cut.mkv")).is_err());
+    }
+
+    #[test]
+    fn source_cut_still_rejects_added_media_and_changed_codec_or_order() {
+        let original = with_font();
+        let mut actual = original.clone();
+        actual.streams.push(actual.streams[1].clone());
+        assert!(map_streams(&original, &actual, Path::new("cut.mkv")).is_err());
+        let mut actual = original.clone();
+        actual.streams[1].codec_name = None;
+        assert!(map_streams(&original, &actual, Path::new("cut.mkv")).is_err());
+        let mut actual = original.clone();
+        actual.streams.swap(1, 2);
+        assert!(map_streams(&original, &actual, Path::new("cut.mkv")).is_err());
+    }
 }

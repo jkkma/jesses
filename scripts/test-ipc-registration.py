@@ -32,5 +32,13 @@ class NativeCommandRegistration(unittest.TestCase):
         routes = set(re.findall(r'"([a-z0-9_]+)"', router))
         self.assertEqual(self.handlers - routes, set())
 
+    def test_job_handlers_request_a_registered_managed_state(self):
+        managed = set(re.findall(r"\bapp\.manage\(\s*([A-Z]\w*)\s*\{", self.source))
+        self.assertTrue(managed)
+        for command, parameters in re.findall(r"async\s+fn\s+(\w+)\((.*?)\)\s*->", self.source, re.S):
+            state = re.search(r"\bjobs:\s*State<\s*'_\s*,\s*(\w+)\s*>", parameters)
+            if state and command in self.handlers:
+                self.assertIn(state.group(1), managed, f"{command} requests unregistered job state {state.group(1)}")
+
 if __name__ == "__main__":
     unittest.main()

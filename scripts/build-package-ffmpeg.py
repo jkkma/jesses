@@ -46,6 +46,16 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from error
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
 def verify_compiler(root):
     receipt = json.loads((root / "jesses-toolchain.json").read_text(encoding="utf-8"))
     if receipt.get("schemaVersion") != 1 or receipt.get("lockSha256") != digest(LOCK):
@@ -169,6 +179,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--msys-root", type=Path, required=True)
+    parser.add_argument("--jobs", type=positive_jobs, default=min(os.cpu_count() or 2, 4), help="Maximum concurrent compiler jobs (default: at most 4).")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise SystemExit("This build driver currently qualifies Windows UCRT64 only.")
@@ -216,7 +227,7 @@ def main():
     env["PATH"] = os.pathsep.join(str(path) for path in (root / "ucrt64/bin", root / "usr/bin", Path(os.environ["SystemRoot"]) / "System32"))
     commands = [
         "./configure " + shlex.join(CONFIGURE),
-        f"make -j{min(os.cpu_count() or 2, 4)} ffmpeg.exe ffprobe.exe",
+        f"make -j{args.jobs} ffmpeg.exe ffprobe.exe",
     ]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
         def run_native(arguments, cwd):
@@ -234,15 +245,15 @@ def main():
         vmaf_spec = importlib.util.spec_from_file_location("vmaf_builder", recipe_inputs / "build-package-vmaf-windows.py")
         vmaf_builder = importlib.util.module_from_spec(vmaf_spec)
         vmaf_spec.loader.exec_module(vmaf_builder)
-        vmaf_prefix = vmaf_builder.build(destination, root, vmaf_archive, run_native)
+        vmaf_prefix = vmaf_builder.build(destination, root, vmaf_archive, run_native, jobs=args.jobs)
         codec_spec = importlib.util.spec_from_file_location("av1_codec_builder", recipe_inputs / "build-package-av1-codecs.py")
         codec_builder = importlib.util.module_from_spec(codec_spec)
         codec_spec.loader.exec_module(codec_builder)
-        codec_prefix, _ = codec_builder.build(destination, root, input_lock, json.loads((recipe_inputs / "standalone-tool-sources.json").read_text()), cache, stager, run_native)
+        codec_prefix, _ = codec_builder.build(destination, root, input_lock, json.loads((recipe_inputs / "standalone-tool-sources.json").read_text()), cache, stager, run_native, jobs=args.jobs)
         processing_spec = importlib.util.spec_from_file_location("processing_builder", recipe_inputs / "build-package-libplacebo-windows.py")
         processing_builder = importlib.util.module_from_spec(processing_spec)
         processing_spec.loader.exec_module(processing_builder)
-        processing_prefix = processing_builder.build(destination, root, cache, env, run_native)
+        processing_prefix = processing_builder.build(destination, root, cache, env, run_native, jobs=min(args.jobs, 2))
         env["PKG_CONFIG_PATH"] = os.pathsep.join(map(str, [processing_prefix / "lib/pkgconfig", processing_prefix / "share/pkgconfig", codec_prefix / "lib/pkgconfig", vmaf_prefix / "lib/pkgconfig", pkgconfig]))
         for command in commands:
             print(command, flush=True)

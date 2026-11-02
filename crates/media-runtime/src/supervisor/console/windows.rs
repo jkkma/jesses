@@ -10,8 +10,7 @@ use std::{
     sync::{Mutex as StdMutex, OnceLock, atomic::AtomicU64},
 };
 use windows_sys::Win32::System::Console::{
-    AllocConsole, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleTitleW,
-    WriteConsoleW,
+    AllocConsole, FreeConsole, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleTitleW, WriteConsoleW,
 };
 const FLAG: &str = "--jesses-owned-console";
 const LIMIT: u64 = 4 * 1024 * 1024;
@@ -247,7 +246,18 @@ where
         }
         Ok(())
     });
-    let ready = tokio::select! {biased;_=cancelled(cancel.clone())=>Err(SupervisorError::Cancelled),result=readiness=>match result{Ok(result)=>result.map_err(SupervisorError::Io),Err(_)=>Err(SupervisorError::Io(io::Error::new(io::ErrorKind::TimedOut,"The diagnostic console did not become ready.")))}};
+    let ready = tokio::select! {
+        biased;
+        _ = cancelled(cancel.clone()) => Err(SupervisorError::Cancelled),
+        _ = cancelled(session.cancel.subscribe()) => Err(SupervisorError::Cancelled),
+        result = readiness => match result {
+            Ok(result) => result.map_err(SupervisorError::Io),
+            Err(_) => Err(SupervisorError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The diagnostic console did not become ready.",
+            ))),
+        },
+    };
     if let Err(error) = ready {
         session.cancel.send_replace(true);
         session.joined().await.map_err(SupervisorError::Cleanup)?;
@@ -389,7 +399,11 @@ fn helper(spool: &Path, state: &Path, mode: &str, title: &str) -> io::Result<i32
     // Duplicate the inherited pipe before AllocConsole can adjust std handles.
     // Readiness never reopens a writable filesystem pathname in the helper.
     let ready = unsafe { BorrowedHandle::borrow_raw(original_stdout) }.try_clone_to_owned()?;
-    if unsafe { GetConsoleWindow() }.is_null() && unsafe { AllocConsole() } == 0 {
+    // CREATE_NO_WINDOW can leave a console process associated with a windowless
+    // console. A null GetConsoleWindow does not establish that it is detached.
+    // This owned helper always creates its own visible console, preserving the
+    // readiness pipe before either operation can replace standard handles.
+    if unsafe { FreeConsole() } == 0 || unsafe { AllocConsole() } == 0 {
         return Err(io::Error::last_os_error());
     }
     let title = title.encode_utf16().chain([0]).collect::<Vec<_>>();

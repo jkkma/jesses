@@ -25,8 +25,6 @@ use tokio::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
-#[cfg(windows)]
-const GROUP: usize = usize::MAX;
 #[cfg(not(windows))]
 const GROUP: usize = 960;
 
@@ -315,21 +313,23 @@ async fn reference(
                     "mkvmerge is required to verify this source queue's concat method.",
                 )
             })?;
+            #[cfg(not(windows))]
             let mut groups = Vec::new();
-            if paths.len() > GROUP {
+            #[cfg(not(windows))]
+            let paths = if paths.len() > GROUP {
                 for group in paths.chunks(GROUP) {
                     let mut part = reserve(joined, "group", "mkv")?;
                     mkvmerge(executable, group, rate, force_rate, &mut part, cancel).await?;
                     groups.push(part);
                 }
-                let paths = groups
+                groups
                     .iter()
                     .map(|group| group.path.clone())
-                    .collect::<Vec<_>>();
-                mkvmerge(executable, &paths, rate, force_rate, &mut output, cancel).await?;
+                    .collect::<Vec<_>>()
             } else {
-                mkvmerge(executable, &paths, rate, force_rate, &mut output, cancel).await?;
-            }
+                paths
+            };
+            mkvmerge(executable, &paths, rate, force_rate, &mut output, cancel).await?;
         }
     }
     Ok(output)

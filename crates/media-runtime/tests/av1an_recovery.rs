@@ -246,7 +246,12 @@ struct WindowsProcess {
 
 #[cfg(windows)]
 fn windows_process_inventory() -> Vec<WindowsProcess> {
-    let result = Command::new("powershell.exe")
+    use std::os::windows::process::CommandExt;
+    // The package gate deliberately leaves only System32 on PATH. Windows
+    // PowerShell is an OS tool in its own subdirectory, not a PATH media tool.
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let result = Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -254,6 +259,7 @@ fn windows_process_inventory() -> Vec<WindowsProcess> {
             "-Command",
             "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath) | ConvertTo-Json -Compress",
         ])
+        .creation_flags(0x08000000)
         .output()
         .expect("Windows process inventory must launch");
     assert!(
@@ -612,6 +618,29 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
     let manifest_path = workspace.join("manifest.json");
     let original_manifest = std::fs::read(&manifest_path).unwrap();
     let baseline: Value = serde_json::from_slice(&original_manifest).unwrap();
+    let launches = baseline["launch_artifacts"]
+        .as_array()
+        .expect("the live staged host must have durable ownership before execution");
+    assert!(!launches.is_empty());
+    for launch in launches {
+        let directory = PathBuf::from(launch["path"].as_str().unwrap());
+        let image = PathBuf::from(launch["image"]["path"].as_str().unwrap());
+        assert_eq!(directory.parent(), Some(workspace.as_path()));
+        assert_eq!(image, directory.join("av1an.exe"));
+        assert_eq!(launch["image"]["sha256"], baseline["tools"][3]["sha256"]);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
+            launch["image"]["sha256"].as_str().unwrap()
+        );
+    }
+    eprintln!(
+        "sealed crash launch ownership: {}",
+        baseline["launch_artifacts"]
+    );
+    eprintln!(
+        "completed chunks retained at crash: {}",
+        baseline["completed"].as_object().unwrap().len()
+    );
     let retained: Vec<_> = baseline["completed"]
         .as_object()
         .unwrap()
@@ -871,22 +900,48 @@ impl RetainedFile {
     }
 }
 
+async fn rejected_resume(manager: &JobManager, id: &str) -> media_core::AppError {
+    match manager.resume_job(id.to_owned()).await {
+        // Strict admission can reject a bad receipt before a job is queued.
+        Err(error) => error,
+        Ok(_) => {
+            let rejected = wait_for(manager, id, |job| job.state.is_terminal()).await;
+            assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
+            rejected
+                .error
+                .expect("Rejected resume must retain its error")
+        }
+    }
+}
+
+fn restore_tampered_fields(path: &Path, baseline: &Value, pointers: &[&str]) {
+    // A rejected real attempt can commit a new launch reservation/receipt.
+    // Restore only our explicit tampering, preserving all valid lifecycle state.
+    let mut current: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    for pointer in pointers {
+        *current.pointer_mut(pointer).unwrap() = baseline.pointer(pointer).unwrap().clone();
+    }
+    std::fs::write(path, serde_json::to_vec(&current).unwrap()).unwrap();
+}
+
 async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input: &Path) {
     let root = Path::new(&job.recovery.as_ref().unwrap().workspace);
     let manifest_path = root.join("manifest.json");
     let original = std::fs::read(&manifest_path).unwrap();
-    let mut manifest: Value = serde_json::from_slice(&original).unwrap();
+    let baseline: Value = serde_json::from_slice(&original).unwrap();
+    let mut manifest = baseline.clone();
     manifest["settings"]["crf"] = json!(10);
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert_eq!(
-        manager.resume_job(job.id.clone()).await.unwrap_err().code,
-        "RECOVERY_INVALID"
+    let rejected = manager.resume_job(job.id.clone()).await.unwrap_err();
+    assert_eq!(rejected.code, "RECOVERY_INVALID");
+    assert!(
+        rejected.message.contains("settings do not match this job"),
+        "{rejected:#?}"
     );
-    std::fs::write(&manifest_path, &original).unwrap();
+    restore_tampered_fields(&manifest_path, &baseline, &["/settings/crf"]);
 
     // A forged segment fingerprint must not substitute content from a different
     // source interval: the full decoded-source comparison remains authoritative.
-    let baseline: Value = serde_json::from_slice(&original).unwrap();
     if let Some(segments) = baseline["segments"]
         .as_array()
         .filter(|segments| segments.len() > 1)
@@ -899,43 +954,42 @@ async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input:
         forged["segments"][0]["length"] = json!(substituted.len());
         forged["segments"][0]["sha256"] = json!(format!("{:x}", Sha256::digest(&substituted)));
         std::fs::write(&manifest_path, serde_json::to_vec(&forged).unwrap()).unwrap();
-        manager.resume_job(job.id.clone()).await.unwrap();
-        let rejected = wait_for(manager, &job.id, |job| job.state.is_terminal()).await;
-        assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
-        assert_eq!(rejected.error.as_ref().unwrap().code, "RECOVERY_INVALID");
+        let rejected = rejected_resume(manager, &job.id).await;
+        assert_eq!(rejected.code, "RECOVERY_INVALID");
         assert!(
-            rejected
-                .error
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("decoded source frames"),
+            rejected.message.contains("decoded source frames"),
             "{rejected:#?}"
         );
         std::fs::write(&segment, bytes).unwrap();
-        std::fs::write(&manifest_path, &original).unwrap();
+        restore_tampered_fields(
+            &manifest_path,
+            &baseline,
+            &["/segments/0/length", "/segments/0/sha256"],
+        );
     }
 
     // av1an builds its concat list by enumerating the entire encode directory.
     // An unrecorded file must be rejected before it reaches that native parser.
     let foreign_chunk = root.join("chunks/encode/99999.ivf");
     std::fs::write(&foreign_chunk, [b'X'; 64]).unwrap();
-    manager.resume_job(job.id.clone()).await.unwrap();
-    let rejected = wait_for(manager, &job.id, |job| job.state.is_terminal()).await;
-    assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
-    assert_eq!(rejected.error.unwrap().code, "RECOVERY_INVALID");
+    let rejected = rejected_resume(manager, &job.id).await;
+    assert_eq!(rejected.code, "RECOVERY_INVALID");
+    assert!(
+        rejected.message.contains("Foreign artifact"),
+        "{rejected:#?}"
+    );
     assert_eq!(std::fs::read(&foreign_chunk).unwrap(), [b'X'; 64]);
     std::fs::remove_file(&foreign_chunk).unwrap();
 
     // Change only the saved tool fingerprint. Never modify an installed executable.
-    let mut manifest: Value = serde_json::from_slice(&original).unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
     manifest["tools"][0]["sha256"] = json!("0".repeat(64));
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    manager.resume_job(job.id.clone()).await.unwrap();
-    let rejected = wait_for(manager, &job.id, |job| job.state.is_terminal()).await;
-    assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
-    assert_eq!(rejected.error.unwrap().code, "RECOVERY_INVALID");
-    std::fs::write(&manifest_path, &original).unwrap();
+    let rejected = rejected_resume(manager, &job.id).await;
+    assert_eq!(rejected.code, "RECOVERY_INVALID");
+    assert!(rejected.message.contains("selected tools"), "{rejected:#?}");
+    restore_tampered_fields(&manifest_path, &baseline, &["/tools/0/sha256"]);
 
     // Appending harmless padding keeps the generated container readable while
     // changing its content fingerprint. Restore its exact bytes afterwards.
@@ -946,10 +1000,12 @@ async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input:
         .unwrap()
         .write_all(&[0; 16])
         .unwrap();
-    manager.resume_job(job.id.clone()).await.unwrap();
-    let rejected = wait_for(manager, &job.id, |job| job.state.is_terminal()).await;
-    assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
-    assert_eq!(rejected.error.unwrap().code, "RECOVERY_INVALID");
+    let rejected = rejected_resume(manager, &job.id).await;
+    assert_eq!(rejected.code, "RECOVERY_INVALID");
+    assert!(
+        rejected.message.contains("original source changed"),
+        "{rejected:#?}"
+    );
     std::fs::OpenOptions::new()
         .write(true)
         .open(input)
@@ -1385,6 +1441,73 @@ async fn configured_source_readers_and_fixed_chunks_stop_reopen_and_resume() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the verified Windows package whose FFMS2/BestSource readers are explicitly external"]
+async fn packaged_absent_optional_readers_reject_before_encoding() {
+    use media_core::{Av1anChunkMethod, Av1anOptions};
+    assert!(
+        std::env::var_os("JESSES_TEST_TOOL_RESOURCES").is_some(),
+        "this is explicit package capability coverage"
+    );
+    let fixture = Fixture::new();
+    let input = fixture.0.join("optional-readers-source.mkv");
+    synthesize_frames(&input, false, 96).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (method, identifier) in [
+        (Av1anChunkMethod::Ffms2, "com.vapoursynth.ffms2"),
+        (Av1anChunkMethod::Bestsource, "com.vapoursynth.bestsource"),
+    ] {
+        let destination = fixture.0.join(format!("unavailable-{method:?}.mkv"));
+        let mut encode = request(&input, &destination, VideoEncoder::SvtAv1FiveFish);
+        encode.settings.av1an_options = Some(Av1anOptions {
+            chunk_method: method,
+            ..Default::default()
+        });
+        let job = manager.start_encode(encode).await.unwrap();
+        let rejected = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+        assert_eq!(rejected.state, JobState::Failed, "{rejected:#?}");
+        let cause = rejected.error.as_ref().unwrap();
+        assert_eq!(cause.code, "AV1AN_DEPENDENCY_MISSING");
+        assert!(cause.message.contains(identifier), "{cause:?}");
+        let recovery = rejected.recovery.as_ref().unwrap();
+        assert_eq!(recovery.completed_frames, 0);
+        let root = Path::new(&recovery.workspace);
+        assert!(!root.join("chunks/chunks.json").exists());
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest["queue"].is_null());
+        assert!(manifest["completed"].as_object().unwrap().is_empty());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        eprintln!(
+            "Packaged optional reader {method:?}: exact {identifier} rejection before queue/chunk creation"
+        );
+    }
+    manager.shutdown().await;
+    assert_eq!(std::fs::read(input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg and 5fish with actual Segment decoding"]
+async fn segment_fixed_chunks_stop_reopen_and_resume_exact_source() {
+    use media_core::{Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSplitMethod};
+    qualify_options(
+        VideoEncoder::SvtAv1FiveFish,
+        true,
+        Some(Av1anOptions {
+            chunk_method: Av1anChunkMethod::Segment,
+            split_method: Av1anSplitMethod::FixedChunks,
+            maximum_chunk_frames: 120,
+            minimum_scene_frames: 12,
+            scene_downscale_height: None,
+            chunk_order: Av1anChunkOrder::Sequential,
+            ..Default::default()
+        }),
+    )
+    .await;
 }
 
 #[tokio::test]

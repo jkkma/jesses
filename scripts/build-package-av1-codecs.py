@@ -62,7 +62,7 @@ def unpack_cmake(archive, record, destination):
     return destination / record["root"]
 
 
-def build(destination, compiler, lock, tool_lock, cache, stager, run):
+def build(destination, compiler, lock, tool_lock, cache, stager, run, *, jobs=4):
     cmake_record = tool_lock["cmakeWindows"]
     cmake_archive = stager.download(cmake_record["url"], cmake_record["sha256"], cache)
     cmake_root = unpack_cmake(cmake_archive, cmake_record, destination / "av1-cmake")
@@ -76,7 +76,7 @@ def build(destination, compiler, lock, tool_lock, cache, stager, run):
         options = ["-DENABLE_TESTS=OFF", "-DENABLE_DOCS=OFF", "-DENABLE_EXAMPLES=OFF", "-DENABLE_TOOLS=OFF", "-DCONFIG_PIC=1"] if identifier == "aom" else ["-DBUILD_APPS=OFF", "-DBUILD_TESTING=OFF", "-DNATIVE=OFF", "-DSVT_AV1_PGO=OFF"]
         common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}", "-DCMAKE_INSTALL_LIBDIR=lib", "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON", "-DFETCHCONTENT_FULLY_DISCONNECTED=ON", "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON", f"-DCMAKE_C_COMPILER={(compiler / 'ucrt64/bin/gcc.exe').as_posix()}", f"-DCMAKE_CXX_COMPILER={(compiler / 'ucrt64/bin/g++.exe').as_posix()}", f"-DCMAKE_MAKE_PROGRAM={(compiler / 'ucrt64/bin/ninja.exe').as_posix()}", f"-DCMAKE_ASM_NASM_COMPILER={(compiler / 'usr/bin/nasm.exe').as_posix()}"]
         run([str(cmake), "-S", str(source), "-B", str(build_dir), *common, *options], destination)
-        run([str(cmake), "--build", str(build_dir), "--parallel", "4"], destination)
+        run([str(cmake), "--build", str(build_dir), "--parallel", str(jobs)], destination)
         run([str(cmake), "--install", str(build_dir)], destination)
     for name in ("aom.pc", "SvtAv1Enc.pc"):
         if not (prefix / "lib/pkgconfig" / name).is_file():

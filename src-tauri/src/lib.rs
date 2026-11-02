@@ -714,9 +714,11 @@ async fn import_image_sequence(
 async fn release_image_sequence(
     request: media_core::ImageSequenceReleaseRequest,
     paths: State<'_, paths::AppPaths>,
-    jobs: State<'_, JobManager>,
+    jobs: State<'_, Jobs>,
 ) -> Result<(), AppError> {
-    jobs.release_image_sequence(request, paths.cache_dir.join("image-sequences"))
+    jobs.manager.ready().await?;
+    jobs.manager
+        .release_image_sequence(request, paths.cache_dir.join("image-sequences"))
         .await
 }
 #[tauri::command]

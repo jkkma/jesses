@@ -32,6 +32,10 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() || std::env::var_os("JESSES_KEEP_TEST_ARTIFACTS").is_some() {
+            eprintln!("Subtitle fixture retained at {}", self.0.display());
+            return;
+        }
         // Every file is owned exclusively by this newly created test fixture.
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -423,7 +427,11 @@ async fn bitmap_burn_happens_in_source_coordinates_before_crop_and_resize() {
         );
         output(
             command("ffmpeg")
-                .args(["-v", "error", "-n", "-f", "lavfi", "-i", &pattern, "-i"])
+                // Preserve the independently authored SUP clock. Without
+                // -copyts FFmpeg rebases its first .250 s cue to zero.
+                .args([
+                    "-v", "error", "-n", "-copyts", "-f", "lavfi", "-i", &pattern, "-i",
+                ])
                 .arg(&bitmap)
                 .args([
                     "-map",
@@ -448,6 +456,14 @@ async fn bitmap_burn_happens_in_source_coordinates_before_crop_and_resize() {
                 .arg(&input),
         )
         .await;
+        let authored = probe(&input, &["-show_packets", "-select_streams", "s:0"]).await;
+        let cue_pts = authored["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|packet| packet["pts_time"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(cue_pts, ["0.250000", "1.500000"]);
         let original = std::fs::read(&input).unwrap();
         let destination = fixture.0.join("bitmap burned.mkv");
         let mut request = request(&input, &destination, "burnIn");

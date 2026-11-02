@@ -1,11 +1,13 @@
 """Source pin and extraction tests for packaged CPU scorers."""
 
 import importlib.util
+import hashlib
 import io
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -15,6 +17,34 @@ SPEC.loader.exec_module(SCORERS)
 
 
 class ScorerSourceTests(unittest.TestCase):
+    def test_msvc_convolve_patch_changes_only_the_outer_inline_annotation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            path = source / "lib/jxl/convolve_separable5.cc"
+            path.parent.mkdir(parents=True)
+            original = b"// retained source\nstatic JXL_MAYBE_INLINE void ConvolveRow(\n  int x) { KeepAlgorithm(x); }\nstatic JXL_MAYBE_INLINE void Helper();\n"
+            path.write_bytes(original)
+            with patch.object(SCORERS, "JXL_CONVOLVE_SHA256", hashlib.sha256(original).hexdigest()):
+                SCORERS.patch_msvc_convolve(source, root / "convolve.patch")
+            self.assertEqual(path.read_bytes(), original.replace(b"static JXL_MAYBE_INLINE void ConvolveRow(", b"static inline void ConvolveRow("))
+            self.assertIn("-static JXL_MAYBE_INLINE void ConvolveRow(", (root / "convolve.patch").read_text())
+
+    def test_msvc_convolve_patch_rejects_changed_pin_before_writing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            path = source / "lib/jxl/convolve_separable5.cc"
+            path.parent.mkdir(parents=True)
+            original = b"static JXL_MAYBE_INLINE void ConvolveRow() {}\n"
+            changed = original + b"// changed\n"
+            path.write_bytes(changed)
+            with patch.object(SCORERS, "JXL_CONVOLVE_SHA256", hashlib.sha256(original).hexdigest()):
+                with self.assertRaisesRegex(ValueError, "pinned.*convolution source"):
+                    SCORERS.patch_msvc_convolve(source, root / "convolve.patch")
+            self.assertEqual(path.read_bytes(), changed)
+            self.assertFalse((root / "convolve.patch").exists())
+
     def test_skcms_commit_root_is_removed_before_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

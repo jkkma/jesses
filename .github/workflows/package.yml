@@ -94,7 +94,7 @@ jobs:
         run: |
           grain_args=()
           if [ "$RUNNER_OS" = Windows ]; then
-            rustup target add --toolchain 1.98.1 x86_64-pc-windows-gnu
+            rustup toolchain install 1.98.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
             grain_args+=(--msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64")
           fi
           python scripts/build-package-grav1synth.py --destination "$RUNNER_TEMP/jesses-grav1synth" "${grain_args[@]}"

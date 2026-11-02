@@ -67,7 +67,10 @@ struct WindowsProcess {
 }
 
 fn process_inventory() -> Vec<WindowsProcess> {
-    let output = Command::new("powershell.exe")
+    use std::os::windows::process::CommandExt;
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let output = Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -75,6 +78,7 @@ fn process_inventory() -> Vec<WindowsProcess> {
             "-Command",
             "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name) | ConvertTo-Json -Compress",
         ])
+        .creation_flags(0x08000000)
         .output()
         .expect("Windows process inventory must launch");
     assert!(

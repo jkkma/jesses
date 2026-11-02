@@ -176,7 +176,15 @@ impl JobManager {
                 state.entries[index].snapshot.encode_settings = Some(settings.clone());
                 state.entries[index].snapshot.edited_command = None;
                 state.entries[index].snapshot.recovery = Some(locator);
-                append_log(&mut state.entries[index].snapshot,if settings.av1an_options.is_some_and(|options|options.source_workflow){"Source New Settings retains the sealed scene/encoder queue and completed chunks; new global processing arguments apply only to unfinished chunks."}else{"New-settings resume invalidated all encoded chunks and incompatible planning receipts; verified compatible prepared source bytes remain guarded."}.into());
+                let message = if settings
+                    .av1an_options
+                    .is_some_and(|options| options.source_workflow)
+                {
+                    "Source New Settings retains completed chunks and saved per-chunk encoder settings, including preset and CRF. Current FFmpeg filters apply only to unfinished chunks; current concatenation settings apply when joining them."
+                } else {
+                    "New-settings resume invalidated all encoded chunks and incompatible planning receipts; verified compatible prepared source bytes remain guarded."
+                };
+                append_log(&mut state.entries[index].snapshot, message.into());
             } else if delete_chunks {
                 state.entries[index].snapshot.recovery = Some(recovery.reset_chunks()?);
                 append_log(&mut state.entries[index].snapshot,"Encoded chunks and completion progress were deleted; verified source preparation and scene/index receipts were retained.".into());

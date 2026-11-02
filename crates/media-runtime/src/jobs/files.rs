@@ -76,7 +76,11 @@ impl Source {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(1); // FILE_SHARE_READ
+            options
+                .share_mode(1) // FILE_SHARE_READ
+                // Open directories far enough to return the explicit type
+                // error below instead of an unrelated Windows access error.
+                .custom_flags(0x02000000); // FILE_FLAG_BACKUP_SEMANTICS
         }
         let file = options.open(&path).map_err(|e| {
             error(

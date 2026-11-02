@@ -142,10 +142,14 @@ mod windows {
         cancel: watch::Receiver<bool>,
         profile: ConsoleProfile,
     ) -> Result<supervisor::CapturedOutput, SupervisorError> {
-        supervisor::with_console_profile(profile, || {
+        let result = supervisor::with_console_profile(profile, || {
             supervisor::run_capture(&spec, cancel, 1024 * 1024, Duration::from_secs(30))
         })
-        .await
+        .await;
+        if let Err(error) = &result {
+            eprintln!("Native fixture {profile:?} capture failed: {error:?}");
+        }
+        result
     }
     async fn no_orphans() {
         wait_for(|| snapshots().is_empty()).await;

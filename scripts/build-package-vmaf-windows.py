@@ -21,7 +21,7 @@ def complete_static_metadata(metadata):
     metadata.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
-def build(destination, compiler, source_archive, run):
+def build(destination, compiler, source_archive, run, *, jobs=4):
     with tarfile.open(source_archive) as outer:
         payload = outer.extractfile(f"mingw-w64-vmaf/vmaf-{VERSION}.tar.gz").read()
     if hashlib.sha256(payload).hexdigest() != EMBEDDED_SHA256:
@@ -42,7 +42,7 @@ def build(destination, compiler, source_archive, run):
     if not xxd.is_file():
         raise ValueError("Pinned xxd is required; VMAF otherwise silently omits its models.")
     run([str(python), "-I", "-m", "mesonbuild.mesonmain", "setup", str(build_dir), str(destination / f"vmaf-{VERSION}/libvmaf"), "--prefix", str(prefix), "--default-library=static", "--buildtype=release", "--wrap-mode=nodownload", "-Denable_tests=false", "-Denable_docs=false", "-Denable_tools=false", "-Denable_float=true", "-Dbuilt_in_models=true"], destination)
-    run([str(compiler / "ucrt64/bin/ninja.exe"), "-C", str(build_dir), "-j4"], destination)
+    run([str(compiler / "ucrt64/bin/ninja.exe"), "-C", str(build_dir), f"-j{jobs}"], destination)
     config = (build_dir / "src/config.h").read_text(encoding="utf-8")
     if "#define VMAF_BUILT_IN_MODELS 1" not in config:
         raise ValueError("The VMAF build did not include the required default models.")

@@ -33,6 +33,16 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from error
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
 def module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     result = importlib.util.module_from_spec(spec)
@@ -115,7 +125,7 @@ def pinned_media(media, compiler):
             raise ValueError("The shared media build inputs changed.")
     helper = module("media_builder", media / "build/scripts/build-package-ffmpeg.py")
     helper.verify_compiler(compiler)
-    runtime = [item for item in provenance["additionalSources"] if item["base"] in
+    runtime = [item for item in provenance["additionalSources"] if item.get("base") in
                {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"}]
     if len(runtime) != 4:
         raise ValueError("The shared compiler runtime sources are incomplete.")
@@ -123,7 +133,7 @@ def pinned_media(media, compiler):
 
 
 def source_record(provenance, base):
-    matches = [item for item in provenance["additionalSources"] if item["base"] == base]
+    matches = [item for item in provenance["additionalSources"] if item.get("base") == base]
     if len(matches) != 1:
         raise ValueError(f"Missing pinned source package: {base}")
     return matches[0]
@@ -181,7 +191,7 @@ def run_logged(commands, destination, env):
                            check=True, timeout=3600)
 
 
-def build_aom(destination, cache, lock, compiler, helper, stager):
+def build_aom(destination, cache, lock, compiler, helper, stager, *, jobs=8):
     pin = lock["aom"]
     archive = download_aom(pin, cache)
     source = destination / "aom-source"
@@ -215,13 +225,13 @@ def build_aom(destination, cache, lock, compiler, helper, stager):
              f"-DCMAKE_CXX_COMPILER={compiler / 'ucrt64/bin/g++.exe'}",
              f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}"]
     run_logged([([str(cmake), "-S", str(source), "-B", str(build), *flags], destination),
-                ([str(cmake), "--build", str(build), "--target", "aomenc", "--parallel", "8"], destination)],
+                ([str(cmake), "--build", str(build), "--target", "aomenc", "--parallel", str(jobs)], destination)],
                destination, env)
     public_flags = [flag for flag in flags if not flag.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER=", "-DCMAKE_MAKE_PROGRAM="))]
     return build / "aomenc.exe", archive, [source / "LICENSE", source / "PATENTS"], public_flags
 
 
-def build_vpx(destination, media, provenance, lock, compiler, helper):
+def build_vpx(destination, media, provenance, lock, compiler, helper, *, jobs=8):
     pin = lock["vpx"]
     record, package = package_record(media, provenance, "mingw-w64-libvpx")
     if record["version"] != "1.17.0-1":
@@ -269,8 +279,8 @@ def build_vpx(destination, media, provenance, lock, compiler, helper):
                  "--disable-install-srcs", "--enable-examples"]
     command = shlex.quote(shell_path(source / "configure")) + " " + " ".join(map(shlex.quote, configure))
     run_logged([([str(bash), "-c", command], build),
-                ([str(compiler / "usr/bin/make.exe"), "-j8", "target=libs"], build),
-                ([str(compiler / "usr/bin/make.exe"), "-j8", "target=examples", "vpxenc.exe"], build)], destination, env)
+                ([str(compiler / "usr/bin/make.exe"), f"-j{jobs}", "target=libs"], build),
+                ([str(compiler / "usr/bin/make.exe"), f"-j{jobs}", "target=examples", "vpxenc.exe"], build)], destination, env)
     return build / "vpxenc.exe", archive, [source / "LICENSE", source / "PATENTS"], configure
 
 
@@ -433,6 +443,7 @@ def main():
     parser.add_argument("--ffmpeg-build", type=Path, required=True)
     parser.add_argument("--msys-root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=Path("target/tool-download-cache"))
+    parser.add_argument("--jobs", type=positive_jobs, default=8, help="Maximum concurrent compiler jobs (default: 8).")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise SystemExit("This recipe builds Windows x64 deliveries only.")
@@ -448,9 +459,9 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     stager = module("media_stager", media / "build/scripts/stage-bundled-tools.py")
     if args.encoder == "aom":
-        result = build_aom(destination, cache, lock, compiler, helper, stager)
+        result = build_aom(destination, cache, lock, compiler, helper, stager, jobs=args.jobs)
     elif args.encoder == "vpx":
-        result = build_vpx(destination, media, provenance, lock, compiler, helper)
+        result = build_vpx(destination, media, provenance, lock, compiler, helper, jobs=args.jobs)
     else:
         result = assemble_x265(destination, media, provenance, compiler, lock, cache, stager)
     finish(args.encoder, destination, media, provenance, runtime, compiler, result[1], result[0],

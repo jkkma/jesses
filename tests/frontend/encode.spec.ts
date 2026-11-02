@@ -36,6 +36,10 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
     const codecs = ['copy', 'aac', 'opus', 'vorbis', 'eac3', 'mp3', 'flac'];
     for (const [index, codec] of codecs.entries()) {
       await region.getByLabel('Codec', { exact: true }).selectOption(codec);
+      if (codec === 'copy') {
+        await expect(region.getByLabel('Channels')).toHaveValue('preserve');
+        await expect(region.getByLabel('Channels')).toBeDisabled();
+      }
       await page
         .getByRole('button', {
           name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
@@ -59,6 +63,7 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
         .map((c: any) => c.payload.request),
     );
     expect(requests.map((request: any) => request.settings.audio[0].codec)).toEqual(codecs);
+    expect(requests[0].settings.audio[0].channels).toBe('preserve');
     expect(requests.every((request: any) => request.settings.audio[0].streamIndex === 1)).toBe(
       true,
     );

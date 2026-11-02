@@ -332,8 +332,15 @@ fn load(path: &Path, verify_originals: bool) -> Result<(Receipt, File), AppError
     let directory = path
         .parent()
         .ok_or_else(|| invalid(path, "Missing sequence cache directory."))?;
-    let directory_guard = open(directory, true)?;
     let mut file = open(&directory.join(RECEIPT), false)?;
+    let receipt = read_receipt(path, verify_originals, &mut file)?;
+    Ok((receipt, file))
+}
+fn read_receipt(path: &Path, verify_originals: bool, file: &mut File) -> Result<Receipt, AppError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid(path, "Missing sequence cache directory."))?;
+    let directory_guard = open(directory, true)?;
     if file
         .metadata()
         .map_err(|e| invalid(path, e.to_string()))?
@@ -358,7 +365,7 @@ fn load(path: &Path, verify_originals: bool) -> Result<(Receipt, File), AppError
     let receipt: Receipt =
         serde_json::from_slice(&bytes).map_err(|e| invalid(path, e.to_string()))?;
     if receipt.version != 1
-        || receipt.receipt_identity != identity(&file)?
+        || receipt.receipt_identity != identity(file)?
         || receipt.directory_identity != identity(&directory_guard)?
         || receipt.sequence_fingerprint != receipt.originals.fingerprint()?
     {
@@ -370,7 +377,7 @@ fn load(path: &Path, verify_originals: bool) -> Result<(Receipt, File), AppError
     if verify_originals {
         receipt.originals.verify(None)?
     }
-    Ok((receipt, file))
+    Ok(receipt)
 }
 /// Shared file locks prevent cache release while any guarded source/preview uses it.
 pub(crate) struct Guard {
@@ -1022,6 +1029,9 @@ pub async fn import_image_sequence(
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|e| invalid(&media, e.to_string()))?;
+    // Windows cannot rename the parent directory while a child file is open,
+    // even when the writer permits FILE_SHARE_DELETE.
+    drop(file);
     stage.remove_files(&copies)?;
     check(&cancel)?;
     let final_directory = cache_root.join(format!("{PREFIX}{}", hash(&bytes)));
@@ -1125,13 +1135,18 @@ pub fn release_image_sequence(
     }
     let parent = path.parent().unwrap();
     let cache_root = fs::canonicalize(cache_root).map_err(|e| invalid(parent, e.to_string()))?;
-    if parent.parent() != Some(cache_root.as_path()) {
+    let source_cache = parent
+        .parent()
+        .ok_or_else(|| invalid(&path, "Missing sequence cache directory."))?
+        .canonicalize()
+        .map_err(|e| invalid(parent, e.to_string()))?;
+    if source_cache != cache_root {
         return Err(invalid(
             &path,
             "The source is outside the application's sequence cache.",
         ));
     }
-    let lease = open(&parent.join(RECEIPT), false)?;
+    let mut lease = open(&parent.join(RECEIPT), false)?;
     lease.try_lock().map_err(|e| {
         error(
             "IMAGE_SEQUENCE_BUSY",
@@ -1139,7 +1154,9 @@ pub fn release_image_sequence(
             &path,
         )
     })?;
-    let (receipt, receipt_file) = load(&path, false)?;
+    // Windows byte-range locks are mandatory for other file handles. Read
+    // through the exclusive lease itself instead of reopening its pathname.
+    let receipt = read_receipt(&path, false, &mut lease)?;
     if receipt.sequence_fingerprint != request.sequence_fingerprint {
         return Err(invalid(
             &path,
@@ -1159,10 +1176,9 @@ pub fn release_image_sequence(
     }
     let media_guard = open(&path, false)?;
     #[cfg(unix)]
-    let receipt_id = identity(&receipt_file)?;
+    let receipt_id = identity(&lease)?;
     #[cfg(unix)]
     let media_id = identity(&media_guard)?;
-    drop(receipt_file);
     #[cfg(unix)]
     {
         if identity(&open(&path, false)?)? != media_id {
@@ -1262,6 +1278,8 @@ mod tests {
             };
             let bytes = serde_json::to_vec(&receipt).unwrap();
             receipt_file.write_all(&bytes).unwrap();
+            receipt_file.sync_all().unwrap();
+            drop(receipt_file);
             let destination = cache.join(format!("{PREFIX}{}", hash(&bytes)));
             stage.publish(&destination).unwrap();
             let path = destination.join(MEDIA);
@@ -1299,6 +1317,59 @@ mod tests {
         release_image_sequence(f.request.clone(), f.cache.clone()).unwrap();
         assert_eq!(fs::read(original).unwrap(), b"changed image");
         assert!(!f.path.exists());
+    }
+    #[tokio::test]
+    async fn release_waits_for_active_admission_but_finished_preflight_does_not_keep_cache_busy() {
+        let f = Fixture::new();
+        let manager = crate::jobs::JobManager::new(f.root.join("logs"));
+        let worker = manager.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let admission = tokio::spawn(async move {
+            worker
+                .run_preflight(0, |_| async move {
+                    entered.send(()).unwrap();
+                    finished.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started.await.unwrap();
+        assert_eq!(
+            manager
+                .release_image_sequence(f.request.clone(), f.cache.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "IMAGE_SEQUENCE_BUSY"
+        );
+        assert!(f.path.exists());
+        finish.send(()).unwrap();
+        admission.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager
+                .state
+                .lock()
+                .await
+                .preflights
+                .iter()
+                .any(|preflight| !preflight.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        manager
+            .release_image_sequence(f.request.clone(), f.cache.clone())
+            .await
+            .unwrap();
+        assert!(!f.path.exists());
+        assert_eq!(
+            fs::read(f.root.join("originals/frame.png")).unwrap(),
+            b"immutable original"
+        );
+        manager.shutdown().await;
     }
     #[cfg(target_os = "linux")]
     #[test]
