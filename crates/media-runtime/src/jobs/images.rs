@@ -17,6 +17,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::watch,
 };
+#[path = "images/implicit.rs"]
+mod implicit;
+#[path = "images/metadata.rs"]
+mod metadata;
+#[path = "images/review.rs"]
+mod review;
+#[path = "images/subtitle.rs"]
+mod subtitle;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 const LIMIT: u32 = 10_000;
@@ -39,6 +47,23 @@ fn check(cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
         ))
     } else {
         Ok(())
+    }
+}
+async fn pause_checkpoint(cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
+    if let Some(control) = supervisor::scoped_pause() {
+        control
+            .wait_until_resumed(cancel)
+            .await
+            .map_err(|cause| process_error(cause, Path::new("")))?;
+    }
+    check(cancel)
+}
+fn process_error(cause: supervisor::SupervisorError, path: &Path) -> AppError {
+    match cause {
+        supervisor::SupervisorError::Cancelled => {
+            AppError::new("JOB_CANCELED", "Image processing was canceled.", None)
+        }
+        other => error(other.to_string(), path),
     }
 }
 async fn tool(name: &str) -> Result<PathBuf, AppError> {
@@ -68,7 +93,7 @@ async fn run(
         },
         cancel.clone(),
         4 * 1024 * 1024,
-        Duration::from_secs(3600),
+        Duration::from_secs(24 * 60 * 60),
     )
     .await
     .map_err(|e| match e {
@@ -99,69 +124,194 @@ async fn run(
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
+fn frame_name(index: u32, extension: &str, source: bool) -> String {
+    if source {
+        format!("{index:08}.{extension}")
+    } else {
+        format!("frame-{index:06}.{extension}")
+    }
+}
+fn frame_pattern(extension: &str, source: bool) -> String {
+    if source {
+        format!("%8d.{extension}")
+    } else {
+        format!("frame-%06d.{extension}")
+    }
+}
 
-async fn frame_hashes(
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Pixels {
+    pub(crate) count: u32,
+    pub(crate) dimensions: (u32, u32),
+    pub(crate) digest: String,
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_pixels(
     ffmpeg: &Path,
     input: &Path,
     stream: u32,
     filter: Option<&str>,
     format: ImagePixelFormat,
-    count: u32,
+    sequence: bool,
+    device_args: &[OsString],
     cancel: &watch::Receiver<bool>,
-) -> Result<Vec<String>, AppError> {
-    let mut a = args(&["-v", "error", "-nostdin", "-i"]);
+) -> Result<Pixels, AppError> {
+    let mut a = args(&["-v", "error", "-nostdin"]);
+    a.extend_from_slice(device_args);
+    if sequence {
+        a.extend(args(&["-f", "image2", "-start_number", "1"]));
+    }
+    a.push("-i".into());
     a.push(input.as_os_str().to_owned());
     a.extend(args(&["-map", &format!("0:{stream}")]));
     if let Some(filter) = filter {
         a.extend(args(&["-vf", filter]));
     }
     a.extend(args(&[
-        "-frames:v",
-        &count.to_string(),
+        "-fps_mode",
+        "passthrough",
         "-c:v",
         "rawvideo",
         "-pix_fmt",
         format.ffmpeg(),
+        "-threads",
+        "2",
         "-f",
         "framemd5",
         "-",
     ]));
-    let data = run(ffmpeg, a, None, cancel).await?;
-    let lines = String::from_utf8(data).map_err(|e| error(e.to_string(), input))?;
-    let hashes = lines
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .map(|line| {
-            line.rsplit(',')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    if hashes.len() != count as usize
-        || hashes
-            .iter()
-            .any(|hash| hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(error("Could not verify every decoded image sample.", input));
-    }
-    Ok(hashes)
+    scan_pixel_command(ffmpeg, a, None, input, cancel).await
 }
-
+async fn scan_pixel_command(
+    ffmpeg: &Path,
+    a: Vec<OsString>,
+    cwd: Option<PathBuf>,
+    input: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Pixels, AppError> {
+    let result = supervisor::run_streaming_stdout(
+        &CommandSpec {
+            executable: ffmpeg.to_owned(),
+            args: a,
+            cwd,
+        },
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(86400),
+        |reader| {
+            use sha2::{Digest, Sha256};
+            use std::io::{BufRead, Read};
+            let mut reader = std::io::BufReader::new(reader);
+            let mut line = Vec::new();
+            let mut hash = Sha256::new();
+            let mut count = 0u32;
+            let mut dimensions = None;
+            loop {
+                line.clear();
+                let n = (&mut reader)
+                    .take(4097)
+                    .read_until(b'\n', &mut line)
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                if n > 4096 {
+                    return Err("An image frame hash record exceeds 4096 bytes.".into());
+                }
+                let text = std::str::from_utf8(&line)
+                    .map_err(|e| e.to_string())?
+                    .trim();
+                if let Some(value) = text.strip_prefix("#dimensions 0:") {
+                    let (w, h) = value
+                        .trim()
+                        .split_once('x')
+                        .ok_or("Invalid image dimensions.")?;
+                    dimensions = Some((
+                        w.parse::<u32>().map_err(|e| e.to_string())?,
+                        h.parse::<u32>().map_err(|e| e.to_string())?,
+                    ));
+                } else if !text.starts_with('#') && !text.is_empty() {
+                    let digest = text.rsplit(',').next().unwrap_or("").trim();
+                    if digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err("Invalid decoded image hash.".into());
+                    }
+                    hash.update(digest.as_bytes());
+                    count = count
+                        .checked_add(1)
+                        .ok_or("Image frame count exceeds the contract range.")?;
+                }
+            }
+            Ok(Pixels {
+                count,
+                dimensions: dimensions.ok_or("No decoded image dimensions.")?,
+                digest: format!("{:x}", hash.finalize()),
+            })
+        },
+    )
+    .await
+    .map_err(|cause| process_error(cause, input))?;
+    check(cancel)?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(error(
+            format!(
+                "The complete image stream could not be decoded: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ),
+            input,
+        ));
+    }
+    Ok(result.value)
+}
+async fn verify_frames(
+    probe: &Path,
+    input: &Path,
+    sequence: bool,
+    expected: u32,
+    size: (u32, u32),
+    pixel_format: Option<ImagePixelFormat>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    #[derive(Deserialize)]
+    struct Frame {
+        width: u32,
+        height: u32,
+        pix_fmt: String,
+    }
+    let mut a = args(&["-v", "error"]);
+    if sequence {
+        a.extend(args(&["-f", "image2", "-start_number", "1"]));
+    }
+    a.extend(args(&[
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=width,height,pix_fmt",
+        "-of",
+        "json",
+        "-i",
+    ]));
+    a.push(input.as_os_str().to_owned());
+    let result=supervisor::run_streaming_stdout(&CommandSpec{executable:probe.to_owned(),args:a,cwd:None},cancel.clone(),65536,Duration::from_secs(86400),move |reader|{let mut count=0u32;let mut mismatch=false;super::encode::frame_scan::parse(reader,|frame:Frame|{count=count.saturating_add(1);mismatch|=(frame.width,frame.height)!=size||pixel_format.is_some_and(|format|frame.pix_fmt!=format.ffmpeg());})?;if count!=expected||mismatch{return Err(format!("Image stream frame count/geometry/pixel layout changed: expected {expected} frames at {}x{}, observed {count}.",size.0,size.1))}Ok(())}).await.map_err(|cause|process_error(cause,input))?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(error(
+            "An exported image could not be completely decoded.",
+            input,
+        ));
+    }
+    check(cancel)
+}
 #[derive(Deserialize)]
 struct Probe {
     streams: Vec<Stream>,
 }
 #[derive(Deserialize)]
 struct Stream {
-    index: u32,
     codec_type: Option<String>,
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     nb_read_frames: Option<String>,
-    color_transfer: Option<String>,
     pix_fmt: Option<String>,
 }
 async fn inspect(
@@ -301,16 +451,17 @@ struct Entry {
 
 /// Holds a fresh directory reservation and removes only entries whose file
 /// identities still match the files created by this job.
-struct Directory {
-    path: PathBuf,
+pub(crate) struct Directory {
+    pub(crate) path: PathBuf,
     identity: Identity,
     #[cfg(unix)]
     identity_guard: Option<File>,
     entries: Vec<Entry>,
+    paths: std::collections::HashSet<PathBuf>,
     published: bool,
 }
 impl Directory {
-    fn new(parent: &Path) -> Result<Self, AppError> {
+    pub(crate) fn new(parent: &Path) -> Result<Self, AppError> {
         let path = parent.join(format!(".jesses-{}", id()));
         fs::create_dir(&path).map_err(|e| error(e.to_string(), &path))?;
         #[cfg(unix)]
@@ -327,6 +478,7 @@ impl Directory {
             #[cfg(unix)]
             identity_guard: Some(identity_guard),
             entries: Vec::new(),
+            paths: std::collections::HashSet::new(),
             published: false,
         })
     }
@@ -342,11 +494,9 @@ impl Directory {
         }
     }
 
-    fn create_file(&mut self, path: PathBuf) -> Result<File, AppError> {
+    pub(crate) fn create_file(&mut self, path: PathBuf) -> Result<File, AppError> {
         self.verify_directory()?;
-        if path.parent() != Some(self.path.as_path())
-            || self.entries.iter().any(|entry| entry.path == path)
-        {
+        if path.parent() != Some(self.path.as_path()) || self.paths.contains(&path) {
             return Err(error("Invalid duplicate image staging path.", &path));
         }
         let file = OpenOptions::new()
@@ -361,6 +511,7 @@ impl Directory {
         let identity_guard = file
             .try_clone()
             .map_err(|cause| error(cause.to_string(), &path))?;
+        self.paths.insert(path.clone());
         self.entries.push(Entry {
             path,
             identity,
@@ -368,10 +519,6 @@ impl Directory {
             identity_guard: Some(identity_guard),
         });
         Ok(file)
-    }
-
-    fn entry_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.entries.iter().map(|entry| &entry.path)
     }
 
     fn verify_entries(&self) -> Result<(), AppError> {
@@ -395,7 +542,7 @@ impl Directory {
             if !m.is_file() || m.file_type().is_symlink() {
                 return Err(error("Unexpected directory entry in image output.", &p));
             }
-            if !self.entries.iter().any(|entry| entry.path == p) {
+            if !self.paths.contains(&p) {
                 return Err(error(
                     "Unexpected file in image output; it was retained for review.",
                     &p,
@@ -404,7 +551,21 @@ impl Directory {
         }
         Ok(())
     }
-    fn publish(&mut self, output: &Path) -> Result<(), AppError> {
+    pub(crate) fn remove_files(
+        &mut self,
+        paths: &std::collections::HashSet<PathBuf>,
+    ) -> Result<(), AppError> {
+        self.verify_entries()?;
+        for entry in &self.entries {
+            if paths.contains(&entry.path) {
+                fs::remove_file(&entry.path).map_err(|e| error(e.to_string(), &entry.path))?;
+            }
+        }
+        self.entries.retain(|entry| !paths.contains(&entry.path));
+        self.paths.retain(|path| !paths.contains(path));
+        Ok(())
+    }
+    pub(crate) fn publish(&mut self, output: &Path) -> Result<(), AppError> {
         self.record_files()?;
         super::files::ensure_absent(output)?;
         #[cfg(target_os = "linux")]
@@ -428,11 +589,32 @@ impl Directory {
                 return Err(error(std::io::Error::last_os_error().to_string(), output));
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let from = std::ffi::CString::new(self.path.as_os_str().as_bytes())
+                .map_err(|e| error(e.to_string(), &self.path))?;
+            let to = std::ffi::CString::new(output.as_os_str().as_bytes())
+                .map_err(|e| error(e.to_string(), output))?;
+            // RENAME_EXCL is the Darwin equivalent of Linux RENAME_NOREPLACE.
+            if unsafe {
+                libc::renameatx_np(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            } != 0
+            {
+                return Err(error(std::io::Error::last_os_error().to_string(), output));
+            }
+        }
         #[cfg(windows)]
         fs::rename(&self.path, output).map_err(|e| error(e.to_string(), output))?;
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         return Err(error(
-            "Atomic image-directory publication is supported on Windows and Linux.",
+            "Atomic image-directory publication is supported on Windows, Linux and macOS.",
             output,
         ));
         self.published = true;
@@ -537,14 +719,178 @@ async fn copy_source(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn plan_qtgmc_image(
+    subtitles: &super::subtitles::Prepared,
+    source: &Source,
+    document: &super::metadata::Document,
+    stream: u32,
+    settings: &media_core::ImageProcessingSettings,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    output: &Path,
+    sequence: bool,
+    cancel: &watch::Receiver<bool>,
+    defer_vulkan: bool,
+) -> Result<(super::qtgmc::Prepared, super::encode_plan::Plan, usize), AppError> {
+    let settings = media_core::EncodeSettings {
+        encoder: media_core::VideoEncoder::X265Standalone,
+        video_stream_index: stream,
+        framing: settings.framing,
+        temporal: settings.temporal,
+        trim: settings.trim,
+        tone_map: settings.tone_map,
+        av1an_filters: settings.filters.clone(),
+        source_filters: settings.source_filters,
+        ..Default::default()
+    };
+    let selected = document.selected(&[stream])?;
+    let mut plan = super::encode_plan::Plan::build(document, &selected, &settings)?;
+    let video = selected[0];
+    let source_frames =
+        super::encode::frame_scan(ffprobe, &source.path, &mut plan, video, false, cancel, None)
+            .await?;
+    let interval = settings
+        .trim
+        .map(|trim| super::trim::Interval::build(trim, source_frames, plan.fps_num, plan.fps_den))
+        .transpose()?;
+    let count = plan.activate_temporal(interval.map_or(source_frames, |value| value.frames))?;
+    image_preflight(
+        output,
+        u32::try_from(count)
+            .map_err(|_| error("Image frame count exceeds the contract range.", output))?,
+        (plan.width, plan.height),
+        sequence,
+    )?;
+    if !(defer_vulkan && plan.requires_vulkan_tone_map()) {
+        plan.resolve_tone_map(ffmpeg, &source.path, document.duration(), cancel)
+            .await?;
+    }
+    let request_id = id();
+    let prepared = super::qtgmc::Prepared::build(
+        &source.path,
+        output,
+        &request_id,
+        &plan,
+        interval.map(|value| {
+            (
+                value.source_start_frame as u32,
+                value.source_end_frame as u32,
+            )
+        }),
+        subtitles,
+        ffmpeg,
+        cancel,
+    )
+    .await?;
+    Ok((prepared, plan, count))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_qtgmc_image(
+    subtitles: &super::subtitles::Prepared,
+    source: &Source,
+    document: &super::metadata::Document,
+    stream: u32,
+    settings: &media_core::ImageProcessingSettings,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    output: &Path,
+    sequence: bool,
+    cancel: &watch::Receiver<bool>,
+) -> Result<super::qtgmc::Prepared, AppError> {
+    let (prepared, plan, count) = plan_qtgmc_image(
+        subtitles, source, document, stream, settings, ffmpeg, ffprobe, output, sequence, cancel,
+        false,
+    )
+    .await?;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let sink = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    let execution = prepared
+        .run(
+            cancel.clone(),
+            sender,
+            &output.with_extension(format!("{}.qtgmc.log", id())),
+        )
+        .await;
+    let _ = sink.await;
+    execution?;
+    prepared.validate(ffprobe, &plan, count, cancel).await?;
+    source.verify()?;
+    Ok(prepared)
+}
+
+fn image_preflight(
+    output: &Path,
+    frames: u32,
+    size: (u32, u32),
+    sequence: bool,
+) -> Result<(), AppError> {
+    let required = u64::from(size.0)
+        .saturating_mul(u64::from(size.1))
+        .saturating_mul(16)
+        .saturating_add(65536)
+        .saturating_mul(u64::from(frames))
+        .saturating_add(16 * 1024 * 1024);
+    let available =
+        super::source_normalization::available(output.parent().expect("destination parent"))?;
+    if required > available {
+        return Err(error(
+            format!(
+                "Image export needs up to {} MiB of temporary space; {} MiB is available.",
+                required.div_ceil(1024 * 1024),
+                available / (1024 * 1024)
+            ),
+            output,
+        ));
+    }
+    #[cfg(unix)]
+    if sequence {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return Err(error(std::io::Error::last_os_error().to_string(), output));
+        }
+        let mut limit = unsafe { limit.assume_init() };
+        let required = u64::from(frames) + 256;
+        if required > limit.rlim_cur {
+            if required > limit.rlim_max {
+                return Err(error(
+                    format!(
+                        "This export needs {required} file descriptors to retain ownership guards; the process hard limit is {}.",
+                        limit.rlim_max
+                    ),
+                    output,
+                ));
+            }
+            limit.rlim_cur = required;
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+                return Err(error(std::io::Error::last_os_error().to_string(), output));
+            }
+        }
+    }
+    let _ = sequence;
+    Ok(())
+}
+
 pub async fn run_image_job(
     request: ImageRequest,
     cancel: watch::Receiver<bool>,
+) -> Result<ImageResult, AppError> {
+    run_image_job_inner(request, cancel, None).await
+}
+
+async fn run_image_job_inner(
+    request: ImageRequest,
+    cancel: watch::Receiver<bool>,
+    review: Option<std::sync::Arc<super::command_edit::Session>>,
 ) -> Result<ImageResult, AppError> {
     check(&cancel)?;
     let ffmpeg = tool("ffmpeg").await?;
     let ffprobe = tool("ffprobe").await?;
     match request {
+        request @ ImageRequest::ImplicitExport { .. } => {
+            implicit::export(request, &ffmpeg, &ffprobe, &cancel, review.as_deref()).await
+        }
         ImageRequest::ImportSequence {
             paths,
             frame_rate,
@@ -696,48 +1042,83 @@ pub async fn run_image_job(
             stream_index,
             start_frame,
             frame_count,
+            full_source,
             format,
             output_path,
             width,
             pixel_format,
+            quality,
+            processing,
         } => {
             let output = destination(&output_path)?;
-            if frame_count == 0
-                || frame_count > LIMIT
-                || start_frame.checked_add(frame_count).is_none()
-                || width.is_some_and(|w| !(1..=8192).contains(&w))
+            if (!full_source
+                && (frame_count == 0 || start_frame.checked_add(frame_count).is_none()))
+                || width.is_some_and(|w| !(1..=16384).contains(&w))
             {
                 return Err(error(
-                    "Choose 1–10000 frames and an optional width from 1 to 8192 pixels.",
+                    "Choose a positive frame interval or the full source, with an optional width from 1 through 16384.",
                     &output,
                 ));
             }
             let sequence = matches!(format, ImageOutput::PngSequence | ImageOutput::JpegSequence);
-            if pixel_format.is_some()
-                && !matches!(format, ImageOutput::Png | ImageOutput::PngSequence)
+            let png = matches!(format, ImageOutput::Png | ImageOutput::PngSequence);
+            let jpeg = matches!(format, ImageOutput::Jpeg | ImageOutput::JpegSequence);
+            let layout = pixel_format.unwrap_or(if jpeg {
+                ImagePixelFormat::Yuv420p
+            } else {
+                ImagePixelFormat::Rgb24
+            });
+            let rgb = matches!(
+                layout,
+                ImagePixelFormat::Rgb24
+                    | ImagePixelFormat::Rgba
+                    | ImagePixelFormat::Rgb48
+                    | ImagePixelFormat::Rgba64
+            );
+            if (png && !rgb)
+                || (jpeg && rgb)
+                || (format == ImageOutput::Gif && pixel_format.is_some())
             {
                 return Err(error(
-                    "Explicit RGB depth and alpha are available for PNG images only.",
+                    "PNG uses RGB24, RGBA, RGB48 or RGBA64; JPEG uses YUV420P, YUV422P or YUV444P; GIF owns its palette layout.",
                     &output,
                 ));
             }
-            if matches!(format, ImageOutput::Png | ImageOutput::Jpeg) && frame_count != 1 {
+            if png && quality.is_some() {
                 return Err(error(
-                    "Still-image output requires exactly one frame.",
+                    "PNG has no quality control; omit image quality.",
                     &output,
                 ));
             }
-            let extension = match format {
-                ImageOutput::Png | ImageOutput::PngSequence => "png",
-                ImageOutput::Jpeg | ImageOutput::JpegSequence => "jpg",
-                ImageOutput::Gif => "gif",
+            let quality = quality.unwrap_or(if format == ImageOutput::Gif { 128 } else { 3 });
+            if (format == ImageOutput::Gif && !(3..=256).contains(&quality))
+                || (jpeg && !(1..=31).contains(&quality))
+            {
+                return Err(error(
+                    "GIF palette size must be 3–256; JPEG quality must be 1–31.",
+                    &output,
+                ));
+            }
+            if matches!(format, ImageOutput::Png | ImageOutput::Jpeg)
+                && (full_source || frame_count != 1)
+            {
+                return Err(error(
+                    "Still-image output requires exactly one frame; choose an image sequence for the full video.",
+                    &output,
+                ));
+            }
+            let extension = if png {
+                "png"
+            } else if jpeg {
+                "jpg"
+            } else {
+                "gif"
             };
             if !sequence
                 && output
                     .extension()
                     .and_then(|v| v.to_str())
-                    .map(|v| v.eq_ignore_ascii_case(extension))
-                    != Some(true)
+                    .is_none_or(|value| !value.eq_ignore_ascii_case(extension))
             {
                 return Err(error(
                     format!("Choose a .{extension} destination."),
@@ -745,83 +1126,206 @@ pub async fn run_image_job(
                 ));
             }
             let source = Source::open(Path::new(&input_path))?;
-            let streams = inspect(&source.path, &ffprobe, &cancel).await?;
-            let s = streams
+            let document =
+                super::probe(&ffprobe, &source.path, &cancel, Some(&[stream_index])).await?;
+            let video = document
+                .streams
                 .iter()
                 .find(|s| s.index == stream_index && s.codec_type.as_deref() == Some("video"))
-                .ok_or_else(|| error("Select a video stream.", &source.path))?;
-            let (w, h) = geometry(s, &source.path)?;
-            if matches!(
-                s.color_transfer.as_deref(),
-                Some("smpte2084" | "arib-std-b67")
-            ) {
+                .ok_or_else(|| error("Select a source video stream.", &source.path))?;
+            let mut processing = processing.unwrap_or_default();
+            let metadata =
+                metadata::Prepared::prepare(processing.metadata.take(), &ffprobe, &cancel).await?;
+            if !full_source {
+                if processing.trim.is_some() {
+                    return Err(error(
+                        "Use a single image interval: either the legacy frame range or shared trim settings.",
+                        &output,
+                    ));
+                }
+                processing.trim = Some(media_core::VideoTrim {
+                    start_frame,
+                    end_frame_exclusive: start_frame + frame_count,
+                    time: None,
+                });
+            }
+            // Legacy width remains a fallback for old saved requests.
+            if processing.framing.resize.is_none() && processing.framing.resize_width.is_none() {
+                processing.framing.resize_width = width;
+            }
+            let had_temporal = processing.temporal.is_some();
+            let mut burn = subtitle::Burn::build(
+                &source,
+                &document,
+                video,
+                &processing,
+                &ffmpeg,
+                &ffprobe,
+                &output,
+                &cancel,
+            )
+            .await?;
+            if (review.is_some() || processing.source_filters)
+                && let Some(result) = review::export(
+                    review.as_deref(),
+                    &source,
+                    &document,
+                    video,
+                    stream_index,
+                    &processing,
+                    &burn,
+                    &metadata,
+                    &ffmpeg,
+                    &ffprobe,
+                    &output,
+                    format,
+                    layout,
+                    quality,
+                    sequence,
+                    full_source,
+                    &cancel,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+            let prepared = if processing
+                .temporal
+                .is_some_and(|value| value.qtgmc.is_some())
+            {
+                Some(
+                    prepare_qtgmc_image(
+                        &burn.prepared,
+                        &source,
+                        &document,
+                        stream_index,
+                        &processing,
+                        &ffmpeg,
+                        &ffprobe,
+                        &output,
+                        sequence,
+                        &cancel,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let prepared_document = if let Some(prepared) = &prepared {
+                Some(super::probe(&ffprobe, &prepared.video.path, &cancel, Some(&[0])).await?)
+            } else {
+                None
+            };
+            let (picture_path, picture_stream, video) =
+                if let (Some(prepared), Some(document)) = (&prepared, &prepared_document) {
+                    processing = Default::default();
+                    burn.prepared = super::subtitles::Prepared::empty();
+                    (prepared.video.path.as_path(), 0, &document.streams[0])
+                } else {
+                    (source.path.as_path(), stream_index, video)
+                };
+            let plan = super::encode_plan::image_filter_plan(
+                video,
+                &processing,
+                burn.prepared.text_filter(),
+                &ffmpeg,
+                picture_path,
+                &cancel,
+                false,
+            )
+            .await?;
+            let reference = burn
+                .scan(
+                    &ffmpeg,
+                    picture_path,
+                    picture_stream,
+                    &plan,
+                    layout,
+                    &cancel,
+                )
+                .await?;
+            if reference.count == 0 {
                 return Err(error(
-                    "Convert HDR to SDR in Quick Convert before exporting display images.",
+                    "The selected image interval contains no frames.",
                     &source.path,
                 ));
             }
-            let total = s
-                .nb_read_frames
-                .as_deref()
-                .and_then(|v| v.parse::<u32>().ok())
-                .ok_or_else(|| error("Could not verify the source frame count.", &source.path))?;
-            if start_frame + frame_count > total {
+            if !full_source && !had_temporal && reference.count != frame_count {
                 return Err(error(
                     "The selected interval extends past the last source frame.",
                     &source.path,
                 ));
             }
+            let frame_count = reference.count;
+            let size = reference.dimensions;
+            if size != (plan.width, plan.height) {
+                return Err(error(
+                    "Picture processing produced geometry different from the shared plan.",
+                    &source.path,
+                ));
+            }
+            image_preflight(&output, frame_count, size, sequence)?;
             let mut stage = Directory::new(output.parent().unwrap())?;
-            let mut filter = format!(
-                "trim=start_frame={start_frame}:end_frame={},setpts=PTS-STARTPTS",
-                start_frame + frame_count
-            );
-            if let Some(target) = width {
-                filter.push_str(&format!(",scale={target}:-1:flags=lanczos"));
-            }
-            if let Some(pixel_format) = pixel_format {
-                filter.push_str(&format!(",format={}", pixel_format.ffmpeg()));
-            }
             let destination = stage.path.join(if sequence {
-                format!("frame-%06d.{extension}")
+                frame_pattern(extension, full_source)
             } else {
                 format!("result.{extension}")
             });
-            let staged_paths = if sequence {
-                (1..=frame_count)
-                    .map(|i| stage.path.join(format!("frame-{i:06}.{extension}")))
-                    .collect::<Vec<_>>()
+            if sequence {
+                for index in 1..=frame_count {
+                    pause_checkpoint(&cancel).await?;
+                    drop(stage.create_file(stage.path.join(frame_name(
+                        index,
+                        extension,
+                        full_source,
+                    )))?);
+                }
             } else {
-                vec![destination.clone()]
-            };
-            for path in staged_paths {
-                drop(stage.create_file(path)?);
+                drop(stage.create_file(destination.clone())?);
             }
-            let mut a = args(&["-v", "error", "-nostdin", "-y", "-i"]);
-            a.push(source.path.as_os_str().to_owned());
+            let mut palette = None;
             if format == ImageOutput::Gif {
-                filter.push_str(",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=sierra2_4a");
-                a.extend(args(&[
-                    "-filter_complex",
-                    &format!("[0:{stream_index}]{filter}[gif]"),
-                    "-map",
-                    "[gif]",
-                    "-loop",
-                    "0",
-                ]));
+                let mut file =
+                    Temporary::create_extension(&output, &format!("{}-palette", id()), "png")?;
+                let mut a = burn.decoder(picture_path, picture_stream, &plan, None, Some(quality));
+                a.extend(args(&["-frames:v", "1", "-update", "1", "-threads", "2"]));
+                a.push(file.path.as_os_str().to_owned());
+                file.close_for_path_writer()?;
+                let execution = run(&ffmpeg, a, burn.cwd(), &cancel).await;
+                let rebound = file.reopen_after_path_writer();
+                execution?;
+                rebound?;
+                file.flush_nonempty_async().await?;
+                palette = Some(file);
+            }
+            let mut a = burn.decoder(
+                picture_path,
+                picture_stream,
+                &plan,
+                palette.as_ref().map(|file| file.path.as_path()),
+                None,
+            );
+            metadata.append(&mut a)?;
+            if palette.is_some() {
+                a.extend(args(&["-loop", "0", "-gifflags", "-offsetting"]));
             } else {
                 a.extend(args(&[
-                    "-map",
-                    &format!("0:{stream_index}"),
-                    "-vf",
-                    &filter,
                     "-fps_mode",
                     "passthrough",
+                    "-pix_fmt",
+                    layout.ffmpeg(),
                 ]));
-                if extension == "jpg" {
-                    a.extend(args(&["-q:v", "2"]));
-                } else if let Some(pixel_format) = pixel_format {
-                    a.extend(args(&["-c:v", "png", "-pix_fmt", pixel_format.ffmpeg()]));
+                if jpeg {
+                    a.extend(args(&[
+                        "-c:v",
+                        "mjpeg",
+                        "-qmin",
+                        "1",
+                        "-q:v",
+                        &quality.to_string(),
+                    ]));
+                } else {
+                    a.extend(args(&["-c:v", "png", "-compression_level", "3"]));
                 }
                 if !sequence {
                     a.extend(args(&["-update", "1"]));
@@ -836,78 +1340,51 @@ pub async fn run_image_job(
                 "2",
             ]));
             a.push(destination.as_os_str().to_owned());
-            let executed = run(&ffmpeg, a, None, &cancel).await;
+            let execution = run(&ffmpeg, a, burn.cwd(), &cancel).await;
             stage.record_files()?;
-            executed?;
-            let expected = if sequence { frame_count as usize } else { 1 };
-            if stage.entry_paths().filter(|p| p.is_file()).count() != expected {
+            execution?;
+            if stage.entries.len() != if sequence { frame_count as usize } else { 1 } {
                 return Err(error(
-                    "Image export produced an unexpected number of files.",
+                    "Image export produced an unexpected file count.",
                     &output,
                 ));
             }
-            let mut result_size = None;
-            let expected_hashes = if let Some(pixel_format) = pixel_format {
-                Some(
-                    frame_hashes(
-                        &ffmpeg,
-                        &source.path,
-                        stream_index,
-                        Some(&filter),
-                        pixel_format,
-                        frame_count,
-                        &cancel,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let mut observed_hashes = Vec::new();
-            for p in stage.entry_paths() {
-                let verified = inspect(p, &ffprobe, &cancel).await?;
-                let v = verified
-                    .first()
-                    .ok_or_else(|| error("An exported image cannot be decoded.", p))?;
-                let expected_frames = if format == ImageOutput::Gif {
-                    frame_count
+            verify_frames(
+                &ffprobe,
+                &destination,
+                sequence,
+                frame_count,
+                size,
+                if format == ImageOutput::Gif {
+                    None
                 } else {
-                    1
-                };
-                if v.nb_read_frames
-                    .as_deref()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    != Some(expected_frames)
-                {
+                    Some(layout)
+                },
+                &cancel,
+            )
+            .await?;
+            if png {
+                let observed = scan_pixels(
+                    &ffmpeg,
+                    &destination,
+                    0,
+                    None,
+                    layout,
+                    sequence,
+                    &[],
+                    &cancel,
+                )
+                .await?;
+                if observed != reference {
                     return Err(error(
-                        "The exported image failed decoded frame-count validation.",
-                        p,
+                        "The PNG sequence changed decoded RGB/alpha samples, frame count or dimensions.",
+                        &output,
                     ));
                 }
-                let size = geometry(v, p)?;
-                if let Some(pixel_format) = pixel_format {
-                    if v.pix_fmt.as_deref() != Some(pixel_format.ffmpeg()) {
-                        return Err(error(
-                            "The PNG output changed the selected RGB depth or alpha layout.",
-                            p,
-                        ));
-                    }
-                    observed_hashes
-                        .extend(frame_hashes(&ffmpeg, p, 0, None, pixel_format, 1, &cancel).await?);
-                }
-                if result_size.is_some_and(|v| v != size) {
-                    return Err(error("Exported images have inconsistent dimensions.", p));
-                }
-                result_size = Some(size);
             }
-            if let Some(expected_hashes) = expected_hashes
-                && observed_hashes != expected_hashes
-            {
-                return Err(error(
-                    "The PNG output changed decoded RGB or alpha samples.",
-                    &output,
-                ));
-            }
+            pause_checkpoint(&cancel).await?;
+            burn.verify()?;
+            metadata.verify()?;
             source.verify()?;
             check(&cancel)?;
             if sequence {
@@ -916,27 +1393,41 @@ pub async fn run_image_job(
                 stage.verify_entries()?;
                 fs::hard_link(&stage.entries[0].path, &output).map_err(|e| {
                     error(
-                        format!(
-                            "Could not publish the image without overwriting an existing file: {e}"
-                        ),
+                        format!("Cannot publish without overwriting an existing file: {e}"),
                         &output,
                     )
                 })?;
             }
-            let (w, h) = result_size.unwrap_or((w, h));
             Ok(ImageResult {
                 output_path: output.to_string_lossy().into_owned(),
                 frame_count,
-                width: w,
-                height: h,
+                width: size.0,
+                height: size.1,
                 notes: if format == ImageOutput::Gif {
-                    vec!["GIF uses a 256-color palette and centisecond frame timing.".into()]
+                    vec![format!(
+                        "GIF uses up to {quality} colors, Floyd-Steinberg dithering and centisecond frame timing. Palette generation and rendering are separate bounded-memory passes."
+                    )]
                 } else {
-                    vec![]
+                    Vec::new()
                 },
             })
         }
     }
+}
+
+pub(crate) async fn run_image_job_with_review(
+    request: ImageRequest,
+    cancel: watch::Receiver<bool>,
+    session: std::sync::Arc<super::command_edit::Session>,
+) -> Result<ImageResult, AppError> {
+    if matches!(request, ImageRequest::ImportSequence { .. }) {
+        return Err(AppError::new(
+            "COMMAND_EDIT_UNSUPPORTED",
+            "Edit Arguments applies to fixed-image exports in Quick Convert.",
+            None,
+        ));
+    }
+    run_image_job_inner(request, cancel, Some(session)).await
 }
 
 #[cfg(test)]
@@ -1055,6 +1546,60 @@ mod tests {
         })
         .await
         .expect("FFmpeg did not start its output");
+        owner.send_replace(true);
+        let failure = task.await.unwrap().unwrap_err();
+        assert_eq!(failure.code, "JOB_CANCELED");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFmpeg PNG encoder"]
+    async fn active_streaming_image_scan_keeps_job_canceled_code() {
+        let root = fixture("active-scan-cancel");
+        let marker = root.join("first.png");
+        let observed = marker.clone();
+        let ffmpeg = tool("ffmpeg").await.unwrap();
+        let (owner, cancel) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut command = args(&[
+                "-v",
+                "error",
+                "-nostdin",
+                "-re",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=64x48:rate=4:duration=30",
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                "-threads",
+                "2",
+            ]);
+            command.push(marker.into_os_string());
+            command.extend(args(&[
+                "-map", "0:v:0", "-c:v", "rawvideo", "-threads", "2", "-f", "framemd5", "-",
+            ]));
+            scan_pixel_command(&ffmpeg, command, None, &ffmpeg, &cancel).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observed.exists() {
+                assert!(
+                    !task.is_finished(),
+                    "Image scan exited before its first frame"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("FFmpeg scan did not produce its first frame");
+        assert!(
+            !task.is_finished(),
+            "Image scan must still be active at cancellation"
+        );
         owner.send_replace(true);
         let failure = task.await.unwrap().unwrap_err();
         assert_eq!(failure.code, "JOB_CANCELED");

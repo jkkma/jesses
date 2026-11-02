@@ -174,6 +174,9 @@ async fn explicit_png_depth_and_alpha_preserve_decoded_samples() {
         let output = fixture.0.join(format!("{:?}.png", format));
         let result = run_image_job(
             ImageRequest::Export {
+                full_source: false,
+                quality: None,
+                processing: None,
                 input_path: source.to_string_lossy().into_owned(),
                 stream_index: 0,
                 start_frame: 0,
@@ -239,6 +242,9 @@ async fn explicit_png_depth_and_alpha_preserve_decoded_samples() {
     let invalid = fixture.0.join("not-alpha.jpg");
     let error = run_image_job(
         ImageRequest::Export {
+            full_source: false,
+            quality: None,
+            processing: None,
             input_path: source.to_string_lossy().into_owned(),
             stream_index: 0,
             start_frame: 0,
@@ -444,6 +450,9 @@ async fn explicit_image_order_round_trips_through_lossless_import_and_png_export
     let directory = fixture.0.join("frames");
     let exported = run_image_job(
         ImageRequest::Export {
+            full_source: false,
+            quality: None,
+            processing: None,
             input_path: output.to_string_lossy().into_owned(),
             stream_index: 0,
             start_frame: 0,
@@ -468,6 +477,9 @@ async fn explicit_image_order_round_trips_through_lossless_import_and_png_export
     }
     let failed = run_image_job(
         ImageRequest::Export {
+            full_source: false,
+            quality: None,
+            processing: None,
             input_path: output.to_string_lossy().into_owned(),
             stream_index: 0,
             start_frame: 0,
@@ -511,6 +523,9 @@ async fn gif_and_still_exports_decode_and_cancellation_never_publishes() {
         let output = fixture.0.join(name);
         let result = run_image_job(
             ImageRequest::Export {
+                full_source: false,
+                quality: None,
+                processing: None,
                 input_path: input.to_string_lossy().into_owned(),
                 stream_index: 0,
                 start_frame: 0,
@@ -532,6 +547,9 @@ async fn gif_and_still_exports_decode_and_cancellation_never_publishes() {
     let output = fixture.0.join("canceled");
     let error = run_image_job(
         ImageRequest::Export {
+            full_source: false,
+            quality: None,
+            processing: None,
             input_path: input.to_string_lossy().into_owned(),
             stream_index: 0,
             start_frame: 0,
@@ -553,4 +571,367 @@ async fn gif_and_still_exports_decode_and_cancellation_never_publishes() {
             .to_string_lossy()
             .starts_with(".jesses-")
     }));
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe; exports 10001 tiny PNG frames"]
+async fn full_source_exports_more_than_ten_thousand_frames_and_cancellation_cleans_owned_files() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("long-tiny.mkv");
+    let mut create = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=2x2:rate=1000",
+        "-frames:v",
+        "10001",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+    ]);
+    create.push(input.as_os_str().to_owned());
+    ffmpeg(create).await;
+    let original = std::fs::read(&input).unwrap();
+    let output = fixture.0.join("complete-sequence");
+    let (_owner, cancel) = watch::channel(false);
+    let request = ImageRequest::Export {
+        input_path: input.to_string_lossy().into_owned(),
+        stream_index: 0,
+        start_frame: 0,
+        frame_count: 0,
+        full_source: true,
+        format: ImageOutput::PngSequence,
+        output_path: output.to_string_lossy().into_owned(),
+        width: None,
+        pixel_format: Some(ImagePixelFormat::Rgb24),
+        quality: None,
+        processing: None,
+    };
+    let result = run_image_job(request.clone(), cancel).await.unwrap();
+    assert_eq!(result.frame_count, 10001);
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 10001);
+    assert_eq!((result.width, result.height), (2, 2));
+    let (_owner, cancel) = watch::channel(false);
+    assert!(run_image_job(request, cancel).await.is_err());
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 10001);
+    let output = fixture.0.join("canceled-full");
+    let (owner, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_image_job(
+        ImageRequest::Export {
+            input_path: input.to_string_lossy().into_owned(),
+            stream_index: 0,
+            start_frame: 0,
+            frame_count: 0,
+            full_source: true,
+            format: ImageOutput::PngSequence,
+            output_path: output.to_string_lossy().into_owned(),
+            width: None,
+            pixel_format: None,
+            quality: None,
+            processing: None,
+        },
+        cancel,
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if std::fs::read_dir(&fixture.0).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".jesses-images")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    owner.send_replace(true);
+    let error = task.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "JOB_CANCELED");
+    assert!(!output.exists());
+    assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".jesses-images")
+    }));
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe PNG/MJPEG/GIF encoders"]
+async fn source_gif_palettes_and_jpeg_quality_and_yuv_layouts_reach_real_encoders() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("color.mkv");
+    let mut create = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=128x96:rate=8:duration=0.5",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+    ]);
+    create.push(input.as_os_str().to_owned());
+    ffmpeg(create).await;
+    let original = std::fs::read(&input).unwrap();
+    for palette in [8, 128] {
+        let output = fixture.0.join(format!("palette-{palette}.gif"));
+        let (_owner, cancel) = watch::channel(false);
+        let result = run_image_job(
+            ImageRequest::Export {
+                input_path: input.to_string_lossy().into_owned(),
+                stream_index: 0,
+                start_frame: 0,
+                frame_count: 0,
+                full_source: true,
+                format: ImageOutput::Gif,
+                output_path: output.to_string_lossy().into_owned(),
+                width: None,
+                pixel_format: None,
+                quality: Some(palette),
+                processing: None,
+            },
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.frame_count, 4);
+        let decoded = pixels(&output).await;
+        let colors = decoded
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            colors <= palette as usize,
+            "palette {palette}: {colors} colors"
+        );
+        if palette == 128 {
+            assert!(colors > 8);
+        }
+    }
+    let mut quality_sizes = Vec::new();
+    for (index, layout, quality) in [
+        (0, ImagePixelFormat::Yuv420p, 3),
+        (1, ImagePixelFormat::Yuv422p, 3),
+        (2, ImagePixelFormat::Yuv444p, 1),
+        (3, ImagePixelFormat::Yuv444p, 31),
+    ] {
+        let output = fixture.0.join(format!("jpeg-{index}"));
+        let (_owner, cancel) = watch::channel(false);
+        let result = run_image_job(
+            ImageRequest::Export {
+                input_path: input.to_string_lossy().into_owned(),
+                stream_index: 0,
+                start_frame: 0,
+                frame_count: 0,
+                full_source: true,
+                format: ImageOutput::JpegSequence,
+                output_path: output.to_string_lossy().into_owned(),
+                width: None,
+                pixel_format: Some(layout),
+                quality: Some(quality),
+                processing: None,
+            },
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.frame_count, 4);
+        let first = output.join("00000001.jpg");
+        let mut a = args(&["-v", "error", "-show_streams", "-of", "json"]);
+        a.push(first.as_os_str().to_owned());
+        let document = ffprobe(a).await;
+        assert_eq!(document["streams"][0]["pix_fmt"], layout.ffmpeg());
+        if index >= 2 {
+            quality_sizes.push(std::fs::metadata(first).unwrap().len());
+        }
+    }
+    assert!(
+        quality_sizes[0] > quality_sizes[1],
+        "JPEG q1 should retain more detail than q31: {quality_sizes:?}"
+    );
+    assert_eq!(std::fs::read(input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe CPU zscale/tonemap and image encoders"]
+async fn full_source_images_apply_shared_time_trim_geometry_fps_tonemap_and_filter_rows() {
+    use media_core::*;
+    let fixture = Fixture::new();
+    let input = fixture.0.join("pq.mkv");
+    let mut create = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=128x96:rate=24:duration=0.5",
+        "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-chroma_sample_location",
+        "left",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+    ]);
+    create.push(input.as_os_str().to_owned());
+    ffmpeg(create).await;
+    let original = std::fs::read(&input).unwrap();
+    let processing = ImageProcessingSettings {
+        metadata: None,
+        subtitle_burn_in: None,
+        trim: Some(VideoTrim {
+            start_frame: 0,
+            end_frame_exclusive: 0,
+            time: Some(VideoTimeTrim {
+                start_milliseconds: 125,
+                end_milliseconds: 375,
+                ..Default::default()
+            }),
+        }),
+        temporal: Some(TemporalSettings {
+            frame_rate: Some(FrameRate {
+                numerator: 12,
+                denominator: 1,
+            }),
+            ..Default::default()
+        }),
+        tone_map: Some(ToneMapSettings {
+            source_workflow: false,
+            algorithm: Some(ToneMapAlgorithm::Hable),
+            source_peak_nits: 1000,
+            backend: ToneMapBackend::Cpu,
+            peak_mode: ToneMapPeakMode::Manual,
+            hdr10_base_layer: false,
+        }),
+        framing: VideoFraming {
+            crop: CropSettings {
+                top: 4,
+                right: 4,
+                bottom: 4,
+                left: 4,
+            },
+            resize_width: Some(60),
+            borders: BorderSettings {
+                top: 2,
+                right: 2,
+                bottom: 2,
+                left: 2,
+            },
+            ..Default::default()
+        },
+        filters: vec!["hue=s=0".into()],
+        source_filters: false,
+    };
+    let output = fixture.0.join("processed");
+    let (_owner, cancel) = watch::channel(false);
+    let result = run_image_job(
+        ImageRequest::Export {
+            input_path: input.to_string_lossy().into_owned(),
+            stream_index: 0,
+            start_frame: 0,
+            frame_count: 0,
+            full_source: true,
+            format: ImageOutput::PngSequence,
+            output_path: output.to_string_lossy().into_owned(),
+            width: None,
+            pixel_format: Some(ImagePixelFormat::Rgb24),
+            quality: None,
+            processing: Some(processing),
+        },
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.frame_count, 3);
+    assert_eq!((result.width, result.height), (64, 48));
+    let values = pixels(&output.join("00000001.png")).await;
+    assert_eq!(values.len(), 64 * 48 * 3);
+    assert!(
+        values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|rgb| rgb[0].abs_diff(rgb[1]) <= 1 && rgb[1].abs_diff(rgb[2]) <= 1)
+    );
+    assert_eq!(&values[..3], &[0, 0, 0]);
+    assert_eq!(std::fs::read(input).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe BWDIF/YADIF filters and PNG encoder"]
+async fn full_source_images_use_both_deinterlacers_and_requested_field_rate() {
+    use media_core::*;
+    let fixture = Fixture::new();
+    let input = fixture.0.join("interlaced.mkv");
+    let mut create = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=128x96:rate=48:duration=0.25",
+        "-vf",
+        "tinterlace=mode=interleave_top,setparams=field_mode=tff:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+    ]);
+    create.push(input.as_os_str().to_owned());
+    ffmpeg(create).await;
+    for engine in [DeinterlaceEngine::Bwdif, DeinterlaceEngine::Yadif] {
+        for mode in [DeinterlaceMode::Frame, DeinterlaceMode::Bob] {
+            let output = fixture.0.join(format!("{engine:?}-{mode:?}"));
+            let (_owner, cancel) = watch::channel(false);
+            let result = run_image_job(
+                ImageRequest::Export {
+                    input_path: input.to_string_lossy().into_owned(),
+                    stream_index: 0,
+                    start_frame: 0,
+                    frame_count: 0,
+                    full_source: true,
+                    format: ImageOutput::PngSequence,
+                    output_path: output.to_string_lossy().into_owned(),
+                    width: None,
+                    pixel_format: Some(ImagePixelFormat::Rgb24),
+                    quality: None,
+                    processing: Some(ImageProcessingSettings {
+                        temporal: Some(TemporalSettings {
+                            deinterlace: Some(DeinterlaceSettings {
+                                engine,
+                                mode,
+                                field_order: FieldOrder::TopFirst,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                },
+                cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.frame_count,
+                if mode == DeinterlaceMode::Bob { 12 } else { 6 }
+            );
+        }
+    }
 }
