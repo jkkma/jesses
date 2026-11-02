@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "znedi3SourceCommit": "fc540224e887dbce773c02c2eba22ca53252b614",
+  "submodules": [
+    {
+      "id": "znedi3-graphengine",
+      "repo": "sekrit-twc/graphengine",
+      "commit": "7bb77a5c062c610e7f44df6a59155cc3ab3e452a",
+      "url": "https://codeload.github.com/sekrit-twc/graphengine/tar.gz/7bb77a5c062c610e7f44df6a59155cc3ab3e452a",
+      "sha256": "8a73a9ee1cbb2e62e182b0501365d71969165157e8ef6308cf76e2e053e44102",
+      "path": "znedi3-graphengine-source.tar.gz"
+    },
+    {
+      "id": "znedi3-vsxx",
+      "repo": "sekrit-twc/vsxx",
+      "commit": "11eb026af5517d69e1d3d6258d1b2c2040c508e7",
+      "url": "https://codeload.github.com/sekrit-twc/vsxx/tar.gz/11eb026af5517d69e1d3d6258d1b2c2040c508e7",
+      "sha256": "2f0a453543b62386ef6050d56d12a991507d733f15aae0b5e1930ac4bcb2f0e7",
+      "path": "znedi3-vsxx-source.tar.gz"
+    }
+  ],
+  "presets": ["Very Fast", "Faster", "Fast", "Medium", "Slow", "Slower", "Very Slow", "Placebo"]
+}

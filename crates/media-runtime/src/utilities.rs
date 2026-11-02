@@ -10,8 +10,8 @@ use crate::{
     discovery::find_executable,
     jobs::files::{Source, Temporary},
     supervisor::{
-        ChildEnvironment, CommandSpec, SupervisorError, run_capture, run_capture_with_environment,
-        run_streaming_stdout,
+        self, ChildEnvironment, CommandSpec, SupervisorError, run_capture,
+        run_capture_with_environment, run_streaming_stdout,
     },
 };
 use media_core::{
@@ -39,8 +39,20 @@ const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const MEDIA_LIMIT: Duration = Duration::from_secs(6 * 60 * 60);
 const PROBE_LIMIT: Duration = Duration::from_secs(60);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+mod auto_outputs;
+mod batch;
+pub use auto_outputs::{UtilityOutputReservations, prepare_utility_outputs};
+mod progress;
+pub use progress::with_utility_progress;
+mod ladder_formats;
+mod ladder_options;
 mod ladder_scorers;
+mod video_container;
+pub use batch::run_utility_batch;
+mod deinterlace_resolution;
+mod grain_measure;
 mod temporal_exports;
+pub use deinterlace_resolution::resolve_deinterlace;
 
 fn error(code: &str, message: impl Into<String>, path: Option<&Path>) -> AppError {
     AppError::new(
@@ -330,17 +342,58 @@ fn ocr_environment(tesseract: &Path) -> Result<ChildEnvironment, AppError> {
     Ok(ChildEnvironment {
         path: Some(path),
         variables,
+        dynamic_variables: Vec::new(),
     })
 }
 
 fn diagnostic_tail(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    let raw = String::from_utf8_lossy(bytes);
+    let text = raw
+        .lines()
+        .filter(|line| {
+            !line.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key,
+                    "frame"
+                        | "fps"
+                        | "bitrate"
+                        | "total_size"
+                        | "out_time_us"
+                        | "out_time_ms"
+                        | "out_time"
+                        | "dup_frames"
+                        | "drop_frames"
+                        | "speed"
+                        | "progress"
+                ) || (key.starts_with("stream_") && key.ends_with("_q"))
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let chars: Vec<char> = text.chars().collect();
     chars[chars.len().saturating_sub(2400)..]
         .iter()
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+fn progress_arguments(executable: &Path, mut args: Vec<OsString>) -> Vec<OsString> {
+    if progress::active()
+        && executable
+            .file_stem()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ffmpeg"))
+        && args.iter().any(|arg| arg == "-i")
+    {
+        // Five-second machine updates keep even a six-hour run's capture bounded.
+        args.splice(
+            0..0,
+            ["-progress", "pipe:2", "-stats_period", "5", "-nostats"]
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    args
 }
 
 async fn capture(
@@ -350,6 +403,7 @@ async fn capture(
     limit: Duration,
     path: Option<&Path>,
 ) -> Result<crate::supervisor::CapturedOutput, AppError> {
+    let args = progress_arguments(&executable, args);
     run_capture(
         &CommandSpec {
             executable,
@@ -372,6 +426,7 @@ async fn capture_with_environment(
     path: Option<&Path>,
     environment: &ChildEnvironment,
 ) -> Result<crate::supervisor::CapturedOutput, AppError> {
+    let args = progress_arguments(&executable, args);
     run_capture_with_environment(
         &CommandSpec {
             executable,
@@ -395,7 +450,12 @@ async fn checked(
     path: Option<&Path>,
     action: &str,
 ) -> Result<crate::supervisor::CapturedOutput, AppError> {
-    let output = capture(executable, args, cancel, limit, path).await?;
+    progress::phase("tool", action);
+    let profile = supervisor::source_tool_console_profile(&executable);
+    let output = supervisor::with_console_profile(profile, || {
+        capture(executable, args, cancel, limit, path)
+    })
+    .await?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -428,8 +488,12 @@ async fn checked_with_environment(
     action: &str,
     environment: &ChildEnvironment,
 ) -> Result<crate::supervisor::CapturedOutput, AppError> {
-    let output =
-        capture_with_environment(executable, args, cancel, limit, path, environment).await?;
+    progress::phase("tool", action);
+    let profile = supervisor::source_tool_console_profile(&executable);
+    let output = supervisor::with_console_profile(profile, || {
+        capture_with_environment(executable, args, cancel, limit, path, environment)
+    })
+    .await?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -587,6 +651,7 @@ async fn ffmpeg_encoders(
         (LadderEncoder::Hevc, "libx265"),
         (LadderEncoder::Av1, "libsvtav1"),
         (LadderEncoder::Vp9, "libvpx-vp9"),
+        (LadderEncoder::AomAv1, "libaom-av1"),
     ]
     .into_iter()
     .filter_map(|(encoder, name)| text.contains(name).then_some(encoder))
@@ -807,6 +872,7 @@ struct ProbeDocument {
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<Value>,
+    start_time: Option<Value>,
     #[serde(default)]
     tags: BTreeMap<String, String>,
 }
@@ -844,6 +910,7 @@ struct ProbeStream {
     chroma_location: Option<String>,
     nb_read_frames: Option<Value>,
     extradata_size: Option<u64>,
+    extradata_hash: Option<String>,
     #[serde(default)]
     disposition: BTreeMap<String, u8>,
     #[serde(default)]
@@ -879,6 +946,8 @@ async fn probe(
         "-show_streams".into(),
         "-show_format".into(),
         "-show_chapters".into(),
+        "-show_data_hash".into(),
+        "sha256".into(),
     ];
     if count_frames {
         args.push("-count_frames".into());
@@ -893,13 +962,15 @@ async fn probe(
         "Media inspection",
     )
     .await?;
-    serde_json::from_slice(&output.stdout).map_err(|cause| {
+    let document: ProbeDocument = serde_json::from_slice(&output.stdout).map_err(|cause| {
         error(
             "UTILITY_PROBE_INVALID",
             format!("FFprobe returned invalid media metadata: {cause}"),
             Some(source),
         )
-    })
+    })?;
+    progress::media(&document);
+    Ok(document)
 }
 
 fn duration(document: &ProbeDocument) -> Option<f64> {
@@ -1098,7 +1169,27 @@ fn compatible_streams_mode(
     for (ordinal, (left, right)) in expected.streams.iter().zip(&actual.streams).enumerate() {
         let mut left_signature = stream_signature(left);
         let mut right_signature = stream_signature(right);
+        if header_carried_stream(left, expected) && header_carried_stream(right, actual) {
+            // Regenerated ISO chapter tracks may use another integer clock.
+            // Their complete header bytes and actual chapter times/tags are
+            // verified independently; a clock denominator is not content.
+            left_signature.remove("timeBase");
+            right_signature.remove("timeBase");
+        }
         if !compare_color {
+            // Color editing may round-trip through Matroska and restore the
+            // original container. Exact packet PTS/DTS are verified separately;
+            // equivalent time-base denominators need not be byte-identical.
+            left_signature.remove("timeBase");
+            right_signature.remove("timeBase");
+            // Codec tags identify their container representation (e.g. avc1);
+            // the codec and full encoded packets remain independently checked.
+            left_signature.remove("codecTag");
+            right_signature.remove("codecTag");
+            // Average rates are derived from container endpoint rounding. The
+            // complete ordered packet PTS/DTS/durations are checked below.
+            left_signature.remove("frameRate");
+            right_signature.remove("frameRate");
             for name in [
                 "colorRange",
                 "colorSpace",
@@ -1886,15 +1977,21 @@ async fn nonvideo_packet_evidence(
     cancel: &watch::Receiver<bool>,
 ) -> Result<Vec<PacketEvidence>, AppError> {
     let mut evidence = Vec::new();
-    for stream in document
-        .streams
-        .iter()
-        .filter(|stream| stream.codec_type.as_deref() != Some("video"))
-    {
+    for stream in document.streams.iter().filter(|stream| {
+        stream.codec_type.as_deref() != Some("video") && !header_carried_stream(stream, document)
+    }) {
         check_cancel(cancel)?;
         evidence.push(packet_evidence(ffprobe, source, stream.index, cancel).await?);
     }
     Ok(evidence)
+}
+
+fn header_carried_stream(stream: &ProbeStream, document: &ProbeDocument) -> bool {
+    stream.codec_type.as_deref() == Some("attachment")
+        || (!document.chapters.is_empty()
+            && stream.codec_type.as_deref() == Some("data")
+            && stream.codec_name.as_deref() == Some("bin_data")
+            && stream.codec_tag_string.as_deref() == Some("text"))
 }
 
 fn validate_nonvideo_packet_evidence(
@@ -1961,6 +2058,23 @@ async fn validate_grain_media(
 ) -> Result<f64, AppError> {
     compatible_streams(expected_document, actual_document, actual_path)?;
     compatible_container_metadata(expected_document, actual_document, actual_path)?;
+    for (expected, actual) in expected_document
+        .streams
+        .iter()
+        .zip(&actual_document.streams)
+    {
+        if header_carried_stream(expected, expected_document) {
+            let hash=expected.extradata_hash.as_deref().filter(|hash|hash.starts_with("SHA256:")&&hash.len()==71)
+                .ok_or_else(||error("UTILITY_VALIDATION_FAILED","A header-carried attachment/chapter track has no complete SHA-256 identity.",Some(actual_path)))?;
+            if actual.extradata_hash.as_deref() != Some(hash) {
+                return Err(error(
+                    "UTILITY_VALIDATION_FAILED",
+                    "An attachment/chapter track's complete header payload changed.",
+                    Some(actual_path),
+                ));
+            }
+        }
+    }
     let actual_evidence =
         grain_media_evidence(ffprobe, actual_path, actual_document, cancel).await?;
     validate_full_decode(ffmpeg, actual_path, cancel).await?;
@@ -2072,52 +2186,83 @@ async fn keyframe_at_or_before(
     source: &Path,
     stream_index: u32,
     requested: f64,
+    minimum: f64,
     cancel: &watch::Receiver<bool>,
 ) -> Result<f64, AppError> {
-    let interval = format!("{requested:.9}%+0.25");
-    let output = checked(
-        ffprobe.to_owned(),
-        vec![
-            "-v".into(),
-            "error".into(),
-            "-threads".into(),
-            "2".into(),
-            "-select_streams".into(),
-            stream_index.to_string().into(),
-            "-skip_frame".into(),
-            "nokey".into(),
-            "-read_intervals".into(),
-            interval.into(),
-            "-show_frames".into(),
-            "-show_entries".into(),
-            "frame=best_effort_timestamp_time".into(),
-            "-of".into(),
-            "csv=p=0".into(),
-            "-i".into(),
-            os(source),
-        ],
-        cancel,
+    // Packet flags avoid decoder look-ahead skipping the preceding keyframe,
+    // especially for transport streams whose seek index lands after that frame.
+    let args = vec![
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        stream_index.to_string().into(),
+        "-read_intervals".into(),
+        format!("{minimum:.9}%{requested:.9}").into(),
+        "-show_packets".into(),
+        "-show_entries".into(),
+        "packet=pts_time,flags".into(),
+        "-of".into(),
+        "compact=p=0:nk=0".into(),
+        os(source),
+    ];
+    let result = run_streaming_stdout(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        65536,
         PROBE_LIMIT,
-        Some(source),
-        "Keyframe inspection",
+        move |reader| {
+            let mut reader = BufReader::new(reader);
+            let mut line = Vec::new();
+            let mut keyframe = None::<f64>;
+            loop {
+                line.clear();
+                let size = (&mut reader)
+                    .take(4097)
+                    .read_until(b'\n', &mut line)
+                    .map_err(|cause| cause.to_string())?;
+                if size == 0 {
+                    break;
+                }
+                if size > 4096 {
+                    return Err("A keyframe packet record exceeds its bound.".into());
+                }
+                let text = std::str::from_utf8(&line).map_err(|cause| cause.to_string())?;
+                let fields = text
+                    .trim()
+                    .split('|')
+                    .filter_map(|field| field.split_once('='))
+                    .collect::<BTreeMap<_, _>>();
+                if fields.get("flags").is_some_and(|flags| flags.contains('K'))
+                    && let Some(pts) = fields
+                        .get("pts_time")
+                        .and_then(|pts| pts.parse::<f64>().ok())
+                        .filter(|pts| {
+                            pts.is_finite() && *pts >= minimum - 0.002 && *pts <= requested + 0.002
+                        })
+                {
+                    keyframe = Some(keyframe.map_or(pts, |previous| previous.max(pts)));
+                }
+            }
+            Ok(keyframe)
+        },
     )
-    .await?;
-    let mut candidates = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= requested + 0.002)
-        .collect::<Vec<_>>();
-    candidates.sort_by(f64::total_cmp);
-    candidates.first().copied().or_else(|| (requested <= 0.002).then_some(0.0)).ok_or_else(|| {
-        error(
+    .await
+    .map_err(|cause| process_error(cause, Some(source)))?;
+    if !result.status.success() {
+        return Err(error(
             "UTILITY_KEYFRAME_NOT_FOUND",
-            "No usable video keyframe was found at or before the requested start. Choose another start point.",
+            String::from_utf8_lossy(&result.stderr),
             Some(source),
-        )
-    })
+        ));
+    }
+    result.value.or_else(||(requested<=minimum+0.002).then_some(minimum)).ok_or_else(||error("UTILITY_KEYFRAME_NOT_FOUND","No usable video keyframe was found at or before the requested start. Choose another start point.",Some(source)))
 }
 
-async fn run_keyframe_cut(
+pub(crate) async fn run_keyframe_cut(
     request: KeyframeCutRequest,
     cancel: &watch::Receiver<bool>,
 ) -> Result<UtilityResult, AppError> {
@@ -2134,7 +2279,7 @@ async fn run_keyframe_cut(
     }
     let source = Source::open(valid_absolute(&request.input_path)?)?;
     let output = destination(&request.output_path, &[&source])?;
-    require_mkv(&output, "Lossless cut")?;
+    let (output_format, output_extension) = video_container::format(&output)?;
     let identity = fingerprint(&source)?;
     let ffprobe = tool("ffprobe", "Lossless keyframe cuts").await?;
     let ffmpeg = tool("ffmpeg", "Lossless keyframe cuts").await?;
@@ -2164,14 +2309,28 @@ async fn run_keyframe_cut(
             Some(&source.path),
         ));
     }
-    let actual_start = keyframe_at_or_before(
+    let origin = input
+        .format
+        .as_ref()
+        .and_then(|format| format.start_time.as_ref())
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .or_else(|| value.as_f64())
+        })
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let actual_start_absolute = keyframe_at_or_before(
         &ffprobe,
         &source.path,
         video.index,
-        request.start_seconds,
+        request.start_seconds + origin,
+        origin,
         cancel,
     )
     .await?;
+    let actual_start = (actual_start_absolute - origin).max(0.0);
     let actual_end = request.end_seconds.min(source_duration);
     if actual_end <= actual_start {
         return Err(error(
@@ -2180,35 +2339,39 @@ async fn run_keyframe_cut(
             Some(&source.path),
         ));
     }
-    let temporary = Temporary::create(&output, &nonce("cut"))?;
+    let temporary = Temporary::create_extension(&output, &nonce("cut"), output_extension)?;
+    let mut cut_args = vec![
+        "-hide_banner".into(),
+        "-v".into(),
+        "warning".into(),
+        "-nostdin".into(),
+        "-ss".into(),
+        format!("{actual_start:.9}").into(),
+        "-i".into(),
+        os(&source.path),
+        "-t".into(),
+        format!("{:.9}", actual_end - actual_start).into(),
+        "-map".into(),
+        "0".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+        "-c".into(),
+        "copy".into(),
+        "-copypriorss".into(),
+        "0".into(),
+        "-avoid_negative_ts".into(),
+        "make_zero".into(),
+        "-y".into(),
+        "-f".into(),
+        output_format.into(),
+    ];
+    video_container::mux_metadata(&mut cut_args, &input, output_format);
+    cut_args.push(os(&temporary.path));
     let tool_output = checked(
         ffmpeg.clone(),
-        vec![
-            "-hide_banner".into(),
-            "-v".into(),
-            "warning".into(),
-            "-nostdin".into(),
-            "-ss".into(),
-            format!("{actual_start:.9}").into(),
-            "-i".into(),
-            os(&source.path),
-            "-t".into(),
-            format!("{:.9}", actual_end - actual_start).into(),
-            "-map".into(),
-            "0".into(),
-            "-map_metadata".into(),
-            "0".into(),
-            "-map_chapters".into(),
-            "0".into(),
-            "-c".into(),
-            "copy".into(),
-            "-avoid_negative_ts".into(),
-            "make_zero".into(),
-            "-y".into(),
-            "-f".into(),
-            "matroska".into(),
-            os(&temporary.path),
-        ],
+        cut_args,
         cancel,
         MEDIA_LIMIT,
         Some(&source.path),
@@ -2220,7 +2383,7 @@ async fn run_keyframe_cut(
     let expected_timeline = decoded_timeline(
         &ffprobe,
         &source.path,
-        Some((actual_start, actual_end)),
+        Some((actual_start_absolute, actual_end + origin)),
         cancel,
     )
     .await?;
@@ -2234,9 +2397,14 @@ async fn run_keyframe_cut(
             Some(&temporary.path),
         )
     })?;
-    let decoded_end = result_timeline.end().unwrap_or(produced_duration);
+    let output_origin = result_timeline.origin().unwrap_or(0.0);
+    let decoded_end = result_timeline
+        .end()
+        .map(|end| end - output_origin)
+        .unwrap_or(produced_duration);
     let retained_end = packet_end(&ffprobe, &temporary.path, cancel)
         .await?
+        .map(|end| end - output_origin)
         .unwrap_or(decoded_end)
         .max(decoded_end);
     let container_tolerance = 0.02 + result_timeline.max_quantum() * 2.0;
@@ -2431,301 +2599,9 @@ async fn run_concat(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct MkvDocument {
-    #[serde(default)]
-    tracks: Vec<MkvTrack>,
-    #[serde(default)]
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MkvTrack {
-    id: u32,
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    properties: BTreeMap<String, Value>,
-}
-
-async fn mkv_document(
-    mkvmerge: &Path,
-    path: &Path,
-    cancel: &watch::Receiver<bool>,
-) -> Result<MkvDocument, AppError> {
-    let output = capture(
-        mkvmerge.to_owned(),
-        vec!["--ui-language".into(), "en".into(), "-J".into(), os(path)],
-        cancel,
-        PROBE_LIMIT,
-        Some(path),
-    )
-    .await?;
-    let document: MkvDocument = serde_json::from_slice(&output.stdout).map_err(|cause| {
-        error(
-            "UTILITY_PROBE_INVALID",
-            format!("mkvmerge returned invalid identification data: {cause}"),
-            Some(path),
-        )
-    })?;
-    if !output.status.success() || !document.errors.is_empty() {
-        return Err(error(
-            "UTILITY_PROBE_FAILED",
-            format!(
-                "mkvmerge could not identify this file: {} {}",
-                document.errors.join("; "),
-                diagnostic_tail(&output.stderr)
-            ),
-            Some(path),
-        ));
-    }
-    Ok(document)
-}
-
-fn video_ordinal(
-    document: &ProbeDocument,
-    stream_index: u32,
-    path: &Path,
-) -> Result<usize, AppError> {
-    let mut ordinal = 0;
-    for stream in &document.streams {
-        if stream.codec_type.as_deref() == Some("video") {
-            if stream.index == stream_index {
-                return Ok(ordinal);
-            }
-            ordinal += 1;
-        }
-    }
-    Err(error(
-        "UTILITY_STREAM_INVALID",
-        format!("Stream {stream_index} is not a video stream."),
-        Some(path),
-    ))
-}
-
-fn mkv_video(document: &MkvDocument, ordinal: usize) -> Option<&MkvTrack> {
-    document
-        .tracks
-        .iter()
-        .filter(|track| track.kind == "video")
-        .nth(ordinal)
-}
-
-fn mkv_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) if !value.trim().is_empty() && value.len() <= 256 => {
-            Some(value.clone())
-        }
-        Value::Number(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-const COLOR_PROPERTIES: [(&str, &str); 10] = [
-    ("color_matrix_coefficients", "--colour-matrix"),
-    (
-        "color_transfer_characteristics",
-        "--colour-transfer-characteristics",
-    ),
-    ("color_primaries", "--colour-primaries"),
-    ("color_range", "--colour-range"),
-    ("max_content_light", "--max-content-light"),
-    ("max_frame_light", "--max-frame-light"),
-    ("chromaticity_coordinates", "--chromaticity-coordinates"),
-    ("white_color_coordinates", "--white-colour-coordinates"),
-    ("max_luminance", "--max-luminance"),
-    ("min_luminance", "--min-luminance"),
-];
-
-fn transferable_color(track: &MkvTrack) -> Vec<(&'static str, &'static str, String)> {
-    COLOR_PROPERTIES
-        .into_iter()
-        .filter_map(|(property, option)| {
-            mkv_value(track.properties.get(property)?).map(|value| (property, option, value))
-        })
-        .collect()
-}
-
-fn mkv_field_order(value: &str) -> Option<u8> {
-    match value {
-        "progressive" => Some(0),
-        "tt" => Some(1),
-        "unknown" => Some(2),
-        "bb" => Some(6),
-        "tb" => Some(9),
-        "bt" => Some(14),
-        _ => None,
-    }
-}
-
-async fn run_color_transfer(
-    request: ColorMetadataTransferRequest,
-    cancel: &watch::Receiver<bool>,
-) -> Result<UtilityResult, AppError> {
-    let metadata_source = Source::open(valid_absolute(&request.metadata_source_path)?)?;
-    let input = Source::open(valid_absolute(&request.input_path)?)?;
-    let output = destination(&request.output_path, &[&metadata_source, &input])?;
-    require_mkv(&output, "Color metadata transfer")?;
-    let ffprobe = tool("ffprobe", "Color metadata transfer").await?;
-    let ffmpeg = tool("ffmpeg", "Color metadata transfer packet verification").await?;
-    let mkvmerge = tool("mkvmerge", "Color metadata transfer").await?;
-    let source_probe = probe(&ffprobe, &metadata_source.path, cancel, false).await?;
-    let input_probe = probe(&ffprobe, &input.path, cancel, false).await?;
-    selected_stream(
-        &source_probe,
-        request.metadata_source_video_stream_index,
-        "video",
-        &metadata_source.path,
-    )?;
-    selected_stream(
-        &input_probe,
-        request.input_video_stream_index,
-        "video",
-        &input.path,
-    )?;
-    let source_ordinal = video_ordinal(
-        &source_probe,
-        request.metadata_source_video_stream_index,
-        &metadata_source.path,
-    )?;
-    let target_ordinal =
-        video_ordinal(&input_probe, request.input_video_stream_index, &input.path)?;
-    let source_mkv = mkv_document(&mkvmerge, &metadata_source.path, cancel).await?;
-    let target_mkv = mkv_document(&mkvmerge, &input.path, cancel).await?;
-    let source_track = mkv_video(&source_mkv, source_ordinal).ok_or_else(|| {
-        error(
-            "UTILITY_STREAM_INVALID",
-            "mkvmerge could not map the selected metadata-source video track.",
-            Some(&metadata_source.path),
-        )
-    })?;
-    let target_track = mkv_video(&target_mkv, target_ordinal).ok_or_else(|| {
-        error(
-            "UTILITY_STREAM_INVALID",
-            "mkvmerge could not map the selected target video track.",
-            Some(&input.path),
-        )
-    })?;
-    let properties = transferable_color(source_track);
-    if properties.is_empty() {
-        return Err(error(
-            "UTILITY_COLOR_METADATA_MISSING",
-            "The selected metadata source exposes no supported color, luminance, chromaticity, or light-level tags.",
-            Some(&metadata_source.path),
-        ));
-    }
-    let before_hash = packet_hash(
-        &ffmpeg,
-        &input.path,
-        request.input_video_stream_index,
-        cancel,
-    )
-    .await?;
-    let scratch = Scratch::create("color")?;
-    let tool_path = scratch.path.join("color-transfer.mkv");
-    let mut args = vec![
-        "--ui-language".into(),
-        "en".into(),
-        "-o".into(),
-        os(&tool_path),
-    ];
-    for (_, option, value) in &properties {
-        args.push((*option).into());
-        args.push(format!("{}:{value}", target_track.id).into());
-    }
-    for (ordinal, stream) in input_probe
-        .streams
-        .iter()
-        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
-        .enumerate()
-    {
-        if let Some(order) = stream.field_order.as_deref().and_then(mkv_field_order)
-            && let Some(track) = mkv_video(&target_mkv, ordinal)
-        {
-            args.push("--field-order".into());
-            args.push(format!("{}:{order}", track.id).into());
-        }
-    }
-    args.push(os(&input.path));
-    let tool_output = checked(
-        mkvmerge.clone(),
-        args,
-        cancel,
-        MEDIA_LIMIT,
-        Some(&input.path),
-        "Color metadata remux",
-    )
-    .await?;
-    let output_probe = probe(&ffprobe, &tool_path, cancel, false).await?;
-    compatible_streams_ignoring_color(&input_probe, &output_probe, &tool_path)?;
-    let output_stream = output_probe
-        .streams
-        .iter()
-        .filter(|stream| stream.codec_type.as_deref() == Some("video"))
-        .nth(target_ordinal)
-        .ok_or_else(|| {
-            error(
-                "UTILITY_VALIDATION_FAILED",
-                "The target video stream is missing from the remuxed output.",
-                Some(&tool_path),
-            )
-        })?;
-    let after_hash = packet_hash(&ffmpeg, &tool_path, output_stream.index, cancel).await?;
-    if before_hash != after_hash {
-        return Err(error(
-            "UTILITY_VALIDATION_FAILED",
-            "Encoded video packet data changed during metadata transfer. The output was not published.",
-            Some(&tool_path),
-        ));
-    }
-    let output_mkv = mkv_document(&mkvmerge, &tool_path, cancel).await?;
-    let written_track = mkv_video(&output_mkv, target_ordinal).ok_or_else(|| {
-        error(
-            "UTILITY_VALIDATION_FAILED",
-            "The remuxed output does not expose the target video track.",
-            Some(&tool_path),
-        )
-    })?;
-    for (property, _, expected) in &properties {
-        let actual = written_track
-            .properties
-            .get(*property)
-            .and_then(mkv_value)
-            .unwrap_or_default();
-        if actual != *expected {
-            return Err(error(
-                "UTILITY_VALIDATION_FAILED",
-                format!(
-                    "The remuxed output did not retain {property} (expected {expected}, found {actual})."
-                ),
-                Some(&tool_path),
-            ));
-        }
-    }
-    check_cancel(cancel)?;
-    let identities = vec![fingerprint(&metadata_source)?, fingerprint(&input)?];
-    let temporary = Temporary::create(&output, &nonce("color"))?;
-    import_artifact(&tool_path, &temporary, cancel).await?;
-    let bytes = publish_media(temporary, &output, &[&metadata_source, &input]).await?;
-    Ok(UtilityResult::Artifact(UtilityArtifact {
-        operation: "colorMetadataTransfer".into(),
-        output_path: output.to_string_lossy().into_owned(),
-        size_bytes: bytes.to_string(),
-        duration_seconds: duration(&output_probe),
-        source_fingerprints: identities,
-        message: format!(
-            "Transferred {} supported color/HDR container properties. Encoded video packet SHA-256 is unchanged.",
-            properties.len()
-        ),
-        diagnostics: [
-            diagnostic_tail(&tool_output.stdout),
-            diagnostic_tail(&tool_output.stderr),
-        ]
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .collect(),
-    }))
-}
+mod color_transfer;
+pub use color_transfer::read_color_metadata;
+use color_transfer::run_color_transfer;
 
 fn valid_ocr_language(value: &str) -> bool {
     !value.is_empty()
@@ -3288,6 +3164,21 @@ async fn run_grain(
     let grav1synth = tool("grav1synth", "AV1 film-grain utilities").await?;
     let ffprobe = tool("ffprobe", "AV1 film-grain validation").await?;
     match request {
+        GrainRequest::MeasureSource {
+            source_path,
+            output_table_path,
+            denoise_strength,
+            denoised_output_path,
+        } => {
+            grain_measure::measure_source(
+                source_path,
+                output_table_path,
+                denoise_strength,
+                denoised_output_path,
+                cancel,
+            )
+            .await
+        }
         GrainRequest::Measure {
             source_path,
             denoised_path,
@@ -3335,6 +3226,11 @@ async fn run_grain(
                     Some(&denoised.path),
                 ));
             }
+            progress::grain_estimate(
+                source_video.width.unwrap_or(0),
+                source_video.height.unwrap_or(0),
+                source_frames.unwrap_or(0),
+            );
             let temporary = Temporary::create(&output, &nonce("grain-measure"))?;
             let tool_output = checked(
                 grav1synth,
@@ -3355,8 +3251,10 @@ async fn run_grain(
             let (_, segment_count) = read_grain_table(&temporary.path)?;
             check_cancel(cancel)?;
             let fingerprints = vec![fingerprint(&source)?, fingerprint(&denoised)?];
-            publish_table(temporary, &output, &[&source, &denoised]).await?;
+            let size_bytes = publish_table(temporary, &output, &[&source, &denoised]).await?;
             Ok(UtilityResult::GrainTable(GrainTableResult {
+                size_bytes: Some(size_bytes.to_string()),
+                denoised_output_path: None,
                 output_path: output.to_string_lossy().into_owned(),
                 segment_count,
                 source_fingerprints: fingerprints,
@@ -3430,8 +3328,10 @@ async fn run_grain(
             let (_, segment_count) = read_grain_table(&temporary.path)?;
             let source_fingerprint = fingerprint(&source)?;
             check_cancel(cancel)?;
-            publish_table(temporary, &output, &[&source]).await?;
+            let size_bytes = publish_table(temporary, &output, &[&source]).await?;
             Ok(UtilityResult::GrainTable(GrainTableResult {
+                size_bytes: Some(size_bytes.to_string()),
+                denoised_output_path: None,
                 output_path: output.to_string_lossy().into_owned(),
                 segment_count,
                 source_fingerprints: vec![source_fingerprint],
@@ -3484,7 +3384,7 @@ async fn run_grain(
             let ffmpeg = tool("ffmpeg", "AV1 film-grain decode validation").await?;
             let source = Source::open(valid_absolute(&input_path)?)?;
             let output = destination(&output_path, &[&source])?;
-            require_mkv(&output, "Film-grain removal")?;
+            let (_, output_extension) = video_container::grain_format(&output)?;
             let input_probe = probe(&ffprobe, &source.path, cancel, false).await?;
             let input_video = input_probe
                 .streams
@@ -3517,7 +3417,8 @@ async fn run_grain(
                     Some(&source.path),
                 ));
             }
-            let temporary = Temporary::create(&output, &nonce("grain-remove"))?;
+            let temporary =
+                Temporary::create_extension(&output, &nonce("grain-remove"), output_extension)?;
             let tool_output = checked(
                 grav1synth.clone(),
                 vec![
@@ -3531,6 +3432,15 @@ async fn run_grain(
                 MEDIA_LIMIT,
                 Some(&source.path),
                 "Film-grain header removal",
+            )
+            .await?;
+            let temporary = video_container::restore_grain_metadata(
+                &ffmpeg,
+                &source,
+                &temporary,
+                &input_probe,
+                &output,
+                cancel,
             )
             .await?;
             let output_probe = probe(&ffprobe, &temporary.path, cancel, false).await?;
@@ -3598,6 +3508,7 @@ async fn run_grain_rewrite(
     let source = Source::open(valid_absolute(&input_path)?)?;
     let mut table_source = None;
     let mut source_args = Vec::<OsString>::new();
+    let mut command = "apply";
     let source_description;
     match grain_source {
         GrainSource::Table { table_path } => {
@@ -3630,8 +3541,7 @@ async fn run_grain_rewrite(
             )
             .await?;
             let presets = parse_grain_presets(&listed.stdout);
-            let base = preset.split('-').next().unwrap_or_default();
-            if !presets.iter().any(|item| item == base) {
+            if !presets.iter().any(|item| item == &preset) {
                 return Err(error(
                     "UTILITY_GRAIN_PRESET_INVALID",
                     format!("'{preset}' is not advertised by the installed grav1synth build."),
@@ -3642,6 +3552,7 @@ async fn run_grain_rewrite(
             source_description = "film-stock preset";
         }
         GrainSource::PhotonNoise { iso, chroma } => {
+            command = "generate";
             if iso == 0 {
                 return Err(error(
                     "UTILITY_GRAIN_ISO_INVALID",
@@ -3662,7 +3573,7 @@ async fn run_grain_rewrite(
         vec![&source]
     };
     let output = destination(&output_path, &refs)?;
-    require_mkv(&output, "Film-grain application")?;
+    let (_, output_extension) = video_container::grain_format(&output)?;
     let input_probe = probe(ffprobe, &source.path, cancel, false).await?;
     let input_video = input_probe
         .streams
@@ -3692,15 +3603,38 @@ async fn run_grain_rewrite(
             Some(&source.path),
         ));
     }
-    let temporary = Temporary::create(&output, &nonce("grain-apply"))?;
+    let temporary = Temporary::create_extension(&output, &nonce("grain-apply"), output_extension)?;
+    let apply_help = checked(
+        grav1synth.to_owned(),
+        vec!["apply".into(), "--help".into()],
+        cancel,
+        Duration::from_secs(15),
+        None,
+        "Film-grain command capability inspection",
+    )
+    .await?;
+    let apply_help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&apply_help.stdout),
+        String::from_utf8_lossy(&apply_help.stderr)
+    );
+    // The source-pinned development tool unifies ISO/presets under `apply`;
+    // released0.2 uses `generate --iso` and always replaces without a flag.
+    if command == "generate" && apply_help.split_whitespace().any(|value| value == "--iso") {
+        command = "apply";
+    }
     let mut args = vec![
-        "apply".into(),
+        command.into(),
         os(&source.path),
         "--output".into(),
         os(&temporary.path),
     ];
     args.extend(source_args);
-    if replace {
+    if replace
+        && apply_help
+            .split_whitespace()
+            .any(|value| value == "--replace")
+    {
         args.push("--replace".into());
     }
     args.push("--overwrite".into());
@@ -3711,6 +3645,15 @@ async fn run_grain_rewrite(
         MEDIA_LIMIT,
         Some(&source.path),
         "Film-grain header write",
+    )
+    .await?;
+    let temporary = video_container::restore_grain_metadata(
+        &ffmpeg,
+        &source,
+        &temporary,
+        &input_probe,
+        &output,
+        cancel,
     )
     .await?;
     let output_probe = probe(ffprobe, &temporary.path, cancel, false).await?;
@@ -3818,7 +3761,13 @@ fn valid_preset(encoder: LadderEncoder, preset: &str) -> bool {
     }
     match encoder {
         LadderEncoder::Av1 => preset.parse::<u8>().is_ok_and(|value| value <= 13),
-        LadderEncoder::Vp9 => preset.parse::<u8>().is_ok_and(|value| value <= 8),
+        LadderEncoder::Vp9 | LadderEncoder::AomAv1 => {
+            preset.parse::<u8>().is_ok_and(|value| value <= 8)
+        }
+        LadderEncoder::H264Nvenc | LadderEncoder::HevcNvenc => matches!(
+            preset,
+            "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7" | "default" | "slow" | "medium" | "fast"
+        ),
         LadderEncoder::H264 | LadderEncoder::Hevc => matches!(
             preset,
             "ultrafast"
@@ -3841,6 +3790,9 @@ fn codec_name(encoder: LadderEncoder) -> &'static str {
         LadderEncoder::Hevc => "libx265",
         LadderEncoder::Av1 => "libsvtav1",
         LadderEncoder::Vp9 => "libvpx-vp9",
+        LadderEncoder::AomAv1 => "libaom-av1",
+        LadderEncoder::H264Nvenc => "h264_nvenc",
+        LadderEncoder::HevcNvenc => "hevc_nvenc",
     }
 }
 
@@ -3898,10 +3850,14 @@ fn scored_source_supported(stream: &ProbeStream) -> bool {
         clean_field(&stream.color_primaries),
         Some("bt709" | "bt470bg" | "smpte170m")
     ) && matches!(clean_field(&stream.color_range), Some("tv" | "pc"))
-        && matches!(
-            clean_field(&stream.chroma_location),
-            Some("left" | "center" | "topleft")
-        )
+        && (stream
+            .pix_fmt
+            .as_deref()
+            .is_some_and(|format| format.starts_with("yuv444p"))
+            || matches!(
+                clean_field(&stream.chroma_location),
+                Some("left" | "center" | "topleft")
+            ))
 }
 
 async fn encode_reference(
@@ -3933,7 +3889,7 @@ async fn encode_reference(
         "-vf".into(),
         "setsar=1,setparams=field_mode=prog".into(),
         "-pix_fmt".into(),
-        pixel_format.into(),
+        ladder_formats::decoded(pixel_format).into(),
         "-c:v".into(),
         "ffv1".into(),
         "-level".into(),
@@ -3953,6 +3909,7 @@ async fn encode_reference(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn encode_candidate(
     ffmpeg: &Path,
     reference: &Path,
@@ -3961,6 +3918,7 @@ async fn encode_candidate(
     crf: u8,
     output: &Path,
     cancel: &watch::Receiver<bool>,
+    overrides: &[OsString],
 ) -> Result<f64, AppError> {
     let started = Instant::now();
     let mut args = vec![
@@ -3989,10 +3947,11 @@ async fn encode_candidate(
                 crf.to_string().into(),
             ]);
         }
-        LadderEncoder::Vp9 => {
+        LadderEncoder::Vp9 | LadderEncoder::AomAv1 => {
+            if request.encoder == LadderEncoder::Vp9 {
+                args.extend(["-deadline".into(), "good".into()]);
+            }
             args.extend([
-                "-deadline".into(),
-                "good".into(),
                 "-cpu-used".into(),
                 request.preset.clone().into(),
                 "-crf".into(),
@@ -4001,7 +3960,20 @@ async fn encode_candidate(
                 "0".into(),
             ]);
         }
+        LadderEncoder::H264Nvenc | LadderEncoder::HevcNvenc => {
+            args.extend([
+                "-preset".into(),
+                request.preset.clone().into(),
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                crf.to_string().into(),
+                "-b:v".into(),
+                "0".into(),
+            ]);
+        }
     }
+    args.extend(overrides.iter().cloned());
     args.extend(color_args(stream));
     args.extend(["-y".into(), "-f".into(), "matroska".into(), os(output)]);
     checked(
@@ -4144,8 +4116,9 @@ async fn run_crf_ladder(
     request: CrfLadderRequest,
     cancel: &watch::Receiver<bool>,
 ) -> Result<UtilityResult, AppError> {
+    request.encoder.require_cpu_encoding()?;
     if !valid_preset(request.encoder, &request.preset)
-        || !matches!(request.pixel_format.as_str(), "yuv420p" | "yuv420p10le")
+        || !ladder_formats::supported(request.encoder, &request.pixel_format)
         || request.crfs.is_empty()
         || request.crfs.len() > 8
         || !(1..=12).contains(&request.sample_count)
@@ -4154,13 +4127,16 @@ async fn run_crf_ladder(
     {
         return Err(error(
             "UTILITY_LADDER_SETTINGS_INVALID",
-            "Choose a supported preset, yuv420p/yuv420p10le, 1-8 CRFs, 1-12 samples, and a 1-120 second sample length.",
+            "Choose a supported encoder preset/pixel format, 1-8 CRFs, 1-12 samples, and a 1-120 second sample length.",
             Some(Path::new(&request.input_path)),
         ));
     }
     let max_crf = match request.encoder {
-        LadderEncoder::H264 | LadderEncoder::Hevc => 51,
-        LadderEncoder::Av1 | LadderEncoder::Vp9 => 63,
+        LadderEncoder::H264
+        | LadderEncoder::Hevc
+        | LadderEncoder::H264Nvenc
+        | LadderEncoder::HevcNvenc => 51,
+        LadderEncoder::Av1 | LadderEncoder::Vp9 | LadderEncoder::AomAv1 => 63,
     };
     let mut crfs = request.crfs.clone();
     crfs.sort_unstable();
@@ -4194,6 +4170,17 @@ async fn run_crf_ladder(
             Some(Path::new(&request.input_path)),
         ));
     }
+    if let Some(directory) = request.keep_samples_directory.as_deref() {
+        let path = valid_absolute(directory)?;
+        ensure_absent(path)?;
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Err(error(
+                "INVALID_OUTPUT",
+                "Choose an existing parent folder for the new sample directory.",
+                Some(path),
+            ));
+        }
+    }
     let source = Source::open(valid_absolute(&request.input_path)?)?;
     let source_size = fs::metadata(&source.path)
         .map_err(|cause| error("FILE_UNREADABLE", cause.to_string(), Some(&source.path)))?
@@ -4220,6 +4207,8 @@ async fn run_crf_ladder(
             Some(&source.path),
         ));
     }
+    ladder_formats::check_help(&ffmpeg, &request, cancel).await?;
+    let options = ladder_options::prepare(&ffmpeg, &request, cancel).await?;
     let source_probe = probe(&ffprobe, &source.path, cancel, false).await?;
     let stream = selected_stream(
         &source_probe,
@@ -4312,6 +4301,19 @@ async fn run_crf_ladder(
                     Some(&path),
                 )
             })?;
+        ladder_formats::validate_decoded(
+            &ffprobe,
+            &path,
+            &request.pixel_format,
+            Some("ffv1"),
+            (
+                reference_stream.width.unwrap_or(0),
+                reference_stream.height.unwrap_or(0),
+            ),
+            Some(frames),
+            cancel,
+        )
+        .await?;
         prepared.push(Sample {
             reference: path,
             seconds,
@@ -4339,6 +4341,7 @@ async fn run_crf_ladder(
                 crf,
                 &candidate,
                 cancel,
+                &options.arguments,
             )
             .await?;
             let candidate_probe = probe(&ffprobe, &candidate, cancel, true).await?;
@@ -4354,6 +4357,16 @@ async fn run_crf_ladder(
                     )
                 })?;
             let candidate_frames = json_u64(candidate_stream.nb_read_frames.as_ref());
+            ladder_formats::validate_decoded(
+                &ffprobe,
+                &candidate,
+                &request.pixel_format,
+                candidate_stream.codec_name.as_deref(),
+                (stream.width.unwrap_or(0), stream.height.unwrap_or(0)),
+                Some(sample.frames),
+                cancel,
+            )
+            .await?;
             if candidate_frames != Some(sample.frames) {
                 return Err(error(
                     "UTILITY_VALIDATION_FAILED",
@@ -4392,7 +4405,11 @@ async fn run_crf_ladder(
                 })?;
                 let quality = crate::quality::analyze_quality(
                     QualityRequest {
-                        options: None,
+                        full_source: false,
+                        options: Some(media_core::QualityOptions {
+                            vmaf_model: request.vmaf_model.unwrap_or_default(),
+                            ..Default::default()
+                        }),
                         reference_path: sample.reference.to_string_lossy().into_owned(),
                         reference_stream_index: 0,
                         reference_start_frame: 0,
@@ -4480,10 +4497,27 @@ async fn run_crf_ladder(
             None => "No score threshold was selected, so no CRF recommendation was made.".into(),
         },
     ];
+    diagnostics.extend(options.diagnostics);
+    let samples_directory = ladder_options::retain_samples(
+        request.keep_samples_directory.as_deref(),
+        &scratch.path,
+        cancel,
+    )?;
+    let samples_size_bytes = samples_directory
+        .as_deref()
+        .map(|path| {
+            ladder_options::retained_size(Path::new(path), cancel).map(|bytes| bytes.to_string())
+        })
+        .transpose()?;
     if let Some(diagnostic) = score_diagnostic {
         diagnostics.push(diagnostic.into());
     }
     Ok(UtilityResult::CrfLadder(CrfLadderResult {
+        content_preset: request.content_preset,
+        parameters: options.parameters,
+        vmaf_model: request.vmaf_model.unwrap_or_default(),
+        samples_directory,
+        samples_size_bytes,
         encoder: request.encoder,
         preset: request.preset,
         metric: request.metric,
@@ -4505,22 +4539,70 @@ pub async fn run_utility(
     cancel: watch::Receiver<bool>,
 ) -> Result<UtilityResult, AppError> {
     check_cancel(&cancel)?;
-    match request {
-        UtilityRequest::KeyframeCut(request) => run_keyframe_cut(request, &cancel).await,
-        UtilityRequest::Concat(request) => run_concat(request, &cancel).await,
+    if let UtilityRequest::CrfLadder(request) = &request {
+        request.encoder.require_cpu_encoding()?;
+    }
+    let sequence_paths: Vec<&str> = match &request {
+        UtilityRequest::KeyframeCut(r) => vec![&r.input_path],
+        UtilityRequest::Concat(r) => r.input_paths.iter().map(String::as_str).collect(),
+        UtilityRequest::CrfLadder(r) => vec![&r.input_path],
+        UtilityRequest::DeinterlaceExport(r) => vec![&r.input_path],
+        UtilityRequest::CadenceRepairExport(r) => vec![&r.input_path],
+        UtilityRequest::Grain(r) => match r {
+            GrainRequest::MeasureSource { source_path, .. } => vec![source_path],
+            GrainRequest::Measure {
+                source_path,
+                denoised_path,
+                ..
+            } => vec![source_path, denoised_path],
+            GrainRequest::Extract { input_path, .. }
+            | GrainRequest::Apply { input_path, .. }
+            | GrainRequest::RewriteHeaders { input_path, .. }
+            | GrainRequest::Remove { input_path, .. } => vec![input_path],
+        },
+        UtilityRequest::ColorMetadataTransfer(r) if r.in_place => vec![&r.input_path],
+        _ => Vec::new(),
+    };
+    if let Some(path) = sequence_paths
+        .into_iter()
+        .find(|path| crate::jobs::sequence::is_sequence(Path::new(path)))
+    {
+        return Err(error(
+            "IMAGE_SEQUENCE_UNSUPPORTED",
+            "This utility requires a regular encoded media source. Nmkoder excludes image sequence folders here; use Quick Convert for picture processing or trim.",
+            Some(Path::new(path)),
+        ));
+    }
+    progress::phase("preparing", "Preparing utility");
+    let result = match request {
+        UtilityRequest::KeyframeCut(request) => Box::pin(run_keyframe_cut(request, &cancel)).await,
+        UtilityRequest::Concat(request) => Box::pin(run_concat(request, &cancel)).await,
         UtilityRequest::ColorMetadataTransfer(request) => {
-            run_color_transfer(request, &cancel).await
+            Box::pin(run_color_transfer(request, &cancel)).await
         }
-        UtilityRequest::SubtitleOcr(request) => run_subtitle_ocr(request, &cancel).await,
-        UtilityRequest::Grain(request) => run_grain(request, &cancel).await,
-        UtilityRequest::CrfLadder(request) => run_crf_ladder(request, &cancel).await,
+        UtilityRequest::SubtitleOcr(request) => Box::pin(run_subtitle_ocr(request, &cancel)).await,
+        UtilityRequest::Grain(request) => Box::pin(run_grain(request, &cancel)).await,
+        UtilityRequest::CrfLadder(request) => Box::pin(run_crf_ladder(request, &cancel)).await,
         UtilityRequest::DeinterlaceExport(request) => {
-            temporal_exports::deinterlace(request, &cancel).await
+            Box::pin(temporal_exports::deinterlace(request, &cancel)).await
         }
         UtilityRequest::CadenceRepairExport(request) => {
-            temporal_exports::repair_cadence(request, &cancel).await
+            Box::pin(temporal_exports::repair_cadence(request, &cancel)).await
         }
-    }
+    };
+    progress::terminal(
+        if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        },
+        if result.is_ok() {
+            "Utility completed"
+        } else {
+            "Utility failed or was canceled"
+        },
+    );
+    result
 }
 
 #[cfg(test)]

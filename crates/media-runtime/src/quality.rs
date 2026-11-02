@@ -19,7 +19,6 @@ use std::{
 use tokio::sync::watch;
 const MAX_FRAMES: u32 = 60_000;
 const MAX_SCAN: u32 = 1_000_000;
-const MAX_REPORT: u64 = 96 * 1024 * 1024;
 fn fail(message: impl Into<String>) -> AppError {
     AppError::new("QUALITY_ANALYSIS_FAILED", message, None)
 }
@@ -30,7 +29,7 @@ fn process_error(error: SupervisorError) -> AppError {
         }
         SupervisorError::Timeout => AppError::new(
             "ANALYSIS_TIMEOUT",
-            "Quality analysis exceeded its 30-minute limit.",
+            "Quality analysis exceeded its 24-hour limit.",
             None,
         ),
         error => fail(error.to_string()),
@@ -40,11 +39,12 @@ fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 struct FrameScan {
-    pts: Vec<f64>,
+    count: u32,
     geometry: BTreeMap<String, String>,
     width: u32,
     height: u32,
     sar: (u32, u32),
+    vp9_decoder: bool,
 }
 fn parse_sar(value: &str) -> Result<(u32, u32), String> {
     if value == "N/A" {
@@ -64,10 +64,16 @@ fn parse_sar(value: &str) -> Result<(u32, u32), String> {
     }
     Ok((n, d))
 }
-fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameScan, String> {
+fn scan_frames(
+    reader: &mut dyn Read,
+    start: u32,
+    count: Option<u32>,
+    mut visit: impl FnMut(f64) -> Result<(), String>,
+) -> Result<FrameScan, String> {
     let mut reader = BufReader::new(reader);
     let mut record = Vec::new();
-    let mut pts = Vec::new();
+    let mut selected_count = 0u32;
+    let mut last_timestamp = None;
     let mut geometry = None;
     let mut ordinal = 0;
     loop {
@@ -99,10 +105,10 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
         if !fields.contains_key("best_effort_timestamp_time") {
             return Err("A decoded frame has no timestamp.".into());
         }
-        if ordinal >= MAX_SCAN {
+        if count.is_some() && ordinal >= MAX_SCAN {
             return Err("Source exceeds one million decoded frames.".into());
         }
-        if ordinal >= start && ordinal < start + count {
+        if ordinal >= start && count.is_none_or(|count| ordinal < start + count) {
             let timestamp: f64 = fields
                 .remove("best_effort_timestamp_time")
                 .unwrap()
@@ -110,7 +116,7 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
                 .map_err(|_| "Invalid frame timestamp.")?;
             if !timestamp.is_finite()
                 || timestamp.abs() > 1e9
-                || pts.last().is_some_and(|last| timestamp <= *last)
+                || last_timestamp.is_some_and(|last| timestamp <= last)
             {
                 return Err("Quality inputs need strictly increasing timestamps.".into());
             }
@@ -136,9 +142,17 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
             }
             if !matches!(
                 fields.get("pix_fmt").map(String::as_str),
-                Some("yuv420p" | "yuv420p10le")
+                Some(
+                    "yuv420p"
+                        | "yuv422p"
+                        | "yuv444p"
+                        | "yuv420p10le"
+                        | "yuv422p10le"
+                        | "yuv444p10le"
+                        | "yuva420p"
+                )
             ) {
-                return Err("Quality analysis supports 8/10-bit planar 4:2:0 inputs.".into());
+                return Err("Quality analysis supports matched 8/10-bit planar YUV 4:2:0/4:2:2/4:4:4 and 8-bit 4:2:0 alpha inputs.".into());
             }
             if !matches!(
                 fields.get("color_transfer").map(String::as_str),
@@ -147,6 +161,18 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
                 return Err(
                     "Quality analysis currently requires explicitly tagged SDR inputs.".into(),
                 );
+            }
+            // HEVC does not signal variable chroma location for 4:2:2; use its
+            // nominal left position when the decoder omits it. Explicit siting
+            // remains authoritative and still has to match the paired input.
+            if fields
+                .get("pix_fmt")
+                .is_some_and(|format| format.starts_with("yuv422p"))
+                && fields
+                    .get("chroma_location")
+                    .is_none_or(|value| matches!(value.as_str(), "unknown" | "unspecified"))
+            {
+                fields.insert("chroma_location".into(), "left".into());
             }
             if !matches!(
                 fields.get("color_range").map(String::as_str),
@@ -157,13 +183,24 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
             ) || !matches!(
                 fields.get("color_primaries").map(String::as_str),
                 Some("bt709" | "bt470bg" | "smpte170m")
-            ) || !matches!(
-                fields.get("chroma_location").map(String::as_str),
-                Some("left" | "center" | "topleft")
-            ) {
+            ) || (!fields
+                .get("pix_fmt")
+                .is_some_and(|format| format.starts_with("yuv444p"))
+                && !matches!(
+                    fields.get("chroma_location").map(String::as_str),
+                    Some("left" | "center" | "topleft")
+                ))
+            {
                 return Err(
                     "Explicit color metadata is required for a meaningful comparison.".into(),
                 );
+            }
+            // Full-resolution chroma has no subsampling/siting coordinate.
+            if fields
+                .get("pix_fmt")
+                .is_some_and(|format| format.starts_with("yuv444p"))
+            {
+                fields.remove("chroma_location");
             }
             if geometry
                 .as_ref()
@@ -174,11 +211,17 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
                 );
             }
             geometry.get_or_insert(fields);
-            pts.push(timestamp);
+            visit(timestamp)?;
+            last_timestamp = Some(timestamp);
+            selected_count = selected_count
+                .checked_add(1)
+                .ok_or("Decoded frame count exceeds the contract range.")?;
         }
-        ordinal += 1;
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or("Decoded frame count exceeds the contract range.")?;
     }
-    if pts.len() != count as usize {
+    if count.is_some_and(|count| selected_count != count) {
         return Err("The selected interval extends beyond the decoded video.".into());
     }
     let mut geometry = geometry.ok_or("No decoded video frames.")?;
@@ -194,21 +237,63 @@ fn scan_frames(reader: &mut dyn Read, start: u32, count: u32) -> Result<FrameSca
         .map_err(|_| "Invalid height.")?;
     let sar = parse_sar(&geometry.remove("sample_aspect_ratio").unwrap())?;
     Ok(FrameScan {
-        pts,
+        count: selected_count,
         geometry,
         width,
         height,
         sar,
+        vp9_decoder: false,
     })
 }
-async fn inspect(
+async fn vp9_decoder(
     source: &Source,
     index: u32,
-    start: u32,
-    count: u32,
     ffprobe: &Path,
     cancel: &watch::Receiver<bool>,
-) -> Result<FrameScan, AppError> {
+) -> Result<bool, AppError> {
+    let mut arguments = args(&[
+        "-v",
+        "error",
+        "-select_streams",
+        &index.to_string(),
+        "-show_entries",
+        "stream=codec_name:stream_tags=alpha_mode",
+        "-of",
+        "json",
+        "-i",
+    ]);
+    arguments.push(source.path.as_os_str().into());
+    let result = run_capture(
+        &CommandSpec {
+            executable: ffprobe.into(),
+            args: arguments,
+            cwd: None,
+        },
+        cancel.clone(),
+        65536,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(process_error)?;
+    if !result.status.success() {
+        return Err(fail(
+            "The selected quality input codec could not be inspected.",
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&result.stdout).map_err(|cause| fail(cause.to_string()))?;
+    Ok(value["streams"].as_array().is_some_and(|streams| {
+        streams.len() == 1
+            && streams[0]["codec_name"] == "vp9"
+            && streams[0]["tags"].as_object().is_some_and(|tags| {
+                tags.iter().any(|(key, value)| {
+                    key.eq_ignore_ascii_case("alpha_mode") && (value == "1" || value == 1)
+                })
+            })
+    }))
+}
+
+fn inspect_spec(source: &Source, index: u32, ffprobe: &Path, vp9: bool) -> CommandSpec {
     let mut arguments = args(&[
         "-v",
         "error",
@@ -223,27 +308,99 @@ async fn inspect(
         "compact=p=0:nk=0",
         "-i",
     ]);
+    if vp9 {
+        let input = arguments
+            .iter()
+            .position(|value| value == "-i")
+            .expect("input");
+        arguments.splice(input..input, ["-c:v".into(), "libvpx-vp9".into()]);
+    }
     arguments.push(source.path.as_os_str().into());
-    let result = run_streaming_stdout(
-        &CommandSpec {
-            executable: ffprobe.into(),
-            args: arguments,
-            cwd: None,
-        },
+    CommandSpec {
+        executable: ffprobe.into(),
+        args: arguments,
+        cwd: None,
+    }
+}
+async fn inspect_pair(
+    reference: &Source,
+    candidate: &Source,
+    request: &QualityRequest,
+    ffprobe: &Path,
+    cancel: &watch::Receiver<bool>,
+    fixed_rate: bool,
+) -> Result<(FrameScan, FrameScan), AppError> {
+    let left_vp9 = vp9_decoder(reference, request.reference_stream_index, ffprobe, cancel).await?;
+    let right_vp9 = vp9_decoder(candidate, request.candidate_stream_index, ffprobe, cancel).await?;
+    let reference_spec = inspect_spec(reference, request.reference_stream_index, ffprobe, left_vp9);
+    let candidate_spec = inspect_spec(
+        candidate,
+        request.candidate_stream_index,
+        ffprobe,
+        right_vp9,
+    );
+    let count = (!request.full_source).then_some(request.frame_count);
+    let left_start = request.reference_start_frame;
+    let right_start = request.candidate_start_frame;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    let left = run_streaming_stdout(
+        &reference_spec,
         cancel.clone(),
-        64 * 1024,
-        Duration::from_secs(1800),
-        move |reader| scan_frames(reader, start, count),
-    )
-    .await
-    .map_err(process_error)?;
-    if !result.status.success() {
+        65536,
+        Duration::from_secs(86400),
+        move |reader| {
+            scan_frames(reader, left_start, count, |pts| {
+                sender
+                    .send(pts)
+                    .map_err(|_| "Paired source inspection stopped.".into())
+            })
+        },
+    );
+    let right = run_streaming_stdout(
+        &candidate_spec,
+        cancel.clone(),
+        65536,
+        Duration::from_secs(86400),
+        move |reader| {
+            let mut first = None;
+            let scan = scan_frames(reader, right_start, count, |pts| {
+                let expected = receiver.recv().map_err(|_| {
+                    "Candidate has more decoded frames than the reference.".to_owned()
+                })?;
+                let (left_first, right_first) = *first.get_or_insert((expected, pts));
+                if !fixed_rate && ((expected - left_first) - (pts - right_first)).abs() > 0.0021 {
+                    return Err("Decoded frame timing differs. Select corresponding frame intervals or enable fixed-rate frame pairing.".into());
+                }
+                Ok(())
+            })?;
+            if receiver.recv().is_ok() {
+                return Err("Reference has more decoded frames than the candidate.".into());
+            }
+            Ok(scan)
+        },
+    );
+    let (left, right) = tokio::join!(Box::pin(left), Box::pin(right));
+    let right = right.map_err(process_error)?;
+    let left = left.map_err(process_error)?;
+    if !left.status.success()
+        || !right.status.success()
+        || !left.stderr.is_empty()
+        || !right.stderr.is_empty()
+    {
         return Err(fail(format!(
-            "Frame inspection failed: {}",
-            String::from_utf8_lossy(&result.stderr)
+            "Complete paired frame inspection failed: {} {}",
+            String::from_utf8_lossy(&left.stderr),
+            String::from_utf8_lossy(&right.stderr)
         )));
     }
-    Ok(result.value)
+    if left.value.count != right.value.count {
+        return Err(fail("Reference and candidate decoded frame counts differ."));
+    }
+    let mut left = left.value;
+    let mut right = right.value;
+    left.vp9_decoder = left_vp9;
+    right.vp9_decoder = right_vp9;
+    Ok((left, right))
 }
 struct Workspace(PathBuf);
 impl Workspace {
@@ -261,21 +418,6 @@ impl Workspace {
         std::fs::create_dir(&path).map_err(|e| fail(e.to_string()))?;
         Ok(Self(path))
     }
-    fn read(&self) -> Result<Vec<u8>, AppError> {
-        let file =
-            std::fs::File::open(self.0.join("quality.log")).map_err(|e| fail(e.to_string()))?;
-        if file.metadata().map_err(|e| fail(e.to_string()))?.len() > MAX_REPORT {
-            return Err(fail("Quality report exceeded its bound."));
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_REPORT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| fail(e.to_string()))?;
-        if bytes.len() as u64 > MAX_REPORT {
-            return Err(fail("Quality report exceeded its bound."));
-        }
-        Ok(bytes)
-    }
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
@@ -283,38 +425,80 @@ impl Drop for Workspace {
         let _ = std::fs::remove_dir(&self.0);
     }
 }
-fn parse_report(
-    bytes: &[u8],
+fn parse_report_reader(
+    reader: &mut dyn Read,
     metric: QualityMetric,
     count: u32,
+    point_limit: u32,
 ) -> Result<(Option<f64>, Vec<QualityPoint>), AppError> {
     let mut points = Vec::new();
     let mut total = 0.0;
-    if metric == QualityMetric::Vmaf {
-        let json: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|e| fail(e.to_string()))?;
-        let frames = json["frames"]
-            .as_array()
-            .ok_or_else(|| fail("Missing VMAF frame scores."))?;
-        for (i, frame) in frames.iter().enumerate() {
-            if frame["frameNum"].as_u64() != Some(i as u64) {
-                return Err(fail("Unexpected VMAF frame order."));
+    let mut seen = 0u32;
+    let stride = count.div_ceil(point_limit.max(1)).max(1);
+    let mut consume = |ordinal: u32, score: Option<f64>| -> Result<(), String> {
+        if ordinal != seen {
+            return Err("Unexpected metric frame sequence.".into());
+        }
+        if let Some(value) = score {
+            if !value.is_finite()
+                || (metric == QualityMetric::Ssim && !(-1.0..=1.0).contains(&value))
+                || (metric == QualityMetric::Psnr && value < 0.0)
+                || (metric == QualityMetric::Vmaf && !(-1000.0..=1000.0).contains(&value))
+            {
+                return Err("Metric score outside its valid range.".into());
             }
-            let value = frame["metrics"]["vmaf"]
-                .as_f64()
-                .filter(|v| v.is_finite() && (-1000.0..=1000.0).contains(v))
-                .ok_or_else(|| fail("Invalid VMAF value."))?;
             total += value;
+        }
+        if (ordinal.is_multiple_of(stride) && points.len() < (point_limit.max(1) - 1) as usize)
+            || ordinal == count - 1
+        {
             points.push(QualityPoint {
-                frame: i as u32,
-                score: Some(value),
+                frame: ordinal,
+                score,
             });
         }
+        seen = seen.checked_add(1).ok_or("Metric frame count overflow.")?;
+        Ok(())
+    };
+    if metric == QualityMetric::Vmaf {
+        #[derive(serde::Deserialize)]
+        struct Frame {
+            #[serde(rename = "frameNum")]
+            frame: u32,
+            metrics: BTreeMap<String, f64>,
+        }
+        let mut failure = None;
+        crate::jobs::parse_frame_records(reader, |frame: Frame| {
+            if failure.is_none() {
+                failure = frame
+                    .metrics
+                    .get("vmaf")
+                    .copied()
+                    .ok_or("Missing VMAF value.".to_owned())
+                    .and_then(|value| consume(frame.frame, Some(value)))
+                    .err();
+            }
+        })
+        .map_err(fail)?;
+        if let Some(error) = failure {
+            return Err(fail(error));
+        }
     } else {
-        for line in std::str::from_utf8(bytes)
-            .map_err(|_| fail("Invalid metric encoding."))?
-            .lines()
-        {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let size = (&mut reader)
+                .take(8193)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| fail(e.to_string()))?;
+            if size == 0 {
+                break;
+            }
+            if size > 8192 {
+                return Err(fail("Metric record exceeds 8192 bytes."));
+            }
+            let line = std::str::from_utf8(&line).map_err(|e| fail(e.to_string()))?;
             let mut fields = BTreeMap::new();
             for field in line.split_whitespace() {
                 if let Some((key, value)) = field.split_once(':')
@@ -325,55 +509,43 @@ fn parse_report(
             }
             let ordinal = fields
                 .get("n")
-                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                .and_then(|value| value.checked_sub(1))
                 .ok_or_else(|| fail("Missing metric frame number."))?;
-            if ordinal != points.len() + 1 {
-                return Err(fail("Unexpected metric frame sequence."));
-            }
-            let key = if metric == QualityMetric::Ssim {
-                "All"
-            } else {
-                "psnr_avg"
-            };
             let raw = fields
-                .get(key)
+                .get(if metric == QualityMetric::Ssim {
+                    "All"
+                } else {
+                    "psnr_avg"
+                })
                 .ok_or_else(|| fail("Missing metric value."))?;
-            if metric == QualityMetric::Psnr && *raw == "inf" {
-                points.push(QualityPoint {
-                    frame: (ordinal - 1) as u32,
-                    score: None,
-                });
-                continue;
-            }
-            let value = Some(raw)
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| fail("Invalid metric score."))?;
-            if (metric == QualityMetric::Ssim && !(-1.0..=1.0).contains(&value))
-                || (metric == QualityMetric::Psnr && value < 0.0)
-            {
-                return Err(fail("Metric score outside its valid range."));
-            }
-            total += value;
-            let score = Some(value);
-            points.push(QualityPoint {
-                frame: (ordinal - 1) as u32,
-                score,
-            });
+            let value = if metric == QualityMetric::Psnr && *raw == "inf" {
+                None
+            } else {
+                Some(raw.parse::<f64>().map_err(|e| fail(e.to_string()))?)
+            };
+            consume(ordinal, value).map_err(fail)?;
         }
     }
-    if points.len() != count as usize {
+    if seen != count {
         return Err(fail("The metric did not compare every requested frame."));
     }
-    let average = total / f64::from(count);
     Ok((
         if metric == QualityMetric::Psnr {
-            None // The authoritative pooled PSNR comes from FFmpeg's summary.
+            None
         } else {
-            Some(average)
+            Some(total / f64::from(count))
         },
         points,
     ))
+}
+#[cfg(test)]
+fn parse_report(
+    bytes: &[u8],
+    metric: QualityMetric,
+    count: u32,
+) -> Result<(Option<f64>, Vec<QualityPoint>), AppError> {
+    parse_report_reader(&mut &*bytes, metric, count, count)
 }
 fn psnr_summary(stderr: &[u8]) -> Result<Option<f64>, AppError> {
     let text = String::from_utf8_lossy(stderr);
@@ -476,6 +648,7 @@ async fn detect_reference_crop(
     interval: (u32, u32),
     size: (u32, u32),
     ffmpeg: &Path,
+    vp9: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Crop, AppError> {
     let (start, count) = interval;
@@ -497,6 +670,10 @@ async fn detect_reference_crop(
         "file,pipe",
         "-i",
     ]);
+    if vp9 {
+        let index = arguments.len() - 1;
+        arguments.splice(index..index, ["-c:v".into(), "libvpx-vp9".into()]);
+    }
     arguments.push(reference.path.as_os_str().into());
     arguments.extend(args(&[
         "-filter_complex",
@@ -519,7 +696,7 @@ async fn detect_reference_crop(
         },
         cancel.clone(),
         256 * 1024,
-        Duration::from_secs(1800),
+        Duration::from_secs(86400),
     )
     .await
     .map_err(process_error)?;
@@ -618,7 +795,7 @@ fn model_name(model: QualityVmafModel) -> &'static str {
     }
 }
 pub async fn analyze_quality(
-    request: QualityRequest,
+    mut request: QualityRequest,
     cancel: watch::Receiver<bool>,
 ) -> Result<QualityResult, AppError> {
     let _permit = permit(&cancel).await?;
@@ -626,10 +803,11 @@ pub async fn analyze_quality(
     if !(1..=1000).contains(&options.subsample) {
         return Err(fail("Score every 1 to 1,000 frames."));
     }
-    if request.frame_count == 0
-        || request.frame_count > MAX_FRAMES
-        || request.reference_start_frame > MAX_SCAN - request.frame_count
-        || request.candidate_start_frame > MAX_SCAN - request.frame_count
+    if !request.full_source
+        && (request.frame_count == 0
+            || request.frame_count > MAX_FRAMES
+            || request.reference_start_frame > MAX_SCAN - request.frame_count
+            || request.candidate_start_frame > MAX_SCAN - request.frame_count)
     {
         return Err(fail(
             "Choose 1 to 60,000 corresponding frames within the first million source frames.",
@@ -646,37 +824,29 @@ pub async fn analyze_quality(
     let candidate_identity = fingerprint(&candidate)?;
     let ffprobe = tool("ffprobe", &cancel).await?;
     let ffmpeg = tool("ffmpeg", &cancel).await?;
-    let left = inspect(
+    if request.full_source
+        && (request.reference_start_frame != 0 || request.candidate_start_frame != 0)
+    {
+        return Err(fail(
+            "Full-source comparison starts at the beginning of both files.",
+        ));
+    }
+    let (left, right) = inspect_pair(
         &reference,
-        request.reference_stream_index,
-        request.reference_start_frame,
-        request.frame_count,
-        &ffprobe,
-        &cancel,
-    )
-    .await?;
-    let right = inspect(
         &candidate,
-        request.candidate_stream_index,
-        request.candidate_start_frame,
-        request.frame_count,
+        &request,
         &ffprobe,
         &cancel,
+        options.fix_frame_rate,
     )
     .await?;
+    if request.full_source {
+        request.frame_count = left.count;
+    }
     if left.geometry != right.geometry {
         return Err(fail(
             "Reference and candidate must have matching pixel format and color metadata. Prepare an explicitly matched reference first.",
         ));
-    }
-    if !options.fix_frame_rate {
-        for (a, b) in left.pts.iter().zip(&right.pts) {
-            if ((a - left.pts[0]) - (b - right.pts[0])).abs() > 0.0021 {
-                return Err(fail(
-                    "Decoded frame timing differs. Select corresponding frame intervals or enable fixed-rate frame pairing.",
-                ));
-            }
-        }
     }
     let crop_requested = matches!(
         options.alignment,
@@ -690,6 +860,7 @@ pub async fn analyze_quality(
                 (request.reference_start_frame, request.frame_count),
                 (left.width, left.height),
                 &ffmpeg,
+                left.vp9_decoder,
                 &cancel,
             )
             .await?,
@@ -699,6 +870,18 @@ pub async fn analyze_quality(
     };
     let aligned = comparison(&left, &right, options.alignment, crop)?;
     let workspace = Workspace::create()?;
+    let required = u64::from(request.frame_count.div_ceil(options.subsample))
+        .saturating_mul(16 * 1024)
+        .saturating_add(16 * 1024 * 1024);
+    let available =
+        crate::jobs::available_space(&workspace.0).map_err(|error| fail(error.message))?;
+    if required > available {
+        return Err(fail(format!(
+            "Complete metric reporting needs up to {} MiB of temporary space; {} MiB is available.",
+            required.div_ceil(1024 * 1024),
+            available / (1024 * 1024)
+        )));
+    }
     let metric = match request.metric {
         QualityMetric::Psnr => "psnr=stats_file=quality.log:shortest=1:repeatlast=0".to_owned(),
         QualityMetric::Ssim => "ssim=stats_file=quality.log:shortest=1:repeatlast=0".to_owned(),
@@ -714,6 +897,14 @@ pub async fn analyze_quality(
     };
     let chain = |filters: &[String]| {
         let mut parts = filters.to_vec();
+        if request.metric == QualityMetric::Vmaf
+            && left
+                .geometry
+                .get("pix_fmt")
+                .is_some_and(|format| format == "yuva420p")
+        {
+            parts.push("format=yuv420p".into());
+        }
         if !sample.is_empty() {
             parts.push(sample.clone());
         }
@@ -748,6 +939,10 @@ pub async fn analyze_quality(
         "file,pipe",
         "-i",
     ]);
+    if left.vp9_decoder {
+        let index = arguments.len() - 1;
+        arguments.splice(index..index, ["-c:v".into(), "libvpx-vp9".into()]);
+    }
     arguments.push(reference.path.as_os_str().into());
     arguments.extend(args(&[
         "-threads",
@@ -757,6 +952,10 @@ pub async fn analyze_quality(
         "file,pipe",
         "-i",
     ]));
+    if right.vp9_decoder {
+        let index = arguments.len() - 1;
+        arguments.splice(index..index, ["-c:v".into(), "libvpx-vp9".into()]);
+    }
     arguments.push(candidate.path.as_os_str().into());
     arguments.extend(args(&[
         "-filter_complex_threads",
@@ -781,7 +980,7 @@ pub async fn analyze_quality(
         },
         cancel.clone(),
         256 * 1024,
-        Duration::from_secs(1800),
+        Duration::from_secs(86400),
     )
     .await
     .map_err(process_error)?;
@@ -792,7 +991,19 @@ pub async fn analyze_quality(
         )));
     }
     let scored_count = request.frame_count.div_ceil(options.subsample);
-    let (mut score, mut points) = parse_report(&workspace.read()?, request.metric, scored_count)?;
+    let report = workspace.0.join("quality.log");
+    let metric = request.metric;
+    let limit = if request.full_source {
+        10_000
+    } else {
+        scored_count
+    };
+    let (mut score, mut points) = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(report).map_err(|e| fail(e.to_string()))?;
+        parse_report_reader(&mut file, metric, scored_count, limit)
+    })
+    .await
+    .map_err(|e| fail(e.to_string()))??;
     for point in &mut points {
         point.frame *= options.subsample;
     }

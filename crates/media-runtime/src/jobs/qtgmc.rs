@@ -75,12 +75,14 @@ pub(crate) async fn runtime(cancel: &watch::Receiver<bool>) -> Result<Runtime, A
 
 fn preset(preset: QtgmcPreset) -> &'static str {
     match preset {
+        QtgmcPreset::VeryFast => "Very Fast",
         QtgmcPreset::Faster => "Faster",
         QtgmcPreset::Fast => "Fast",
         QtgmcPreset::Medium => "Medium",
         QtgmcPreset::Slow => "Slow",
         QtgmcPreset::Slower => "Slower",
         QtgmcPreset::VerySlow => "Very Slow",
+        QtgmcPreset::Placebo => "Placebo",
     }
 }
 
@@ -173,12 +175,16 @@ pub(super) struct Prepared {
     pub producer: CommandSpec,
     pub consumer: CommandSpec,
     environment: Option<ChildEnvironment>,
+    source_observation: Option<super::source_filters::Observation>,
     _script: Script,
     cache: PathBuf,
     workspace: Stats,
 }
 
 impl Prepared {
+    pub(super) fn environment(&self) -> Option<&ChildEnvironment> {
+        self.environment.as_ref()
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         source: &Path,
@@ -295,6 +301,20 @@ impl Prepared {
             "matroska".into(),
             "pipe:1".into(),
         ]);
+        let source_observation = if plan.has_source_filters() {
+            // Preserve the actual filter-derived output cadence. A frozen -r
+            // here would duplicate/drop custom-filter output before the real
+            // source encoder (or image muxer) sees it.
+            if let Some(index) = consumer_args.iter().position(|arg| arg == "-r") {
+                consumer_args.drain(index..index + 2);
+            }
+            let observation = super::source_filters::Observation::new(output);
+            let counters = observation.arguments_for_streams(&[0])?;
+            consumer_args.splice(consumer_args.len() - 1..consumer_args.len() - 1, counters);
+            Some(observation)
+        } else {
+            None
+        };
         Ok(Self {
             video,
             producer,
@@ -304,6 +324,7 @@ impl Prepared {
                 cwd: subtitles.decoder_cwd().map(Path::to_path_buf),
             },
             environment: runtime.environment,
+            source_observation,
             _script: script,
             cache,
             workspace,
@@ -361,6 +382,62 @@ impl Prepared {
             ));
         }
         self.video.flush_nonempty_async().await
+    }
+
+    pub async fn validate_source_filters(
+        &self,
+        ffprobe: &Path,
+        plan: &Plan,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<usize, AppError> {
+        let observations = self
+            .source_observation
+            .as_ref()
+            .ok_or_else(|| {
+                files::error(
+                    "SOURCE_FILTER_OBSERVATION_INVALID",
+                    "The QTGMC source-filter counters are absent.",
+                    &self.video.path,
+                )
+            })?
+            .completed(cancel)
+            .await?;
+        let clock = observations.first().ok_or_else(|| {
+            files::error(
+                "SOURCE_FILTER_OBSERVATION_INVALID",
+                "The QTGMC filtered producer supplied no frames.",
+                &self.video.path,
+            )
+        })?;
+        let document = super::probe(ffprobe, &self.video.path, cancel, Some(&[0])).await?;
+        let stream = document.streams.first().ok_or_else(|| {
+            files::error(
+                "QTGMC_PREPARE_FAILED",
+                "The filtered QTGMC reference has no video.",
+                &self.video.path,
+            )
+        })?;
+        let mut observed = plan.clone();
+        observed.observe_source_filter_reference(stream, clock)?;
+        let count = Box::pin(super::encode::frame_scan(
+            ffprobe,
+            &self.video.path,
+            &mut observed,
+            stream,
+            true,
+            cancel,
+            None,
+        ))
+        .await?;
+        if count as u64 != clock.frames {
+            return Err(files::error(
+                "SOURCE_FILTER_OBSERVATION_INVALID",
+                "The QTGMC reference does not contain every actual filtered producer frame.",
+                &self.video.path,
+            ));
+        }
+        Box::pin(self.validate(ffprobe, &observed, count, cancel)).await?;
+        Ok(count)
     }
 
     pub async fn validate(
@@ -523,7 +600,7 @@ pub(crate) async fn check_tools(
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let program = format!(
-        "import vapoursynth as vs\nimport havsfunc\ncore = vs.core\nclip = core.std.BlankClip(width=192, height=128, length=8, format=vs.YUV420P8, fpsnum=30000, fpsden=1001)\nclip = core.std.SetFrameProps(clip, _FieldBased={field})\nclip = havsfunc.QTGMC(clip, Preset={preset:?}, TFF={tff}, FPSDivisor={divisor})\nwith clip.get_frame(0):\n    print('JESSES_QTGMC_OK', clip.num_frames, clip.fps_num, clip.fps_den)\nclip.set_output()\n",
+        "import vapoursynth as vs\nimport havsfunc\ncore = vs.core\nclip = core.std.BlankClip(width=192, height=128, length=8, format=vs.YUV420P8, fpsnum=30000, fpsden=1001)\nclip = core.std.SetFrameProps(clip, _FieldBased={field})\nclip = havsfunc.QTGMC(clip, Preset={preset:?}, TFF={tff}, FPSDivisor={divisor})\nfor index in range(clip.num_frames):\n    with clip.get_frame(index):\n        pass\nprint('JESSES_QTGMC_OK', clip.num_frames, clip.fps_num, clip.fps_den)\nclip.set_output()\n",
         field = if settings.field_order == FieldOrder::TopFirst {
             2
         } else {
@@ -585,9 +662,63 @@ pub(crate) async fn check_tools(
     Ok(())
 }
 
+/// Exercise the selected preset before a source-style fallback decision.
+pub(crate) async fn qualify(
+    settings: QtgmcSettings,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let runtime = runtime(cancel).await?;
+    let output = std::env::temp_dir().join("jesses-qtgmc-probe.mkv");
+    let work = Stats::create(
+        &output,
+        &format!(
+            "qtgmc-check-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    )?;
+    check_tools(
+        &runtime.vspipe,
+        runtime.environment.as_ref(),
+        &work.path,
+        settings,
+        cancel,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_all_eight_qtgmc_presets_keep_their_exact_provider_names() {
+        for (value, name) in [
+            (QtgmcPreset::Placebo, "Placebo"),
+            (QtgmcPreset::VerySlow, "Very Slow"),
+            (QtgmcPreset::Slower, "Slower"),
+            (QtgmcPreset::Slow, "Slow"),
+            (QtgmcPreset::Medium, "Medium"),
+            (QtgmcPreset::Fast, "Fast"),
+            (QtgmcPreset::Faster, "Faster"),
+            (QtgmcPreset::VeryFast, "Very Fast"),
+        ] {
+            assert_eq!(preset(value), name);
+            let script = source_script(
+                Path::new("/source.mkv"),
+                Path::new("/cache.lwi"),
+                0,
+                None,
+                QtgmcSettings {
+                    mode: DeinterlaceMode::Bob,
+                    field_order: FieldOrder::TopFirst,
+                    preset: value,
+                },
+            )
+            .unwrap();
+            assert!(script.contains(&format!("Preset={name:?}")));
+        }
+    }
 
     #[test]
     fn source_paths_are_literals_and_trim_precedes_qtgmc() {

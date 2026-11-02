@@ -709,7 +709,9 @@ pub(super) async fn deinterlace(
                 source_fingerprints: vec![fingerprint(&source)?],
                 message: format!(
                     "Exported progressive near-lossless H.264 at {}/{} fps using {}.",
-                    output_fps.0, output_fps.1, name
+                    output_fps.0,
+                    output_fps.1,
+                    name.to_ascii_uppercase()
                 ),
                 diagnostics: vec![format!(
                     "Validated {expected} decoded frames, source tracks, and complete output decode."

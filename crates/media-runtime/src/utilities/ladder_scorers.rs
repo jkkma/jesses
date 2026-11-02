@@ -3,6 +3,8 @@
 //! plugins; XPSNR uses FFmpeg.
 use super::*;
 
+#[cfg(not(windows))]
+mod portable;
 pub(super) enum Scorer {
     Python {
         executable: PathBuf,
@@ -74,12 +76,7 @@ impl Scorer {
         }
         #[cfg(not(windows))]
         {
-            let _ = work;
-            return Err(scorer_error(
-                "UTILITY_SCORER_UNAVAILABLE",
-                "This scorer currently requires the validated Windows VapourSynth runtime.",
-                ffmpeg,
-            ));
+            return portable::prepare(metric, work, cancel).await.map(Some);
         }
         #[cfg(windows)]
         {
@@ -211,6 +208,16 @@ impl Scorer {
         cancel: &watch::Receiver<bool>,
         force_cpu: bool,
     ) -> Result<Option<f64>, AppError> {
+        progress::phase(
+            "scoring",
+            &format!(
+                "Scoring {}",
+                metric_name(match self {
+                    Self::Python { metric, .. } => *metric,
+                    Self::Xpsnr { .. } => LadderMetric::XpsnrWeighted,
+                })
+            ),
+        );
         match self {
             Self::Xpsnr { ffmpeg } => {
                 score_xpsnr(ffmpeg, reference, candidate, expected_frames, cancel).await
@@ -335,7 +342,7 @@ fn gpu_probe(metric: LadderMetric, plugin: &Path) -> String {
         _ => unreachable!(),
     };
     format!(
-        "import math\nimport vapoursynth as vs\ncore = vs.core\ncore.std.LoadPlugin(path={literal})\nref = core.std.BlankClip(width=192, height=128, format=vs.YUV444P10, length=2, color=[256,512,512])\ndist = core.std.BlankClip(ref, color=[264,520,520])\nclip, name = {score}\nwith clip.get_frame(0) as frame:\n    value = float(frame.props[name])\n    assert math.isfinite(value), value\n    print('JESSES_VSHIP_OK', value)\n"
+        "import math\nimport vapoursynth as vs\ncore = vs.core\nif not hasattr(core, 'vship'):\n    core.std.LoadPlugin(path={literal})\nref = core.std.BlankClip(width=192, height=128, format=vs.YUV444P10, length=2, color=[256,512,512])\ndist = core.std.BlankClip(ref, color=[264,520,520])\nclip, name = {score}\nwith clip.get_frame(0) as frame:\n    value = float(frame.props[name])\n    assert math.isfinite(value), value\n    print('JESSES_VSHIP_OK', value)\n"
     )
 }
 
@@ -352,13 +359,16 @@ fn python_script(
             .map_err(|cause| scorer_error("UTILITY_SCORER_FAILED", cause.to_string(), path))
     };
     let mut script = format!(
-        "import math\nimport vapoursynth as vs\ncore = vs.core\nREF = {}\nDIST = {}\nCACHE = {}\nEXPECTED = {expected}\n",
+        "import math, sys\nimport vapoursynth as vs\ncore = vs.core\nREF = {}\nDIST = {}\nCACHE = {}\nEXPECTED = {expected}\n",
         literal(reference)?,
         literal(candidate)?,
         literal(cache)?
     );
     if let Some(plugin) = gpu_plugin {
-        script.push_str(&format!("core.std.LoadPlugin(path={})\n", literal(plugin)?));
+        script.push_str(&format!(
+            "if not hasattr(core, 'vship'):\n    core.std.LoadPlugin(path={})\n",
+            literal(plugin)?
+        ));
     }
     script.push_str("\ndef open_video(path):\n    return core.lsmas.LWLibavSource(source=path, cachedir=CACHE)\nref = open_video(REF)\ndist = open_video(DIST)\nif ref.num_frames != EXPECTED or dist.num_frames != EXPECTED:\n    raise RuntimeError('scorer inputs changed frame count')\n");
     match metric {
@@ -368,7 +378,7 @@ fn python_script(
         LadderMetric::ButteraugliInf => script.push_str("\ndef rgb(clip):\n    matrix = {1:'709',5:'470bg',6:'170m'}.get(int(clip.get_frame(0).props.get('_Matrix', 1)), '709')\n    return core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=matrix)\nscored = core.julek.Butteraugli(reference=rgb(ref), distorted=rgb(dist), distmap=1, intensity_target=203.0)\nNAMES = ('_FrameButteraugli',)\n"),
         _ => unreachable!(),
     }
-    script.push_str("\ntotal = 0.0\nfor i in range(EXPECTED):\n    props = scored.get_frame(i).props\n    value = next((float(props[name]) for name in NAMES if name in props), None)\n    if value is None or not math.isfinite(value):\n        raise RuntimeError('missing or nonfinite scorer frame property')\n    total += value\nprint('JESSES_LADDER_SCORE %.9f %d' % (total / EXPECTED, EXPECTED))\n");
+    script.push_str("\ntotal = 0.0\nfor i in range(EXPECTED):\n    props = scored.get_frame(i).props\n    value = next((float(props[name]) for name in NAMES if name in props), None)\n    if value is None or not math.isfinite(value):\n        raise RuntimeError('missing or nonfinite scorer frame property')\n    total += value\n    if i % max(1, EXPECTED // 100) == 0:\n        print('out_time_us=%d' % ((i + 1) * 1000000 * scored.fps_den / scored.fps_num), file=sys.stderr, flush=True)\nprint('JESSES_LADDER_SCORE %.9f %d' % (total / EXPECTED, EXPECTED))\n");
     Ok(script)
 }
 
@@ -382,22 +392,25 @@ async fn score_xpsnr(
     let result = run_capture(
         &CommandSpec {
             executable: ffmpeg.to_owned(),
-            args: ["-hide_banner", "-v", "error", "-nostdin", "-i"]
-                .into_iter()
-                .map(Into::into)
-                .chain([
-                    os(candidate),
-                    "-i".into(),
-                    os(reference),
-                    "-filter_complex".into(),
-                    "[0:v:0][1:v:0]xpsnr=stats_file=-".into(),
-                    "-frames:v".into(),
-                    expected.to_string().into(),
-                    "-f".into(),
-                    "null".into(),
-                    "-".into(),
-                ])
-                .collect(),
+            args: progress_arguments(
+                ffmpeg,
+                ["-hide_banner", "-v", "error", "-nostdin", "-i"]
+                    .into_iter()
+                    .map(Into::into)
+                    .chain([
+                        os(candidate),
+                        "-i".into(),
+                        os(reference),
+                        "-filter_complex".into(),
+                        "[0:v:0][1:v:0]xpsnr=stats_file=-".into(),
+                        "-frames:v".into(),
+                        expected.to_string().into(),
+                        "-f".into(),
+                        "null".into(),
+                        "-".into(),
+                    ])
+                    .collect(),
+            ),
             cwd: None,
         },
         cancel.clone(),
@@ -406,7 +419,7 @@ async fn score_xpsnr(
     )
     .await
     .map_err(|cause| process_error(cause, Some(candidate)))?;
-    if !result.status.success() || !result.stderr.is_empty() {
+    if !result.status.success() || !diagnostic_tail(&result.stderr).is_empty() {
         return Err(scorer_error(
             "UTILITY_SCORER_FAILED",
             format!(

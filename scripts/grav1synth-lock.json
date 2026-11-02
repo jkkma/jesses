@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "commit": "1044228cd411672b565e5762a9b3597f4dd163b0",
+    "url": "https://codeload.github.com/rust-av/grav1synth/tar.gz/1044228cd411672b565e5762a9b3597f4dd163b0",
+    "sha256": "af08ddd74813867cc47ef86484472870d587280ec64661a7b62fbcf907637701",
+    "filename": "grav1synth-1044228.tar.gz",
+    "sourceRoot": "grav1synth-1044228cd411672b565e5762a9b3597f4dd163b0"
+  },
+  "ffmpeg": {
+    "version": "8.1",
+    "url": "https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz",
+    "sha256": "b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a",
+    "filename": "ffmpeg-8.1.tar.xz",
+    "sourceRoot": "ffmpeg-8.1"
+  },
+  "dav1d": {
+    "id": "dav1d",
+    "version": "1.5.4-1",
+    "url": "https://repo.msys2.org/mingw/sources/mingw-w64-dav1d-1.5.4-1.src.tar.zst",
+    "sha256": "dd7bdbd140996eb26e857c2cfe80d0952641c997a5826c15d5bb204571d2518e",
+    "filename": "mingw-w64-dav1d-1.5.4-1.src.tar.zst",
+    "bundleRoot": "mingw-w64-dav1d",
+    "upstream": "https://code.videolan.org/videolan/dav1d",
+    "embeddedArchive": "mingw-w64-dav1d/dav1d-1.5.4.tar.xz",
+    "embeddedSha256": "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5",
+    "sourceRoot": "dav1d-1.5.4",
+    "licenseFiles": [
+      "COPYING",
+      "doc/PATENTS"
+    ]
+  },
+  "presets": [
+    "Super8",
+    "MaxMid",
+    "16mm",
+    "16mm-1",
+    "16mm-2",
+    "16mm-3",
+    "Classic35",
+    "Classic35-1",
+    "Classic35-2",
+    "Classic35-3",
+    "Modern35",
+    "Modern35-1",
+    "Modern35-2",
+    "Modern35-3"
+  ],
+  "rustVersion": "1.98.1"
+}

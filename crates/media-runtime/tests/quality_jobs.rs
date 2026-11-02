@@ -118,6 +118,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     ];
     let (_owner, cancel) = tokio::sync::watch::channel(false);
     let request = QualityRequest {
+        full_source: false,
         reference_path: reference.to_string_lossy().into_owned(),
         reference_stream_index: 0,
         reference_start_frame: 12,
@@ -146,6 +147,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     ] {
         let result = analyze_quality(
             QualityRequest {
+                full_source: false,
                 metric,
                 ..request.clone()
             },
@@ -170,6 +172,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     }
     let sampled = analyze_quality(
         QualityRequest {
+            full_source: false,
             options: Some(QualityOptions {
                 subsample: 5,
                 ..QualityOptions::default()
@@ -194,6 +197,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     ] {
         let selected = analyze_quality(
             QualityRequest {
+                full_source: false,
                 options: Some(QualityOptions {
                     vmaf_model: model,
                     subsample: 4,
@@ -230,6 +234,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     arguments.push(padded.as_os_str().into());
     capture(&ffmpeg, arguments).await;
     let crop_request = QualityRequest {
+        full_source: false,
         reference_path: padded.to_string_lossy().into_owned(),
         metric: QualityMetric::Ssim,
         options: Some(QualityOptions {
@@ -250,6 +255,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     assert!(
         analyze_quality(
             QualityRequest {
+                full_source: false,
                 options: None,
                 ..crop_request
             },
@@ -266,6 +272,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     capture(&ffmpeg, arguments).await;
     let resized = analyze_quality(
         QualityRequest {
+            full_source: false,
             reference_path: large.to_string_lossy().into_owned(),
             metric: QualityMetric::Ssim,
             options: Some(QualityOptions {
@@ -287,6 +294,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     capture(&ffmpeg, arguments).await;
     let crop_and_resized = analyze_quality(
         QualityRequest {
+            full_source: false,
             reference_path: large_padded.to_string_lossy().into_owned(),
             metric: QualityMetric::Ssim,
             options: Some(QualityOptions {
@@ -313,6 +321,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     capture(&ffmpeg, arguments).await;
     let desqueezed = analyze_quality(
         QualityRequest {
+            full_source: false,
             reference_path: anamorphic.to_string_lossy().into_owned(),
             metric: QualityMetric::Ssim,
             ..request.clone()
@@ -329,6 +338,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     arguments.push(retimed.as_os_str().into());
     capture(&ffmpeg, arguments).await;
     let timed = QualityRequest {
+        full_source: false,
         candidate_path: retimed.to_string_lossy().into_owned(),
         metric: QualityMetric::Ssim,
         ..request.clone()
@@ -343,6 +353,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     );
     let fixed = analyze_quality(
         QualityRequest {
+            full_source: false,
             options: Some(QualityOptions {
                 fix_frame_rate: true,
                 ..QualityOptions::default()
@@ -356,6 +367,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     assert_eq!(fixed.frame_count, 24);
     assert!(fixed.message.contains("paired by frame number"));
     let identical = QualityRequest {
+        full_source: false,
         candidate_path: reference.to_string_lossy().into_owned(),
         ..request.clone()
     };
@@ -369,6 +381,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     assert_eq!(
         analyze_quality(
             QualityRequest {
+                full_source: false,
                 metric: QualityMetric::Ssim,
                 ..identical
             },
@@ -382,6 +395,7 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
     assert!(
         analyze_quality(
             QualityRequest {
+                full_source: false,
                 candidate_start_frame: 36,
                 ..request.clone()
             },
@@ -407,4 +421,88 @@ async fn scores_match_pixels_and_reject_invalid_alignment_without_source_changes
         std::fs::remove_file(path).unwrap();
     }
     std::fs::remove_dir(directory).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe; scores 60001 frames"]
+async fn full_source_quality_streams_actual_pairs_beyond_partial_cap_and_rejects_shorter_candidates()
+ {
+    let tools = media_runtime::get_capabilities().await;
+    let ffmpeg = PathBuf::from(
+        tools
+            .iter()
+            .find(|tool| tool.id == "ffmpeg")
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap(),
+    );
+    let directory = std::env::temp_dir().join(format!(
+        "jesses-quality-full-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let input = directory.join("full.mkv");
+    let mut a = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=gray:size=32x32:rate=1000",
+        "-frames:v",
+        "60001",
+        "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-chroma_sample_location",
+        "left",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+    ]);
+    a.push(input.as_os_str().to_owned());
+    capture(&ffmpeg, a).await;
+    let original = Sha256::digest(std::fs::read(&input).unwrap());
+    let request = QualityRequest {
+        reference_path: input.to_string_lossy().into_owned(),
+        reference_stream_index: 0,
+        reference_start_frame: 0,
+        candidate_path: input.to_string_lossy().into_owned(),
+        candidate_stream_index: 0,
+        candidate_start_frame: 0,
+        frame_count: 0,
+        full_source: true,
+        metric: QualityMetric::Psnr,
+        options: None,
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let result = analyze_quality(request.clone(), cancel).await.unwrap();
+    assert_eq!(result.frame_count, 60001);
+    assert_eq!(result.score, None);
+    assert!(result.points.len() <= 10000);
+    assert_eq!(result.points.last().unwrap().frame, 60000);
+    let short = directory.join("short.mkv");
+    let mut a = args(&["-v", "error", "-i"]);
+    a.push(input.as_os_str().to_owned());
+    a.extend(args(&["-frames:v", "12", "-c:v", "copy"]));
+    a.push(short.as_os_str().to_owned());
+    capture(&ffmpeg, a).await;
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let error = analyze_quality(
+        QualityRequest {
+            candidate_path: short.to_string_lossy().into_owned(),
+            ..request
+        },
+        cancel,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "QUALITY_ANALYSIS_FAILED");
+    assert_eq!(Sha256::digest(std::fs::read(&input).unwrap()), original);
+    std::fs::remove_dir_all(directory).unwrap();
 }

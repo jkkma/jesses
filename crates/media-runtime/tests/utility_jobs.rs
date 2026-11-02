@@ -108,6 +108,10 @@ async fn crf_ladder_scores_all_new_metrics_with_expected_direction() {
     ] {
         let result = media_runtime::run_utility(
             UtilityRequest::CrfLadder(CrfLadderRequest {
+                content_preset: None,
+                parameters: Vec::new(),
+                vmaf_model: None,
+                keep_samples_directory: None,
                 input_path: path(&source),
                 video_stream_index: 0,
                 encoder: LadderEncoder::H264,
@@ -413,6 +417,9 @@ async fn real_utility_routes_publish_validated_outputs_without_touching_sources(
     let color_output = fixture.0.join("color-transfer.mkv");
     let result = media_runtime::run_utility(
         UtilityRequest::ColorMetadataTransfer(ColorMetadataTransferRequest {
+            copy_color: true,
+            copy_hdr: true,
+            in_place: false,
             metadata_source_path: path(&color_source),
             metadata_source_video_stream_index: 0,
             input_path: path(&first),
@@ -427,6 +434,10 @@ async fn real_utility_routes_publish_validated_outputs_without_touching_sources(
 
     let ladder = media_runtime::run_utility(
         UtilityRequest::CrfLadder(CrfLadderRequest {
+            content_preset: None,
+            parameters: Vec::new(),
+            vmaf_model: None,
+            keep_samples_directory: None,
             input_path: path(&first),
             video_stream_index: 0,
             encoder: LadderEncoder::H264,
@@ -692,4 +703,361 @@ async fn real_utility_routes_publish_validated_outputs_without_touching_sources(
     assert_eq!(fs::read(second).unwrap(), original_second);
     assert_eq!(fs::read(b_frame_source).unwrap(), original_b_frame_source);
     assert_eq!(fs::read(av1).unwrap(), original_av1);
+}
+
+#[tokio::test]
+#[ignore = "requires real FFmpeg/FFprobe with libx264 and grav1synth"]
+async fn fork_presets_kept_ladder_samples_and_source_grain_measurement() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("grainy source.mkv");
+    make_ffv1(&source, "bt709", "tv", "1");
+    let original = fs::read(&source).unwrap();
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let samples = fixture.0.join("reviewable ladder samples");
+    let result = media_runtime::run_utility(
+        UtilityRequest::CrfLadder(CrfLadderRequest {
+            input_path: path(&source),
+            video_stream_index: 0,
+            encoder: LadderEncoder::H264,
+            preset: "ultrafast".into(),
+            pixel_format: "yuv420p10le".into(),
+            crfs: vec![18, 35],
+            sample_count: 1,
+            sample_seconds: 1.0,
+            metric: LadderMetric::Ssim,
+            recommendation_threshold: None,
+            content_preset: Some("Anime / Cel Animation".into()),
+            parameters: Vec::new(),
+            vmaf_model: Some(media_core::QualityVmafModel::Negative),
+            keep_samples_directory: Some(path(&samples)),
+        }),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    let UtilityResult::CrfLadder(ladder) = result else {
+        panic!("expected ladder");
+    };
+    assert_eq!(ladder.parameters.len(), 8, "{:?}", ladder.diagnostics);
+    assert_eq!(ladder.rungs.len(), 2);
+    assert_eq!(
+        ladder.content_preset.as_deref(),
+        Some("Anime / Cel Animation")
+    );
+    assert_eq!(ladder.vmaf_model, media_core::QualityVmafModel::Negative);
+    assert_eq!(
+        ladder.samples_directory.as_deref(),
+        Some(path(&samples).as_str())
+    );
+    assert!(
+        ladder
+            .rungs
+            .iter()
+            .all(|rung| rung.score.is_some_and(|score| score.is_finite()))
+    );
+    let files = fs::read_dir(&samples)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 3);
+    for sample in &files {
+        assert_eq!(decoded_video_frames(sample), 24);
+    }
+    for keep in [false, true] {
+        let table = fixture.0.join(if keep {
+            "kept-reference.tbl"
+        } else {
+            "private-reference.tbl"
+        });
+        let denoised = fixture.0.join("retained denoised.mkv");
+        let result = media_runtime::run_utility(
+            UtilityRequest::Grain(GrainRequest::MeasureSource {
+                source_path: path(&source),
+                output_table_path: path(&table),
+                denoise_strength: 4,
+                denoised_output_path: keep.then(|| path(&denoised)),
+            }),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let UtilityResult::GrainTable(measured) = result else {
+            panic!("expected grain table");
+        };
+        assert!(measured.segment_count > 0);
+        assert!(table.is_file());
+        assert_eq!(measured.denoised_output_path.is_some(), keep);
+        if keep {
+            assert_eq!(decoded_video_frames(&denoised), 24);
+        }
+    }
+    assert_eq!(fs::read(&source).unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires real FFmpeg and FFprobe"]
+async fn utility_batch_preserves_successes_and_continues_after_a_failed_source() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("batch source.mkv");
+    make_ffv1(&source, "bt709", "tv", "1");
+    let original = fs::read(&source).unwrap();
+    let output = fixture.0.join("batch output.mkv");
+    let cut = |input: &Path, output: &Path| {
+        UtilityRequest::KeyframeCut(KeyframeCutRequest {
+            input_path: path(input),
+            output_path: path(output),
+            start_seconds: 0.0,
+            end_seconds: 1.0,
+        })
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let request = media_core::UtilityBatchRequest {
+        requests: vec![
+            cut(
+                &fixture.0.join("missing.mkv"),
+                &fixture.0.join("failed.mkv"),
+            ),
+            cut(&source, &output),
+        ],
+    };
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let observed_output = output.clone();
+    let result = media_runtime::with_utility_progress(
+        move |value| {
+            let existed = observed_output.exists();
+            sink.lock().unwrap().push((value, existed));
+        },
+        media_runtime::run_utility_batch(request.clone(), cancel.clone()),
+    )
+    .await
+    .unwrap();
+    {
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(value, _)| value.row_index == Some(0) && value.status == "failed")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(value, existed)| value.row_index == Some(1)
+                    && value.status == "running"
+                    && !existed)
+        );
+        assert!(events.iter().any(|(value, _)| value.row_index == Some(1)
+            && value.status == "succeeded"
+            && value.completed_rows == 2));
+    }
+    assert_eq!(result.completed, 1);
+    assert!(!result.canceled);
+    assert_eq!(result.entries.len(), 2);
+    assert!(result.entries[0].error.is_some());
+    assert!(result.entries[1].result.is_some());
+    assert_eq!(decoded_video_frames(&output), 24);
+    let published = fs::read(&output).unwrap();
+    let repeated = media_runtime::run_utility_batch(request, cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(repeated.code, "OUTPUT_EXISTS");
+    assert_eq!(fs::read(&output).unwrap(), published);
+    assert_eq!(fs::read(&source).unwrap(), original);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[ignore = "requires an actual external VapourSynth Python with L-SMASH, vszip and julek plugins"]
+async fn portable_cpu_ladder_metrics_score_every_retained_frame() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("portable metric source.mkv");
+    make_ffv1(&source, "bt709", "tv", "1");
+    let original = fs::read(&source).unwrap();
+    for metric in [LadderMetric::Ssimulacra2, LadderMetric::ButteraugliInf] {
+        let samples = fixture.0.join(format!("samples-{metric:?}"));
+        let (_owner, cancel) = tokio::sync::watch::channel(false);
+        let result = media_runtime::run_utility(
+            UtilityRequest::CrfLadder(CrfLadderRequest {
+                input_path: path(&source),
+                video_stream_index: 0,
+                encoder: LadderEncoder::H264,
+                preset: "ultrafast".into(),
+                pixel_format: "yuv420p10le".into(),
+                crfs: vec![23],
+                sample_count: 1,
+                sample_seconds: 1.0,
+                metric,
+                recommendation_threshold: None,
+                content_preset: None,
+                parameters: Vec::new(),
+                vmaf_model: None,
+                keep_samples_directory: Some(path(&samples)),
+            }),
+            cancel,
+        )
+        .await
+        .unwrap();
+        let UtilityResult::CrfLadder(ladder) = result else {
+            panic!("expected ladder")
+        };
+        assert_eq!(ladder.rungs.len(), 1);
+        assert!(ladder.rungs[0].score.is_some_and(f64::is_finite));
+        for entry in fs::read_dir(samples).unwrap() {
+            assert_eq!(decoded_video_frames(&entry.unwrap().path()), 24);
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg/FFprobe with libaom, SVT-AV1 and all three built-in libvmaf models"]
+async fn av1_ladders_use_all_vmaf_models_presets_and_no_clobber_sample_publication() {
+    use media_core::QualityVmafModel;
+    let fixture = Fixture::new();
+    let source = fixture.0.join("AV1 model source.mkv");
+    make_ffv1(&source, "bt709", "tv", "1");
+    let original = fs::read(&source).unwrap();
+    for encoder in [LadderEncoder::AomAv1, LadderEncoder::Av1] {
+        for model in [
+            QualityVmafModel::Standard,
+            QualityVmafModel::Negative,
+            QualityVmafModel::FourK,
+        ] {
+            let samples = fixture.0.join(format!("{encoder:?}-{model:?}-samples"));
+            let request = UtilityRequest::CrfLadder(CrfLadderRequest {
+                input_path: path(&source),
+                video_stream_index: 0,
+                encoder,
+                preset: "8".into(),
+                pixel_format: "yuv420p10le".into(),
+                crfs: vec![28],
+                sample_count: 1,
+                sample_seconds: 1.0,
+                metric: LadderMetric::Vmaf,
+                recommendation_threshold: None,
+                content_preset: (encoder == LadderEncoder::Av1)
+                    .then(|| "Game Capture / Gameplay".into()),
+                parameters: Vec::new(),
+                vmaf_model: Some(model),
+                keep_samples_directory: Some(path(&samples)),
+            });
+            let (_owner, cancel) = tokio::sync::watch::channel(false);
+            let result = media_runtime::run_utility(request.clone(), cancel.clone())
+                .await
+                .unwrap();
+            let UtilityResult::CrfLadder(ladder) = result else {
+                panic!("expected ladder")
+            };
+            assert_eq!(ladder.encoder, encoder);
+            assert_eq!(ladder.vmaf_model, model);
+            assert_eq!(ladder.rungs.len(), 1);
+            let score = ladder.rungs[0]
+                .score
+                .expect("VMAF must score the complete sample");
+            assert!(score.is_finite() && (0.0..=100.0).contains(&score));
+            assert_eq!(
+                ladder.samples_directory.as_deref(),
+                Some(path(&samples).as_str())
+            );
+            if encoder == LadderEncoder::Av1 {
+                assert_eq!(
+                    ladder.content_preset.as_deref(),
+                    Some("Game Capture / Gameplay")
+                );
+                let source_presets: serde_json::Value =
+                    serde_json::from_str(include_str!("../../../src/lib/content-presets.json"))
+                        .unwrap();
+                let source_rows = source_presets["svtAv1"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["name"] == "Game Capture / Gameplay")
+                    .unwrap()["parameters"]
+                    .as_array()
+                    .unwrap();
+                for row in source_rows {
+                    let name = row["name"].as_str().unwrap();
+                    assert!(
+                        ladder.parameters.iter().any(|item| item.name == name)
+                            || ladder
+                                .diagnostics
+                                .iter()
+                                .any(|text| text.contains(&format!("control {name}="))
+                                    && text.contains("omitted")),
+                        "missing preset disposition {name}: {ladder:?}"
+                    );
+                }
+            }
+            let mut retained = fs::read_dir(&samples)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    assert_eq!(decoded_video_frames(&path), 24);
+                    (path.clone(), fs::read(path).unwrap())
+                })
+                .collect::<Vec<_>>();
+            retained.sort_by(|left, right| left.0.cmp(&right.0));
+            assert_eq!(retained.len(), 2, "one reference plus one encoded rung");
+            let repeated = media_runtime::run_utility(request, cancel)
+                .await
+                .unwrap_err();
+            assert_eq!(repeated.code, "OUTPUT_EXISTS");
+            for (path, bytes) in retained {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            assert_eq!(fs::read(&source).unwrap(), original);
+            eprintln!(
+                "{encoder:?} {model:?}: VMAF={score:.6}, applied preset controls={}, retained2×24frames; existing destination preserved",
+                ladder.parameters.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg/FFprobe with SVT-AV1 and libvmaf"]
+async fn eight_bit_svt_preset_reports_high_bit_depth_control_omission() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("eight bit gameplay.mkv");
+    make_ffv1(&source, "bt709", "tv", "1");
+    let original = fs::read(&source).unwrap();
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let result = media_runtime::run_utility(
+        UtilityRequest::CrfLadder(CrfLadderRequest {
+            input_path: path(&source),
+            video_stream_index: 0,
+            encoder: LadderEncoder::Av1,
+            preset: "8".into(),
+            pixel_format: "yuv420p".into(),
+            crfs: vec![28],
+            sample_count: 1,
+            sample_seconds: 1.0,
+            metric: LadderMetric::Vmaf,
+            recommendation_threshold: None,
+            content_preset: Some("Game Capture / Gameplay".into()),
+            parameters: Vec::new(),
+            vmaf_model: None,
+            keep_samples_directory: None,
+        }),
+        cancel,
+    )
+    .await
+    .unwrap();
+    let UtilityResult::CrfLadder(ladder) = result else {
+        panic!("expected ladder")
+    };
+    assert!(
+        ladder
+            .parameters
+            .iter()
+            .all(|value| value.name != "hbd-mds")
+    );
+    assert!(
+        ladder
+            .diagnostics
+            .iter()
+            .any(|text| text.contains("control hbd-mds=1") && text.contains("omitted"))
+    );
+    assert!(ladder.rungs[0].score.is_some_and(f64::is_finite));
+    assert_eq!(fs::read(source).unwrap(), original);
 }
