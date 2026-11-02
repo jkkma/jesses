@@ -14,6 +14,10 @@ struct Measurement {
     input_i: String,
     input_tp: String,
     input_lra: String,
+    #[serde(default)]
+    input_thresh: Option<String>,
+    #[serde(default)]
+    target_offset: Option<String>,
 }
 
 fn measurement(value: &str) -> Result<Option<f64>, String> {
@@ -27,7 +31,7 @@ fn measurement(value: &str) -> Result<Option<f64>, String> {
     Ok(Some(value))
 }
 
-fn parse(stderr: &[u8], request: &LoudnessRequest) -> Result<LoudnessResult, String> {
+fn record(stderr: &[u8]) -> Result<Measurement, String> {
     let text = std::str::from_utf8(stderr).map_err(|_| "Invalid loudness output encoding.")?;
     let start = text
         .rfind('{')
@@ -40,8 +44,11 @@ fn parse(stderr: &[u8], request: &LoudnessRequest) -> Result<LoudnessResult, Str
     if end - start > 8192 {
         return Err("Loudness record exceeded its size limit.".into());
     }
-    let record: Measurement =
-        serde_json::from_str(&text[start..end]).map_err(|error| error.to_string())?;
+    serde_json::from_str(&text[start..end]).map_err(|error| error.to_string())
+}
+
+fn parse(stderr: &[u8], request: &LoudnessRequest) -> Result<LoudnessResult, String> {
+    let record = record(stderr)?;
     let integrated = measurement(&record.input_i)?;
     let peak = measurement(&record.input_tp)?;
     let range = measurement(&record.input_lra)?;
@@ -98,6 +105,9 @@ pub async fn measure_loudness(
         AudioChannels::Stereo => "aformat=channel_layouts=stereo,".into(),
         AudioChannels::Surround51 => "aformat=channel_layouts=5.1,".into(),
         AudioChannels::Surround71 => "aformat=channel_layouts=7.1,".into(),
+        AudioChannels::Explicit { layout: media_core::AudioChannelLayoutPolicy::Source, .. } => String::new(),
+        AudioChannels::Explicit { layout: media_core::AudioChannelLayoutPolicy::FfmpegDefault, .. } => return Err(fail("INVALID_ANALYSIS", "Encoder-default layouts must be qualified by the native encode job before normalization.".into())),
+        AudioChannels::Explicit { count, .. } => match count { 1 => "aformat=channel_layouts=mono,", 2 => "aformat=channel_layouts=stereo,", 6 => "aformat=channel_layouts=5.1,", 8 => "aformat=channel_layouts=7.1,", _ => return Err(fail("INVALID_ANALYSIS", "This explicit channel count has no selected speaker layout.".into())) }.into(),
     };
     // Only the measured input values are used. The filter's processed samples
     // go to the null muxer, never to a media output or the source directory.
@@ -178,6 +188,191 @@ pub async fn measure_loudness(
     let mut result =
         parse(&output.stderr, &request).map_err(|message| fail("ANALYSIS_FAILED", message))?;
     result.source_fingerprint = identity;
+    Ok(result)
+}
+
+/// Owned evidence for one exact input, output channel layout and clipped sample
+/// span. Fields stay private so the second pass can only use this measurement.
+pub(crate) struct NormalizationMeasurement {
+    source: Source,
+    fingerprint: String,
+    stream_index: u32,
+    prefix: String,
+    channels: String,
+    target: media_core::LoudnessTarget,
+    integrated: f64,
+    peak: f64,
+    range: f64,
+    threshold: f64,
+    offset: f64,
+}
+impl NormalizationMeasurement {
+    pub(crate) fn verify(&self) -> Result<(), AppError> {
+        self.source.verify()?;
+        if fingerprint(&self.source)? != self.fingerprint {
+            return Err(AppError::new(
+                "SOURCE_CHANGED",
+                "The measured loudness source changed before execution.",
+                Some(self.source.path.to_string_lossy().into_owned()),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn filter(&self) -> String {
+        let lra = (self.range.ceil() + 1.0).clamp(1.0, 50.0);
+        format!(
+            "{}loudnorm=I={}:TP=-1:LRA={lra}:measured_I={}:measured_TP={}:measured_LRA={}:measured_thresh={}:offset={}:linear=true",
+            self.channels,
+            self.target.lufs(),
+            self.integrated,
+            self.peak,
+            self.range,
+            self.threshold,
+            self.offset
+        )
+    }
+    pub(crate) fn evidence(&self) -> String {
+        format!(
+            "Measured two-pass loudness for stream {}: {} LUFS, {} dBTP, {} LU LRA; target {} LUFS/-1 dBTP over {}. Peak requires dynamic limiting: {}.",
+            self.stream_index,
+            self.integrated,
+            self.peak,
+            self.range,
+            self.target.lufs(),
+            self.prefix,
+            self.peak + (f64::from(self.target.lufs()) - self.integrated) > -1.0
+        )
+    }
+}
+
+pub(crate) async fn measure_normalization(
+    ffmpeg: &Path,
+    input: &Path,
+    index: u32,
+    prefix: &str,
+    channels: &str,
+    target: media_core::LoudnessTarget,
+    cancel: &watch::Receiver<bool>,
+) -> Result<NormalizationMeasurement, AppError> {
+    check_cancel(cancel).map_err(|_| {
+        AppError::new(
+            "JOB_CANCELED",
+            "Loudness measurement canceled; no output was published.",
+            None,
+        )
+    })?;
+    let source = Source::open(input)?;
+    let identity = fingerprint(&source)?;
+    let filter = format!(
+        "{prefix},{channels}loudnorm=I={}:TP=-1:LRA=7:print_format=json",
+        target.lufs()
+    );
+    let args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-nostats".into(),
+        "-v".into(),
+        "info".into(),
+        "-protocol_whitelist".into(),
+        "file,pipe".into(),
+        "-i".into(),
+        source.path.as_os_str().to_owned(),
+        "-map".into(),
+        format!("0:{index}").into(),
+        "-vn".into(),
+        "-sn".into(),
+        "-dn".into(),
+        "-af".into(),
+        filter.into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ];
+    let output = run_capture(
+        &CommandSpec {
+            executable: ffmpeg.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        256 * 1024,
+        Duration::from_secs(1800),
+    )
+    .await
+    .map_err(|error| {
+        AppError::new(
+            match error {
+                SupervisorError::Cancelled => "JOB_CANCELED",
+                SupervisorError::Timeout => "JOB_TIMEOUT",
+                _ => "LOUDNESS_MEASUREMENT_FAILED",
+            },
+            error.to_string(),
+            Some(input.to_string_lossy().into_owned()),
+        )
+    })?;
+    source.verify()?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            "LOUDNESS_MEASUREMENT_FAILED",
+            format!(
+                "FFmpeg could not measure the selected audio span: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .rev()
+                    .take(1500)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ),
+            None,
+        ));
+    }
+    let fail = |message: String| {
+        AppError::new(
+            "LOUDNESS_MEASUREMENT_FAILED",
+            message,
+            Some(input.to_string_lossy().into_owned()),
+        )
+    };
+    let record = record(&output.stderr).map_err(&fail)?;
+    let number = |value: &str| {
+        measurement(value).and_then(|n| n.ok_or_else(|| "The selected audio span is silent or has no finite integrated loudness measurement.".into())).map_err(&fail)
+    };
+    let result = NormalizationMeasurement {
+        source,
+        fingerprint: identity,
+        stream_index: index,
+        prefix: prefix.into(),
+        channels: channels.into(),
+        target,
+        integrated: number(&record.input_i)?,
+        peak: number(&record.input_tp)?,
+        range: number(&record.input_lra)?,
+        threshold: number(
+            record
+                .input_thresh
+                .as_deref()
+                .ok_or_else(|| fail("Missing measured threshold.".into()))?,
+        )?,
+        offset: number(
+            record
+                .target_offset
+                .as_deref()
+                .ok_or_else(|| fail("Missing measured target offset.".into()))?,
+        )?,
+    };
+    if result.range < 0.0 {
+        return Err(fail("Invalid measured loudness range.".into()));
+    }
+    result.verify()?;
+    check_cancel(cancel).map_err(|_| {
+        AppError::new(
+            "JOB_CANCELED",
+            "Loudness measurement canceled; no output was published.",
+            None,
+        )
+    })?;
     Ok(result)
 }
 

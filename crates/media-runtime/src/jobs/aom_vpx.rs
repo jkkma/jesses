@@ -61,6 +61,9 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         format!("--fps={}/{}", plan.fps_num, plan.fps_den).into(),
         "--disable-warning-prompt".into(),
     ];
+    if let Some(frames) = super::super::encoding_preferences::keyframes(plan, settings) {
+        args.push(format!("--kf-max-dist={frames}").into());
+    }
     if settings.lossless {
         args.push("--lossless=1".into());
     } else {
@@ -111,6 +114,9 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     if settings.encoder == VideoEncoder::AomAv1 {
         args.extend(super::av1an::aom_grain_parameters(settings));
     }
+    if settings.source_filters {
+        args.retain(|argument| !argument.to_string_lossy().starts_with("--fps="));
+    }
     args.extend(super::super::parameters::arguments(settings));
     args.push("-".into());
     args
@@ -120,6 +126,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
 /// chroma. Raw input also avoids ambiguous non-4:2:0 Y4M geometry/format.
 fn raw_video_input(plan: &Plan, settings: &EncodeSettings) -> bool {
     settings.encoder == VideoEncoder::AomAv1
+        && !settings.source_filters
         && (plan.output_bit_depth() > 8 || !plan.output_pixel_format.contains("420"))
 }
 

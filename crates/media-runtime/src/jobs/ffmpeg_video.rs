@@ -23,31 +23,15 @@ pub(super) fn library(encoder: VideoEncoder) -> &'static str {
     match encoder {
         VideoEncoder::X265 => "libx265",
         VideoEncoder::Vp9 => "libvpx-vp9",
-        VideoEncoder::H264Nvenc => "h264_nvenc",
-        VideoEncoder::HevcNvenc => "hevc_nvenc",
+        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
+            unreachable!("historical hardware encoders are rejected at admission")
+        }
         _ => unreachable!("FFmpeg video encoder"),
     }
 }
 
-pub(super) fn encoder_pixel_format(encoder: VideoEncoder, depth: u8) -> &'static str {
-    if matches!(encoder, VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc) && depth == 10 {
-        "p010le"
-    } else if depth == 10 {
-        "yuv420p10le"
-    } else {
-        "yuv420p"
-    }
-}
-
 pub(super) fn output_format(plan: &Plan) -> &'static str {
-    if matches!(
-        plan.encoder,
-        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
-    ) {
-        encoder_pixel_format(plan.encoder, plan.output_bit_depth())
-    } else {
-        plan.output_pixel_format
-    }
+    plan.output_pixel_format
 }
 
 pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
@@ -64,6 +48,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     .into_iter()
     .map(OsString::from)
     .collect();
+    // Output options follow the pipe input, below.
     if alpha {
         args.extend([
             "-f".into(),
@@ -133,6 +118,9 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         "-chroma_sample_location".into(),
         plan.chroma.into(),
     ]);
+    if let Some(frames) = super::super::encoding_preferences::keyframes(plan, settings) {
+        args.extend(["-g".into(), frames.to_string().into()]);
+    }
     match settings.encoder {
         VideoEncoder::X265 => {
             if !settings.lossless {
@@ -145,9 +133,10 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                 // All options are fixed scalars; no input path reaches this parser.
                 "-x265-params".into(),
                 format!(
-                    "pools=4:frame-threads=2:log-level=warning{}{}",
+                    "pools=4:frame-threads=2:log-level=warning{}{}{}",
                     if settings.lossless { ":lossless=1" } else { "" },
-                    super::super::parameters::x265_suffix(settings)
+                    super::super::parameters::x265_suffix(settings),
+                    plan.ffmpeg_x265_hdr_suffix()
                 )
                 .into(),
             ]);
@@ -191,37 +180,11 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
             }
         }
         VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
-            const PRESETS: [&str; 7] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"];
-            args.extend([
-                "-preset".into(),
-                PRESETS[usize::from(settings.preset)].into(),
-            ]);
-            if settings.lossless {
-                args.extend([
-                    "-tune".into(),
-                    "lossless".into(),
-                    "-rc".into(),
-                    "constqp".into(),
-                    "-qp".into(),
-                    "0".into(),
-                ]);
-            } else {
-                args.extend([
-                    "-rc".into(),
-                    "vbr".into(),
-                    "-cq".into(),
-                    settings.crf.to_string().into(),
-                    "-b:v".into(),
-                    "0".into(),
-                ]);
-            }
+            unreachable!("historical hardware encoders are rejected at admission")
         }
         _ => unreachable!("FFmpeg video encoder"),
     }
-    if matches!(
-        settings.encoder,
-        VideoEncoder::Vp9 | VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
-    ) {
+    if matches!(settings.encoder, VideoEncoder::Vp9) {
         args.extend(super::super::parameters::arguments(settings));
     }
     args.extend(
@@ -244,6 +207,9 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
 }
 
 pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> Result<(), String> {
+    if encoder.is_hardware() {
+        return Err("Jesses supports CPU video encoding only.".into());
+    }
     let name = library(encoder);
     let has_encoder = help
         .lines()
@@ -281,69 +247,24 @@ pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> 
     Ok(())
 }
 
-pub(super) fn hardware_probe_arguments(
-    encoder: VideoEncoder,
-    depth: u8,
-    lossless: bool,
-) -> Vec<OsString> {
-    let format = encoder_pixel_format(encoder, depth);
-    let mut args: Vec<OsString> = [
-        "-hide_banner",
-        "-nostdin",
-        "-v",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=s=64x64:r=1:d=1",
-        "-frames:v",
-        "1",
-        "-an",
-        "-vf",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    args.extend([
-        format!("format={format}").into(),
-        "-c:v".into(),
-        library(encoder).into(),
-        "-preset".into(),
-        "p1".into(),
-    ]);
-    if lossless {
-        args.extend([
-            "-tune".into(),
-            "lossless".into(),
-            "-rc".into(),
-            "constqp".into(),
-            "-qp".into(),
-            "0".into(),
-        ]);
-    } else {
-        args.extend([
-            "-rc".into(),
-            "vbr".into(),
-            "-cq".into(),
-            "23".into(),
-            "-b:v".into(),
-            "0".into(),
-        ]);
-    }
-    args.extend(["-f".into(), "null".into(), "-".into()]);
-    args
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn missing_library_or_depth_is_rejected_instead_of_falling_back() {
-        let help = "Encoder libx265 [HEVC]:\n Supported pixel formats: yuv420p\n -crf -preset -x265-params";
-        assert!(validate_help(help, VideoEncoder::X265, "yuv420p").is_ok());
-        assert!(validate_help(help, VideoEncoder::X265, "yuv420p10le").is_err());
-        assert!(validate_help(help, VideoEncoder::Vp9, "yuv420p").is_err());
-        assert!(validate_help("Codec not recognized", VideoEncoder::Vp9, "yuv420p").is_err());
+    fn missing_cpu_library_or_selected_depth_is_rejected() {
+        assert!(
+            validate_help("Codec is not recognized", VideoEncoder::X265, "yuv420p10le").is_err()
+        );
+        assert!(validate_help("Encoder libx265 [x265]\nSupported pixel formats: yuv420p\n-crf -preset -x265-params",VideoEncoder::X265,"yuv420p10le").is_err());
+    }
+    #[test]
+    fn hardware_library_catalog_is_not_a_supported_cpu_encoder() {
+        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
+            assert!(
+                validate_help("Encoder h264_nvenc [legacy]", encoder, "yuv420p")
+                    .unwrap_err()
+                    .contains("CPU")
+            );
+        }
     }
 }

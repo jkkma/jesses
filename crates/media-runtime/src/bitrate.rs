@@ -204,11 +204,13 @@ pub async fn analyze_bitrate(
             "Choose a bitrate window from 0.1 to 3,600 seconds.".into(),
         ));
     }
+    check_cancel(&cancel)?;
     let _permit = permit(&cancel).await?;
     let source = Source::open(Path::new(&request.input_path))?;
     let identity = fingerprint(&source)?;
+    let packet_input = crate::jobs::sequence::packet_input(&source.path, &cancel).await?;
     let executable = tool("ffprobe", &cancel).await?;
-    let args: Vec<OsString> = [
+    let mut args: Vec<OsString> = [
         "-v",
         "error",
         "-protocol_whitelist",
@@ -220,12 +222,15 @@ pub async fn analyze_bitrate(
         "packet=stream_index,pts_time,dts_time,duration_time,size:packet_side_data=",
         "-of",
         "compact=p=0:nk=0",
-        "-i",
     ]
     .into_iter()
     .map(OsString::from)
-    .chain(std::iter::once(source.path.as_os_str().to_owned()))
     .collect();
+    if let Some(input) = &packet_input {
+        args.extend_from_slice(&input.arguments);
+    } else {
+        args.extend(["-i".into(), source.path.as_os_str().to_owned()]);
+    }
     let scan = run_streaming_stdout(
         &CommandSpec {
             executable,
@@ -249,6 +254,9 @@ pub async fn analyze_bitrate(
         ),
         error => fail("ANALYSIS_FAILED", error.to_string()),
     })?;
+    if let Some(input) = &packet_input {
+        input.verify(&cancel)?;
+    }
     source.verify()?;
     if fingerprint(&source)? != identity {
         return Err(fail(

@@ -306,6 +306,7 @@ async fn mixed_offsets_and_external_measured_gain_bind_the_right_file_and_track(
             preset: 0,
             external_tracks: vec![
                 ExternalTrack {
+                    subtitle_burn_in: false,
                     input_path: external.to_string_lossy().into(),
                     stream_index: 0,
                     offset_milliseconds: 500,
@@ -315,6 +316,7 @@ async fn mixed_offsets_and_external_measured_gain_bind_the_right_file_and_track(
                     default: None,
                     forced: None,
                     audio: Some(ExternalAudioSettings {
+                        normalization: None,
                         codec: AudioCodec::Flac,
                         bitrate_kbps: 128,
                         channels: AudioChannels::Preserve,
@@ -325,6 +327,7 @@ async fn mixed_offsets_and_external_measured_gain_bind_the_right_file_and_track(
                     }),
                 },
                 ExternalTrack {
+                    subtitle_burn_in: false,
                     input_path: external.to_string_lossy().into(),
                     stream_index: 1,
                     offset_milliseconds: -125,
@@ -630,6 +633,7 @@ async fn manual_external_gain_and_offset_trim_preserve_exact_decoded_samples() {
                 time: None,
             }),
             external_tracks: vec![ExternalTrack {
+                subtitle_burn_in: false,
                 input_path: external.to_string_lossy().into(),
                 stream_index: 0,
                 offset_milliseconds: 500,
@@ -639,6 +643,7 @@ async fn manual_external_gain_and_offset_trim_preserve_exact_decoded_samples() {
                 default: None,
                 forced: None,
                 audio: Some(ExternalAudioSettings {
+                    normalization: None,
                     codec: AudioCodec::Flac,
                     bitrate_kbps: 128,
                     channels: AudioChannels::Preserve,
@@ -755,11 +760,13 @@ async fn cross_file_order_track_overrides_and_independent_donor_only_sources() {
             preset: 0,
             external_tracks: vec![
                 ExternalTrack {
+                    subtitle_burn_in: false,
                     input_path: external.to_string_lossy().into(),
                     stream_index: 0,
                     offset_milliseconds: 0,
                     subtitle_mode: None,
                     audio: Some(ExternalAudioSettings {
+                        normalization: None,
                         codec: AudioCodec::Flac,
                         bitrate_kbps: 128,
                         channels: AudioChannels::Preserve,
@@ -771,6 +778,7 @@ async fn cross_file_order_track_overrides_and_independent_donor_only_sources() {
                     forced: Some(false),
                 },
                 ExternalTrack {
+                    subtitle_burn_in: false,
                     input_path: external.to_string_lossy().into(),
                     stream_index: 1,
                     offset_milliseconds: 0,

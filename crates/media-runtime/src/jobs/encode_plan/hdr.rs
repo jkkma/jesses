@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use super::unsupported;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Mastering {
+pub(in crate::jobs) struct Mastering {
     // R, G, B, white point x/y; max and min luminance in cd/m2.
     values: [f64; 10],
 }
@@ -153,7 +153,7 @@ mod formatting_tests {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct StaticMetadata {
+pub(in crate::jobs) struct StaticMetadata {
     pub mastering: Option<Mastering>,
     pub light: Option<(u16, u16)>,
 }
@@ -253,6 +253,39 @@ impl StaticMetadata {
     }
 }
 
+#[cfg(test)]
+mod rpu_tests {
+    use super::*;
+    #[test]
+    fn profile8_gpu_requires_complete_single_layer_rpu_on_each_frame() {
+        let record = serde_json::json!({"side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1,"bl_present_flag":1,"rpu_present_flag":1,"el_present_flag":0});
+        let hdr = Hdr10::build(std::slice::from_ref(&record), true, false).unwrap();
+        let data = serde_json::json!({"side_data_type":"Dolby Vision RPU Data"});
+        let metadata = serde_json::json!({"side_data_type":"Dolby Vision Metadata","bl_bit_depth":10,"bl_video_full_range_flag":0,"disable_residual_flag":1});
+        assert!(
+            hdr.require_gpu_rpu(&[data.clone(), metadata.clone()])
+                .is_ok()
+        );
+        assert!(hdr.require_gpu_rpu(std::slice::from_ref(&data)).is_err());
+        assert!(
+            hdr.require_gpu_rpu(std::slice::from_ref(&metadata))
+                .is_err()
+        );
+        for (field, value) in [
+            ("bl_bit_depth", 8),
+            ("bl_video_full_range_flag", 1),
+            ("disable_residual_flag", 0),
+        ] {
+            let mut malformed = metadata.clone();
+            malformed[field] = value.into();
+            assert!(hdr.require_gpu_rpu(&[data.clone(), malformed]).is_err());
+        }
+        let mut dual = record;
+        dual["el_present_flag"] = 1.into();
+        assert!(Hdr10::build(&[dual], true, false).is_err());
+    }
+}
+
 pub(super) fn kind(value: &Value) -> &str {
     value
         .get("side_data_type")
@@ -303,6 +336,8 @@ pub(super) struct Hdr10 {
     pub discard_dynamic: bool,
     pub dolby: Option<DolbyVision>,
     pub allow_profile5: bool,
+    pub imported_dolby: bool,
+    pub imported_hdr10plus: bool,
 }
 
 impl Hdr10 {
@@ -330,6 +365,8 @@ impl Hdr10 {
             discard_dynamic,
             dolby,
             allow_profile5,
+            imported_dolby: false,
+            imported_hdr10plus: false,
         };
         validate_side_data(values, Some(&hdr), false)?;
         Ok(hdr)
@@ -356,6 +393,34 @@ impl Hdr10 {
         }
         Ok(())
     }
+
+    pub fn require_gpu_rpu(&self, values: &[Value]) -> Result<(), AppError> {
+        if self.dolby.as_ref().is_some_and(DolbyVision::is_profile5) {
+            return self.require_profile5_rpu(values);
+        }
+        if !self
+            .dolby
+            .as_ref()
+            .is_some_and(|dolby| dolby.profile == 8 && dolby.compatibility == 1)
+            || !values
+                .iter()
+                .any(|value| kind(value) == "Dolby Vision RPU Data")
+            || !values.iter().any(|value| {
+                kind(value) == "Dolby Vision Metadata"
+                    && value.get("bl_bit_depth").and_then(Value::as_u64) == Some(10)
+                    && value
+                        .get("bl_video_full_range_flag")
+                        .and_then(Value::as_u64)
+                        == Some(0)
+                    && value.get("disable_residual_flag").and_then(Value::as_u64) == Some(1)
+            })
+        {
+            return Err(unsupported(
+                "Single-layer Dolby Vision8.1 GPU rendering requires intact RPU data and parsed limited-range10-bit metadata without an enhancement-layer residual on every decoded frame.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Explicit allowlist: do not silently discard unrecognized rendering metadata.
@@ -366,12 +431,16 @@ pub(super) fn validate_side_data(
 ) -> Result<(), AppError> {
     for value in values {
         match kind(value) {
+            "DOVI configuration record" | "Dolby Vision RPU Data" | "Dolby Vision Metadata"
+                if encoded && hdr.is_some_and(|hdr| hdr.imported_dolby) => {}
+            "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+                if encoded && hdr.is_some_and(|hdr| hdr.imported_hdr10plus) => {}
             "Mastering display metadata" | "Content light level metadata" if hdr.is_some() => {}
             "DOVI configuration record"
             | "Dolby Vision RPU Data"
             | "Dolby Vision Metadata"
             | "HEVC enhancement-layer decoder configuration" => {
-                let hdr = hdr.filter(|hdr| hdr.discard_dynamic && hdr.dolby.is_some() && !encoded).ok_or_else(|| unsupported("Dolby Vision requires either explicit GPU/RPU rendering for profile 5 or explicit HDR10 fallback using a compatible profile 7/8 base layer."))?;
+                let hdr = hdr.filter(|hdr| hdr.discard_dynamic && hdr.dolby.is_some() && !encoded).ok_or_else(|| unsupported("Dolby Vision requires supported single-layer GPU/RPU rendering or explicit HDR10 fallback using a compatible profile7/8 base layer."))?;
                 if kind(value) == "DOVI configuration record"
                     && Some(DolbyVision::parse(value, hdr.allow_profile5)?) != hdr.dolby
                 {
@@ -406,11 +475,40 @@ pub(super) fn validate_side_data(
             | "H.265 User Data Unregistered SEI message"
             | "SMPTE 12-1 timecode" => {}
             _ => {
-                return Err(unsupported(
-                    "Unsupported video side data was found. HDR10+ requires explicit HDR10 fallback; display transforms and unknown rendering metadata are unsupported.",
-                ));
+                return Err(unsupported(&format!(
+                    "Unsupported video side data '{}' was found. HDR10+ requires explicit HDR10 fallback; display transforms and unknown rendering metadata are unsupported.",
+                    kind(value)
+                )));
             }
         }
     }
     Ok(())
+}
+
+pub(super) fn authored(
+    value: &media_core::HdrMetadataSettings,
+) -> Result<StaticMetadata, AppError> {
+    let mut fields = Vec::new();
+    if let Some(mastering) = value.mastering_display {
+        fields.push(serde_json::json!({"side_data_type":"Mastering display metadata",
+            "red_x":format!("{}/50000",mastering.red.x),"red_y":format!("{}/50000",mastering.red.y),
+            "green_x":format!("{}/50000",mastering.green.x),"green_y":format!("{}/50000",mastering.green.y),
+            "blue_x":format!("{}/50000",mastering.blue.x),"blue_y":format!("{}/50000",mastering.blue.y),
+            "white_point_x":format!("{}/50000",mastering.white_point.x),"white_point_y":format!("{}/50000",mastering.white_point.y),
+            "max_luminance":format!("{}/10000",mastering.max_luminance_ten_thousandths),"min_luminance":format!("{}/10000",mastering.min_luminance_ten_thousandths)}));
+    }
+    if let Some(light) = value.content_light {
+        fields.push(serde_json::json!({"side_data_type":"Content light level metadata","max_content":light.max_content,"max_average":light.max_average}));
+    }
+    StaticMetadata::parse(&fields)
+}
+impl StaticMetadata {
+    pub(super) fn apply_authored(&mut self, authored: &Self) {
+        if authored.mastering.is_some() {
+            self.mastering = authored.mastering.clone();
+        }
+        if let Some(light) = authored.light {
+            self.light = if light == (0, 0) { None } else { Some(light) };
+        }
+    }
 }

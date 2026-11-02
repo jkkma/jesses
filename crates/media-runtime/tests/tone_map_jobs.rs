@@ -23,7 +23,15 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let parent = if std::env::var_os("JESSES_KEEP_TEST_ARTIFACTS").is_some() {
+            let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-artifacts/tone-map");
+            std::fs::create_dir_all(&parent).unwrap();
+            parent
+        } else {
+            std::env::temp_dir()
+        };
+        let path = parent.join(format!(
             "jesses-tone-map-{}-{nonce}-{serial}",
             std::process::id()
         ));
@@ -33,9 +41,241 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::env::var_os("JESSES_KEEP_TEST_ARTIFACTS").is_some() {
+            eprintln!("Retained native tone-map fixture: {}", self.0.display());
+            return;
+        }
         // Every file is owned exclusively by this newly created test fixture.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires qualified CPU FFmpeg with libplacebo and a physical Vulkan device"]
+async fn selected_spline_uses_physical_vulkan_while_final_encoder_is_cpu() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("HDR FFV1 input.mkv");
+    synthesize(&input, 10, false, true, "128x96", 8, ("bt2020", "left")).await;
+    let original = std::fs::read(&input).unwrap();
+    let destination = fixture.0.join("CPU x264 Vulkan Spline.mkv");
+    let mut request = request(&input, &destination, VideoEncoder::X264, 0);
+    request.source.stream_indices = vec![1];
+    request.settings.tone_map = Some(
+        serde_json::from_value(json!({
+            "sourcePeakNits":1000,"backend":"auto","peakMode":"measured","algorithm":"spline"
+        }))
+        .unwrap(),
+    );
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let plan = media_runtime::preview_encode_plan(request.clone(), cancel)
+        .await
+        .unwrap();
+    assert!(plan.stages.iter().any(|stage| {
+        stage
+            .arguments
+            .iter()
+            .any(|arg| arg.contains("libplacebo=tonemapping=spline:"))
+    }));
+    assert!(plan.stages.iter().any(|stage| {
+        stage
+            .arguments
+            .windows(2)
+            .any(|args| args == ["-init_hw_device", "vulkan"])
+    }));
+    std::fs::write(
+        fixture.0.join("proof-command-plan.json"),
+        serde_json::to_vec_pretty(&plan).unwrap(),
+    )
+    .unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let started = manager.start_encode(request.clone()).await.unwrap();
+    let done = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(done.state, JobState::Succeeded, "{done:#?}");
+    assert_eq!(done.encode_settings.as_ref(), Some(&request.settings));
+    let log = done.logs.join("\n");
+    assert!(
+        log.contains("GPU libplacebo tone mapping") && log.contains("Spline curve"),
+        "{log}"
+    );
+    assert!(log.contains("standalone x264"), "{log}");
+    assert!(
+        !log.contains("CPU fallback selected") && !log.contains("Hable was selected"),
+        "{log}"
+    );
+    let actual = probe(&destination, &["-show_streams", "-count_frames"]).await;
+    let video = &actual["streams"][0];
+    assert_eq!(actual["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["nb_read_frames"], "8");
+    assert_eq!(video["width"], 128);
+    assert_eq!(video["height"], 96);
+    assert_eq!(video["pix_fmt"], "yuv420p10le");
+    for field in ["color_primaries", "color_transfer", "color_space"] {
+        assert_eq!(video[field], "bt709", "{actual:#}");
+    }
+    assert_eq!(video["color_range"], "tv");
+    assert!(!actual.to_string().contains("Mastering display"));
+    // Independent literal reference, deliberately not taken from the native
+    // Plan/Transform builder. Compare decoded CPU-encoded pixels to Vulkan's
+    // non-black HDR render, allowing ordinary CRF23 reconstruction error.
+    let reference_graph = "setparams=field_mode=prog:range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,libplacebo=tonemapping=spline:peak_detect=1:apply_dolbyvision=0:format=yuv420p10le:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,limiter=min=64:max=940:planes=1,limiter=min=64:max=960:planes=6,sidedata=mode=delete,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+    let expected = output(
+        command("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-init_hw_device", "vulkan", "-i"])
+            .arg(&input)
+            .args([
+                "-map",
+                "0:1",
+                "-vf",
+                reference_graph,
+                "-frames:v",
+                "8",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]),
+    )
+    .await;
+    let decoded = output(
+        command("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&destination)
+            .args([
+                "-map",
+                "0:v:0",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]),
+    )
+    .await;
+    assert_eq!(expected.len(), 8 * 128 * 96 * 3);
+    assert_eq!(decoded.len(), expected.len());
+    let samples = |bytes: &[u8]| {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>()
+    };
+    let expected_samples = samples(&expected);
+    let decoded_samples = samples(&decoded);
+    let range = expected_samples.iter().max().unwrap() - expected_samples.iter().min().unwrap();
+    assert!(
+        range > 200,
+        "The independent HDR render must contain non-black picture detail."
+    );
+    let mse = expected_samples
+        .iter()
+        .zip(&decoded_samples)
+        .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+        .sum::<f64>()
+        / expected_samples.len() as f64;
+    let rmse = mse.sqrt();
+    assert!(
+        rmse < 40.0,
+        "CPU x264 reconstruction differs from independent literal Vulkan Spline: RMSE={rmse}"
+    );
+    std::fs::write(fixture.0.join("proof-pixels.json"),serde_json::to_vec_pretty(&json!({"frames":8,"samples":expected_samples.len(),"referenceRange":range,"rmse10Bit":rmse,"referenceGraph":reference_graph})).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    std::fs::write(
+        fixture.0.join("proof-output.json"),
+        serde_json::to_vec_pretty(&actual).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.0.join("proof-job.json"),
+        serde_json::to_vec_pretty(&done).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "Physical Vulkan probe accepted; CPU x264 produced eight validated 128x96 BT709 10-bit frames; independent literal Spline reconstruction RMSE={rmse:.3}."
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "set VK_DRIVER_FILES to an absent file; requires FFmpeg/FFprobe and x264"]
+async fn held_spline_remains_editable_without_vulkan_and_unchanged_execution_rejects_it() {
+    use media_core::{CommandEditConfirmation, CommandEditRequest};
+    let driver = std::env::var_os("VK_DRIVER_FILES")
+        .expect("Use an absent Vulkan ICD file for this isolated test");
+    assert!(!Path::new(&driver).exists());
+    let fixture = Fixture::new();
+    let input = fixture.0.join("HDR input.mkv");
+    synthesize(&input, 10, false, true, "128x96", 4, ("bt2020", "left")).await;
+    let original = std::fs::read(&input).unwrap();
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let ffmpeg = std::env::var_os("JESSES_FFMPEG").unwrap();
+    for edited in [false, true] {
+        let destination = fixture.0.join(format!("held-{edited}.mkv"));
+        let mut request = request(&input, &destination, VideoEncoder::X264, 0);
+        request.source.stream_indices = vec![1];
+        request.settings.tone_map = Some(
+            serde_json::from_value(json!({
+                "sourcePeakNits":1000,"backend":"auto","peakMode":"measured","algorithm":"spline","sourceWorkflow":true
+            }))
+            .unwrap(),
+        );
+        let manager = JobManager::new(fixture.0.join(format!("logs-held-{edited}")));
+        let (_owner, cancel) = tokio::sync::watch::channel(false);
+        let review = tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.prepare_command_edit(
+                CommandEditRequest::Encode {
+                    request: Box::new(request),
+                },
+                cancel.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let id = review.job.as_ref().unwrap().id.clone();
+        assert!(
+            review.arguments.contains("tonemapping=spline") && review.arguments.contains("vulkan")
+        );
+        assert!(!destination.exists());
+        let stage = fixture.0.join(format!(".jesses-{id}.partial.mkv"));
+        let arguments = if edited {
+            format!(
+                "{} -v error -nostdin -i {} -map 0:1 -c:v ffv1 -threads 1 -y {}",
+                quote(&ffmpeg.to_string_lossy()),
+                quote(&input.to_string_lossy()),
+                quote(&stage.to_string_lossy())
+            )
+        } else {
+            review.arguments
+        };
+        manager
+            .confirm_command_edit(
+                CommandEditConfirmation {
+                    id: review.id,
+                    arguments,
+                },
+                cancel,
+            )
+            .await
+            .unwrap();
+        let done = wait_for(&manager, &id, |job| job.state.is_terminal()).await;
+        manager.shutdown().await;
+        if edited {
+            assert_eq!(done.state, JobState::Succeeded, "{done:#?}");
+            assert!(done.edited_command.is_some());
+        } else {
+            assert_eq!(done.state, JobState::Failed, "{done:#?}");
+            assert_eq!(done.error.unwrap().code, "TONE_MAP_GPU_UNAVAILABLE");
+            assert!(!destination.exists());
+        }
+        assert!(!stage.exists());
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
 }
 
 fn command(executable: impl AsRef<std::ffi::OsStr>) -> Command {

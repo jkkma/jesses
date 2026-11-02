@@ -24,6 +24,7 @@ fn invalid(message: impl Into<String>) -> AppError {
 
 fn audio_settings(audio: &ExternalAudioSettings, index: u32) -> AudioTrackSettings {
     AudioTrackSettings {
+        normalization: audio.normalization,
         stream_index: index,
         codec: audio.codec,
         bitrate_kbps: audio.bitrate_kbps,
@@ -71,6 +72,20 @@ pub(super) fn additional_source_paths(settings: &EncodeSettings) -> Vec<&Path> {
         .chain(settings.chapters_source_path.as_deref().map(Path::new))
         .chain(
             settings
+                .hdr_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.dolby_vision_rpu_path.as_deref())
+                .map(Path::new),
+        )
+        .chain(
+            settings
+                .hdr_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.hdr10_plus_json_path.as_deref())
+                .map(Path::new),
+        )
+        .chain(
+            settings
                 .mov_timecode_track
                 .as_ref()
                 .and_then(|track| track.input_path.as_deref())
@@ -80,6 +95,7 @@ pub(super) fn additional_source_paths(settings: &EncodeSettings) -> Vec<&Path> {
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
+    super::output_metadata::validate(settings)?;
     if settings.external_tracks.len() > 100 {
         return Err(invalid("Select at most 100 tracks from other files."));
     }
@@ -169,6 +185,7 @@ struct Track {
     stream: Stream,
     audio: Option<AudioTrackSettings>,
     subtitle_mode: Option<SubtitleMode>,
+    subtitle_burn_in: bool,
     offset_milliseconds: i32,
     metadata: TrackMetadata,
 }
@@ -325,10 +342,10 @@ impl ExternalTracks {
                 })?;
             if !matches!(
                 stream.codec_type.as_deref(),
-                Some("audio" | "subtitle" | "attachment")
+                Some("video" | "audio" | "subtitle" | "attachment" | "data")
             ) {
                 return Err(invalid(
-                    "Only audio, subtitles and attachments can be added from another file. Select video in the encoding source control.",
+                    "Only video, audio, subtitles, data and attachments can be selected from another file.",
                 ));
             }
             if track.audio.is_some() && stream.codec_type.as_deref() != Some("audio") {
@@ -336,7 +353,9 @@ impl ExternalTracks {
                     "Audio conversion settings require an external audio track.",
                 ));
             }
-            if track.subtitle_mode.is_some() && stream.codec_type.as_deref() != Some("subtitle") {
+            if (track.subtitle_mode.is_some() || track.subtitle_burn_in)
+                && stream.codec_type.as_deref() != Some("subtitle")
+            {
                 return Err(invalid(
                     "Subtitle processing settings require an external subtitle track.",
                 ));
@@ -418,7 +437,10 @@ impl ExternalTracks {
                 mux_input,
                 original_index: track.stream_index,
                 audio,
-                subtitle_mode: track.subtitle_mode,
+                subtitle_mode: track
+                    .subtitle_mode
+                    .or(track.subtitle_burn_in.then_some(SubtitleMode::Copy)),
+                subtitle_burn_in: track.subtitle_burn_in,
                 offset_milliseconds: track.offset_milliseconds,
                 metadata: TrackMetadata::external(track),
                 stream: copied,
@@ -588,6 +610,7 @@ impl ExternalTracks {
             .subtitles
             .extend(self.tracks.iter().filter_map(|track| {
                 track.subtitle_mode.map(|mode| SubtitleTrackSettings {
+                    burn_in: track.subtitle_burn_in,
                     stream_index: track.stream.index,
                     mode,
                 })
@@ -632,8 +655,12 @@ impl ExternalTracks {
 
     pub fn extend_document(&self, primary: &Document, settings: &EncodeSettings) -> Document {
         let mut document = primary.clone();
+        for stream in &mut document.streams {
+            super::output_metadata::strip_stream(stream, settings);
+        }
         document.streams.extend(self.tracks.iter().map(|track| {
             let mut stream = track.stream.clone();
+            super::output_metadata::strip_stream(&mut stream, settings);
             track.metadata.apply(&mut stream);
             stream
         }));
@@ -664,6 +691,7 @@ impl ExternalTracks {
                 .chapters
                 .clone();
         }
+        super::output_metadata::apply(&mut document, settings);
         document
     }
 
@@ -745,12 +773,20 @@ impl ExternalTracks {
             .collect())
     }
 
-    pub fn metadata_input_index(&self) -> usize {
-        self.metadata_input.map_or(0, |slot| slot + 2)
+    pub fn metadata_input_index(&self, settings: &EncodeSettings) -> isize {
+        if settings.copy_metadata == Some(false) {
+            -1
+        } else {
+            self.metadata_input.map_or(0, |slot| slot as isize + 2)
+        }
     }
 
-    pub fn chapters_input_index(&self) -> usize {
-        self.chapters_input.map_or(0, |slot| slot + 2)
+    pub fn chapters_input_index(&self, settings: &EncodeSettings) -> isize {
+        if settings.copy_chapters == Some(false) {
+            -1
+        } else {
+            self.chapters_input.map_or(0, |slot| slot as isize + 2)
+        }
     }
 
     pub fn timecode(&self) -> Option<&container::TimecodeTrack> {
@@ -813,21 +849,44 @@ impl ExternalTracks {
         settings: &EncodeSettings,
         selected: &[&Stream],
         output: &Document,
+        container: media_core::ContainerFormat,
     ) -> Result<(), AppError> {
+        super::output_metadata::verify(settings, output)?;
         for (source, actual) in selected.iter().zip(&output.streams) {
             if let Some(options) = self.track_metadata(source.index, settings) {
-                for (key, expected) in [
-                    ("title", &options.title),
-                    ("handler_name", &options.title),
-                    ("language", &options.language),
-                ] {
+                for (key, expected) in [("title", &options.title), ("language", &options.language)]
+                {
                     if let Some(expected) = expected {
+                        let iso = matches!(
+                            container,
+                            media_core::ContainerFormat::Mp4
+                                | media_core::ContainerFormat::Mov
+                                | media_core::ContainerFormat::M4a
+                        );
+                        let key = if iso && key == "title" {
+                            "handler_name"
+                        } else {
+                            key
+                        };
                         let actual = actual
                             .tags
                             .iter()
                             .find(|(name, _)| name.eq_ignore_ascii_case(key))
                             .map(|(_, value)| value.as_str())
-                            .filter(|value| !value.is_empty());
+                            .filter(|value| !value.is_empty())
+                            .filter(|value| {
+                                !(iso
+                                    && expected.is_empty()
+                                    && matches!(
+                                        *value,
+                                        "VideoHandler"
+                                            | "SoundHandler"
+                                            | "SubtitleHandler"
+                                            | "TimeCodeHandler"
+                                            | "DataHandler"
+                                            | "und"
+                                    ))
+                            });
                         if actual != (!expected.is_empty()).then_some(expected.as_str()) {
                             return Err(AppError::new(
                                 "OUTPUT_VALIDATION_FAILED",
@@ -892,16 +951,29 @@ impl ExternalTracks {
                 .iter()
                 .position(|stream| stream.index == track.stream.index)
                 .expect("resolved external output track") as u32;
-            mux::verify_shifted_packets(
-                ffprobe,
-                &self.inputs[track.input].source.path,
-                track.original_index,
-                output,
-                output_index,
-                f64::from(track.offset_milliseconds) / 1000.0,
-                cancel,
-            )
-            .await?;
+            if track.stream.codec_type.as_deref() == Some("video") {
+                mux::verify_shifted_video_packets(
+                    ffprobe,
+                    &self.inputs[track.input].source.path,
+                    track.original_index,
+                    output,
+                    output_index,
+                    f64::from(track.offset_milliseconds) / 1000.0,
+                    cancel,
+                )
+                .await
+            } else {
+                mux::verify_shifted_packets(
+                    ffprobe,
+                    &self.inputs[track.input].source.path,
+                    track.original_index,
+                    output,
+                    output_index,
+                    f64::from(track.offset_milliseconds) / 1000.0,
+                    cancel,
+                )
+                .await
+            }?;
         }
         self.verify()
     }
@@ -914,6 +986,7 @@ mod tests {
     fn base_settings() -> EncodeSettings {
         EncodeSettings {
             external_tracks: vec![media_core::ExternalTrack {
+                subtitle_burn_in: false,
                 audio: None,
                 offset_milliseconds: 0,
                 subtitle_mode: None,
@@ -951,6 +1024,7 @@ mod tests {
         assert!(validate(&settings).is_err());
         settings.external_tracks = (0..101)
             .map(|index| media_core::ExternalTrack {
+                subtitle_burn_in: false,
                 audio: None,
                 offset_milliseconds: 0,
                 subtitle_mode: None,
@@ -968,6 +1042,7 @@ mod tests {
         assert!(validate(&settings).is_err());
         settings.external_tracks = (0..33)
             .map(|index| media_core::ExternalTrack {
+                subtitle_burn_in: false,
                 audio: None,
                 offset_milliseconds: 0,
                 subtitle_mode: None,

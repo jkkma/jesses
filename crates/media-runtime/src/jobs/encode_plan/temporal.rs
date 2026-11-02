@@ -20,15 +20,15 @@ fn valid_rate(rate: FrameRate) -> bool {
         && rate.numerator <= 12_000_000
         && rate.denominator > 0
         && rate.denominator <= 100_000
-        && u64::from(rate.numerator) >= u64::from(rate.denominator)
-        && u64::from(rate.numerator) <= u64::from(rate.denominator) * 120
+        && u64::from(rate.numerator) * 1000 >= u64::from(rate.denominator)
+        && u64::from(rate.numerator) <= u64::from(rate.denominator) * 1000
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     if let Some(temporal) = settings.temporal {
         if temporal.frame_rate.is_some_and(|rate| !valid_rate(rate)) {
             return Err(invalid(
-                "Use a positive rational output rate from 1 through 120 fps (numerator at most 12000000; denominator at most 100000).",
+                "Use a positive rational output rate from 0.001 through 1000 fps (numerator at most 12000000; denominator at most 100000).",
             ));
         }
         let workflows = usize::from(temporal.deinterlace.is_some())
@@ -152,7 +152,7 @@ impl Transform {
         let output = self.settings.frame_rate.unwrap_or(reconstructed_rate);
         if !valid_rate(output) {
             return Err(invalid(
-                "The resulting output rate must be from 1 through 120 fps. Choose a lower explicit rate for bob deinterlacing.",
+                "The resulting output rate must be from 0.001 through 1000 fps. Choose a lower explicit rate for bob deinterlacing.",
             ));
         }
         let denominator = u128::from(reconstructed_rate.numerator) * u128::from(output.denominator);
@@ -179,6 +179,7 @@ impl Transform {
                 self.settings
                     .qtgmc
                     .map(|setting| media_core::DeinterlaceSettings {
+                        engine: Default::default(),
                         mode: setting.mode,
                         field_order: setting.field_order,
                     })
@@ -202,9 +203,10 @@ impl Transform {
                     )
                 },
                 |setting| {
-                    frame.interlaced_frame == Some(1)
-                        && frame.top_field_first
-                            == Some(u8::from(setting.field_order == FieldOrder::TopFirst))
+                    frame.interlaced_frame == Some(0)
+                        || (frame.interlaced_frame == Some(1)
+                            && frame.top_field_first
+                                == Some(u8::from(setting.field_order == FieldOrder::TopFirst)))
                 },
             )
     }
@@ -217,7 +219,8 @@ impl Transform {
         )];
         if let Some(setting) = self.settings.deinterlace {
             filters.push(format!(
-                "bwdif=mode={}:parity={}:deint=all",
+                "{}=mode={}:parity={}:deint=all",
+                setting.engine.ffmpeg(),
                 if setting.mode == DeinterlaceMode::Bob {
                     "send_field"
                 } else {
@@ -347,12 +350,13 @@ impl Transform {
         let mut input = "testsrc2=s=64x64:r=30000/1001:d=0.5,format=yuv420p";
         if let Some(setting) = self.settings.deinterlace {
             filters.push(format!(
-                "setfield={},bwdif=mode={}:parity={}:deint=all",
+                "setfield={},{}=mode={}:parity={}:deint=all",
                 if setting.field_order == FieldOrder::TopFirst {
                     "tff"
                 } else {
                     "bff"
                 },
+                setting.engine.ffmpeg(),
                 if setting.mode == DeinterlaceMode::Bob {
                     "send_field"
                 } else {
@@ -484,8 +488,10 @@ impl Plan {
             )?;
             self.fps_num = rate.numerator;
             self.fps_den = rate.denominator;
+            self.source_chunk_rate = (self.fps_num, self.fps_den);
             return Ok(frames);
         }
+        self.source_chunk_rate = (self.fps_num, self.fps_den);
         Ok(frames)
     }
     pub(super) fn fields_match(&self, frame: &Frame, encoded: bool) -> bool {
@@ -508,7 +514,7 @@ impl Plan {
         } else if self.temporal.as_ref().is_some_and(|transform| {
             transform.settings.deinterlace.is_some() || transform.settings.qtgmc.is_some()
         }) {
-            "A source frame is progressive, has unknown field order, or disagrees with the selected TFF/BFF order. Choose the matching field order for a uniformly interlaced source."
+            "A source frame has unknown scan flags or its interlaced field order disagrees with the selected TFF/BFF order. Progressive frames are permitted when deinterlacing is explicitly selected."
         } else if self.temporal.as_ref().is_some_and(|transform| {
             transform
                 .settings
@@ -523,7 +529,7 @@ impl Plan {
         {
             "Inverse telecine found an interlaced frame with the wrong field order. Choose the matching TFF/BFF order."
         } else {
-            "An interlaced source frame requires explicit BWDIF deinterlacing and the matching source field order."
+            "An interlaced source frame requires explicit BWDIF/YADIF deinterlacing and the matching source field order."
         }))
     }
     pub fn temporal_document(&self, mut document: metadata::Document) -> metadata::Document {
@@ -592,6 +598,7 @@ mod tests {
     fn temporal_order_and_rate_limits_are_explicit() {
         let mut transform = Transform::new(TemporalSettings {
             deinterlace: Some(media_core::DeinterlaceSettings {
+                engine: Default::default(),
                 mode: DeinterlaceMode::Bob,
                 field_order: FieldOrder::BottomFirst,
             }),
@@ -629,12 +636,12 @@ mod tests {
                 denominator: 0,
             },
             FrameRate {
-                numerator: 121,
+                numerator: 1001,
                 denominator: 1,
             },
             FrameRate {
                 numerator: 1,
-                denominator: 2,
+                denominator: 1001,
             },
         ] {
             assert!(!valid_rate(rate));
@@ -654,14 +661,59 @@ mod tests {
         assert!(
             transform
                 .activate(
-                    61,
+                    501,
                     FrameRate {
-                        numerator: 61,
+                        numerator: 501,
                         denominator: 1
                     }
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn both_deinterlacers_keep_field_validation_and_explicit_progressive_processing() {
+        for engine in [
+            media_core::DeinterlaceEngine::Bwdif,
+            media_core::DeinterlaceEngine::Yadif,
+        ] {
+            let mut transform = Transform::new(TemporalSettings {
+                deinterlace: Some(media_core::DeinterlaceSettings {
+                    engine,
+                    mode: DeinterlaceMode::Bob,
+                    field_order: FieldOrder::TopFirst,
+                }),
+                ..Default::default()
+            });
+            let frame = |interlaced: Option<u8>, top: Option<u8>| {
+                serde_json::from_value::<Frame>(
+                    serde_json::json!({"interlaced_frame":interlaced,"top_field_first":top}),
+                )
+                .unwrap()
+            };
+            assert!(transform.field_matches(&frame(Some(0), None)));
+            assert!(transform.field_matches(&frame(Some(1), Some(1))));
+            assert!(!transform.field_matches(&frame(Some(1), Some(0))));
+            assert!(!transform.field_matches(&frame(Some(1), None)));
+            assert!(!transform.field_matches(&frame(None, None)));
+            assert_eq!(
+                transform
+                    .activate(
+                        48,
+                        FrameRate {
+                            numerator: 24,
+                            denominator: 1
+                        }
+                    )
+                    .unwrap()
+                    .0,
+                96
+            );
+            assert!(transform.filter().unwrap().contains(&format!(
+                "{}=mode=send_field:parity=tff:deint=all",
+                engine.ffmpeg()
+            )));
+        }
     }
 
     #[test]
@@ -746,6 +798,7 @@ mod tests {
              cadence: Option<media_core::CadenceRepairSettings>| {
                 Transform::new(TemporalSettings {
                     deinterlace: mode.map(|mode| media_core::DeinterlaceSettings {
+                        engine: Default::default(),
                         mode,
                         field_order: FieldOrder::TopFirst,
                     }),
@@ -794,6 +847,7 @@ mod tests {
         let settings = [
             TemporalSettings {
                 deinterlace: Some(media_core::DeinterlaceSettings {
+                    engine: Default::default(),
                     mode: DeinterlaceMode::Bob,
                     field_order: FieldOrder::BottomFirst,
                 }),

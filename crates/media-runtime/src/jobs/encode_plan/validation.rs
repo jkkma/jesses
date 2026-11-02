@@ -54,16 +54,7 @@ impl Validation {
     }
 
     fn discover(&mut self, first: &Frame) -> Result<(), AppError> {
-        let needs_mastering = self.declared.plan.needs_mastering_metadata();
-        if let Some(hdr) = &mut self.declared.plan.hdr10 {
-            hdr.metadata
-                .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
-            if needs_mastering && hdr.metadata.mastering.is_none() {
-                return Err(unsupported(
-                    "HDR10 encoding requires valid mastering display metadata in the stream or first decoded frame.",
-                ));
-            }
-        }
+        self.declared.plan.absorb_source_metadata(first)?;
         Ok(())
     }
 
@@ -93,10 +84,19 @@ struct Cadence {
     count: usize,
     observed_hdr: StaticMetadata,
     error: Option<AppError>,
+    previous_time: Option<f64>,
+    source_queue: Option<super::super::source_queue::Cursor>,
 }
 
 impl Cadence {
     fn new(plan: Plan, stream: Stream, encoded: bool) -> Self {
+        let source_queue = encoded
+            .then(|| {
+                plan.source_queue
+                    .as_ref()
+                    .map(|regions| regions.cursor(plan.output_origin))
+            })
+            .flatten();
         // Output containers may quantize a fine source time base to milliseconds.
         let tolerance = if encoded {
             rational(stream.time_base.as_deref())
@@ -115,6 +115,8 @@ impl Cadence {
             count: 0,
             observed_hdr: StaticMetadata::default(),
             error: None,
+            previous_time: None,
+            source_queue,
         }
     }
 
@@ -135,7 +137,7 @@ impl Cadence {
     }
 
     fn validate(&mut self, frame: &Frame) -> Result<(), AppError> {
-        if self.count == 0 {
+        if self.count == 0 && self.source_queue.is_none() {
             if !self.encoded
                 && !self
                     .plan
@@ -146,24 +148,53 @@ impl Cadence {
                 ));
             }
             self.observed_hdr = StaticMetadata::parse(&self.stream.side_data_list)?;
-            validate_side_data(
-                &self.stream.side_data_list,
-                self.plan.validation_hdr(self.encoded),
-                self.encoded,
-            )?;
+            self.plan
+                .validate_video_side_data(&self.stream.side_data_list, self.encoded)?;
         }
         let time = seconds(frame.best_effort_timestamp_time.as_deref())
             .ok_or_else(|| unsupported("A decoded frame has no usable timestamp."))?;
-        if (time - self.count as f64 * self.plan.frame_seconds()).abs() > self.tolerance {
+        if !self.encoded
+            && (self.plan.source_cut_ordinals
+                || self.plan.source_dolby_render
+                || self.plan.source_av1an_base_clock)
+        {
+            if self.previous_time.is_some_and(|previous| time <= previous) {
+                return Err(unsupported(
+                    "The decoded source timestamps must be strictly increasing.",
+                ));
+            }
+            self.previous_time = Some(time);
+        } else if !self
+            .source_queue
+            .as_ref()
+            .is_some_and(|queue| queue.has_reference_clock())
+            && (time
+                - if self.encoded {
+                    self.plan.output_origin
+                } else {
+                    self.plan.source_origin
+                }
+                - self.count as f64 * self.plan.frame_seconds())
+            .abs()
+                > self.tolerance
+        {
             return Err(unsupported(
                 "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
             ));
+        }
+        if let Some(queue) = &mut self.source_queue {
+            return queue.push(frame);
         }
         let (width, height) = self.plan.frame_dimensions(self.encoded);
         self.plan.validate_fields(frame, self.encoded)?;
         if frame.width != Some(width)
             || frame.height != Some(height)
-            || frame.sample_aspect_ratio.as_deref() != Some(self.plan.frame_sar(self.encoded))
+            || frame
+                .sample_aspect_ratio
+                .as_deref()
+                .filter(|value| !matches!(*value, "0:1" | "N/A"))
+                .unwrap_or("1:1")
+                != self.plan.frame_sar(self.encoded)
         {
             return Err(unsupported(
                 "Decoded frame dimensions or sample aspect ratio differ from the processing plan.",
@@ -193,15 +224,20 @@ impl Cadence {
                 "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
             ));
         }
-        validate_side_data(
-            &frame.side_data_list,
-            self.plan.validation_hdr(self.encoded),
-            self.encoded,
-        )?;
+        self.plan
+            .validate_video_side_data(&frame.side_data_list, self.encoded)?;
         if !self.encoded
             && let Some(hdr) = self.plan.hdr10.as_ref()
         {
             hdr.require_profile5_rpu(&frame.side_data_list)?;
+            if self
+                .plan
+                .tone_map
+                .as_ref()
+                .is_some_and(|tone| tone.dolby_rpu)
+            {
+                hdr.require_gpu_rpu(&frame.side_data_list)?;
+            }
         }
         if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
             let actual = StaticMetadata::parse(&frame.side_data_list)?;
@@ -234,6 +270,10 @@ impl Cadence {
         }
         if let Some(error) = self.error {
             return Err(error);
+        }
+        if let Some(queue) = &self.source_queue {
+            queue.finish()?;
+            return Ok((self.plan, self.count));
         }
         if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
             hdr.metadata

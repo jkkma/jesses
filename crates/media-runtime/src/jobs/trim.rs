@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::sync::watch;
+#[path = "trim_source.rs"]
+mod source;
 #[path = "trim_subtitles.rs"]
 mod subtitles;
 pub(super) use subtitles::{Text, read as read_subtitles};
@@ -44,6 +46,16 @@ pub(super) fn validate_selection(
         return Ok(());
     }
     for stream in selected {
+        if settings.source_trim
+            && (stream.codec_type.as_deref() == Some("audio")
+                || (stream.codec_type.as_deref() == Some("subtitle")
+                    && !settings.subtitles.iter().any(|track| {
+                        track.stream_index == stream.index
+                            && (track.mode != media_core::SubtitleMode::Copy || track.burn_in)
+                    })))
+        {
+            continue;
+        }
         match stream.codec_type.as_deref() {
             Some("audio")
                 if !super::audio::converted(settings).any(|track| {
@@ -61,7 +73,7 @@ pub(super) fn validate_selection(
                     Some("ass" | "subrip" | "webvtt" | "mov_text")
                 ) && !settings.subtitles.iter().any(|track| {
                     track.stream_index == stream.index
-                        && track.mode == media_core::SubtitleMode::BurnIn
+                        && (track.mode == media_core::SubtitleMode::BurnIn || track.burn_in)
                 }) =>
             {
                 return Err(unsupported(format!(
@@ -206,6 +218,8 @@ pub(super) struct Prepared {
     pub expected: Document,
     subtitles: Vec<Subtitle>,
     chapters: PathBuf,
+    source: Option<source::SourceTrim>,
+    iso_subtitles: bool,
 }
 
 async fn write_asset(
@@ -244,6 +258,7 @@ impl Prepared {
     }
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
+        settings: &EncodeSettings,
         interval: Interval,
         source: &Document,
         selected: &[&Stream],
@@ -256,9 +271,19 @@ impl Prepared {
         cancel: &watch::Receiver<bool>,
     ) -> Result<Self, AppError> {
         let mut expected = interval.expected_document(source)?;
+        let source_trim = Box::pin(source::SourceTrim::build(
+            settings, interval, source, selected, external, ffmpeg, input, output, id, scratch,
+            cancel,
+        ))
+        .await?;
+        let copied = source_trim
+            .as_ref()
+            .map_or_else(Vec::new, source::SourceTrim::indices);
         let mut subtitles = Vec::new();
         for stream in selected.iter().filter(|stream| {
             stream.codec_type.as_deref() == Some("subtitle")
+                && !settings.source_trim
+                && !copied.contains(&stream.index)
                 && matches!(
                     stream.codec_name.as_deref(),
                     Some("ass" | "subrip" | "webvtt" | "mov_text")
@@ -333,6 +358,11 @@ impl Prepared {
             expected,
             subtitles,
             chapters,
+            source: source_trim,
+            iso_subtitles: matches!(
+                super::container::staging_format(selected, Some(settings)),
+                media_core::ContainerFormat::Mov | media_core::ContainerFormat::Mp4
+            ),
         })
     }
 
@@ -396,7 +426,95 @@ impl Prepared {
                 .replacen("asetpts=N/SR/TB+STARTPTS", prefix, 1)
                 .into();
         }
+        if self.iso_subtitles {
+            for subtitle in &self.subtitles {
+                let position = selected
+                    .iter()
+                    .position(|stream| stream.index == subtitle.source_index)
+                    .expect("selected trimmed subtitle");
+                let last = args.len() - 1;
+                args.splice(
+                    last..last,
+                    [format!("-c:{position}").into(), "mov_text".into()],
+                );
+            }
+        }
+        if let Some(source) = &self.source {
+            source.apply(args, selected);
+        }
         Ok(())
+    }
+
+    pub fn audio_origin(&self, video_origin: f64) -> f64 {
+        self.source
+            .as_ref()
+            .map_or(video_origin, |source| source.audio_origin(video_origin))
+    }
+
+    pub fn copied_indices(&self) -> Vec<u32> {
+        self.source
+            .as_ref()
+            .map_or_else(Vec::new, source::SourceTrim::indices)
+    }
+
+    /// The complete packet proof is authoritative over FFprobe's AAC header start,
+    /// which includes CodecDelay and can differ from its first presentation packet.
+    pub fn normalize_verified_packet_starts(
+        &self,
+        artifact: &mut Document,
+        expected: &Document,
+        selected: &[&Stream],
+    ) {
+        for index in self.copied_indices() {
+            if let (Some(position), Some(stream)) = (
+                selected.iter().position(|stream| stream.index == index),
+                expected.streams.iter().find(|stream| stream.index == index),
+            ) {
+                artifact.streams[position].packet_start_time = stream.packet_start_time;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn verify_source(
+        &self,
+        ffmpeg: &Path,
+        ffprobe: &Path,
+        output: &Path,
+        selected: &[&Stream],
+        artifact: &Document,
+        video_index: Option<u32>,
+        encoded_video: Option<&Path>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(Document, f64), AppError> {
+        let mut expected = self.expected.clone();
+        let Some(source) = &self.source else {
+            return Ok((expected, 0.0));
+        };
+        let origin = video_index
+            .and_then(|index| selected.iter().position(|stream| stream.index == index))
+            .and_then(|position| artifact.streams.get(position))
+            .and_then(|stream| {
+                stream.packet_start_time.or_else(|| {
+                    stream
+                        .start_time
+                        .as_deref()
+                        .and_then(|time| time.parse().ok())
+                })
+            })
+            .unwrap_or(source.origin_hint());
+        Box::pin(source.verify(
+            ffmpeg,
+            ffprobe,
+            output,
+            selected,
+            origin,
+            &mut expected,
+            encoded_video,
+            cancel,
+        ))
+        .await?;
+        Ok((expected, origin))
     }
 
     pub async fn verify_subtitles(
@@ -440,6 +558,7 @@ mod tests {
                 start_frame: 0,
                 end_frame_exclusive: 0,
                 time: Some(VideoTimeTrim {
+                    seek_strategy: Default::default(),
                     start_milliseconds: 500,
                     end_milliseconds: 1_001,
                 }),
@@ -460,6 +579,7 @@ mod tests {
             start_frame: 0,
             end_frame_exclusive: 0,
             time: Some(VideoTimeTrim {
+                seek_strategy: Default::default(),
                 start_milliseconds: 1,
                 end_milliseconds: 2,
             }),
@@ -470,6 +590,7 @@ mod tests {
             start_frame: 0,
             end_frame_exclusive: 0,
             time: Some(VideoTimeTrim {
+                seek_strategy: Default::default(),
                 start_milliseconds: 900,
                 end_milliseconds: 1_001,
             }),

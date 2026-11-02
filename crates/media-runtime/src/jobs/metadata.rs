@@ -14,6 +14,7 @@ pub(super) struct Document {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct Format {
+    pub format_name: Option<String>,
     pub duration: Option<String>,
     pub start_time: Option<String>,
     #[serde(default)]
@@ -109,8 +110,8 @@ impl Document {
                 })?;
             match stream.codec_type.as_deref() {
                 Some("attachment") => attachment_seen = true,
-                Some("video" | "audio" | "subtitle") if !attachment_seen => {}
-                Some("video" | "audio" | "subtitle") => {
+                Some("video" | "audio" | "subtitle" | "data") if !attachment_seen => {}
+                Some("video" | "audio" | "subtitle" | "data") => {
                     return Err(AppError::new(
                         "STREAM_ORDER_UNSUPPORTED",
                         "Matroska places attachments after media tracks. Put selected attachments last.",
@@ -120,20 +121,24 @@ impl Document {
                 _ => {
                     return Err(AppError::new(
                         "STREAM_UNSUPPORTED",
-                        format!("Stream {index} cannot be copied by this Matroska workflow."),
+                        format!("Stream {index} has an unsupported type for this workflow."),
                         None,
                     ));
                 }
             }
             streams.push(stream);
         }
-        if !streams
-            .iter()
-            .any(|s| matches!(s.codec_type.as_deref(), Some("video" | "audio")))
+        if !streams.is_empty()
+            && !streams.iter().any(|s| {
+                matches!(
+                    s.codec_type.as_deref(),
+                    Some("video" | "audio" | "subtitle" | "data")
+                )
+            })
         {
             return Err(AppError::new(
                 "STREAM_SELECTION_INVALID",
-                "Select at least one video or audio stream.",
+                "Select at least one media stream.",
                 None,
             ));
         }
@@ -146,7 +151,7 @@ impl Document {
             .filter(|s| {
                 matches!(
                     s.codec_type.as_deref(),
-                    Some("video" | "audio" | "subtitle")
+                    Some("video" | "audio" | "subtitle" | "data")
                 )
             })
             .filter_map(|s| {
@@ -220,7 +225,7 @@ pub(super) fn verify(
     selected: &[&Stream],
     output: &Document,
 ) -> Result<(), AppError> {
-    verify_inner(source, selected, output, None, &[], &[])
+    verify_inner(source, selected, output, &[], &[], &[])
 }
 
 /// Container text conversion is verified separately against every readable cue.
@@ -232,7 +237,10 @@ pub(super) fn verify_container(
     output: &Document,
     converted_subtitles: &[u32],
 ) -> Result<(), AppError> {
-    verify_inner(source, selected, output, None, &[], converted_subtitles)
+    if converted_subtitles.is_empty() {
+        return verify(source, selected, output);
+    }
+    verify_inner(source, selected, output, &[], &[], converted_subtitles)
 }
 
 pub(super) fn verify_encoded(
@@ -248,17 +256,85 @@ pub(super) fn verify_encoded(
         source,
         selected,
         output,
-        Some((video_index, expected_codec, expected_dimensions)),
+        &[EncodedVideo {
+            index: video_index,
+            codec: expected_codec,
+            dimensions: expected_dimensions,
+        }],
         audio,
         &[],
     )
+}
+
+pub(super) fn verify_audio_conversion(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    audio: &[media_core::AudioTrackSettings],
+) -> Result<(), AppError> {
+    verify_inner(source, selected, output, &[], audio, &[])
+}
+
+pub(super) fn verify_audio_conversion_with_subtitles(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    audio: &[media_core::AudioTrackSettings],
+    converted_subtitles: &[u32],
+) -> Result<(), AppError> {
+    if converted_subtitles.is_empty() {
+        return verify_audio_conversion(source, selected, output, audio);
+    }
+    verify_inner(source, selected, output, &[], audio, converted_subtitles)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_encoded_with_subtitles(
+    source: &Document,
+    selected: &[&Stream],
+    output: &Document,
+    video_index: u32,
+    expected_codec: &str,
+    expected_dimensions: (u32, u32),
+    audio: &[media_core::AudioTrackSettings],
+    converted_subtitles: &[u32],
+) -> Result<(), AppError> {
+    if converted_subtitles.is_empty() {
+        return verify_encoded(
+            source,
+            selected,
+            output,
+            video_index,
+            expected_codec,
+            expected_dimensions,
+            audio,
+        );
+    }
+    verify_inner(
+        source,
+        selected,
+        output,
+        &[EncodedVideo {
+            index: video_index,
+            codec: expected_codec,
+            dimensions: expected_dimensions,
+        }],
+        audio,
+        converted_subtitles,
+    )
+}
+
+pub(super) struct EncodedVideo<'a> {
+    pub index: u32,
+    pub codec: &'a str,
+    pub dimensions: (u32, u32),
 }
 
 fn verify_inner(
     source: &Document,
     selected: &[&Stream],
     output: &Document,
-    encoded_video: Option<(u32, &str, (u32, u32))>,
+    encoded_videos: &[EncodedVideo<'_>],
     audio: &[media_core::AudioTrackSettings],
     converted_subtitles: &[u32],
 ) -> Result<(), AppError> {
@@ -269,9 +345,12 @@ fn verify_inner(
         ));
     }
     for (expected, actual) in selected.iter().zip(&output.streams) {
-        let encoded = encoded_video.is_some_and(|(index, _, _)| index == expected.index);
+        let encoded_video = encoded_videos
+            .iter()
+            .find(|video| video.index == expected.index);
+        let encoded = encoded_video.is_some();
         let (expected_width, expected_height) = if encoded {
-            let (_, _, (width, height)) = encoded_video.expect("encoded video plan");
+            let (width, height) = encoded_video.expect("encoded video plan").dimensions;
             (Some(width), Some(height))
         } else {
             (expected.width, expected.height)
@@ -308,8 +387,10 @@ fn verify_inner(
             }
         }
         if expected.codec_type != actual.codec_type
+            || (expected.codec_type.as_deref() == Some("data")
+                && expected.codec_tag_string != actual.codec_tag_string)
             || if encoded {
-                actual.codec_name.as_deref() != encoded_video.map(|(_, codec, _)| codec)
+                actual.codec_name.as_deref() != encoded_video.map(|video| video.codec)
             } else if let Some(track) = converted_audio {
                 actual.codec_name.as_deref() != Some(super::audio::codec_name(track.codec))
             } else {
@@ -335,9 +416,31 @@ fn verify_inner(
                     && actual.bits_per_raw_sample.as_deref() != Some("24")
             })
         {
-            return Err(fail(
-                "The output stream order, codecs, or media properties changed.",
-            ));
+            return Err(fail(&format!(
+                "The output stream order, codecs, or media properties changed (source stream {}, output {}: expected {:?}/{:?} {:?}x{:?}, audio {:?}/{:?}; actual {:?}/{:?} {:?}x{:?}, audio {:?}/{:?}).",
+                expected.index,
+                actual.index,
+                expected.codec_type,
+                encoded_video
+                    .map(|video| video.codec)
+                    .or_else(|| converted_audio.map(|track| super::audio::codec_name(track.codec)))
+                    .or(expected.codec_name.as_deref()),
+                expected_width,
+                expected_height,
+                converted_audio.map_or_else(
+                    || expected.sample_rate.clone(),
+                    |track| super::audio::expected_rate(expected, track)
+                ),
+                converted_audio.map_or(expected.channels, |track| super::audio::expected_channels(
+                    expected, track
+                )),
+                actual.codec_type,
+                actual.codec_name,
+                actual.width,
+                actual.height,
+                actual.sample_rate,
+                actual.channels,
+            )));
         }
         let media_track = matches!(expected.codec_type.as_deref(), Some("video" | "audio"));
         let expected_packets = expected
@@ -436,9 +539,10 @@ fn verify_inner(
             }
         }
         if actual < expected - tolerance || actual > latest_end {
-            return Err(fail(
-                "The output duration differs from the selected source tracks.",
-            ));
+            return Err(fail(&format!(
+                "The output duration differs from the selected source tracks: observed {actual:.6}s, expected {expected:.6}s (allowed {lower:.6}..{latest_end:.6}s).",
+                lower = expected - tolerance
+            )));
         }
     }
     Ok(())
@@ -547,6 +651,7 @@ mod tests {
         output.streams[0].sample_rate = Some("48000".into());
         output.streams[0].nb_read_packets = Some("12".into());
         let tracks = [media_core::AudioTrackSettings {
+            normalization: None,
             stream_index: 2,
             codec: media_core::AudioCodec::Opus,
             bitrate_kbps: 128,

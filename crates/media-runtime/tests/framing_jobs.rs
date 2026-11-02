@@ -668,6 +668,7 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     manager.ready().await.unwrap();
     let base = BatchEncodeInput {
+        video_mode: None,
         temporal: None,
         tone_map: None,
         trim: None,
@@ -684,11 +685,21 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
     invalid_borders.framing.borders.left = 1;
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            copy_metadata: None,
+            copy_chapters: None,
+            source_naming: None,
+            encoding_preferences: None,
+            constant_quantizer: None,
+            source_nvenc_quality: false,
+            source_trim: false,
+            hdr_metadata: None,
+            video_mode: Default::default(),
             parameters: Vec::new(),
             av1an_options: None,
             output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
+            source_filters: false,
             output_container: None,
             rate_control: None,
             lossless: false,
@@ -697,6 +708,7 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
             inputs: vec![
                 base.clone(),
                 BatchEncodeInput {
+                    video_mode: None,
                     framing: borders_only(),
                     ..base
                 },

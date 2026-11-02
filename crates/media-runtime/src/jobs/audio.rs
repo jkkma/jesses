@@ -1,7 +1,7 @@
 //! Audio overrides are tied to source indices; encoder arguments use output
 //! positions. Converted audio is checked using decoded samples, after codec
 //! delay/pre-skip has been applied by the decoder, rather than packet counts.
-use media_core::{AudioChannels, AudioCodec, AudioTrackSettings};
+use media_core::{AudioChannelLayoutPolicy, AudioChannels, AudioCodec, AudioTrackSettings};
 use serde::Deserialize;
 
 use super::*;
@@ -46,15 +46,29 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 "Audio settings contain duplicate source stream indices.",
             ));
         }
-        let maximum = if track.codec == AudioCodec::Eac3 {
-            6144
-        } else {
-            512
-        };
-        if track.codec != AudioCodec::Flac && !(32..=maximum).contains(&track.bitrate_kbps) {
-            return Err(invalid(format!(
-                "Audio bitrate must be an integer from 32 to {maximum} kb/s."
-            )));
+        if !(8..=8192).contains(&track.bitrate_kbps) {
+            return Err(invalid(
+                "Audio bitrate must be an integer from 8 to 8192 kb/s; the selected codec may impose narrower limits.",
+            ));
+        }
+        if let AudioChannels::Explicit { count, layout } = track.channels {
+            if !(1..=24).contains(&count) {
+                return Err(invalid(
+                    "Audio channel count must be an integer from 1 to 24.",
+                ));
+            }
+            if layout == AudioChannelLayoutPolicy::Standard && ![1, 2, 6, 8].contains(&count) {
+                return Err(invalid(
+                    "This channel count requires its actual source speaker layout. Only mono, stereo, 5.1 and 7.1 have an unambiguous standard conversion here.",
+                ));
+            }
+        }
+        if track.normalization.is_some()
+            && (track.codec == AudioCodec::Copy || track.gain.is_some())
+        {
+            return Err(invalid(
+                "Measured loudness normalization requires audio conversion and cannot be combined with a separate gain.",
+            ));
         }
         if track.codec == AudioCodec::Copy && track.channels != AudioChannels::Preserve {
             return Err(invalid("Copy audio requires the original channel layout."));
@@ -150,21 +164,57 @@ pub(super) fn validate_selection(
         }
         if !source
             .channels
-            .is_some_and(|channels| (1..=8).contains(&channels))
+            .is_some_and(|channels| (1..=24).contains(&channels))
         {
             return Err(invalid(
-                "Audio conversion requires a known source channel count from 1 to 8.",
+                "Audio conversion requires a known source channel count from 1 to 24.",
+            ));
+        }
+        if let AudioChannels::Explicit {
+            count,
+            layout: AudioChannelLayoutPolicy::Source,
+        } = track.channels
+            && (source.channels != Some(u32::from(count)) || source.channel_layout.is_none())
+        {
+            return Err(invalid(
+                "The explicit channel count does not match a known source speaker layout. Select a named downmix or preserve the probed source count.",
             ));
         }
         let output_channels = expected_channels(source, track).expect("known source channel count");
+        if matches!(
+            track.channels,
+            AudioChannels::Explicit {
+                layout: AudioChannelLayoutPolicy::FfmpegDefault,
+                ..
+            }
+        ) && expected_layout(source, track).is_none()
+        {
+            return Err(invalid(
+                "The requested count has no qualified FFmpeg speaker layout for this codec. Preserve an actual source layout, use a supported count, or copy the source.",
+            ));
+        }
+        let codec_max_channels = match track.codec {
+            AudioCodec::Mp3 => 2,
+            AudioCodec::Eac3 => 6,
+            AudioCodec::Flac => 8,
+            AudioCodec::Opus => 8,
+            AudioCodec::Vorbis | AudioCodec::Aac => 24,
+            AudioCodec::Copy => unreachable!(),
+        };
+        if output_channels > codec_max_channels {
+            return Err(invalid(format!(
+                "{} supports at most {codec_max_channels} channels in this workflow; the source grid permits counts through 24.",
+                codec_name(track.codec)
+            )));
+        }
         if track.codec == AudioCodec::Eac3 && output_channels > 6 {
             return Err(invalid(
                 "E-AC-3 conversion supports up to 5.1 channels. Choose 5.1 or another codec.",
             ));
         }
         let maximum_bitrate = match track.codec {
-            AudioCodec::Aac => (rate * output_channels * 6 / 1000).min(512),
-            AudioCodec::Opus => (output_channels * 256).min(512),
+            AudioCodec::Aac => rate * output_channels * 6 / 1000,
+            AudioCodec::Opus => output_channels * 256,
             AudioCodec::Mp3 => {
                 if rate >= 32000 {
                     320
@@ -173,7 +223,8 @@ pub(super) fn validate_selection(
                 }
             }
             AudioCodec::Eac3 => 6144 * rate / 48000,
-            AudioCodec::Flac | AudioCodec::Vorbis => 512,
+            AudioCodec::Vorbis => 8192,
+            AudioCodec::Flac => 8192,
             AudioCodec::Copy => unreachable!(),
         };
         if track.codec != AudioCodec::Flac && u32::from(track.bitrate_kbps) > maximum_bitrate {
@@ -193,7 +244,7 @@ pub(super) fn validate_selection(
                     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
                 ]
             } else {
-                &[32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+                &[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
             };
             if !allowed.contains(&track.bitrate_kbps) {
                 return Err(invalid(
@@ -225,7 +276,30 @@ pub(super) fn validate_selection(
                 Some("7.1") => Some(8),
                 _ => None,
             };
-            if layout_channels != source.channels {
+            let recognized_extended = source.channels.is_some_and(|n| n > 8)
+                && source.channel_layout.as_deref().is_some_and(|layout| {
+                    !layout.is_empty()
+                        && layout.len() <= 128
+                        && layout
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b" .()+-|".contains(&b))
+                });
+            // Like the source, an explicit output conversion may use FFmpeg's
+            // standard count default for a header with no layout. The exact
+            // encoder/count path is qualified with that same Nc parser below.
+            let qualified_input_default = source.channel_layout.is_none()
+                && source.channels.is_some_and(|n| (1..=8).contains(&n))
+                && !matches!(
+                    track.channels,
+                    AudioChannels::Explicit {
+                        layout: AudioChannelLayoutPolicy::Source,
+                        ..
+                    }
+                );
+            if layout_channels != source.channels
+                && !recognized_extended
+                && !qualified_input_default
+            {
                 return Err(invalid(
                     "Converting multichannel audio requires a recognized speaker layout matching its channel count.",
                 ));
@@ -244,7 +318,7 @@ pub(super) fn validate_selection(
                 ),
                 _ => false,
             };
-            if track.channels == AudioChannels::Preserve && unsupported_layout {
+            if preserves_layout(track.channels) && unsupported_layout {
                 return Err(invalid(format!(
                     "{} cannot preserve the speaker layout of audio stream {}. Choose an explicit mono or stereo downmix, another codec, or copy.",
                     codec_name(track.codec),
@@ -276,6 +350,17 @@ pub(super) fn expected_rate(
     }
 }
 
+fn preserves_layout(channels: AudioChannels) -> bool {
+    matches!(
+        channels,
+        AudioChannels::Preserve
+            | AudioChannels::Explicit {
+                layout: AudioChannelLayoutPolicy::Source,
+                ..
+            }
+    )
+}
+
 pub(super) fn expected_channels(
     source: &metadata::Stream,
     track: &AudioTrackSettings,
@@ -286,6 +371,7 @@ pub(super) fn expected_channels(
         AudioChannels::Stereo => Some(2),
         AudioChannels::Surround51 => Some(6),
         AudioChannels::Surround71 => Some(8),
+        AudioChannels::Explicit { count, .. } => Some(u32::from(count)),
     }
 }
 
@@ -294,12 +380,58 @@ pub(super) fn expected_layout<'a>(
     track: &AudioTrackSettings,
 ) -> Option<&'a str> {
     match track.channels {
-        AudioChannels::Preserve => source.channel_layout.as_deref(),
+        AudioChannels::Preserve => source.channel_layout.as_deref().or_else(|| {
+            source
+                .channels
+                .and_then(|n| u8::try_from(n).ok())
+                .and_then(|n| ffmpeg_default_layout(n, AudioCodec::Copy))
+        }),
         AudioChannels::Mono => Some("mono"),
         AudioChannels::Stereo => Some("stereo"),
         AudioChannels::Surround51 if track.codec == AudioCodec::Eac3 => Some("5.1(side)"),
         AudioChannels::Surround51 => Some("5.1"),
         AudioChannels::Surround71 => Some("7.1"),
+        AudioChannels::Explicit {
+            layout: AudioChannelLayoutPolicy::Source,
+            ..
+        } => source.channel_layout.as_deref(),
+        AudioChannels::Explicit {
+            count,
+            layout: AudioChannelLayoutPolicy::FfmpegDefault,
+        } => ffmpeg_default_layout(count, track.codec),
+        AudioChannels::Explicit {
+            count,
+            layout: AudioChannelLayoutPolicy::Standard,
+        } => match count {
+            1 => Some("mono"),
+            2 => Some("stereo"),
+            6 if track.codec == AudioCodec::Eac3 => Some("5.1(side)"),
+            6 => Some("5.1"),
+            8 => Some("7.1"),
+            _ => None,
+        },
+    }
+}
+
+// These are FFmpeg's actual -ac count defaults, including codec negotiation.
+// The exact installed encoder is exercised below; a layout warning, a different
+// probed layout, or failure prevents this mapping from reaching user media.
+fn ffmpeg_default_layout(count: u8, codec: AudioCodec) -> Option<&'static str> {
+    match (count, codec) {
+        (1, _) => Some("mono"),
+        (2, _) => Some("stereo"),
+        (3, AudioCodec::Eac3) => Some("3.0(back)"),
+        (3, _) => Some("2.1"),
+        (4, AudioCodec::Eac3) => Some("quad(side)"),
+        (4, _) => Some("4.0"),
+        (5, AudioCodec::Eac3) => Some("5.0(side)"),
+        (5, _) => Some("5.0"),
+        (6, AudioCodec::Eac3) => Some("5.1(side)"),
+        (6, _) => Some("5.1"),
+        (7, AudioCodec::Aac) => Some("6.1(back)"),
+        (7, _) => Some("6.1"),
+        (8, _) => Some("7.1"),
+        _ => None,
     }
 }
 
@@ -350,13 +482,107 @@ pub(super) fn append_arguments(
     if track.codec == AudioCodec::Aac {
         args.extend([format!("-profile:{position}").into(), "aac_low".into()]);
     }
-    if track.channels != AudioChannels::Preserve {
+    if matches!(
+        track.channels,
+        AudioChannels::Explicit {
+            layout: AudioChannelLayoutPolicy::FfmpegDefault,
+            ..
+        }
+    ) {
+        args.extend([
+            format!("-ac:{position}").into(),
+            expected_channels(source, track).unwrap().to_string().into(),
+        ]);
+    } else if !preserves_layout(track.channels) {
         args.extend([
             format!("-ac:{position}").into(),
             expected_channels(source, track).unwrap().to_string().into(),
             format!("-channel_layout:{position}").into(),
             expected_layout(source, track).unwrap().into(),
         ]);
+    }
+}
+
+/// First-pass records remain bound to the native job's original input and exact
+/// sample trim. Reopening an inspector or changing UI controls cannot alter them.
+pub(super) struct Normalization {
+    measurements: Vec<(u32, crate::loudness::NormalizationMeasurement)>,
+}
+impl Normalization {
+    pub async fn prepare(
+        ffmpeg: &Path,
+        input: &Path,
+        selected: &[&metadata::Stream],
+        settings: &EncodeSettings,
+        external: &super::external_tracks::ExternalTracks,
+        prefixes: &std::collections::BTreeMap<u32, String>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Self, AppError> {
+        let mut measurements = Vec::new();
+        for track in converted(settings) {
+            let Some(normalization) = track.normalization else {
+                continue;
+            };
+            let stream = *selected
+                .iter()
+                .find(|stream| stream.index == track.stream_index)
+                .expect("validated normalization selection");
+            let (path, original) = external
+                .audio_source(track.stream_index)
+                .unwrap_or((input, stream));
+            let channels = if preserves_layout(track.channels) {
+                String::new()
+            } else {
+                format!(
+                    "aformat=channel_layouts={},",
+                    expected_layout(original, track).expect("validated explicit layout")
+                )
+            };
+            let prefix = prefixes
+                .get(&track.stream_index)
+                .map(String::as_str)
+                .unwrap_or("asetpts=N/SR/TB+STARTPTS");
+            let measured = crate::loudness::measure_normalization(
+                ffmpeg,
+                path,
+                original.index,
+                prefix,
+                &channels,
+                normalization.target,
+                cancel,
+            )
+            .await?;
+            measurements.push((track.stream_index, measured));
+        }
+        Ok(Self { measurements })
+    }
+    pub fn evidence(&self) -> impl Iterator<Item = String> + '_ {
+        self.measurements
+            .iter()
+            .map(|(_, record)| record.evidence())
+    }
+    pub fn apply_mux(
+        &self,
+        args: &mut [OsString],
+        selected: &[&metadata::Stream],
+    ) -> Result<(), AppError> {
+        for (index, measured) in &self.measurements {
+            measured.verify()?;
+            let position = selected
+                .iter()
+                .position(|stream| stream.index == *index)
+                .expect("selected normalization track");
+            let key = format!("-filter:{position}");
+            let at = args
+                .iter()
+                .position(|arg| arg == key.as_str())
+                .ok_or_else(|| invalid("Measured loudness requires the converted audio filter."))?;
+            let prefix = args[at + 1]
+                .to_str()
+                .ok_or_else(|| invalid("Invalid audio filter encoding."))?;
+            args[at + 1] = format!("{prefix},{}", measured.filter()).into();
+        }
+        Ok(())
     }
 }
 
@@ -546,15 +772,19 @@ pub(super) async fn check_conversion_support(
     };
     let rate = sample_rate(source)?;
     let layout = match source.channels {
-        Some(1) => "mono",
-        Some(2) => "stereo",
-        _ => source.channel_layout.as_deref().expect("validated layout"),
+        Some(1) => "mono".to_owned(),
+        Some(2) => "stereo".to_owned(),
+        Some(count) => source
+            .channel_layout
+            .clone()
+            .unwrap_or_else(|| format!("{count}c")),
+        None => unreachable!("validated source count"),
     };
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
         "-v",
-        "error",
+        "warning",
         "-f",
         "lavfi",
         "-i",
@@ -589,7 +819,11 @@ pub(super) async fn check_conversion_support(
     )
     .await
     .map_err(|error| process_error(error, ffmpeg))?;
-    if !encoded.status.success() {
+    let warnings = String::from_utf8_lossy(&encoded.stderr).to_ascii_lowercase();
+    if !encoded.status.success()
+        || warnings.contains("incorrect channel layout")
+        || warnings.contains("clamp")
+    {
         return Err(fail());
     }
     temporary.flush_nonempty_async().await?;
@@ -1029,6 +1263,7 @@ mod tests {
     use super::*;
     fn track(codec: AudioCodec) -> AudioTrackSettings {
         AudioTrackSettings {
+            normalization: None,
             stream_index: 1,
             codec,
             bitrate_kbps: 128,
@@ -1061,7 +1296,7 @@ mod tests {
             assert!(validate_selection(&selected, &settings).is_err());
         }
         settings.audio[0].stream_index = 1;
-        for bitrate in [0, 31, 513, u16::MAX] {
+        for bitrate in [0, 7, 8193, u16::MAX] {
             settings.audio[0].bitrate_kbps = bitrate;
             assert!(validate_settings(&settings).is_err());
         }
@@ -1073,6 +1308,51 @@ mod tests {
         validate_settings(&settings).unwrap();
         settings.audio[0] = track(AudioCodec::Copy);
         validate_settings(&settings).unwrap();
+    }
+
+    #[test]
+    fn source_numeric_grid_preserves_counts_and_codec_constraints() {
+        let mut document = source();
+        document.streams[1].channels = Some(3);
+        document.streams[1].channel_layout = Some("3.0".into());
+        let mut settings = EncodeSettings {
+            audio: vec![track(AudioCodec::Flac)],
+            ..Default::default()
+        };
+        settings.audio[0].channels = AudioChannels::Explicit {
+            count: 3,
+            layout: AudioChannelLayoutPolicy::Source,
+        };
+        settings.audio[0].bitrate_kbps = 8192;
+        validate_settings(&settings).unwrap();
+        validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
+        assert_eq!(
+            expected_layout(&document.streams[1], &settings.audio[0]),
+            Some("3.0")
+        );
+        settings.audio[0].channels = AudioChannels::Explicit {
+            count: 3,
+            layout: AudioChannelLayoutPolicy::Standard,
+        };
+        assert!(validate_settings(&settings).is_err());
+        settings.audio[0].channels = AudioChannels::Explicit {
+            count: 24,
+            layout: AudioChannelLayoutPolicy::Source,
+        };
+        validate_settings(&settings).unwrap();
+        assert!(validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).is_err());
+        settings.audio[0].channels = AudioChannels::Stereo;
+        settings.audio[0].codec = AudioCodec::Opus;
+        settings.audio[0].bitrate_kbps = 8;
+        validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
+        settings.audio[0].bitrate_kbps = 8192;
+        validate_settings(&settings).unwrap();
+        assert!(validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).is_err());
+        settings.audio[0].normalization = Some(media_core::AudioNormalization {
+            target: media_core::LoudnessTarget::Lufs16,
+        });
+        settings.audio[0].codec = AudioCodec::Copy;
+        assert!(validate_settings(&settings).is_err());
     }
 
     #[test]
@@ -1160,7 +1440,7 @@ mod tests {
         assert!(validate_selection(&source.selected(&[0, 1]).unwrap(), &settings).is_err());
     }
     #[test]
-    fn requires_known_preserved_layout_and_supported_aac_sample_rate() {
+    fn requires_qualified_preserved_layout_and_supported_aac_sample_rate() {
         let mut document = source();
         document.streams[1].sample_rate = Some("12345".into());
         let mut settings = EncodeSettings {
@@ -1172,9 +1452,13 @@ mod tests {
         validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
         document.streams[1].channels = Some(6);
         document.streams[1].channel_layout = None;
-        assert!(validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).is_err());
+        validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
+        assert_eq!(
+            expected_layout(&document.streams[1], &settings.audio[0]),
+            Some("5.1")
+        );
         settings.audio[0].channels = AudioChannels::Stereo;
-        assert!(validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).is_err());
+        validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
         document.streams[1].channel_layout = Some("5.1".into());
         validate_selection(&document.selected(&[0, 1]).unwrap(), &settings).unwrap();
     }

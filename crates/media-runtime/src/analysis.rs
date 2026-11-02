@@ -156,6 +156,7 @@ struct Format {
 struct Stream {
     index: u32,
     codec_type: Option<String>,
+    field_order: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     duration: Option<String>,
@@ -271,7 +272,7 @@ async fn inspect(
     let ffmpeg = tool("ffmpeg", cancel).await?;
     let mut args: Vec<OsString> = [
         "-v", "error", "-protocol_whitelist", "file", "-show_streams", "-show_format",
-        "-show_entries", "stream=index,codec_type,width,height,duration,sample_aspect_ratio,color_transfer,color_primaries,color_space,color_range:stream_tags:stream_side_data=side_data_type,displaymatrix,rotation:format=duration",
+        "-show_entries", "stream=index,codec_type,field_order,width,height,duration,sample_aspect_ratio,color_transfer,color_primaries,color_space,color_range:stream_tags:stream_side_data=side_data_type,displaymatrix,rotation:format=duration",
         "-of", "json", "-i",
     ].into_iter().map(OsString::from).collect();
     args.push(source.path.as_os_str().to_owned());
@@ -417,8 +418,14 @@ fn matrix_transform(matrix: [i64; 9]) -> Option<(bool, &'static str)> {
 }
 
 fn display_transform(stream: &Stream) -> Result<(bool, &'static str), &'static str> {
-    let matrices = stream
-        .side_data_list
+    display_transform_parts(&stream.side_data_list, &stream.tags)
+}
+
+pub(crate) fn display_transform_parts(
+    side_data: &[serde_json::Value],
+    tags: &BTreeMap<String, String>,
+) -> Result<(bool, &'static str), &'static str> {
+    let matrices = side_data
         .iter()
         .filter(|side_data| {
             side_data.get("displaymatrix").is_some()
@@ -441,15 +448,12 @@ fn display_transform(stream: &Stream) -> Result<(bool, &'static str), &'static s
 
     // Older containers may expose only a rotation tag. Do not use this summary
     // when the full matrix is present: a reflected matrix can report a misleading angle.
-    let rotation = stream
-        .side_data_list
+    let rotation = side_data
         .iter()
         .filter_map(|v| v.get("rotation"))
         .find_map(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
         .or_else(|| {
-            stream
-                .tags
-                .iter()
+            tags.iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case("rotate"))?
                 .1
                 .parse()
@@ -704,6 +708,24 @@ pub async fn detect_crop(
     request: AutoCropRequest,
     cancel: watch::Receiver<bool>,
 ) -> Result<AutoCropResult, AppError> {
+    detect_crop_with_samples(request, cancel, SAMPLE_POINTS as u8).await
+}
+
+/// The source application's persisted automatic-crop sample count. Keeping it
+/// explicit also makes a running analysis independent of later preference edits.
+pub async fn detect_crop_with_samples(
+    request: AutoCropRequest,
+    cancel: watch::Receiver<bool>,
+    sample_count: u8,
+) -> Result<AutoCropResult, AppError> {
+    if !(1..=100).contains(&sample_count) {
+        return Err(AppError::new(
+            "ANALYSIS_INVALID",
+            "Automatic crop needs 1–100 sample positions.",
+            None,
+        ));
+    }
+    let sample_count = u32::from(sample_count);
     let _permit = permit(&cancel).await?;
     let input = inspect(request.input_path, request.video_stream_index, &cancel).await?;
     if input.width < 64
@@ -725,8 +747,8 @@ pub async fn detect_crop(
         )
     })?;
     let mut found = Vec::new();
-    for sample in 0..SAMPLE_POINTS {
-        let position = duration * (f64::from(sample) + 0.5) / f64::from(SAMPLE_POINTS);
+    for sample in 0..sample_count {
+        let position = duration * (f64::from(sample) + 0.5) / f64::from(sample_count);
         let mut args = decoder_args(&input, position, true);
         args.extend(
             [
@@ -758,7 +780,7 @@ pub async fn detect_crop(
         crop,
         source_width: input.width,
         source_height: input.height,
-        sample_count: SAMPLE_POINTS,
+        sample_count,
         sampled_frames: found.len() as u32,
         agreement_percent,
         source_fingerprint: input.fingerprint,
@@ -925,3 +947,7 @@ mod tests {
         assert_eq!(error.code, "ANALYSIS_CANCELLED");
     }
 }
+
+#[path = "analysis/fields.rs"]
+mod fields;
+pub use fields::{detect_fields, snap_keyframe};

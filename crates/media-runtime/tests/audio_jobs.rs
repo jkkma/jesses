@@ -120,6 +120,7 @@ async fn synthesize(input: &Path, seconds: u32) {
 
 fn track(stream_index: u32, codec: AudioCodec, channels: AudioChannels) -> AudioTrackSettings {
     AudioTrackSettings {
+        normalization: None,
         stream_index,
         codec,
         bitrate_kbps: if stream_index == 2 { 256 } else { 128 },
@@ -432,6 +433,7 @@ async fn additional_codec_rates_and_eac3_side_surround_are_preserved() {
             &input,
             &destination,
             vec![AudioTrackSettings {
+                normalization: None,
                 stream_index: 1,
                 codec,
                 bitrate_kbps: bitrate,
@@ -687,11 +689,11 @@ async fn low_sample_rate_aac_validates_last_frame_padding_without_shifting_video
 
 #[tokio::test]
 #[ignore = "requires real FFmpeg with native AAC and libopus, FFprobe, and x264"]
-async fn negative_container_timeline_is_rejected_before_encoding_without_rebasing_audio() {
+async fn negative_container_audio_origin_is_preserved_without_rebasing_audio() {
     let fixture = Fixture::new();
     let input = fixture.0.join("source.mkv");
     let negative = fixture.0.join("negative.mkv");
-    let destination = fixture.0.join("rejected.mkv");
+    let destination = fixture.0.join("negative-preserved.mkv");
     synthesize(&input, 2).await;
     output(
         command("ffmpeg")
@@ -721,6 +723,7 @@ async fn negative_container_timeline_is_rejected_before_encoding_without_rebasin
             .unwrap()
             < 0.0
     );
+    let source_bytes = std::fs::read(&negative).unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
     let started = manager
         .start_encode(request(
@@ -732,9 +735,21 @@ async fn negative_container_timeline_is_rejected_before_encoding_without_rebasin
         .unwrap();
     let completed = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
     manager.shutdown().await;
-    assert_eq!(completed.state, JobState::Failed, "{completed:#?}");
-    assert_eq!(completed.error.unwrap().code, "ENCODE_INPUT_UNSUPPORTED");
-    assert!(!destination.exists());
+    assert_eq!(completed.state, JobState::Succeeded, "{completed:#?}");
+    let original = decoded_timeline(&negative, 1).await;
+    let converted = decoded_timeline(&destination, 3).await;
+    assert!(original.0 < 0.0);
+    assert!((converted.0 - original.0).abs() <= 0.002);
+    assert!((converted.1 as f64 - original.1 as f64 * 48000.0 / 44100.0).abs() <= 2.0);
+    assert_eq!(
+        packet_hashes(&negative, 3).await,
+        packet_hashes(&destination, 2).await
+    );
+    assert_eq!(
+        packet_hashes(&negative, 4).await,
+        packet_hashes(&destination, 4).await
+    );
+    assert_eq!(std::fs::read(&negative).unwrap(), source_bytes);
     assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|entry| {
         entry
             .unwrap()

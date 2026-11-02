@@ -153,7 +153,7 @@ fn request(
 
 #[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe and standalone x264"]
-async fn bwdif_top_and_bottom_field_order_preserve_source_fields_and_bob_count() {
+async fn bwdif_and_yadif_top_and_bottom_field_order_preserve_source_fields_and_bob_count() {
     let directory = Fixture::new();
     let manager = JobManager::new(directory.0.join("logs"));
     let stride = 192 * 112 * 3 / 2;
@@ -162,52 +162,60 @@ async fn bwdif_top_and_bottom_field_order_preserve_source_fields_and_bob_count()
         let before = Sha256::digest(std::fs::read(&input).unwrap());
         let original = raw(&input).await;
         assert_eq!(original.len(), 48 * stride);
-        for mode in [
-            media_core::DeinterlaceMode::Frame,
-            media_core::DeinterlaceMode::Bob,
+        for engine in [
+            media_core::DeinterlaceEngine::Bwdif,
+            media_core::DeinterlaceEngine::Yadif,
         ] {
-            let output = directory.0.join(format!("{bottom}-{mode:?}.mkv"));
-            let settings = media_core::TemporalSettings {
-                deinterlace: Some(media_core::DeinterlaceSettings {
-                    mode,
-                    field_order: if bottom {
-                        media_core::FieldOrder::BottomFirst
-                    } else {
-                        media_core::FieldOrder::TopFirst
-                    },
-                }),
-                ..Default::default()
-            };
-            let job = manager
-                .start_encode(request(&input, &output, settings))
-                .await
-                .unwrap();
-            let job = finish(&manager, &job.id).await;
-            assert_eq!(
-                job.state,
-                JobState::Succeeded,
-                "{bottom} {mode:?}: {:?} {:?}",
-                job.error,
-                job.logs
-            );
-            let decoded = raw(&output).await;
-            let factor = if mode == media_core::DeinterlaceMode::Bob {
-                2
-            } else {
-                1
-            };
-            assert_eq!(decoded.len(), 48 * factor * stride);
-            for n in 0..48 {
-                for field in 0..factor {
-                    let parity = (usize::from(bottom) + field) % 2;
-                    for row in (parity..112).step_by(2) {
-                        let a = n * stride + row * 192;
-                        let b = (n * factor + field) * stride + row * 192;
-                        assert_eq!(
-                            &original[a..a + 192],
-                            &decoded[b..b + 192],
-                            "source field changed {bottom} {mode:?} frame{n} row{row}"
-                        );
+            for mode in [
+                media_core::DeinterlaceMode::Frame,
+                media_core::DeinterlaceMode::Bob,
+            ] {
+                let output = directory
+                    .0
+                    .join(format!("{bottom}-{engine:?}-{mode:?}.mkv"));
+                let settings = media_core::TemporalSettings {
+                    deinterlace: Some(media_core::DeinterlaceSettings {
+                        engine,
+                        mode,
+                        field_order: if bottom {
+                            media_core::FieldOrder::BottomFirst
+                        } else {
+                            media_core::FieldOrder::TopFirst
+                        },
+                    }),
+                    ..Default::default()
+                };
+                let job = manager
+                    .start_encode(request(&input, &output, settings))
+                    .await
+                    .unwrap();
+                let job = finish(&manager, &job.id).await;
+                assert_eq!(
+                    job.state,
+                    JobState::Succeeded,
+                    "{bottom} {mode:?}: {:?} {:?}",
+                    job.error,
+                    job.logs
+                );
+                let decoded = raw(&output).await;
+                let factor = if mode == media_core::DeinterlaceMode::Bob {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(decoded.len(), 48 * factor * stride);
+                for n in 0..48 {
+                    for field in 0..factor {
+                        let parity = (usize::from(bottom) + field) % 2;
+                        for row in (parity..112).step_by(2) {
+                            let a = n * stride + row * 192;
+                            let b = (n * factor + field) * stride + row * 192;
+                            assert_eq!(
+                                &original[a..a + 192],
+                                &decoded[b..b + 192],
+                                "source field changed {bottom} {mode:?} frame{n} row{row}"
+                            );
+                        }
                     }
                 }
             }
@@ -215,6 +223,7 @@ async fn bwdif_top_and_bottom_field_order_preserve_source_fields_and_bob_count()
         let wrong = directory.0.join(format!("wrong-{bottom}.mkv"));
         let settings = media_core::TemporalSettings {
             deinterlace: Some(media_core::DeinterlaceSettings {
+                engine: Default::default(),
                 mode: media_core::DeinterlaceMode::Bob,
                 field_order: if bottom {
                     media_core::FieldOrder::TopFirst
@@ -431,6 +440,7 @@ async fn source_frame_trim_precedes_bob_and_keeps_the_selected_fields() {
         &output,
         media_core::TemporalSettings {
             deinterlace: Some(media_core::DeinterlaceSettings {
+                engine: Default::default(),
                 mode: media_core::DeinterlaceMode::Bob,
                 field_order: media_core::FieldOrder::TopFirst,
             }),
@@ -700,6 +710,7 @@ async fn time_trim_maps_to_exact_frames_and_display_ratio_sets_final_sar() {
         time: Some(media_core::VideoTimeTrim {
             start_milliseconds: 250,
             end_milliseconds: 1_250,
+            ..Default::default()
         }),
     });
     let manager = JobManager::new(directory.0.join("logs"));

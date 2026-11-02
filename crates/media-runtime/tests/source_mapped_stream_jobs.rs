@@ -1,0 +1,857 @@
+//! Actual source-allowed multi-source video maps, order and immutable ownership.
+use media_core::*;
+use media_runtime::JobManager;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+static NEXT: AtomicU64 = AtomicU64::new(1);
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-artifacts/source-mapped-streams")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        Self(fs::canonicalize(root).unwrap())
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("Retained {}", self.0.display())
+        } else {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+fn tool(name: &str) -> OsString {
+    std::env::var_os(format!("JESSES_{}", name.to_uppercase())).unwrap_or_else(|| name.into())
+}
+fn args(values: &[&str]) -> Vec<OsString> {
+    values.iter().map(OsString::from).collect()
+}
+fn run(name: &str, args: &[OsString]) -> Vec<u8> {
+    let result = std::process::Command::new(tool(name))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result.stdout
+}
+fn probe(path: &Path, packets: bool) -> serde_json::Value {
+    let mut values = args(&[
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+    ]);
+    if packets {
+        values.extend(args(&["-show_packets", "-show_data_hash", "sha256"]));
+    }
+    values.push(path.as_os_str().to_owned());
+    serde_json::from_slice(&run("ffprobe", &values)).unwrap()
+}
+async fn terminal(manager: &JobManager, id: &str) -> JobSnapshot {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let job = manager
+                .list_jobs()
+                .await
+                .into_iter()
+                .find(|job| job.id == id)
+                .unwrap();
+            if job.state.is_terminal() {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+fn fixture(f: &Fixture) {
+    for (name, width) in [("primary.mkv", 64), ("external.mkv", 80)] {
+        let mut values = args(&["-v", "error", "-f", "lavfi", "-i"]);
+        values.push(format!("testsrc2=size={width}x48:rate=4:duration=1").into());
+        values.extend(args(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=96x64:rate=5:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=1",
+            "-map",
+            "0:v",
+            "-map",
+            "1:v",
+            "-map",
+            "2:a",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "-threads",
+            "1",
+            "-metadata:s:0",
+            "title=First picture",
+            "-metadata:s:0",
+            "language=jpn",
+            "-metadata:s:1",
+            "title=Second picture",
+            "-metadata:s:1",
+            "language=eng",
+            "-metadata:s:2",
+            "title=Voice",
+        ]));
+        values.push(f.0.join(name).into_os_string());
+        run("ffmpeg", &values);
+    }
+}
+fn request(f: &Fixture, output: &str) -> EncodeRequest {
+    let external = f.0.join("external.mkv").to_string_lossy().into_owned();
+    EncodeRequest {
+        source: RemuxRequest {
+            input_path: f.0.join("primary.mkv").to_string_lossy().into_owned(),
+            output_path: f.0.join(output).to_string_lossy().into_owned(),
+            stream_indices: vec![1, 0, 2],
+        },
+        settings: EncodeSettings {
+            video_mode: VideoMode::Copy,
+            external_tracks: vec![
+                ExternalTrack {
+                    input_path: external.clone(),
+                    stream_index: 0,
+                    offset_milliseconds: 250,
+                    title: Some("External picture 日本語".into()),
+                    language: Some("fra".into()),
+                    audio: None,
+                    subtitle_mode: None,
+                    subtitle_burn_in: false,
+                    default: None,
+                    forced: None,
+                },
+                ExternalTrack {
+                    input_path: external.clone(),
+                    stream_index: 2,
+                    offset_milliseconds: 500,
+                    title: Some("External voice".into()),
+                    language: Some("deu".into()),
+                    audio: None,
+                    subtitle_mode: None,
+                    subtitle_burn_in: false,
+                    default: None,
+                    forced: None,
+                },
+            ],
+            track_order: vec![
+                EncodeTrackRef {
+                    input_path: Some(external.clone()),
+                    stream_index: 2,
+                },
+                EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 1,
+                },
+                EncodeTrackRef {
+                    input_path: Some(external),
+                    stream_index: 0,
+                },
+                EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 2,
+                },
+                EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 0,
+                },
+            ],
+            ..Default::default()
+        },
+    }
+}
+fn verify_packets(
+    source: &serde_json::Value,
+    index: u32,
+    output: &serde_json::Value,
+    position: u32,
+    shift: f64,
+) {
+    let packets = |document: &serde_json::Value, stream: u32| {
+        document["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|packet| packet["stream_index"] == stream)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let before = packets(source, index);
+    let after = packets(output, position);
+    assert!(!before.is_empty());
+    assert_eq!(before.len(), after.len());
+    for (a, b) in before.iter().zip(&after) {
+        assert_eq!(a["data_hash"], b["data_hash"]);
+        for field in ["pts_time", "dts_time"] {
+            let a = a[field].as_str().unwrap().parse::<f64>().unwrap();
+            let b = b[field].as_str().unwrap().parse::<f64>().unwrap();
+            assert!(
+                (b - a - shift).abs() < 0.002,
+                "{field}: {a} {b} shift{shift}"
+            );
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe"]
+async fn copies_every_checked_primary_and_external_video_in_output_order_with_offsets_and_packet_identity()
+ {
+    let f = Fixture::new();
+    fixture(&f);
+    let primary = probe(&f.0.join("primary.mkv"), true);
+    let external = probe(&f.0.join("external.mkv"), true);
+    let original = [
+        fs::read(f.0.join("primary.mkv")).unwrap(),
+        fs::read(f.0.join("external.mkv")).unwrap(),
+    ];
+    let manager = JobManager::new(f.0.join("logs"));
+    let job = manager
+        .start_encode(request(&f, "output.mkv"))
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &job.id).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+    let actual = probe(&f.0.join("output.mkv"), true);
+    let streams = actual["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 5);
+    assert_eq!(
+        streams
+            .iter()
+            .map(|s| s["codec_type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["audio", "video", "video", "audio", "video"]
+    );
+    assert_eq!(streams[1]["width"], 96);
+    assert_eq!(streams[2]["width"], 80);
+    assert_eq!(streams[4]["width"], 64);
+    assert_eq!(streams[2]["tags"]["title"], "External picture 日本語");
+    assert_eq!(streams[2]["tags"]["language"], "fra");
+    verify_packets(&external, 2, &actual, 0, 0.5);
+    verify_packets(&primary, 1, &actual, 1, 0.0);
+    verify_packets(&external, 0, &actual, 2, 0.25);
+    verify_packets(&primary, 2, &actual, 3, 0.0);
+    verify_packets(&primary, 0, &actual, 4, 0.0);
+    assert_eq!(fs::read(f.0.join("primary.mkv")).unwrap(), original[0]);
+    assert_eq!(fs::read(f.0.join("external.mkv")).unwrap(), original[1]);
+    manager.shutdown().await;
+}
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe"]
+async fn held_multiple_video_copy_keeps_external_identity_and_destination_ownership() {
+    let f = Fixture::new();
+    fixture(&f);
+    let manager = JobManager::new(f.0.join("logs"));
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let review = manager
+        .prepare_command_edit(
+            CommandEditRequest::Encode {
+                request: Box::new(request(&f, "guarded.mkv")),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    let id = review.job.as_ref().unwrap().id.clone();
+    fs::write(f.0.join("guarded.mkv"), b"later owner").unwrap();
+    manager
+        .confirm_command_edit(
+            CommandEditConfirmation {
+                id: review.id,
+                arguments: review.arguments,
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &id).await;
+    assert_eq!(finished.state, JobState::Failed);
+    assert_eq!(finished.error.unwrap().code, "OUTPUT_EXISTS");
+    assert_eq!(fs::read(f.0.join("guarded.mkv")).unwrap(), b"later owner");
+    let review = manager
+        .prepare_command_edit(
+            CommandEditRequest::Encode {
+                request: Box::new(request(&f, "changed.mkv")),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    let id = review.job.as_ref().unwrap().id.clone();
+    let mut source = fs::OpenOptions::new()
+        .append(true)
+        .open(f.0.join("external.mkv"))
+        .unwrap();
+    use std::io::Write;
+    source.write_all(b"mutation").unwrap();
+    drop(source);
+    manager
+        .confirm_command_edit(
+            CommandEditConfirmation {
+                id: review.id,
+                arguments: review.arguments,
+            },
+            cancel,
+        )
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &id).await;
+    assert_eq!(finished.state, JobState::Failed);
+    assert_eq!(finished.error.unwrap().code, "SOURCE_CHANGED");
+    assert!(!f.0.join("changed.mkv").exists());
+    manager.shutdown().await;
+}
+
+fn mov_sources(f: &Fixture) {
+    let mut values = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x48:rate=4:duration=1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-threads",
+        "1",
+        "-timecode",
+        "01:02:03:00",
+    ]);
+    values.push(f.0.join("timecode.mov").into_os_string());
+    run("ffmpeg", &values);
+    fs::write(
+        f.0.join("gpmd.mov"),
+        include_bytes!("fixtures/timed-gpmd.mov"),
+    )
+    .unwrap();
+}
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe and x264"]
+async fn mov_staging_preserves_primary_tmcd_and_external_timed_gpmd_order_and_every_packet() {
+    let f = Fixture::new();
+    mov_sources(&f);
+    let original = probe(&f.0.join("timecode.mov"), true);
+    let gpmd = probe(&f.0.join("gpmd.mov"), true);
+    assert_eq!(gpmd["packets"].as_array().unwrap().len(), 2);
+    let external = f.0.join("gpmd.mov").to_string_lossy().into_owned();
+    let manager = JobManager::new(f.0.join("logs"));
+    for (index, encoded, held) in [(0, false, false), (1, false, true), (2, true, false)] {
+        let output = f.0.join(format!("data-{index}.mov"));
+        let request = EncodeRequest {
+            source: RemuxRequest {
+                input_path: f.0.join("timecode.mov").to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0, 1],
+            },
+            settings: EncodeSettings {
+                video_mode: if encoded {
+                    VideoMode::Encode
+                } else {
+                    VideoMode::Copy
+                },
+                encoder: VideoEncoder::X264,
+                preset: 0,
+                crf: 28,
+                external_tracks: vec![ExternalTrack {
+                    input_path: external.clone(),
+                    stream_index: 0,
+                    offset_milliseconds: 250,
+                    title: None,
+                    language: None,
+                    audio: None,
+                    subtitle_mode: None,
+                    subtitle_burn_in: false,
+                    default: None,
+                    forced: None,
+                }],
+                track_order: vec![
+                    EncodeTrackRef {
+                        input_path: None,
+                        stream_index: 0,
+                    },
+                    EncodeTrackRef {
+                        input_path: Some(external.clone()),
+                        stream_index: 0,
+                    },
+                    EncodeTrackRef {
+                        input_path: None,
+                        stream_index: 1,
+                    },
+                ],
+                output_metadata: Some(OutputMetadata {
+                    title: Some("Mapped data 日本語".into()),
+                    language: Some("eng".into()),
+                }),
+                ..Default::default()
+            },
+        };
+        let job = if held {
+            let (_owner, cancel) = tokio::sync::watch::channel(false);
+            let review = manager
+                .prepare_command_edit(
+                    CommandEditRequest::Encode {
+                        request: Box::new(request),
+                    },
+                    cancel.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(review.arguments.contains(".partial.mov"));
+            assert!(review.arguments.contains("gpmd"));
+            let CommandEditResult::Encode { job } = manager
+                .confirm_command_edit(
+                    CommandEditConfirmation {
+                        id: review.id,
+                        arguments: format!("{} && :", review.arguments),
+                    },
+                    cancel,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            *job
+        } else {
+            manager.start_encode(request).await.unwrap()
+        };
+        let result = terminal(&manager, &job.id).await;
+        assert_eq!(result.state, JobState::Succeeded, "case{index}: {result:?}");
+        let actual = probe(&output, true);
+        let streams = actual["streams"].as_array().unwrap();
+        assert_eq!(
+            streams.len(),
+            3,
+            "No unchecked or duplicate timecode track may be generated"
+        );
+        assert_eq!(streams[0]["codec_type"], "video");
+        assert_eq!(streams[1]["codec_tag_string"], "gpmd");
+        assert_eq!(streams[2]["codec_tag_string"], "tmcd");
+        verify_packets(&gpmd, 0, &actual, 1, 0.25);
+        verify_packets(&original, 1, &actual, 2, 0.0);
+        if !encoded {
+            verify_packets(&original, 0, &actual, 0, 0.0);
+        }
+        assert_eq!(actual["format"]["tags"]["title"], "Mapped data 日本語");
+    }
+    // A data-only source has real timed packets and needs no invented video.
+    let output = f.0.join("data-only.mov");
+    let job = manager
+        .start_encode(EncodeRequest {
+            source: RemuxRequest {
+                input_path: external,
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0],
+            },
+            settings: EncodeSettings {
+                video_mode: VideoMode::Drop,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let result = terminal(&manager, &job.id).await;
+    assert_eq!(result.state, JobState::Succeeded, "{result:?}");
+    let actual = probe(&output, true);
+    assert_eq!(actual["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(actual["streams"][0]["codec_tag_string"], "gpmd");
+    verify_packets(&gpmd, 0, &actual, 0, 0.0);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe 9"]
+async fn mov_rejects_independently_unreadable_source_order_and_suppresses_unchecked_timecode() {
+    let f = Fixture::new();
+    mov_sources(&f);
+    let original = fs::read(f.0.join("timecode.mov")).unwrap();
+    let mut source_args = args(&["-v", "error", "-i"]);
+    source_args.push(f.0.join("timecode.mov").into_os_string());
+    source_args.extend(args(&[
+        "-map",
+        "0:1",
+        "-map",
+        "0:0",
+        "-c",
+        "copy",
+        "-write_tmcd",
+        "0",
+    ]));
+    source_args.push(f.0.join("source-corrupt-order.mov").into_os_string());
+    run("ffmpeg", &source_args);
+    let independent = std::process::Command::new(tool("ffprobe"))
+        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .arg(f.0.join("source-corrupt-order.mov"))
+        .output()
+        .unwrap();
+    assert!(
+        !independent.status.success(),
+        "The pinned FFmpeg9 source-corruption fixture changed; requalify its decoder behavior"
+    );
+    let manager = JobManager::new(f.0.join("logs"));
+    for (name, indices, expected) in [
+        ("bad-order.mov", vec![1, 0], "PROBE_FAILED"),
+        ("data-unsupported.mkv", vec![0, 1], "CONTAINER_INCOMPATIBLE"),
+    ] {
+        let output = f.0.join(name);
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: f.0.join("timecode.mov").to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: indices,
+                },
+                settings: EncodeSettings {
+                    video_mode: VideoMode::Copy,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let finished = terminal(&manager, &job.id).await;
+        assert_eq!(finished.state, JobState::Failed, "{finished:?}");
+        assert_eq!(finished.error.unwrap().code, expected);
+        assert!(!output.exists());
+    }
+    // Deselecting the imported tmcd must not add an implicit replacement.
+    let output = f.0.join("video-without-timecode.mov");
+    let job = manager
+        .start_encode(EncodeRequest {
+            source: RemuxRequest {
+                input_path: f.0.join("timecode.mov").to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0],
+            },
+            settings: EncodeSettings {
+                video_mode: VideoMode::Copy,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &job.id).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+    let actual = probe(&output, true);
+    assert_eq!(actual["streams"].as_array().unwrap().len(), 1);
+    verify_packets(&probe(&f.0.join("timecode.mov"), true), 0, &actual, 0, 0.0);
+    assert_eq!(fs::read(f.0.join("timecode.mov")).unwrap(), original);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe"]
+async fn mov_data_and_converted_mov_text_share_staging_without_losing_cues() {
+    let f = Fixture::new();
+    mov_sources(&f);
+    let subtitles = f.0.join("caption.srt");
+    fs::write(&subtitles, "1\n00:00:00,250 --> 00:00:00,750\n字幕 MOV\n").unwrap();
+    let external = subtitles.to_string_lossy().into_owned();
+    let output = f.0.join("caption-data.mov");
+    let manager = JobManager::new(f.0.join("logs"));
+    let job = manager
+        .start_encode(EncodeRequest {
+            source: RemuxRequest {
+                input_path: f.0.join("timecode.mov").to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0, 1],
+            },
+            settings: EncodeSettings {
+                video_mode: VideoMode::Copy,
+                external_tracks: vec![ExternalTrack {
+                    input_path: external,
+                    stream_index: 0,
+                    offset_milliseconds: 0,
+                    title: Some("Caption".into()),
+                    language: Some("jpn".into()),
+                    subtitle_mode: Some(SubtitleMode::MovText),
+                    subtitle_burn_in: false,
+                    audio: None,
+                    default: None,
+                    forced: None,
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &job.id).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+    let actual = probe(&output, true);
+    assert_eq!(actual["streams"].as_array().unwrap().len(), 3);
+    assert_eq!(actual["streams"][1]["codec_tag_string"], "tmcd");
+    assert_eq!(actual["streams"][2]["codec_name"], "mov_text");
+    let mut values = args(&["-v", "error", "-i"]);
+    values.push(output.into_os_string());
+    values.extend(args(&["-map", "0:2", "-c:s", "srt", "-f", "srt", "-"]));
+    let actual = String::from_utf8(run("ffmpeg", &values)).unwrap();
+    assert!(actual.contains("00:00:00,250 --> 00:00:00,750"));
+    assert!(actual.contains("字幕 MOV"));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg9, x264 and source AV1AN/VapourSynth"]
+async fn mov_text_without_data_survives_copy_direct_and_av1an_mp4_mov_and_pcm() {
+    let f = Fixture::new();
+    let caption = f.0.join("captions.srt");
+    fs::write(&caption,"1\n00:00:00,100 --> 00:00:00,500\nFirst Unicode 字\n\n2\n00:00:00,600 --> 00:00:00,900\nSecond cue\n").unwrap();
+    let source = f.0.join("text-source.mp4");
+    let mut generate = args(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x48:rate=8:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=sample_rate=48000:duration=1",
+        "-i",
+    ]);
+    generate.push(caption.into());
+    generate.extend(args(&[
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:s",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "1",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "mov_text",
+        "-metadata:s:s:0",
+        "language=jpn",
+        "-metadata:s:s:0",
+        "handler_name=Caption title",
+    ]));
+    generate.push(source.as_os_str().into());
+    run("ffmpeg", &generate);
+    let original = fs::read(&source).unwrap();
+    let before = probe(&source, true);
+    let manager = JobManager::new(f.0.join("logs"));
+    for (index, (mode, backend)) in [
+        (VideoMode::Copy, EncodeBackend::Standalone),
+        (VideoMode::Encode, EncodeBackend::Standalone),
+        (VideoMode::Encode, EncodeBackend::Av1an),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for extension in ["mp4", "mov"] {
+            let output = f.0.join(format!("text-{index}.{extension}"));
+            let settings = EncodeSettings {
+                video_mode: mode,
+                backend,
+                encoder: VideoEncoder::X264,
+                preset: 8,
+                workers: 1,
+                av1an_options: (backend == EncodeBackend::Av1an).then_some(Av1anOptions {
+                    split_method: Av1anSplitMethod::FixedChunks,
+                    maximum_chunk_frames: 0,
+                    chunk_method: Av1anChunkMethod::Select,
+                    concat_method: Av1anConcatMethod::Ffmpeg,
+                    pixel_format: Some(Av1anPixelFormat::Yuv420p),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let request = EncodeRequest {
+                source: RemuxRequest {
+                    input_path: source.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1, 2],
+                },
+                settings,
+            };
+            let job = manager.start_encode(request).await.unwrap();
+            let finished = terminal(&manager, &job.id).await;
+            assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+            let actual = probe(&output, true);
+            assert_eq!(actual["streams"][2]["codec_name"], "mov_text");
+            let packets = |document: &serde_json::Value| {
+                document["packets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|packet| packet["stream_index"] == 2)
+                    .map(|packet| {
+                        (
+                            packet["data_hash"].clone(),
+                            packet["pts_time"].clone(),
+                            packet["duration_time"].clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(packets(&actual), packets(&before));
+        }
+    }
+    // MOV can retain copied PCM alongside text, so tx3g staging cannot always
+    // pick MP4 merely because both containers can carry the subtitle.
+    let pcm = f.0.join("pcm-source.mov");
+    let mut values = args(&["-v", "error", "-i"]);
+    values.push(source.as_os_str().into());
+    values.extend(args(&["-map", "0", "-c", "copy", "-c:a", "pcm_s16le"]));
+    values.push(pcm.as_os_str().into());
+    run("ffmpeg", &values);
+    let output = f.0.join("pcm-copy.mov");
+    let job = manager
+        .start_encode(EncodeRequest {
+            source: RemuxRequest {
+                input_path: pcm.to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                stream_indices: vec![0, 1, 2],
+            },
+            settings: EncodeSettings {
+                video_mode: VideoMode::Copy,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let finished = terminal(&manager, &job.id).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+    assert_eq!(
+        probe(&output, false)["streams"][1]["codec_name"],
+        "pcm_s16le"
+    );
+    // AV1 cannot use the MOV muxer, so its copied tx3g companion selects MP4
+    // staging while preserving the software-coded video packets.
+    let av1 = f.0.join("av1-source.mp4");
+    let mut values = args(&["-v", "error", "-i"]);
+    values.push(source.as_os_str().into());
+    values.extend(args(&[
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-c:v",
+        "libaom-av1",
+        "-cpu-used",
+        "8",
+        "-threads",
+        "1",
+        "-crf",
+        "40",
+        "-b:v",
+        "0",
+    ]));
+    values.push(av1.as_os_str().into());
+    run("ffmpeg", &values);
+    let output = f.0.join("av1-copy.mp4");
+    let request = EncodeRequest {
+        source: RemuxRequest {
+            input_path: av1.to_string_lossy().into_owned(),
+            output_path: output.to_string_lossy().into_owned(),
+            stream_indices: vec![0, 1, 2],
+        },
+        settings: EncodeSettings {
+            video_mode: VideoMode::Copy,
+            ..Default::default()
+        },
+    };
+    let (owner, cancel) = tokio::sync::watch::channel(false);
+    let review = manager
+        .prepare_command_edit(
+            CommandEditRequest::Encode {
+                request: Box::new(request),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    let CommandEditResult::Encode { job } = manager
+        .confirm_command_edit(
+            CommandEditConfirmation {
+                id: review.id,
+                arguments: review.arguments,
+            },
+            cancel,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    drop(owner);
+    let finished = terminal(&manager, &job.id).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+    assert_eq!(probe(&output, false)["streams"][0]["codec_name"], "av1");
+    // Explicit conversion out of tx3g must still use MKV, and conversion into
+    // tx3g must select ISO staging even when the original codec is SubRip.
+    for (mode, extension) in [
+        (SubtitleMode::SubRip, "mkv"),
+        (SubtitleMode::MovText, "mp4"),
+    ] {
+        let input = if mode == SubtitleMode::SubRip {
+            source.clone()
+        } else {
+            f.0.join("converted-SubRip.mkv")
+        };
+        let output = f.0.join(format!("converted-{mode:?}.{extension}"));
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1, 2],
+                },
+                settings: EncodeSettings {
+                    video_mode: VideoMode::Copy,
+                    subtitles: vec![SubtitleTrackSettings {
+                        stream_index: 2,
+                        mode,
+                        burn_in: false,
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let finished = terminal(&manager, &job.id).await;
+        assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+        assert_eq!(
+            probe(&output, false)["streams"][2]["codec_name"],
+            if mode == SubtitleMode::SubRip {
+                "subrip"
+            } else {
+                "mov_text"
+            }
+        );
+    }
+    assert_eq!(fs::read(source).unwrap(), original);
+    manager.shutdown().await;
+}

@@ -35,6 +35,14 @@ use super::*;
 pub use command_plan::preview_encode_plan;
 use media_core::VideoEncoder;
 
+// Construct large async state in a short-lived helper frame. Box::pin at the
+// callsite can retain its unboxed construction temporary in the caller's debug
+// poll frame even after the future lives on the heap.
+#[inline(never)]
+pub(super) fn boxed<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 impl JobManager {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn encode(
@@ -47,10 +55,21 @@ impl JobManager {
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
-        self.encode_mode(
+        let execution = self.encode_mode(
             id, request, settings, cancel, log_path, temporary, scratch, None,
-        )
-        .await
+        );
+        if (settings.source_filters || settings.tone_map.is_some_and(|tone| tone.source_workflow))
+            && settings.backend == media_core::EncodeBackend::Standalone
+            && !settings.source_nvenc_quality
+        {
+            super::source_filters::with_observer(
+                super::source_filters::Observation::new(Path::new(&request.output_path)),
+                execution,
+            )
+            .await
+        } else {
+            execution.await
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -64,6 +83,253 @@ impl JobManager {
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
         preview: Option<&mut media_core::EncodeCommandPlan>,
+    ) -> Result<(), AppError> {
+        // Keep independent pipelines in boxed futures. The video validator has
+        // substantial debug state; placing conversion inside its poll frame
+        // consumes the ordinary worker thread's stack before any media runs.
+        if settings.video_mode != media_core::VideoMode::Encode {
+            boxed(|| {
+                self.convert(
+                    id, request, settings, cancel, log_path, temporary, scratch, preview,
+                )
+            })
+            .await
+        } else if settings.source_trim
+            && settings.trim.is_some()
+            && settings.backend == media_core::EncodeBackend::Av1an
+        {
+            boxed(|| {
+                self.encode_source_av1an_mode(
+                    id, request, settings, cancel, log_path, temporary, scratch, preview,
+                )
+            })
+            .await
+        } else {
+            boxed(|| {
+                self.encode_source_mode(
+                    id, request, settings, cancel, log_path, temporary, scratch, preview,
+                )
+            })
+            .await
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_source_av1an_mode(
+        &self,
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        cancel: &watch::Receiver<bool>,
+        log_path: &Path,
+        temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
+        mut preview: Option<&mut media_core::EncodeCommandPlan>,
+    ) -> Result<(), AppError> {
+        let prepared = super::source_normalization::av1an_trim::Prepared::prepare(
+            self, id, request, settings, cancel, log_path,
+        )
+        .await?;
+        let result = boxed(|| {
+            self.encode_video_mode(
+                id,
+                &prepared.request,
+                &prepared.settings,
+                cancel,
+                log_path,
+                temporary,
+                scratch,
+                preview.as_deref_mut(),
+                Some(&prepared.source_path),
+                Some(&prepared.original),
+                Some(settings),
+                Some(request),
+                Some(prepared.video_origin),
+            )
+        })
+        .await;
+        if let Some(preview) = preview {
+            preview.source_fingerprint = crate::analysis::fingerprint(&prepared.original)?;
+            preview.notes.insert(0,"Source AV1AN first stream-copies the configured section before command review, retaining keyframe preroll and the copied input's native stream clocks. The loaded original remains the naming, metadata and request authority.".into());
+        }
+        let keep = self
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .is_some_and(|entry| entry.snapshot.recovery.is_some());
+        let cleanup = prepared.finish(keep);
+        match (result, cleanup) {
+            (Err(error), Err(cleanup)) => Err(AppError::new(
+                error.code,
+                format!("{} Source-cut cleanup: {}", error.message, cleanup.message),
+                cleanup.path,
+            )),
+            (Err(error), _) => Err(error),
+            (Ok(()), result) => result,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_source_mode(
+        &self,
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        cancel: &watch::Receiver<bool>,
+        log_path: &Path,
+        temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
+        mut preview: Option<&mut media_core::EncodeCommandPlan>,
+    ) -> Result<(), AppError> {
+        self.phase(
+            id,
+            JobState::Preparing,
+            "Inspecting selected streams and source clock.",
+        )
+        .await;
+        let (original, document) =
+            super::source_normalization::inspect(request, settings, cancel).await?;
+        let existing = super::source_normalization::exists(id, request)?;
+        let mut required = super::source_normalization::needs(&document, settings, false)?;
+        if !existing && !required {
+            let result = boxed(|| {
+                self.encode_video_mode(
+                    id,
+                    request,
+                    settings,
+                    cancel,
+                    log_path,
+                    temporary,
+                    scratch,
+                    preview.as_deref_mut(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .await;
+            match &result {
+                Err(error)
+                    if error.code == "ENCODE_INPUT_UNSUPPORTED"
+                        && (error
+                            .message
+                            .contains("Decoded frame timestamps are not constant-rate")
+                            || error.message.contains("timelines that start at zero")) =>
+                {
+                    required = true;
+                }
+                _ => return result,
+            }
+            // A rejected source clock has not entered the encoder. Remove its
+            // owned capability-probe assets before the normalized retry.
+            for temporary in scratch.iter_mut() {
+                temporary.cleanup()?;
+            }
+            scratch.clear();
+            if let Some(mut stale) = temporary.take() {
+                stale.cleanup()?;
+            }
+        }
+        if existing {
+            let recoverable = self
+                .state
+                .lock()
+                .await
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .is_some_and(|entry| {
+                    entry.snapshot.recovery.is_some()
+                        || entry.snapshot.standalone_recovery.is_some()
+                });
+            if !recoverable {
+                return Err(files::error(
+                    "OUTPUT_EXISTS",
+                    "A canonical source workspace already exists without an admitted recovery locator; it was preserved.",
+                    Path::new(&request.output_path),
+                ));
+            }
+        }
+        let prepared = Box::pin(super::source_normalization::Prepared::prepare(
+            self,
+            id,
+            request,
+            settings,
+            original,
+            required,
+            cancel,
+            &log_path.with_extension("source-normalization.log"),
+        ))
+        .await?;
+        let effective = prepared.effective_settings(settings);
+        let result = boxed(|| {
+            self.encode_video_mode(
+                id,
+                request,
+                &effective,
+                cancel,
+                log_path,
+                temporary,
+                scratch,
+                preview.as_deref_mut(),
+                Some(&prepared.source_path),
+                Some(&prepared.original),
+                Some(settings),
+                None,
+                None,
+            )
+        })
+        .await;
+        if let Some(preview) = preview {
+            preview.source_fingerprint = crate::analysis::fingerprint(&prepared.original)?;
+            preview.notes.insert(0,"A verified lossless canonical source applies display rotation, rebases the selected video origin and explicitly normalizes variable timestamps to a constant source clock. Original request paths remain the immutable authority; both complete source identities are checked for recovery.".into());
+        }
+        let keep = self
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .is_some_and(|entry| {
+                entry.snapshot.recovery.is_some() || entry.snapshot.standalone_recovery.is_some()
+            });
+        let cleanup = prepared.finish(keep);
+        match (result, cleanup) {
+            (Err(error), Err(cleanup)) => Err(AppError::new(
+                error.code,
+                format!(
+                    "{} Canonical source cleanup: {}",
+                    error.message, cleanup.message
+                ),
+                cleanup.path,
+            )),
+            (Err(error), _) => Err(error),
+            (Ok(()), result) => result,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_video_mode(
+        &self,
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        cancel: &watch::Receiver<bool>,
+        log_path: &Path,
+        temporary: &mut Option<Temporary>,
+        scratch: &mut Vec<Temporary>,
+        preview: Option<&mut media_core::EncodeCommandPlan>,
+        normalized_source: Option<&Path>,
+        original_guard: Option<&Source>,
+        authority_settings: Option<&EncodeSettings>,
+        authority_request: Option<&RemuxRequest>,
+        source_origin: Option<f64>,
     ) -> Result<(), AppError> {
         check_cancel(cancel)?;
         let attempt_id = if settings.backend == media_core::EncodeBackend::Av1an {
@@ -81,7 +347,8 @@ impl JobManager {
             "Inspecting selected streams and encoder capabilities.",
         )
         .await;
-        let input = PathBuf::from(&request.input_path);
+        let input =
+            normalized_source.map_or_else(|| PathBuf::from(&request.input_path), Path::to_path_buf);
         let owned_request = request.clone();
         let (source, output) = tokio::task::spawn_blocking(move || {
             let source = Source::open(&input)?;
@@ -204,13 +471,48 @@ impl JobManager {
             })
             .await;
         }
-        let document = probe(
+        let mut document = probe(
             &ffprobe,
             &source.path,
             cancel,
             Some(&request.stream_indices),
         )
         .await?;
+        if document
+            .streams
+            .iter()
+            .find(|stream| stream.index == settings.video_stream_index)
+            .is_some_and(super::source_picture_metadata::needs_enrichment)
+        {
+            self.change(id,|snapshot|append_log(snapshot,"Inspecting decoded source color and static HDR declarations omitted by stream headers.".into())).await;
+            Box::pin(super::source_picture_metadata::enrich(
+                &ffprobe,
+                &source.path,
+                &mut document,
+                settings.video_stream_index,
+                cancel,
+            ))
+            .await?;
+            source.verify()?;
+        }
+        let source_dolby = settings.tone_map.is_some_and(|tone| tone.source_workflow)
+            && document
+                .streams
+                .iter()
+                .find(|stream| stream.index == settings.video_stream_index)
+                .is_some_and(|video| {
+                    super::encode_plan::preserves_dolby_source_clock(video, settings)
+                });
+        let mut source_settings = settings.clone();
+        if source_dolby {
+            source_settings.source_filters = true;
+        }
+        let authority_settings = authority_settings.or(source_dolby.then_some(settings));
+        let settings = if source_dolby {
+            &source_settings
+        } else {
+            settings
+        };
         let selected = document.selected(&request.stream_indices)?;
         let external = super::external_tracks::ExternalTracks::prepare(
             &source, request, settings, &document, &ffprobe, cancel,
@@ -230,7 +532,41 @@ impl JobManager {
             &preflight_selected,
             Some(&mux_settings),
         )?;
-        let mut plan = Plan::build(&document, &selected, settings)?;
+        let mut planning_document = document.clone();
+        if source_origin.is_some()
+            && let Some(video) = planning_document
+                .streams
+                .iter_mut()
+                .find(|stream| stream.index == settings.video_stream_index)
+        {
+            video.start_time = Some("0".into());
+            video.packet_start_time = Some(0.0);
+        }
+        let mut plan = if source_origin.is_some() {
+            Plan::build_source_cut(
+                &planning_document,
+                &planning_document.selected(&request.stream_indices)?,
+                settings,
+            )?
+        } else {
+            Plan::build(
+                &planning_document,
+                &planning_document.selected(&request.stream_indices)?,
+                settings,
+            )?
+        };
+        if let Some(source_origin) = source_origin {
+            plan.source_origin = source_origin;
+        }
+        plan.source_cut_ordinals = source_origin.is_some();
+        let video = selected
+            .iter()
+            .find(|stream| stream.index == plan.video_index)
+            .expect("validated video");
+        for note in plan.source_interpretation_notes(video) {
+            self.change(id, |snapshot| append_log(snapshot, note)).await;
+        }
+
         let mkvmerge = if settings.encoder == VideoEncoder::AomAv1
             && plan.is_hdr10()
             && mkvmerge.is_none()
@@ -318,13 +654,7 @@ impl JobManager {
                             .expect("validated audio selection"),
                     )
                 });
-            if matches!(
-                track.codec,
-                media_core::AudioCodec::Flac
-                    | media_core::AudioCodec::Mp3
-                    | media_core::AudioCodec::Vorbis
-                    | media_core::AudioCodec::Eac3
-            ) {
+            if track.codec != media_core::AudioCodec::Copy {
                 self.phase(id, JobState::Preparing, "Checking selected audio settings, codec delay, and final padding with the installed tools.").await;
                 scratch.push(Temporary::create(
                     &output,
@@ -381,13 +711,34 @@ impl JobManager {
         let frame_count = self
             .scan_frames(id, &ffprobe, &source.path, &mut plan, video, false, cancel)
             .await?;
+        let dynamic_hdr =
+            super::dynamic_hdr::Resources::prepare(settings, frame_count, cancel).await?;
         external.validate_timecode_clock(plan.fps_num, plan.fps_den, frame_count)?;
         // Container duration may include a longer audio or subtitle track.
         // Peak sampling belongs to the selected, fully scanned source video.
         let source_video_duration = frame_count as f64 * plan.frame_seconds();
-        plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
-            .await?;
-        if let Some(description) = plan.tone_map_description() {
+        if source_origin.is_some()
+            && let Some(video) = output_document
+                .streams
+                .iter_mut()
+                .find(|stream| stream.index == plan.video_index)
+        {
+            video.start_time = Some("0".into());
+            video.packet_start_time = Some(0.0);
+            video.duration = Some(source_video_duration.to_string());
+            video
+                .tags
+                .retain(|key, _| !metadata::is_derived_stream_tag(key));
+        }
+        // An explicit Vulkan graph remains editable on a machine without its
+        // device. Probe physical execution only after unchanged confirmation.
+        let deferred_vulkan =
+            self.command_review(id).await.is_some() && plan.requires_vulkan_tone_map();
+        if !deferred_vulkan {
+            plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
+                .await?;
+        }
+        if !deferred_vulkan && let Some(description) = plan.tone_map_description() {
             self.change(id, |snapshot| append_log(snapshot, description))
                 .await;
         }
@@ -403,6 +754,9 @@ impl JobManager {
         if settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
+        if super::parameters::requires_serial_svt(settings) {
+            self.change(id, |snapshot| append_log(snapshot, "SVT high-bit-depth mode decision plus overlays uses one processing lane (lp=1), within the selected worker limit, to avoid the observed SVT4.2 parallel short-clip crash. Both requested controls remain enabled.".into())).await;
+        }
         let interval = settings
             .trim
             .map(|trim| super::trim::Interval::build(trim, frame_count, plan.fps_num, plan.fps_den))
@@ -414,6 +768,20 @@ impl JobManager {
                 *timeline = clipped;
                 audio_filters.insert(track.stream_index, filter);
             }
+        }
+        let normalization = audio::Normalization::prepare(
+            &ffmpeg,
+            &source.path,
+            &output_document.selected(&preflight_indices)?,
+            &mux_settings,
+            &external,
+            &audio_filters,
+            cancel,
+        )
+        .await?;
+        for evidence in normalization.evidence() {
+            self.change(id, |snapshot| append_log(snapshot, evidence))
+                .await;
         }
         // Current MP4/MOV muxing loses AAC priming for positive track origins.
         // Check the effective decoded start after any trim has rebased it, and
@@ -451,7 +819,17 @@ impl JobManager {
                 .await;
             plan.set_exact_duplicate_count(source_frame_count, report.unique_frames)?;
         }
-        let frame_count = plan.activate_temporal(source_frame_count)?;
+        let transformed_frame_count = plan.activate_temporal(source_frame_count)?;
+        let mut frame_count = if settings.backend == media_core::EncodeBackend::Av1an
+            && (settings.source_filters
+                || settings
+                    .av1an_options
+                    .is_some_and(|options| options.source_workflow))
+        {
+            source_frame_count
+        } else {
+            transformed_frame_count
+        };
         let combined_selected = output_document.selected(&preflight_indices)?;
         let prepared_trim = if let Some(interval) = interval {
             self.phase(
@@ -462,6 +840,7 @@ impl JobManager {
             .await;
             Some(
                 super::trim::Prepared::build(
+                    &mux_settings,
                     interval,
                     &output_document,
                     &combined_selected,
@@ -505,7 +884,10 @@ impl JobManager {
         container::preflight_explicit_defaults(&output, &output_selected, &explicit_defaults_off)?;
         let measured_nonvideo = if matches!(
             settings.rate_control,
-            Some(media_core::VideoRateControl::TargetSize { .. })
+            Some(
+                media_core::VideoRateControl::TargetSize { .. }
+                    | media_core::VideoRateControl::TargetSizeDecimal { .. }
+            )
         ) {
             self.phase(
                 id,
@@ -513,6 +895,14 @@ impl JobManager {
                 "Measuring selected audio, subtitles, and attachments for the target file size.",
             )
             .await;
+            let budget_selected = output_selected
+                .iter()
+                .copied()
+                .filter(|stream| {
+                    stream.codec_type.as_deref() != Some("video")
+                        || stream.index == plan.video_index
+                })
+                .collect::<Vec<_>>();
             let dummy = Temporary::create(&output, &format!("{attempt_id}-size-video"))?;
             let measured = Temporary::create(&output, &format!("{attempt_id}-size-media"))?;
             let make_dummy = supervisor::run_capture(
@@ -558,15 +948,16 @@ impl JobManager {
                 &source.path,
                 &dummy.path,
                 &measured.path,
-                &output_selected,
+                &budget_selected,
                 &plan,
                 settings,
                 &external,
             );
             if let Some(prepared) = &prepared_trim {
-                prepared.apply_mux(&mut args, &output_selected, &audio_filters)?;
+                prepared.apply_mux(&mut args, &budget_selected, &audio_filters)?;
             }
-            subtitle_assets.apply_mux(&mut args, &output_selected);
+            normalization.apply_mux(&mut args, &budget_selected)?;
+            subtitle_assets.apply_mux(&mut args, &budget_selected);
             tokio::fs::create_dir_all(self.log_dir.as_ref())
                 .await
                 .map_err(|e| {
@@ -616,6 +1007,7 @@ impl JobManager {
             frame_count as f64 * plan.frame_seconds(),
             measured_nonvideo,
         )?;
+
         if preview.is_none() {
             tokio::fs::create_dir_all(self.log_dir.as_ref())
                 .await
@@ -625,18 +1017,42 @@ impl JobManager {
         }
         source.verify()?;
         check_cancel(cancel)?;
-        let qtgmc = if plan.requires_qtgmc() {
+        let source_qtgmc = settings.source_filters
+            && settings.backend == media_core::EncodeBackend::Standalone
+            && plan.requires_qtgmc();
+        let source_qtgmc_checkpoint_ready = source_qtgmc
+            && self
+                .state
+                .lock()
+                .await
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .and_then(|entry| entry.snapshot.standalone_recovery.as_ref())
+                .is_some_and(|recovery| {
+                    matches!(
+                        recovery.phase,
+                        media_core::StandaloneRecoveryPhase::VideoComplete
+                            | media_core::StandaloneRecoveryPhase::TimingWrapComplete
+                            | media_core::StandaloneRecoveryPhase::Finalizing
+                    )
+                });
+        let defer_source_qtgmc = source_qtgmc
+            && !source_qtgmc_checkpoint_ready
+            && self.command_review(id).await.is_some();
+        let mut qtgmc = boxed(||async {Ok::<_,AppError>(if plan.requires_qtgmc() {
             self.phase(
                 id,
                 JobState::Preparing,
                 "Preparing a verified lossless QTGMC intermediate with the configured VapourSynth runtime.",
             )
             .await;
+            let qtgmc_plan=if settings.source_filters && settings.backend==media_core::EncodeBackend::Av1an {plan.without_source_filter_rows()}else{plan.clone()};
             let prepared = super::qtgmc::Prepared::build(
                 &source.path,
                 &output,
                 &attempt_id,
-                &plan,
+                &qtgmc_plan,
                 interval.map(|value| {
                     (
                         u32::try_from(value.source_start_frame).expect("validated frame bound"),
@@ -648,7 +1064,7 @@ impl JobManager {
                 cancel,
             )
             .await?;
-            if preview.is_none() {
+            if preview.is_none() && !defer_source_qtgmc && !source_qtgmc_checkpoint_ready {
                 let prep_log = log_path.with_extension("qtgmc.log");
                 self.change(id, |snapshot| {
                     snapshot.log_path = Some(prep_log.to_string_lossy().into_owned());
@@ -666,15 +1082,14 @@ impl JobManager {
                 let result = prepared.run(cancel.clone(), sender, &prep_log).await;
                 let _ = observer.await;
                 result?;
-                prepared
-                    .validate(&ffprobe, &plan, frame_count, cancel)
-                    .await?;
+                if settings.source_filters {frame_count=boxed(||prepared.validate_source_filters(&ffprobe,&plan,cancel)).await?;}
+                else {prepared.validate(&ffprobe, &plan, frame_count, cancel).await?;}
                 source.verify()?;
             }
             Some(prepared)
         } else {
             None
-        };
+        })}).await?;
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
@@ -714,6 +1129,7 @@ impl JobManager {
                 qtgmc.as_ref(),
                 &subtitle_assets,
                 &audio_filters,
+                &normalization,
                 rate.as_ref(),
                 frame_count,
                 &attempt_id,
@@ -724,7 +1140,7 @@ impl JobManager {
             external.verify()?;
             return check_cancel(cancel);
         }
-        let qtgmc_identity = if let Some(prepared) = &qtgmc {
+        let qtgmc_identity = if !source_qtgmc && let Some(prepared) = &qtgmc {
             self.phase(
                 id,
                 JobState::Preparing,
@@ -846,8 +1262,8 @@ impl JobManager {
             }
             let (workspace, intermediate, stable_input) = av1an::Recovery::prepare(
                 id,
-                request,
-                settings,
+                authority_request.unwrap_or(request),
+                authority_settings.unwrap_or(settings),
                 &source.path,
                 prepared_source,
                 tools,
@@ -878,18 +1294,19 @@ impl JobManager {
             let two_pass = rate.as_ref().is_some_and(|value| value.two_pass);
             let mut arguments = consumer_arguments(&plan, settings);
             if let Some(rate) = &rate {
-                rate.arguments(
-                    &mut arguments,
-                    settings.encoder,
-                    if two_pass { 2 } else { 1 },
-                );
+                rate.arguments_for_settings(&mut arguments, settings, if two_pass { 2 } else { 1 });
             }
+            let recovery_frames = if source_qtgmc {
+                transformed_frame_count
+            } else {
+                frame_count
+            };
             let mut signature = arguments
                 .into_iter()
                 .map(|value| value.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
             signature.extend([
-                format!("frames={frame_count}"),
+                format!("frames={recovery_frames}"),
                 format!("fps={}/{}", plan.fps_num, plan.fps_den),
                 format!("size={}x{}", plan.width, plan.height),
                 format!("sar={}", plan.output_sar()),
@@ -902,12 +1319,16 @@ impl JobManager {
             }
             if let Some(qtgmc) = &qtgmc {
                 tools.push(qtgmc.producer.executable.clone());
-                signature.push(format!(
-                    "qtgmc-decoded={}",
-                    qtgmc_identity
-                        .as_deref()
-                        .expect("executed QTGMC decoded identity")
-                ));
+                if source_qtgmc {
+                    signature.push("qtgmc-source-filter=deferred-render-v1".into());
+                } else {
+                    signature.push(format!(
+                        "qtgmc-decoded={}",
+                        qtgmc_identity
+                            .as_deref()
+                            .expect("executed QTGMC decoded identity")
+                    ));
+                }
             }
             let extension = match settings.encoder {
                 VideoEncoder::SvtAv1
@@ -921,11 +1342,11 @@ impl JobManager {
             let prepared = super::standalone_recovery::Recovery::prepare(
                 id,
                 request,
-                settings,
+                authority_settings.unwrap_or(settings),
                 &source.path,
                 tools,
                 signature,
-                frame_count,
+                recovery_frames,
                 two_pass,
                 extension,
                 locator,
@@ -953,6 +1374,11 @@ impl JobManager {
         // attempt owned by execute's unconditional cleanup. Keep its durable
         // owner local so another cancellation releases the handle while
         // preserving the checkpoint for the next explicit resume.
+        let source_final_iso =
+            container::source_iso_format(&output, &output_selected, &mux_settings);
+        let staging_format = source_final_iso
+            .unwrap_or_else(|| container::staging_format(&output_selected, Some(&mux_settings)));
+        let mut source_iso_receipt = None;
         if standalone_final.is_none() {
             *temporary = Some(if let Some(recovery) = recovery.as_ref() {
                 // A forced host exit cannot run Temporary::drop. Keep av1an's final
@@ -961,13 +1387,14 @@ impl JobManager {
                 // attempts with the workspace; never infer ownership from a name
                 // beside the user's destination.
                 Temporary::durable(
-                    &recovery
-                        .root
-                        .join(format!("attempt-{attempt_id}.partial.mkv")),
+                    &recovery.root.join(format!(
+                        "attempt-{attempt_id}.partial.{}",
+                        staging_format.extension()
+                    )),
                     false,
                 )?
             } else {
-                Temporary::create(&output, &attempt_id)?
+                Temporary::create_extension(&output, &attempt_id, staging_format.extension())?
             });
         }
         if durable.is_none() {
@@ -1004,6 +1431,11 @@ impl JobManager {
         } else {
             None
         };
+        let mut standalone_hdr = if settings.backend == media_core::EncodeBackend::Standalone {
+            Some(dynamic_hdr.stage_standalone(&output, &attempt_id)?)
+        } else {
+            None
+        };
         self.change(id, |snapshot| {
             append_log(
                 snapshot,
@@ -1016,6 +1448,146 @@ impl JobManager {
         })
         .await;
         check_cancel(cancel)?;
+        if settings.backend == media_core::EncodeBackend::Standalone
+            && self.command_review(id).await.is_some()
+        {
+            // The held program owns many asynchronous construction temporaries.
+            // Isolate that complete phase so its debug poll frame is not also
+            // reserved while the normal QTGMC/encoder process tree is polled.
+            let edited=boxed(||async {
+            let two_pass = rate.as_ref().is_some_and(|rate| rate.two_pass);
+            if two_pass && standalone_stats.is_none() {
+                standalone_stats = Some(super::rate_control::Stats::create(&output, &format!("{attempt_id}-review"))?);
+            }
+            let first_pass = two_pass.then(|| Temporary::create(&output, &format!("{attempt_id}-review-pass-one"))).transpose()?;
+            let mut commands = Vec::new();
+            if defer_source_qtgmc && let Some(prepared)=&qtgmc {
+                commands.push(format!("{} | {} > {}",super::command_edit::format_command(&prepared.producer),super::command_edit::format_command(&prepared.consumer),super::command_edit::quote(&prepared.video.path.to_string_lossy())));
+            }
+            let mut path_outputs = Vec::new();
+            let mut producer = CommandSpec {
+                executable: ffmpeg.clone(),
+                args: if let Some(qtgmc) = &qtgmc {
+                    decoder_args_preprocessed(&qtgmc.video.path, &plan)
+                } else {
+                    decoder_args_with_subtitles(&source.path, &plan, subtitle_assets.text_filter(), subtitle_assets.bitmap_input())
+                },
+                cwd: if qtgmc.is_some() { None } else { subtitle_assets.decoder_cwd().map(Path::to_path_buf) },
+            };
+            aom_vpx::configure_producer_output(&mut producer.args, &plan, settings);
+            let mut encoded_path = intermediate.path.clone();
+            for pass in 1..=if two_pass { 2 } else { 1 } {
+                let pass_output = if two_pass && pass == 1 { first_pass.as_ref().expect("review first pass") } else { intermediate };
+                let mut args = consumer_arguments(&plan, settings);
+                if let Some(resources) = &standalone_hdr { resources.apply(&mut args); }
+                if let Some(table) = &standalone_grain_table {
+                    for index in 0..args.len() {
+                        if args[index] == "--fgs-table" && args.get(index + 1) == Some(&OsString::from(super::av1an::GRAIN_TABLE_NAME)) { args[index + 1] = table.path().as_os_str().to_owned(); }
+                        else if args[index] == OsString::from(format!("--film-grain-table={}", super::av1an::GRAIN_TABLE_NAME)) { let mut argument = OsString::from("--film-grain-table="); argument.push(table.path().as_os_str()); args[index] = argument; }
+                    }
+                }
+                if let Some(rate) = &rate { rate.arguments_for_settings(&mut args, settings, pass); }
+                let redirect = if !dynamic_hdr.is_empty() {
+                    let native = Temporary::create_ivf(&output, &format!("{attempt_id}-review-hdr-{pass}"))?;
+                    let at = args.iter().position(|arg| arg == "-b").expect("SVT output");
+                    args[at + 1] = native.path.as_os_str().to_owned();
+                    if !two_pass || pass == 2 { encoded_path = native.path.clone(); }
+                    path_outputs.push(native);
+                    String::new()
+                } else {
+                    format!(" > {}", super::command_edit::quote(&pass_output.path.to_string_lossy()))
+                };
+                let consumer = CommandSpec { executable: encoder.clone(), args, cwd: standalone_stats.as_ref().map(|stats| stats.path.clone()) };
+                commands.push(format!("{} | {}{redirect}", super::command_edit::format_command(&producer), super::command_edit::format_command(&consumer)));
+            }
+            let needs_wrapper = matches!(settings.encoder, VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone) || (settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10());
+            if needs_wrapper {
+                let wrapped = Temporary::create(&output, &format!("{attempt_id}-review-timed"))?;
+                let mut args = x265::mkvmerge_arguments(&encoded_path, &wrapped.path, &plan);
+                if settings.encoder == VideoEncoder::AomAv1 { let metadata = plan.aom_hdr_mkvmerge_arguments(); args.splice(args.len() - 1..args.len() - 1, metadata); }
+                let command = super::command_edit::format_command(&CommandSpec { executable: mkvmerge.as_ref().expect("timing dependency").clone(), args, cwd: None });
+                commands.push(if cfg!(windows) { format!("({command} & if errorlevel 2 (exit /b 2) else (exit /b 0))") } else { format!("({command}; result=$?; [ \"$result\" -le 1 ])") });
+                encoded_path = wrapped.path.clone(); path_outputs.push(wrapped);
+            }
+            let attachment = super::encode_settings::SettingsAttachment::prepare(&temp.path, &format!("{attempt_id}-review"), settings)?;
+            let mut mux = mux_args(&source.path, &encoded_path, &temp.path, &output_selected, &plan, settings, &external);
+            if let Some(trim) = &prepared_trim { trim.apply_mux(&mut mux, &output_selected, &audio_filters)?; }
+            normalization.apply_mux(&mut mux, &output_selected)?; subtitle_assets.apply_mux(&mut mux, &output_selected);
+            if let Some(attachment) = &attachment { attachment.apply(&mut mux, output_selected.iter().filter(|stream| stream.codec_type.as_deref() == Some("attachment")).count()); }
+            commands.push(super::command_edit::format_command(&CommandSpec { executable: ffmpeg.clone(), args: mux, cwd: None }));
+            let program = commands.join(" &&\n");
+            if let Some(review) = self.review_command(id, "ffmpeg", &program, &output, cancel).await?
+                && review.arguments != review.generated.trim()
+            {
+                for temporary in &mut path_outputs { temporary.close_for_path_writer()?; }
+                if defer_source_qtgmc && let Some(prepared)=&mut qtgmc {prepared.video.close_for_path_writer()?;}
+                let result = boxed(||self.run_edited_program_with_environment(id, &review, None, &source.path, cancel, log_path,qtgmc.as_ref().and_then(|prepared|prepared.environment()))).await;
+                if defer_source_qtgmc && let Some(prepared)=&mut qtgmc {prepared.video.reopen_after_path_writer()?;}
+                for temporary in &mut path_outputs { if temporary.path.exists() { temporary.reopen_after_path_writer()?; } }
+                result?;
+                let actual = super::command_edit::verify_actual_output(&ffmpeg, &ffprobe, temp, cancel).await?;
+                source.verify()?; external.verify()?; if let Some(original) = original_guard { original.verify()?; }
+                self.change(id, |snapshot| { snapshot.duration_seconds = actual.duration(); append_log(snapshot, "The complete edited program produced fully decodable media; original typed picture expectations were replaced by the confirmed program.".into()); }).await;
+                return Ok::<bool,AppError>(true);
+            }
+                Ok::<bool,AppError>(false)
+            }).await?;
+            if edited {
+                self.finalize_verified(
+                    id,
+                    cancel,
+                    &source,
+                    Some(&external),
+                    temp,
+                    &output,
+                    None,
+                    None,
+                    None,
+                    scratch,
+                )
+                .await?;
+                drop(standalone_stats);
+                drop(standalone_timed);
+                drop(standalone_final);
+                drop(durable);
+                if let Some(recovery) = standalone_recovery {
+                    recovery.cleanup()?;
+                    self.change(id, |snapshot| snapshot.standalone_recovery = None)
+                        .await;
+                }
+                return Ok(());
+            }
+        }
+        if deferred_vulkan {
+            plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
+                .await?;
+            if let Some(description) = plan.tone_map_description() {
+                self.change(id, |snapshot| append_log(snapshot, description))
+                    .await;
+            }
+        }
+        if defer_source_qtgmc && let Some(prepared) = &qtgmc {
+            let prep_log = log_path.with_extension("qtgmc.log");
+            let (sender, events) = mpsc::channel(256);
+            let observer = self.observe_encode(id, events, Some(plan.frame_seconds()));
+            let result = boxed(|| prepared.run(cancel.clone(), sender, &prep_log)).await;
+            let _ = observer.await;
+            result?;
+            frame_count =
+                boxed(|| prepared.validate_source_filters(&ffprobe, &plan, cancel)).await?;
+            source.verify()?;
+        }
+        if source_qtgmc
+            && !source_qtgmc_checkpoint_ready
+            && let Some(prepared) = &qtgmc
+        {
+            let identity =
+                boxed(|| prepared.decoded_identity(&ffmpeg, frame_count, cancel)).await?;
+            let recovery = standalone_recovery.as_mut().expect("standalone recovery");
+            boxed(|| recovery.remember_source_qtgmc(&prepared.video.path, identity, cancel))
+                .await?;
+            boxed(|| recovery.verify_source_qtgmc(&prepared.video.path, cancel)).await?;
+        }
         let video_position = output_selected
             .iter()
             .position(|stream| stream.index == plan.video_index)
@@ -1023,6 +1595,20 @@ impl JobManager {
         let resume_finalizing = standalone_recovery.as_ref().is_some_and(|recovery| {
             recovery.phase() == Some(media_core::StandaloneRecoveryPhase::Finalizing)
         });
+        if settings.source_filters
+            && let Some(contract) = standalone_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.source_filter_contract())
+        {
+            plan.apply_source_filter_contract(contract)?;
+            frame_count = usize::try_from(contract.frames).map_err(|_| {
+                files::error(
+                    "ENCODE_VALIDATION_FAILED",
+                    "The observed filter frame count exceeds this platform.",
+                    &output,
+                )
+            })?;
+        }
         if resume_finalizing {
             self.change(id, |snapshot| {
                 append_log(
@@ -1036,30 +1622,149 @@ impl JobManager {
         if !resume_finalizing {
             if settings.backend == media_core::EncodeBackend::Av1an {
                 let recovery = recovery.as_ref().expect("av1an recovery workspace");
-                if !recovery.finalizing {
+                if settings
+                    .av1an_options
+                    .is_some_and(|options| options.source_workflow)
+                {
+                    frame_count = recovery.queue_frame_count().await?;
+                }
+                if !recovery.finalizing || self.command_review(id).await.is_some() {
                     self.phase(id, JobState::Running, &format!("av1an is detecting scenes and encoding parallel {} chunks; selected audio settings will be applied afterward.", settings.encoder.name())).await;
-                    self.encode_av1an(
-                        id,
-                        av1an_input.as_deref().expect("prepared av1an input"),
-                        &encoder,
-                        av1an_executable.as_ref().expect("av1an executable"),
-                        &ffmpeg,
-                        &ffprobe,
-                        mkvmerge.as_deref(),
-                        recovery,
-                        intermediate,
-                        &plan,
-                        settings,
-                        cancel,
-                        log_path,
-                        frame_count,
-                    )
-                    .await?;
+                    let review_attachment = (self.command_review(id).await.is_some()
+                        || recovery.edited_command().await?.is_some())
+                    .then(|| {
+                        super::encode_settings::SettingsAttachment::prepare(
+                            &temp.path,
+                            &format!("{attempt_id}-review"),
+                            settings,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                    let post_mux = if self.command_review(id).await.is_some()
+                        || recovery.edited_command().await?.is_some()
+                    {
+                        let mut args = mux_args(
+                            &source.path,
+                            &intermediate.path,
+                            &temp.path,
+                            &output_selected,
+                            &plan,
+                            settings,
+                            &external,
+                        );
+                        if let Some(trim) = &prepared_trim {
+                            trim.apply_mux(&mut args, &output_selected, &audio_filters)?;
+                        }
+                        normalization.apply_mux(&mut args, &output_selected)?;
+                        subtitle_assets.apply_mux(&mut args, &output_selected);
+                        if let Some(attachment) = &review_attachment {
+                            attachment.apply(
+                                &mut args,
+                                output_selected
+                                    .iter()
+                                    .filter(|stream| {
+                                        stream.codec_type.as_deref() == Some("attachment")
+                                    })
+                                    .count(),
+                            );
+                        }
+                        Some(CommandSpec {
+                            executable: ffmpeg.clone(),
+                            args,
+                            cwd: None,
+                        })
+                    } else {
+                        None
+                    };
+                    let edited = self
+                        .encode_av1an(
+                            id,
+                            av1an_input.as_deref().expect("prepared av1an input"),
+                            &encoder,
+                            av1an_executable.as_ref().expect("av1an executable"),
+                            &ffmpeg,
+                            &ffprobe,
+                            mkvmerge.as_deref(),
+                            recovery,
+                            intermediate,
+                            &mut plan,
+                            settings,
+                            cancel,
+                            log_path,
+                            frame_count,
+                            &dynamic_hdr,
+                            post_mux,
+                        )
+                        .await?;
+                    if let Some(actual) = plan.source_queue_frame_count() {
+                        frame_count = actual;
+                    }
+                    if edited {
+                        let actual = super::command_edit::verify_actual_output(
+                            &ffmpeg, &ffprobe, temp, cancel,
+                        )
+                        .await?;
+                        source.verify()?;
+                        external.verify()?;
+                        if let Some(original) = original_guard {
+                            original.verify()?;
+                        }
+                        self.change(id, |snapshot| { snapshot.duration_seconds = actual.duration(); append_log(snapshot, "The confirmed AV1AN program and selected-track mux produced fully decodable media.".into()); }).await;
+                        self.finalize_verified(
+                            id,
+                            cancel,
+                            &source,
+                            Some(&external),
+                            temp,
+                            &output,
+                            None,
+                            None,
+                            None,
+                            scratch,
+                        )
+                        .await?;
+                        if let Some(mut attempt) = temporary.take() {
+                            attempt.cleanup()?;
+                        }
+                        drop(durable);
+                        recovery.cleanup().await?;
+                        self.change(id, |snapshot| snapshot.recovery = None).await;
+                        return Ok(());
+                    }
                     let summary = recovery.finalizing().await?;
                     self.change(id, |snapshot| snapshot.recovery = Some(summary))
                         .await;
                 } else {
                     self.change(id,|snapshot|append_log(snapshot,"Reusing the verified durable AV1 intermediate; continuing output finalization.".into())).await;
+                    if settings.source_filters {
+                        let actual =
+                            probe(&ffprobe, &intermediate.path, cancel, Some(&[0])).await?;
+                        let stream = actual.streams.first().ok_or_else(|| {
+                            files::error(
+                                "ENCODE_VALIDATION_FAILED",
+                                "The saved filtered AV1AN stage has no video.",
+                                &intermediate.path,
+                            )
+                        })?;
+                        plan.observe_source_filter_stream(stream, None)?;
+                    }
+                    if settings
+                        .av1an_options
+                        .is_some_and(|options| options.source_workflow)
+                        && let Some(actual) = super::av1an::verify_source_join(
+                            &ffmpeg,
+                            &ffprobe,
+                            mkvmerge.as_deref(),
+                            recovery,
+                            intermediate,
+                            &mut plan,
+                            cancel,
+                        )
+                        .await?
+                    {
+                        frame_count = actual;
+                    }
                 }
             } else {
                 let mut producer = CommandSpec {
@@ -1091,6 +1796,9 @@ impl JobManager {
                     args: consumer_arguments(&plan, settings),
                     cwd: None,
                 };
+                if let Some(resources) = &standalone_hdr {
+                    resources.apply(&mut consumer.args);
+                }
                 if let Some(table) = &standalone_grain_table {
                     let name = super::av1an::GRAIN_TABLE_NAME;
                     for index in 0..consumer.args.len() {
@@ -1165,12 +1873,21 @@ impl JobManager {
                 } else {
                     1
                 };
+                if first == 2 {
+                    self.change(id, |snapshot| {
+                        append_log(
+                            snapshot,
+                            "Resuming after verified pass one; only pass two will run.".into(),
+                        )
+                    })
+                    .await;
+                }
                 for pass in first..=if two_pass { 2 } else { 1 } {
                     check_cancel(cancel)?;
                     source.verify()?;
                     consumer.args = base_arguments.clone();
                     if let Some(rate) = &rate {
-                        rate.arguments(&mut consumer.args, settings.encoder, pass);
+                        rate.arguments_for_settings(&mut consumer.args, settings, pass);
                     }
                     consumer.cwd = stats.as_ref().map(|stats| stats.path.clone());
                     if let Some(stats) = &stats {
@@ -1199,16 +1916,57 @@ impl JobManager {
                     };
                     let (sender, events) = mpsc::channel(256);
                     let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
-                    let result = supervisor::run_pipeline_to_file(
-                        &producer,
-                        &consumer,
-                        cancel.clone(),
-                        sender,
-                        &pass_log,
-                        Duration::from_secs(24 * 60 * 60),
-                        pass_output.clone_file()?,
-                    )
-                    .await;
+                    let result = if !dynamic_hdr.is_empty() {
+                        // These fork builds print metadata-loading messages to
+                        // stdout. A separate identity-guarded path writer keeps
+                        // those diagnostics out of the IVF byte stream.
+                        let mut native = Temporary::create_ivf(
+                            &output,
+                            &format!("{attempt_id}-hdr-pass-{pass}"),
+                        )?;
+                        let output_arg = consumer
+                            .args
+                            .iter()
+                            .position(|arg| arg == "-b")
+                            .expect("SVT output argument");
+                        consumer.args[output_arg + 1] = native.path.as_os_str().to_owned();
+                        native.close_for_path_writer()?;
+                        let execution = supervisor::run_pipeline(
+                            &producer,
+                            &consumer,
+                            cancel.clone(),
+                            sender,
+                            &pass_log,
+                            Duration::from_secs(24 * 60 * 60),
+                        )
+                        .await;
+                        let rebound = native.reopen_after_path_writer();
+                        rebound?;
+                        match execution {
+                            Ok(result) => {
+                                if result.producer_status.success()
+                                    && result.consumer_status.success()
+                                {
+                                    native.flush_nonempty_async().await?;
+                                    super::dynamic_hdr::copy_encoded(&native, pass_output, cancel)
+                                        .await?;
+                                }
+                                Ok(result)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        supervisor::run_pipeline_to_file(
+                            &producer,
+                            &consumer,
+                            cancel.clone(),
+                            sender,
+                            &pass_log,
+                            Duration::from_secs(24 * 60 * 60),
+                            pass_output.clone_file()?,
+                        )
+                        .await
+                    };
                     let _ = event_task.await;
                     let result = result.map_err(|e| process_error(e, &source.path))?;
                     if !result.producer_status.success() || !result.consumer_status.success() {
@@ -1246,11 +2004,47 @@ impl JobManager {
                         &ffprobe,
                         intermediate,
                         video,
-                        &plan,
-                        frame_count,
+                        &mut plan,
+                        &mut frame_count,
+                        if settings.source_filters {
+                            Some(
+                                super::source_filters::current()
+                                    .expect("source filter observation scope")
+                                    .completed(cancel)
+                                    .await?
+                                    .into_iter()
+                                    .find(|clock| clock.stream_index == 0)
+                                    .ok_or_else(|| {
+                                        files::error(
+                                            "SOURCE_FILTER_OBSERVATION_INVALID",
+                                            "The filtered producer omitted video stream zero.",
+                                            &output,
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        },
                         cancel,
                     )
                     .await?;
+                    if source_qtgmc && let Some(prepared) = &qtgmc {
+                        boxed(|| {
+                            standalone_recovery
+                                .as_ref()
+                                .expect("standalone recovery")
+                                .verify_source_qtgmc(&prepared.video.path, cancel)
+                        })
+                        .await?;
+                    }
+                    if settings.source_filters {
+                        standalone_recovery
+                            .as_mut()
+                            .expect("standalone recovery")
+                            .remember_source_filter_contract(
+                                plan.source_filter_contract(frame_count),
+                            )?;
+                    }
                     let summary = standalone_recovery
                         .as_mut()
                         .expect("standalone recovery")
@@ -1437,6 +2231,7 @@ impl JobManager {
             if let Some(prepared) = &prepared_trim {
                 prepared.apply_mux(&mut mux_arguments, &output_selected, &audio_filters)?;
             }
+            normalization.apply_mux(&mut mux_arguments, &output_selected)?;
             subtitle_assets.apply_mux(&mut mux_arguments, &output_selected);
             if let Some(attachment) = &settings_attachment {
                 attachment.apply(
@@ -1477,18 +2272,60 @@ impl JobManager {
             check_cancel(cancel)?;
             temp.flush_nonempty_async().await?;
             self.phase(id,JobState::Finalizing,"Decoding the completed output to verify exact frame count and timing, then checking copied tracks and metadata.").await;
+            if let Some(format) = source_final_iso {
+                source_iso_receipt = Some(container::seal_source_iso(temp, format, cancel).await?);
+            }
             let mut artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
             if let Some(attachment) = &settings_attachment {
                 attachment.verify_and_remove(&mut artifact)?;
             }
-            let expected_document = subtitle_assets.expected_document(
-                prepared_trim
-                    .as_ref()
-                    .map_or(&output_document, |prepared| &prepared.expected),
-            );
+            let verified_trim = if let Some(prepared) = &prepared_trim {
+                let (expected, origin) = prepared
+                    .verify_source(
+                        &ffmpeg,
+                        &ffprobe,
+                        &temp.path,
+                        &output_selected,
+                        &artifact,
+                        Some(plan.video_index),
+                        Some(&intermediate.path),
+                        cancel,
+                    )
+                    .await?;
+                prepared.normalize_verified_packet_starts(
+                    &mut artifact,
+                    &expected,
+                    &output_selected,
+                );
+                plan.output_origin = origin;
+                if !prepared.copied_indices().is_empty() {
+                    super::mux::verify_shifted_video_packets(
+                        &ffprobe,
+                        &intermediate.path,
+                        0,
+                        &temp.path,
+                        video_position as u32,
+                        origin,
+                        cancel,
+                    )
+                    .await?;
+                }
+                Some(expected)
+            } else {
+                None
+            };
+            let expected_document = subtitle_assets
+                .expected_document(verified_trim.as_ref().unwrap_or(&output_document));
             let expected_document = plan.temporal_document(expected_document);
+            let expected_document = plan.source_filter_document(expected_document, frame_count);
+            let (expected_document, converted_subtitles) = container::normalize_staging(
+                &expected_document,
+                &output_indices,
+                &mut artifact,
+                Some(&mux_settings),
+            )?;
             let expected_selected = expected_document.selected(&output_indices)?;
-            metadata::verify_encoded(
+            metadata::verify_encoded_with_subtitles(
                 &expected_document,
                 &expected_selected,
                 &artifact,
@@ -1496,8 +2333,14 @@ impl JobManager {
                 plan.output_codec(),
                 (plan.width, plan.height),
                 &mux_settings.audio,
+                &converted_subtitles,
             )?;
-            external.verify_metadata_overrides(settings, &expected_selected, &artifact)?;
+            external.verify_metadata_overrides(
+                settings,
+                &expected_selected,
+                &artifact,
+                container::staging_format(&output_selected, Some(&mux_settings)),
+            )?;
             if let Some(prepared) = &prepared_trim {
                 prepared
                     .verify_subtitles(
@@ -1525,7 +2368,17 @@ impl JobManager {
                     cancel,
                 )
                 .await?;
-                let evidence = audio::verify_timeline(timeline, &decoded, track.codec)?;
+                let evidence = audio::verify_timeline(
+                    &timeline.shifted(
+                        prepared_trim
+                            .as_ref()
+                            .map_or(plan.output_origin, |prepared| {
+                                prepared.audio_origin(plan.output_origin)
+                            }),
+                    ),
+                    &decoded,
+                    track.codec,
+                )?;
                 self.change(id, |snapshot| {
                     append_log(
                         snapshot,
@@ -1535,11 +2388,55 @@ impl JobManager {
                 .await;
             }
             let encoded = &artifact.streams[video_position];
-            plan.validate_encoded_stream(video, encoded)?;
+            if plan.has_source_queue() {
+                super::mux::verify_shifted_video_packets(
+                    &ffprobe,
+                    &intermediate.path,
+                    0,
+                    &temp.path,
+                    video_position as u32,
+                    0.0,
+                    cancel,
+                )
+                .await?;
+            }
+            if let Some(format) = source_final_iso.filter(|_| plan.output_codec() == "vp9") {
+                super::mux::verify_shifted_video_packets(
+                    &ffprobe,
+                    &intermediate.path,
+                    0,
+                    &temp.path,
+                    video_position as u32,
+                    plan.output_origin,
+                    cancel,
+                )
+                .await?;
+                let checkpoint = probe(&ffprobe, &intermediate.path, cancel, Some(&[0])).await?;
+                let checkpoint = checkpoint.streams.first().ok_or_else(|| {
+                    files::error(
+                        "ENCODE_VALIDATION_FAILED",
+                        "The verified VP9 checkpoint lost its video stream.",
+                        &intermediate.path,
+                    )
+                })?;
+                plan.validate_packet_copied_iso_vp9(video, checkpoint, encoded, format)?;
+            } else {
+                plan.validate_encoded_stream(video, encoded)?;
+            }
             self.change(id, |snapshot| snapshot.progress_seconds = Some(0.0))
                 .await;
+            let mut final_video_plan = plan.clone();
+            final_video_plan.output_origin = plan.encoded_mux_origin();
             let decoded_count = self
-                .scan_frames(id, &ffprobe, &temp.path, &mut plan, encoded, true, cancel)
+                .scan_frames(
+                    id,
+                    &ffprobe,
+                    &temp.path,
+                    &mut final_video_plan,
+                    encoded,
+                    true,
+                    cancel,
+                )
                 .await?;
             if decoded_count != frame_count {
                 return Err(AppError::new(
@@ -1550,15 +2447,15 @@ impl JobManager {
             }
             source.verify()?;
             check_cancel(cancel)?;
-            if let Some(media_core::VideoRateControl::TargetSize { target_size_mib }) =
-                settings.rate_control
+            if let Some(target) = settings
+                .rate_control
+                .and_then(super::rate_control::target_bytes)
             {
                 let actual = temp
                     .clone_file()?
                     .metadata()
                     .map_err(|e| files::error("OUTPUT_UNREADABLE", e.to_string(), &temp.path))?
                     .len();
-                let target = u64::from(target_size_mib) * 1024 * 1024;
                 self.change(id, |snapshot| append_log(snapshot, format!("Target-size result before any final container conversion: {actual} bytes, requested {target} bytes ({:.2}% difference). Two-pass targets are estimates; encoder content and container overhead determine actual size.", (actual as f64 / target as f64 - 1.0) * 100.0))).await;
             }
             if let Some(recovery) = standalone_recovery.as_mut() {
@@ -1669,18 +2566,108 @@ impl JobManager {
             })
             .await;
         }
+        if source_origin.is_some() {
+            let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+            for (position, stream) in output_selected.iter().enumerate() {
+                let Some(original) = document
+                    .streams
+                    .iter()
+                    .find(|original| original.index == stream.index)
+                else {
+                    continue;
+                };
+                if !matches!(
+                    stream.codec_type.as_deref(),
+                    Some("audio" | "subtitle" | "data")
+                ) || audio::converted(&mux_settings)
+                    .any(|track| track.stream_index == stream.index)
+                    || subtitle_assets.overridden_indices().contains(&stream.index)
+                {
+                    continue;
+                }
+                if super::source_normalization::aac::needed(&document, original) {
+                    let evidence = super::source_normalization::aac::verify(
+                        &ffmpeg,
+                        &ffprobe,
+                        &source.path,
+                        original,
+                        &temp.path,
+                        &artifact.streams[position],
+                        0.0,
+                        cancel,
+                    )
+                    .await?;
+                    self.change(id, |snapshot| append_log(snapshot, evidence))
+                        .await;
+                } else {
+                    super::mux::verify_packets(
+                        &ffprobe,
+                        &source.path,
+                        stream.index,
+                        &temp.path,
+                        position as u32,
+                        cancel,
+                    )
+                    .await?;
+                    if stream.codec_type.as_deref() == Some("audio") {
+                        let before =
+                            audio::scan(&ffprobe, &source.path, original, false, cancel).await?;
+                        let after = audio::scan_container_output(
+                            &ffprobe,
+                            &temp.path,
+                            &artifact.streams[position],
+                            &before,
+                            cancel,
+                        )
+                        .await?;
+                        let evidence =
+                            audio::verify_timeline(&before, &after, media_core::AudioCodec::Copy)?;
+                        self.change(id, |snapshot| {
+                            append_log(snapshot, format!("Copied cut audio: {evidence}"))
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
         external
             .verify_packets_excluding(
                 &ffprobe,
                 &temp.path,
                 &output_selected,
-                &prepared_trim
-                    .as_ref()
-                    .map_or_else(Vec::new, |trim| trim.subtitle_indices()),
+                &prepared_trim.as_ref().map_or_else(Vec::new, |trim| {
+                    let mut indices = trim.subtitle_indices();
+                    indices.extend(trim.copied_indices());
+                    indices
+                }),
                 cancel,
             )
             .await?;
-        self.finalize(
+        for (position, stream) in output_selected
+            .iter()
+            .enumerate()
+            .filter(|(_, stream)| stream.codec_type.as_deref() == Some("data"))
+        {
+            if external.audio_source(stream.index).is_none() {
+                super::mux::verify_shifted_packets(
+                    &ffprobe,
+                    &source.path,
+                    stream.index,
+                    &temp.path,
+                    position as u32,
+                    0.0,
+                    cancel,
+                )
+                .await?;
+            }
+        }
+        if let Some(original) = original_guard {
+            original.verify()?;
+        }
+        if let Some(staged) = standalone_hdr.take() {
+            staged.finish()?;
+        }
+        self.finalize_verified(
             id,
             cancel,
             &source,
@@ -1692,6 +2679,12 @@ impl JobManager {
                 numerator: plan.fps_num,
                 denominator: plan.fps_den,
                 frames: frame_count,
+                source_iso: if let Some(receipt) = source_iso_receipt {
+                    receipt.verify(temp, cancel).await?;
+                    Some(receipt)
+                } else {
+                    None
+                },
             }),
             plan.has_alpha().then_some((
                 &plan,
@@ -1699,6 +2692,13 @@ impl JobManager {
                 video_position,
                 frame_count,
                 settings.lossless,
+            )),
+            Some((
+                &dynamic_hdr,
+                ffmpeg.as_path(),
+                ffprobe.as_path(),
+                video_position,
+                (plan.fps_num, plan.fps_den),
             )),
             scratch,
         )
@@ -1807,7 +2807,7 @@ impl JobManager {
         result
     }
 
-    fn observe_encode(
+    pub(super) fn observe_encode(
         &self,
         id: &str,
         mut events: mpsc::Receiver<ProcessEvent>,
@@ -1822,6 +2822,13 @@ impl JobManager {
                 };
                 manager
                     .change(&id, |snapshot| {
+                        if let Some(progress) = progress_seconds(&line) {
+                            snapshot.progress_seconds = Some(
+                                snapshot
+                                    .duration_seconds
+                                    .map_or(progress, |duration| progress.min(duration)),
+                            );
+                        }
                         if let (Some(value), Some(frame_seconds)) = (
                             svt_frame_counter(&line).or_else(|| x264::frame_counter(&line)),
                             frame_seconds,
@@ -1854,7 +2861,7 @@ fn svt_frame_counter(line: &str) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn frame_scan(
+pub(in crate::jobs) async fn frame_scan(
     ffprobe: &Path,
     input: &Path,
     plan: &mut Plan,
@@ -1941,7 +2948,7 @@ async fn frame_scan(
     Ok(count)
 }
 
-fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
+pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -1959,7 +2966,7 @@ fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
         format!("-threads:{}", index).into(),
         threads.to_string().into(),
     ]);
-    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,top_field_first,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag","-of","json","-i"].into_iter().map(OsString::from));
+    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,top_field_first,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,displaymatrix,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag,disable_residual_flag","-of","json","-i"].into_iter().map(OsString::from));
     args.push(input.as_os_str().to_owned());
     args
 }
@@ -1968,8 +2975,9 @@ async fn validate_video_checkpoint(
     ffprobe: &Path,
     checkpoint: &Temporary,
     source: &metadata::Stream,
-    plan: &Plan,
-    expected_frames: usize,
+    plan: &mut Plan,
+    expected_frames: &mut usize,
+    producer: Option<super::source_filters::ProducerClock>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let document = if plan.encoder == VideoEncoder::X265Standalone {
@@ -2024,6 +3032,16 @@ async fn validate_video_checkpoint(
             &checkpoint.path,
         )
     })?;
+    if let Some(producer) = &producer {
+        plan.observe_source_filter_stream(encoded, Some(producer))?;
+        *expected_frames = usize::try_from(producer.frames).map_err(|_| {
+            files::error(
+                "ENCODE_VALIDATION_FAILED",
+                "The filtered producer frame count exceeds this platform.",
+                &checkpoint.path,
+            )
+        })?;
+    }
     plan.validate_elementary_checkpoint(source, encoded)?;
     let mut args: Vec<OsString> = [
         "-v",
@@ -2059,7 +3077,7 @@ async fn validate_video_checkpoint(
         .trim()
         .parse::<usize>()
         .ok();
-    if !result.status.success() || !result.stderr.is_empty() || frames != Some(expected_frames) {
+    if !result.status.success() || !result.stderr.is_empty() || frames != Some(*expected_frames) {
         return Err(files::error(
             "ENCODE_VALIDATION_FAILED",
             format!(
@@ -2110,6 +3128,12 @@ pub(super) fn decoder_args_preprocessed(input: &Path, plan: &Plan) -> Vec<OsStri
         "-color_range".into(),
         if plan.full_range { "pc" } else { "tv" }.into(),
     ]);
+    args.extend(super::source_filters::arguments());
+    if plan.has_source_filters()
+        && let Some(position) = args.iter().position(|argument| argument == "-fps_mode")
+    {
+        args.drain(position..position + 2);
+    }
     if plan.has_alpha() {
         args.extend(["-f".into(), "rawvideo".into(), "pipe:1".into()]);
     } else {
@@ -2130,6 +3154,33 @@ fn decoder_args_with_subtitles(
     text: Option<&str>,
     bitmap: Option<(&Path, u32, f64)>,
 ) -> Vec<OsString> {
+    let seek = plan.trim.and_then(|trim| trim.time).filter(|time| {
+        time.seek_strategy == media_core::VideoSeekStrategy::InputSeek
+            && time.start_milliseconds > 0
+    });
+    // Accurate input seeking still decodes from the preceding keyframe, then
+    // discards earlier frames. Its decoded timestamps are relative to the seek
+    // position, so the time filter must use the same new origin exactly once.
+    let source_bitmap = bitmap.is_some() && plan.source_trim;
+    let mut sought_plan;
+    let plan = if seek.is_some() && (bitmap.is_none() || source_bitmap) {
+        sought_plan = plan.clone();
+        let relative = sought_plan
+            .trim
+            .as_mut()
+            .expect("time trim")
+            .time
+            .as_mut()
+            .expect("time trim");
+        relative.end_milliseconds -= relative.start_milliseconds;
+        relative.start_milliseconds = 0;
+        if sought_plan.source_dolby_render {
+            sought_plan.source_origin = 0.0;
+        }
+        &sought_plan
+    } else {
+        plan
+    };
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -2149,25 +3200,90 @@ fn decoder_args_with_subtitles(
     if plan.source_is_vp9_alpha() {
         args.extend(["-c:v".into(), "libvpx-vp9".into()]);
     }
+    if let Some(time) = seek {
+        args.extend([
+            "-ss".into(),
+            format!(
+                "{}.{:03}",
+                time.start_milliseconds / 1000,
+                time.start_milliseconds % 1000
+            )
+            .into(),
+            "-accurate_seek".into(),
+        ]);
+    }
     args.push("-i".into());
     args.push(input.as_os_str().to_owned());
     if let Some((path, bitmap, offset)) = bitmap {
-        args.insert(0, "-copyts".into());
-        args.extend([
-            "-itsoffset".into(),
-            format!("{offset:.6}").into(),
-            "-protocol_whitelist".into(),
-            "file".into(),
-            "-i".into(),
-            path.as_os_str().to_owned(),
-        ]);
-        let filter = super::subtitles::bitmap_filter(
-            &format!("0:{}", plan.video_index),
-            plan.decoder_prefix().as_deref(),
-            plan.geometry_filter_with_text(text).as_deref(),
-            plan.output_bit_depth(),
-            bitmap,
-        );
+        let shared_source = source_bitmap && path == input && offset == 0.0;
+        if !shared_source {
+            if source_bitmap {
+                if let Some(time) = seek {
+                    args.extend([
+                        "-ss".into(),
+                        format!(
+                            "{}.{:03}",
+                            time.start_milliseconds / 1000,
+                            time.start_milliseconds % 1000
+                        )
+                        .into(),
+                    ]);
+                }
+            } else {
+                args.insert(0, "-copyts".into());
+            }
+            args.extend([
+                "-itsoffset".into(),
+                format!("{offset:.6}").into(),
+                "-protocol_whitelist".into(),
+                "file".into(),
+                "-i".into(),
+                path.as_os_str().to_owned(),
+            ]);
+        }
+        let filter = if source_bitmap {
+            let mut original = plan.clone();
+            original.trim = None;
+            let trim = plan
+                .trim
+                .filter(|_| !plan.uses_source_output_trim())
+                .map(|trim| {
+                    if let Some(time) = trim.time {
+                        format!(
+                            "trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS",
+                            f64::from(time.start_milliseconds) / 1000.0,
+                            f64::from(time.end_milliseconds) / 1000.0
+                        )
+                    } else {
+                        format!(
+                            "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
+                            trim.start_frame, trim.end_frame_exclusive
+                        )
+                    }
+                });
+            let geometry = plan.geometry_filter_with_text(text);
+            let suffix = trim
+                .into_iter()
+                .chain(geometry)
+                .collect::<Vec<_>>()
+                .join(",");
+            super::subtitles::source_bitmap_filter(
+                &format!("0:{}", plan.video_index),
+                original.decoder_prefix().as_deref(),
+                (!suffix.is_empty()).then_some(suffix.as_str()),
+                plan.output_bit_depth(),
+                usize::from(!shared_source),
+                bitmap,
+            )
+        } else {
+            super::subtitles::bitmap_filter(
+                &format!("0:{}", plan.video_index),
+                plan.decoder_prefix().as_deref(),
+                plan.geometry_filter_with_text(text).as_deref(),
+                plan.output_bit_depth(),
+                bitmap,
+            )
+        };
         args.extend([
             "-filter_complex".into(),
             filter.into(),
@@ -2213,6 +3329,13 @@ fn decoder_args_with_subtitles(
         .into_iter()
         .map(OsString::from),
     );
+    args.extend(plan.source_output_trim());
+    args.extend(super::source_filters::arguments());
+    if plan.has_source_filters()
+        && let Some(position) = args.iter().position(|argument| argument == "-fps_mode")
+    {
+        args.drain(position..position + 2);
+    }
     if plan.has_alpha() {
         args.extend(["-f".into(), "rawvideo".into(), "pipe:1".into()]);
     } else {
@@ -2264,6 +3387,13 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         plan.chroma.into(),
     ];
     let mut args: Vec<OsString> = values.into_iter().map(OsString::from).collect();
+    if settings.source_filters {
+        for option in ["--fps-num", "--fps-denom"] {
+            if let Some(position) = args.iter().position(|argument| argument == option) {
+                args.drain(position..position + 2);
+            }
+        }
+    }
     if settings.lossless {
         if let Some(index) = args.iter().position(|value| value == "--crf") {
             args.drain(index..index + 2);
@@ -2271,6 +3401,9 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         args.extend(["--lossless".into(), "1".into()]);
     }
     args.extend(plan.hdr_arguments());
+    if let Some(frames) = super::encoding_preferences::keyframes(plan, settings) {
+        args.extend(["--keyint".into(), frames.to_string().into()]);
+    }
     // Keep the coded source texture. Synthesis is an explicit setting and never
     // enables SVT's source denoiser, regardless of encoder version defaults.
     args.extend([
@@ -2301,6 +3434,9 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         _ => {}
     }
     args.extend(super::parameters::arguments(settings));
+    if super::parameters::requires_serial_svt(settings) {
+        args.extend(["--lp".into(), "1".into()]);
+    }
     args
 }
 
@@ -2310,13 +3446,14 @@ fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<Os
         .map(OsString::from)
         .collect();
     args.extend(encoder_parameters(plan, settings));
+    super::dynamic_hdr::Resources::parameters(&mut args, settings);
     super::av1an::grain_parameters(&mut args, settings);
     args.push("-b".into());
     args.push(output.as_os_str().to_owned());
     args
 }
 
-fn consumer_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+pub(in crate::jobs) fn consumer_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
     match settings.encoder {
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
             encoder_args(Path::new("stdout"), plan, settings)
@@ -2450,48 +3587,6 @@ async fn check_encoder_capabilities(
                     .unwrap_or_else(|| "FFmpeg failed its video encoder capability check.".into()),
                 encoder,
             ));
-        }
-        if matches!(
-            settings.encoder,
-            VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
-        ) {
-            let probe = supervisor::run_capture(
-                &CommandSpec {
-                    executable: encoder.to_owned(),
-                    args: ffmpeg_video::hardware_probe_arguments(
-                        settings.encoder,
-                        plan.output_bit_depth(),
-                        settings.lossless,
-                    ),
-                    cwd: None,
-                },
-                cancel.clone(),
-                256 * 1024,
-                Duration::from_secs(15),
-            )
-            .await
-            .map_err(|error| process_error(error, encoder))?;
-            if !probe.status.success() {
-                let detail = String::from_utf8_lossy(&probe.stderr)
-                    .lines()
-                    .rev()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("the NVIDIA driver rejected encoder initialization")
-                    .trim()
-                    .chars()
-                    .take(240)
-                    .collect::<String>();
-                return Err(files::error(
-                    "NVENC_HARDWARE_UNAVAILABLE",
-                    format!(
-                        "FFmpeg advertises {}, but no compatible NVIDIA NVENC device/driver accepted the selected {}-bit{} probe. Install or update the NVIDIA driver, verify this codec/depth on the GPU, or choose a software encoder. Probe: {detail}",
-                        ffmpeg_video::library(settings.encoder),
-                        plan.output_bit_depth(),
-                        if settings.lossless { " lossless" } else { "" }
-                    ),
-                    encoder,
-                ));
-            }
         }
         return Ok(());
     }
@@ -2650,6 +3745,14 @@ async fn check_encoder_capabilities(
     if settings.lossless {
         required.push("--lossless");
     }
+    if let Some(metadata) = &settings.hdr_metadata {
+        if metadata.dolby_vision_rpu_path.is_some() {
+            required.push("--dolby-vision-rpu");
+        }
+        if metadata.hdr10_plus_json_path.is_some() {
+            required.push("--hdr10plus-json");
+        }
+    }
     if settings.rate_control.is_some() {
         required.extend(["--rc", "--tbr", "--pass", "--stats", "--passes"]);
     }
@@ -2710,6 +3813,7 @@ async fn check_encoder_capabilities(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mux_args(
     input: &Path,
     ivf: &Path,
@@ -2735,10 +3839,15 @@ fn mux_args(
     .map(OsString::from)
     .collect();
     args.push(input.as_os_str().to_owned());
-    if audio::converted(settings).next().is_some() || !external.is_empty() {
-        // Codec delay can create negative packet DTS. Keep source timestamps
-        // and prohibit the muxer from shifting every track to compensate.
-        args.insert(0, "-copyts".into());
+    // A copied track can precede the selected video too (for example MP2
+    // encoder delay in MPEG-TS). Preserve its negative canonical origin just
+    // as strictly as converted audio and external-track timestamps.
+    args.insert(0, "-copyts".into());
+    if plan.restores_source_dolby_clock() {
+        args.extend([
+            "-itsoffset".into(),
+            format!("{:.9}", plan.encoded_mux_origin()).into(),
+        ]);
     }
     args.push("-i".into());
     args.push(ivf.as_os_str().to_owned());
@@ -2756,14 +3865,32 @@ fn mux_args(
     }
     args.extend([
         "-map_metadata".into(),
-        external.metadata_input_index().to_string().into(),
+        external.metadata_input_index(settings).to_string().into(),
         "-map_chapters".into(),
-        external.chapters_input_index().to_string().into(),
+        external.chapters_input_index(settings).to_string().into(),
         "-c".into(),
         "copy".into(),
     ]);
+    if settings
+        .hdr_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.dolby_vision_rpu_path.is_some())
+    {
+        let position = selected
+            .iter()
+            .position(|stream| stream.index == plan.video_index)
+            .expect("selected video");
+        // IVF has no container configuration record. The native FFmpeg filter
+        // authors profile10 signalling; the final verifier checks every parsed
+        // RPU field plus the configuration, including after MP4 conversion.
+        args.extend([
+            format!("-bsf:{position}").into(),
+            "dovi_rpu=compression=none".into(),
+        ]);
+    }
     // MOV/MP4 brands and minor versions describe the container being written.
     // They cannot be copied into the verified Matroska staging file as tags.
+    super::output_metadata::append(&mut args, settings);
     for key in ["major_brand", "minor_version", "compatible_brands"] {
         args.extend(["-metadata".into(), format!("{key}=").into()]);
     }
@@ -2774,10 +3901,14 @@ fn mux_args(
         if let Some(track) = converted_audio {
             audio::append_arguments(&mut args, index, track, stream);
         }
-        args.extend([
-            format!("-map_metadata:s:{index}").into(),
-            format!("{input_index}:s:{stream_index}").into(),
-        ]);
+        if settings.copy_metadata != Some(false)
+            || stream.codec_type.as_deref() == Some("attachment")
+        {
+            args.extend([
+                format!("-map_metadata:s:{index}").into(),
+                format!("{input_index}:s:{stream_index}").into(),
+            ]);
+        }
         let disposition = stream
             .disposition
             .iter()
@@ -2822,9 +3953,13 @@ fn mux_args(
             }
             display_num /= a;
             display_den /= a;
+            if !settings.source_filters && !plan.has_source_queue() {
+                args.extend([
+                    format!("-aspect:{index}").into(),
+                    format!("{display_num}:{display_den}").into(),
+                ]);
+            }
             args.extend([
-                format!("-aspect:{index}").into(),
-                format!("{display_num}:{display_den}").into(),
                 format!("-color_primaries:{index}").into(),
                 plan.primaries.to_string().into(),
                 format!("-color_trc:{index}").into(),
@@ -2860,10 +3995,27 @@ fn mux_args(
             }
         }
     }
-    if audio::converted(settings).next().is_some() || !external.is_empty() {
-        args.extend(["-avoid_negative_ts".into(), "disabled".into()]);
+    args.extend(["-avoid_negative_ts".into(), "disabled".into()]);
+    if let Some(format) = container::source_iso_format(output, selected, settings) {
+        container::append_format_options(&mut args, format, selected);
+        if format == media_core::ContainerFormat::Mp4
+            && settings
+                .encoding_preferences
+                .is_some_and(|preferences| preferences.mp4_faststart)
+            && let Some(index) = args.iter().rposition(|argument| argument == "-movflags")
+        {
+            args[index + 1] = format!("{}+faststart", args[index + 1].to_string_lossy()).into();
+        }
+        let index = selected
+            .iter()
+            .position(|stream| stream.index == plan.video_index)
+            .expect("source encoded picture");
+        let scale = u64::from(plan.fps_num) * 1000;
+        let step = u64::from(plan.fps_den) * 1000;
+        args.extend([format!("-bsf:{index}").into(),format!("setts=pts=round(PTS/{step})*{step}:dts=round(DTS/{step})*{step}:duration={step}:time_base=1/{scale}:prescale=1").into(),"-f".into(),format.ffmpeg_format().into(),"-y".into()]);
+    } else {
+        container::append_staging_format(&mut args, selected, Some(settings));
     }
-    args.extend(["-f", "matroska", "-y"].into_iter().map(OsString::from));
     args.push(output.as_os_str().to_owned());
     args
 }

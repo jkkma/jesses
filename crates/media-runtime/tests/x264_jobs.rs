@@ -519,6 +519,7 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     manager.ready().await.unwrap();
     let input = BatchEncodeInput {
+        video_mode: None,
         temporal: None,
         tone_map: None,
         trim: None,
@@ -531,11 +532,21 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
     };
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            copy_metadata: None,
+            copy_chapters: None,
+            source_naming: None,
+            encoding_preferences: None,
+            constant_quantizer: None,
+            source_nvenc_quality: false,
+            source_trim: false,
+            hdr_metadata: None,
+            video_mode: Default::default(),
             parameters: Vec::new(),
             av1an_options: None,
             output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
+            source_filters: false,
             output_container: None,
             rate_control: None,
             lossless: false,
@@ -622,17 +633,28 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
     let request = request(&input, &destination, 5);
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
+            copy_metadata: None,
+            copy_chapters: None,
+            source_naming: None,
+            encoding_preferences: None,
+            constant_quantizer: None,
+            source_nvenc_quality: false,
+            source_trim: false,
+            hdr_metadata: None,
+            video_mode: Default::default(),
             parameters: Vec::new(),
             av1an_options: None,
             output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
+            source_filters: false,
             output_container: None,
             rate_control: None,
             lossless: false,
             svt_crf_quarter_steps: None,
             svt_preset: None,
             inputs: vec![BatchEncodeInput {
+                video_mode: None,
                 temporal: None,
                 tone_map: None,
                 trim: None,

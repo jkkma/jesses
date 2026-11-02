@@ -5,20 +5,392 @@ use super::metadata::{Document, Stream};
 
 mod aspect;
 mod framing;
-mod hdr;
+pub(super) mod hdr;
 mod temporal;
 mod tone_map;
 use hdr::{Hdr10, StaticMetadata, validate_side_data};
 mod validation;
 pub(super) use validation::Validation;
 
+fn display_matrix(value: &serde_json::Value) -> bool {
+    matches!(
+        value
+            .get("side_data_type")
+            .and_then(serde_json::Value::as_str),
+        Some("Display Matrix" | "3x3 displaymatrix")
+    )
+}
+
+pub(super) fn preserves_dolby_source_clock(video: &Stream, settings: &EncodeSettings) -> bool {
+    let source = settings.tone_map.is_some_and(|tone| tone.source_workflow);
+    let legacy = settings.trim.is_none()
+        && !settings
+            .subtitles
+            .iter()
+            .any(|track| track.mode == media_core::SubtitleMode::BurnIn || track.burn_in)
+        && !settings.external_tracks.iter().any(|track| {
+            track.subtitle_burn_in || track.subtitle_mode == Some(media_core::SubtitleMode::BurnIn)
+        });
+    settings.backend == EncodeBackend::Standalone
+        && (source || legacy)
+        && !settings.hdr_metadata.as_ref().is_some_and(|metadata| {
+            metadata.dolby_vision_rpu_path.is_some() || metadata.hdr10_plus_json_path.is_some()
+        })
+        && tone_map::Transform::build(video, settings)
+            .ok()
+            .flatten()
+            .is_some_and(|tone| tone.permits_original_clock())
+}
+
+pub(super) fn source_av1an_base_clock(video: &Stream, settings: &EncodeSettings) -> bool {
+    settings.backend == EncodeBackend::Av1an
+        && settings
+            .av1an_options
+            .is_some_and(|options| options.source_workflow)
+        && settings.tone_map.is_some_and(|tone| {
+            tone.source_workflow
+                && tone.backend != media_core::ToneMapBackend::Gpu
+                && tone.algorithm != Some(media_core::ToneMapAlgorithm::Spline)
+        })
+        && !settings.hdr_metadata.as_ref().is_some_and(|metadata| {
+            metadata.dolby_vision_rpu_path.is_some() || metadata.hdr10_plus_json_path.is_some()
+        })
+        && !video.side_data_list.iter().any(display_matrix)
+        && !video
+            .tags
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("rotate"))
+        && tone_map::compatible_dolby_base(video)
+}
+
+pub(super) struct ImageFilterPlan {
+    pub filter: Option<String>,
+    pub prefix: String,
+    pub suffix: String,
+    pub device_args: Vec<std::ffi::OsString>,
+    pub input_seek: Option<String>,
+    pub output_trim: Vec<std::ffi::OsString>,
+    pub source_clock: bool,
+    pub width: u32,
+    pub height: u32,
+}
+pub(super) async fn image_filter_plan(
+    video: &Stream,
+    processing: &media_core::ImageProcessingSettings,
+    text: Option<&str>,
+    ffmpeg: &std::path::Path,
+    input: &std::path::Path,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    defer_vulkan: bool,
+) -> Result<ImageFilterPlan, AppError> {
+    let mut video = video.clone();
+    let mut processing = processing.clone();
+    let angle = video
+        .side_data_list
+        .iter()
+        .find_map(|value| value.get("rotation").and_then(serde_json::Value::as_f64))
+        .unwrap_or(0.0)
+        .round() as i32;
+    let oriented = super::source_normalization::oriented_settings(
+        &EncodeSettings {
+            framing: processing.framing,
+            ..Default::default()
+        },
+        angle,
+    );
+    processing.framing = oriented.framing;
+    if matches!(angle.rem_euclid(360), 90 | 270) {
+        std::mem::swap(&mut video.width, &mut video.height);
+        if let Some((n, d)) = video
+            .sample_aspect_ratio
+            .as_deref()
+            .and_then(|value| value.split_once(':'))
+            .map(|(n, d)| (n.to_owned(), d.to_owned()))
+        {
+            video.sample_aspect_ratio = Some(format!("{d}:{n}"));
+        }
+    }
+    let settings = EncodeSettings {
+        encoder: VideoEncoder::X264,
+        framing: processing.framing,
+        temporal: processing.temporal,
+        trim: processing.trim,
+        tone_map: processing.tone_map,
+        av1an_filters: processing.filters.clone(),
+        source_filters: processing.source_filters,
+        ..Default::default()
+    };
+    framing::validate(&settings)?;
+    temporal::validate(&settings)?;
+    tone_map::validate_settings(&settings)?;
+    super::av1an::validate_filters(&settings)?;
+    super::trim::validate_settings(&settings)?;
+    let source_clock =
+        processing.source_filters || processing.tone_map.is_some_and(|tone| tone.source_workflow);
+    let mut filters = if source_clock {
+        Vec::new()
+    } else {
+        vec!["setpts=PTS-STARTPTS".to_owned()]
+    };
+    if !source_clock && let Some(trim) = processing.trim {
+        if let Some(time) = trim.time {
+            if time.end_milliseconds <= time.start_milliseconds {
+                return Err(unsupported("Image trim end must follow its start."));
+            }
+            filters.push(format!(
+                "trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS",
+                f64::from(time.start_milliseconds) / 1000.0,
+                f64::from(time.end_milliseconds) / 1000.0
+            ));
+        } else {
+            if trim.end_frame_exclusive <= trim.start_frame {
+                return Err(unsupported("Image trim end must follow its start."));
+            }
+            filters.push(format!(
+                "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
+                trim.start_frame, trim.end_frame_exclusive
+            ));
+        }
+    }
+    if let Some(temporal) = processing.temporal {
+        if let Some(deint) = temporal.deinterlace {
+            filters.push(format!(
+                "{}=mode={}:parity={}:deint=all",
+                deint.engine.ffmpeg(),
+                if deint.mode == media_core::DeinterlaceMode::Bob {
+                    "send_field"
+                } else {
+                    "send_frame"
+                },
+                if deint.field_order == media_core::FieldOrder::TopFirst {
+                    "tff"
+                } else {
+                    "bff"
+                }
+            ));
+        }
+        if let Some(cadence) = temporal.cadence_repair {
+            if cadence.kind == media_core::CadenceRepairKind::ExactDuplicates {
+                filters.push("mpdecimate=max=0:keep=0:hi=0:lo=0:frac=1".into());
+            } else {
+                filters.push(format!(
+                    "fieldmatch=order={}:combmatch=full",
+                    if cadence.field_order == media_core::FieldOrder::TopFirst {
+                        "tff"
+                    } else {
+                        "bff"
+                    }
+                ));
+                if cadence.combed_fallback {
+                    filters.push("bwdif=mode=send_frame:parity=auto:deint=interlaced".into());
+                }
+                filters.push("decimate=cycle=5".into());
+            }
+        }
+    }
+    let mut device_args = Vec::new();
+    if let Some(mut tone) = tone_map::Transform::build(&video, &settings)? {
+        if !(defer_vulkan && tone.requires_vulkan()) {
+            tone.resolve(ffmpeg, input, video.index, None, None, cancel)
+                .await?;
+        }
+        device_args = tone.device_args();
+        filters.push(tone.filter());
+    }
+    if let Some(rate) = processing.temporal.and_then(|value| value.frame_rate) {
+        filters.push(format!(
+            "fps=fps={}/{}:start_time=0:round=near:eof_action=round",
+            rate.numerator, rate.denominator
+        ));
+    }
+    let prefix = filters.join(",");
+    filters.clear();
+    let (width, height) = (
+        video
+            .width
+            .ok_or_else(|| unsupported("Image source width is absent."))?,
+        video
+            .height
+            .ok_or_else(|| unsupported("Image source height is absent."))?,
+    );
+    let (width, height) = if processing.framing != media_core::VideoFraming::default() {
+        let sar = aspect::parse_source(video.sample_aspect_ratio.as_deref())?;
+        let (n, d) = sar.split_once(':').expect("validated SAR");
+        let mut geometry = framing::Geometry::build_with_sar(
+            width,
+            height,
+            processing.framing,
+            (n.parse().unwrap(), d.parse().unwrap()),
+        )?;
+        geometry.resize_filter = processing.temporal.unwrap_or_default().resize_filter;
+        if let Some(filter) = geometry.image_filter_with_text(text) {
+            filters.push(filter)
+        }
+        (geometry.width, geometry.height)
+    } else {
+        if let Some(text) = text {
+            filters.push(text.to_owned());
+        }
+        (width, height)
+    };
+    if let Some(aspect) = processing.temporal.and_then(|value| value.aspect_ratio) {
+        filters.push(aspect::Transform::build(aspect, width, height)?.filter());
+    }
+    filters.extend(super::av1an::filter_rows(&settings));
+    let suffix = filters.join(",");
+    let filter = [prefix.as_str(), suffix.as_str()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    let input_seek = source_clock
+        .then_some(processing.trim)
+        .flatten()
+        .and_then(|trim| trim.time)
+        .filter(|time| time.seek_strategy == media_core::VideoSeekStrategy::InputSeek)
+        .map(|time| format!("{:.3}", f64::from(time.start_milliseconds) / 1000.0));
+    let output_trim = if source_clock {
+        let rate = [
+            video.avg_frame_rate.as_deref(),
+            video.r_frame_rate.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.split_once('/'))
+        .filter_map(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .find(|(n, d)| *n > 0 && *d > 0);
+        if rate.is_none() && processing.trim.is_some_and(|trim| trim.time.is_none()) {
+            return Err(unsupported(
+                "Source image frame trim requires a valid nominal frame rate.",
+            ));
+        }
+        let rate = rate.unwrap_or((1, 1));
+        source_trim_arguments(
+            processing.trim,
+            rate,
+            source_keeps_frame_count(processing.temporal, rate),
+        )
+    } else {
+        Vec::new()
+    };
+    Ok(ImageFilterPlan {
+        filter: Some(if filter.is_empty() {
+            "null".into()
+        } else {
+            filter
+        }),
+        prefix: if prefix.is_empty() {
+            "null".into()
+        } else {
+            prefix
+        },
+        suffix,
+        device_args,
+        input_seek,
+        output_trim,
+        source_clock,
+        width,
+        height,
+    })
+}
+
+fn source_keeps_frame_count(
+    temporal: Option<media_core::TemporalSettings>,
+    rate: (u32, u32),
+) -> bool {
+    temporal.is_none_or(|temporal| {
+        !temporal
+            .deinterlace
+            .is_some_and(|deinterlace| deinterlace.mode == media_core::DeinterlaceMode::Bob)
+            && !temporal
+                .qtgmc
+                .is_some_and(|qtgmc| qtgmc.mode == media_core::DeinterlaceMode::Bob)
+            && temporal.frame_rate.is_none_or(|value| {
+                (f64::from(value.numerator) / f64::from(value.denominator)
+                    - f64::from(rate.0) / f64::from(rate.1))
+                .abs()
+                    < 0.01
+            })
+    })
+}
+
+fn source_trim_arguments(
+    trim: Option<media_core::VideoTrim>,
+    rate: (u32, u32),
+    keep_count: bool,
+) -> Vec<std::ffi::OsString> {
+    let Some(trim) = trim else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    if let Some(time) = trim.time {
+        if time.seek_strategy == media_core::VideoSeekStrategy::DecodeFromStart {
+            args.extend([
+                "-ss".into(),
+                format!("{:.3}", f64::from(time.start_milliseconds) / 1000.0).into(),
+            ]);
+        }
+        args.extend([
+            "-t".into(),
+            format!(
+                "{:.3}",
+                f64::from(time.end_milliseconds - time.start_milliseconds) / 1000.0
+            )
+            .into(),
+        ]);
+    } else {
+        let (n, d) = rate;
+        let frame = f64::from(d) / f64::from(n);
+        let start = ((f64::from(trim.start_frame) * frame - frame / 2.0).max(0.0) * 1000.0).floor()
+            / 1000.0;
+        let duration =
+            ((f64::from(trim.end_frame_exclusive - trim.start_frame) + 0.5) * frame * 1000.0)
+                .floor()
+                / 1000.0;
+        args.extend([
+            "-ss".into(),
+            format!("{start:.3}").into(),
+            "-t".into(),
+            format!("{duration:.3}").into(),
+        ]);
+        if keep_count {
+            args.extend([
+                "-frames:v".into(),
+                (trim.end_frame_exclusive - trim.start_frame)
+                    .to_string()
+                    .into(),
+            ]);
+        }
+    }
+    args
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
     pub trim: Option<media_core::VideoTrim>,
+    /// Verified common mux clock for source packet-granular trim.
+    pub output_origin: f64,
+    /// Validated source origin. Copied AV1AN cuts additionally permit ordinal
+    /// clocks; source Dolby rendering additionally validates monotonic clocks
+    /// before the actual producer/engine establishes its encoded CFR contract.
+    pub source_origin: f64,
+    /// Set only after the source AV1AN copied-cut receipt is fully verified.
+    /// That reader consumes every decoded frame by ordinal, retaining copied
+    /// GOP boundary gaps in the input clock rather than inventing frames.
+    pub source_cut_ordinals: bool,
+    source_dolby_clock: bool,
+    pub(super) source_dolby_render: bool,
+    source_av1an_base_clock: bool,
+    source_rotation: i32,
+    source_coded_size: (u32, u32),
+    // Only an internally verified copied cut may carry its original matrix.
+    source_cut_transform: Option<&'static str>,
+    pub source_trim: bool,
     tone_map: Option<tone_map::Transform>,
     grain_prefilter: Option<u8>,
     prepare_metric_reference: bool,
     custom_filters: Vec<String>,
+    source_filters: bool,
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
     source_pixel_format: &'static str,
@@ -33,14 +405,23 @@ pub(super) struct Plan {
     output_sar: String,
     pub fps_num: u32,
     pub fps_den: u32,
+    /// Frozen typed processing rate before arbitrary source filter output is
+    /// observed. The fork captures its chunk interval at this same boundary.
+    source_chunk_rate: (u32, u32),
+    source_av1an_input_rate: (u32, u32),
+    source_av1an_workflow: bool,
+    source_queue: Option<std::sync::Arc<super::source_queue::Regions>>,
     pub cadence_reconciled: bool,
     pub tolerance: f64,
     pub primaries: u8,
     pub transfer: u8,
     pub matrix: u8,
     pub full_range: bool,
+    source_full_range: bool,
     pub chroma: &'static str,
     hdr10: Option<Hdr10>,
+    source_hdr10: Option<Hdr10>,
+    authored_hdr: Option<StaticMetadata>,
 }
 
 pub(super) fn unsupported(message: &str) -> AppError {
@@ -48,6 +429,21 @@ pub(super) fn unsupported(message: &str) -> AppError {
 }
 
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    super::encoding_preferences::validate(settings)?;
+    if settings.video_mode == media_core::VideoMode::Encode {
+        settings.encoder.require_cpu_encoding()?;
+        if settings.source_nvenc_quality {
+            return Err(AppError::new(
+                "HARDWARE_ENCODING_UNSUPPORTED",
+                "This historical hardware encoding profile is unsupported in CPU-only Jesses.",
+                None,
+            ));
+        }
+    }
+    if settings.video_mode != media_core::VideoMode::Encode {
+        return super::conversion::validate_settings(settings);
+    }
+    validate_hdr_metadata_settings(settings)?;
     super::external_tracks::validate(settings)?;
     super::parameters::validate(settings)?;
     temporal::validate(settings)?;
@@ -144,12 +540,12 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
     let standalone = settings.backend == EncodeBackend::Standalone;
     let valid = match settings.encoder {
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-            settings.svt_crf_quarter_steps.map_or_else(
-                || (1..=63).contains(&settings.crf),
-                |value| (4..=280).contains(&value),
-            ) && settings
-                .svt_preset
-                .map_or(settings.preset <= 13, |value| (-3..=13).contains(&value))
+            settings
+                .svt_crf_quarter_steps
+                .map_or_else(|| settings.crf <= 63, |value| value <= 280)
+                && settings
+                    .svt_preset
+                    .map_or(settings.preset <= 13, |value| (-3..=13).contains(&value))
                 && settings.film_grain <= 50
         }
         VideoEncoder::X264 => {
@@ -192,7 +588,7 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
         }
         VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
             standalone
-                && settings.crf <= 51
+                && (settings.constant_quantizer.is_some() || settings.crf <= 51)
                 && settings.preset <= 6
                 && settings.film_grain == 0
                 && !settings.hdr10_fallback
@@ -251,6 +647,100 @@ fn sdr_color(text: Option<&str>) -> Result<u8, AppError> {
     }
 }
 
+fn unspecified(text: Option<&str>) -> bool {
+    matches!(text, None | Some("unknown" | "unspecified"))
+}
+fn source_sdr_color(text: Option<&str>, fallback: u8) -> Result<u8, AppError> {
+    if unspecified(text) {
+        Ok(fallback)
+    } else {
+        sdr_color(text)
+    }
+}
+fn color_name(code: u8) -> &'static str {
+    match code {
+        1 => "bt709",
+        5 => "bt470bg",
+        6 => "smpte170m",
+        9 => "bt2020",
+        16 => "smpte2084",
+        18 => "arib-std-b67",
+        _ => unreachable!("validated color code"),
+    }
+}
+fn matrix_name(code: u8) -> &'static str {
+    if code == 9 {
+        "bt2020nc"
+    } else {
+        color_name(code)
+    }
+}
+
+pub(super) fn validate_hdr_metadata_settings(settings: &EncodeSettings) -> Result<(), AppError> {
+    let Some(metadata) = &settings.hdr_metadata else {
+        return Ok(());
+    };
+    hdr::authored(metadata)?;
+    if settings.tone_map.is_some()
+        || !(settings.encoder.is_svt()
+            || matches!(
+                settings.encoder,
+                VideoEncoder::AomAv1 | VideoEncoder::X265 | VideoEncoder::X265Standalone
+            ))
+    {
+        return Err(unsupported(
+            "Authored HDR metadata requires HDR output with SVT-AV1, AOM or x265. Disable SDR tone mapping or choose an HDR-capable encoder.",
+        ));
+    }
+    if metadata.dolby_vision_rpu_path.is_some() || metadata.hdr10_plus_json_path.is_some() {
+        if !matches!(
+            settings.encoder,
+            VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr
+        ) {
+            return Err(unsupported(
+                "External Dolby Vision/HDR10+ metadata requires a compatible SVT provider with the matching metadata library.",
+            ));
+        }
+        if settings.trim.is_some()
+            || settings.temporal.is_some()
+            || settings.framing != media_core::VideoFraming::default()
+            || !settings.av1an_filters.is_empty()
+            || settings
+                .av1an_grain
+                .as_ref()
+                .is_some_and(|grain| grain.denoise)
+        {
+            return Err(unsupported(
+                "External per-frame HDR metadata must match unchanged complete source frames. Clear trim, geometry, frame-rate, deinterlace and custom filters before importing it.",
+            ));
+        }
+        if settings.backend == EncodeBackend::Av1an
+            && !settings.av1an_options.is_some_and(|options| {
+                options.split_method == media_core::Av1anSplitMethod::FixedChunks
+                    && options.maximum_chunk_frames == 0
+            })
+        {
+            return Err(unsupported(
+                "External per-frame HDR metadata requires standalone encoding or a single AV1AN chunk (fixed splitting, maximum chunk frames 0). Parallel chunks require metadata sliced to their source frame intervals.",
+            ));
+        }
+        for path in [
+            metadata.dolby_vision_rpu_path.as_deref(),
+            metadata.hdr10_plus_json_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.contains('\0') || !std::path::Path::new(path).is_absolute() {
+                return Err(unsupported(
+                    "HDR metadata resources require absolute local file paths.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn source_pixel_format(
     format: Option<&str>,
     full_range: bool,
@@ -269,6 +759,7 @@ fn source_pixel_format(
         Some("uyvy422") => Ok(("uyvy422", 8)),
         Some("rgb24") if full_range => Ok(("rgb24", 8)),
         Some("bgr24") if full_range => Ok(("bgr24", 8)),
+        Some("bgr0") if full_range => Ok(("bgr0", 8)),
         Some("gbrp") if full_range => Ok(("gbrp", 8)),
         Some("gbrp10le") if full_range => Ok(("gbrp10le", 10)),
         Some("gbrp12le") if full_range => Ok(("gbrp12le", 12)),
@@ -291,6 +782,7 @@ fn rgb_source_format(format: &str) -> bool {
         format,
         "rgb24"
             | "bgr24"
+            | "bgr0"
             | "rgba"
             | "gbrp"
             | "gbrp10le"
@@ -302,8 +794,59 @@ fn rgb_source_format(format: &str) -> bool {
 }
 
 impl Plan {
-    pub fn build(
+    /// The caller has independently sealed a source AV1AN stream-copy cut.
+    /// Plan its display raster while retaining its untouched coded-frame contract.
+    pub(super) fn build_source_cut(
         document: &Document,
+        selected: &[&Stream],
+        settings: &EncodeSettings,
+    ) -> Result<Self, AppError> {
+        let original = selected
+            .iter()
+            .copied()
+            .find(|video| {
+                video.index == settings.video_stream_index
+                    && video.codec_type.as_deref() == Some("video")
+            })
+            .ok_or_else(|| unsupported("The verified cut has no selected video."))?;
+        let (swaps, transform) =
+            crate::analysis::display_transform_parts(&original.side_data_list, &original.tags)
+                .map_err(unsupported)?;
+        let mut display = document.clone();
+        let video = display
+            .streams
+            .iter_mut()
+            .find(|video| video.index == original.index)
+            .expect("selected cut stream");
+        video.side_data_list.retain(|value| !display_matrix(value));
+        video
+            .tags
+            .retain(|key, _| !key.eq_ignore_ascii_case("rotate"));
+        let raw_sar = aspect::parse_source(original.sample_aspect_ratio.as_deref())?;
+        if swaps {
+            std::mem::swap(&mut video.width, &mut video.height);
+            let (n, d) = raw_sar.split_once(':').expect("validated source SAR");
+            video.sample_aspect_ratio = Some(format!("{d}:{n}"));
+        }
+        let indices = selected
+            .iter()
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        let mut plan = Self::build(&display, &display.selected(&indices)?, settings)?;
+        plan.source_coded_size = (
+            original
+                .width
+                .ok_or_else(|| unsupported("The copied source width is absent."))?,
+            original
+                .height
+                .ok_or_else(|| unsupported("The copied source height is absent."))?,
+        );
+        plan.source_sar = raw_sar;
+        plan.source_cut_transform = Some(transform);
+        Ok(plan)
+    }
+    pub fn build(
+        _document: &Document,
         selected: &[&Stream],
         settings: &EncodeSettings,
     ) -> Result<Self, AppError> {
@@ -315,12 +858,19 @@ impl Plan {
             .iter()
             .filter(|s| s.codec_type.as_deref() == Some("video"))
             .collect();
-        if videos.len() != 1 || videos[0].index != settings.video_stream_index {
+        if videos.len() != 1
+            || !videos
+                .iter()
+                .any(|video| video.index == settings.video_stream_index)
+        {
             return Err(unsupported(
                 "Select exactly one video stream and make it the video chosen for encoding.",
             ));
         }
-        let video = videos[0];
+        let video = videos
+            .iter()
+            .find(|video| video.index == settings.video_stream_index)
+            .expect("selected video");
         let tone_map = tone_map::Transform::build(video, settings)?;
         let source_has_alpha_tag = video
             .tags
@@ -334,29 +884,35 @@ impl Plan {
                 "An alpha_mode source needs supported VP9 8-bit 4:2:0 alpha metadata and an explicit alpha-preserving output.",
             ));
         }
+        let inherently_full = video.pix_fmt.as_deref().is_some_and(|format| {
+            format.starts_with("rgb")
+                || format.starts_with("bgr")
+                || format.starts_with("gbr")
+                || format.starts_with("yuvj")
+        });
+        let source_full_range = match video.color_range.as_deref() {
+            Some("pc") => true,
+            Some("tv") => false,
+            value if unspecified(value) => inherently_full,
+            _ => return Err(unsupported("The source color range is unsupported.")),
+        };
         let (source_pixel_format, source_depth) = source_pixel_format(
             if source_is_vp9_alpha {
                 Some("yuva420p")
             } else {
                 video.pix_fmt.as_deref()
             },
-            video.color_range.as_deref() == Some("pc"),
+            source_full_range,
         )?;
         let rgb_source = rgb_source_format(source_pixel_format);
         let alpha_source = matches!(source_pixel_format, "rgba" | "yuva420p");
-        if settings.encoder.is_svt()
-            && video.color_range.as_deref() == Some("pc")
-            && !rgb_source
-            && tone_map.is_none()
-        {
-            return Err(unsupported(
-                "SVT requires limited-range YUV. Full-range opaque RGB can be explicitly converted to limited-range BT.709 output.",
-            ));
-        }
         if rgb_source
-            && (video.color_space.as_deref() != Some("gbr")
-                || video.color_primaries.as_deref() != Some("bt709")
-                || video.color_transfer.as_deref() != Some("bt709"))
+            && (!unspecified(video.color_space.as_deref())
+                && video.color_space.as_deref() != Some("gbr")
+                || !unspecified(video.color_primaries.as_deref())
+                    && video.color_primaries.as_deref() != Some("bt709")
+                || !unspecified(video.color_transfer.as_deref())
+                    && video.color_transfer.as_deref() != Some("bt709"))
         {
             return Err(unsupported(
                 "RGB/GBR input requires full-range BT.709 primaries and transfer with an explicit GBR identity matrix. RGBA alpha requires standalone VP9 YUVA output.",
@@ -371,25 +927,33 @@ impl Plan {
             None | Some("progressive" | "unknown")
         ) {
             return Err(unsupported(
-                "Interlaced video requires explicit BWDIF, QTGMC, or inverse telecine processing and the matching TFF/BFF source field order.",
+                "Interlaced video requires explicit BWDIF, YADIF, QTGMC, or inverse telecine processing and the matching TFF/BFF source field order.",
             ));
         }
         let source_sar = aspect::parse_source(video.sample_aspect_ratio.as_deref())?;
-        if source_sar != "1:1"
-            && settings
-                .temporal
-                .and_then(|temporal| temporal.aspect_ratio)
-                .is_none()
-        {
-            return Err(unsupported(
-                "A non-square source requires an explicit output SAR or DAR conversion.",
-            ));
-        }
         let is_hdr10 = video.color_primaries.as_deref() == Some("bt2020")
             && video.color_transfer.as_deref() == Some("smpte2084")
             && video.color_space.as_deref() == Some("bt2020nc")
             && video.pix_fmt.as_deref() == Some("yuv420p10le")
-            && video.color_range.as_deref() == Some("tv");
+            && !source_full_range;
+        if !is_hdr10
+            && tone_map.is_none()
+            && video.side_data_list.iter().any(|value| {
+                matches!(
+                    hdr::kind(value),
+                    "Mastering display metadata" | "Content light level metadata"
+                )
+            })
+        {
+            return Err(unsupported(&format!(
+                "Static HDR metadata requires a supported HDR color contract. Observed {:?}, {:?}, {:?}, {:?}, {:?}.",
+                video.pix_fmt,
+                video.color_primaries,
+                video.color_transfer,
+                video.color_space,
+                video.color_range
+            )));
+        }
         let explicit_pixel_format = settings
             .output_pixel_format
             .or_else(|| {
@@ -406,10 +970,9 @@ impl Plan {
         if alpha_source
             && (settings.temporal.is_some()
                 || !settings.av1an_filters.is_empty()
-                || settings
-                    .subtitles
-                    .iter()
-                    .any(|subtitle| subtitle.mode == media_core::SubtitleMode::BurnIn))
+                || settings.subtitles.iter().any(|subtitle| {
+                    subtitle.mode == media_core::SubtitleMode::BurnIn || subtitle.burn_in
+                }))
         {
             return Err(unsupported(
                 "VP9 alpha preservation currently supports trim and framing, but not temporal filters, custom pixel filters, or subtitle burn-in.",
@@ -431,6 +994,7 @@ impl Plan {
                     | VideoEncoder::SvtAv1Hdr
                     | VideoEncoder::AomAv1
                     | VideoEncoder::X265Standalone
+                    | VideoEncoder::X265
             )
             && tone_map.is_none()
         {
@@ -438,18 +1002,48 @@ impl Plan {
                 "The selected encoder supports SDR output only. Select SVT-AV1, AOM, or standalone x265 for preserved HDR10, or enable explicit HDR/HLG-to-SDR tone mapping.",
             ));
         }
-        let hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg || tone.dv5) {
+        let source_hdr10 = if is_hdr10 || tone_map.as_ref().is_some_and(|tone| tone.hlg || tone.dv5)
+        {
             Some(Hdr10::build(
-                &video.side_data_list,
+                &video
+                    .side_data_list
+                    .iter()
+                    .filter(|value| {
+                        !(settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                            && preserves_dolby_source_clock(video, settings)
+                            && display_matrix(value))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 settings.hdr10_fallback
-                    || tone_map
-                        .as_ref()
-                        .is_some_and(|tone| tone.settings.hdr10_base_layer || tone.dv5),
+                    || tone_map.as_ref().is_some_and(|tone| {
+                        tone.settings.hdr10_base_layer
+                            || tone.dolby_rpu
+                            || (tone.settings.source_workflow && tone.permits_original_clock())
+                    }),
                 tone_map.as_ref().is_some_and(|tone| tone.dv5),
             )?)
         } else {
             None
         };
+        let authored_hdr = settings
+            .hdr_metadata
+            .as_ref()
+            .map(hdr::authored)
+            .transpose()?;
+        if authored_hdr.is_some() && !is_hdr10 {
+            return Err(unsupported(
+                "Authored HDR metadata requires a BT.2020/PQ 10-bit HDR10 source/output. Static metadata cannot turn SDR pixels into HDR.",
+            ));
+        }
+        let mut hdr10 = source_hdr10.clone();
+        if let (Some(hdr), Some(metadata)) = (&mut hdr10, &settings.hdr_metadata) {
+            hdr.imported_dolby = metadata.dolby_vision_rpu_path.is_some();
+            hdr.imported_hdr10plus = metadata.hdr10_plus_json_path.is_some();
+        }
+        if let (Some(hdr), Some(authored)) = (&mut hdr10, &authored_hdr) {
+            hdr.metadata.apply_authored(authored);
+        }
         if hdr10.as_ref().is_some_and(|hdr| hdr.dolby.is_some())
             && video.codec_name.as_deref() != Some("hevc")
         {
@@ -457,7 +1051,17 @@ impl Plan {
                 "Dolby Vision HDR10 fallback supports HEVC profile 7/8 base layers only.",
             ));
         }
-        validate_side_data(&video.side_data_list, hdr10.as_ref(), false)?;
+        let validation_side_data = video
+            .side_data_list
+            .iter()
+            .filter(|value| {
+                !(settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                    && preserves_dolby_source_clock(video, settings)
+                    && display_matrix(value))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_side_data(&validation_side_data, hdr10.as_ref(), false)?;
         if video
             .tags
             .iter()
@@ -478,8 +1082,8 @@ impl Plan {
         }
         let (width, height) = match (video.width, video.height) {
             (Some(w), Some(h))
-                if (64..=8192).contains(&w)
-                    && (64..=8192).contains(&h)
+                if (2..=16384).contains(&w)
+                    && (2..=16384).contains(&h)
                     && w % 2 == 0
                     && h % 2 == 0 =>
             {
@@ -487,11 +1091,46 @@ impl Plan {
             }
             _ => {
                 return Err(unsupported(
-                    "Encoding requires even dimensions between 64 and 8192 pixels.",
+                    "Encoding requires even dimensions between 2 and 16384 pixels.",
                 ));
             }
         };
-        let mut geometry = framing::Geometry::build(width, height, settings.framing)?;
+        let source_dolby_render = settings.tone_map.is_some_and(|tone| tone.source_workflow)
+            && preserves_dolby_source_clock(video, settings);
+        let rotation = if source_dolby_render {
+            video
+                .side_data_list
+                .iter()
+                .find_map(|value| value.get("rotation").and_then(serde_json::Value::as_f64))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let source_rotation = rotation.round() as i32;
+        if !rotation.is_finite()
+            || (rotation - f64::from(source_rotation)).abs() > 0.001
+            || source_rotation % 90 != 0
+        {
+            return Err(unsupported(
+                "Intact Dolby rendering supports right-angle display rotations only.",
+            ));
+        }
+        let source_coded_size = (width, height);
+        let (width, height) = if source_rotation.rem_euclid(180) == 90 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let (sar_n, sar_d) = source_sar.split_once(':').expect("validated SAR");
+        let mut geometry = framing::Geometry::build_with_sar(
+            width,
+            height,
+            settings.framing,
+            (
+                sar_n.parse().expect("SAR numerator"),
+                sar_d.parse().expect("SAR denominator"),
+            ),
+        )?;
         geometry.resize_filter = settings
             .temporal
             .map_or_default(|temporal| temporal.resize_filter);
@@ -500,35 +1139,72 @@ impl Plan {
             .and_then(|temporal| temporal.aspect_ratio)
             .map(|aspect| aspect::Transform::build(aspect, geometry.width, geometry.height))
             .transpose()?;
-        let output_sar = aspect.map_or_else(|| "1:1".into(), aspect::Transform::sar);
+        let output_sar = aspect.map_or_else(
+            || {
+                if settings.framing.resize.is_some() || settings.framing.resize_width.is_some() {
+                    "1:1".into()
+                } else {
+                    source_sar.clone()
+                }
+            },
+            aspect::Transform::sar,
+        );
         let (fps_num, fps_den) = rational(video.avg_frame_rate.as_deref())
             .or_else(|| rational(video.r_frame_rate.as_deref()))
             .ok_or_else(|| unsupported("The source has no usable rational frame rate."))?;
         let fps = f64::from(fps_num) / f64::from(fps_den);
-        if !(1.0..=120.0).contains(&fps) {
+        if !(0.001..=1000.0).contains(&fps) {
             return Err(unsupported(
-                "Encoding supports constant frame rates from 1 through 120 fps.",
+                "Encoding supports positive constant frame rates from 0.001 through 1000 fps; the selected encoder may impose a narrower limit.",
             ));
         }
         let tick = rational(video.time_base.as_deref())
             .map(|(n, d)| f64::from(n) / f64::from(d))
             .unwrap_or(0.000001);
         let tolerance = tick.clamp(0.000001, 0.001) + 0.000002;
-        for start in [
-            video.start_time.as_deref(),
-            document
-                .format
-                .as_ref()
-                .and_then(|f| f.start_time.as_deref()),
-        ] {
-            if !seconds(start).is_some_and(|value| value.abs() <= tolerance) {
-                return Err(unsupported(
-                    "Encoding requires video and container timelines that start at zero. Timestamp offset handling is not available yet.",
-                ));
-            }
+        let declared_origin = seconds(video.start_time.as_deref())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        if !seconds(video.start_time.as_deref()).is_some_and(|value| value.abs() <= tolerance)
+            && !preserves_dolby_source_clock(video, settings)
+            && !source_av1an_base_clock(video, settings)
+        {
+            return Err(unsupported(
+                "Encoding requires video timelines that start at zero. Timestamp offset handling requires canonical source preparation.",
+            ));
         }
+        let conventional_sdr = if rgb_source
+            || video.height.is_some_and(|height| height > 576)
+            || video.width.is_some_and(|width| width >= 1280)
+        {
+            1
+        } else if video.height == Some(576) {
+            5
+        } else {
+            6
+        };
+        let fallback_sdr = [
+            video.color_space.as_deref(),
+            video.color_primaries.as_deref(),
+            video.color_transfer.as_deref(),
+        ]
+        .into_iter()
+        .find_map(|value| sdr_color(value).ok())
+        .unwrap_or(conventional_sdr);
         Ok(Self {
-            custom_filters: settings.av1an_filters.clone(),
+            output_origin: 0.0,
+            source_origin: declared_origin,
+            source_cut_ordinals: false,
+            source_dolby_clock: declared_origin.abs() > tolerance
+                && preserves_dolby_source_clock(video, settings),
+            source_dolby_render,
+            source_rotation,
+            source_coded_size,
+            source_cut_transform: None,
+            source_av1an_base_clock: source_av1an_base_clock(video, settings),
+            source_trim: settings.source_trim,
+            custom_filters: super::av1an::filter_rows(settings),
+            source_filters: settings.source_filters,
             grain_prefilter: settings
                 .av1an_grain
                 .as_ref()
@@ -536,9 +1212,19 @@ impl Plan {
                 .map(|grain| grain.denoise_strength),
             prepare_metric_reference: settings
                 .av1an_options
+                .filter(|options| !options.source_target_defaults)
                 .and_then(|options| options.target_quality)
                 .is_some_and(|target| target.metric != media_core::Av1anTargetMetric::Vmaf),
-            temporal: settings.temporal.map(temporal::Transform::new),
+            temporal: settings.temporal.map(|mut value| {
+                if settings
+                    .av1an_options
+                    .is_some_and(|options| options.source_workflow)
+                    && !super::av1an::source_resamples(settings, (fps_num, fps_den))
+                {
+                    value.frame_rate = None;
+                }
+                temporal::Transform::new(value)
+            }),
             trim: settings.trim,
             encoder: settings.encoder,
             source_pixel_format,
@@ -559,6 +1245,13 @@ impl Plan {
             output_sar,
             fps_num,
             fps_den,
+            source_chunk_rate: (fps_num, fps_den),
+            source_av1an_input_rate: (fps_num, fps_den),
+            source_av1an_workflow: settings.backend == EncodeBackend::Av1an
+                && settings
+                    .av1an_options
+                    .is_some_and(|options| options.source_workflow),
+            source_queue: None,
             cadence_reconciled: false,
             tolerance,
             primaries: if tone_map.is_some() {
@@ -566,14 +1259,14 @@ impl Plan {
             } else if is_hdr10 {
                 9
             } else {
-                sdr_color(video.color_primaries.as_deref())?
+                source_sdr_color(video.color_primaries.as_deref(), fallback_sdr)?
             },
             transfer: if tone_map.is_some() {
                 1
             } else if is_hdr10 {
                 16
             } else {
-                sdr_color(video.color_transfer.as_deref())?
+                source_sdr_color(video.color_transfer.as_deref(), fallback_sdr)?
             },
             matrix: if tone_map.is_some() {
                 1
@@ -582,21 +1275,16 @@ impl Plan {
             } else if rgb_source {
                 1 // The encoded YUV uses BT.709; RGB input carries GBR identity.
             } else {
-                sdr_color(video.color_space.as_deref())?
+                source_sdr_color(video.color_space.as_deref(), fallback_sdr)?
             },
             hdr10,
-            full_range: if tone_map.is_some() || (settings.encoder.is_svt() && rgb_source) {
+            source_hdr10,
+            authored_hdr,
+            source_full_range,
+            full_range: if tone_map.is_some() || settings.encoder.is_svt() {
                 false
             } else {
-                match video.color_range.as_deref() {
-                    Some("tv") => false,
-                    Some("pc") => true,
-                    _ => {
-                        return Err(unsupported(
-                            "Explicit limited or full color range is required.",
-                        ));
-                    }
-                }
+                source_full_range
             },
             chroma: if tone_map.is_some() {
                 "left"
@@ -615,6 +1303,7 @@ impl Plan {
                     None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => {
                         "unknown"
                     }
+                    None | Some("unspecified" | "unknown") => "left",
                     _ => {
                         return Err(unsupported(
                             "SVT supports left, top-left, or unspecified chroma placement; x264, x265, and VP9 require explicit left, center, or top-left placement.",
@@ -630,8 +1319,201 @@ impl Plan {
         f64::from(self.fps_den) / f64::from(self.fps_num)
     }
 
+    pub fn source_interpretation_notes(&self, source: &Stream) -> Vec<String> {
+        let mut notes = Vec::new();
+        if [
+            source.color_primaries.as_deref(),
+            source.color_transfer.as_deref(),
+            source.color_space.as_deref(),
+            source.color_range.as_deref(),
+        ]
+        .into_iter()
+        .any(unspecified)
+        {
+            notes.push(format!("Unspecified source SDR fields use conventional interpretation: primaries {}, transfer {}, matrix {}, range {}. Explicit source tags remain authoritative; every decoded frame is still checked against the original stream metadata.",color_name(self.primaries),color_name(self.transfer),matrix_name(self.matrix),if self.source_full_range {"full"} else {"limited"}));
+        }
+        if self.source_full_range != self.full_range {
+            notes.push("The selected encoder requires limited-range YUV; the verified decoder converts full-range source samples before encoding.".into());
+        }
+        notes
+    }
+
     pub fn output_sar(&self) -> &str {
         &self.output_sar
+    }
+    pub fn encoded_mux_origin(&self) -> f64 {
+        if self.source_dolby_clock && !self.source_dolby_render && self.trim.is_none() {
+            self.source_origin
+        } else {
+            self.output_origin
+        }
+    }
+    pub fn restores_source_dolby_clock(&self) -> bool {
+        self.source_dolby_clock && !self.source_dolby_render && self.trim.is_none()
+    }
+    pub fn has_source_filters(&self) -> bool {
+        self.source_filters
+    }
+    pub fn source_chunk_rate(&self) -> (u32, u32) {
+        self.source_chunk_rate
+    }
+    pub(in crate::jobs) fn source_av1an_input_rate(&self) -> (u32, u32) {
+        self.source_av1an_input_rate
+    }
+    pub(in crate::jobs) fn source_queue_regions(
+        &mut self,
+        regions: std::sync::Arc<super::source_queue::Regions>,
+        rate: (u32, u32),
+    ) {
+        (self.width, self.height) = regions.first_dimensions();
+        self.output_sar = regions.first_sar().into();
+        (self.fps_num, self.fps_den) = regions.reference_rate().unwrap_or(rate);
+        self.source_queue = Some(regions);
+    }
+    pub(in crate::jobs) fn source_queue_frame_count(&self) -> Option<usize> {
+        self.source_queue
+            .as_ref()
+            .map(|regions| usize::try_from(regions.frames()).expect("validated source queue size"))
+    }
+    pub(in crate::jobs) fn has_source_queue(&self) -> bool {
+        self.source_queue.is_some()
+    }
+    pub fn without_source_filter_rows(&self) -> Self {
+        let mut plan = self.clone();
+        plan.custom_filters.clear();
+        plan
+    }
+    pub fn source_filter_rows_only(&self) -> Option<String> {
+        (!self.custom_filters.is_empty()).then(|| self.custom_filters.join(","))
+    }
+
+    pub fn source_filter_document(&self, mut document: Document, frames: usize) -> Document {
+        if (self.source_filters || self.source_queue.is_some() || self.source_av1an_base_clock)
+            && let Some(video) = document
+                .streams
+                .iter_mut()
+                .find(|stream| stream.index == self.video_index)
+        {
+            // Raw source filters can change frame count or nominal Y4M rate.
+            // Count/geometry/clock have already been proved against the actual
+            // coded checkpoint; copied non-video tracks retain their own ends.
+            video.duration = Some(
+                self.source_queue
+                    .as_ref()
+                    .and_then(|regions| regions.reference_duration())
+                    .unwrap_or(frames as f64 * self.frame_seconds())
+                    .to_string(),
+            );
+            video.avg_frame_rate = Some(format!("{}/{}", self.fps_num, self.fps_den));
+            video.r_frame_rate = video.avg_frame_rate.clone();
+            video.sample_aspect_ratio = Some(self.output_sar.clone());
+            if (self.source_dolby_render && self.trim.is_none()) || self.source_av1an_base_clock {
+                // Source Y4M's default CFR pads a positive first-frame gap;
+                // the separately wrapped coded track consequently starts at0.
+                // Copied audio/subtitle clocks retain their original authority.
+                video.start_time = Some("0".into());
+                video.packet_start_time = Some(0.0);
+            }
+            video
+                .tags
+                .retain(|key, _| !super::metadata::is_derived_stream_tag(key));
+        }
+        document
+    }
+    pub fn source_filter_contract(&self, frames: usize) -> super::source_filters::OutputContract {
+        super::source_filters::OutputContract {
+            width: self.width,
+            height: self.height,
+            sar: self.output_sar.clone(),
+            numerator: self.fps_num,
+            denominator: self.fps_den,
+            frames: frames as u64,
+        }
+    }
+    pub fn apply_source_filter_contract(
+        &mut self,
+        contract: &super::source_filters::OutputContract,
+    ) -> Result<(), AppError> {
+        if !self.source_filters
+            || contract.width == 0
+            || contract.height == 0
+            || contract.frames == 0
+            || contract.numerator == 0
+            || contract.denominator == 0
+        {
+            return Err(unsupported(
+                "Invalid observed source-filter output contract.",
+            ));
+        }
+        let sar = aspect::parse_source(Some(&contract.sar))?;
+        self.width = contract.width;
+        self.height = contract.height;
+        self.output_sar = sar;
+        self.fps_num = contract.numerator;
+        self.fps_den = contract.denominator;
+        Ok(())
+    }
+    pub fn observe_source_filter_reference(
+        &mut self,
+        stream: &Stream,
+        clock: &super::source_filters::ProducerClock,
+    ) -> Result<(), AppError> {
+        if !self.source_filters
+            || stream.codec_name.as_deref() != Some("ffv1")
+            || !self.matches_output_format(stream.pix_fmt.as_deref())
+        {
+            return Err(unsupported(
+                "The source filter reference must remain a lossless FFV1 video in the selected pixel format.",
+            ));
+        }
+        self.width = stream
+            .width
+            .filter(|value| *value > 0)
+            .ok_or_else(|| unsupported("The filtered reference has no valid width."))?;
+        self.height = stream
+            .height
+            .filter(|value| *value > 0)
+            .ok_or_else(|| unsupported("The filtered reference has no valid height."))?;
+        self.output_sar = aspect::parse_source(stream.sample_aspect_ratio.as_deref())?;
+        self.fps_num = clock.time_base.1;
+        self.fps_den = clock.time_base.0;
+        Ok(())
+    }
+    pub fn observe_source_filter_stream(
+        &mut self,
+        stream: &Stream,
+        producer: Option<&super::source_filters::ProducerClock>,
+    ) -> Result<(), AppError> {
+        if !self.source_filters
+            || stream.codec_name.as_deref() != Some(self.output_codec())
+            || !self.matches_output_format(stream.pix_fmt.as_deref())
+        {
+            return Err(unsupported(
+                "The source filter output changed the selected codec or pixel format/depth.",
+            ));
+        }
+        let (width, height) = match (stream.width, stream.height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
+            _ => {
+                return Err(unsupported(
+                    "The source filter output has no valid geometry.",
+                ));
+            }
+        };
+        self.width = width;
+        self.height = height;
+        self.output_sar = aspect::parse_source(stream.sample_aspect_ratio.as_deref())?;
+        if let Some(producer) = producer
+            && (self.encoder.is_svt()
+                || matches!(
+                    self.encoder,
+                    VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
+                ))
+        {
+            self.fps_num = producer.time_base.1;
+            self.fps_den = producer.time_base.0;
+        }
+        Ok(())
     }
 
     pub fn has_alpha(&self) -> bool {
@@ -657,6 +1539,12 @@ impl Plan {
     /// Timeline-changing filters therefore run once into a verified lossless
     /// source which all scene, chunk and quality-reference readers share.
     pub fn requires_av1an_preprocess(&self) -> bool {
+        if self.source_av1an_workflow {
+            return false;
+        }
+        if self.source_filters {
+            return self.trim.is_some();
+        }
         self.trim.is_some()
             || self.grain_prefilter.is_some()
             || !self.custom_filters.is_empty()
@@ -779,10 +1667,21 @@ impl Plan {
         } else {
             // VSPipe's Y4M output does not carry source SAR. Re-establish the
             // plan's square-pixel default on the owned QTGMC intermediate.
-            filters.push("setsar=1/1:max=65535".into());
+            filters.push(format!(
+                "setsar={}:max=65535",
+                self.output_sar.replace(':', "/")
+            ));
         }
         filters.extend(self.custom_filters.iter().cloned());
         (!filters.is_empty()).then(|| filters.join(","))
+    }
+
+    /// AV1AN's original FFmpeg source reader already applies its display matrix.
+    /// The second filtering pipe must not apply that orientation a second time.
+    pub fn av1an_decoder_filter(&self) -> Option<String> {
+        let mut reader = self.clone();
+        reader.source_cut_transform = None;
+        reader.decoder_filter()
     }
 
     pub fn decoder_filter(&self) -> Option<String> {
@@ -805,13 +1704,94 @@ impl Plan {
         }
         if let Some(aspect) = self.aspect {
             filters.push(aspect.filter());
+        } else if self.output_sar != "1:1" {
+            filters.push(format!(
+                "setsar={}:max=65535",
+                self.output_sar.replace(':', "/")
+            ));
         }
         filters.extend(self.custom_filters.iter().cloned());
         (!filters.is_empty()).then(|| filters.join(","))
     }
 
+    pub(super) fn validate_video_side_data(
+        &self,
+        values: &[serde_json::Value],
+        encoded: bool,
+    ) -> Result<(), AppError> {
+        if !encoded && let Some(expected) = self.source_cut_transform {
+            if values.iter().any(display_matrix) {
+                let (_, actual) =
+                    crate::analysis::display_transform_parts(values, &Default::default())
+                        .map_err(unsupported)?;
+                if actual != expected {
+                    return Err(unsupported(
+                        "The verified copied-cut display transform changed during decoding.",
+                    ));
+                }
+            }
+            let remaining = values
+                .iter()
+                .filter(|value| !display_matrix(value))
+                .cloned()
+                .collect::<Vec<_>>();
+            validate_side_data(&remaining, self.validation_hdr(encoded), encoded)
+        } else if !encoded && self.source_dolby_render && self.source_rotation != 0 {
+            for value in values.iter().filter(|value| display_matrix(value)) {
+                if value
+                    .get("rotation")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_none_or(|rotation| {
+                        (rotation - f64::from(self.source_rotation)).abs() > 0.001
+                    })
+                {
+                    return Err(unsupported(
+                        "The original Dolby display rotation changed during decoding.",
+                    ));
+                }
+            }
+            let remaining = values
+                .iter()
+                .filter(|value| !display_matrix(value))
+                .cloned()
+                .collect::<Vec<_>>();
+            validate_side_data(&remaining, self.validation_hdr(encoded), encoded)
+        } else {
+            validate_side_data(values, self.validation_hdr(encoded), encoded)
+        }
+    }
+
+    pub(super) fn uses_source_output_trim(&self) -> bool {
+        self.source_dolby_render || (self.source_trim && self.source_filters)
+    }
+
+    pub(super) fn source_output_trim(&self) -> Vec<std::ffi::OsString> {
+        if !self.uses_source_output_trim() {
+            return Vec::new();
+        }
+        source_trim_arguments(
+            self.trim,
+            self.source_chunk_rate,
+            source_keeps_frame_count(
+                self.temporal.as_ref().map(|value| value.settings),
+                self.source_chunk_rate,
+            ),
+        )
+    }
+
     pub fn decoder_prefix(&self) -> Option<String> {
         let mut filters = Vec::new();
+        if let Some(transform) = self.source_cut_transform.filter(|value| !value.is_empty()) {
+            filters.push(transform.trim_end_matches(',').to_owned());
+        }
+        if self.source_dolby_render {
+            match self.source_rotation.rem_euclid(360) {
+                90 => filters.push("transpose=cclock".into()),
+                180 => filters.push("hflip,vflip".into()),
+                270 => filters.push("transpose=clock".into()),
+                _ => {}
+            }
+        }
         if let Some(strength) = self.grain_prefilter {
             filters.push(format!(
                 "hqdn3d={strength}:{strength}:{}:{}",
@@ -819,7 +1799,9 @@ impl Plan {
                 u16::from(strength) * 3 / 2
             ));
         }
-        if let Some(trim) = self.trim {
+        if !self.uses_source_output_trim()
+            && let Some(trim) = self.trim
+        {
             if let Some(time) = trim.time {
                 let seconds = |milliseconds: u32| {
                     format!("{}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
@@ -836,13 +1818,22 @@ impl Plan {
                 ));
             }
         }
-        if let Some(temporal) = &self.temporal
+        if !self.source_dolby_render
+            && let Some(temporal) = &self.temporal
             && let Some(filter) = temporal.filter()
         {
             filters.push(filter);
         }
         if let Some(tone) = &self.tone_map {
             filters.push(tone.filter());
+        }
+        if self.source_dolby_render
+            && let Some(rate) = self
+                .temporal
+                .as_ref()
+                .and_then(|temporal| temporal.settings.frame_rate)
+        {
+            filters.push(format!("fps=fps={}/{}", rate.numerator, rate.denominator));
         }
         if let Some(conversion) = self.pixel_conversion() {
             filters.push(conversion);
@@ -856,7 +1847,7 @@ impl Plan {
         } else {
             self.source_pixel_format
         };
-        if input == self.output_pixel_format {
+        if input == self.output_pixel_format && self.source_full_range == self.full_range {
             return None;
         }
         let matrix = match self.matrix {
@@ -866,7 +1857,7 @@ impl Plan {
             9 => "bt2020",
             _ => unreachable!("validated color matrix"),
         };
-        let input_range = if rgb_source_format(self.source_pixel_format) || self.full_range {
+        let input_range = if rgb_source_format(self.source_pixel_format) || self.source_full_range {
             "full"
         } else {
             "limited"
@@ -929,6 +1920,12 @@ impl Plan {
         Ok(())
     }
 
+    pub fn requires_vulkan_tone_map(&self) -> bool {
+        self.tone_map
+            .as_ref()
+            .is_some_and(tone_map::Transform::requires_vulkan)
+    }
+
     pub fn tone_map_device_args(&self) -> Vec<std::ffi::OsString> {
         self.tone_map
             .as_ref()
@@ -955,11 +1952,41 @@ impl Plan {
     }
 
     fn validation_hdr(&self, encoded: bool) -> Option<&Hdr10> {
-        if encoded && self.is_tone_mapped() {
-            None
+        if encoded {
+            if self.is_tone_mapped() {
+                None
+            } else {
+                self.hdr10.as_ref()
+            }
         } else {
-            self.hdr10.as_ref()
+            self.source_hdr10.as_ref()
         }
+    }
+    fn absorb_source_metadata(&mut self, first: &Frame) -> Result<(), AppError> {
+        let required = self.needs_mastering_metadata();
+        let imported_dolby = self.hdr10.as_ref().is_some_and(|hdr| hdr.imported_dolby);
+        let imported_hdr10plus = self
+            .hdr10
+            .as_ref()
+            .is_some_and(|hdr| hdr.imported_hdr10plus);
+        if let Some(source) = &mut self.source_hdr10 {
+            source
+                .metadata
+                .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
+            let mut output = source.clone();
+            output.imported_dolby = imported_dolby;
+            output.imported_hdr10plus = imported_hdr10plus;
+            if let Some(authored) = &self.authored_hdr {
+                output.metadata.apply_authored(authored);
+            }
+            if required && output.metadata.mastering.is_none() {
+                return Err(unsupported(
+                    "HDR10 output requires mastering display metadata in the source or an authored mastering-display override.",
+                ));
+            }
+            self.hdr10 = Some(output);
+        }
+        Ok(())
     }
 
     fn needs_mastering_metadata(&self) -> bool {
@@ -969,11 +1996,15 @@ impl Plan {
         self.tone_map.is_none()
     }
 
-    fn frame_dimensions(&self, encoded: bool) -> (u32, u32) {
+    pub(super) fn frame_dimensions(&self, encoded: bool) -> (u32, u32) {
         if encoded {
             (self.width, self.height)
         } else {
-            (self.geometry.source_width, self.geometry.source_height)
+            if self.source_dolby_render || self.source_cut_transform.is_some() {
+                self.source_coded_size
+            } else {
+                (self.geometry.source_width, self.geometry.source_height)
+            }
         }
     }
 
@@ -1054,6 +2085,26 @@ impl Plan {
         args
     }
 
+    pub fn ffmpeg_x265_hdr_suffix(&self) -> String {
+        let args = self.x265_hdr_arguments();
+        let mut fields = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            let name = args[index]
+                .to_str()
+                .expect("HDR option")
+                .trim_start_matches('-');
+            if matches!(name, "hdr10" | "repeat-headers") {
+                fields.push(format!(":{name}=1"));
+                index += 1;
+            } else {
+                fields.push(format!(":{name}={}", args[index + 1].to_string_lossy()));
+                index += 2;
+            }
+        }
+        fields.join("")
+    }
+
     /// AOM's CLI writes HDR CICP into AV1 but cannot emit mastering or CLL
     /// metadata OBUs. Matroska carries those verified values through the
     /// subsequent FFmpeg copy mux, including when the destination is MP4.
@@ -1129,19 +2180,12 @@ impl Plan {
         frames: &Frames,
         stream: &Stream,
     ) -> Result<usize, AppError> {
-        let needs_mastering = self.needs_mastering_metadata();
-        if let Some(hdr) = &mut self.hdr10 {
+        if self.source_hdr10.is_some() {
             let first = frames
                 .frames
                 .first()
                 .ok_or_else(|| unsupported("The video did not decode to any frames."))?;
-            hdr.metadata
-                .absorb_first_frame(&StaticMetadata::parse(&first.side_data_list)?)?;
-            if needs_mastering && hdr.metadata.mastering.is_none() {
-                return Err(unsupported(
-                    "HDR10 encoding requires valid mastering display metadata in the stream or first decoded frame.",
-                ));
-            }
+            self.absorb_source_metadata(first)?;
         }
         let declared_error = match self.validate_frames_buffered(frames, stream, false) {
             Ok(count) => return Ok(count),
@@ -1213,15 +2257,32 @@ impl Plan {
             ));
         }
         let mut observed_hdr = StaticMetadata::parse(&stream.side_data_list)?;
-        validate_side_data(
-            &stream.side_data_list,
-            self.validation_hdr(encoded),
-            encoded,
-        )?;
+        self.validate_video_side_data(&stream.side_data_list, encoded)?;
+        let mut previous_time = None;
         for (index, frame) in frames.frames.iter().enumerate() {
             let time = seconds(frame.best_effort_timestamp_time.as_deref())
                 .ok_or_else(|| unsupported("A decoded frame has no usable timestamp."))?;
-            if (time - index as f64 * self.frame_seconds()).abs() > tolerance {
+            if !encoded
+                && (self.source_cut_ordinals
+                    || self.source_dolby_render
+                    || self.source_av1an_base_clock)
+            {
+                if previous_time.is_some_and(|previous| time <= previous) {
+                    return Err(unsupported(
+                        "The decoded source timestamps must be strictly increasing.",
+                    ));
+                }
+                previous_time = Some(time);
+            } else if (time
+                - if encoded {
+                    self.output_origin
+                } else {
+                    self.source_origin
+                }
+                - index as f64 * self.frame_seconds())
+            .abs()
+                > tolerance
+            {
                 return Err(unsupported(
                     "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
                 ));
@@ -1230,7 +2291,12 @@ impl Plan {
             self.validate_fields(frame, encoded)?;
             if frame.width != Some(width)
                 || frame.height != Some(height)
-                || frame.sample_aspect_ratio.as_deref() != Some(self.frame_sar(encoded))
+                || frame
+                    .sample_aspect_ratio
+                    .as_deref()
+                    .filter(|value| !matches!(*value, "0:1" | "N/A"))
+                    .unwrap_or("1:1")
+                    != self.frame_sar(encoded)
             {
                 return Err(unsupported(
                     "Decoded frame dimensions or sample aspect ratio differ from the processing plan.",
@@ -1260,9 +2326,12 @@ impl Plan {
                     "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
                 ));
             }
-            validate_side_data(&frame.side_data_list, self.validation_hdr(encoded), encoded)?;
+            self.validate_video_side_data(&frame.side_data_list, encoded)?;
             if !encoded && let Some(hdr) = self.hdr10.as_ref() {
                 hdr.require_profile5_rpu(&frame.side_data_list)?;
+                if self.tone_map.as_ref().is_some_and(|tone| tone.dolby_rpu) {
+                    hdr.require_gpu_rpu(&frame.side_data_list)?;
+                }
             }
             if let Some(hdr) = self.validation_hdr(encoded) {
                 let actual = StaticMetadata::parse(&frame.side_data_list)?;
@@ -1311,6 +2380,33 @@ impl Plan {
         self.validate_encoded_stream_fields(source, output, false)
     }
 
+    /// ISO VP9 does not carry Matroska's chroma-siting declaration. This is
+    /// usable only after the caller proves every copied video packet against
+    /// the fully validated encoder checkpoint. All explicit declarations and
+    /// all remaining planned fields must still match.
+    pub fn validate_packet_copied_iso_vp9(
+        &self,
+        source: &Stream,
+        checkpoint: &Stream,
+        output: &Stream,
+        format: media_core::ContainerFormat,
+    ) -> Result<(), AppError> {
+        if self.output_codec() != "vp9"
+            || !matches!(
+                format,
+                media_core::ContainerFormat::Mp4 | media_core::ContainerFormat::Mov
+            )
+        {
+            return self.validate_encoded_stream(source, output);
+        }
+        self.validate_elementary_checkpoint(source, checkpoint)?;
+        let mut declared = output.clone();
+        if declared.chroma_location.is_none() {
+            declared.chroma_location = Some(self.chroma.into());
+        }
+        self.validate_encoded_stream(source, &declared)
+    }
+
     /// An elementary VP9/IVF checkpoint cannot represent display aspect,
     /// chroma location, color primaries, or transfer characteristics. The
     /// final Matroska stage writes and strictly validates those plan fields.
@@ -1321,25 +2417,46 @@ impl Plan {
         source: &Stream,
         output: &Stream,
     ) -> Result<(), AppError> {
+        if self.encoder == VideoEncoder::X264 && self.output_sar != "1:1" {
+            // x264's native Matroska writer truncates display dimensions to
+            // integral pixels. The common mux restores the exact rational
+            // aspect; only this owned intermediate admits that known value.
+            let (n, d) = self.output_sar.split_once(':').expect("validated SAR");
+            let (n, d) = (
+                n.parse::<u64>().expect("SAR numerator"),
+                d.parse::<u64>().expect("SAR denominator"),
+            );
+            let (mut numerator, mut denominator) = if n >= d {
+                (u64::from(self.width) * n / d, u64::from(self.width))
+            } else {
+                (u64::from(self.height), u64::from(self.height) * d / n)
+            };
+            let (mut a, mut b) = (numerator, denominator);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            numerator /= a;
+            denominator /= a;
+            let mut intermediate = self.clone();
+            intermediate.output_sar = format!("{numerator}:{denominator}");
+            if output.sample_aspect_ratio.as_deref() == Some(intermediate.output_sar.as_str()) {
+                return intermediate.validate_encoded_stream_fields(source, output, false);
+            }
+        }
         self.validate_encoded_stream_fields(source, output, self.output_codec() == "vp9")
     }
 
     fn validate_encoded_stream_fields(
         &self,
-        source: &Stream,
+        _source: &Stream,
         output: &Stream,
         allow_absent_vp9_container_fields: bool,
     ) -> Result<(), AppError> {
-        let expected_primaries = if self.is_tone_mapped() {
-            Some("bt709")
-        } else {
-            source.color_primaries.as_deref()
-        };
-        let expected_transfer = if self.is_tone_mapped() {
-            Some("bt709")
-        } else {
-            source.color_transfer.as_deref()
-        };
+        if let Some(regions) = &self.source_queue {
+            return regions.verify_header(output, allow_absent_vp9_container_fields);
+        }
+        let expected_primaries = Some(color_name(self.primaries));
+        let expected_transfer = Some(color_name(self.transfer));
         let optional_container_field_matches = |actual: Option<&str>, expected: Option<&str>| {
             actual == expected || (allow_absent_vp9_container_fields && actual.is_none())
         };
@@ -1397,7 +2514,7 @@ impl Plan {
                 (if rgb_source_format(self.source_pixel_format) {
                     output.color_space.as_deref() != Some("bt709")
                 } else {
-                    source.color_space != output.color_space
+                    output.color_space.as_deref() != Some(matrix_name(self.matrix))
                 }) || !optional_container_field_matches(
                     output.color_transfer.as_deref(),
                     expected_transfer,
@@ -1411,7 +2528,29 @@ impl Plan {
         {
             return Err(AppError::new(
                 "ENCODE_VALIDATION_FAILED",
-                "The encoded output codec, dimensions, bit depth, aspect ratio, or color metadata differ from the plan.",
+                format!(
+                    "The encoded output codec, dimensions, bit depth, aspect ratio, or color metadata differ from the plan. Observed codec {:?}, format {:?}, size {:?}x{:?}, SAR {:?}, primaries {:?}, transfer {:?}, matrix {:?}, range {:?}, chroma {:?}; expected {}, {}, {}x{}, SAR {}, primaries {}, transfer {}, matrix {}, range {}, chroma {}.",
+                    output.codec_name,
+                    output.pix_fmt,
+                    output.width,
+                    output.height,
+                    output.sample_aspect_ratio,
+                    output.color_primaries,
+                    output.color_transfer,
+                    output.color_space,
+                    output.color_range,
+                    output.chroma_location,
+                    self.output_codec(),
+                    self.output_pixel_format,
+                    self.width,
+                    self.height,
+                    self.output_sar,
+                    color_name(self.primaries),
+                    color_name(self.transfer),
+                    matrix_name(self.matrix),
+                    if self.full_range { "pc" } else { "tv" },
+                    self.chroma
+                ),
                 None,
             ));
         }
@@ -1430,7 +2569,7 @@ pub(super) struct Frames {
     pub frames: Vec<Frame>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub(super) struct Frame {
     best_effort_timestamp_time: Option<String>,
     interlaced_frame: Option<u8>,
@@ -1448,9 +2587,339 @@ pub(super) struct Frame {
     side_data_list: Vec<serde_json::Value>,
 }
 
+impl Frame {
+    pub(in crate::jobs) fn source_queue_shape(&self) -> Self {
+        let mut frame = self.clone();
+        frame.best_effort_timestamp_time = None;
+        if matches!(
+            frame.sample_aspect_ratio.as_deref(),
+            None | Some("0:1" | "N/A")
+        ) {
+            frame.sample_aspect_ratio = Some("1:1".into());
+        }
+        for value in [
+            &mut frame.chroma_location,
+            &mut frame.color_space,
+            &mut frame.color_transfer,
+            &mut frame.color_primaries,
+            &mut frame.color_range,
+        ] {
+            if matches!(value.as_deref(), Some("unknown" | "unspecified" | "N/A")) {
+                *value = None;
+            }
+        }
+        frame
+    }
+    pub(in crate::jobs) fn source_queue_dimensions(&self) -> Option<(u32, u32)> {
+        self.width
+            .zip(self.height)
+            .filter(|(w, h)| *w > 0 && *h > 0)
+    }
+    pub(in crate::jobs) fn source_queue_time(&self) -> Option<f64> {
+        self.best_effort_timestamp_time
+            .as_deref()?
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_dolby_origin_keeps_strict_cfr_and_does_not_enable_trim_or_ordinal_clocks() {
+        let document:Document=serde_json::from_value(serde_json::json!({"streams":[{
+            "index":0,"codec_type":"video","codec_name":"hevc","width":128,"height":96,
+            "pix_fmt":"yuv420p10le","field_order":"progressive","sample_aspect_ratio":"1:1",
+            "avg_frame_rate":"4/1","time_base":"1/1000","start_time":"0.05",
+            "color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc",
+            "color_range":"tv","chroma_location":"topleft","side_data_list":[{
+                "side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1,
+                "bl_present_flag":1,"rpu_present_flag":1,"el_present_flag":0
+            }]}]})).unwrap();
+        let settings=EncodeSettings {encoder:VideoEncoder::X264,tone_map:Some(serde_json::from_value(serde_json::json!({"sourcePeakNits":4000,"backend":"auto","peakMode":"measured","algorithm":"spline"})).unwrap()),..Default::default()};
+        let selected = document.selected(&[0]).unwrap();
+        let stream = selected[0];
+        let mut plan = Plan::build(&document, &selected, &settings).unwrap();
+        assert_eq!(plan.source_origin, 0.05);
+        assert_eq!(plan.encoded_mux_origin(), 0.05);
+        assert!(!plan.source_cut_ordinals);
+        let frames:Frames=serde_json::from_value(serde_json::json!({"frames":(0..4).map(|index|serde_json::json!({
+            "best_effort_timestamp_time":(0.05+f64::from(index)/4.0).to_string(),"interlaced_frame":0,"top_field_first":0,
+            "width":128,"height":96,"pix_fmt":"yuv420p10le","sample_aspect_ratio":"1:1","chroma_location":"topleft",
+            "color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc","color_range":"tv",
+            "side_data_list":[{"side_data_type":"Dolby Vision RPU Data"},{"side_data_type":"Dolby Vision Metadata","bl_bit_depth":10,"bl_video_full_range_flag":0,"disable_residual_flag":1}]
+        })).collect::<Vec<_>>()})).unwrap();
+        assert_eq!(plan.validate_source_frames(&frames, stream).unwrap(), 4);
+        let mut variable = Frames {
+            frames: frames.frames.clone(),
+        };
+        variable.frames[2].best_effort_timestamp_time = Some("0.555".into());
+        assert!(plan.validate_source_frames(&variable, stream).is_err());
+        let mut missing = Frames {
+            frames: frames.frames.clone(),
+        };
+        missing.frames[1].side_data_list.clear();
+        assert!(plan.validate_source_frames(&missing, stream).is_err());
+        let mut trimmed = settings.clone();
+        trimmed.trim = Some(
+            serde_json::from_value(serde_json::json!({"startFrame":0,"endFrameExclusive":4}))
+                .unwrap(),
+        );
+        assert!(!preserves_dolby_source_clock(stream, &trimmed));
+        assert!(Plan::build(&document, &selected, &trimmed).is_err());
+        let source_cpu=EncodeSettings{backend:EncodeBackend::Av1an,encoder:VideoEncoder::X264,
+            av1an_options:Some(media_core::Av1anOptions{source_workflow:true,..Default::default()}),
+            tone_map:Some(serde_json::from_value(serde_json::json!({"sourcePeakNits":4000,"backend":"auto","peakMode":"measured","algorithm":"hable","sourceWorkflow":true})).unwrap()),..Default::default()};
+        let mut source_plan = Plan::build(&document, &selected, &source_cpu).unwrap();
+        assert!(source_plan.source_av1an_base_clock);
+        assert!(!source_plan.source_cut_ordinals);
+        assert_eq!(source_plan.encoded_mux_origin(), 0.0);
+        assert_eq!(
+            source_plan
+                .validate_source_frames(&variable, stream)
+                .unwrap(),
+            4
+        );
+        variable.frames[2].best_effort_timestamp_time =
+            variable.frames[1].best_effort_timestamp_time.clone();
+        assert!(
+            source_plan
+                .validate_source_frames(&variable, stream)
+                .is_err()
+        );
+        let mut legacy_cpu = source_cpu.clone();
+        legacy_cpu.av1an_options.as_mut().unwrap().source_workflow = false;
+        assert!(Plan::build(&document, &selected, &legacy_cpu).is_err());
+    }
+
+    #[test]
+    fn source_settings_reach_all_encoder_gops_and_resize_filters() {
+        let document = source();
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::X264,
+            VideoEncoder::X265Standalone,
+            VideoEncoder::AomAv1,
+            VideoEncoder::VpxStandalone,
+            VideoEncoder::X265,
+            VideoEncoder::Vp9,
+        ] {
+            let settings = EncodeSettings {
+                encoder,
+                preset: 0,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 1,
+                    mp4_faststart: true,
+                }),
+                ..Default::default()
+            };
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            let expected = super::super::encoding_preferences::keyframes(&plan, &settings).unwrap();
+            let args = super::super::encode::consumer_arguments(&plan, &settings);
+            let found = if matches!(encoder, VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone) {
+                args.iter()
+                    .any(|arg| arg == format!("--kf-max-dist={expected}").as_str())
+            } else {
+                args.windows(2).any(|pair| {
+                    (pair[0] == "--keyint" || pair[0] == "-g")
+                        && pair[1] == expected.to_string().as_str()
+                })
+            };
+            assert!(found, "{encoder:?}: {args:?}");
+        }
+        for (filter, name) in [
+            (media_core::ResizeFilter::Spline, "spline"),
+            (media_core::ResizeFilter::Area, "area"),
+        ] {
+            let settings = EncodeSettings {
+                framing: media_core::VideoFraming {
+                    resize_width: Some(160),
+                    ..Default::default()
+                },
+                temporal: Some(media_core::TemporalSettings {
+                    resize_filter: filter,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            assert!(
+                plan.decoder_filter()
+                    .unwrap()
+                    .contains(&format!("flags={name}"))
+            );
+        }
+        let settings = EncodeSettings {
+            encoding_preferences: Some(media_core::EncodingPreferences {
+                keyframe_interval_seconds: 1,
+                mp4_faststart: false,
+            }),
+            ..Default::default()
+        };
+        let mut plan =
+            Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+        plan.fps_num = 25;
+        plan.fps_den = 2;
+        assert_eq!(
+            super::super::encoding_preferences::keyframes(&plan, &settings),
+            Some(12),
+            "source Math.Round uses ties-to-even"
+        );
+    }
+
+    #[test]
+    fn authored_hdr_output_does_not_replace_source_validation_metadata() {
+        use media_core::{
+            HdrChromaticity, HdrContentLight, HdrMasteringDisplay, HdrMetadataSettings,
+        };
+        let (source, decoded) = hdr_source_and_frames();
+        let metadata = HdrMetadataSettings {
+            mastering_display: Some(HdrMasteringDisplay {
+                red: HdrChromaticity { x: 34000, y: 16000 },
+                green: HdrChromaticity { x: 13250, y: 34500 },
+                blue: HdrChromaticity { x: 7500, y: 3000 },
+                white_point: HdrChromaticity { x: 15635, y: 16450 },
+                max_luminance_ten_thousandths: 20_000_000,
+                min_luminance_ten_thousandths: 1,
+            }),
+            content_light: Some(HdrContentLight {
+                max_content: 500,
+                max_average: 250,
+            }),
+            ..Default::default()
+        };
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings {
+                hdr_metadata: Some(metadata.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            plan.source_hdr10.as_ref().unwrap().metadata.light,
+            Some((200, 142))
+        );
+        assert_eq!(
+            plan.hdr10.as_ref().unwrap().metadata.light,
+            Some((500, 250))
+        );
+        assert!(plan.hdr_arguments().iter().any(|value| value == "500,250"));
+        assert!(
+            plan.x265_hdr_arguments()
+                .iter()
+                .any(|value| value.to_string_lossy().contains("L(20000000,1)"))
+        );
+        let mut invalid = metadata.clone();
+        invalid
+            .mastering_display
+            .as_mut()
+            .unwrap()
+            .max_luminance_ten_thousandths = 0;
+        assert!(
+            validate_settings(&EncodeSettings {
+                hdr_metadata: Some(invalid),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        let mut invalid = metadata.clone();
+        invalid.content_light = Some(HdrContentLight {
+            max_content: 100,
+            max_average: 101,
+        });
+        assert!(
+            validate_settings(&EncodeSettings {
+                hdr_metadata: Some(invalid),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        let mut unknown = metadata;
+        unknown.content_light = Some(HdrContentLight {
+            max_content: 0,
+            max_average: 0,
+        });
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings {
+                hdr_metadata: Some(unknown),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.validate_source_frames(&decoded, &source.streams[0])
+            .unwrap();
+        assert!(plan.hdr10.as_ref().unwrap().metadata.light.is_none());
+    }
+
+    #[test]
+    fn unspecified_sdr_tags_anamorphic_sar_small_frames_and_high_cadence_have_explicit_plans() {
+        let mut untagged = source();
+        let video = &mut untagged.streams[0];
+        video.color_primaries = None;
+        video.color_transfer = None;
+        video.color_space = None;
+        video.color_range = None;
+        video.chroma_location = None;
+        video.sample_aspect_ratio = None;
+        let plan = Plan::build(
+            &untagged,
+            &untagged.selected(&[0]).unwrap(),
+            &x264_settings(),
+        )
+        .unwrap();
+        assert_eq!((plan.primaries, plan.transfer, plan.matrix), (6, 6, 6));
+        assert!(!plan.full_range);
+        assert_eq!(plan.chroma, "left");
+        assert!(
+            !plan
+                .source_interpretation_notes(&untagged.streams[0])
+                .is_empty()
+        );
+        let mut anamorphic = source();
+        anamorphic.streams[0].sample_aspect_ratio = Some("4:3".into());
+        let plan = Plan::build(
+            &anamorphic,
+            &anamorphic.selected(&[0]).unwrap(),
+            &x264_settings(),
+        )
+        .unwrap();
+        assert_eq!(plan.output_sar(), "4:3");
+        assert!(plan.decoder_filter().unwrap().contains("setsar=4/3"));
+        let mut small = source();
+        small.streams[0].width = Some(32);
+        small.streams[0].height = Some(24);
+        small.streams[0].avg_frame_rate = Some("240/1".into());
+        let plan = Plan::build(&small, &small.selected(&[0]).unwrap(), &x264_settings()).unwrap();
+        assert_eq!((plan.width, plan.height, plan.fps_num), (32, 24, 240));
+        let mut full = source();
+        full.streams[0].color_range = Some("pc".into());
+        let plan = Plan::build(
+            &full,
+            &full.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        assert!(!plan.full_range);
+        assert!(
+            plan.decoder_filter()
+                .unwrap()
+                .contains("in_range=full:out_range=limited")
+        );
+    }
 
     #[test]
     fn vp9_elementary_checkpoint_allows_only_absent_container_color_fields() {
@@ -1483,6 +2952,73 @@ mod tests {
     }
 
     #[test]
+    fn copied_iso_vp9_allows_only_missing_chroma_after_verified_checkpoint() {
+        use media_core::ContainerFormat;
+        let mut source = source();
+        source.streams[0].chroma_location = Some("left".into());
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::Vp9,
+            ..Default::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        let mut checkpoint = source.streams[0].clone();
+        checkpoint.codec_name = Some("vp9".into());
+        let mut output = checkpoint.clone();
+        output.chroma_location = None;
+        assert!(
+            plan.validate_encoded_stream(&source.streams[0], &output)
+                .is_err()
+        );
+        plan.validate_packet_copied_iso_vp9(
+            &source.streams[0],
+            &checkpoint,
+            &output,
+            ContainerFormat::Mp4,
+        )
+        .unwrap();
+        assert!(
+            plan.validate_packet_copied_iso_vp9(
+                &source.streams[0],
+                &checkpoint,
+                &output,
+                ContainerFormat::Matroska
+            )
+            .is_err()
+        );
+        for field in ["chroma", "pixel", "primaries", "codec", "sar"] {
+            let mut changed = output.clone();
+            match field {
+                "chroma" => changed.chroma_location = Some("center".into()),
+                "pixel" => changed.pix_fmt = Some("yuv420p10le".into()),
+                "primaries" => changed.color_primaries = Some("bt470bg".into()),
+                "codec" => changed.codec_name = Some("h264".into()),
+                "sar" => changed.sample_aspect_ratio = Some("4:3".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                plan.validate_packet_copied_iso_vp9(
+                    &source.streams[0],
+                    &checkpoint,
+                    &changed,
+                    ContainerFormat::Mp4
+                )
+                .is_err(),
+                "accepted {field}"
+            );
+        }
+        checkpoint.chroma_location = Some("center".into());
+        assert!(
+            plan.validate_packet_copied_iso_vp9(
+                &source.streams[0],
+                &checkpoint,
+                &output,
+                ContainerFormat::Mp4
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn framing_validates_original_source_frames_and_transformed_output_frames_separately() {
         for hdr in [false, true] {
             let (source, decoded) = if hdr {
@@ -1497,6 +3033,8 @@ mod tests {
                         right: 16,
                         ..Default::default()
                     },
+                    resize: None,
+                    border_ratio: None,
                     resize_width: Some(64),
                     borders: media_core::BorderSettings {
                         top: 8,
@@ -1942,6 +3480,59 @@ mod tests {
     }
 
     #[test]
+    fn verified_cut_orientation_keeps_coded_scan_and_display_contract_separate() {
+        let mut document = source();
+        let matrix = serde_json::json!({"side_data_type":"Display Matrix","displaymatrix":"\n00000000: 0 -65536 0\n00000001: 65536 0 0\n00000002: 0 0 1073741824\n","rotation":90});
+        document.streams[0].side_data_list.push(matrix.clone());
+        document.streams[0].sample_aspect_ratio = Some("4:3".into());
+        let settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::X264,
+            ..x264_settings()
+        };
+        let selected = document.selected(&[0]).unwrap();
+        assert!(Plan::build(&document, &selected, &settings).is_err());
+        let plan = Plan::build_source_cut(&document, &selected, &settings).unwrap();
+        assert_eq!(plan.frame_dimensions(false), (128, 96));
+        assert_eq!(plan.frame_dimensions(true), (96, 128));
+        assert_eq!(plan.frame_sar(false), "4:3");
+        assert_eq!(plan.output_sar(), "3:4");
+        assert!(
+            plan.decoder_filter()
+                .unwrap()
+                .starts_with("transpose=cclock")
+        );
+        assert!(
+            !plan
+                .av1an_decoder_filter()
+                .unwrap_or_default()
+                .contains("transpose")
+        );
+        assert!(
+            plan.validate_video_side_data(std::slice::from_ref(&matrix), false)
+                .is_ok()
+        );
+        assert!(
+            plan.validate_video_side_data(std::slice::from_ref(&matrix), true)
+                .is_err()
+        );
+        let mut changed = matrix;
+        changed["displaymatrix"] = serde_json::json!(
+            "\n00000000: 0 65536 0\n00000001: -65536 0 0\n00000002: 0 0 1073741824\n"
+        );
+        assert!(
+            plan.validate_video_side_data(&[changed.clone()], false)
+                .is_err()
+        );
+        changed["displaymatrix"] = serde_json::json!("malformed");
+        document.streams[0].side_data_list = vec![changed];
+        assert!(
+            Plan::build_source_cut(&document, &document.selected(&[0]).unwrap(), &settings)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn fork_options_are_validated_without_leaking_to_other_encoders() {
         for encoder in [
             VideoEncoder::SvtAv1,
@@ -2169,7 +3760,7 @@ mod tests {
     }
 
     #[test]
-    fn x264_accepts_both_backends_and_rejects_hdr_or_unknown_chroma() {
+    fn x264_accepts_both_backends_and_unspecified_chroma_but_rejects_hdr() {
         assert!(
             validate_settings(&EncodeSettings {
                 backend: EncodeBackend::Av1an,
@@ -2216,7 +3807,7 @@ mod tests {
                 &unknown_chroma.selected(&[0]).unwrap(),
                 &x264_settings()
             )
-            .is_err()
+            .is_ok()
         );
         let (hdr, _) = hdr_source_and_frames();
         let error = Plan::build(&hdr, &hdr.selected(&[0]).unwrap(), &x264_settings()).unwrap_err();
@@ -2340,7 +3931,7 @@ mod tests {
 
     #[test]
     fn opaque_rgb_has_an_explicit_gbr_to_bt709_conversion_and_alpha_is_rejected() {
-        for source_format in ["rgb24", "bgr24"] {
+        for source_format in ["rgb24", "bgr24", "bgr0"] {
             let mut source = source();
             let stream = &mut source.streams[0];
             stream.pix_fmt = Some(source_format.into());
@@ -2575,6 +4166,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verified_copied_cut_uses_ordinals_but_rejects_bad_source_clocks_and_fields() {
+        let source = source();
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        let boundary = frames(&["0.083", "0.125", "0.166", "0.250"]);
+        assert!(
+            plan.validate_frames(&boundary, &source.streams[0], false)
+                .is_err()
+        );
+        plan.source_cut_ordinals = true;
+        plan.source_origin = 0.083;
+        assert_eq!(
+            plan.validate_frames(&boundary, &source.streams[0], false)
+                .unwrap(),
+            4
+        );
+        for times in [
+            ["0.083", "0.083"],
+            ["0.083", "0.042"],
+            ["0.083", "NaN"],
+            ["0.083", "inf"],
+        ] {
+            assert!(
+                plan.validate_frames(&frames(&times), &source.streams[0], false)
+                    .is_err(),
+                "{times:?}"
+            );
+        }
+        let mut changed = frames(&["0.083", "0.125", "0.166", "0.250"]);
+        changed.frames[3].width = Some(64);
+        assert!(
+            plan.validate_frames(&changed, &source.streams[0], false)
+                .is_err()
+        );
+        // The source-only policy cannot relax the actual output cadence.
+        assert!(
+            plan.validate_frames(&boundary, &source.streams[0], true)
+                .is_err()
+        );
+    }
+
     fn long_cfr_frames(num: u64, den: u64) -> Frames {
         let template = frames(&["0"]).frames.pop().unwrap();
         Frames {
@@ -2777,7 +4414,7 @@ mod tests {
         for (field, value) in [
             ("color_transfer", "smpte2084"),
             ("pix_fmt", "rgb24"),
-            ("sample_aspect_ratio", "4:3"),
+            ("sample_aspect_ratio", "4:0"),
             ("field_order", "tt"),
             ("start_time", "1"),
         ] {
@@ -2796,7 +4433,7 @@ mod tests {
         }
         assert!(
             validate_settings(&EncodeSettings {
-                crf: 0,
+                crf: 64,
                 ..EncodeSettings::default()
             })
             .is_err()

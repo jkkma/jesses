@@ -299,6 +299,7 @@ async fn target_size_measures_flac_and_trimmed_duration_and_rejects_impossible_c
                     time: None,
                 }),
                 audio: vec![media_core::AudioTrackSettings {
+                    normalization: None,
                     stream_index: 1,
                     codec: media_core::AudioCodec::Flac,
                     bitrate_kbps: 128,

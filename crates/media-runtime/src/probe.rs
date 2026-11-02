@@ -131,6 +131,7 @@ fn pixel_depth(pixel_format: Option<&str>) -> Option<u32> {
             | "gray"
             | "rgb24"
             | "bgr24"
+            | "bgr0"
             | "rgba"
             | "bgra"
     ) {
@@ -146,6 +147,7 @@ fn pixel_depth(pixel_format: Option<&str>) -> Option<u32> {
             .find(|depth| suffix.ends_with(&depth.to_string()));
     }
     match format {
+        "rgb48le" | "rgb48be" | "rgba64le" | "rgba64be" => Some(16),
         "p010le" | "p010be" => Some(10),
         "p012le" | "p012be" => Some(12),
         "p016le" | "p016be" => Some(16),
@@ -330,10 +332,12 @@ pub(crate) fn parse_probe(
     let format = document.format;
     let format_tags = format.as_ref().and_then(|format| format.tags.as_ref());
     Ok(MediaFile {
+        source: None,
         id: media_id(&path),
         path,
         name,
         size_bytes: size.to_string(),
+        modified_at_ms: None,
         duration_seconds,
         title: format_tags.and_then(|tags| tag(tags, "title")),
         language: format_tags.and_then(|tags| tag(tags, "language")),
@@ -394,6 +398,7 @@ pub async fn probe_media(path: String) -> Result<MediaFile, AppError> {
             format!("The selected file could not be accessed: {error}"),
         )
     })?;
+    let source_guard = crate::jobs::files::Source::open(&canonical)?;
     let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
         fail(
             "FILE_UNREADABLE",
@@ -460,7 +465,18 @@ pub async fn probe_media(path: String) -> Result<MediaFile, AppError> {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    parse_probe(&output.stdout, canonical_text, name, metadata.len())
+    let mut media = parse_probe(&output.stdout, canonical_text, name, metadata.len())?;
+    media.modified_at_ms = metadata.modified().ok().map(unix_milliseconds);
+    crate::jobs::sequence::decorate(&mut media)?;
+    source_guard.verify()?;
+    Ok(media)
+}
+
+fn unix_milliseconds(time: std::time::SystemTime) -> f64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64() * 1000.0,
+        Err(error) => -error.duration().as_secs_f64() * 1000.0,
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +498,21 @@ mod tests {
         assert_eq!(parsed.streams[1].title.as_deref(), Some("Original mix"));
         assert_eq!(parsed.streams[2].width, None);
         assert_eq!(parsed.size_bytes, "9007199254740993");
+    }
+
+    #[test]
+    fn modification_time_preserves_signed_unix_milliseconds_and_unknown_probe_records() {
+        let offset = Duration::from_millis(1700000000123);
+        assert_eq!(
+            unix_milliseconds(std::time::UNIX_EPOCH + offset),
+            1700000000123.0
+        );
+        assert_eq!(
+            unix_milliseconds(std::time::UNIX_EPOCH - Duration::from_millis(123)),
+            -123.0
+        );
+        let media = parse_probe(br#"{"streams":[]}"#, "source".into(), "source".into(), 0).unwrap();
+        assert_eq!(media.modified_at_ms, None);
     }
 
     #[test]

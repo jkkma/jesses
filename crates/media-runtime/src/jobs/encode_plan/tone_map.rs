@@ -51,11 +51,37 @@ enum GpuProbeError {
     Unavailable(String),
 }
 
+pub(super) fn compatible_dolby_base(video: &Stream) -> bool {
+    video.side_data_list.iter().any(|value| {
+        value
+            .get("side_data_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("DOVI configuration record")
+            && value.get("dv_profile").and_then(serde_json::Value::as_u64) == Some(8)
+            && value
+                .get("dv_bl_signal_compatibility_id")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+    }) && super::hdr::Hdr10::build(
+        &video
+            .side_data_list
+            .iter()
+            .filter(|value| !super::display_matrix(value))
+            .cloned()
+            .collect::<Vec<_>>(),
+        true,
+        false,
+    )
+    .is_ok()
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Transform {
     pub settings: ToneMapSettings,
     pub hlg: bool,
     pub dv5: bool,
+    pub dolby_rpu: bool,
+    dv8: bool,
     chroma: &'static str,
     workflow: EncodeBackend,
     resolved: ResolvedBackend,
@@ -76,6 +102,54 @@ impl Transform {
                 == Some("DOVI configuration record")
                 && value.get("dv_profile").and_then(serde_json::Value::as_u64) == Some(5)
         });
+        let dv8 = video.side_data_list.iter().any(|value| {
+            value
+                .get("side_data_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("DOVI configuration record")
+                && value.get("dv_profile").and_then(serde_json::Value::as_u64) == Some(8)
+                && value
+                    .get("dv_bl_signal_compatibility_id")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+        });
+        let source_compatible_base = tone.source_workflow && compatible_dolby_base(video);
+        if tone.source_workflow
+            && !dv5
+            && !dv8
+            && video.side_data_list.iter().any(|value| {
+                value
+                    .get("side_data_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DOVI configuration record")
+            })
+        {
+            return Err(unsupported(
+                "Source tone mapping requires a supported single-layer Dolby profile5 or HDR10-compatible profile8.1 configuration.",
+            ));
+        }
+        let dolby_rpu = (dv5 || dv8)
+            && !tone.hdr10_base_layer
+            && settings.backend == EncodeBackend::Standalone
+            && tone.peak_mode == ToneMapPeakMode::Measured
+            && tone.backend != ToneMapBackend::Cpu;
+        if dv8 && !tone.hdr10_base_layer && !dolby_rpu && !source_compatible_base {
+            return Err(unsupported(
+                "Dolby Vision profile8.1 requires standalone measured Vulkan rendering with its RPU, or an explicit HDR10-base-layer tone map.",
+            ));
+        }
+        if dolby_rpu
+            && dv8
+            && settings.temporal.is_some_and(|value| {
+                value.deinterlace.is_some()
+                    || value.qtgmc.is_some()
+                    || value.cadence_repair.is_some()
+            })
+        {
+            return Err(unsupported(
+                "Render the intact single-layer Dolby Vision picture before deinterlacing or changing frame correspondence.",
+            ));
+        }
         let hlg = video.color_transfer.as_deref() == Some("arib-std-b67");
         if dv5 {
             if tone.backend == ToneMapBackend::Cpu
@@ -133,9 +207,20 @@ impl Transform {
             settings: tone,
             hlg,
             dv5,
+            dolby_rpu,
+            dv8,
             chroma,
             workflow: settings.backend,
-            resolved: ResolvedBackend::Cpu,
+            // Spline is libplacebo's curve. Even a held/generated command must
+            // retain it before the Vulkan capability probe has run.
+            resolved: if dolby_rpu
+                || tone.backend == ToneMapBackend::Gpu
+                || tone.algorithm == Some(ToneMapAlgorithm::Spline)
+            {
+                ResolvedBackend::Gpu
+            } else {
+                ResolvedBackend::Cpu
+            },
             effective_peak_nits: f64::from(tone.source_peak_nits),
             measured_peak_nits: None,
             fallback_note: None,
@@ -174,20 +259,49 @@ impl Transform {
             };
             return format!(
                 "{input_tags}{discard_dynamic}libplacebo=tonemapping={algorithm}:peak_detect=1:apply_dolbyvision={}:format=yuv420p10le:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,limiter=min=64:max=940:planes=1,limiter=min=64:max=960:planes=6,sidedata=mode=delete,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
-                u8::from(self.dv5)
+                u8::from(self.dolby_rpu)
             );
         }
         let algorithm = match self.cpu_algorithm() {
             media_core::ToneMapAlgorithm::Hable => "hable",
             media_core::ToneMapAlgorithm::Mobius => "mobius",
             media_core::ToneMapAlgorithm::Reinhard => "reinhard",
-            media_core::ToneMapAlgorithm::Spline => unreachable!("Spline substitutes Hable on CPU"),
+            media_core::ToneMapAlgorithm::Spline => unreachable!("Spline requires libplacebo"),
         };
         let transfer = if self.hlg {
             "arib-std-b67"
         } else {
             "smpte2084"
         };
+        if self.settings.source_workflow {
+            // ToneMapConfig.AnchorNits and ClampFilters are part of the
+            // source curve's calibrated brightness, independent of admission.
+            // Keep the historical explicit API's100-nit path below separate.
+            let linear = if self.hlg {
+                "zscale=transfer=linear".to_owned()
+            } else {
+                "zscale=transfer=linear:npl=266.667".to_owned()
+            };
+            let peak = if self.hlg {
+                String::new()
+            } else {
+                format!(":peak={:.3}", (self.effective_peak_nits / 266.667).max(1.0))
+            };
+            let deletes = [
+                "MASTERING_DISPLAY_METADATA",
+                "CONTENT_LIGHT_LEVEL",
+                "DOVI_METADATA",
+                "DOVI_RPU_BUFFER",
+                "DYNAMIC_HDR_PLUS",
+                "DYNAMIC_HDR_VIVID",
+                "AMBIENT_VIEWING_ENVIRONMENT",
+            ]
+            .map(|kind| format!("sidedata=mode=delete:type={kind}"))
+            .join(",");
+            return format!(
+                "setparams=color_trc={transfer}:color_primaries=bt2020:colorspace=bt2020nc,{linear},format=gbrpf32le,zscale=primaries=bt709,tonemap=tonemap={algorithm}{peak},zscale=transfer=bt709:matrix=bt709:range=tv,format=gbrp16le,zscale=matrix=bt709:range=tv,format=yuv444p16le,{deletes},format=yuv420p10le,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+            );
+        }
         // zimg maps PQ absolute luminance (and its 1000-nit reference HLG EOTF)
         // to linear values relative to npl=100. Both tonemap input and its
         // explicit signal peak therefore use the same 100-nit units.
@@ -203,10 +317,17 @@ impl Transform {
     }
 
     fn cpu_algorithm(&self) -> ToneMapAlgorithm {
-        match self.settings.algorithm.unwrap_or_default() {
-            ToneMapAlgorithm::Spline => ToneMapAlgorithm::Hable,
-            other => other,
-        }
+        self.settings.algorithm.unwrap_or_default()
+    }
+
+    pub(super) fn requires_vulkan(&self) -> bool {
+        self.dv5
+            || self.settings.backend == ToneMapBackend::Gpu
+            || self.settings.algorithm == Some(ToneMapAlgorithm::Spline)
+    }
+
+    pub(super) fn permits_original_clock(&self) -> bool {
+        self.dv5 || self.dv8
     }
 
     pub fn device_args(&self) -> Vec<OsString> {
@@ -222,14 +343,14 @@ impl Transform {
             ResolvedBackend::Gpu => format!(
                 "GPU libplacebo tone mapping with per-frame peak detection and {:?} curve{}.",
                 self.settings.algorithm.unwrap_or_default(),
-                if self.dv5 {
+                if self.dolby_rpu {
                     "; Dolby Vision RPU applied"
                 } else {
                     ""
                 }
             ),
             ResolvedBackend::Cpu => format!(
-                "CPU zscale tone mapping with {:?} curve and {:.0}-nit peak{}{}.",
+                "CPU zscale tone mapping with {:?} curve and {:.0}-nit peak{}{}{}.",
                 self.cpu_algorithm(),
                 self.effective_peak_nits,
                 self.measured_peak_nits
@@ -237,6 +358,11 @@ impl Transform {
                         " (sampled {:.0} nits)",
                         value
                     )),
+                if self.dv8 && self.settings.source_workflow {
+                    "; compatible HDR10 base layer used, Dolby metadata discarded"
+                } else {
+                    ""
+                },
                 self.fallback_note
                     .as_ref()
                     .map_or(String::new(), |note| format!(" {note}"))
@@ -268,7 +394,12 @@ impl Transform {
         args.extend([
             filter.into(),
             "-pix_fmt".into(),
-            "+yuv420p10le".into(),
+            if self.settings.source_workflow && self.resolved == ResolvedBackend::Cpu {
+                "yuv420p10le"
+            } else {
+                "+yuv420p10le"
+            }
+            .into(),
             "-f".into(),
             "rawvideo".into(),
             "pipe:1".into(),
@@ -330,7 +461,13 @@ impl Transform {
                     if *cancel.borrow() {
                         return Err(crate::jobs::canceled());
                     }
-                    if self.dv5 || self.settings.backend == ToneMapBackend::Gpu {
+                    if self.dv5
+                        || (self.dv8
+                            && !self.settings.hdr10_base_layer
+                            && !self.settings.source_workflow)
+                        || self.settings.backend == ToneMapBackend::Gpu
+                        || self.settings.algorithm == Some(ToneMapAlgorithm::Spline)
+                    {
                         return Err(AppError::new(
                             "TONE_MAP_GPU_UNAVAILABLE",
                             format!(
@@ -350,12 +487,8 @@ impl Transform {
                 "Dolby Vision profile 5 cannot be rendered by the CPU tone-map chain; its RPU must be applied by a real GPU.",
             ));
         }
-        if self.settings.algorithm == Some(ToneMapAlgorithm::Spline) {
-            self.fallback_note = Some(format!(
-                "{} Spline is unavailable on CPU; Hable was selected.",
-                self.fallback_note.as_deref().unwrap_or_default()
-            ));
-        }
+        self.resolved = ResolvedBackend::Cpu;
+        self.dolby_rpu = false;
         self.check_tools(ffmpeg, cancel).await?;
         if !self.hlg && self.settings.peak_mode == ToneMapPeakMode::Measured {
             self.measured_peak_nits =
@@ -536,6 +669,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_compatible_dolby_base_fallback_is_not_a_legacy_opt_in() {
+        let video:Stream=serde_json::from_value(serde_json::json!({
+            "index":0,"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p10le","color_range":"tv",
+            "color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc","chroma_location":"left",
+            "side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1,"bl_present_flag":1,"rpu_present_flag":1,"el_present_flag":0}]
+        })).unwrap();
+        let mut settings=EncodeSettings{tone_map:Some(serde_json::from_value(serde_json::json!({"sourcePeakNits":4000,"backend":"cpu","algorithm":"hable","peakMode":"manual"})).unwrap()),..Default::default()};
+        assert!(Transform::build(&video, &settings).is_err());
+        settings.tone_map.as_mut().unwrap().source_workflow = true;
+        let source = Transform::build(&video, &settings).unwrap().unwrap();
+        assert!(!source.dolby_rpu);
+        assert!(source.filter().contains("tonemap=tonemap=hable"));
+        assert!(
+            source
+                .filter()
+                .contains("zscale=transfer=linear:npl=266.667")
+        );
+        assert!(
+            source
+                .filter()
+                .contains("tonemap=tonemap=hable:peak=15.000")
+        );
+        assert!(
+            source
+                .filter()
+                .contains("format=gbrp16le,zscale=matrix=bt709:range=tv,format=yuv444p16le")
+        );
+        for (field, value) in [
+            ("el_present_flag", 1),
+            ("bl_present_flag", 0),
+            ("dv_bl_signal_compatibility_id", 0),
+        ] {
+            let mut malformed = video.clone();
+            malformed.side_data_list[0][field] = value.into();
+            assert!(Transform::build(&malformed, &settings).is_err(), "{field}");
+        }
+        settings.tone_map.as_mut().unwrap().source_workflow = false;
+        settings.tone_map.as_mut().unwrap().hdr10_base_layer = true;
+        assert!(
+            Transform::build(&video, &settings)
+                .unwrap()
+                .unwrap()
+                .filter()
+                .contains("npl=100:agamma=0")
+        );
+    }
+
+    #[test]
     fn pq_eotf_and_declared_peak_headroom_are_bounded() {
         assert_eq!(pq_code_to_nits(64), 0.0);
         assert!((pq_code_to_nits(940) - 10_000.0).abs() < 0.1);
@@ -566,6 +747,7 @@ mod tests {
             &normal,
             &EncodeSettings {
                 tone_map: Some(ToneMapSettings {
+                    source_workflow: false,
                     hdr10_base_layer: true,
                     ..tone
                 }),
@@ -597,9 +779,47 @@ mod tests {
     }
 
     #[test]
+    fn single_layer_profile8_uses_rpu_unless_base_layer_was_explicitly_selected() {
+        let video:Stream=serde_json::from_value(serde_json::json!({
+            "index":0,"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p10le",
+            "color_range":"tv","color_primaries":"bt2020","color_transfer":"smpte2084",
+            "color_space":"bt2020nc","chroma_location":"topleft","side_data_list":[{
+                "side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1,
+                "rpu_present_flag":1,"el_present_flag":0,"bl_present_flag":1
+            }]})).unwrap();
+        for base in [false, true] {
+            let settings = EncodeSettings {
+                tone_map: Some(ToneMapSettings {
+                    source_workflow: false,
+                    algorithm: Some(ToneMapAlgorithm::Spline),
+                    backend: ToneMapBackend::Auto,
+                    peak_mode: ToneMapPeakMode::Measured,
+                    source_peak_nits: 4000,
+                    hdr10_base_layer: base,
+                }),
+                ..Default::default()
+            };
+            let transform = Transform::build(&video, &settings).unwrap().unwrap();
+            assert_eq!(transform.dolby_rpu, !base);
+            assert!(transform.filter().contains(if base {
+                "apply_dolbyvision=0"
+            } else {
+                "apply_dolbyvision=1"
+            }));
+            assert_eq!(
+                transform
+                    .filter()
+                    .contains("sidedata=mode=delete:type=DOVI_RPU_BUFFER"),
+                base
+            );
+        }
+    }
+
+    #[test]
     fn gpu_cannot_discard_a_manual_peak_and_cpu_cannot_offer_spline() {
         let settings = |backend, peak_mode, algorithm| EncodeSettings {
             tone_map: Some(ToneMapSettings {
+                source_workflow: false,
                 backend,
                 peak_mode,
                 algorithm,
@@ -635,6 +855,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_spline_keeps_its_curve_and_rejects_an_unavailable_vulkan_provider() {
+        let video: Stream = serde_json::from_value(serde_json::json!({
+            "index":0,"codec_type":"video","codec_name":"hevc",
+            "pix_fmt":"yuv420p10le","color_range":"tv",
+            "color_primaries":"bt2020","color_transfer":"smpte2084",
+            "color_space":"bt2020nc","chroma_location":"left"
+        }))
+        .unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        for backend in [ToneMapBackend::Auto, ToneMapBackend::Gpu] {
+            let mut transform = Transform::build(
+                &video,
+                &EncodeSettings {
+                    tone_map: Some(ToneMapSettings {
+                        source_workflow: false,
+                        backend,
+                        peak_mode: ToneMapPeakMode::Measured,
+                        source_peak_nits: 1000,
+                        algorithm: Some(ToneMapAlgorithm::Spline),
+                        hdr10_base_layer: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                transform
+                    .filter()
+                    .contains("libplacebo=tonemapping=spline:")
+            );
+            assert!(!transform.filter().contains("tonemapping=hable"));
+            assert_eq!(transform.device_args(), ["-init_hw_device", "vulkan"]);
+            let error = transform
+                .resolve(
+                    Path::new("missing-spline-provider/ffmpeg"),
+                    Path::new("missing-source"),
+                    0,
+                    Some(1.0),
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "TONE_MAP_GPU_UNAVAILABLE");
+            assert!(
+                transform
+                    .filter()
+                    .contains("libplacebo=tonemapping=spline:")
+            );
+            assert!(transform.fallback_note.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn canceled_gpu_probe_does_not_fall_back_or_report_gpu_unavailable() {
         let video: Stream = serde_json::from_value(serde_json::json!({
             "index":0,"codec_type":"video","codec_name":"hevc",
@@ -649,6 +924,7 @@ mod tests {
                 &video,
                 &EncodeSettings {
                     tone_map: Some(ToneMapSettings {
+                        source_workflow: false,
                         backend,
                         peak_mode: ToneMapPeakMode::Measured,
                         source_peak_nits: 1000,

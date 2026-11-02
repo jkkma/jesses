@@ -156,6 +156,7 @@ async fn measures_selected_track_applies_flat_gain_and_rejects_stale_source() {
             crf: 23,
             preset: 0,
             audio: vec![AudioTrackSettings {
+                normalization: None,
                 stream_index: 1,
                 codec: AudioCodec::Flac,
                 bitrate_kbps: 128,

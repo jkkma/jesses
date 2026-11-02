@@ -12,6 +12,7 @@ fn invalid(message: &str) -> AppError {
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
+    settings.encoder.require_cpu_encoding()?;
     if settings.lossless && settings.rate_control.is_some() {
         return Err(invalid(
             "Lossless mode cannot be combined with bitrate or target-size rate control.",
@@ -25,26 +26,12 @@ pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
             "Bitrate and target size currently require standalone encoding.",
         ));
     }
-    if matches!(
-        settings.encoder,
-        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc
-    ) && !matches!(
-        control,
-        VideoRateControl::Bitrate {
-            two_pass: false,
-            ..
-        }
-    ) {
-        return Err(invalid(
-            "NVENC supports one-pass video bitrate in this workflow. Two-pass bitrate and target size require a software encoder with external pass statistics.",
-        ));
-    }
     match control {
         VideoRateControl::Bitrate { bitrate_kbps, .. }
-            if !(1..=100_000).contains(&bitrate_kbps) =>
+            if !(10..=100_000).contains(&bitrate_kbps) =>
         {
             Err(invalid(
-                "Video bitrate must be a whole number from 1 to 100000 decimal kb/s.",
+                "Video bitrate must be a whole number from 10 to 100000 decimal kb/s.",
             ))
         }
         VideoRateControl::TargetSize { target_size_mib }
@@ -54,6 +41,16 @@ pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
                 "Target file size must be a whole number from 1 to 1048576 MiB.",
             ))
         }
+        VideoRateControl::TargetSizeDecimal {
+            target_size_tenths_mb,
+        } if target_size_tenths_mb > 81_920 => Err(invalid(
+            "Target file size must be from 0.0 to 8192.0 MB in tenths.",
+        )),
+        VideoRateControl::TargetSizeDecimal {
+            target_size_tenths_mb: 0,
+        } => Err(invalid(
+            "A zero target file size leaves no bitrate for video. Choose a positive target.",
+        )),
         _ => Ok(()),
     }
 }
@@ -68,6 +65,7 @@ pub(super) fn validate_encoder_version(
             Some(
                 VideoRateControl::Bitrate { two_pass: true, .. }
                     | VideoRateControl::TargetSize { .. }
+                    | VideoRateControl::TargetSizeDecimal { .. }
             )
         )
     {
@@ -93,12 +91,34 @@ pub(super) fn validate_encoder_version(
     }
 }
 
+pub(super) fn target_bytes(control: VideoRateControl) -> Option<u64> {
+    match control {
+        VideoRateControl::TargetSize { target_size_mib } => {
+            Some(u64::from(target_size_mib) * 1_048_576)
+        }
+        // Round once, at the byte boundary, rather than silently rounding away
+        // the UI's fractional MB. Integer arithmetic retains exact tenths.
+        VideoRateControl::TargetSizeDecimal {
+            target_size_tenths_mb,
+        } => Some((u64::from(target_size_tenths_mb) * 1_048_576 + 5) / 10),
+        _ => None,
+    }
+}
+
 pub(super) struct Rate {
     pub kbps: u32,
     pub two_pass: bool,
 }
 
 impl Rate {
+    pub(super) fn arguments_for_settings(
+        &self,
+        args: &mut Vec<OsString>,
+        settings: &EncodeSettings,
+        pass: u8,
+    ) {
+        self.arguments(args, settings.encoder, pass);
+    }
     pub fn resolve(
         settings: &EncodeSettings,
         seconds: f64,
@@ -115,8 +135,8 @@ impl Rate {
                 kbps: bitrate_kbps,
                 two_pass,
             },
-            VideoRateControl::TargetSize { target_size_mib } => {
-                let total = u64::from(target_size_mib) * 1024 * 1024;
+            VideoRateControl::TargetSize { .. } | VideoRateControl::TargetSizeDecimal { .. } => {
+                let total = target_bytes(control).expect("target-size variant");
                 // A target is an estimate. Reserve 1% plus 64 KiB for video packet
                 // framing/indexes and the final container's non-payload bytes.
                 let reserve = total / 100 + 65_536;
@@ -214,12 +234,7 @@ impl Rate {
                 }
             }
             VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
-                remove_pair(args, "-cq");
-                remove_pair(args, "-b:v");
-                add.extend([
-                    "-b:v".into(),
-                    (u64::from(self.kbps) * 1000).to_string().into(),
-                ]);
+                unreachable!("hardware encoding is rejected at admission")
             }
             VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
                 remove_pair(args, "--crf");
@@ -418,6 +433,72 @@ impl Drop for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_source_tenths_round_trip_without_changing_legacy_mib() {
+        for tenths in [0, 1, 11, 500, 81920] {
+            let rate = VideoRateControl::TargetSizeDecimal {
+                target_size_tenths_mb: tenths,
+            };
+            let serialized = serde_json::to_value(rate).unwrap();
+            assert_eq!(serialized["targetSizeTenthsMb"], tenths);
+            assert_eq!(
+                serde_json::from_value::<VideoRateControl>(serialized).unwrap(),
+                rate
+            );
+            assert_eq!(
+                validate(&EncodeSettings {
+                    rate_control: Some(rate),
+                    ..Default::default()
+                })
+                .is_ok(),
+                tenths > 0
+            );
+        }
+        assert_eq!(
+            target_bytes(VideoRateControl::TargetSizeDecimal {
+                target_size_tenths_mb: 11
+            }),
+            Some(1_153_434)
+        );
+        assert_eq!(
+            target_bytes(VideoRateControl::TargetSizeDecimal {
+                target_size_tenths_mb: 500
+            }),
+            target_bytes(VideoRateControl::TargetSize {
+                target_size_mib: 50
+            })
+        );
+        assert!(
+            validate(&EncodeSettings {
+                rate_control: Some(VideoRateControl::TargetSizeDecimal {
+                    target_size_tenths_mb: 81921
+                }),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&EncodeSettings {
+                rate_control: Some(VideoRateControl::Bitrate {
+                    bitrate_kbps: 9,
+                    two_pass: false
+                }),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        for bitrate_kbps in [10, 1500, 100000] {
+            validate(&EncodeSettings {
+                rate_control: Some(VideoRateControl::Bitrate {
+                    bitrate_kbps,
+                    two_pass: false,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+
     #[test]
     fn mainline_two_pass_requires_the_final_pass_protocol() {
         for control in [

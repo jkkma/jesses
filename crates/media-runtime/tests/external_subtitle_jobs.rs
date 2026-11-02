@@ -138,6 +138,7 @@ fn request(video: &Path, external: &Path, output: &Path, mode: SubtitleMode) -> 
             encoder: VideoEncoder::X264,
             preset: 0,
             external_tracks: vec![ExternalTrack {
+                subtitle_burn_in: false,
                 input_path: external.to_string_lossy().into_owned(),
                 stream_index: 0,
                 audio: None,

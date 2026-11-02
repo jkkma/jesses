@@ -71,7 +71,17 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         args.extend(["--crf".into(), settings.crf.to_string().into()]);
     }
     args.extend(plan.x265_hdr_arguments());
+    if let Some(frames) = super::super::encoding_preferences::keyframes(plan, settings) {
+        args.extend(["--keyint".into(), frames.to_string().into()]);
+    }
     args.extend(super::super::parameters::arguments(settings));
+    // Source custom rows may set a new sample aspect. Let the actual Y4M
+    // header reach the encoder; the frozen pre-filter SAR is not an override.
+    if settings.source_filters
+        && let Some(index) = args.iter().position(|arg| arg == "--sar")
+    {
+        args.drain(index..index + 2);
+    }
     args
 }
 

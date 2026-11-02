@@ -38,7 +38,7 @@ fn format(codec: &str) -> Option<&'static str> {
 
 fn target(mode: SubtitleMode) -> Option<(&'static str, &'static str)> {
     match mode {
-        SubtitleMode::SubRip => Some(("subrip", "srt")),
+        SubtitleMode::MovText | SubtitleMode::SubRip => Some(("subrip", "srt")),
         SubtitleMode::Ass => Some(("ass", "ass")),
         SubtitleMode::WebVtt => Some(("webvtt", "webvtt")),
         _ => None,
@@ -64,6 +64,25 @@ pub(super) fn bitmap_filter(
     )
 }
 
+/// The source consumer overlays on the picture's original clock before its
+/// output trim. Its default sub2video startup (including an initially blank
+/// canvas at an aligned input seek) is intentionally retained.
+pub(super) fn source_bitmap_filter(
+    video: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    depth: u8,
+    input: usize,
+    index: u32,
+) -> String {
+    let prefix = prefix.unwrap_or("null");
+    let suffix = suffix.map_or_else(String::new, |value| format!(",{value}"));
+    format!(
+        "[{video}]{prefix}[jesses_prepared];[jesses_prepared][{input}:{index}]overlay=shortest=1:format={}{suffix}[jesses_video]",
+        if depth == 10 { "yuv420p10" } else { "yuv420" }
+    )
+}
+
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     let mut seen = HashSet::new();
     let mut burns = 0;
@@ -73,12 +92,14 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 "Subtitle settings contain duplicate source stream indices.",
             ));
         }
-        if track.mode != SubtitleMode::Copy && settings.backend != EncodeBackend::Standalone {
+        if (track.mode != SubtitleMode::Copy || track.burn_in)
+            && settings.backend != EncodeBackend::Standalone
+        {
             return Err(invalid(
                 "Subtitle conversion and burn-in currently require standalone encoding.",
             ));
         }
-        burns += usize::from(track.mode == SubtitleMode::BurnIn);
+        burns += usize::from(track.mode == SubtitleMode::BurnIn || track.burn_in);
     }
     if burns > 1 {
         return Err(invalid(
@@ -101,13 +122,14 @@ pub(super) fn validate_selection(
                     && stream.codec_type.as_deref() == Some("subtitle")
             })
             .ok_or_else(|| invalid("Subtitle settings must refer to selected subtitle tracks."))?;
-        if track.mode == SubtitleMode::Copy {
+        if track.mode == SubtitleMode::Copy && !track.burn_in {
             continue;
         }
         let codec = stream.codec_name.as_deref().unwrap_or_default();
         let text = format(codec).is_some();
         if !text
-            && (track.mode != SubtitleMode::BurnIn
+            && (!(track.mode == SubtitleMode::BurnIn
+                || (track.mode == SubtitleMode::Copy && track.burn_in))
                 || !matches!(
                     codec,
                     "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub"
@@ -117,7 +139,7 @@ pub(super) fn validate_selection(
                 "Text conversion supports ASS, SubRip and WebVTT. Bitmap subtitles can be copied or burned; OCR is not applied.",
             ));
         }
-        if track.mode == SubtitleMode::BurnIn
+        if (track.mode == SubtitleMode::BurnIn || track.burn_in)
             && settings.tone_map.is_none()
             && selected.iter().any(|stream| {
                 stream.codec_type.as_deref() == Some("video")
@@ -196,6 +218,109 @@ async fn capture(
 }
 
 impl Prepared {
+    pub(super) fn empty() -> Self {
+        Self {
+            assets: Vec::new(),
+            directory: None,
+            conversions: Vec::new(),
+            overridden: Vec::new(),
+            burned: None,
+            bitmap: None,
+            text_filter: None,
+        }
+    }
+    fn reserve_directory(&mut self, output: &Path, id: &str) -> Result<(), AppError> {
+        if self.directory.is_some() {
+            return Ok(());
+        }
+        let path = output
+            .parent()
+            .expect("validated output parent")
+            .join(format!(".jesses-{id}-subtitles"));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(&path)
+            .map_err(|error| invalid(format!("Could not reserve subtitle workspace: {error}")))?;
+        self.directory = Some(Directory(path));
+        Ok(())
+    }
+
+    /// Render at the original selected-picture clock. Keeping ASS events intact
+    /// preserves animation/karaoke through a trim instead of rewriting cues.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn image_burn(
+        document: &Document,
+        input: &Path,
+        index: u32,
+        video: &Stream,
+        tone_mapped: bool,
+        offset: f64,
+        picture_clock: f64,
+        ffmpeg: &Path,
+        output: &Path,
+        id: &str,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Self, AppError> {
+        let stream = document
+            .streams
+            .iter()
+            .find(|stream| {
+                stream.index == index && stream.codec_type.as_deref() == Some("subtitle")
+            })
+            .ok_or_else(|| {
+                invalid("The selected subtitle stream no longer exists in its source.")
+            })?;
+        let settings = EncodeSettings {
+            subtitles: vec![media_core::SubtitleTrackSettings {
+                stream_index: index,
+                mode: SubtitleMode::BurnIn,
+                burn_in: false,
+            }],
+            ..Default::default()
+        };
+        let mut video = video.clone();
+        if tone_mapped {
+            video.color_transfer = None;
+        }
+        validate_selection(&[&video, stream], &settings)?;
+        let codec = stream.codec_name.as_deref().unwrap_or_default();
+        let mut result = Self::empty();
+        if let Some(extension) = format(codec) {
+            result.reserve_directory(output, id)?;
+            let text = trim::read_subtitles(ffmpeg, input, index, codec, cancel).await?;
+            let text = if offset == 0.0 {
+                text
+            } else {
+                text.shifted(offset)?.visible()?
+            };
+            let path = result.write_asset("burn", extension, text.render().as_bytes())?;
+            result
+                .extract_fonts(document, ffmpeg, input, cancel)
+                .await?;
+            let name = path
+                .file_name()
+                .expect("generated asset")
+                .to_str()
+                .expect("ASCII asset");
+            result.text_filter = Some(format!(
+                "setpts=PTS+{picture_clock:.9}/TB,subtitles=filename={name}:fontsdir=.,setpts=PTS-{picture_clock:.9}/TB"
+            ));
+        } else {
+            result.bitmap = Some(Bitmap {
+                path: input.to_path_buf(),
+                index,
+                offset_seconds: offset - picture_clock,
+            });
+        }
+        Ok(result)
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         settings: &EncodeSettings,
@@ -219,15 +344,63 @@ impl Prepared {
             bitmap: None,
             text_filter: None,
         };
+        let source_trim = settings.source_trim
+            && settings.backend == EncodeBackend::Standalone
+            && trimmed.is_some();
+        let intact_dolby = document
+            .streams
+            .iter()
+            .find(|stream| stream.index == settings.video_stream_index)
+            .is_some_and(|video| {
+                settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                    && super::encode_plan::preserves_dolby_source_clock(video, settings)
+            });
+        let picture_clock = if source_trim && (intact_dolby || settings.source_filters) {
+            settings
+                .trim
+                .and_then(|trim| trim.time)
+                .filter(|time| time.seek_strategy == media_core::VideoSeekStrategy::InputSeek)
+                .map_or(0.0, |time| f64::from(time.start_milliseconds) / 1000.0)
+        } else if source_trim {
+            let video = document
+                .streams
+                .iter()
+                .find(|stream| stream.index == settings.video_stream_index)
+                .ok_or_else(|| {
+                    invalid("The source subtitle renderer needs the selected video clock.")
+                })?;
+            let (n, d) = video
+                .avg_frame_rate
+                .as_deref()
+                .or(video.r_frame_rate.as_deref())
+                .and_then(|rate| rate.split_once('/'))
+                .ok_or_else(|| {
+                    invalid("The source subtitle renderer needs a source frame rate.")
+                })?;
+            let (n, d) = (
+                n.parse::<f64>()
+                    .map_err(|_| invalid("Invalid source subtitle frame rate."))?,
+                d.parse::<f64>()
+                    .map_err(|_| invalid("Invalid source subtitle frame rate."))?,
+            );
+            if !n.is_finite() || !d.is_finite() || n <= 0.0 || d <= 0.0 {
+                return Err(invalid("Invalid source subtitle frame rate."));
+            }
+            trimmed.expect("source trim").interval.source_start_frame as f64 * d / n
+        } else {
+            0.0
+        };
         for track in settings
             .subtitles
             .iter()
-            .filter(|track| track.mode != SubtitleMode::Copy)
+            .filter(|track| track.mode != SubtitleMode::Copy || track.burn_in)
         {
             if *cancel.borrow() {
                 return Err(super::canceled());
             }
-            result.overridden.push(track.stream_index);
+            if track.mode != SubtitleMode::Copy {
+                result.overridden.push(track.stream_index);
+            }
             let stream = selected
                 .iter()
                 .find(|stream| stream.index == track.stream_index)
@@ -239,25 +412,22 @@ impl Prepared {
                     |(path, document, index)| (path, document, index),
                 );
             let Some(source_format) = format(codec) else {
-                result.burned = Some(track.stream_index);
+                if track.mode == SubtitleMode::BurnIn {
+                    result.burned = Some(track.stream_index);
+                }
                 result.bitmap = Some(Bitmap {
                     path: subtitle_input.to_path_buf(),
                     index: source_index,
                     offset_seconds: external.offset_seconds(track.stream_index)
-                        - trimmed.map_or(0.0, |trim| trim.interval.start),
+                        - if source_trim {
+                            0.0
+                        } else {
+                            trimmed.map_or(0.0, |trim| trim.interval.start)
+                        },
                 });
                 continue;
             };
-            if result.directory.is_none() {
-                let path = output
-                    .parent()
-                    .expect("validated output parent")
-                    .join(format!(".jesses-{id}-subtitles"));
-                std::fs::create_dir(&path).map_err(|error| {
-                    invalid(format!("Could not reserve subtitle workspace: {error}"))
-                })?;
-                result.directory = Some(Directory(path));
-            }
+            result.reserve_directory(output, id)?;
             let source =
                 if let Some((asset, _)) = trimmed.and_then(|trim| trim.asset(track.stream_index)) {
                     trim::read_subtitles(ffmpeg, asset, 0, codec, cancel).await?
@@ -265,7 +435,7 @@ impl Prepared {
                     let text =
                         trim::read_subtitles(ffmpeg, subtitle_input, source_index, codec, cancel)
                             .await?;
-                    if external.source_track(track.stream_index).is_some() {
+                    if external.source_track(track.stream_index).is_some() && !source_trim {
                         text.shifted(external.offset_seconds(track.stream_index))?
                             .visible()?
                     } else {
@@ -277,8 +447,10 @@ impl Prepared {
                 source_format,
                 source.render().as_bytes(),
             )?;
-            if track.mode == SubtitleMode::BurnIn {
-                result.burned = Some(track.stream_index);
+            if track.mode == SubtitleMode::BurnIn || track.burn_in {
+                if track.mode == SubtitleMode::BurnIn {
+                    result.burned = Some(track.stream_index);
+                }
                 result
                     .extract_fonts(subtitle_document, ffmpeg, subtitle_input, cancel)
                     .await?;
@@ -289,8 +461,21 @@ impl Prepared {
                     .expect("generated name")
                     .to_str()
                     .expect("ASCII generated name");
-                result.text_filter = Some(format!("subtitles=filename={name}:fontsdir=."));
-            } else {
+                let filter = format!("subtitles=filename={name}:fontsdir=.");
+                result.text_filter = Some(if source_trim {
+                    let clock = picture_clock - external.offset_seconds(track.stream_index);
+                    format!("setpts=PTS+{clock:.9}/TB,{filter},setpts=PTS-{clock:.9}/TB")
+                } else {
+                    filter
+                });
+            }
+            // Source conversion belongs to the final seek/mux command. Its
+            // independently generated packet reference lives in Prepared trim;
+            // the intact original text above remains a separate burn consumer.
+            if source_trim {
+                continue;
+            }
+            if !matches!(track.mode, SubtitleMode::BurnIn | SubtitleMode::Copy) {
                 let (target_codec, target_format) = target(track.mode).expect("conversion mode");
                 let args = [
                     "-v".into(),
@@ -325,7 +510,15 @@ impl Prepared {
                 )?;
                 result.conversions.push(Conversion {
                     index: track.stream_index,
-                    codec: target_codec,
+                    codec: if track.mode == SubtitleMode::MovText
+                        && matches!(
+                            super::container::staging_format(selected, Some(settings)),
+                            media_core::ContainerFormat::Mov | media_core::ContainerFormat::Mp4
+                        ) {
+                        "mov_text"
+                    } else {
+                        target_codec
+                    },
                     text,
                     path,
                     derived_tags: stream
@@ -511,6 +704,13 @@ impl Prepared {
                 .expect("output map")
                 .0;
             args[map + 1] = format!("{next_input}:0").into();
+            if converted.codec == "mov_text" {
+                let last = args.len() - 1;
+                args.splice(
+                    last..last,
+                    [format!("-c:{output_index}").into(), "mov_text".into()],
+                );
+            }
             for key in [
                 "ENCODER",
                 "DURATION",

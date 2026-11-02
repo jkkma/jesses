@@ -206,6 +206,7 @@ fn request(primary: &Path, external: &Path, output: &Path) -> EncodeRequest {
             external_tracks: [2, 1, 0]
                 .into_iter()
                 .map(|stream_index| ExternalTrack {
+                    subtitle_burn_in: false,
                     offset_milliseconds: 0,
                     subtitle_mode: None,
                     title: None,
@@ -218,6 +219,7 @@ fn request(primary: &Path, external: &Path, output: &Path) -> EncodeRequest {
                 })
                 .collect(),
             subtitles: vec![media_core::SubtitleTrackSettings {
+                burn_in: false,
                 stream_index: 2,
                 mode: media_core::SubtitleMode::Ass,
             }],
@@ -269,6 +271,7 @@ fn audio(
     channels: media_core::AudioChannels,
 ) -> media_core::ExternalAudioSettings {
     media_core::ExternalAudioSettings {
+        normalization: None,
         gain: None,
         codec,
         bitrate_kbps: 128,
@@ -524,6 +527,7 @@ async fn converted_external_audio_keeps_distinct_sources_timestamps_and_primary_
     let output = root.0.join("converted.mkv");
     let mut mixed = request(&primary, &first, &output);
     let selected = |path: &Path, index, audio| ExternalTrack {
+        subtitle_burn_in: false,
         offset_milliseconds: 0,
         subtitle_mode: None,
         title: None,
@@ -671,6 +675,7 @@ async fn invalid_external_sources_fail_without_publishing_or_modifying_media() {
         request.source.stream_indices = vec![0];
         request.settings.subtitles.clear();
         request.settings.external_tracks = vec![ExternalTrack {
+            subtitle_burn_in: false,
             offset_milliseconds: 0,
             subtitle_mode: None,
             title: None,
@@ -777,6 +782,7 @@ async fn mp4_rejects_copied_external_pcm_but_accepts_aac_conversion() {
     mixed.source.stream_indices = vec![0];
     mixed.settings.subtitles.clear();
     mixed.settings.external_tracks = vec![ExternalTrack {
+        subtitle_burn_in: false,
         offset_milliseconds: 0,
         subtitle_mode: None,
         title: None,
@@ -847,6 +853,7 @@ async fn delayed_external_aac_rejects_mp4_and_mov_before_video_encoding() {
         mixed.source.stream_indices = vec![0];
         mixed.settings.subtitles.clear();
         mixed.settings.external_tracks = vec![ExternalTrack {
+            subtitle_burn_in: false,
             offset_milliseconds: 0,
             subtitle_mode: None,
             title: None,
@@ -937,6 +944,7 @@ async fn delayed_primary_audio_trimmed_to_zero_can_convert_to_mp4_aac() {
         time: None,
     });
     mixed.settings.audio = vec![media_core::AudioTrackSettings {
+        normalization: None,
         stream_index: 1,
         codec: media_core::AudioCodec::Aac,
         bitrate_kbps: 128,
@@ -978,6 +986,7 @@ async fn invalid_external_audio_settings_fail_before_video_or_publication() {
             "bitrate",
             0,
             media_core::ExternalAudioSettings {
+                normalization: None,
                 bitrate_kbps: 0,
                 ..audio(Codec::Opus, Channels::Mono)
             },
@@ -990,6 +999,7 @@ async fn invalid_external_audio_settings_fail_before_video_or_publication() {
         mixed.source.stream_indices = vec![0];
         mixed.settings.subtitles.clear();
         mixed.settings.external_tracks = vec![ExternalTrack {
+            subtitle_burn_in: false,
             offset_milliseconds: 0,
             subtitle_mode: None,
             title: None,
@@ -1159,6 +1169,7 @@ async fn late_external_audio_uses_packet_end_instead_of_header_duration() {
     let output = root.0.join("late-output.mkv");
     let mut mixed = request(&primary, &external, &output);
     mixed.settings.external_tracks = vec![ExternalTrack {
+        subtitle_burn_in: false,
         offset_milliseconds: 0,
         subtitle_mode: None,
         title: None,
@@ -1247,6 +1258,7 @@ async fn negative_external_audio_timestamps_do_not_shift_any_output_track() {
     let output = root.0.join("early-output.mkv");
     let mut mixed = request(&primary, &external, &output);
     mixed.settings.external_tracks = vec![ExternalTrack {
+        subtitle_burn_in: false,
         offset_milliseconds: 0,
         subtitle_mode: None,
         title: None,

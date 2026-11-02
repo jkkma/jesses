@@ -72,7 +72,10 @@ impl Transform {
 }
 
 pub(super) fn parse_source(value: Option<&str>) -> Result<String, AppError> {
-    let value = value.ok_or_else(|| invalid("The source sample aspect ratio is missing."))?;
+    let value = match value {
+        None | Some("0:1" | "N/A" | "unknown") => return Ok("1:1".into()),
+        Some(value) => value,
+    };
     let (numerator, denominator) = value
         .split_once(':')
         .ok_or_else(|| invalid("The source sample aspect ratio is invalid."))?;
