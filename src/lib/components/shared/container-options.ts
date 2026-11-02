@@ -2,7 +2,11 @@ import type { ContainerFormat } from '$lib/ipc/generated';
 
 export function destinationContainer(path: string): ContainerFormat {
   const extension = path.split('.').pop()?.toLowerCase();
-  return extension === 'mp4' || extension === 'mov' || extension === 'webm'
+  return extension === 'mp4' ||
+    extension === 'mov' ||
+    extension === 'webm' ||
+    extension === 'm4a' ||
+    extension === 'ogg'
     ? extension
     : 'matroska';
 }

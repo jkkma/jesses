@@ -1,14 +1,17 @@
 <script lang="ts">
   import { validRate, type RateDraft } from './rate-control-options';
+  import type { VideoEncoder } from '$lib/ipc/generated';
   let {
     idPrefix,
     draft,
     disabled,
+    encoder,
     onchange,
   }: {
     idPrefix: string;
     draft: RateDraft;
     disabled: boolean;
+    encoder: VideoEncoder;
     onchange: (value: RateDraft) => void;
   } = $props();
 </script>
@@ -30,7 +33,25 @@
         <option value="targetSize">Target file size</option>
       </select>
     </div>
-    {#if draft.mode === 'bitrate'}
+    {#if draft.mode === 'constantQp'}
+      <div class="control compact-control">
+        <label for={`${idPrefix}-constant-qp`}>Constant QP (0–51)</label><input
+          id={`${idPrefix}-constant-qp`}
+          type="number"
+          min="0"
+          max="51"
+          step="1"
+          value={draft.constantQp ?? ''}
+          {disabled}
+          oninput={(event) =>
+            onchange({
+              ...draft,
+              constantQp:
+                event.currentTarget.value === '' ? undefined : event.currentTarget.valueAsNumber,
+            })}
+        />
+      </div>
+    {:else if draft.mode === 'bitrate'}
       <div class="control compact-control">
         <label for={`${idPrefix}-video-bitrate`}>Video bitrate (kb/s)</label>
         <input
@@ -96,7 +117,9 @@
     </p>
   {/if}
   {#if !validRate(draft)}<p role="alert">
-      Enter a whole number from 1 to {draft.mode === 'bitrate' ? '100000 kb/s' : '1048576 MiB'}.
+      {draft.mode === 'constantQp'
+        ? 'Enter a whole number from 0 to 51.'
+        : `Enter a whole number from 1 to ${draft.mode === 'bitrate' ? '100000 kb/s' : '1048576 MiB'}.`}
     </p>{/if}
 </div>
 

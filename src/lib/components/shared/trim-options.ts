@@ -9,6 +9,7 @@ import type { AudioTrackDraft } from './audio-options';
 export type TrimDraft = {
   enabled: boolean;
   mode: 'frames' | 'time';
+  seekStrategy?: 'inputSeek' | 'decodeFromStart';
   startFrame: number | undefined;
   endFrameExclusive: number | undefined;
   startMilliseconds: number | undefined;
@@ -31,6 +32,7 @@ export function selectedTrim(draft: TrimDraft): VideoTrim | undefined {
       time: {
         startMilliseconds: draft.startMilliseconds!,
         endMilliseconds: draft.endMilliseconds!,
+        ...(draft.seekStrategy ? { seekStrategy: draft.seekStrategy } : {}),
       },
     };
   }
@@ -43,6 +45,7 @@ export function trimError(
   included: number[],
   streams: MediaStream[],
   subtitles: SubtitleTrackSettings[] = [],
+  videoMode: 'encode' | 'copy' | 'drop' = 'encode',
 ): string | null {
   if (!draft.enabled) return null;
   if (draft.mode === 'time') {
@@ -68,31 +71,6 @@ export function trimError(
     draft.endFrameExclusive! <= draft.startFrame!
   )
     return 'Enter a zero-based start frame and a greater, exclusive end frame.';
-  if (
-    streams.some(
-      (stream) =>
-        stream.kind === 'audio' &&
-        included.includes(stream.index) &&
-        (!audio.find((track) => track.streamIndex === stream.index) ||
-          audio.find((track) => track.streamIndex === stream.index)?.codec === 'copy'),
-    )
-  )
-    return 'Choose an audio conversion for each included audio track when trimming. Copy cannot cut compressed packets at exact sample boundaries.';
-  if (
-    streams.some(
-      (stream) =>
-        stream.kind === 'subtitle' &&
-        included.includes(stream.index) &&
-        !['ass', 'subrip', 'webvtt', 'mov_text'].includes(stream.codec ?? '') &&
-        !(
-          ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(
-            stream.codec ?? '',
-          ) &&
-          subtitles.some((track) => track.streamIndex === stream.index && track.mode === 'burnIn')
-        ),
-    )
-  )
-    return 'Trimming supports text subtitles and burned bitmap subtitles. Exclude unsupported subtitle tracks or burn bitmap subtitles into video.';
   return null;
 }
 export function trimSummary(trim: VideoTrim | undefined | null): string {

@@ -17,12 +17,17 @@ export function selectedSubtitles(
   included: number[],
 ): SubtitleTrackSettings[] {
   return tracks
-    .filter((track) => included.includes(track.streamIndex) && track.mode !== 'copy')
+    .filter(
+      (track) =>
+        (included.includes(track.streamIndex) || track.mode === 'burnIn') &&
+        (track.mode !== 'copy' || track.burnIn),
+    )
     .map((track) => ({ ...track }));
 }
 
 export const subtitleLabels: Record<SubtitleMode, string> = {
   copy: 'Copy source',
+  movText: 'MOV_TEXT',
   subRip: 'SubRip (SRT)',
   ass: 'ASS',
   webVtt: 'WebVTT',
@@ -40,9 +45,13 @@ export function subtitleError(
   const selected = selectedSubtitles(tracks, included);
   if (selected.length && backend !== 'standalone')
     return 'Subtitle conversion and burn-in require standalone encoding.';
-  if (selected.filter((track) => track.mode === 'burnIn').length > 1)
+  if (selected.filter((track) => track.mode === 'burnIn' || track.burnIn).length > 1)
     return 'Choose at most one subtitle track to burn into the video.';
-  if (selected.some((track) => track.mode === 'burnIn') && knownHdr(video) && !toneMapped)
+  if (
+    selected.some((track) => track.mode === 'burnIn' || track.burnIn) &&
+    knownHdr(video) &&
+    !toneMapped
+  )
     return 'Burn-in requires SDR video; HDR rendering needs an explicit tone-map workflow.';
   for (const track of selected) {
     const stream = streams.find(
@@ -52,7 +61,7 @@ export function subtitleError(
     if (
       !['ass', 'subrip', 'webvtt', 'mov_text'].includes(stream.codec ?? '') &&
       !(
-        track.mode === 'burnIn' &&
+        (track.mode === 'burnIn' || track.burnIn) &&
         ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(stream.codec ?? '')
       )
     )

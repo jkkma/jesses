@@ -11,7 +11,8 @@ export const outputPixelFormats: { value: Av1anPixelFormat; label: string }[] = 
 ];
 
 export function allowedOutputPixelFormats(encoder: VideoEncoder): Av1anPixelFormat[] {
-  if (['svtAv1', 'svtAv1FiveFish', 'svtAv1Hdr', 'h264Nvenc', 'hevcNvenc'].includes(encoder))
+  if (['h264Nvenc', 'hevcNvenc'].includes(encoder)) return [];
+  if (['svtAv1', 'svtAv1FiveFish', 'svtAv1Hdr'].includes(encoder))
     return ['yuv420p', 'yuv420p10le'];
   if (encoder === 'vpxStandalone') return ['yuv420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le'];
   if (encoder === 'vp9') return ['yuv420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le', 'yuva420p'];

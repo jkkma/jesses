@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import Button from '$lib/components/ui/button/button.svelte';
-  import { detectCrop, previewFrame } from '$lib/ipc/client';
+  import { detectCrop, previewFrame, snapKeyframe } from '$lib/ipc/client';
   import type {
     AutoCropResult,
     CropSettings,
@@ -16,12 +16,20 @@
     videoStreamIndex,
     crop,
     onapply,
+    onmarkstart,
+    onmarkend,
+    showCrop = true,
+    snapOnStart = false,
     disabled = false,
   }: {
     file: MediaFile;
     videoStreamIndex: number;
     crop: CropSettings;
     onapply: (crop: CropSettings) => void;
+    onmarkstart?: (seconds: number) => void;
+    onmarkend?: (seconds: number) => void;
+    showCrop?: boolean;
+    snapOnStart?: boolean;
     disabled?: boolean;
   } = $props();
 
@@ -34,11 +42,14 @@
   let proposal = $state<AutoCropResult | null>(null);
   let loading = $state(false);
   let detecting = $state(false);
+  let snapping = $state(false);
+  let snapMessage = $state('');
   let previewError = $state('');
   let cropError = $state('');
   let applied = $state(false);
   let previewAbort: AbortController | null = null;
   let cropAbort: AbortController | null = null;
+  let snapAbort: AbortController | null = null;
   let previewGeneration = 0;
   let cropGeneration = 0;
   let activeSource = '';
@@ -69,6 +80,9 @@
     ++cropGeneration;
     cropAbort?.abort();
     cropAbort = null;
+    snapAbort?.abort();
+    snapAbort = null;
+    snapping = false;
     detecting = false;
     if (!preview) proposal = null;
   }
@@ -87,6 +101,7 @@
       previewError = '';
       cropError = '';
       applied = false;
+      snapMessage = '';
       if (expanded && !disabled) void loadPreview();
     });
   });
@@ -137,6 +152,10 @@
 
   function seek(input: HTMLInputElement) {
     stopPreview();
+    snapAbort?.abort();
+    snapAbort = null;
+    snapping = false;
+    snapMessage = '';
     position = input.valueAsNumber;
     preview = null;
     previewError = '';
@@ -183,6 +202,40 @@
     proposal = null;
     applied = true;
   }
+
+  async function snapStart() {
+    if (disabled || !preview || !onmarkstart) return;
+    snapAbort?.abort();
+    const controller = new AbortController();
+    snapAbort = controller;
+    const source = activeSource;
+    const fingerprint = preview.sourceFingerprint;
+    const requested = position;
+    snapping = true;
+    snapMessage = '';
+    try {
+      const result = await snapKeyframe(
+        { inputPath: file.path, videoStreamIndex, positionSeconds: requested },
+        controller.signal,
+      );
+      if (controller.signal.aborted || source !== activeSource || position !== requested) return;
+      if (result.sourceFingerprint !== fingerprint)
+        snapMessage = 'The source changed since the preview. Refresh and try again.';
+      else if (result.positionSeconds === null)
+        snapMessage = 'No usable keyframe was found at or before this position.';
+      else {
+        onmarkstart(result.positionSeconds);
+        snapMessage = `Start set to the preceding keyframe at ${result.positionSeconds.toFixed(3)} s.`;
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) snapMessage = errorMessage(cause);
+    } finally {
+      if (snapAbort === controller) {
+        snapping = false;
+        snapAbort = null;
+      }
+    }
+  }
 </script>
 
 <div class="source-preview">
@@ -195,16 +248,19 @@
       if (expanded && !preview) void loadPreview();
       if (!expanded) cancel();
     }}
-    ><span class="disclosure-arrow" class:expanded aria-hidden="true"></span>Source preview &
-    automatic crop</button
+    ><span class="disclosure-arrow" class:expanded aria-hidden="true"></span>{showCrop
+      ? 'Source preview & automatic crop'
+      : 'Visual trim picker'}</button
   >
   {#if expanded}
     <div class="preview-content">
-      <p class="small-muted">
-        Inspect coded source pixels before rotation, display aspect correction, resize and borders.
-        The outline shows
-        {proposal?.crop ? 'the proposed crop' : 'your current crop'}.
-      </p>
+      {#if showCrop}<p class="small-muted">
+          Inspect coded source pixels before rotation, display aspect correction, resize and
+          borders. The outline shows
+          {proposal?.crop ? 'the proposed crop' : 'your current crop'}.
+        </p>{:else}<p class="small-muted">
+          Seek to a source position, then set the start or exclusive end of the interval.
+        </p>{/if}
       {#if preview}
         <figure>
           <div class="preview-image" style={`aspect-ratio: ${preview.width} / ${preview.height}`}>
@@ -214,7 +270,7 @@
               width={preview.width}
               height={preview.height}
             />
-            {#if cropFits}
+            {#if showCrop && cropFits}
               <div
                 class="crop-outline"
                 class:proposed={!!proposal?.crop}
@@ -266,39 +322,68 @@
         />
       {/if}
       {#if previewError}<p role="alert" class="analysis-error">{previewError}</p>{/if}
-      <div class="analysis-actions">
-        <Button variant="outline" onclick={detect} disabled={disabled || detecting}>
-          {detecting ? 'Detecting crop…' : 'Detect black borders'}
-        </Button>
-        {#if loading || detecting}<Button variant="ghost" onclick={cancel}>Cancel analysis</Button
-          >{/if}
-      </div>
-      {#if proposal}
-        <div class="crop-proposal" aria-live="polite">
-          <p>{proposal.message}</p>
-          {#if proposal.crop}
-            <p class="crop-values">
-              Proposed crop: top {proposal.crop.top}, right {proposal.crop.right}, bottom
-              {proposal.crop.bottom}, left {proposal.crop.left} pixels.
-            </p>
-            <p class="small-muted">
-              {proposal.agreementPercent}% of usable frame detections agree across
-              {proposal.sampleCount} sampled positions.
-            </p>
-            <div class="analysis-actions">
-              <Button onclick={apply} disabled={disabled || !identityMatches}
-                >Apply detected crop</Button
-              >
-              <Button variant="ghost" onclick={() => (proposal = null)}>Dismiss proposal</Button>
-            </div>
-            {#if !preview}<p class="small-muted">
-                Load a source preview before applying this crop.
-              </p>{/if}
-          {/if}
+      {#if onmarkstart || onmarkend}
+        <div class="analysis-actions" aria-label="Set trim boundaries">
+          {#if onmarkstart}<Button
+              variant="outline"
+              disabled={disabled || !preview || loading || snapping}
+              onclick={() => (snapOnStart ? void snapStart() : onmarkstart?.(position))}
+              >Set start here</Button
+            >{/if}
+          {#if onmarkend}<Button
+              variant="outline"
+              disabled={disabled || !preview || loading}
+              onclick={() => onmarkend?.(position)}>Set end here</Button
+            >{/if}
+          {#if onmarkstart}<Button
+              variant="outline"
+              disabled={disabled || !preview || loading || snapping}
+              onclick={snapStart}
+              >{snapping ? 'Finding keyframe…' : 'Set start to preceding keyframe'}</Button
+            >{/if}
         </div>
+        {#if snapMessage}<p class="small-muted" role="status">{snapMessage}</p>{/if}
+        <p class="small-muted">
+          The end is exclusive: the frame at the end position is not included.
+        </p>
       {/if}
-      {#if applied}<p class="small-muted" role="status">Detected crop applied to this file.</p>{/if}
-      {#if cropError}<p role="alert" class="analysis-error">{cropError}</p>{/if}
+      {#if showCrop}
+        <div class="analysis-actions">
+          <Button variant="outline" onclick={detect} disabled={disabled || detecting}>
+            {detecting ? 'Detecting crop…' : 'Detect black borders'}
+          </Button>
+          {#if loading || detecting}<Button variant="ghost" onclick={cancel}>Cancel analysis</Button
+            >{/if}
+        </div>
+        {#if proposal}
+          <div class="crop-proposal" aria-live="polite">
+            <p>{proposal.message}</p>
+            {#if proposal.crop}
+              <p class="crop-values">
+                Proposed crop: top {proposal.crop.top}, right {proposal.crop.right}, bottom
+                {proposal.crop.bottom}, left {proposal.crop.left} pixels.
+              </p>
+              <p class="small-muted">
+                {proposal.agreementPercent}% of usable frame detections agree across
+                {proposal.sampleCount} sampled positions.
+              </p>
+              <div class="analysis-actions">
+                <Button onclick={apply} disabled={disabled || !identityMatches}
+                  >Apply detected crop</Button
+                >
+                <Button variant="ghost" onclick={() => (proposal = null)}>Dismiss proposal</Button>
+              </div>
+              {#if !preview}<p class="small-muted">
+                  Load a source preview before applying this crop.
+                </p>{/if}
+            {/if}
+          </div>
+        {/if}
+        {#if applied}<p class="small-muted" role="status">
+            Detected crop applied to this file.
+          </p>{/if}
+        {#if cropError}<p role="alert" class="analysis-error">{cropError}</p>{/if}
+      {/if}
     </div>
   {/if}
 </div>

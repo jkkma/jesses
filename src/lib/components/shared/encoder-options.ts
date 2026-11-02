@@ -19,8 +19,6 @@ export const encoderChoices: { value: VideoEncoder; label: string }[] = [
   { value: 'x265Standalone', label: 'x265 · HEVC' },
   { value: 'aomAv1', label: 'AOM · AV1' },
   { value: 'vpxStandalone', label: 'VP9 · vpxenc' },
-  { value: 'h264Nvenc', label: 'NVIDIA NVENC · H.264' },
-  { value: 'hevcNvenc', label: 'NVIDIA NVENC · HEVC' },
   { value: 'x265', label: 'x265 · HEVC (FFmpeg)' },
   { value: 'vp9', label: 'VP9 · libvpx (FFmpeg)' },
 ];
@@ -194,6 +192,7 @@ export function requiredEncoderTools(
   backend: EncodeBackend,
   encoder: VideoEncoder,
   concatMethod?: 'ffmpeg' | 'mkvmerge',
+  sourceWorkflow = false,
 ): string[] {
   return [
     'ffmpeg',
@@ -201,7 +200,8 @@ export function requiredEncoderTools(
     encoderOptions(encoder).tool,
     ...(encoder === 'x265Standalone' ||
     (backend === 'av1an' &&
-      (['x264', 'vpxStandalone'].includes(encoder) || concatMethod === 'mkvmerge'))
+      ((!sourceWorkflow && ['x264', 'vpxStandalone'].includes(encoder)) ||
+        concatMethod === 'mkvmerge'))
       ? ['mkvmerge']
       : []),
     ...(backend === 'av1an' ? ['av1an'] : []),
@@ -230,6 +230,8 @@ export function sourceBitDepth(stream: MediaStream | undefined): number | null {
 }
 
 export function encodeSummary(settings: EncodeSettings): string {
+  if (settings.videoMode === 'copy' || settings.videoMode === 'drop')
+    return `${settings.videoMode === 'copy' ? 'Copied video' : 'Audio-only output'} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}`;
   if (!isSvtEncoder(settings.encoder)) {
     const options = encoderOptions(settings.encoder);
     const route = ['x264', 'x265Standalone', 'aomAv1', 'vpxStandalone'].includes(settings.encoder)
@@ -239,8 +241,8 @@ export function encodeSummary(settings: EncodeSettings): string {
       settings.backend === 'av1an'
         ? `av1an / ${options.name} · ${settings.workers ?? 2} parallel chunks`
         : `${route} ${options.name}`;
-    return `${workflow} · ${options.codec} · Source bit depth · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless)} · Preset ${presetLabel(settings.encoder, settings.svtPreset ?? settings.preset)} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
+    return `${workflow} · ${options.codec} · Source bit depth · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless, settings.constantQuantizer)} · Preset ${presetLabel(settings.encoder, settings.svtPreset ?? settings.preset)} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
   }
   const name = encoderOptions(settings.encoder).name;
-  return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · 10-bit · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless)} · Preset ${settings.svtPreset ?? settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
+  return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · 10-bit · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless, settings.constantQuantizer)} · Preset ${settings.svtPreset ?? settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
 }

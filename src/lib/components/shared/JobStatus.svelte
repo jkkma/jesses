@@ -1,11 +1,12 @@
 <script lang="ts">
   import { Square } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
-  import { errorMessage, fileName, formatDuration } from './format';
+  import { errorMessage, fileName, formatBytes, formatDuration } from './format';
   import { ProgressEstimator, type ProgressEstimate } from './progress-estimate';
   import type { JobSnapshot, MuxRequest } from '$lib/ipc/generated';
   import { encodeSummary, encoderOptions } from './encoder-options';
   import { canKeepProgress, canResumeJob, savedProgressSummary, terminalJob } from './job-state';
+  import { isDesktop, openDirectory, parentDirectory } from '$lib/ipc/client';
 
   let {
     job,
@@ -28,10 +29,33 @@
   } = $props();
   let errors = $state<Record<string, string>>({});
   let queueError = $state<string | null>(null);
+  let folderError = $state<string | null>(null);
+  async function openOutputFolder(path: string) {
+    const folder = parentDirectory(path);
+    if (!folder) {
+      folderError = 'The output has no parent folder.';
+      return;
+    }
+    try {
+      folderError = null;
+      await openDirectory(folder);
+    } catch (cause) {
+      folderError = errorMessage(cause);
+    }
+  }
   let actions = $state<
     Record<string, 'cancel' | 'keep' | 'resume' | 'discard' | 'pause' | undefined>
   >({});
   let confirmDiscard = $state<string | null>(null);
+  function sizeComparison(input: string, output: string): string {
+    try {
+      const a = BigInt(input),
+        b = BigInt(output);
+      return b < a ? 'smaller' : b > a ? 'larger' : 'same size';
+    } catch {
+      return 'comparison unavailable';
+    }
+  }
   let stopping = $state(false);
   const pending = $derived(jobs.filter((entry) => !terminalJob(entry.state)));
   const history = $derived(
@@ -84,8 +108,8 @@
     return () => clearInterval(timer);
   });
   const canDiscard = (entry: JobSnapshot) =>
-    entry.encodeSettings?.backend === 'av1an' &&
-    !!entry.recovery &&
+    ((entry.encodeSettings?.backend === 'av1an' && !!entry.recovery) ||
+      (entry.encodeSettings?.backend === 'standalone' && !!entry.standaloneRecovery)) &&
     ['stopped', 'failed', 'interrupted'].includes(entry.state);
   async function runAction(id: string, action: 'cancel' | 'keep' | 'resume' | 'discard') {
     if (actions[id] || stopping) return;
@@ -147,7 +171,7 @@
 </script>
 
 {#snippet recoveryControls(entry: JobSnapshot)}
-  {#if entry.encodeSettings?.backend === 'av1an' && ['running', 'paused'].includes(entry.state)}
+  {#if ['preparing', 'running', 'paused', 'finalizing'].includes(entry.state)}
     <Button
       variant="outline"
       disabled={!!actions[entry.id] || stopping}
@@ -155,12 +179,15 @@
       >{actions[entry.id] === 'pause'
         ? 'Updating workers…'
         : entry.state === 'paused'
-          ? 'Continue encoding'
-          : 'Pause encoding'}</Button
+          ? entry.encodeSettings
+            ? 'Continue encoding'
+            : 'Continue job'
+          : entry.encodeSettings
+            ? 'Pause encoding'
+            : 'Pause job'}</Button
     >
     {#if entry.state === 'paused'}<p class="small-muted" role="status">
-        Workers are paused. Memory and open files remain in use. Continue, cancel, or stop and keep
-        progress.
+        Processes are paused. Memory and open files remain in use. Continue or cancel the job.
       </p>{/if}
   {/if}
   {#if entry.state === 'stopping'}
@@ -269,13 +296,28 @@
     <div class="section-heading">
       <span class="eyebrow"
         >{job.encodeSettings
-          ? `${encoderOptions(job.encodeSettings.encoder).codec} encode`
+          ? job.encodeSettings.videoMode === 'copy'
+            ? 'Video copy / audio conversion'
+            : job.encodeSettings.videoMode === 'drop'
+              ? 'Audio conversion'
+              : `${encoderOptions(job.encodeSettings.encoder).codec} encode`
           : 'Remux'} · Job status</span
       >
       <strong role="status">{job.state.charAt(0).toUpperCase() + job.state.slice(1)}</strong>
     </div>
     <div class="job-body">
       <p class="job-path">{job.request.outputPath}</p>
+      {#if job.inputSizeBytes && job.outputSizeBytes}<p class="small-muted">
+          Input {formatBytes(job.inputSizeBytes)} → Output {formatBytes(job.outputSizeBytes)} ({sizeComparison(
+            job.inputSizeBytes,
+            job.outputSizeBytes,
+          )})
+        </p>{/if}
+      {#if isDesktop()}<button
+          type="button"
+          onclick={() => openOutputFolder(job.request.outputPath)}>Open output folder</button
+        >{/if}
+      {#if folderError}<p role="alert">{folderError}</p>{/if}
       {#if job.muxRequest}<details>
           <summary>Saved track settings</summary>{@render muxSettings(job.muxRequest)}
         </details>{/if}
@@ -284,7 +326,9 @@
         </p>{/if}
       {#if validationPhase === 'preparing'}
         <p>
-          Checking source metadata and frames before encoding. Long videos can take several minutes.
+          {#if job.encodeSettings?.videoMode && job.encodeSettings.videoMode !== 'encode'}Checking
+            source metadata and media before processing. Long sources can take several minutes.{:else}Checking
+            source metadata and frames before encoding. Long videos can take several minutes.{/if}
         </p>
       {:else if validationPhase === 'finalizing'}
         <p>
@@ -301,11 +345,14 @@
         <p class="small-muted">
           {#if validationPhase === 'preparing'}Source validation ·
           {:else if validationPhase === 'finalizing'}Output validation ·
+          {:else if job.encodeSettings?.videoMode && job.encodeSettings.videoMode !== 'encode'}Converting
+            ·
           {:else if job.encodeSettings}Encoding ·
           {:else}Remuxing ·{/if}
           {#if progress !== null}
             {formatDuration(progress)}{duration !== null ? ` / ${formatDuration(duration)}` : ''}
-            of video {validationPhase ? 'scanned' : 'processed'}
+            of {job.encodeSettings?.videoMode === 'drop' ? 'audio' : 'video'}
+            {validationPhase ? 'scanned' : 'processed'}
             {#if duration === null}
               · Duration unavailable{/if}
           {:else if validationPhase}Waiting for scan progress…
@@ -393,6 +440,11 @@
                 : 'Remux'} · {entry.state.charAt(0).toUpperCase() + entry.state.slice(1)}</strong
             >
             <p class="job-path">{entry.request.outputPath}</p>
+            {#if entry.inputSizeBytes && entry.outputSizeBytes}<p class="small-muted">
+                Input {formatBytes(entry.inputSizeBytes)} → Output {formatBytes(
+                  entry.outputSizeBytes,
+                )} ({sizeComparison(entry.inputSizeBytes, entry.outputSizeBytes)})
+              </p>{/if}
             {#if entry.error}<p class="job-error">{entry.error.message}</p>{/if}
             {#if entry.error?.code === 'OUTPUT_CLEANUP_FAILED' && entry.error.path}
               <p class="job-path">Temporary file retained: {entry.error.path}</p>

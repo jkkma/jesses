@@ -174,7 +174,7 @@ export function parameterError(
     encoder?.startsWith('svtAv1') ||
     catalog?.encoder === 'x264' ||
     catalog?.encoder.startsWith('svtAv1');
-  const maximum = native || extraEncoderParameters[encoder || catalog?.encoder || ''] ? 64 : 16;
+  const maximum = catalog || native || extraEncoderParameters[encoder || ''] ? 64 : 16;
   if (values.length > maximum || new Set(values.map((value) => value.name)).size !== values.length)
     return `Choose each parameter once, with at most ${maximum} overrides.`;
   for (const value of values) {

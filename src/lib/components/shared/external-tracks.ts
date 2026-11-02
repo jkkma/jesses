@@ -206,20 +206,6 @@ export function externalTrackIssue(
       );
       if (issue) return issue;
     }
-    if (context.trimming) {
-      if (stream.kind === 'audio' && !choice.audio)
-        return 'Choose audio conversion for every external audio track when trimming. Copy cannot cut compressed packets at exact sample boundaries.';
-      if (
-        stream.kind === 'subtitle' &&
-        !['ass', 'subrip', 'webvtt', 'mov_text'].includes(stream.codec ?? '') &&
-        !(
-          ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(
-            stream.codec ?? '',
-          ) && choice.subtitleMode === 'burnIn'
-        )
-      )
-        return 'Trimming supports text subtitles and burned bitmap subtitles from other files. Exclude unsupported subtitle tracks or burn bitmap subtitles into video.';
-    }
   }
   return null;
 }

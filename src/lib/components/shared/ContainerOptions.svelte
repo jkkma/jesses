@@ -5,11 +5,13 @@
     onchange,
     disabled = false,
     compactHelp = false,
+    audioOnly = false,
   }: {
     value: ContainerFormat;
     onchange: (value: ContainerFormat) => void;
     disabled?: boolean;
     compactHelp?: boolean;
+    audioOnly?: boolean;
   } = $props();
 </script>
 
@@ -25,6 +27,9 @@
     <option value="mp4">MP4 (.mp4)</option>
     <option value="mov">QuickTime (.mov)</option>
     <option value="webm">WebM (.webm)</option>
+    {#if audioOnly}<option value="m4a">M4A audio (.m4a)</option><option value="ogg"
+        >Ogg audio (.ogg)</option
+      >{/if}
   </select>
 </label>
 {#snippet compatibility()}
@@ -35,6 +40,8 @@
       subtitles become WebVTT; fonts, styles and positioning may change. Attachments are
       unsupported. Existing files are never replaced. Incompatible selections are rejected before
       encoding.
+    {:else if value === 'm4a' || value === 'ogg'}This container accepts compatible audio tracks.
+      Incompatible tracks are rejected before saving; existing files are never replaced.
     {:else}MP4/MOV text subtitles become MP4 text; fonts, styles and positioning may change. Track
       titles and chapter timing are preserved. If a track type has no default, its first track
       becomes default. Attachments and unsupported metadata require Matroska. Existing files are

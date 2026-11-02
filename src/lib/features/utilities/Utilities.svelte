@@ -4,8 +4,12 @@
     isDesktop,
     chooseUtilityDestination,
     chooseUtilityFile,
+    chooseOutputFolder,
     inspectUtilityCapabilities,
     runUtility,
+    runUtilityBatch,
+    setMediaAnalysisPaused,
+    detectFields,
   } from '$lib/ipc/client';
   import type {
     MediaFile,
@@ -20,9 +24,19 @@
     DeinterlaceMode,
     FieldOrder,
     QtgmcPreset,
+    QualityVmafModel,
+    UtilityBatchResult,
+    UtilityProgress,
   } from '$lib/ipc/generated';
-  import { errorMessage, formatBytes, fileName } from '$lib/components/shared/format';
+  import {
+    errorMessage,
+    formatBytes,
+    fileName,
+    formatDuration,
+  } from '$lib/components/shared/format';
   import ImageWorkflows from './ImageWorkflows.svelte';
+  import SourcePreview from '$lib/components/shared/SourcePreview.svelte';
+  import contentPresets from '$lib/content-presets.json';
   let { files, onimport }: { files: MediaFile[]; onimport: (paths: string[]) => void } = $props();
   let kind = $state<
     | 'keyframeCut'
@@ -42,15 +56,25 @@
   let end = $state(10);
   let order = $state<string[]>([]);
   let language = $state('eng');
-  let grainOperation = $state<'measure' | 'extract' | 'apply' | 'rewriteHeaders' | 'remove'>(
-    'extract',
-  );
+  let grainOperation = $state<
+    'measureSource' | 'measure' | 'extract' | 'apply' | 'rewriteHeaders' | 'remove'
+  >('extract');
   let grainSource = $state<'table' | 'preset' | 'photonNoise'>('photonNoise');
   let tablePath = $state('');
   let grainPreset = $state('');
   let iso = $state(400);
   let chroma = $state(false);
+  let denoiseStrength = $state(4);
+  let keepDenoised = $state(false);
   let encoder = $state<LadderEncoder>('h264');
+  $effect(() => {
+    if (['h264Nvenc', 'hevcNvenc'].includes(encoder)) {
+      encoder = 'h264';
+      preset = 'medium';
+      pixel = 'yuv420p';
+      crfs = '18, 23, 28';
+    }
+  });
   let preset = $state('medium');
   let pixel = $state('yuv420p');
   let crfs = $state('18, 23, 28');
@@ -58,19 +82,55 @@
   let seconds = $state(2);
   let metric = $state<LadderMetric>('vmaf');
   let threshold = $state('');
+  let contentPreset = $state('');
+  let vmafModel = $state<QualityVmafModel>('standard');
+  let samplesDirectory = $state('');
   let deinterlaceMethod = $state<DeinterlaceExportMethod>('qtgmc');
   let deinterlaceMode = $state<DeinterlaceMode>('bob');
   let fieldOrder = $state<FieldOrder>('topFirst');
   let qtgmcPreset = $state<QtgmcPreset>('verySlow');
   let pending = $state(false);
+  let batch = $state(false);
+  let batchResult = $state<UtilityBatchResult | null>(null);
+  let utilityProgress = $state<UtilityProgress | null>(null);
+  let rowProgress = $state<Record<number, UtilityProgress>>({});
+  let analysisId = $state<string | null>(null);
+  let paused = $state(false);
+  let pausing = $state(false);
   let checking = $state(false);
   let error = $state<string | null>(null);
   let capabilities = $state<UtilityCapabilities | null>(null);
   let result = $state<UtilityResult | null>(null);
   let controller: AbortController | undefined;
   let capabilityController: AbortController | undefined;
+  let fieldController: AbortController | undefined;
+  let fieldDetecting = $state(false);
+  let fieldResult = $state<Awaited<ReturnType<typeof detectFields>> | null>(null);
+  let detectedSource = '';
   const selected = $derived(files.find((f) => f.path === source));
+  const grainEstimate = $derived.by(() => {
+    const video = selected?.streams.find((item) => item.index === stream);
+    const [n, d] = (video?.frameRate ?? '').split('/').map(Number);
+    const fps = d ? n / d : n;
+    const seconds = video?.durationSeconds ?? selected?.durationSeconds;
+    return video?.width && video.height && seconds && fps > 0
+      ? (video.width * video.height * seconds * fps) / 7_200_000
+      : null;
+  });
+  function onUtilityProgress(progress: UtilityProgress) {
+    utilityProgress = progress;
+    if (progress.rowIndex != null) rowProgress = { ...rowProgress, [progress.rowIndex]: progress };
+  }
   const referenceFile = $derived(files.find((f) => f.path === reference));
+  const ladderPresets = $derived(
+    encoder === 'h264'
+      ? contentPresets.x264
+      : encoder === 'hevc'
+        ? contentPresets.x265
+        : encoder === 'av1'
+          ? contentPresets.svtAv1
+          : [],
+  );
   $effect(() => {
     if (!source && files.length) source = files[0].path;
   });
@@ -87,10 +147,39 @@
   $effect(() => {
     referenceStream = referenceFile?.streams.find((s) => s.kind === 'video')?.index ?? 0;
   });
+  $effect(() => {
+    const identity = `${source}\0${stream}`;
+    if (identity !== detectedSource) {
+      detectedSource = identity;
+      fieldController?.abort();
+      fieldResult = null;
+      fieldDetecting = false;
+    }
+  });
   onDestroy(() => {
     controller?.abort();
     capabilityController?.abort();
+    fieldController?.abort();
   });
+  async function detectSourceFields() {
+    fieldController?.abort();
+    const active = new AbortController();
+    fieldController = active;
+    fieldDetecting = true;
+    fieldResult = null;
+    error = null;
+    try {
+      const result = await detectFields(
+        { inputPath: source, videoStreamIndex: stream },
+        active.signal,
+      );
+      if (!active.signal.aborted) fieldResult = result;
+    } catch (e) {
+      if (!active.signal.aborted) error = errorMessage(e);
+    } finally {
+      if (fieldController === active) fieldDetecting = false;
+    }
+  }
   async function inspect() {
     checking = true;
     error = null;
@@ -124,15 +213,155 @@
       error = errorMessage(e);
     }
   }
+  async function chooseSamplesDirectory() {
+    try {
+      const parent = await chooseOutputFolder();
+      if (!parent) return;
+      const separator = parent.includes('\\') ? '\\' : '/';
+      const name = fileName(source).replace(/\.[^./\\]+$/, '') || 'source';
+      samplesDirectory = `${parent.replace(/[\\/]+$/, '')}${separator}${name}-ladder-samples`;
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+  async function togglePause() {
+    if (!analysisId || pausing) return;
+    pausing = true;
+    try {
+      await setMediaAnalysisPaused(analysisId, !paused);
+      paused = !paused;
+    } catch (e) {
+      error = errorMessage(e);
+    } finally {
+      pausing = false;
+    }
+  }
+  function batchOutput(
+    folder: string,
+    file: MediaFile,
+    index: number,
+    ext: string,
+    suffix: string = kind,
+  ): string {
+    const separator = folder.includes('\\') ? '\\' : '/';
+    const name = file.name.replace(/\.[^./\\]+$/, '') || 'source';
+    return `${folder.replace(/[\\/]+$/, '')}${separator}${name}-${suffix}-${index + 1}.${ext}`;
+  }
+  function makeBatchRequest(
+    request: UtilityRequest,
+    file: MediaFile,
+    index: number,
+    folder: string,
+    ext: string,
+  ): UtilityRequest {
+    const video = file.streams.find((item) => item.kind === 'video')?.index ?? 0;
+    const subtitle = file.streams.find((item) => item.kind === 'subtitle')?.index ?? 0;
+    const outputPath = batchOutput(folder, file, index, ext);
+    switch (request.kind) {
+      case 'keyframeCut':
+        return {
+          kind: request.kind,
+          request: { ...request.request, inputPath: file.path, outputPath },
+        };
+      case 'colorMetadataTransfer':
+        return {
+          kind: request.kind,
+          request: {
+            ...request.request,
+            inputPath: file.path,
+            inputVideoStreamIndex: video,
+            outputPath,
+          },
+        };
+      case 'subtitleOcr':
+        return {
+          kind: request.kind,
+          request: {
+            ...request.request,
+            inputPath: file.path,
+            subtitleStreamIndex: subtitle,
+            outputPath,
+          },
+        };
+      case 'deinterlaceExport':
+        return {
+          kind: request.kind,
+          request: {
+            ...request.request,
+            inputPath: file.path,
+            videoStreamIndex: video,
+            outputPath,
+          },
+        };
+      case 'cadenceRepairExport':
+        return {
+          kind: request.kind,
+          request: {
+            ...request.request,
+            inputPath: file.path,
+            videoStreamIndex: video,
+            outputPath,
+          },
+        };
+      case 'crfLadder':
+        return {
+          kind: request.kind,
+          request: {
+            ...request.request,
+            inputPath: file.path,
+            videoStreamIndex: video,
+            ...(request.request.keepSamplesDirectory
+              ? { keepSamplesDirectory: batchOutput(folder, file, index, 'samples', 'ladder') }
+              : {}),
+          },
+        };
+      case 'grain': {
+        const grain = request.request;
+        if (grain.operation === 'measureSource')
+          return {
+            kind: 'grain',
+            request: {
+              ...grain,
+              sourcePath: file.path,
+              outputTablePath: outputPath,
+              ...(keepDenoised
+                ? { denoisedOutputPath: batchOutput(folder, file, index, 'mkv', 'denoised') }
+                : {}),
+            },
+          };
+        if (grain.operation === 'measure')
+          return {
+            kind: 'grain',
+            request: { ...grain, sourcePath: file.path, outputTablePath: outputPath },
+          };
+        if (grain.operation === 'extract')
+          return {
+            kind: 'grain',
+            request: { ...grain, inputPath: file.path, outputTablePath: outputPath },
+          };
+        return { kind: 'grain', request: { ...grain, inputPath: file.path, outputPath } };
+      }
+      case 'concat':
+        return request;
+    }
+  }
   async function run() {
     pending = true;
     error = null;
     result = null;
+    batchResult = null;
+    utilityProgress = null;
+    rowProgress = {};
+    paused = false;
     const active = new AbortController();
     controller = active;
     try {
       if (kind !== 'concat' && !selected) throw new Error('Import and choose a source first.');
+      const inBatch = batch && kind !== 'concat';
+      const batchFolder = inBatch ? await chooseOutputFolder() : null;
+      if (inBatch && !batchFolder) return;
       let request: UtilityRequest;
+      let outputExt = 'mkv';
       if (kind === 'crfLadder') {
         const parts = crfs.split(',').map((v) => v.trim());
         const values = parts.map(Number);
@@ -153,16 +382,28 @@
             sampleSeconds: seconds,
             metric,
             recommendationThreshold: threshold.trim() ? Number(threshold) : null,
+            vmafModel,
+            ...(contentPreset
+              ? {
+                  contentPreset,
+                  parameters:
+                    ladderPresets.find((item) => item.name === contentPreset)?.parameters ?? [],
+                }
+              : {}),
+            ...(samplesDirectory ? { keepSamplesDirectory: samplesDirectory } : {}),
           },
         };
       } else {
         const ext =
           kind === 'subtitleOcr'
             ? 'srt'
-            : kind === 'grain' && ['measure', 'extract'].includes(grainOperation)
+            : kind === 'grain' && ['measureSource', 'measure', 'extract'].includes(grainOperation)
               ? 'tbl'
               : 'mkv';
-        const output = await chooseUtilityDestination(kind + '-output.' + ext, [ext]);
+        outputExt = ext;
+        const output = inBatch
+          ? batchOutput(batchFolder!, selected!, 0, ext)
+          : await chooseUtilityDestination(kind + '-output.' + ext, [ext]);
         if (!output) return;
         if (kind === 'keyframeCut')
           request = {
@@ -217,7 +458,20 @@
           };
         else {
           let grain: GrainRequest;
-          if (grainOperation === 'measure')
+          if (grainOperation === 'measureSource') {
+            const denoisedOutputPath =
+              keepDenoised && !inBatch
+                ? await chooseUtilityDestination('denoised-output.mkv', ['mkv'])
+                : null;
+            if (keepDenoised && !inBatch && !denoisedOutputPath) return;
+            grain = {
+              operation: 'measureSource',
+              sourcePath: source,
+              outputTablePath: output,
+              denoiseStrength,
+              ...(denoisedOutputPath ? { denoisedOutputPath } : {}),
+            };
+          } else if (grainOperation === 'measure')
             grain = {
               operation: 'measure',
               sourcePath: source,
@@ -245,12 +499,29 @@
           request = { kind: 'grain', request: grain };
         }
       }
-      result = await runUtility(request, active.signal);
+      if (inBatch) {
+        const requests = files.map((file, index) =>
+          makeBatchRequest(request, file, index, batchFolder!, outputExt),
+        );
+        batchResult = await runUtilityBatch(
+          { requests },
+          active.signal,
+          (id) => (analysisId = id),
+          onUtilityProgress,
+        );
+      } else
+        result = await runUtility(
+          request,
+          active.signal,
+          (id) => (analysisId = id),
+          onUtilityProgress,
+        );
     } catch (e) {
       error = active.signal.aborted ? 'Utility canceled.' : errorMessage(e);
     } finally {
       pending = false;
       controller = undefined;
+      paused = false;
     }
   }
 </script>
@@ -334,6 +605,19 @@
           /></label
         >
       </div>
+      {#if selected && selected.streams.some((item) => item.kind === 'video')}
+        <SourcePreview
+          file={selected}
+          videoStreamIndex={selected.streams.find((item) => item.kind === 'video')!.index}
+          crop={{ top: 0, right: 0, bottom: 0, left: 0 }}
+          onapply={() => {}}
+          showCrop={false}
+          snapOnStart={true}
+          disabled={pending || !isDesktop()}
+          onmarkstart={(seconds) => (start = Math.round(seconds * 1_000) / 1_000)}
+          onmarkend={(seconds) => (end = Math.round(seconds * 1_000) / 1_000)}
+        />
+      {/if}
     {:else if kind === 'concat'}
       <p>
         Join files in the displayed order without re-encoding. Video/audio formats and stream
@@ -419,6 +703,22 @@
             ></label
           >{/if}
       </div>
+      <div class="actions">
+        <button
+          type="button"
+          onclick={detectSourceFields}
+          disabled={pending || fieldDetecting || !selected || !isDesktop()}
+          >{fieldDetecting ? 'Inspecting fields…' : 'Detect field order'}</button
+        >{#if fieldDetecting}<button type="button" onclick={() => fieldController?.abort()}
+            >Cancel detection</button
+          >{/if}{#if fieldResult && ['topFirst', 'bottomFirst'].includes(fieldResult.order)}<button
+            type="button"
+            onclick={() =>
+              (fieldOrder = fieldResult!.order === 'bottomFirst' ? 'bottomFirst' : 'topFirst')}
+            >Apply detected field order</button
+          >{/if}
+      </div>
+      {#if fieldResult}<p role="status">{fieldResult.evidence}</p>{/if}
     {:else if kind === 'cadenceRepairExport'}
       <p>
         Repair an interlaced capture with more than 2% repeated-frame padding. The utility compares
@@ -452,15 +752,41 @@
     {/if}
     {#if kind === 'grain'}
       <div class="fields">
-        <label
+        <label class="source-field"
           >Grain operation<select bind:value={grainOperation} disabled={pending}
-            ><option value="extract">Extract grain table</option><option value="measure"
-              >Measure against denoised video</option
-            ><option value="apply">Apply grain</option><option value="rewriteHeaders"
-              >Replace grain headers</option
-            ><option value="remove">Remove grain</option></select
+            ><option value="extract">Extract grain table</option><option value="measureSource"
+              >Measure grain from source (denoise automatically)</option
+            ><option value="measure">Measure against denoised video</option><option value="apply"
+              >Apply grain</option
+            ><option value="rewriteHeaders">Replace grain headers</option><option value="remove"
+              >Remove grain</option
+            ></select
           ></label
         >
+        {#if grainOperation === 'measureSource'}
+          <label class="compact-field"
+            >Denoise strength<input
+              type="number"
+              min="1"
+              max="16"
+              step="1"
+              bind:value={denoiseStrength}
+              disabled={pending}
+            /></label
+          >
+          <label class="checkbox-field"
+            ><input type="checkbox" bind:checked={keepDenoised} disabled={pending} />Keep denoised
+            copy</label
+          >
+          <p>
+            Creates a temporary denoised reference, measures the grain difference, then removes the
+            reference unless you keep it. Long sources can take hours.
+          </p>
+          {#if grainEstimate}<p>
+              Approximate source measurement time: {formatDuration(grainEstimate)}. Actual time
+              depends on your computer and source.
+            </p>{/if}
+        {/if}
         {#if grainOperation === 'apply' || grainOperation === 'rewriteHeaders'}<label
             >Grain source<select bind:value={grainSource} disabled={pending}
               ><option value="photonNoise">Photon noise strength</option><option value="table"
@@ -507,14 +833,32 @@
           >Encoder<select
             bind:value={encoder}
             disabled={pending}
-            onchange={() => (preset = encoder === 'av1' ? '8' : encoder === 'vp9' ? '2' : 'medium')}
+            onchange={() => {
+              preset =
+                encoder === 'av1'
+                  ? '8'
+                  : encoder === 'vp9'
+                    ? '2'
+                    : encoder === 'aomAv1'
+                      ? '4'
+                      : encoder.endsWith('Nvenc')
+                        ? 'p4'
+                        : 'medium';
+              contentPreset = '';
+            }}
             ><option value="h264">H.264 · libx264</option><option value="hevc"
               >HEVC · libx265</option
             ><option value="av1">AV1 · libsvtav1</option><option value="vp9"
               >VP9 · libvpx-vp9</option
-            ></select
+            ><option value="aomAv1">AV1 · libaom</option></select
           ></label
-        ><label class="compact-field"
+        >{#if ladderPresets.length}<label
+            >Content preset<select bind:value={contentPreset} disabled={pending}
+              ><option value="">None</option>{#each ladderPresets as item}<option value={item.name}
+                  >{item.name}</option
+                >{/each}</select
+            ></label
+          >{/if}<label class="compact-field"
           >Preset / speed<input bind:value={preset} disabled={pending} /></label
         ><label
           >Pixel format<select bind:value={pixel} disabled={pending}
@@ -557,8 +901,38 @@
               disabled={pending}
             /></label
           >{/if}
+        {#if metric === 'vmaf'}<label
+            >VMAF model<select bind:value={vmafModel} disabled={pending}
+              ><option value="standard">Default</option><option value="negative">NEG</option><option
+                value="fourK">4K</option
+              ></select
+            ></label
+          >{/if}
       </div>
+      {#if contentPreset}<p>
+          {ladderPresets.find((item) => item.name === contentPreset)?.description}
+        </p>{/if}
+      <div class="actions">
+        <button type="button" onclick={chooseSamplesDirectory} disabled={pending}
+          >Keep sample encodes…</button
+        >{#if samplesDirectory}<button
+            type="button"
+            onclick={() => (samplesDirectory = '')}
+            disabled={pending}>Do not keep samples</button
+          >{/if}
+      </div>
+      {#if samplesDirectory}<label class="source-field standalone-field"
+          >New samples directory<input bind:value={samplesDirectory} disabled={pending} /></label
+        >
+        <p>Choose a new path; an existing directory will not be replaced.</p>{/if}
     {/if}
+    {#if kind !== 'concat'}<label class="checkbox-field"
+        ><input type="checkbox" bind:checked={batch} disabled={pending} />Run this utility for all {files.length}
+        imported {files.length === 1 ? 'file' : 'files'}</label
+      >{#if batch}<p>
+          Each file uses its first applicable stream and receives a uniquely numbered output in the
+          chosen folder. Failures are reported per file; later files still run.
+        </p>{/if}{/if}
     <div class="actions">
       <button
         class="primary-action"
@@ -567,9 +941,41 @@
         disabled={pending || !isDesktop() || (kind === 'concat' ? order.length < 2 : !selected)}
         >{pending ? 'Running…' : kind === 'crfLadder' ? 'Analyze ladder' : 'Run utility'}</button
       >{#if pending}<button type="button" onclick={() => controller?.abort()}>Cancel utility</button
+        ><button type="button" onclick={togglePause} disabled={!analysisId || pausing}
+          >{pausing ? 'Updating…' : paused ? 'Continue utility' : 'Pause utility'}</button
         >{/if}
     </div>
     {#if error}<p role="alert">{error}</p>{/if}
+    {#if pending && utilityProgress}<div class="result" role="status">
+        <p>{utilityProgress.phase}: {utilityProgress.message}</p>
+        <p>
+          Elapsed {formatDuration(
+            utilityProgress.elapsedSeconds,
+          )}{#if utilityProgress.estimatedRemainingSeconds != null}
+            · Approximately {formatDuration(utilityProgress.estimatedRemainingSeconds)} remaining{/if}
+        </p>
+        {#if utilityProgress.durationSeconds && utilityProgress.progressSeconds != null}<progress
+            max={utilityProgress.durationSeconds}
+            value={utilityProgress.progressSeconds}
+          ></progress>{/if}{#if batch}<ul>
+            {#each files as file, index}<li>
+                {file.name}: {rowProgress[index]?.status ??
+                  'waiting'}{#if rowProgress[index]?.message}
+                  — {rowProgress[index].message}{/if}
+              </li>{/each}
+          </ul>{/if}
+      </div>{/if}
+    {#if batchResult}<div class="result" role="status">
+        <h2>Batch {batchResult.canceled ? 'canceled' : 'finished'}</h2>
+        <p>{batchResult.completed} of {files.length} utilities completed.</p>
+        <ul>
+          {#each batchResult.entries as entry}<li>
+              <strong>{files[entry.index]?.name ?? `File ${entry.index + 1}`}</strong>: {entry.error
+                ? entry.error.message
+                : (entry.result?.result.message ?? 'No result returned.')}
+            </li>{/each}
+        </ul>
+      </div>{/if}
     {#if result}
       <div class="result" role="status">
         <h2>Completed</h2>

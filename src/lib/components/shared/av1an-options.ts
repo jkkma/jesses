@@ -11,8 +11,8 @@ export type Av1anDraft = Omit<Av1anOptions, 'targetQuality'> & {
   targetEnabled: boolean;
   target: Av1anTargetQuality;
 };
-export function defaultAv1an(usePreferences = true): Av1anDraft {
-  const saved = usePreferences ? readAv1anPreferences() : null;
+export function defaultAv1an(usePreferences = true, sourceFilters = false): Av1anDraft {
+  const saved = usePreferences ? readAv1anPreferences(sourceFilters) : null;
   return {
     chunkMethod: saved?.chunkMethod ?? 'lsmash',
     splitMethod: saved?.splitMethod ?? 'sceneDetection',
@@ -26,7 +26,7 @@ export function defaultAv1an(usePreferences = true): Av1anDraft {
       ? { sceneDetectionSlices: saved.sceneDetectionSlices }
       : {}),
     maxTries: 3,
-    concatMethod: saved?.concatMethod ?? 'ffmpeg',
+    concatMethod: saved?.concatMethod ?? 'mkvmerge',
     attachSettings: false,
     targetEnabled: false,
     target: {
@@ -67,13 +67,15 @@ export function av1anError(
   hdr = false,
   encoder: VideoEncoder = 'svtAv1Hdr',
   attachmentSupported = true,
+  sourceDefaults = false,
 ): string | null {
   if (
-    !whole(draft.maximumChunkFrames, 0, 100000) ||
-    !whole(draft.minimumSceneFrames, 1, 100000) ||
-    (draft.maximumChunkFrames > 0 && draft.minimumSceneFrames > draft.maximumChunkFrames) ||
-    (draft.sceneDownscaleHeight !== null &&
-      (!whole(draft.sceneDownscaleHeight, 64, 4320) || draft.sceneDownscaleHeight % 2 !== 0))
+    !sourceDefaults &&
+    (!whole(draft.maximumChunkFrames, 0, 100000) ||
+      !whole(draft.minimumSceneFrames, 1, 100000) ||
+      (draft.maximumChunkFrames > 0 && draft.minimumSceneFrames > draft.maximumChunkFrames) ||
+      (draft.sceneDownscaleHeight !== null &&
+        (!whole(draft.sceneDownscaleHeight, 64, 4320) || draft.sceneDownscaleHeight % 2 !== 0)))
   )
     return 'Use valid whole frame counts and an even scene height. Minimum scene length cannot exceed an enabled chunk limit.';
   if (
@@ -90,7 +92,7 @@ export function av1anError(
       encoder === 'x264' || encoder === 'x265Standalone' || encoder === 'aomAv1'
         ? ['yuv420p', 'yuv420p10le', 'yuv422p', 'yuv422p10le', 'yuv444p', 'yuv444p10le']
         : encoder === 'vpxStandalone'
-          ? ['yuv420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le']
+          ? ['yuv420p', 'yuva420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le']
           : ['yuv420p', 'yuv420p10le']
     ).includes(draft.pixelFormat)
   )
@@ -102,7 +104,22 @@ export function av1anError(
     return 'Quality targeting currently requires SDR. These metric pipelines are not qualified for HDR sources.';
   const q = draft.target;
   const maximumCrf = encoder === 'x264' || encoder === 'x265Standalone' ? 51 : 63;
-  if (
+  if (sourceDefaults) {
+    const constraints: Partial<Record<Av1anTargetMetric, [number, number, number]>> = {
+      vmaf: [100, 990, 10],
+      ssimulacra2: [300, 990, 10],
+      butteraugli: [5, 100, 1],
+      xpsnrWeighted: [200, 600, 5],
+    };
+    const limits = constraints[q.metric];
+    if (
+      !limits ||
+      q.minimumScoreTenths !== q.maximumScoreTenths ||
+      !whole(q.minimumScoreTenths, limits[0], limits[1]) ||
+      q.minimumScoreTenths % limits[2] !== 0
+    )
+      return 'Enter a valid score for the selected quality metric.';
+  } else if (
     !whole(q.minimumScoreTenths, 0, 1000) ||
     !whole(q.maximumScoreTenths, q.minimumScoreTenths, 1000) ||
     !whole(q.minimumCrf, 0, maximumCrf) ||
@@ -125,7 +142,9 @@ export function av1anError(
   if (
     (q.metric === 'ssimulacra2' ||
       q.metric === 'butteraugli' ||
-      ((q.metric === 'xpsnr' || q.metric === 'xpsnrWeighted') && q.probingRate > 1)) &&
+      ((q.metric === 'xpsnr' || q.metric === 'xpsnrWeighted') &&
+        !sourceDefaults &&
+        q.probingRate > 1)) &&
     ['select', 'hybrid'].includes(draft.chunkMethod)
   )
     return 'This scorer needs L-SMASH, FFMS2, or BestSource. XPSNR with every frame can use FFmpeg select or hybrid.';
@@ -134,11 +153,13 @@ export function av1anError(
 export function selectedAv1an(
   draft: Av1anDraft,
   encoder: VideoEncoder = 'svtAv1Hdr',
+  sourceWorkflow = false,
 ): Av1anOptions {
   const { targetEnabled, target, ...options } = draft;
   return {
     ...options,
-    ...(['x264', 'x265Standalone', 'vpxStandalone'].includes(encoder)
+    ...(encoder === 'x265Standalone' ||
+    (!sourceWorkflow && ['x264', 'vpxStandalone'].includes(encoder))
       ? { concatMethod: 'mkvmerge' as const }
       : {}),
     ...(targetEnabled ? { targetQuality: { ...target } } : {}),
@@ -147,7 +168,7 @@ export function selectedAv1an(
 export function av1anSummary(options?: Av1anOptions): string {
   if (!options) return '';
   const q = options.targetQuality;
-  return ` · ${options.chunkMethod} · ${options.splitMethod === 'fixedChunks' ? 'fixed chunks' : `${options.sceneDetection} scenes`} · ${options.maximumChunkFrames ? `${options.maximumChunkFrames}f maximum` : 'unlimited chunks'}${options.encoderThreads === undefined ? '' : ` · ${options.encoderThreads === 0 ? 'Auto' : options.encoderThreads} encoder threads`}${q ? ` · ${metricName(q.metric)} ${(q.minimumScoreTenths / 10).toFixed(1)}–${(q.maximumScoreTenths / 10).toFixed(1)} probes` : ''}`;
+  return ` · ${options.chunkMethod} · ${options.splitMethod === 'fixedChunks' ? 'no scene detection' : `${options.sceneDetection} scenes`} · ${options.sourceWorkflow ? 'keyframe interval chunks' : options.maximumChunkFrames ? `${options.maximumChunkFrames}f maximum` : 'unlimited chunks'}${options.encoderThreads === undefined ? '' : ` · ${options.encoderThreads === 0 ? 'Auto' : options.encoderThreads} encoder threads`}${q ? ` · ${metricName(q.metric)} ${(q.minimumScoreTenths / 10).toFixed(1)}–${(q.maximumScoreTenths / 10).toFixed(1)} probes` : ''}`;
 }
 
 export function metricName(metric: Av1anTargetMetric = 'vmaf'): string {

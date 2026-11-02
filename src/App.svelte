@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { appVersion } from '$lib/app-version';
   import {
     preferences,
@@ -33,6 +33,17 @@
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import FileInspector from '$lib/features/files/FileInspector.svelte';
+  import SourceFileList from '$lib/features/source/FileList.svelte';
+  import SourceTrackList from '$lib/features/source/TrackList.svelte';
+  import SourceSettings from '$lib/features/source/SourceSettings.svelte';
+  import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
+  import { batchRunId } from '$lib/source-workspace';
+  import type {
+    FileListMode,
+    TrackSelection,
+    TaskView,
+    WorkspaceAction,
+  } from '$lib/source-workspace';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
   import Av1an from '$lib/features/av1an/Av1an.svelte';
   import BatchEncode from '$lib/features/batch/BatchEncode.svelte';
@@ -41,12 +52,14 @@
   import { terminalJob } from '$lib/components/shared/job-state';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import CompletionPanel from '$lib/features/tools/CompletionPanel.svelte';
-  import Utilities from '$lib/features/utilities/Utilities.svelte';
+  import SourceUtilities from '$lib/features/utilities/SourceUtilities.svelte';
   import SavedJobs from '$lib/features/utilities/SavedJobs.svelte';
   import { encoderChoices, encoderOptions } from '$lib/components/shared/encoder-options';
   import {
     chooseMediaFiles,
     chooseMediaFolder,
+    importImageSequence,
+    releaseImageSequence,
     scanMediaFolder,
     getCapabilities,
     isDesktop,
@@ -65,7 +78,13 @@
     discardAv1anRecovery,
     setJobPaused,
     recentPathIsFolder,
+    getStorageLocations,
+    saveActivityLog,
+    openDirectory,
+    extractAttachment,
+    setCompletionOptions,
   } from '$lib/ipc/client';
+  import { restoreAndTrackWindow } from '$lib/window-state';
   import type {
     EncodeRequest,
     JobSnapshot,
@@ -82,15 +101,319 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
+  type View = 'files' | 'tracks' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   type ImportEntry = { path: string; detectFolder: boolean };
   type ImportSession = { generation: number; folders: string[]; completed: string[] };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
   let view = $state<View>('files');
+  let uiStateReady = $state(false);
+  let logHeight = $state(140);
+  let logUserAdjusted = $state(false);
+  let logActionBusy = $state(false);
+  $effect(() => {
+    if (!uiStateReady) return;
+    try {
+      localStorage.setItem('jesses.active-view', view);
+      localStorage.setItem('jesses.log-panel-height', String(logHeight));
+    } catch {
+      /* UI state is optional. */
+    }
+  });
   let files = $state<MediaFile[]>([]);
   let selectedId = $state<string | null>(null);
+  let selectedFileIds = $state<string[]>([]);
+  let importChoices = $state<{ path: string; checked: boolean }[] | null>(null);
+  let finishImportChoices:
+    ((value: { paths: string[]; replace: boolean } | null) => void) | undefined;
+  function chooseImportItems(paths: string[]) {
+    if (!files.length || !paths.length) return Promise.resolve({ paths, replace: false });
+    if (finishImportChoices) return Promise.resolve(null);
+    importChoices = paths.map((path) => ({ path, checked: true }));
+    return new Promise<{ paths: string[]; replace: boolean } | null>((resolve) => {
+      finishImportChoices = resolve;
+    });
+  }
+  function finishImportDialog(replace?: boolean) {
+    const resolve = finishImportChoices;
+    const chosen = importChoices?.filter((item) => item.checked).map((item) => item.path) ?? [];
+    finishImportChoices = undefined;
+    importChoices = null;
+    resolve?.(replace === undefined ? null : { paths: chosen, replace });
+  }
+  let sequencePrompt = $state<{ path: string; text: string; error: string } | null>(null);
+  let finishSequencePrompt:
+    ((rate: { numerator: number; denominator: number } | null) => void) | undefined;
+  let sequenceImportAbort: AbortController | undefined;
+  function askSequenceRate(path: string) {
+    sequencePrompt = { path, text: '30', error: '' };
+    return new Promise<{ numerator: number; denominator: number } | null>((resolve) => {
+      finishSequencePrompt = resolve;
+    });
+  }
+  function finishSequenceRate(useDefault = false) {
+    if (!sequencePrompt) return;
+    const text = useDefault ? '30' : sequencePrompt.text.trim() || '30';
+    const match = /^(\d+)(?:\/(\d+))?$/.exec(text);
+    const decimal = /^\d+(?:\.\d+)?$/.test(text) ? Math.fround(Number(text)) : NaN;
+    const floor = Math.floor(decimal);
+    const rounded = decimal - floor === 0.5 && floor % 2 === 0 ? floor : Math.round(decimal);
+    const numerator = match ? Number(match[1]) : rounded;
+    const denominator = match ? Number(match[2] || 1) : 1;
+    if (
+      !Number.isSafeInteger(numerator) ||
+      !Number.isSafeInteger(denominator) ||
+      numerator < 1 ||
+      denominator < 1 ||
+      numerator > 2147483647 ||
+      denominator > 2147483647 ||
+      numerator / denominator < 0.001 ||
+      numerator / denominator > 1000
+    ) {
+      sequencePrompt.error = 'Enter a positive frame rate, such as 30 or 24000/1001.';
+      return;
+    }
+    const resolve = finishSequencePrompt;
+    finishSequencePrompt = undefined;
+    sequencePrompt = null;
+    resolve?.({ numerator, denominator });
+  }
+  function displaySourcePath(file: MediaFile) {
+    return file.source?.kind === 'imageSequence' ? file.source.directoryPath : file.path;
+  }
+  let mainSourceId = $state<string | null>(null);
+  let fileMode = $state<FileListMode>('mux');
+  let batchNameTemplate = $state('{name}');
+  let trackSelection = $state<TrackSelection[]>([]);
+  let workspaceActions = $state<Partial<Record<TaskView, WorkspaceAction>>>({});
+  let lastActionStatus = $state('');
+  let lastTaskTab = $state<'convert' | 'av1an' | 'utilities'>('av1an');
+  let shutdownWhenDone = $state(false);
+  let shutdownError = $state('');
+  let updatingShutdown = $state(false);
+  const mainSource = $derived(files.find((file) => file.id === mainSourceId));
+  const taskSource = $derived(fileMode === 'batch' ? files[0] : mainSource);
+  const batchExample = $derived.by(() => {
+    const first = files[0];
+    if (!first) return 'Load a file to see an example.';
+    const naming =
+      lastTaskTab === 'utilities'
+        ? { codec: '', quality: '', preset: '', extension: '' }
+        : workspaceActions[lastTaskTab]?.batchNaming;
+    if (!naming) return '';
+    const original =
+      displaySourcePath(first)
+        .replace(/[\\/]$/, '')
+        .split(/[\\/]/)
+        .at(-1) ?? first.name;
+    const dot = original.lastIndexOf('.');
+    const stem =
+      first.source?.kind === 'imageSequence'
+        ? original
+        : dot > 0
+          ? original.slice(0, dot)
+          : original;
+    const now = new Date();
+    const values: Record<string, string> = {
+      name: stem,
+      ext: first.source?.kind === 'imageSequence' ? '' : dot > 0 ? original.slice(dot + 1) : '',
+      index: '1'.padStart(String(files.length).length, '0'),
+      codec: naming.codec,
+      crf: naming.quality,
+      quality: naming.quality,
+      preset: naming.preset,
+      width: '',
+      height: '',
+      date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`,
+    };
+    const base =
+      (batchNameTemplate.trim() || '{name}')
+        .replace(/\{([^{}]+)\}/g, (whole, key: string) => values[key.toLowerCase()] ?? whole)
+        .replace(/[\\/:*?"<>|\u0000]/g, '_')
+        .trim()
+        .replace(/[. ]+$/, '') || stem;
+    return `e.g. ${original} → ${base}${naming.extension ? `.${naming.extension}` : ''}`;
+  });
+  const action = $derived(
+    view === 'convert' || view === 'av1an' || view === 'utilities'
+      ? workspaceActions[view]
+      : undefined,
+  );
+  const runningAction = $derived(
+    Object.values(workspaceActions).find((candidate) => candidate?.active),
+  );
+  const displayAction = $derived(runningAction ?? action);
+  const currentActionText = $derived.by(() => {
+    if (displayAction?.active)
+      return (
+        displayAction.progressDescription ||
+        `Running: ${displayAction.label.replace(/^Run(?: Batch)?:\s*/, '')}...`
+      );
+    if (currentJob && !terminalJob(currentJob.state)) {
+      const task =
+        currentJob.encodeSettings?.backend === 'av1an'
+          ? 'AV1AN encode'
+          : currentJob.encodeSettings
+            ? 'Encode'
+            : 'Task';
+      return `${currentJob.state === 'paused' ? 'Paused' : 'Running'}: ${task}...`;
+    }
+    if (lastActionStatus) return lastActionStatus;
+    if (!currentJob) return '';
+    if (currentJob.state === 'succeeded') return 'Done.';
+    if (currentJob.state === 'failed' || currentJob.state === 'interrupted')
+      return 'Did not finish - the log has the details.';
+    return 'Canceled.';
+  });
+  function registerWorkspaceAction(tab: TaskView, next: WorkspaceAction | null) {
+    const previous = workspaceActions[tab];
+    if (next?.active && !previous?.active) lastActionStatus = '';
+    else if (previous?.active && !next?.active && next?.progressDescription)
+      lastActionStatus = next.progressDescription;
+    workspaceActions = { ...workspaceActions, [tab]: next ?? undefined };
+  }
+  function selectFiles(ids: string[]) {
+    selectedFileIds = ids;
+    selectedId = ids.at(-1) ?? null;
+  }
+  function loadTracks(ids = selectedFileIds, switchTab = true) {
+    const chosen = files.filter((file) => ids.includes(file.id));
+    if (!chosen.length) return;
+    if (!mainSourceId) mainSourceId = chosen[0].id;
+    const existing = new Set(
+      trackSelection.map((row) => JSON.stringify([row.sourceId, row.streamIndex])),
+    );
+    let hasVideo = trackSelection.some((row) =>
+      files
+        .find((file) => file.id === row.sourceId)
+        ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === 'video'),
+    );
+    const additions: TrackSelection[] = [];
+    for (const file of chosen) {
+      const alreadyHadVideo = hasVideo;
+      for (const stream of file.streams) {
+        const key = JSON.stringify([file.id, stream.index]);
+        if (existing.has(key)) continue;
+        existing.add(key);
+        additions.push({
+          sourceId: file.id,
+          streamIndex: stream.index,
+          included:
+            stream.codec?.toLowerCase() !== 'unknown' &&
+            !(stream.kind === 'video' && alreadyHadVideo),
+          title: stream.title ?? '',
+          language: stream.language ?? '',
+          defaultFlag: stream.isDefault ?? null,
+          forcedFlag: null,
+        });
+        if (stream.kind === 'video') hasVideo = true;
+      }
+    }
+    let next = [...trackSelection, ...additions];
+    for (const kind of ['audio', 'subtitle']) {
+      const candidates = next.filter(
+        (row) =>
+          row.included &&
+          files
+            .find((file) => file.id === row.sourceId)
+            ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === kind),
+      );
+      if (candidates.length && !candidates.some((row) => row.defaultFlag === true)) {
+        const first = candidates[0];
+        next = next.map((row) => (row === first ? { ...row, defaultFlag: true } : row));
+      }
+    }
+    trackSelection = next;
+    if (switchTab) view = 'tracks';
+  }
+  function changeFileMode(next: FileListMode) {
+    const previous = fileMode;
+    if (previous === 'mux' && next === 'batch') {
+      mainSourceId = null;
+      trackSelection = [];
+    }
+    fileMode = next;
+    if (previous === 'batch' && next === 'mux' && files.length === 1 && !trackSelection.length)
+      loadTracks([files[0].id], false);
+  }
+  function moveSelectedFile(offset: number) {
+    if (selectedFileIds.length !== 1) return;
+    const index = files.findIndex((file) => file.id === selectedFileIds[0]);
+    if (index < 0 || index + offset < 0 || index + offset >= files.length) return;
+    const next = [...files];
+    [next[index], next[index + offset]] = [next[index + offset], next[index]];
+    files = next;
+  }
+  function sortFiles(sort: string) {
+    const [field, direction] = sort.split(':');
+    const sign = direction === 'desc' ? -1 : 1;
+    files = [...files].sort((a, b) => {
+      if (field === 'mtime') {
+        const left = a.modifiedAtMs,
+          right = b.modifiedAtMs;
+        return left == null
+          ? right == null
+            ? 0
+            : -sign
+          : right == null
+            ? sign
+            : (left - right) * sign;
+      }
+      if (field === 'size')
+        return BigInt(a.sizeBytes) < BigInt(b.sizeBytes)
+          ? -sign
+          : BigInt(a.sizeBytes) > BigInt(b.sizeBytes)
+            ? sign
+            : 0;
+      return displaySourcePath(a).localeCompare(displaySourcePath(b)) * sign;
+    });
+  }
+  function removeSelectedFiles() {
+    for (const id of [...selectedFileIds]) removeFile(id);
+    selectedFileIds = [];
+  }
+  async function extractSelectedAttachment(row: TrackSelection) {
+    const source = files.find((file) => file.id === row.sourceId);
+    if (!source) throw new Error('The selected source is no longer loaded.');
+    const folder = await extractAttachment(source.path, row.streamIndex);
+    addLog(`Extracted attachment from ${source.name}.`);
+    await openDirectory(folder);
+  }
+  async function setShutdown(checked: boolean) {
+    updatingShutdown = true;
+    shutdownError = '';
+    try {
+      await setCompletionOptions({ notify: false, finishAction: checked ? 'shutdown' : 'none' });
+      shutdownWhenDone = checked;
+    } catch (cause) {
+      shutdownError = errorMessage(cause);
+    } finally {
+      updatingShutdown = false;
+    }
+  }
+  function resizeLog(event: PointerEvent) {
+    const startY = event.clientY;
+    const height =
+      document.querySelector('.log-entries')?.getBoundingClientRect().height ?? logHeight;
+    logUserAdjusted = true;
+    try {
+      localStorage.setItem('jesses.log-height-user-adjusted', 'true');
+    } catch {
+      /* Optional UI state. */
+    }
+    function move(next: PointerEvent) {
+      logHeight = Math.max(90, Math.min(400, height - (next.clientY - startY)));
+    }
+    function finish() {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', finish);
+      window.removeEventListener('pointercancel', finish);
+    }
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', finish, { once: true });
+    window.addEventListener('pointercancel', finish, { once: true });
+  }
   let fileQuery = $state('');
   let tools = $state<ToolInfo[]>(
     [
@@ -108,6 +431,7 @@
       .map((tool) => ({ ...tool, available: false, path: null, version: null, detail: null })),
   );
   let toolsLoading = $state(desktop);
+  let toolsRevision = $state(0);
   let toolsChecked = $state(false);
   let toolsError = $state<string | null>(null);
   let importing = $state(false);
@@ -143,6 +467,52 @@
   let logOpen = $state(false);
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
+  let batchJobIds = $state<Record<string, string>>({});
+  let utilityBatchStatuses = $state<Record<string, import('$lib/source-workspace').BatchRowStatus>>(
+    {},
+  );
+  let batchStatusOwner: string | null = null;
+  let batchStatusFiles = new Map<string, MediaFile>();
+  function reportBatchStatuses(
+    runId: string,
+    statuses: Record<string, import('$lib/source-workspace').BatchRowStatus>,
+    begin = false,
+  ) {
+    if (begin) {
+      batchStatusOwner = runId;
+      batchJobIds = {};
+      batchStatusFiles = new Map(files.map((file) => [file.id, file]));
+    } else if (batchStatusOwner !== runId) return;
+    utilityBatchStatuses = Object.fromEntries(
+      Object.entries(statuses).filter(([id]) =>
+        files.some((file) => file.id === id && file === batchStatusFiles.get(id)),
+      ),
+    );
+  }
+  const batchStatuses = $derived.by(() => {
+    const result: Record<string, { glyph: string; text: string; note?: string }> = {};
+    for (const [fileId, jobId] of Object.entries(batchJobIds)) {
+      const job = jobs.find((item) => item.id === jobId);
+      if (!job) continue;
+      const source = files.find((entry) => entry.id === fileId);
+      const note =
+        source?.source?.kind === 'imageSequence'
+          ? job.error?.message.replaceAll(source.path, source.source.directoryPath)
+          : job.error?.message;
+      const state = job.state;
+      result[fileId] =
+        state === 'queued'
+          ? { glyph: '○', text: 'Queued' }
+          : state === 'succeeded'
+            ? { glyph: '✔', text: 'Done' }
+            : state === 'failed' || state === 'interrupted'
+              ? { glyph: '✕', text: 'Failed', note }
+              : state === 'canceled' || state === 'stopped'
+                ? { glyph: '■', text: 'Canceled' }
+                : { glyph: '▶', text: 'Running…' };
+    }
+    return { ...result, ...utilityBatchStatuses };
+  });
   let jobsConnected = $state(false);
   let jobsError = $state<string | null>(null);
   let jobsConnecting = $state(false);
@@ -223,10 +593,43 @@
     jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
     addLog(paused ? 'Paused live av1an workers.' : 'Continued live av1an workers.');
   }
+  async function activateRecoverySource(path: string) {
+    if (importing) throw new Error('Wait for the current import to finish before resuming.');
+    const beforeFiles = files,
+      beforeMain = mainSourceId,
+      generation = ++importGeneration;
+    const source = await probeMedia(path);
+    if (generation !== importGeneration || files !== beforeFiles || mainSourceId !== beforeMain)
+      throw new Error('The source list changed while the saved input was loading.');
+    if (source.path !== path)
+      throw new Error('The saved input path did not resolve to the same source.');
+    clearFiles();
+    files = [source];
+    selectedId = source.id;
+    selectedFileIds = [source.id];
+    loadTracks([source.id], false);
+    await tick();
+    await tick();
+    if ((fileMode === 'batch' ? files[0]?.path : mainSource?.path) !== path)
+      throw new Error('The saved input could not be made the current source.');
+  }
+  function acceptRecoveryJobs(before: JobSnapshot[], after: JobSnapshot[]) {
+    for (const snapshot of after) {
+      const prior = before.find((job) => job.id === snapshot.id),
+        current = jobs.find((job) => job.id === snapshot.id);
+      if (current !== prior) continue;
+      if (current) jobs = jobs.map((job) => (job.id === snapshot.id ? snapshot : job));
+      else jobs = [snapshot, ...jobs];
+    }
+  }
   async function submitEncode(request: EncodeRequest) {
     const job = await startEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
     addLog(`${encoderOptions(request.settings.encoder).name} encode job submitted.`);
+  }
+  function acceptReviewedJob(job: JobSnapshot) {
+    // Subscription updates may arrive before the command reply.
+    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
   }
   async function queueEncode(request: EncodeRequest) {
     const job = await enqueueEncode(request);
@@ -234,7 +637,39 @@
     addLog(`${encoderOptions(request.settings.encoder).name} encode added to the queue.`);
   }
   async function queueBatch(requests: EncodeRequest[]) {
+    const statusId = batchRunId('encode');
+    batchStatusOwner = statusId;
+    batchStatusFiles = new Map(files.map((file) => [file.id, file]));
     const submitted = await enqueueEncodeBatch(requests);
+    if (batchStatusOwner === statusId) {
+      utilityBatchStatuses =
+        requests[0]?.settings.backend === 'av1an'
+          ? Object.fromEntries(
+              files
+                .filter((entry) => entry.source?.kind === 'imageSequence')
+                .map((entry) => [
+                  entry.id,
+                  {
+                    glyph: '✕',
+                    text: 'Failed',
+                    note: 'AV1AN does not support image sequence folders.',
+                  },
+                ]),
+            )
+          : {};
+      batchJobIds = Object.fromEntries(
+        submitted
+          .map((job) => {
+            const file = files.find(
+              (entry) =>
+                entry === batchStatusFiles.get(entry.id) &&
+                pathKey(entry.path) === pathKey(job.request.inputPath),
+            );
+            return file ? [file.id, job.id] : null;
+          })
+          .filter((row): row is [string, string] => row !== null),
+      );
+    }
     // Keep authoritative channel updates that beat the command response.
     const missing = submitted.filter((job) => !jobs.some((entry) => entry.id === job.id));
     jobs = [...missing.reverse(), ...jobs];
@@ -263,6 +698,9 @@
   );
 
   function addLog(message: string, level: LogEntry['level'] = 'info') {
+    for (const file of files)
+      if (file.source?.kind === 'imageSequence')
+        message = message.replaceAll(file.path, file.source.directoryPath);
     logs = [
       ...logs.slice(-199),
       {
@@ -280,6 +718,7 @@
 
   async function refreshTools() {
     if (!desktop) return;
+    toolsRevision++;
     toolsLoading = true;
     toolsError = null;
     try {
@@ -308,7 +747,7 @@
   function queueImportPaths(paths: string[], detectFolders = false) {
     const activeKey = activePath ? pathKey(activePath) : null;
     const queued = new Set(importQueue.map((entry) => pathKey(entry.path)));
-    const loaded = new Set(files.map((file) => pathKey(file.path)));
+    const loaded = new Set(files.map((file) => pathKey(displaySourcePath(file))));
     for (const path of paths) {
       const key = pathKey(path);
       if (key === activeKey || queued.has(key) || loaded.has(key)) continue;
@@ -341,9 +780,14 @@
     activePath = null;
     importing = false;
     importingName = '';
+    if (fileMode === 'mux' && files.length === 1 && !mainSourceId) loadTracks([files[0].id], false);
   }
 
   function stopImport() {
+    sequenceImportAbort?.abort();
+    finishSequencePrompt?.(null);
+    finishSequencePrompt = undefined;
+    sequencePrompt = null;
     const recent = takeImportRecents(importGeneration);
     ++importGeneration;
     importQueue = [];
@@ -380,9 +824,30 @@
           const folder = entry.detectFolder && (await recentPathIsFolder(path));
           if (generation !== importGeneration) return;
           if (folder) {
-            await scanImportFolder(path, recursiveImport, generation);
+            const frameRate = await askSequenceRate(path);
+            if (generation !== importGeneration || !frameRate) return;
+            const controller = new AbortController();
+            sequenceImportAbort = controller;
+            const media = await importImageSequence(
+              { directoryPath: path, frameRate },
+              controller.signal,
+            );
+            if (sequenceImportAbort === controller) sequenceImportAbort = undefined;
             if (generation !== importGeneration) return;
-            recordImportRecent(generation, 'folders', path);
+            recordImportRecent(generation, 'folders', displaySourcePath(media));
+            const existing = files.find(
+              (item) => pathKey(displaySourcePath(item)) === pathKey(displaySourcePath(media)),
+            );
+            if (existing) {
+              selectedId = existing.id;
+              selectedFileIds = [existing.id];
+              releaseSequence(media);
+            } else {
+              files = [...files, media];
+              addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
+              selectedId = media.id;
+              selectedFileIds = [media.id];
+            }
             continue;
           }
           const media = await probeMedia(path);
@@ -393,6 +858,7 @@
             addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
           }
           selectedId = media.id;
+          selectedFileIds = [media.id];
         } catch (error) {
           if (generation !== importGeneration) return;
           const message = errorMessage(error);
@@ -413,8 +879,11 @@
       queueImportPaths(paths, detectFolders);
       return;
     }
+    const selection = await chooseImportItems(paths);
+    if (!selection?.paths.length) return;
+    if (selection.replace) clearFiles();
     const generation = beginImport();
-    queueImportPaths(paths, detectFolders);
+    queueImportPaths(selection.paths, detectFolders);
     await drainImport(generation);
   }
 
@@ -425,7 +894,10 @@
     try {
       const paths = await chooseMediaFiles();
       if (generation !== importGeneration) return;
-      queueImportPaths(paths);
+      const selection = await chooseImportItems(paths);
+      if (generation !== importGeneration || !selection?.paths.length) return;
+      if (selection.replace) clearFiles();
+      queueImportPaths(selection.paths);
       await drainImport(generation);
     } catch (error) {
       if (generation !== importGeneration) return;
@@ -440,12 +912,15 @@
   async function addFolder() {
     if (!desktop || importing) return;
     const generation = beginImport();
-    const recursive = recursiveImport;
     importingName = 'Choosing folder';
     try {
-      const path = await chooseMediaFolder();
-      if (generation !== importGeneration || !path) return;
-      await importFolder(path, recursive, generation);
+      const paths = await chooseMediaFolder();
+      if (generation !== importGeneration || !paths.length) return;
+      const selection = await chooseImportItems(paths);
+      if (generation !== importGeneration || !selection?.paths.length) return;
+      if (selection.replace) clearFiles();
+      queueImportPaths(selection.paths, true);
+      await drainImport(generation);
     } catch (error) {
       if (generation !== importGeneration) return;
       const message = errorMessage(error);
@@ -489,12 +964,20 @@
     try {
       const folder = await recentPathIsFolder(path);
       if (generation !== importGeneration) return;
-      if (folder) await importFolder(path, recursiveImport, generation);
-      else {
-        const key = pathKey(path);
-        const existing = files.find((file) => pathKey(file.path) === key);
+      if (folder) {
+        const existing = files.find((item) => pathKey(displaySourcePath(item)) === pathKey(path));
         if (existing) {
-          selectedId = existing.id;
+          selectFiles([existing.id]);
+          await rememberMedia([path]);
+          return;
+        }
+        queueImportPaths([path], true);
+        await drainImport(generation);
+      } else {
+        const key = pathKey(path);
+        const existing = files.find((file) => pathKey(displaySourcePath(file)) === key);
+        if (existing) {
+          selectFiles([existing.id]);
           await rememberMedia([existing.path]);
           return;
         }
@@ -525,16 +1008,59 @@
   function removeFile(id: string) {
     const file = files.find((entry) => entry.id === id);
     files = files.filter((entry) => entry.id !== id);
+    const { [id]: _removedBatchJob, ...remainingBatchJobs } = batchJobIds;
+    batchJobIds = remainingBatchJobs;
+    const { [id]: _removedUtilityStatus, ...remainingUtilityStatuses } = utilityBatchStatuses;
+    utilityBatchStatuses = remainingUtilityStatuses;
+    selectedFileIds = selectedFileIds.filter((entry) => entry !== id);
+    trackSelection = trackSelection.filter((track) => track.sourceId !== id);
+    if (mainSourceId === id) {
+      mainSourceId = null;
+      if (fileMode === 'mux' && files.length) {
+        mainSourceId = files[0].id;
+        if (!trackSelection.some((row) => row.sourceId === mainSourceId))
+          loadTracks([mainSourceId], false);
+      }
+    }
     if (!files.length) fileQuery = '';
     if (selectedId === id) selectedId = files[0]?.id ?? null;
-    if (file) addLog(`Removed ${file.name} from the workspace.`);
+    if (file) {
+      addLog(`Removed ${file.name} from the workspace.`);
+      if (file.source?.kind === 'imageSequence') releaseSequence(file);
+    }
   }
 
   function clearFiles() {
+    const removed = files;
     fileQuery = '';
     files = [];
+    for (const file of removed) if (file.source?.kind === 'imageSequence') releaseSequence(file);
+    batchJobIds = {};
+    utilityBatchStatuses = {};
+    batchStatusOwner = null;
+    batchStatusFiles.clear();
     selectedId = null;
+    selectedFileIds = [];
+    mainSourceId = null;
+    trackSelection = [];
     addLog('Source list cleared.');
+  }
+
+  function releaseSequence(file: MediaFile) {
+    if (
+      file.source?.kind !== 'imageSequence' ||
+      files.some((loaded) => pathKey(loaded.path) === pathKey(file.path))
+    )
+      return;
+    void releaseImageSequence({
+      inputPath: file.path,
+      sequenceFingerprint: file.source.sequenceFingerprint,
+    }).catch(() =>
+      addLog(
+        `${file.name}: the managed sequence is retained because it is still in use or cannot be released.`,
+        'error',
+      ),
+    );
   }
 
   function loadSample(nextView: View = 'files') {
@@ -596,7 +1122,9 @@
     addLog('Loaded synthetic interface sample. No media file was read.');
   }
 
+  let shiftHeld = false;
   function handleKeydown(event: KeyboardEvent) {
+    shiftHeld = event.shiftKey;
     if (desktop && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') {
       event.preventDefault();
       void addFiles();
@@ -610,13 +1138,34 @@
         : 'Browser preview ready. Local file access requires the desktop app.',
     );
     try {
-      logOpen = localStorage.getItem('jesses.log-panel-open') === 'true';
+      const savedView = localStorage.getItem('jesses.active-view');
+      if (
+        savedView &&
+        ['files', 'tracks', 'convert', 'av1an', 'tools', 'utilities'].includes(savedView)
+      )
+        view = savedView as View;
+      else if (savedView === 'batch') view = 'convert';
+      else if (savedView === 'remux') view = 'tracks';
+      const savedHeight = Number(localStorage.getItem('jesses.log-panel-height'));
+      if (Number.isFinite(savedHeight) && savedHeight >= 90 && savedHeight <= 400)
+        logHeight = savedHeight;
+      logUserAdjusted = localStorage.getItem('jesses.log-height-user-adjusted') === 'true';
     } catch {
       /* Storage may be unavailable in a restricted webview. */
     }
+    uiStateReady = true;
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    let stopWindowTracking: (() => void) | undefined;
     if (desktop) {
+      void restoreAndTrackWindow()
+        .then((stop) => {
+          if (disposed) stop();
+          else stopWindowTracking = stop;
+        })
+        .catch(() => {
+          /* Window state is optional. */
+        });
       void loadPreferences();
       void refreshTools();
       void connectJobs();
@@ -635,6 +1184,7 @@
       disposed = true;
       ++importGeneration;
       unlisten?.();
+      stopWindowTracking?.();
       jobsDisposed = true;
       stopJobSubscription?.();
     };
@@ -648,589 +1198,657 @@
       /* The panel still works without persistence. */
     }
   }
+  async function exportActivityLog() {
+    if (logActionBusy || !logs.length) return;
+    logActionBusy = true;
+    try {
+      const contents =
+        logs
+          .map((entry) => `${entry.time} [${entry.level.toUpperCase()}] ${entry.message}`)
+          .join('\n') + '\n';
+      const path = await saveActivityLog(contents);
+      if (path) addLog(`Activity log saved to ${path}.`);
+    } catch (error) {
+      addLog(`Could not save activity log: ${errorMessage(error)}`, 'error');
+    } finally {
+      logActionBusy = false;
+    }
+  }
+  async function copyActivityLog() {
+    if (!logs.length) return;
+    try {
+      const contents =
+        logs
+          .map((entry) => `${entry.time} [${entry.level.toUpperCase()}] ${entry.message}`)
+          .join('\n') + '\n';
+      let copied = false;
+      try {
+        if (navigator.clipboard) {
+          await navigator.clipboard.writeText(contents);
+          copied = true;
+        }
+      } catch {
+        /* Try the webview fallback below. */
+      }
+      if (!copied) {
+        const previousFocus = document.activeElement as HTMLElement | null;
+        const text = document.createElement('textarea');
+        text.value = contents;
+        text.style.position = 'fixed';
+        text.style.opacity = '0';
+        document.body.appendChild(text);
+        text.select();
+        try {
+          copied = document.execCommand('copy');
+        } finally {
+          text.remove();
+          previousFocus?.focus();
+        }
+      }
+      if (!copied) throw new Error('Clipboard access was denied.');
+      addLog('Activity log copied.');
+    } catch (error) {
+      addLog(`Could not copy activity log: ${errorMessage(error)}`, 'error');
+    }
+  }
+  async function openLogFolder() {
+    if (logActionBusy) return;
+    logActionBusy = true;
+    try {
+      const folder = (await getStorageLocations()).find(([label]) => label === 'Job logs')?.[1];
+      if (!folder) throw new Error('Job log folder is unavailable.');
+      await openDirectory(folder);
+    } catch (error) {
+      addLog(`Could not open the job log folder: ${errorMessage(error)}`, 'error');
+    } finally {
+      logActionBusy = false;
+    }
+  }
 </script>
 
 <svelte:window
   onkeydown={handleKeydown}
+  onkeyup={(event) => {
+    shiftHeld = event.shiftKey;
+  }}
+  onblur={() => {
+    shiftHeld = false;
+  }}
   ondragover={(event) => event.preventDefault()}
   ondrop={(event) => event.preventDefault()}
 />
 
-<div class="app-shell">
+<div class="app-shell" class:compact-utilities={view === 'utilities' && !logUserAdjusted}>
   <header class="app-header">
     <div class="brand">
       <img src="/app-icon.png" width="30" height="30" alt="" />
       <div class="brand-wordmark">jesses</div>
+      <span class="version">v{appVersion}</span>
     </div>
-    <nav class="workspace-nav" aria-label="Workspace workflows">
-      <button
-        type="button"
-        class:active={view === 'files'}
-        aria-current={view === 'files' ? 'page' : undefined}
-        title="Start here: add and inspect source media"
-        onclick={() => (view = 'files')}
-        ><Files size={16} aria-hidden="true" />Files<span class="nav-count">{files.length}</span
-        ></button
-      >
-      <button
-        type="button"
-        class:active={view === 'convert'}
-        aria-current={view === 'convert' ? 'page' : undefined}
-        title="Encode one source with guided settings"
-        onclick={() => (view = 'convert')}
-        ><SlidersHorizontal size={16} aria-hidden="true" />Quick Convert</button
-      >
-      <button
-        type="button"
-        class:active={view === 'av1an'}
-        aria-current={view === 'av1an' ? 'page' : undefined}
-        title="Scene-based AV1 encoding with parallel chunks"
-        onclick={() => (view = 'av1an')}><Clapperboard size={16} aria-hidden="true" />av1an</button
-      >
-      <button
-        type="button"
-        class:active={view === 'batch'}
-        aria-current={view === 'batch' ? 'page' : undefined}
-        title="Apply one encoding recipe to multiple sources"
-        onclick={() => (view = 'batch')}><Layers size={16} aria-hidden="true" />Batch encode</button
-      >
-      <button
-        type="button"
-        class:active={view === 'remux'}
-        aria-current={view === 'remux' ? 'page' : undefined}
-        title="Repackage streams without re-encoding"
-        onclick={() => (view = 'remux')}><FolderOpen size={16} aria-hidden="true" />Remux</button
-      >
-      <button
-        type="button"
-        class:active={view === 'tools'}
-        aria-current={view === 'tools' ? 'page' : undefined}
-        title="Check installed tools and change app defaults"
-        onclick={() => (view = 'tools')}
-        ><Wrench size={16} aria-hidden="true" />Tools & settings</button
-      >
-      <button
-        type="button"
-        class:active={view === 'utilities'}
-        aria-current={view === 'utilities' ? 'page' : undefined}
-        title="Run focused media tasks such as cuts, joins, OCR, and analysis"
-        onclick={() => (view = 'utilities')}
-        ><FlaskConical size={16} aria-hidden="true" />Utilities</button
-      >
-    </nav>
-    <button
-      type="button"
-      class="environment-status"
-      onclick={() => (view = 'tools')}
-      title="View tools and environment"
-    >
-      {#if !desktop}<Monitor size={14} aria-hidden="true" /><span>Browser preview</span>
-      {:else if toolsLoading}<LoaderCircle size={14} class="spinning" aria-hidden="true" /><span
-          >Checking tools</span
-        >
-      {:else if toolsError}<CircleAlert size={14} aria-hidden="true" /><span>Tool check failed</span
-        >
-      {:else if availableTools === tools.length && tools.length > 0}<Check
-          size={14}
-          aria-hidden="true"
-        /><span>Tools available</span>
-      {:else}<CircleAlert size={14} aria-hidden="true" /><span
-          >{availableTools} / {tools.length} tools available</span
-        >{/if}
-      <ArrowRight size={12} aria-hidden="true" />
-    </button>
   </header>
-
-  <main>
-    {#if !desktop}
-      <div class="preview-notice">
-        <Monitor size={15} aria-hidden="true" />
-        <p>
-          <strong>Browser preview.</strong> Open the desktop app to add local media and detect tools.
-        </p>
-        <button type="button" class="text-button" onclick={() => loadSample(view)}
-          ><FlaskConical size={13} aria-hidden="true" />{hasSample
-            ? 'View sample'
-            : 'Load sample'}</button
+  <div class="work-area">
+    <nav class="workspace-nav" aria-label="Workspace workflows">
+      {#each [{ id: 'files', label: 'File List' }, { id: 'tracks', label: 'Track List' }, { id: 'av1an', label: 'AV1AN' }, { id: 'convert', label: 'Quick Convert' }, { id: 'utilities', label: 'Utilities' }, { id: 'tools', label: 'Settings' }] as tab}
+        <button
+          type="button"
+          class:active={view === tab.id}
+          aria-current={view === tab.id ? 'page' : undefined}
+          onclick={() => {
+            view = tab.id as View;
+            if (tab.id === 'convert' || tab.id === 'av1an') lastTaskTab = tab.id;
+            else if (tab.id === 'utilities' && workspaceActions.utilities?.label !== 'Run')
+              lastTaskTab = 'utilities';
+          }}>{tab.label}</button
         >
+      {/each}
+    </nav>
+    <main>
+      {#if view === 'files'}
+        <SourceFileList
+          {files}
+          selectedIds={selectedFileIds}
+          primary={selectedFile}
+          mode={fileMode}
+          {batchNameTemplate}
+          {batchExample}
+          statuses={batchStatuses}
+          recentPaths={preferences.value.recentPaths}
+          {importing}
+          {desktop}
+          onselect={selectFiles}
+          onmode={changeFileMode}
+          onname={(value) => (batchNameTemplate = value)}
+          onadd={addFiles}
+          onfolder={addFolder}
+          onrecent={(path) => {
+            recentSelection = path;
+            void openRecent();
+          }}
+          onload={() => loadTracks()}
+          onremove={removeSelectedFiles}
+          onmove={moveSelectedFile}
+          onsort={sortFiles}
+        />
+      {:else if view === 'tracks'}
+        <SourceTrackList
+          {files}
+          tracks={trackSelection}
+          mainFile={mainSource}
+          mode={fileMode}
+          onchange={(next) => (trackSelection = next)}
+          onextract={extractSelectedAttachment}
+        />
+      {:else if view === 'tools'}
+        <SourceSettings
+          onreset={() => {
+            workspaceActions.convert?.reset?.();
+            workspaceActions.av1an?.reset?.();
+          }}
+        />
+      {/if}
+      {#if (view === 'convert' || view === 'av1an') && jobsError}<p role="alert">
+          {jobsError}
+          <button type="button" onclick={connectJobs} disabled={jobsConnecting}>Reconnect</button>
+        </p>{/if}
+      <div hidden={view !== 'convert'}>
+        <QuickConvert
+          {files}
+          file={taskSource}
+          {tools}
+          {toolsRevision}
+          {toolsLoading}
+          {jobs}
+          tracks={trackSelection}
+          {fileMode}
+          {batchNameTemplate}
+          sourcePreferences={preferences.value.general}
+          onlog={(message) => addLog(message)}
+          registerAction={registerWorkspaceAction}
+          onbatchqueue={queueBatch}
+          onbatchstatus={reportBatchStatuses}
+          onreviewjob={acceptReviewedJob}
+          ontracklist={() => {
+            lastActionStatus = 'Canceled.';
+            view = 'tracks';
+          }}
+          isShiftHeld={() => shiftHeld}
+          connected={jobsConnected}
+          onfiles={() => (view = 'files')}
+          onstart={submitEncode}
+          onqueue={queueEncode}
+        />
       </div>
-    {/if}
-
-    {#if sourceRequired}
-      <div class="source-required notice" role="region" aria-label="Choose a media source">
-        <Files size={18} aria-hidden="true" />
-        <div class="source-required-copy">
-          <strong
-            >{desktop
-              ? 'Choose media to begin.'
-              : 'Try the sample to explore this workflow.'}</strong
-          >
-          <p>
-            {desktop
-              ? 'Add a file or folder from Files.'
-              : 'Load the sample to explore the settings.'}
-          </p>
-        </div>
-        <div class="source-required-actions">
-          <Button variant="outline" onclick={() => (view = 'files')}
-            ><Files size={14} aria-hidden="true" />Open Files</Button
-          >
-          {#if !desktop}<Button onclick={() => loadSample(view)}
-              ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
-            >{/if}
-        </div>
+      <div hidden={view !== 'av1an'}>
+        <Av1an
+          {files}
+          file={taskSource}
+          {tools}
+          {toolsRevision}
+          {toolsLoading}
+          {jobs}
+          tracks={trackSelection}
+          {fileMode}
+          {batchNameTemplate}
+          sourcePreferences={preferences.value.general}
+          onlog={(message) => addLog(message)}
+          registerAction={registerWorkspaceAction}
+          onbatchqueue={queueBatch}
+          onbatchstatus={reportBatchStatuses}
+          onreviewjob={acceptReviewedJob}
+          isShiftHeld={() => shiftHeld}
+          onrecoverysource={activateRecoverySource}
+          onrecoveryjobs={acceptRecoveryJobs}
+          connected={jobsConnected}
+          onfiles={() => (view = 'files')}
+          onstart={submitEncode}
+          onqueue={queueEncode}
+        />
       </div>
-    {/if}
-
-    {#if view === 'files'}
-      <section class="files-workspace" aria-label="Source files">
-        <div class="files-toolbar">
-          <h1>Source files</h1>
-          <div class="toolbar-actions">
-            <Button
-              onclick={addFiles}
-              disabled={!desktop || importing}
-              title={!desktop
-                ? 'Local files require the jesses desktop app'
-                : 'Add media files (Ctrl+O)'}
-              >{#if importing}<LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading
-                files{:else}<Plus size={16} aria-hidden="true" />Add files{/if}</Button
-            >
-            <Button variant="outline" onclick={addFolder} disabled={!desktop || importing}
-              ><FolderOpen size={15} aria-hidden="true" />Add folder</Button
-            >
-            <Button variant="ghost" onclick={clearFiles} disabled={!files.length || importing}
-              ><Trash2 size={14} aria-hidden="true" />Clear list</Button
-            >
-          </div>
-        </div>
-        <div class="file-options">
-          <label
-            ><input
-              type="checkbox"
-              checked={recursiveImport}
-              onchange={changeRecursive}
-              disabled={!desktop || importing}
-              title="Folder scans stop at 500 media files or 10,000 entries"
-            /> Include subfolders</label
-          >
-          {#if preferences.loaded && preferences.value.recentPaths.length}
-            <div class="recent-media">
-              <label for="recent-media-path">Recent media</label>
-              <select id="recent-media-path" bind:value={recentSelection} disabled={importing}>
-                <option value="">Choose a file or folder</option>
-                {#each preferences.value.recentPaths as path}<option value={path}>{path}</option
-                  >{/each}
-              </select>
-              <Button
-                variant="outline"
-                onclick={openRecent}
-                disabled={importing || !recentSelection}>Open recent</Button
-              >
-            </div>
-          {/if}
-          {#if importing}<Button variant="outline" onclick={stopImport}>Stop import</Button>{/if}
-        </div>
-        {#if importNotice}<div class="notice" role="status"><p>{importNotice}</p></div>{/if}
-        {#if importErrors.length}
-          <div class="notice error-notice import-errors" role="alert">
-            <CircleAlert size={17} aria-hidden="true" />
-            <div>
-              {#each importErrors as failure}<p>
-                  <strong>{failure.name}:</strong>
-                  {failure.message}
-                </p>{/each}
-            </div>
-            <button
-              type="button"
-              class="icon-button"
-              aria-label="Dismiss import errors"
-              onclick={() => (importErrors = [])}><X size={15} aria-hidden="true" /></button
-            >
-          </div>
-        {/if}
-        <section class="workflow-launcher" aria-label="Choose a workflow">
-          <h2 class="sr-only">Choose a workflow</h2>
-          <div class="workflow-shortcuts">
-            <button
-              type="button"
-              onclick={() => (view = 'convert')}
-              title="Choose a format, size, and quality"
-            >
-              <SlidersHorizontal size={16} aria-hidden="true" /><span>Convert a file</span>
-            </button>
-            <button
-              type="button"
-              onclick={() => (view = 'av1an')}
-              title="Encode scenes in parallel"
-            >
-              <Clapperboard size={16} aria-hidden="true" /><span>Encode with av1an</span>
-            </button>
-            <button
-              type="button"
-              onclick={() => (view = 'batch')}
-              title="Apply one recipe to your file list"
-            >
-              <Layers size={16} aria-hidden="true" /><span>Convert multiple files</span>
-            </button>
-            <button
-              type="button"
-              onclick={() => (view = 'remux')}
-              title="Change containers without encoding"
-            >
-              <FolderOpen size={16} aria-hidden="true" /><span>Repackage streams</span>
-            </button>
-          </div>
-        </section>
-        <div class="file-columns">
-          <div class="source-library-column">
-            <section
-              class="file-library"
-              class:has-files={files.length > 0}
-              aria-label="Imported media"
-            >
-              <div class="library-heading">
-                <span class="eyebrow">Input media</span><span class="small-muted"
-                  >{files.length
-                    ? `${files.length} ${files.length === 1 ? 'file' : 'files'} · ${formatBytes(String(totalSize))}`
-                    : 'No files added'}</span
-                >
-              </div>
-              {#if files.length}
-                <div class="library-search">
-                  <label class="search-field">
-                    <Search size={15} aria-hidden="true" />
-                    <input
-                      type="search"
-                      aria-label="Search source files"
-                      placeholder="Find a file by name or folder…"
-                      bind:value={fileQuery}
-                    />
-                  </label>
-                  <span class="small-muted" role="status"
-                    >{visibleFiles.length} of {files.length} shown</span
-                  >
-                </div>
-                {#if !visibleFiles.length}
-                  <div class="search-empty">
-                    <Search size={22} aria-hidden="true" />
-                    <strong>No matching files</strong>
-                    <p>Try another name or folder. Your imported files are still here.</p>
-                    <button type="button" class="text-button" onclick={() => (fileQuery = '')}
-                      >Clear search</button
-                    >
-                  </div>
-                {:else}
-                  <div class="file-table-scroll">
-                    <table class="file-table">
-                      <thead
-                        ><tr
-                          ><th class="name-column">Source</th><th>Duration</th><th>Video</th><th
-                            class="audio-column">Audio</th
-                          ><th class="size-column">Size</th><th class="remove-column"
-                            ><span class="sr-only">Remove</span></th
-                          ></tr
-                        ></thead
-                      ><tbody>
-                        {#each visibleFiles as file (file.id)}
-                          {@const video = file.streams.find((stream) => stream.kind === 'video')}
-                          {@const audio = file.streams.find((stream) => stream.kind === 'audio')}
-                          <tr class:selected={selectedId === file.id}>
-                            <td class="name-cell"
-                              ><button
-                                type="button"
-                                class="file-select"
-                                aria-pressed={selectedId === file.id}
-                                onclick={() => (selectedId = file.id)}
-                                title={file.path}
-                                ><span class="file-type-icon"
-                                  ><Film size={19} strokeWidth={1.5} aria-hidden="true" /></span
-                                ><span class="file-name"
-                                  ><strong>{file.name}</strong><span
-                                    >{file.id === sampleId
-                                      ? 'Synthetic sample'
-                                      : (file.format ?? 'Media file')}{video?.width && video.height
-                                      ? ` · ${video.width} × ${video.height}`
-                                      : ''}</span
-                                  ></span
-                                ></button
-                              ></td
-                            >
-                            <td class="mono">{formatDuration(file.durationSeconds)}</td><td
-                              ><span class="table-codec"
-                                >{video ? displayCodec(video.codec) : '—'}</span
-                              ></td
-                            ><td class="audio-column"
-                              ><span class="table-codec"
-                                >{audio ? displayCodec(audio.codec) : '—'}</span
-                              ></td
-                            ><td class="mono size-column">{formatBytes(file.sizeBytes)}</td><td
-                              class="remove-column"
-                              ><button
-                                type="button"
-                                class="icon-button"
-                                aria-label={`Remove ${file.name}`}
-                                onclick={() => removeFile(file.id)}
-                                disabled={importing}><X size={14} aria-hidden="true" /></button
-                              ></td
-                            >
-                          </tr>
-                        {/each}
-                      </tbody>
-                    </table>
-                  </div>
-                {/if}
-                {#if importing}<div class="import-progress" role="status">
-                    <LoaderCircle size={15} class="spinning" aria-hidden="true" />Reading {importingName}…
-                  </div>{/if}
-              {:else}
-                <div class="library-empty">
-                  <div class="empty-file-symbol">
-                    <FilePlus2 size={26} strokeWidth={1.5} aria-hidden="true" />
-                  </div>
-                  <h2>{importing ? 'Reading your media…' : 'No media yet'}</h2>
-                  <p>
-                    {importing
-                      ? importingName
-                      : desktop
-                        ? 'Drop files here or use Add files above (Ctrl+O).'
-                        : 'Load a sample to inspect its media details.'}
-                  </p>
-                  {#if !desktop}<Button variant="outline" onclick={() => loadSample()}
-                      ><FlaskConical size={14} aria-hidden="true" />Try sample</Button
-                    >{/if}
-                </div>
-              {/if}
-            </section>
-          </div>
-          <FileInspector file={selectedFile} sample={selectedFile?.id === sampleId} />
-        </div>
-      </section>
-    {:else if view === 'tools'}
-      <ToolsPanel
-        {tools}
-        {desktop}
-        loading={toolsLoading}
-        checked={toolsChecked}
-        error={toolsError}
-        onrefresh={refreshTools}
-      />
-    {/if}
-    {#if (view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux') && jobsError}
-      <div class="notice error-notice" role="alert">
-        <CircleAlert size={16} aria-hidden="true" />
-        <div>
-          <p><strong>Job controls are unavailable.</strong> {jobsError}</p>
-          <p>
-            Files remains available. For a storage problem, correct it and restart jesses. Reconnect
-            retries the job connection.
-          </p>
-        </div>
-        <Button variant="outline" onclick={connectJobs} disabled={jobsConnecting}
-          >Reconnect jobs</Button
-        >
+      <div hidden={view !== 'utilities'}>
+        <SourceUtilities
+          {files}
+          file={taskSource}
+          tracks={trackSelection}
+          {fileMode}
+          registerAction={registerWorkspaceAction}
+          onbatchstatus={(statuses, runId, begin) => reportBatchStatuses(runId, statuses, begin)}
+          onlog={(message, error) => addLog(message, error ? 'error' : 'info')}
+        />
       </div>
-    {/if}
-    <div hidden={view !== 'convert'}>
-      <QuickConvert
-        {files}
-        file={selectedFile}
-        {tools}
-        {jobs}
-        connected={jobsConnected}
-        onfiles={() => (view = 'files')}
-        onstart={submitEncode}
-        onqueue={queueEncode}
-      />
-    </div>
-    <div hidden={view !== 'av1an'}>
-      <Av1an
-        {files}
-        file={selectedFile}
-        {tools}
-        {jobs}
-        connected={jobsConnected}
-        onfiles={() => (view = 'files')}
-        onstart={submitEncode}
-        onqueue={queueEncode}
-      />
-    </div>
-    <div hidden={view !== 'batch'}>
-      <BatchEncode
-        {files}
-        {tools}
-        connected={jobsConnected}
-        onfiles={() => (view = 'files')}
-        onqueue={queueBatch}
-      />
-    </div>
-    <div hidden={view !== 'remux'}>
-      <Remux
-        file={selectedFile}
-        {files}
-        {tools}
-        {jobs}
-        connected={jobsConnected}
-        onfiles={() => (view = 'files')}
-        onstart={submitRemux}
-        onmux={submitMux}
-      />
-    </div>
-    <div hidden={view !== 'utilities'}>
-      <Utilities {files} onimport={(paths) => void importPaths(paths)} /><SavedJobs
-        {jobs}
-        onqueue={queueEncode}
-      />
-    </div>
-    <div hidden={!(view === 'convert' || view === 'av1an' || view === 'batch' || view === 'remux')}>
-      <JobStatus
-        job={currentJob}
-        {jobs}
-        oncancel={stopJob}
-        onstop={stopQueue}
-        onkeep={keepJobProgress}
-        onresume={resumeSavedJob}
-        ondiscard={discardSavedAv1anProgress}
-        onpause={pauseLiveJob}
-      />
-    </div>
-    <CompletionPanel
-      settingsVisible={view === 'convert' ||
-        view === 'av1an' ||
-        view === 'batch' ||
-        view === 'remux'}
-    />
-  </main>
-
-  <section class="log-panel" class:expanded={logOpen} aria-label="Activity log">
+    </main>
+  </div>
+  <div
+    class="log-splitter"
+    role="slider"
+    aria-label="Resize log"
+    aria-orientation="horizontal"
+    aria-valuenow={logHeight}
+    aria-valuemin="90"
+    aria-valuemax="400"
+    tabindex="0"
+    onpointerdown={resizeLog}
+    onkeydown={(event) => {
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        logUserAdjusted = true;
+        try {
+          localStorage.setItem('jesses.log-height-user-adjusted', 'true');
+        } catch {
+          /* Optional UI state. */
+        }
+        logHeight = Math.min(400, logHeight + 10);
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        logUserAdjusted = true;
+        try {
+          localStorage.setItem('jesses.log-height-user-adjusted', 'true');
+        } catch {
+          /* Optional UI state. */
+        }
+        logHeight = Math.max(90, logHeight - 10);
+      }
+    }}
+  ></div>
+  <section class="log-panel expanded" aria-label="Activity log">
     <div class="log-bar">
-      <button
-        type="button"
-        class="log-toggle"
-        onclick={toggleLog}
-        aria-expanded={logOpen}
-        aria-controls="activity-log"
-        ><Terminal size={14} aria-hidden="true" /><span>Activity log</span><span class="log-count"
-          >{logs.length}</span
-        >{#if logOpen}<ChevronDown size={14} aria-hidden="true" />{:else}<ChevronUp
-            size={14}
-            aria-hidden="true"
-          />{/if}</button
-      >
+      <strong>LOG</strong>
       <div class="log-bar-right">
-        {#if importing}<span role="status"
-            ><LoaderCircle size={12} class="spinning" aria-hidden="true" />Reading media</span
-          >{:else}<span
-            ><span class="status-square"></span>{desktop ? 'Ready' : 'Preview mode'}</span
-          >{/if}{#if logOpen}<button
-            type="button"
-            class="text-button"
-            onclick={() => (logs = [])}
-            disabled={!logs.length}>Clear log</button
-          >{/if}
+        <button type="button" onclick={copyActivityLog} disabled={!logs.length}>Copy</button><button
+          type="button"
+          onclick={exportActivityLog}
+          disabled={!logs.length || logActionBusy}>Save…</button
+        ><button type="button" onclick={openLogFolder} disabled={logActionBusy}>Log Folder</button
+        ><button type="button" onclick={() => (logs = [])} disabled={!logs.length}>Clear</button>
       </div>
     </div>
-    {#if logOpen}<div
-        id="activity-log"
-        class="log-entries"
-        role="log"
-        aria-label="Recent activity"
-        aria-live="polite"
-      >
-        {#each logs as entry (entry.id)}<div
-            class="log-entry"
-            class:log-error={entry.level === 'error'}
-          >
-            <time class="mono">{entry.time}</time><span class="log-level mono">{entry.level}</span
-            ><span>{entry.message}</span>
-          </div>{:else}<div class="log-empty">No activity to show.</div>{/each}
-      </div>{/if}
+    <div
+      id="activity-log"
+      class="log-entries"
+      role="log"
+      aria-label="Recent activity"
+      aria-live="polite"
+      style:height={`${logHeight}px`}
+    >
+      {#each logs as entry (entry.id)}<div
+          class="log-entry"
+          class:log-error={entry.level === 'error'}
+        >
+          <span>{entry.message}</span>
+        </div>{/each}
+    </div>
   </section>
   <footer class="status-bar">
-    <span
-      >jesses <span class="mono">{appVersion}</span><span class="footer-divider">/</span>Created by
-      jkkma</span
-    ><span>Desktop media encoding, muxing, and analysis.</span>
+    <div class="current-action">
+      <span aria-label="Current action" title={currentActionText}>{currentActionText}</span
+      ><progress
+        aria-label="Task progress"
+        max={displayAction?.active ? 1 : currentJob?.durationSeconds || 1}
+        value={displayAction?.active
+          ? (displayAction.progress ?? 0)
+          : currentJob?.progressSeconds || 0}
+        aria-valuetext={displayAction?.active ? displayAction.progressDescription : undefined}
+      ></progress>
+    </div>
+    <label
+      ><input
+        type="checkbox"
+        checked={shutdownWhenDone}
+        disabled={!desktop || updatingShutdown}
+        onchange={(event) => {
+          const input = event.currentTarget;
+          void setShutdown(input.checked).then(() => {
+            input.checked = shutdownWhenDone;
+          });
+        }}
+      /> Shutdown when done</label
+    >
+    {#if displayAction?.active}<button
+        type="button"
+        disabled={!displayAction.pause}
+        onclick={() => displayAction?.pause?.()}>{displayAction.paused ? 'Resume' : 'Pause'}</button
+      ><button type="button" disabled={!displayAction.stop} onclick={() => displayAction?.stop?.()}
+        >Stop</button
+      >
+    {:else if currentJob && ['preparing', 'running', 'paused', 'finalizing'].includes(currentJob.state)}<button
+        type="button"
+        onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
+        >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
+      ><button type="button" onclick={stopQueue}>Stop</button>{/if}
+    <button
+      type="button"
+      class="run-button"
+      disabled={!action?.canRun || !!runningAction || !desktop}
+      onclick={(event) =>
+        action?.run({ editCommand: event.shiftKey, isShiftHeld: () => shiftHeld })}
+      >{action?.label ?? 'Run'}</button
+    >
   </footer>
+  {#if shutdownError}<p role="alert">{shutdownError}</p>{/if}
 </div>
 
+<SourceDialog
+  title={`Import ${importChoices?.length ?? 0} File${importChoices?.length === 1 ? '' : 's'}`}
+  open={importChoices !== null}
+  onclose={() => finishImportDialog()}
+  width={640}
+>
+  <p>Uncheck any files you don't want to import.</p>
+  <div class="import-choices">
+    {#each importChoices ?? [] as item}
+      <label><input type="checkbox" bind:checked={item.checked} /> {fileName(item.path)}</label>
+    {/each}
+  </div>
+  <div class="import-actions">
+    <button onclick={() => finishImportDialog(true)}>Replace file list</button><button
+      onclick={() => finishImportDialog(false)}>Add to file list</button
+    >
+  </div>
+</SourceDialog>
+<SourceDialog
+  title="Enter Frame Rate"
+  open={sequencePrompt !== null}
+  onclose={() => finishSequenceRate(true)}
+  width={440}
+>
+  {#if sequencePrompt}
+    <p>
+      Please enter a frame rate to use for the image sequence '{fileName(sequencePrompt.path).slice(
+        0,
+        80,
+      )}'.
+    </p>
+    <input
+      aria-label="Frame rate"
+      bind:value={sequencePrompt.text}
+      onkeydown={(event) => {
+        if (event.key === 'Enter') finishSequenceRate();
+      }}
+    />
+    {#if sequencePrompt.error}<p role="alert">{sequencePrompt.error}</p>{/if}
+    <div class="import-actions"><button onclick={() => finishSequenceRate()}>OK</button></div>
+  {/if}
+</SourceDialog>
+
 <style>
-  .recent-media {
-    display: flex;
-    flex: 1 1 430px;
-    justify-content: flex-end;
-    gap: 7px;
-    align-items: center;
-    min-width: 0;
-  }
-  .recent-media label {
-    white-space: nowrap;
-    font-size: 11px;
-  }
-  .recent-media select {
-    flex: 0 1 260px;
-    min-width: 120px;
-    height: 30px;
-    padding: 0 7px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background: var(--background);
-    font-size: 11px;
-  }
-  .file-options {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 7px 16px;
-    min-height: 37px;
-    padding: 3px 0 7px;
-  }
-  .file-options > label {
-    display: flex;
-    align-items: center;
+  .import-choices {
+    min-height: 220px;
+    max-height: 55vh;
+    overflow: auto;
+    display: grid;
+    align-content: start;
     gap: 6px;
-    font-size: 11px;
-    white-space: nowrap;
   }
-  .file-options input {
-    accent-color: #ad5326;
-  }
-  .source-required {
-    align-items: center;
-    margin: 8px 0;
-    background: var(--accent);
-    border-color: var(--border);
-  }
-  .source-required > :global(svg) {
-    flex: 0 0 auto;
-    color: var(--jesses-rust-text);
-  }
-  .source-required-copy {
-    flex: 1 1 320px;
-    min-width: 0;
-  }
-  .source-required-copy strong {
-    display: block;
-    font-size: 12px;
-  }
-  .source-required-copy p {
-    margin-top: 3px;
-    font-size: 11px;
-    color: var(--muted-foreground);
-  }
-  .source-required-actions {
+  .import-actions {
     display: flex;
-    flex: 0 0 auto;
-    flex-wrap: wrap;
+    justify-content: end;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .app-shell {
+    height: 100vh;
+    min-height: 680px;
+    padding: 10px;
+    gap: 8px;
+    background: var(--background);
+    color: var(--foreground);
+  }
+  .app-header {
+    min-height: 29px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    border: 0;
+    background: transparent;
+  }
+  .brand {
+    align-items: baseline;
     gap: 8px;
   }
-  @media (max-width: 850px) {
-    .source-required-actions {
-      flex-basis: 100%;
+  .brand-wordmark {
+    color: var(--foreground);
+    font-size: 21px;
+    font-weight: 650;
+    letter-spacing: -0.9px;
+  }
+  .version {
+    color: var(--muted-foreground);
+    font-size: 10px;
+  }
+  .work-area {
+    min-height: 260px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    border-radius: 8px;
+    background: var(--card);
+    overflow: hidden;
+  }
+  .workspace-nav {
+    min-height: 35px;
+    gap: 20px;
+    align-items: flex-start;
+    padding: 0 8px;
+    overflow-x: auto;
+  }
+  .workspace-nav button {
+    height: 29px;
+    padding: 0;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 13px;
+  }
+  .workspace-nav button:hover {
+    background: transparent;
+    color: var(--foreground);
+  }
+  .workspace-nav button.active {
+    color: var(--foreground);
+    border-color: var(--primary);
+    background: transparent;
+  }
+  main {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 0 4px;
+  }
+  main > div:not([hidden]) {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .log-panel {
+    flex: 0 0 auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+  .log-splitter {
+    height: 5px;
+    flex: 0 0 5px;
+    border-radius: 3px;
+    background: var(--rule);
+    cursor: ns-resize;
+    touch-action: none;
+  }
+  .log-bar {
+    min-height: 30px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0;
+    border: 0;
+  }
+  .log-bar strong {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: var(--muted-foreground);
+  }
+  .log-bar-right {
+    display: flex;
+    gap: 5px;
+  }
+  .log-bar button,
+  .status-bar button {
+    padding: 0.38rem 0.7rem;
+    border: 0;
+    border-radius: 4px;
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    font-size: 12px;
+  }
+  .log-bar button:disabled,
+  .status-bar button:disabled {
+    opacity: 0.5;
+  }
+  .log-entries {
+    min-height: 90px;
+    max-height: 400px;
+    overflow: auto;
+    padding: 6px;
+    background: var(--background);
+    color: var(--foreground);
+    border: 0;
+    border-radius: 5px;
+    font:
+      11px Consolas,
+      monospace;
+  }
+  @media (max-width: 1000px) and (max-height: 800px) {
+    .compact-utilities .log-entries {
+      min-height: 36px;
+      height: 36px !important;
     }
-    .recent-media {
-      justify-content: flex-start;
-      flex-basis: 100%;
-    }
+  }
+  .log-entry {
+    display: block;
+    padding: 0;
+    line-height: 1.35;
+  }
+  .log-entry.log-error {
+    color: var(--destructive);
+  }
+  .status-bar {
+    min-height: 32px;
+    padding: 0;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    background: transparent;
+    border: 0;
+    color: var(--foreground);
+    font-size: 13px;
+  }
+  .current-action {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .current-action span {
+    min-height: 12px;
+    font-size: 11px;
+    line-height: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .status-bar progress {
+    width: 100%;
+    height: 8px;
+    accent-color: var(--primary);
+  }
+  .status-bar label {
+    white-space: nowrap;
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .status-bar .run-button {
+    min-width: 120px;
+    color: var(--primary-foreground);
+    background: var(--primary);
+    font-weight: 600;
+  }
+  /* Paper shell and menu selection stay compact at desktop and laptop widths. */
+  .app-shell {
+    background-color: #c9c1a9;
+    background-image:
+      repeating-linear-gradient(0deg, transparent 0 31px, #7278660b 31px 32px),
+      repeating-linear-gradient(90deg, transparent 0 31px, #7278660b 31px 32px);
+  }
+  .brand-wordmark {
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    font-size: 18px;
+    font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
+  }
+  .brand img {
+    filter: grayscale(1) contrast(0.9);
+  }
+  .version {
+    letter-spacing: 0.06em;
+  }
+  .work-area {
+    border: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--card);
+  }
+  .workspace-nav {
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .workspace-nav button {
+    position: relative;
+    padding: 0 9px 0 16px;
+    border: 0;
+    letter-spacing: 0.045em;
+    font-size: 12px;
+  }
+  .workspace-nav button::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    width: 4px;
+    height: 4px;
+    background: var(--border);
+  }
+  .workspace-nav button:hover {
+    background: var(--secondary);
+  }
+  .workspace-nav button.active {
+    background: var(--primary);
+    color: var(--primary-foreground);
+  }
+  .workspace-nav button.active::before {
+    background: var(--primary-foreground);
+  }
+  .log-splitter {
+    border-radius: 0;
+    background: repeating-linear-gradient(90deg, var(--border) 0 36px, transparent 36px 39px);
+  }
+  .log-bar strong {
+    letter-spacing: 0.13em;
+  }
+  .log-entries {
+    border: 1px solid var(--border);
+    border-radius: 0;
+    background: #d6d0b8;
+  }
+  .log-bar button,
+  .status-bar button {
+    border-radius: 0;
+  }
+  .status-bar .run-button {
+    letter-spacing: 0.035em;
   }
 </style>

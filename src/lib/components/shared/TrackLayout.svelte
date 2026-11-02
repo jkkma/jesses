@@ -21,6 +21,7 @@
     chaptersDonor,
     movTimecode,
     outputIsMov,
+    timecodeSupported = true,
     issue,
     disabled,
     onorder,
@@ -40,6 +41,7 @@
     chaptersDonor: SourceDonor | undefined;
     movTimecode: MovTimecodeChoice | undefined;
     outputIsMov: boolean;
+    timecodeSupported?: boolean;
     issue: string | null;
     disabled: boolean;
     onorder: (value: EncodeTrackRef[]) => void;
@@ -86,7 +88,7 @@
   <summary>Output track order, labels & source data</summary>
   <div class="layout-content">
     <p>
-      Choose where container metadata and chapters come from. The video always uses the encoding
+      Choose where container metadata and chapters come from. Primary tracks use the selected
       source.
     </p>
     <div class="donors">
@@ -96,7 +98,7 @@
           {disabled}
           onchange={(event) => onmetadata(donor(event.currentTarget.value))}
         >
-          <option value="">Video source (default)</option>
+          <option value="">Primary source (default)</option>
           {#each realFiles as file (file.id)}<option value={file.id}>{file.name}</option>{/each}
           {#if metadataDonor?.invalidated}<option value="__stale__"
               >Removed or changed source</option
@@ -109,7 +111,7 @@
           {disabled}
           onchange={(event) => onchapters(donor(event.currentTarget.value))}
         >
-          <option value="">Video source (default)</option>
+          <option value="">Primary source (default)</option>
           {#each realFiles as file (file.id)}<option value={file.id}>{file.name}</option>{/each}
           {#if chaptersDonor?.invalidated}<option value="__stale__"
               >Removed or changed source</option
@@ -125,7 +127,7 @@
             : movTimecode
               ? JSON.stringify([movTimecode.sourceId, movTimecode.streamIndex])
               : ''}
-          {disabled}
+          disabled={disabled || !timecodeSupported}
           onchange={(event) => chooseTimecode(event.currentTarget.value)}
         >
           <option value="">No copied timecode</option>
@@ -140,10 +142,16 @@
               >Selected timecode needs attention</option
             >{/if}
         </select><small
-          >Copies a genuine tmcd data track into MOV output. The full video and its frame cadence
-          must stay unchanged.</small
+          >{timecodeSupported
+            ? 'Copies a genuine tmcd data track into MOV output. The full video and its frame cadence must stay unchanged.'
+            : 'MOV timecode selection is available when video is encoded.'}</small
         ></label
       >
+      {#if !timecodeSupported && movTimecode}<button
+          type="button"
+          {disabled}
+          onclick={() => ontimecode(undefined)}>Remove selected timecode</button
+        >{/if}
     {/if}
     <p>
       Move media tracks in output order. Attachments stay after media and can be reordered there.

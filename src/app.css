@@ -1,6 +1,7 @@
 /* Only application sources define utilities; media builds and test edits do not. */
 @import 'tailwindcss' source('./');
 
+/* A quiet paper-and-ink palette, with geometry kept in CSS rather than game assets. */
 :root {
   font-family:
     'Segoe UI',
@@ -10,42 +11,42 @@
   font-size: 13px;
   line-height: 1.5;
   color-scheme: light;
-  color: #302e29;
-  background: #f7f6f2;
+  color: #373a31;
+  background: #c9c1a9;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --background: #f7f6f2;
-  --foreground: #302e29;
-  --card: #fffefa;
-  --card-foreground: #302e29;
-  --popover: #fffefa;
-  --popover-foreground: #302e29;
-  --primary: #a74923;
-  --primary-foreground: #ffffff;
-  --secondary: #eeece5;
-  --secondary-foreground: #302e29;
-  --muted: #eeece5;
-  --muted-foreground: #666158;
-  --accent: #f3e8de;
-  --accent-foreground: #302e29;
-  --destructive: #923b31;
-  --border: #b3aca0;
-  --input: #b3aca0;
-  --ring: #8c482c;
-  --sidebar: #fffefa;
-  --sidebar-foreground: #34322d;
-  --sidebar-primary: #34322d;
-  --sidebar-primary-foreground: #f0eee6;
-  --sidebar-accent: #d5c8b7;
-  --sidebar-accent-foreground: #34322d;
-  --sidebar-border: #7c7367;
-  --sidebar-ring: #8c482c;
-  --radius: 6px;
-  --jesses-primary-hover: #91421d;
-  --jesses-rust-text: #8c482c;
-  --rule: #dedbd2;
-  --success: #4a6044;
+  --background: #dad4bb;
+  --foreground: #373a31;
+  --card: #e8e2cd;
+  --card-foreground: #373a31;
+  --popover: #ece7d4;
+  --popover-foreground: #373a31;
+  --primary: #41463a;
+  --primary-foreground: #f1eedb;
+  --secondary: #cfc8b1;
+  --secondary-foreground: #373a31;
+  --muted: #d6cfb8;
+  --muted-foreground: #5d6052;
+  --accent: #bdbda6;
+  --accent-foreground: #292d25;
+  --destructive: #833c32;
+  --border: #928f7b;
+  --input: #928f7b;
+  --ring: #41463a;
+  --sidebar: #dad4bb;
+  --sidebar-foreground: #373a31;
+  --sidebar-primary: #41463a;
+  --sidebar-primary-foreground: #f1eedb;
+  --sidebar-accent: #bdbda6;
+  --sidebar-accent-foreground: #292d25;
+  --sidebar-border: #928f7b;
+  --sidebar-ring: #41463a;
+  --radius: 0px;
+  --jesses-primary-hover: #292d25;
+  --jesses-rust-text: #454b3c;
+  --rule: #b2ab93;
+  --success: #53634a;
 }
 
 @theme inline {
@@ -143,7 +144,7 @@ svg {
   background: var(--background);
 }
 ::-webkit-scrollbar-thumb {
-  background: #aaa091;
+  background: #8f8a76;
   border: 2px solid var(--background);
 }
 .mono {
@@ -1258,6 +1259,23 @@ h1 {
   background: var(--background);
   border-top: 1px solid var(--rule);
 }
+.log-size {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 28px;
+  border-top: 1px solid var(--rule);
+  color: var(--muted-foreground);
+  font-size: 10px;
+}
+.log-size label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.log-size input {
+  width: 100px;
+  accent-color: var(--primary);
+}
 .log-entry {
   display: grid;
   grid-template-columns: 67px 39px 1fr;
@@ -1462,4 +1480,29 @@ h1 {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Square, understated controls and explicit keyboard focus throughout the desktop. */
+button,
+input,
+select,
+textarea,
+summary,
+[data-slot='button'],
+.panel {
+  border-radius: 0;
+}
+input[type='checkbox'],
+input[type='radio'],
+input[type='range'],
+progress {
+  accent-color: var(--primary);
+}
+button:not(:disabled):hover,
+summary:hover {
+  filter: brightness(0.94);
+}
+:focus-visible {
+  outline: 2px solid #30372c;
+  outline-offset: 2px;
 }

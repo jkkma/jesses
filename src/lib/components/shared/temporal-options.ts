@@ -7,7 +7,14 @@ import type {
   TemporalSettings,
 } from '$lib/ipc/generated';
 
+// Mirrors the runtime's rational output frame-rate bounds.
+export const FPS_MAX_NUMERATOR = 12_000_000;
+export const FPS_MAX_DENOMINATOR = 100_000;
+export const FPS_MAX = 1000;
+export const FPS_MIN_DENOMINATOR = 1000;
+
 export type TemporalDraft = {
+  fieldDetectionManual?: boolean;
   deinterlace:
     'off' | 'frame' | 'bob' | 'qtgmcFrame' | 'qtgmcBob' | 'inverseTelecine' | 'exactDuplicates';
   fieldOrder: FieldOrder;
@@ -47,13 +54,13 @@ export function temporalError(value: TemporalDraft, _backend: EncodeBackend): st
       !Number.isInteger(n) ||
       !Number.isInteger(d) ||
       n < 1 ||
-      n > 12000000 ||
+      n > FPS_MAX_NUMERATOR ||
       d < 1 ||
-      d > 100000 ||
-      n < d ||
-      n > 120 * d
+      d > FPS_MAX_DENOMINATOR ||
+      n * FPS_MIN_DENOMINATOR < d ||
+      n > FPS_MAX * d
     )
-      return 'Use an integer numerator and denominator describing 1–120 output frames per second.';
+      return `Use an integer numerator and denominator describing ${1 / FPS_MIN_DENOMINATOR}–${FPS_MAX} output frames per second.`;
   }
   if (value.aspect !== 'off') {
     const { aspectNumerator: n, aspectDenominator: d } = value;

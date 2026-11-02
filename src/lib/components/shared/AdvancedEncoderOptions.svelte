@@ -1,378 +1,337 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { getEncoderParameters } from '$lib/ipc/client';
+  import { contentPresets, applicableContentPreset } from './content-presets';
+  import sourceHelp from '$lib/encoder-source-help.json';
+  import SourceDialog from './SourceDialog.svelte';
   import type {
     EncodeBackend,
     EncoderParameter,
     EncoderParameterCatalog,
-    EncoderParameterPreset,
     VideoEncoder,
   } from '$lib/ipc/generated';
-  import {
-    getEncoderParameters,
-    getParameterPresets,
-    saveParameterPreset,
-    removeParameterPreset,
-  } from '$lib/ipc/client';
-  import { parameterError } from './encoder-parameters';
-  import EncoderCommandEditor from './EncoderCommandEditor.svelte';
   let {
     encoder,
     backend,
     value,
     disabled = false,
+    catalogRevision = 0,
+    catalogUnavailable = false,
     onchange,
+    oncatalog,
+    raw = {},
+    onraw,
+    onresource,
   }: {
     encoder: VideoEncoder;
     backend: EncodeBackend;
     value: EncoderParameter[];
     disabled?: boolean;
+    catalogRevision?: number;
+    catalogUnavailable?: boolean;
     onchange: (value: EncoderParameter[]) => void;
+    oncatalog?: (catalog: EncoderParameterCatalog, revision: number) => void;
+    raw?: Record<string, string>;
+    onraw?: (value: Record<string, string>) => void;
+    onresource?: (name: string, path: string) => void;
   } = $props();
-  let expanded = $state(false);
-  let catalog = $state<EncoderParameterCatalog | null>(null);
-  let search = $state('');
-  const visibleParameters = $derived(
-    (catalog?.parameters ?? []).filter((spec) =>
-      `${spec.name} ${spec.label} ${spec.group}`
-        .toLowerCase()
-        .includes(search.trim().toLowerCase()),
-    ),
+  let catalog = $state<EncoderParameterCatalog | null>(null),
+    category = $state(''),
+    error = $state(''),
+    help = $state<string | null>(null),
+    pendingPreset = $state<string | null>(null);
+  type HelpRow = { summary: string; details: string; examples: string };
+  const sourceRows = $derived(
+    (sourceHelp as Record<string, Record<string, HelpRow>>)[encoder] ?? {},
   );
-  let busy = $state(false);
-  let error = $state<string | null>(null);
-  let name = $state('');
-  let selectedPreset = $state('');
-  let presets = $state<EncoderParameterPreset[]>([]);
-  let presetsReady = $state(false);
-  let presetBusy = $state(false);
-  let controller: AbortController | undefined;
-  let generation = 0;
-  const issue = $derived(parameterError(value, catalog, encoder));
-  const availablePresets = $derived(
-    presets.filter((preset) => preset.encoder === encoder && preset.backend === backend),
+  const virtuals = $derived(
+    encoder === 'x265Standalone' || encoder === 'x265'
+      ? [
+          { name: 'master-display', group: 'HDR Metadata' },
+          { name: 'max-cll', group: 'HDR Metadata' },
+        ]
+      : encoder.startsWith('svtAv1')
+        ? [
+            { name: 'fgs-table', group: 'Film Grain & Noise' },
+            { name: 'dolby-vision-rpu', group: 'HDR Metadata' },
+            { name: 'hdr10plus-json', group: 'HDR Metadata' },
+          ]
+        : [],
   );
-  function initialValue(spec: EncoderParameterCatalog['parameters'][number]): string {
-    return spec.example || spec.choices[0] || spec.minimumValue || String(spec.minimum);
+  const groups = $derived([
+    ...new Set([
+      ...(catalog?.parameters ?? []).map((p) => p.group || 'Arguments'),
+      ...virtuals.map((p) => p.group),
+    ]),
+  ]);
+  const presets = $derived(contentPresets(encoder));
+  const helpRow = $derived(help ? sourceRows[help] : undefined);
+  const examples = $derived(
+    (helpRow?.examples ?? '')
+      .replaceAll('\\n', '\n')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => {
+        const [value, ...text] = line.split('|');
+        return { value: value.trim(), text: text.join('|').trim() };
+      }),
+  );
+  function currentFilled() {
+    return [
+      ...value,
+      ...Object.entries(raw)
+        .filter(([, v]) => v.trim())
+        .map(([name, value]) => ({ name, value })),
+    ];
   }
-  function message(cause: unknown): string {
-    return cause instanceof Error
-      ? cause.message
-      : String((cause as { message?: string })?.message ?? cause);
+  function covers(preset: (typeof presets)[number], filled: EncoderParameter[]) {
+    return (
+      filled.length > 0 &&
+      filled.every((item) =>
+        preset.parameters.some(
+          (p) =>
+            p.name === item.name &&
+            p.value.replaceAll(',', ':') === item.value.replaceAll(',', ':'),
+        ),
+      )
+    );
   }
-  async function load() {
-    controller?.abort();
-    const current = ++generation;
-    const signal = (controller = new AbortController()).signal;
-    busy = true;
-    error = null;
-    catalog = null;
-    presetsReady = false;
-    presets = [];
-    try {
-      const [result, stored] = await Promise.allSettled([
-        getEncoderParameters(encoder, backend, signal),
-        getParameterPresets(),
-      ]);
-      if (!signal.aborted && current === generation) {
-        if (result.status === 'fulfilled') catalog = result.value;
-        else error = message(result.reason);
-        if (stored.status === 'fulfilled') {
-          presets = stored.value;
-          presetsReady = true;
-        } else error = message(stored.reason);
-      }
-    } catch (cause) {
-      if (!signal.aborted && current === generation)
-        error =
-          cause instanceof Error
-            ? cause.message
-            : String((cause as { message?: string })?.message ?? cause);
-    } finally {
-      if (current === generation) busy = false;
-    }
-  }
-  $effect(() => {
-    encoder;
-    backend;
-    const open = expanded;
-    untrack(() => {
-      controller?.abort();
-      generation++;
-      busy = false;
-      catalog = null;
-      error = null;
-      selectedPreset = '';
-      search = '';
-      if (open) void load();
-    });
-    return () => {
-      controller?.abort();
-      generation++;
-    };
-  });
-  function update(parameter: string, text: string | undefined) {
-    onchange([
-      ...value.filter((value) => value.name !== parameter),
-      ...(text === undefined ? [] : [{ name: parameter, value: text }]),
-    ]);
-  }
-  async function save() {
-    if (!presetsReady || presetBusy) return;
-    const current = generation;
-    const chosenName = name.trim();
-    presetBusy = true;
-    try {
-      if (issue) throw new Error(issue);
-      const result = await saveParameterPreset({
-        name: chosenName,
-        encoder,
-        backend,
-        parameters: value.map((item) => ({ name: item.name, value: item.value })),
-      });
-      if (current === generation) {
-        presets = result;
-        selectedPreset = chosenName;
-        error = null;
-      }
-    } catch (cause) {
-      if (current === generation) error = message(cause);
-    } finally {
-      presetBusy = false;
-    }
-  }
-  function applyPreset() {
-    const preset = availablePresets.find((preset) => preset.name === selectedPreset);
-    if (!preset) return;
-    const issue = parameterError(preset.parameters, catalog, encoder);
-    if (issue) {
-      error = issue;
+  function applyPreset(name: string, confirmed = false) {
+    if (!catalog) return;
+    const preset = presets.find((p) => p.name === name),
+      filled = currentFilled();
+    if (!preset && !filled.length) return;
+    if (preset && filled.length === preset.parameters.length && covers(preset, filled)) return;
+    if (!confirmed && filled.length && !presets.some((p) => covers(p, filled))) {
+      pendingPreset = name;
       return;
     }
-    onchange(preset.parameters.map((value) => ({ name: value.name, value: value.value })));
-    error = null;
-  }
-  async function remove() {
-    const preset = availablePresets.find((preset) => preset.name === selectedPreset);
-    if (!preset || !presetsReady || presetBusy) return;
-    const current = generation;
-    presetBusy = true;
-    try {
-      const result = await removeParameterPreset({
-        name: preset.name,
-        encoder: preset.encoder,
-        backend: preset.backend,
-      });
-      if (current === generation) {
-        presets = result;
-        selectedPreset = '';
-        error = null;
-      }
-    } catch (cause) {
-      if (current === generation) error = message(cause);
-    } finally {
-      presetBusy = false;
+    onraw?.({});
+    if (!preset) {
+      onchange([]);
+      error = '';
+      return;
     }
+    const result = applicableContentPreset(preset.parameters, catalog, encoder);
+    onchange(result.accepted);
+    error = result.skipped.length ? `Unavailable arguments: ${result.skipped.join(', ')}.` : '';
+  }
+  $effect(() => {
+    const currentEncoder = encoder,
+      currentBackend = backend,
+      revision = catalogRevision,
+      unavailable = catalogUnavailable;
+    const controller = new AbortController();
+    catalog = null;
+    error = '';
+    if (!unavailable)
+      void getEncoderParameters(currentEncoder, currentBackend, controller.signal)
+        .then((result) => {
+          if (!controller.signal.aborted) {
+            catalog = result;
+            category = result.parameters[0]?.group || 'Arguments';
+            oncatalog?.(result, revision);
+          }
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            error = cause instanceof Error ? cause.message : String(cause);
+        });
+    return () => controller.abort();
+  });
+  function update(name: string, text: string) {
+    onchange([
+      ...value.filter((item) => item.name !== name),
+      ...(text.trim() ? [{ name, value: text }] : []),
+    ]);
   }
 </script>
 
-<details class="advanced-parameters" bind:open={expanded}>
-  <summary>Advanced encoder parameters{value.length ? ` (${value.length} overrides)` : ''}</summary>
-  {#if expanded}
-    <p class="small-muted">
-      The speed preset applies first; these explicit overrides apply afterward. Saved parameter
-      presets replace the override list and leave quality, speed, paths and source processing
-      controls as configured. Presets are saved in this application instance’s preferences,
-      including its separate portable configuration.
-    </p>
-    {#if busy}<p role="status">Checking the installed encoder catalog…</p>{:else if catalog}
-      <p class="small-muted">{catalog.route}: {catalog.toolVersion}</p>
-      <EncoderCommandEditor {value} {catalog} {disabled} {onchange} />
-      {#if catalog.parameters.length > 8}<label class="parameter-search"
-          >Find a parameter
-          <input type="search" bind:value={search} placeholder="Name or category" {disabled} />
-        </label>{/if}
-      <fieldset {disabled}>
-        <legend>Validated encoder overrides</legend>
-        {#each visibleParameters as spec, index (spec.name)}
-          {@const current = value.find((value) => value.name === spec.name)}
-          {#if index === 0 || visibleParameters[index - 1].group !== spec.group}
-            <h4>{spec.group || 'Advanced'}</h4>
-          {/if}
-          <div class="parameter-row">
-            <label
-              ><input
-                type="checkbox"
-                aria-label={`Override ${spec.label}`}
-                checked={!!current}
-                onchange={(event) =>
-                  update(spec.name, event.currentTarget.checked ? initialValue(spec) : undefined)}
-              />{spec.label}</label
-            >
-            {#if current}
-              {#if spec.valueKind === 'choice'}
-                <select
-                  aria-label={`${spec.label} value`}
-                  value={current.value}
-                  onchange={(event) => update(spec.name, event.currentTarget.value)}
-                >
-                  {#each spec.choices as choice}<option value={choice}>{choice}</option>{/each}
-                </select>
-              {:else if spec.valueKind === 'pairWhole' || spec.valueKind === 'pairDecimal' || spec.valueKind === 'choiceList'}
-                <input
-                  type="text"
-                  aria-label={`${spec.label} value`}
-                  value={current.value}
-                  placeholder={spec.example}
-                  maxlength="32"
-                  oninput={(event) => update(spec.name, event.currentTarget.value)}
-                />
-              {:else}
-                <input
-                  type="number"
-                  aria-label={`${spec.label} value`}
-                  value={current.value}
-                  min={spec.minimumValue || spec.minimum}
-                  max={spec.maximumValue || spec.maximum}
-                  step={spec.valueKind === 'decimal' ? '0.001' : '1'}
-                  oninput={(event) => update(spec.name, event.currentTarget.value)}
-                />
-              {/if}
-            {/if}
-            <small
-              >{spec.argument} · {spec.description}{spec.valueKind === 'choiceList'
-                ? ` Choices: ${spec.choices.join(', ')}.`
-                : spec.valueKind !== 'choice'
-                  ? ` (${spec.minimumValue || spec.minimum}–${spec.maximumValue || spec.maximum})`
-                  : ''}{spec.example ? ` · e.g. ${spec.example}` : ''}</small
-            >
-          </div>
-        {/each}
-        {#if !catalog.parameters.length}<p>
-            This build advertises none of the qualified overrides.
-          </p>{:else if !visibleParameters.length}<p>No matching parameters.</p>{/if}
-      </fieldset>
-      <button type="button" onclick={() => onchange([])} disabled={disabled || !value.length}
-        >Clear overrides</button
-      >
-      {#each catalog.notes as note}<p class="small-muted">{note}</p>{/each}
-      <div class="preset-controls">
-        <label
-          >Parameter preset name<input
-            aria-label="Parameter preset name"
-            bind:value={name}
-            maxlength="64"
-            {disabled}
-          /></label
-        >
-        <button
-          type="button"
-          onclick={save}
-          disabled={disabled || !presetsReady || presetBusy || !!issue || !name.trim()}
-          >Save parameter preset</button
-        >
-        <p class="small-muted">
-          Saving an existing name replaces that preset for this encoder and workflow.
-        </p>
-        <label
-          >Saved parameter preset<select
-            aria-label="Saved parameter preset"
-            bind:value={selectedPreset}
-            {disabled}
-            ><option value="">Choose a preset</option>{#each availablePresets as preset}<option
-                value={preset.name}>{preset.name}</option
-              >{/each}</select
-          ></label
-        >
-        <button
-          type="button"
-          onclick={applyPreset}
-          disabled={disabled || !presetsReady || presetBusy || !selectedPreset}
-          >Apply parameter preset</button
-        >
-        <button
-          type="button"
-          onclick={remove}
-          disabled={disabled || !presetsReady || presetBusy || !selectedPreset}
-          >Remove saved parameter preset</button
-        >
-      </div>
-    {:else}<button type="button" onclick={load} {disabled}>Check installed parameters</button>{/if}
-    {#if issue}<p role="alert">{issue}</p>{/if}
-    {#if error}<p role="alert">{error}</p>{/if}
-  {/if}
-</details>
+{#if error}<p role="alert">{error}</p>{/if}
+{#if presets.length}<div class="preset-row">
+    <span>Presets</span>{#each presets as preset}<button
+        disabled={!catalog || disabled}
+        title={preset.description}
+        onclick={() => applyPreset(preset.name)}>{preset.name}</button
+      >{/each}<button {disabled} onclick={() => applyPreset('')}>Clear</button>
+  </div>{/if}
+<div role="tablist" aria-label="Encoder argument categories" class="categories">
+  {#each groups as group}<button
+      role="tab"
+      aria-selected={category === group}
+      class:active={category === group}
+      onclick={() => (category = group)}>{group}</button
+    >{/each}
+</div>
+<div class="grid">
+  <table>
+    <thead><tr><th>Argument</th><th>Value</th><th>Description, Possible Values</th></tr></thead
+    ><tbody>
+      {#each (catalog?.parameters ?? []).filter((p) => (p.group || 'Arguments') === category && !virtuals.some((managed) => managed.name === p.name)) as spec}<tr
+          oncontextmenu={(event) => {
+            event.preventDefault();
+            help = spec.name;
+          }}
+          ><td>{spec.argument}</td><td
+            ><input
+              aria-label={`${spec.label} value`}
+              {disabled}
+              value={value.find((item) => item.name === spec.name)?.value ?? ''}
+              oninput={(event) => update(spec.name, event.currentTarget.value)}
+            /></td
+          ><td>{sourceRows[spec.name]?.summary ?? spec.description.split('\n\n')[0]}</td></tr
+        >{/each}
+      {#each virtuals.filter((p) => p.group === category) as spec}<tr
+          oncontextmenu={(event) => {
+            event.preventDefault();
+            help = spec.name;
+          }}
+          ><td>{spec.name}</td><td
+            ><input
+              aria-label={`${spec.name} value`}
+              {disabled}
+              value={raw[spec.name] ?? ''}
+              oninput={(event) => onraw?.({ ...raw, [spec.name]: event.currentTarget.value })}
+              onblur={(event) => {
+                if (spec.name === 'fgs-table') onresource?.(spec.name, event.currentTarget.value);
+              }}
+            /></td
+          ><td>{sourceRows[spec.name]?.summary ?? ''}</td></tr
+        >{/each}
+    </tbody>
+  </table>
+</div>
+{#if help}{@const spec = catalog?.parameters.find((p) => p.name === help)}<SourceDialog
+    title="Argument Details"
+    open={true}
+    onclose={() => (help = null)}
+    width={720}
+    ><div class="help-content">
+      <strong>{spec?.argument ?? `--${help}`}</strong>
+      <p>{helpRow?.summary ?? spec?.description.split('\n\n')[0] ?? ''}</p>
+      <p class="details">
+        {helpRow?.details ||
+          "No extended description has been written for this argument yet. The line above is what the encoder's own documentation says about it."}
+      </p>
+      {#if examples.length}<h3>EXAMPLES</h3>
+        {#each examples as example}<div class="example">
+            <code>{example.value}</code><span>{example.text}</span>
+          </div>{/each}{/if}
+      <div class="help-actions"><button onclick={() => (help = null)}>Close</button></div>
+    </div></SourceDialog
+  >{/if}
+<SourceDialog
+  title="Replace the arguments already set?"
+  open={pendingPreset !== null}
+  onclose={() => (pendingPreset = null)}
+  ><p>
+    {currentFilled().length} argument{currentFilled().length === 1 ? ' is' : 's are'} set, and {currentFilled()
+      .length === 1
+      ? 'it does'
+      : 'they do'} not match a preset:
+  </p>
+  <p>
+    {currentFilled()
+      .map((p) => `${p.name} ${p.value}`)
+      .join(', ')}
+  </p>
+  <p>
+    {pendingPreset
+      ? `Applying '${pendingPreset}' replaces them all. Continue?`
+      : 'Clearing empties them all. Continue?'}
+  </p>
+  <div class="help-actions">
+    <button onclick={() => (pendingPreset = null)}>No</button><button
+      onclick={() => {
+        const choice = pendingPreset ?? '';
+        pendingPreset = null;
+        applyPreset(choice, true);
+      }}>Yes</button
+    >
+  </div></SourceDialog
+>
 
 <style>
-  .advanced-parameters {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-    min-width: 0;
-  }
-  summary {
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 600;
-  }
-  fieldset,
-  .preset-controls {
-    display: grid;
-    gap: 10px;
-    min-width: 0;
-    margin-top: 12px;
-  }
-  fieldset {
-    border: 1px solid var(--border);
-    padding: 10px;
-    max-block-size: 28rem;
-    overflow-y: auto;
-  }
-  .parameter-search {
-    display: grid;
-    gap: 6px;
-    margin-top: 12px;
-  }
-  .parameter-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(100px, 150px);
-    gap: 8px;
-    align-items: center;
-  }
-  .parameter-row label {
+  .preset-row {
     display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 12px;
-  }
-  .parameter-row small {
-    grid-column: 1/-1;
-    color: var(--muted-foreground);
-  }
-  fieldset h4 {
-    margin: 10px 0 0;
-    font-size: 12px;
-  }
-  .preset-controls label {
-    display: grid;
     gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 6px 0;
     font-size: 12px;
   }
-  input,
-  select {
-    min-width: 0;
-    max-width: 100%;
+  .categories {
+    display: flex;
+    gap: 2px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
   }
   button {
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px;
+    color: inherit;
     background: var(--background);
-    color: var(--foreground);
-    font-size: 12px;
+    border: 1px solid var(--border);
+    padding: 5px 10px;
     cursor: pointer;
   }
-  button:disabled {
-    opacity: 0.5;
-    cursor: default;
+  .categories button {
+    border-bottom: 0;
+  }
+  .active {
+    font-weight: bold;
+  }
+  .grid {
+    overflow: auto;
+    max-height: 50vh;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  th:first-child {
+    width: 250px;
+  }
+  th:nth-child(2) {
+    width: 110px;
+  }
+  input {
+    width: 100%;
+    padding: 4px;
+    color: inherit;
+    background: var(--background);
+    border: 1px solid var(--border);
+  }
+  .help-content {
+    max-height: 70vh;
+    overflow: auto;
+  }
+  .help-content strong {
+    font-size: 18px;
+  }
+  .details {
+    white-space: pre-wrap;
+  }
+  .example {
+    display: grid;
+    grid-template-columns: minmax(80px, auto) 1fr;
+    gap: 8px;
+    margin: 6px 0;
+  }
+  .example code {
+    max-width: 340px;
+    overflow-wrap: anywhere;
+    background: var(--muted);
+    padding: 4px;
+  }
+  .help-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
   }
 </style>

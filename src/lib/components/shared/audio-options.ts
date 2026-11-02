@@ -18,15 +18,17 @@ function outputChannels(
   track: AudioTrackDraft,
   stream: MediaStream | undefined,
 ): number | undefined {
-  return track.channels === 'mono'
-    ? 1
-    : track.channels === 'stereo'
-      ? 2
-      : track.channels === 'surround51'
-        ? 6
-        : track.channels === 'surround71'
-          ? 8
-          : (stream?.channels ?? undefined);
+  return typeof track.channels === 'object'
+    ? track.channels.explicit.count
+    : track.channels === 'mono'
+      ? 1
+      : track.channels === 'stereo'
+        ? 2
+        : track.channels === 'surround51'
+          ? 6
+          : track.channels === 'surround71'
+            ? 8
+            : (stream?.channels ?? undefined);
 }
 
 export function audioBitrateChoices(
@@ -106,16 +108,21 @@ export function validAudio(
         track.gain.tenthsDb > 240)
     )
       return false;
-    const stream = streams.find((stream) => stream.index === track.streamIndex);
-    if (audioCompatibilityError(track, stream)) return false;
+    const channels = track.channels;
+    if (
+      typeof channels === 'object' &&
+      (!Number.isInteger(channels.explicit.count) ||
+        channels.explicit.count < 1 ||
+        channels.explicit.count > 24)
+    )
+      return false;
+    if (track.normalization && track.gain) return false;
     if (track.codec === 'flac') return true;
-    const choices = audioBitrateChoices(track, stream);
     return (
       typeof track.bitrateKbps === 'number' &&
       Number.isInteger(track.bitrateKbps) &&
-      track.bitrateKbps >= 32 &&
-      track.bitrateKbps <= audioBitrateMax(track, stream) &&
-      (!choices || choices.includes(track.bitrateKbps))
+      track.bitrateKbps >= 8 &&
+      track.bitrateKbps <= 8192
     );
   });
 }
@@ -127,7 +134,7 @@ export function selectedAudio(audio: AudioTrackDraft[], included: number[]): Aud
       ...track,
       bitrateKbps: track.codec === 'copy' || track.codec === 'flac' ? 128 : track.bitrateKbps!,
       channels: track.codec === 'copy' ? 'preserve' : track.channels,
-      ...(track.codec === 'copy' ? { gain: undefined } : {}),
+      ...(track.codec === 'copy' ? { gain: undefined, normalization: undefined } : {}),
     }));
 }
 

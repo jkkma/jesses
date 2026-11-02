@@ -1,7 +1,12 @@
 <script lang="ts">
+  import { onDestroy, untrack } from 'svelte';
+  import { detectFields, isDesktop } from '$lib/ipc/client';
+  import { errorMessage } from './format';
   import type { EncodeBackend, MediaStream } from '$lib/ipc/generated';
   import {
     selectedTemporal,
+    FPS_MAX_NUMERATOR,
+    FPS_MAX_DENOMINATOR,
     temporalError,
     temporalSummary,
     type TemporalDraft,
@@ -10,19 +15,99 @@
     value,
     video,
     backend,
+    sourcePath,
     disabled = false,
+    autoApply = true,
     onchange,
   }: {
     value: TemporalDraft;
     video?: MediaStream;
     backend: EncodeBackend;
+    sourcePath?: string;
     disabled?: boolean;
+    autoApply?: boolean;
     onchange: (value: TemporalDraft) => void;
   } = $props();
+  let fieldDetection = $state<Awaited<ReturnType<typeof detectFields>> | null>(null);
+  let detecting = $state(false);
+  let detectionError = $state('');
+  let detectionController: AbortController | undefined;
+  let previousSource = '';
+  let editRevision = 0;
+  function update(next: TemporalDraft) {
+    editRevision++;
+    onchange({ ...next, fieldDetectionManual: true });
+  }
+  $effect(() => {
+    const source = `${sourcePath ?? ''}\0${video?.index ?? ''}`;
+    if (source !== previousSource) {
+      detectionController?.abort();
+      previousSource = source;
+      fieldDetection = null;
+      detectionError = '';
+      detecting = false;
+      editRevision = 0;
+      if (sourcePath && video && isDesktop() && !disabled) untrack(() => void detect(true));
+    }
+  });
+  onDestroy(() => detectionController?.abort());
+  async function detect(automatic = false) {
+    if (!sourcePath || !video || disabled) return;
+    detectionController?.abort();
+    const controller = new AbortController();
+    const revision = editRevision;
+    const eligibleForAutomaticApplication =
+      value.deinterlace === 'off' && !value.fieldDetectionManual;
+    detectionController = controller;
+    detecting = true;
+    fieldDetection = null;
+    detectionError = '';
+    try {
+      const result = await detectFields(
+        { inputPath: sourcePath, videoStreamIndex: video.index },
+        controller.signal,
+      );
+      if (!controller.signal.aborted) {
+        fieldDetection = result;
+        if (
+          automatic &&
+          autoApply &&
+          eligibleForAutomaticApplication &&
+          revision === editRevision &&
+          result.order !== 'undetermined'
+        )
+          applyResult(result);
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted && !automatic) detectionError = errorMessage(cause);
+    } finally {
+      if (detectionController === controller) detecting = false;
+    }
+  }
+  function applyDetection() {
+    if (!fieldDetection || fieldDetection.order === 'undetermined') return;
+    editRevision++;
+    applyResult(fieldDetection);
+  }
+  function applyResult(result: NonNullable<typeof fieldDetection>) {
+    const deinterlace = result.telecined
+      ? 'inverseTelecine'
+      : result.order === 'progressive'
+        ? 'off'
+        : 'frame';
+    const fieldOrder =
+      result.order === 'progressive'
+        ? value.fieldOrder
+        : result.order === 'bottomFirst'
+          ? 'bottomFirst'
+          : 'topFirst';
+    if (value.deinterlace !== deinterlace || value.fieldOrder !== fieldOrder)
+      onchange({ ...value, deinterlace, fieldOrder });
+  }
   const issue = $derived(temporalError(value, backend));
   const configuredSummary = $derived(
     temporalSummary(selectedTemporal(value)).replace(/^ · /, '') ||
-      'Source timing and square pixels',
+      'Source timing and aspect ratio',
   );
   const summary = $derived(issue ? `Needs attention · ${issue}` : configuredSummary);
 </script>
@@ -39,6 +124,25 @@
       Source field order: {video?.fieldOrder ?? 'not reported'}. Source frame rate: {video?.frameRate ??
         'not reported'}.
     </p>
+    {#if sourcePath && video}
+      <div class="detection">
+        <button type="button" onclick={() => detect()} disabled={disabled || detecting}
+          >{detecting ? 'Inspecting fields…' : 'Detect field order'}</button
+        >
+        {#if detecting}<button type="button" onclick={() => detectionController?.abort()}
+            >Cancel detection</button
+          >{/if}
+        {#if fieldDetection}
+          <p role="status">{fieldDetection.evidence}</p>
+          {#if fieldDetection.order !== 'undetermined'}<button
+              type="button"
+              onclick={applyDetection}
+              {disabled}>Apply detected processing</button
+            >{/if}
+        {/if}
+        {#if detectionError}<p role="alert">{detectionError}</p>{/if}
+      </div>
+    {/if}
     <label
       >Source reconstruction
       <select
@@ -46,7 +150,7 @@
         value={value.deinterlace}
         {disabled}
         onchange={(event) =>
-          onchange({
+          update({
             ...value,
             deinterlace: event.currentTarget.value as TemporalDraft['deinterlace'],
           })}
@@ -67,7 +171,7 @@
           aria-label="Source field order"
           value={value.fieldOrder}
           onchange={(event) =>
-            onchange({
+            update({
               ...value,
               fieldOrder: event.currentTarget.value as TemporalDraft['fieldOrder'],
             })}
@@ -84,7 +188,7 @@
             aria-label="QTGMC preset"
             value={value.qtgmcPreset}
             onchange={(event) =>
-              onchange({
+              update({
                 ...value,
                 qtgmcPreset: event.currentTarget.value as TemporalDraft['qtgmcPreset'],
               })}
@@ -99,8 +203,7 @@
           ><input
             type="checkbox"
             checked={value.combedFallback}
-            onchange={(event) =>
-              onchange({ ...value, combedFallback: event.currentTarget.checked })}
+            onchange={(event) => update({ ...value, combedFallback: event.currentTarget.checked })}
           />Deinterlace frames still combed after field matching</label
         >
       {/if}
@@ -122,7 +225,7 @@
         type="checkbox"
         checked={value.changeRate}
         {disabled}
-        onchange={(event) => onchange({ ...value, changeRate: event.currentTarget.checked })}
+        onchange={(event) => update({ ...value, changeRate: event.currentTarget.checked })}
       />Set output frame rate</label
     >
     {#if value.changeRate}
@@ -132,11 +235,11 @@
             aria-label="FPS numerator"
             type="number"
             min="1"
-            max="12000000"
+            max={FPS_MAX_NUMERATOR}
             step="1"
             value={value.numerator}
             oninput={(event) =>
-              onchange({
+              update({
                 ...value,
                 numerator:
                   event.currentTarget.value === '' ? undefined : event.currentTarget.valueAsNumber,
@@ -148,11 +251,11 @@
             aria-label="FPS denominator"
             type="number"
             min="1"
-            max="100000"
+            max={FPS_MAX_DENOMINATOR}
             step="1"
             value={value.denominator}
             oninput={(event) =>
-              onchange({
+              update({
                 ...value,
                 denominator:
                   event.currentTarget.value === '' ? undefined : event.currentTarget.valueAsNumber,
@@ -171,7 +274,7 @@
         aria-label="Resize filter"
         value={value.resizeFilter}
         onchange={(event) =>
-          onchange({
+          update({
             ...value,
             resizeFilter: event.currentTarget.value as TemporalDraft['resizeFilter'],
           })}
@@ -188,9 +291,9 @@
         aria-label="Output aspect ratio"
         value={value.aspect}
         onchange={(event) =>
-          onchange({ ...value, aspect: event.currentTarget.value as TemporalDraft['aspect'] })}
+          update({ ...value, aspect: event.currentTarget.value as TemporalDraft['aspect'] })}
       >
-        <option value="off">Square pixels (default)</option><option value="sample"
+        <option value="off">Preserve source aspect ratio</option><option value="sample"
           >Custom sample aspect ratio (SAR)</option
         ><option value="display">Custom display aspect ratio (DAR)</option>
       </select>
@@ -206,7 +309,7 @@
             step="1"
             value={value.aspectNumerator}
             oninput={(event) =>
-              onchange({
+              update({
                 ...value,
                 aspectNumerator:
                   event.currentTarget.value === '' ? undefined : event.currentTarget.valueAsNumber,
@@ -222,7 +325,7 @@
             step="1"
             value={value.aspectDenominator}
             oninput={(event) =>
-              onchange({
+              update({
                 ...value,
                 aspectDenominator:
                   event.currentTarget.value === '' ? undefined : event.currentTarget.valueAsNumber,
@@ -295,6 +398,16 @@
     grid-template-columns: repeat(2, minmax(0, 9rem));
     gap: 8px;
     grid-column: 1 / -1;
+  }
+  .detection {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .detection p {
+    flex-basis: 100%;
   }
   input,
   select {

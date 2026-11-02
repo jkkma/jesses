@@ -11,7 +11,7 @@ export function knownHdr(stream: MediaStream | undefined): boolean {
 export function preservableHdr10(stream: MediaStream | undefined): boolean {
   return (
     stream?.pixelFormat === 'yuv420p10le' &&
-    stream.colorRange === 'tv' &&
+    (stream.colorRange == null || ['tv', 'unknown', 'unspecified'].includes(stream.colorRange)) &&
     stream.colorPrimaries === 'bt2020' &&
     stream.colorTransfer === 'smpte2084' &&
     stream.colorSpace === 'bt2020nc'

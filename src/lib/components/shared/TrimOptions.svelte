@@ -5,12 +5,16 @@
     draft,
     disabled = false,
     error = null,
+    copyVideo = false,
+    timeOnly = false,
     onchange,
   }: {
     idPrefix: string;
     draft: TrimDraft;
     disabled?: boolean;
     error?: string | null;
+    copyVideo?: boolean;
+    timeOnly?: boolean;
     onchange: (value: TrimDraft) => void;
   } = $props();
   function number(event: Event): number | undefined {
@@ -32,31 +36,36 @@
       type="checkbox"
       checked={draft.enabled}
       {disabled}
-      onchange={(event) => onchange({ ...draft, enabled: event.currentTarget.checked })}
+      onchange={(event) =>
+        onchange({
+          ...draft,
+          enabled: event.currentTarget.checked,
+          ...(timeOnly ? { mode: 'time' as const } : {}),
+        })}
     />Trim video interval</label
   >
   {#if draft.enabled}
-    <fieldset class="trim-mode" {disabled}>
-      <legend>Boundary unit</legend>
-      <label
-        ><input
-          type="radio"
-          name={`${idPrefix}-trim-mode`}
-          value="frames"
-          checked={draft.mode === 'frames'}
-          onchange={() => onchange({ ...draft, mode: 'frames' })}
-        />Frames</label
-      >
-      <label
-        ><input
-          type="radio"
-          name={`${idPrefix}-trim-mode`}
-          value="time"
-          checked={draft.mode === 'time'}
-          onchange={() => onchange({ ...draft, mode: 'time' })}
-        />Time</label
-      >
-    </fieldset>
+    {#if !timeOnly}<fieldset class="trim-mode" {disabled}>
+        <legend>Boundary unit</legend>
+        <label
+          ><input
+            type="radio"
+            name={`${idPrefix}-trim-mode`}
+            value="frames"
+            checked={draft.mode === 'frames'}
+            onchange={() => onchange({ ...draft, mode: 'frames' })}
+          />Frames</label
+        >
+        <label
+          ><input
+            type="radio"
+            name={`${idPrefix}-trim-mode`}
+            value="time"
+            checked={draft.mode === 'time'}
+            onchange={() => onchange({ ...draft, mode: 'time' })}
+          />Time</label
+        >
+      </fieldset>{/if}
     <div class="trim-fields">
       {#if draft.mode === 'frames'}
         <div class="field">
@@ -114,8 +123,11 @@
       {draft.mode === 'frames'
         ? 'Frame 0 is the first frame.'
         : 'Time boundaries use source timestamps to millisecond precision; only frames whose timestamps are inside the interval are selected.'}
-      Audio must use a conversion. Text subtitle overlaps and chapters are clipped to this interval; overlaps
-      with timed ASS effects or WebVTT inline timestamps are rejected. The end must fit the source.
+      {#if copyVideo}The start is moved back to a usable keyframe for stream copy. The end must fit
+        the source.
+      {:else}Audio must use a conversion. Text subtitle overlaps and chapters are clipped to this
+        interval; overlaps with timed ASS effects or WebVTT inline timestamps are rejected. The end
+        must fit the source.{/if}
     </p>
     {#if error}<p role="alert">{error}</p>{/if}
   {/if}
