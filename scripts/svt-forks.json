@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "sourceProvider": "svt-av1-hdr",
   "encoders": [
     {
       "id": "svt-av1-5fish",

@@ -79,7 +79,9 @@ class ExtraEncoderStageTests(unittest.TestCase):
         (self.delivery / "build-provenance.json").write_text(json.dumps(self.receipt), encoding="utf-8")
 
     def stage(self):
-        with patch.object(stager.subprocess, "run") as run:
+        # The subprocess is mocked: provide its Windows-only environment input
+        # explicitly so receipt tests are also reproducible on Linux.
+        with patch.dict(stager.os.environ, {"SystemRoot": str(self.root / "Windows")}), patch.object(stager.subprocess, "run") as run:
             run.return_value.stdout = self.receipt["tool"]["version"]
             run.return_value.stderr = ""
             return stager.stage_extra_encoder(self.delivery, self.tools, "x86_64-pc-windows-msvc", "x265")

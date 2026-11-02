@@ -1,4 +1,4 @@
-name: Portable Windows package
+name: Native desktop packages
 
 on:
   workflow_dispatch:
@@ -23,8 +23,9 @@ jobs:
         include:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-          # Linux packaging is deferred. The guarded steps below remain for a
-          # deliberate future reactivation of the Linux matrix lane.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/package-build
@@ -50,13 +51,15 @@ jobs:
           workspaces: . -> target/package-build
       - name: Install Linux packaging prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf libfuse2 nasm yasm cmake meson ninja-build autoconf automake libtool pkg-config patch git xxd gperf
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf libfuse2 nasm yasm cmake meson ninja-build autoconf automake libtool pkg-config patch git xxd gperf libclang-dev
       - run: pnpm install --frozen-lockfile
       - run: python scripts/test-package-desktop.py
       - name: Verify isolated Scoop qualification helpers
         if: runner.os == 'Windows'
         run: python scripts/test-qualify-scoop.py
       - run: python scripts/test-package-toolchain.py
+      - run: python scripts/test-package-av1-codecs.py
+      - run: python scripts/test-package-grav1synth.py
       - run: python scripts/test-package-standalone.py
       - name: Verify additional Windows standalone delivery contracts
         if: runner.os == 'Windows'
@@ -86,6 +89,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: python scripts/build-package-ffmpeg.py --destination "$RUNNER_TEMP/jesses-ffmpeg" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
+      - name: Build the exact source grain provider with private compatible libraries
+        shell: bash
+        run: |
+          grain_args=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            rustup target add --toolchain 1.98.1 x86_64-pc-windows-gnu
+            grain_args+=(--msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64")
+          fi
+          python scripts/build-package-grav1synth.py --destination "$RUNNER_TEMP/jesses-grav1synth" "${grain_args[@]}"
       - name: Build Linux FFmpeg pair with static codecs and retain corresponding sources
         if: runner.os == 'Linux'
         shell: bash
@@ -145,18 +157,18 @@ jobs:
           else
             standalone_args+=(--x264-build "$RUNNER_TEMP/jesses-standalone-linux/x264/delivery" --svt-build "$RUNNER_TEMP/jesses-standalone-linux/svt-av1/delivery")
           fi
-          python scripts/stage-bundled-tools.py --destination "$RUNNER_TEMP/jesses-bundled-tools" --target "$PACKAGE_TARGET" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" "${standalone_args[@]}"
+          python scripts/stage-bundled-tools.py --destination "$RUNNER_TEMP/jesses-bundled-tools" --target "$PACKAGE_TARGET" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --grav1synth-build "$RUNNER_TEMP/jesses-grav1synth/delivery" "${standalone_args[@]}"
       - name: Build native package discovery gate
         run: cargo build -p media-runtime --example package_tools --locked
       - name: Verify Windows bundled discovery with external tools unavailable
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265 --require-tool mkvmerge
+          python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265 --require-tool mkvmerge --require-tool grav1synth
       - name: Verify Linux bundled discovery with external tools unavailable
         if: runner.os == 'Linux'
         shell: bash
-        run: python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1
+        run: python scripts/qualify-package-tools.py --probe "$CARGO_TARGET_DIR/debug/examples/package_tools" --resources "$RUNNER_TEMP/jesses-bundled-tools" --require-media --require-tool x264 --require-tool svt-av1 --require-tool grav1synth
       - name: Qualify the packaged media pair with real files
         shell: bash
         run: |
@@ -168,6 +180,10 @@ jobs:
           export JESSES_SVT_AV1="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1/SvtAv1EncApp$suffix"
           export JESSES_SVT_AV1_5FISH="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-5fish/SvtAv1EncApp$suffix"
           export JESSES_SVT_AV1_HDR="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/svt-av1-hdr/SvtAv1EncApp$suffix"
+          export JESSES_GRAIN_RESOURCES="$RUNNER_TEMP/jesses-bundled-tools"
+          cargo test -p media-runtime --test grain_provider --locked -- --ignored --nocapture --test-threads=1
+          export JESSES_GRAV1SYNTH="$RUNNER_TEMP/jesses-bundled-tools/resources/tools/grav1synth/grav1synth$suffix"
+          cargo test -p media-runtime --test utility_containers --locked -- --ignored --nocapture --test-threads=1
           cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --test image_jobs --locked -- --ignored --test-threads=1
           # Bundled QTGMC is evaluated against real frames by the dependency merger above.
           cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip qtgmc
@@ -211,7 +227,7 @@ jobs:
         shell: bash
         run: |
           suffix=""
-          standalone_args=(--require-tool x264 --require-tool svt-av1)
+          standalone_args=(--require-tool x264 --require-tool svt-av1 --require-tool grav1synth)
           if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; standalone_args+=(--require-tool av1an --require-tool aomenc --require-tool vpxenc --require-tool x265 --require-tool mkvmerge); fi
           python scripts/verify-bundle-resources.py --packages "$RUNNER_TEMP/jesses-packages" --probe "$CARGO_TARGET_DIR/debug/examples/package_tools$suffix" --destination "$RUNNER_TEMP/jesses-extracted-bundles" --require-media "${standalone_args[@]}"
       - name: Retain native gate evidence
@@ -223,6 +239,8 @@ jobs:
             ${{ runner.temp }}/jesses-portable-*.json
             ${{ runner.temp }}/jesses-portable-*.log
             ${{ runner.temp }}/jesses-ffmpeg/build.log
+            ${{ runner.temp }}/jesses-grav1synth/**/*.log
+            ${{ runner.temp }}/jesses-grav1synth/delivery/qualification/*
             ${{ runner.temp }}/jesses-standalone-linux/**/build.log
             ${{ runner.temp }}/jesses-x264/build.log
             ${{ runner.temp }}/jesses-svt/build.log

@@ -8,3 +8,8 @@ src/lib/ipc/generated.ts
 test-results/
 playwright-report/
 tests/fixtures/generated/
+# Byte-stable provider locks are hashed into qualified delivery provenance.
+scripts/grav1synth-lock.json
+scripts/package-ffmpeg-linux-lock.json
+scripts/package-ffmpeg-windows-lock.json
+scripts/package-libplacebo-lock.json

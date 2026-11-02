@@ -68,15 +68,13 @@ CRF values through 70 and research presets down to -3 are submitted only when th
 selected mainline or HDR build advertises them. The installed 5fish build used for
 Windows qualification correctly rejects values it does not advertise.
 
-## NVENC
+## Hardware encoder compatibility
 
-H.264 NVENC and HEVC NVENC use FFmpeg's NVIDIA encoders. Discovery alone is not
-enough: admission performs a bounded one-frame encoder initialization with the
-selected depth and lossless mode. Missing hardware, an incompatible driver, or an
-unsupported codec/depth combination returns `NVENC_HARDWARE_UNAVAILABLE` with the
-driver's final diagnostic before source encoding begins. The qualification host
-has an AMD Radeon 880M, so the retained evidence covers this negative gate; a
-successful NVIDIA encode still requires qualification on compatible hardware.
+Hardware video encoding is excluded by the latest explicit user request. Old
+NVENC job records remain readable, but encoding/recovery admission returns
+`HARDWARE_ENCODING_UNSUPPORTED`; unused selectors do not block packet copy or
+audio-only conversion. Vulkan/libplacebo Spline processing and GPU metrics stay
+supported. Earlier provider evidence is historical, not pending qualification.
 
 ## Exact timing
 
@@ -127,5 +125,5 @@ broader evidence and remaining platform boundaries.
 - Test Unicode paths, cancellation, no-overwrite publication, source preservation,
   corrupted recovery artifacts and actual decoded output for every shipped tool
   build.
-- Treat Linux execution, NVIDIA-positive NVENC, fresh installation and packaged
+- Treat Linux execution, fresh installation and packaged
   dependency delivery as separate release qualification gates.

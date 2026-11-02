@@ -25,16 +25,19 @@ LOCK = ROOT / "scripts/package-ffmpeg-windows-lock.json"
 VERSION = "9.0.1"
 URL = f"https://ffmpeg.org/releases/ffmpeg-{VERSION}.tar.xz"
 SHA256 = "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+CPU_POLICY=json.loads(Path(__file__).with_name("cpu-encoding-policy.json").read_text(encoding="utf-8"))
 CONFIGURE = [
+    "--disable-encoder="+",".join(CPU_POLICY["excludedEncoders"]),
     "--disable-autodetect", "--disable-doc", "--disable-ffplay", "--disable-debug",
     "--disable-shared", "--enable-static", "--enable-gpl", "--enable-version3",
     "--disable-pthreads", "--enable-w32threads", "--enable-libx264", "--enable-libx265", "--enable-libvpx",
     "--enable-libopus", "--enable-libmp3lame", "--enable-libvorbis",
     "--enable-libdav1d", "--enable-libzimg", "--enable-zlib", "--enable-bzlib",
-    "--enable-libass", "--enable-libvmaf",
+    "--enable-libass", "--enable-libvmaf", "--enable-libaom", "--enable-libsvtav1",
+    "--enable-vulkan", "--enable-libplacebo",
     "--enable-lzma", "--pkg-config-flags=--static --dont-define-prefix",
-    "--extra-cflags=-I../static-vmaf/include",
-    "--extra-ldflags=-L../static-vmaf/lib -static -static-libgcc -static-libstdc++",
+    "--extra-cflags=-I../static-vmaf/include -I../static-av1/include -I../static-libplacebo/include",
+    "--extra-ldflags=-L../static-vmaf/lib -L../static-av1/lib -L../static-libplacebo/lib -static -static-libgcc -static-libstdc++",
 ]
 
 
@@ -55,8 +58,9 @@ def verify_compiler(root):
 
 def build_environment(pkgconfig):
     rejected = {"CFLAGS", "CPPFLAGS", "CXXFLAGS", "LDFLAGS", "LIBS", "PKG_CONFIG", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_SYSTEM_INCLUDE_PATH", "PKG_CONFIG_SYSTEM_LIBRARY_PATH", "CC", "CXX", "LD", "AR", "AS", "NM", "STRIP", "RANLIB", "MAKE", "MAKEFLAGS", "MFLAGS", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH", "LD_PRELOAD", "LD_RUN_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "INCLUDE", "LIB", "BASH_ENV", "ENV", "CONFIG_SITE", "CROSS_COMPILE", "HOSTCC", "CC_FOR_BUILD"}
-    env = {name: value for name, value in os.environ.items() if name.upper() not in rejected}
+    env = {name: value for name, value in os.environ.items() if name.upper() not in rejected and not name.upper().startswith(("CMAKE_", "GIT_"))}
     env.update(MSYSTEM="UCRT64", CHERE_INVOKING="1", MSYS2_PATH_TYPE="strict", SOURCE_DATE_EPOCH="1789257600", LC_ALL="C", TZ="UTC")
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
     env["PKG_CONFIG_PATH"] = str(pkgconfig)
     return env
 
@@ -78,7 +82,11 @@ def verify_vmaf_model(executable):
     # model directories unavailable. A successful feature probe is insufficient.
     env = {name: value for name, value in os.environ.items() if name.upper() not in {"VMAF_MODEL_PATH", "VMAF_MODEL_DIR"}}
     env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
-    subprocess.run([str(executable), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=2:duration=1", "-filter_complex", "[0:v]split[reference][distorted];[distorted][reference]libvmaf=model=version=vmaf_v0.6.1", "-f", "null", "-"], env=env, capture_output=True, text=True, check=True, timeout=60)
+    for model in ("vmaf_v0.6.1", "vmaf_v0.6.1neg", "vmaf_4k_v0.6.1"):
+        subprocess.run([str(executable), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "testsrc2=size=192x108:rate=2:duration=1", "-filter_complex", f"[0:v]split[reference][distorted];[distorted][reference]libvmaf=model=version={model}", "-f", "null", "-"], env=env, capture_output=True, text=True, check=True, timeout=60)
+    for codec, options in [("libaom-av1", ["-cpu-used", "8", "-threads", "2"]), ("libsvtav1", ["-preset", "12", "-svtav1-params", "lp=2"])]:
+        for pixel_format in ("yuv420p", "yuv420p10le"):
+            subprocess.run([str(executable), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "testsrc2=s=128x128:r=4:d=1", "-vf", f"format={pixel_format}", "-c:v", codec, *options, "-f", "null", "-"], env=env, capture_output=True, text=True, check=True, timeout=90)
 
 
 def deliver(destination, source_dir, root, versions, imports, input_lock):
@@ -96,10 +104,20 @@ def deliver(destination, source_dir, root, versions, imports, input_lock):
     shutil.copy2(source_archive, sources_dir / source_archive.name)
     for name in ("COPYING.GPLv2", "COPYING.GPLv3", "COPYING.LGPLv2.1", "COPYING.LGPLv3", "LICENSE.md"):
         shutil.copy2(source_dir / name, notices_dir / name)
+    shutil.copy2(destination / "av1-cmake" / json.loads((destination / "build-inputs/standalone-tool-sources.json").read_text())["cmakeWindows"]["root"] / "doc/cmake/LICENSE.rst", notices_dir / "CMake-LICENSE.rst")
     cache = ROOT / "target/tool-download-cache"
     cache.mkdir(parents=True, exist_ok=True)
     lock = input_lock
     additional_sources = []
+    processing = destination / "libplacebo-delivery"
+    processing_receipt = json.loads((processing / "source-receipt.json").read_text())
+    for item in processing_receipt["sources"]:
+        original = processing / item["path"]
+        if digest(original) != item["sha256"]:
+            raise ValueError("A Vulkan processing source archive changed before delivery.")
+        shutil.copy2(original, sources_dir / original.name)
+        additional_sources.append(item)
+    shutil.copytree(processing / "licenses", notices_dir / "vulkan-processing")
     for record in lock["linkedSources"]:
         archive_path = stager.download(record["url"], record["sha256"], cache)
         shutil.copy2(archive_path, sources_dir / record["filename"])
@@ -140,7 +158,7 @@ def deliver(destination, source_dir, root, versions, imports, input_lock):
         executable = delivery / f"{name}.exe"
         shutil.copy2(destination / "bin" / executable.name, executable)
         tool_records.append({"id": name, "path": executable.name, "sha256": digest(executable), "version": version, "systemImports": imports[name]})
-    provenance = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "source": {"url": URL, "sha256": SHA256, "path": f"sources/{source_archive.name}"}, "configure": CONFIGURE, "compilerInputLockSha256": digest(destination / "build-inputs/package-ffmpeg-windows-lock.json"), "tools": tool_records, "additionalSources": additional_sources,
+    provenance = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "encodingPolicy":"cpu-only", "processingPolicy":"vulkan-libplacebo", "source": {"url": URL, "sha256": SHA256, "path": f"sources/{source_archive.name}"}, "configure": CONFIGURE, "compilerInputLockSha256": digest(destination / "build-inputs/package-ffmpeg-windows-lock.json"), "tools": tool_records, "additionalSources": additional_sources,
                   "licenses": [{"path": path.relative_to(delivery).as_posix(), "sha256": digest(path)} for path in sorted(notices_dir.rglob("*")) if path.is_file()],
                   "buildInputs": [{"path": path.relative_to(delivery).as_posix(), "sha256": digest(path)} for path in sorted(recipes.iterdir())]}
     (delivery / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
@@ -163,7 +181,7 @@ def main():
     destination.mkdir(parents=True, exist_ok=False)
     recipe_inputs = destination / "build-inputs"
     recipe_inputs.mkdir()
-    for name in ("build-package-ffmpeg.py", "build-package-vmaf-windows.py", "bootstrap-package-toolchain.py", "stage-bundled-tools.py", "package-ffmpeg-windows-lock.json"):
+    for name in ("build-package-ffmpeg.py", "build-package-vmaf-windows.py", "build-package-av1-codecs.py", "standalone-tool-sources.json", "bootstrap-package-toolchain.py", "stage-bundled-tools.py", "package-ffmpeg-windows-lock.json", "qualify-cpu-encoders.py", "cpu-encoding-policy.json", "qualify-libplacebo.py", "build-package-libplacebo.py", "build-package-libplacebo-windows.py", "package-libplacebo-lock.json", "libplacebo-python314.patch", "build-package-ffmpeg-linux.py"):
         shutil.copy2(ROOT / "scripts" / name, recipe_inputs / name)
     input_lock = json.loads((recipe_inputs / "package-ffmpeg-windows-lock.json").read_text(encoding="utf-8"))
     archive = destination / f"ffmpeg-{VERSION}.tar.xz"
@@ -217,7 +235,15 @@ def main():
         vmaf_builder = importlib.util.module_from_spec(vmaf_spec)
         vmaf_spec.loader.exec_module(vmaf_builder)
         vmaf_prefix = vmaf_builder.build(destination, root, vmaf_archive, run_native)
-        env["PKG_CONFIG_PATH"] = str(vmaf_prefix / "lib/pkgconfig") + os.pathsep + str(pkgconfig)
+        codec_spec = importlib.util.spec_from_file_location("av1_codec_builder", recipe_inputs / "build-package-av1-codecs.py")
+        codec_builder = importlib.util.module_from_spec(codec_spec)
+        codec_spec.loader.exec_module(codec_builder)
+        codec_prefix, _ = codec_builder.build(destination, root, input_lock, json.loads((recipe_inputs / "standalone-tool-sources.json").read_text()), cache, stager, run_native)
+        processing_spec = importlib.util.spec_from_file_location("processing_builder", recipe_inputs / "build-package-libplacebo-windows.py")
+        processing_builder = importlib.util.module_from_spec(processing_spec)
+        processing_spec.loader.exec_module(processing_builder)
+        processing_prefix = processing_builder.build(destination, root, cache, env, run_native)
+        env["PKG_CONFIG_PATH"] = os.pathsep.join(map(str, [processing_prefix / "lib/pkgconfig", processing_prefix / "share/pkgconfig", codec_prefix / "lib/pkgconfig", vmaf_prefix / "lib/pkgconfig", pkgconfig]))
         for command in commands:
             print(command, flush=True)
             subprocess.run([str(bash), "--noprofile", "--norc", "-c", "export PATH=/ucrt64/bin:/usr/bin; " + command], cwd=source_dir, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600)
@@ -237,9 +263,15 @@ def main():
         system = {"advapi32.dll", "avicap32.dll", "bcrypt.dll", "comdlg32.dll", "crypt32.dll", "dwrite.dll", "gdi32.dll", "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "psapi.dll", "rpcrt4.dll", "secur32.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "usp10.dll", "vfw32.dll", "winmm.dll", "ws2_32.dll"}
         if not imports[name] or any(item.lower() not in system and not item.lower().startswith("api-ms-win-") for item in imports[name]):
             raise ValueError(f"The static FFmpeg build imported an unqualified runtime DLL: {imports[name]}")
-    provenance = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "source": {"url": URL, "sha256": SHA256, "path": archive.name}, "configure": CONFIGURE, "tools": [{"id": name, "path": f"bin/{name}.exe", "sha256": digest(output_dir / f"{name}.exe"), "version": version} for name, version in versions.items()]}
+    provenance = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "encodingPolicy":"cpu-only", "source": {"url": URL, "sha256": SHA256, "path": archive.name}, "configure": CONFIGURE, "tools": [{"id": name, "path": f"bin/{name}.exe", "sha256": digest(output_dir / f"{name}.exe"), "version": version} for name, version in versions.items()]}
     (destination / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(provenance, indent=2), flush=True)
+    spec=importlib.util.spec_from_file_location("cpu_encoding_qualification",recipe_inputs/"qualify-cpu-encoders.py")
+    qualifier=importlib.util.module_from_spec(spec);spec.loader.exec_module(qualifier)
+    (recipe_inputs/"cpu-encoders.json").write_text(json.dumps(qualifier.qualify(output_dir/"ffmpeg.exe"),indent=2)+"\n",encoding="utf-8")
+    spec=importlib.util.spec_from_file_location("processing_qualification",recipe_inputs/"qualify-libplacebo.py")
+    processing=importlib.util.module_from_spec(spec);spec.loader.exec_module(processing)
+    (recipe_inputs/"libplacebo-capabilities.json").write_text(json.dumps(processing.qualify(output_dir/"ffmpeg.exe"),indent=2)+"\n",encoding="utf-8")
     deliver(destination, source_dir, root, versions, imports, input_lock)
 
 

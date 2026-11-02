@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-av1an-grain-table"
+description = "Enables the read_av1an_grain_table command without any pre-configured scope."
+commands.allow = ["read_av1an_grain_table"]
+
+[[permission]]
+identifier = "deny-read-av1an-grain-table"
+description = "Denies the read_av1an_grain_table command without any pre-configured scope."
+commands.deny = ["read_av1an_grain_table"]

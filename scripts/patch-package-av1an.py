@@ -11,6 +11,8 @@ SOURCE_ROOT = "Av1an-805dad69143fa0a81cfe2fb89c0b9e90a828ea72"
 MARKER = "ffmpeg9-passthrough-v1"
 PROBE_FILTER_MARKER = "target-probe-filter-v1"
 SEGMENT_MARKER = "segment-ffmpeg9-v1"
+SIGNED_XPSNR_MARKER = "xpsnr-signed-stats-v1"
+SOURCE_PROBE_MARKER = "source-unfiltered-probes-v1"
 
 
 def patch_source(source, archive_path, patch_path):
@@ -42,9 +44,18 @@ def patch_source(source, archive_path, patch_path):
     before = '"{}-unstable (rev {}) ({})\n'
     if version.count(before) != 1:
         raise ValueError("The pinned av1an version banner changed.")
-    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [' + SEGMENT_MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + ']\n')
+    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [' + SEGMENT_MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + '] [' + SIGNED_XPSNR_MARKER + '] [' + SOURCE_PROBE_MARKER + ']\n')
+    before = "    pub vmaf_filter: Option<String>,\n"
+    after = before + '''
+    /// Preserve source-app target probes and references before final filters.
+    #[clap(long, help_heading = "Target Quality")]
+    pub source_unfiltered_probes: bool,
+'''
+    if version.count(before) != 1:
+        raise ValueError("The pinned CLI reference filter option changed.")
+    version = version.replace(before, after)
     before = "            vmaf_filter: self.vmaf_filter.clone(),\n"
-    after = before + "            ffmpeg_filter_args: vec![],\n"
+    after = before + "            ffmpeg_filter_args: vec![],\n            source_unfiltered_probes: self.source_unfiltered_probes,\n"
     if version.count(before) != 1:
         raise ValueError("The pinned CLI target-quality initializer changed.")
     changed[paths[1]] = version.replace(before, after)
@@ -170,6 +181,36 @@ def patch_source(source, archive_path, patch_path):
         if xpsnr.count(before) != 1:
             raise ValueError("The pinned XPSNR metric scale inputs changed.")
         xpsnr = xpsnr.replace(before, after)
+    # FFmpeg's XPSNR scores can be negative. The pinned engine's unsigned
+    # expressions reject a valid negative average and silently skip frames.
+    before = r"([0-9\.]+|inf)"
+    after = r"(-?[0-9\.]+|-?inf)"
+    if xpsnr.count(before) != 7:
+        raise ValueError("The pinned XPSNR score parser changed.")
+    xpsnr = xpsnr.replace(before, after)
+    xpsnr += '''
+
+#[cfg(test)]
+mod signed_stats_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn signed_frame_and_average_scores_are_not_dropped() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "n: 1 XPSNR y: -1.4500 XPSNR u: 0.0152 XPSNR v: -0.8051").unwrap();
+        writeln!(file, "n: 2 XPSNR y: 2.0000 XPSNR u: 1.0000 XPSNR v: 0.5000").unwrap();
+        writeln!(file, "XPSNR average, 2 frames  y: 0.7021  u: 0.0152  v: -0.8051  (minimum: -0.8051)").unwrap();
+        let (minimum, frames) = read_xpsnr_file(file.path(), XPSNRSubMetric::Minimum).unwrap();
+        assert_eq!(minimum, -0.8051);
+        assert_eq!(frames, [-1.45, 0.5]);
+        let (weighted, frames) = read_xpsnr_file(file.path(), XPSNRSubMetric::Weighted).unwrap();
+        assert_eq!(weighted, weight_xpsnr(0.7021, 0.0152, -0.8051));
+        assert_eq!(frames.len(), 2);
+        assert!((frames[0] - (-1.45 * 4.0 + 0.0152 - 0.8051) / 6.0).abs() < 1e-12);
+    }
+}
+'''
     changed[paths[5]] = xpsnr
     vmaf = original[paths[6]]
     start = vmaf.index("pub fn run_vmaf(")
@@ -218,12 +259,12 @@ def patch_source(source, archive_path, patch_path):
     changed[paths[6]] = vmaf[:start] + region + vmaf[end:]
     target_quality = original[paths[7]]
     before = "    pub vmaf_filter:           Option<String>,\n"
-    after = before + "    #[serde(default)]\n    pub ffmpeg_filter_args:    Vec<String>,\n"
+    after = before + "    #[serde(default)]\n    pub ffmpeg_filter_args:    Vec<String>,\n    #[serde(default)]\n    pub source_unfiltered_probes: bool,\n"
     if target_quality.count(before) != 1:
         raise ValueError("The pinned target-quality filter fields changed.")
     target_quality = target_quality.replace(before, after)
     before = "            vmaf_filter: None,\n"
-    after = before + "            ffmpeg_filter_args: vec![],\n"
+    after = before + "            ffmpeg_filter_args: vec![],\n            source_unfiltered_probes: false,\n"
     if target_quality.count(before) != 1:
         raise ValueError("The pinned target-quality defaults changed.")
     target_quality = target_quality.replace(before, after)
@@ -236,7 +277,45 @@ def patch_source(source, archive_path, patch_path):
 """
     if target_quality.count(before) != 1:
         raise ValueError("The pinned target-quality probe call changed.")
-    changed[paths[7]] = target_quality.replace(before, after)
+    target_quality = target_quality.replace(before, after)
+    before = "impl TargetQuality {\n"
+    after = before + '''    /// Source-app compatibility: final filters must not leak into probes.
+    pub fn set_final_filters(&mut self, filters: &[String]) {
+        if self.source_unfiltered_probes {
+            self.ffmpeg_filter_args.clear();
+            self.vmaf_filter = None;
+        } else {
+            self.ffmpeg_filter_args.clone_from(&filters.to_vec());
+        }
+    }
+
+'''
+    if target_quality.count(before) != 1:
+        raise ValueError("The pinned target-quality implementation changed.")
+    target_quality = target_quality.replace(before, after)
+    target_quality += '''
+
+#[cfg(test)]
+mod source_probe_filter_tests {
+    use super::*;
+
+    #[test]
+    fn source_mode_omits_final_transforms_and_legacy_mode_retains_them() {
+        let filters = vec!["-vf".to_owned(), "crop=160:96,hue=s=0".to_owned()];
+        let mut quality = TargetQuality::default("temp", crate::encoder::Encoder::svt_av1);
+        quality.vmaf_filter = Some("crop=160:96,hue=s=0".to_owned());
+        quality.set_final_filters(&filters);
+        assert_eq!(quality.ffmpeg_filter_args, filters);
+        assert!(quality.vmaf_filter.is_some());
+        quality.source_unfiltered_probes = true;
+        quality.set_final_filters(&filters);
+        assert!(quality.ffmpeg_filter_args.is_empty());
+        assert!(quality.vmaf_filter.is_none());
+        assert_eq!(serde_json::to_value(&quality).unwrap()["source_unfiltered_probes"], true);
+    }
+}
+'''
+    changed[paths[7]] = target_quality
     settings = original[paths[8]]
     before = """        if self.target_quality.target.is_some() {
             match self.target_quality.metric {
@@ -244,9 +323,7 @@ def patch_source(source, archive_path, patch_path):
     after = """        if self.target_quality.target.is_some() {
             // Persist the actual final-chunk FFmpeg input transforms with the
             // target-quality plan so fresh and resumed probes use them once.
-            self.target_quality
-                .ffmpeg_filter_args
-                .clone_from(&self.ffmpeg_filter_args);
+            self.target_quality.set_final_filters(&self.ffmpeg_filter_args);
             match self.target_quality.metric {
 """
     if settings.count(before) != 1:

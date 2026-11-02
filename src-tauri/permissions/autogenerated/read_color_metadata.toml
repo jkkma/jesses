@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-color-metadata"
+description = "Enables the read_color_metadata command without any pre-configured scope."
+commands.allow = ["read_color_metadata"]
+
+[[permission]]
+identifier = "deny-read-color-metadata"
+description = "Denies the read_color_metadata command without any pre-configured scope."
+commands.deny = ["read_color_metadata"]

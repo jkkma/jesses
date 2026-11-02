@@ -1,0 +1,73 @@
+name: macOS native checks and app archives
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install explicit external media dependencies
+        run: |
+          brew install ffmpeg-full mkvtoolnix x264 x265 aom libvpx svt-av1 tesseract
+          # The full formula supplies AOM, Vorbis, libass and zimg. It is
+          # keg-only, so select it explicitly instead of the reduced ffmpeg.
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: python3 scripts/test-package-macos.py
+      - run: python3 scripts/test-ipc-registration.py
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: pnpm contracts:check
+      - name: Verify native media outcomes
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          cargo test -p media-runtime --test migration_encode --test analysis_jobs --test image_jobs --test mux_jobs --test ffmpeg_video_jobs --locked -- --include-ignored --test-threads=1
+          cargo test -p media-runtime --test utility_jobs utility_batch_ --locked -- --ignored --test-threads=1
+      - name: Build ad-hoc signed native application
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles app --config src-tauri/tauri.macos.conf.json
+      - name: Verify exact app and create development archive
+        run: python3 scripts/package-macos.py --app target/${{ matrix.target }}/release/bundle/macos/jesses.app --destination target/macos-package --target ${{ matrix.target }} --native --launch-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jesses-${{ matrix.target }}-development
+          path: |
+            target/macos-package/*.tar.gz
+            target/macos-package/SHA256SUMS
+            target/macos-package/*.log
+            target/macos-package/payload/macos-package-manifest.json
+          if-no-files-found: warn
+          retention-days: 14

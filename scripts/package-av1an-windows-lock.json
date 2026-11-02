@@ -205,5 +205,15 @@
     "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
     "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
     "root": "cmake-4.4.3-windows-x86_64"
-  }
+  },
+  "compatibilityMarkers": [
+    "ffmpeg9-passthrough-v1",
+    "segment-ffmpeg9-v1",
+    "julek-butteraugli-v1",
+    "lsmash-software-probes-v1",
+    "ffmpeg-metric-matrix-v1",
+    "target-probe-filter-v1",
+    "xpsnr-signed-stats-v1",
+    "source-unfiltered-probes-v1"
+  ]
 }

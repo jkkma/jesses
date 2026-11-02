@@ -68,7 +68,7 @@ class StagingTests(unittest.TestCase):
         shared = [{"base": base, "path": f"sources/{base}.tar.zst", "sha256": "a" * 64} for base in sorted(delivery.SHARED_BASES)]
         media = self.tools / "ffmpeg/build-provenance.json"
         media.write_text(json.dumps({"additionalSources": shared, "licenses": [], "buildInputs": []}))
-        self.version = "av1an 0.5.2 [ffmpeg9-passthrough-v1] [segment-ffmpeg9-v1] [julek-butteraugli-v1] [target-probe-filter-v1]"
+        self.version = "av1an 0.5.2 [ffmpeg9-passthrough-v1] [segment-ffmpeg9-v1] [julek-butteraugli-v1] [target-probe-filter-v1] [xpsnr-signed-stats-v1] [source-unfiltered-probes-v1]"
         def record(name):
             path = self.directory / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +108,15 @@ class StagingTests(unittest.TestCase):
         with patch.object(delivery.subprocess, "run") as execute, self.assertRaisesRegex(ValueError, "inventory"):
             self.stage()
         execute.assert_not_called()
+
+    def test_engine_without_signed_xpsnr_fix_is_rejected(self):
+        self.version = self.version.replace(" [xpsnr-signed-stats-v1]", "")
+        self.receipt["tool"]["version"] = self.version
+        self.write_receipt()
+        output = SimpleNamespace(stdout=self.version + "\nsystems.innocent.lsmas : Found\n", stderr="")
+        with patch.object(delivery, "runtime_environment", return_value={}), patch.object(delivery.subprocess, "run", return_value=output), self.assertRaisesRegex(ValueError, "identity or decoder"):
+            self.stage()
+        self.assertFalse((self.tools / "av1an").exists())
 
     def test_unlisted_plugin_is_rejected_before_native_execution(self):
         (self.directory / "python/Lib/site-packages/vapoursynth/plugins/unlisted.dll").write_bytes(b"injected")

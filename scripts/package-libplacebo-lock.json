@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "purpose": "CPU video encoders with Vulkan/libplacebo processing; exact libplacebo7.351.0 submodule pins, glslang optimizer disabled",
+  "libraries": [
+    {
+      "id": "libplacebo",
+      "version": "v7.351.0",
+      "url": "https://codeload.github.com/haasn/libplacebo/tar.gz/v7.351.0",
+      "sha256": "716954501d9b76e6906fddda66febc5886493d0673dd265ec1e6e52f4e5cd7c6",
+      "filename": "libplacebo-v7.351.0.tar.gz",
+      "sourceRoot": "libplacebo-7.351.0",
+      "licenseFiles": [
+        "LICENSE"
+      ],
+      "upstream": "https://github.com/haasn/libplacebo"
+    },
+    {
+      "id": "vulkan-headers",
+      "version": "cacef3039d277c448c89336290ec3937270b0996",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/cacef3039d277c448c89336290ec3937270b0996",
+      "sha256": "400dc4bc49438f24ab9e90e6e587d9b1621a236f05eba80f6c048d7a1a96d353",
+      "filename": "vulkan-headers-cacef3039d277c448c89336290ec3937270b0996.tar.gz",
+      "sourceRoot": "Vulkan-Headers-cacef3039d277c448c89336290ec3937270b0996",
+      "licenseFiles": [
+        "LICENSE.md"
+      ],
+      "upstream": "https://github.com/KhronosGroup/Vulkan-Headers"
+    },
+    {
+      "id": "glslang",
+      "version": "15.1.0",
+      "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/15.1.0",
+      "sha256": "4bdcd8cdb330313f0d4deed7be527b0ac1c115ff272e492853a6e98add61b4bc",
+      "filename": "glslang-15.1.0.tar.gz",
+      "sourceRoot": "glslang-15.1.0",
+      "licenseFiles": [
+        "LICENSE.txt"
+      ],
+      "upstream": "https://github.com/KhronosGroup/glslang"
+    },
+    {
+      "id": "fast-float",
+      "version": "1bf70101536d37fa9954cc4f03fd0903d045a9f3",
+      "url": "https://codeload.github.com/fastfloat/fast_float/tar.gz/1bf70101536d37fa9954cc4f03fd0903d045a9f3",
+      "sha256": "95c7730f3db8bfb8568e26387bed5df5284158c408d2c6411ed8ad4f5a6dc9ae",
+      "filename": "fast-float-1bf70101536d37fa9954cc4f03fd0903d045a9f3.tar.gz",
+      "sourceRoot": "fast_float-1bf70101536d37fa9954cc4f03fd0903d045a9f3",
+      "licenseFiles": [
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "LICENSE-BOOST"
+      ],
+      "upstream": "https://github.com/fastfloat/fast_float"
+    },
+    {
+      "id": "jinja",
+      "version": "15206881c006c79667fe5154fe80c01c65410679",
+      "url": "https://codeload.github.com/pallets/jinja/tar.gz/15206881c006c79667fe5154fe80c01c65410679",
+      "sha256": "b88a20dcc2e34072fcf4159325bc6c34cd4b29a81a8b83d15d2f28ba561da296",
+      "filename": "jinja-15206881c006c79667fe5154fe80c01c65410679.tar.gz",
+      "sourceRoot": "jinja-15206881c006c79667fe5154fe80c01c65410679",
+      "licenseFiles": [
+        "LICENSE.txt"
+      ],
+      "upstream": "https://github.com/pallets/jinja"
+    },
+    {
+      "id": "markupsafe",
+      "version": "28ace20b140d15c083e1cbc163ee6b7778ba098c",
+      "url": "https://codeload.github.com/pallets/markupsafe/tar.gz/28ace20b140d15c083e1cbc163ee6b7778ba098c",
+      "sha256": "bead4c1f90f02956a082c6f026237e1e106a00636f4b26c3f16921631eb8737f",
+      "filename": "markupsafe-28ace20b140d15c083e1cbc163ee6b7778ba098c.tar.gz",
+      "sourceRoot": "markupsafe-28ace20b140d15c083e1cbc163ee6b7778ba098c",
+      "licenseFiles": [
+        "LICENSE.txt"
+      ],
+      "upstream": "https://github.com/pallets/markupsafe"
+    }
+  ],
+  "compatibilityPatches": [
+    {
+      "id": "python314-elementtree-root-v1",
+      "path": "libplacebo-python314.patch",
+      "sha256": "d1e0be6bb9f125f3a2f9f43b332bc46c9eace60b60f9a796a8a8337589bc4216",
+      "reason": "ElementTree requires an Element root on Python3.14; pass parsed getroot explicitly."
+    }
+  ]
+}

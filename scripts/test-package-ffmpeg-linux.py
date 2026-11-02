@@ -63,7 +63,7 @@ class SourceBuildTests(unittest.TestCase):
             root = Path(temporary)
             builder = BUILD.Builder(root / "build", root / "cache", 1)
             self.assertFalse(any(value == "unexpected-host-input" for value in builder.env.values()))
-            self.assertEqual(builder.env["PKG_CONFIG_LIBDIR"], str(builder.prefix) + "/lib/pkgconfig")
+            self.assertEqual(builder.env["PKG_CONFIG_LIBDIR"], str(builder.prefix) + "/lib/pkgconfig:" + str(builder.prefix) + "/share/pkgconfig")
             self.assertEqual(builder.env["CC"], "gcc")
 
     def test_empty_directories_required_by_bare_git_are_retained(self):

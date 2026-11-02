@@ -67,7 +67,7 @@ def stage(directory, tools_root, target, inventory):
         raise ValueError("The portable frameserver's required runtime files are missing.")
     result = subprocess.run([str(directory / receipt["tool"]["path"]), "--version"], env=runtime_environment(directory), capture_output=True, text=True, check=True, timeout=30)
     version = result.stdout + result.stderr
-    if version.splitlines()[0] != receipt["tool"]["version"] or "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "systems.innocent.lsmas : Found" not in version:
+    if version.splitlines()[0] != receipt["tool"]["version"] or "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "[xpsnr-signed-stats-v1]" not in version or "[source-unfiltered-probes-v1]" not in version or "systems.innocent.lsmas : Found" not in version:
         raise ValueError("The portable av1an identity or decoder availability changed.")
     if actual != {record["path"]: record["sha256"] for record in inventory(directory)}:
         raise ValueError("Av1an execution changed its delivery payload.")
@@ -90,7 +90,7 @@ def qualify(directory, scratch, ffmpeg):
         result = subprocess.run([str(directory / "av1an.exe"), "--version"], cwd=scratch, env=env, capture_output=True, text=True, check=True, timeout=30)
         version = result.stdout + result.stderr
         log.write(version)
-        if "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "systems.innocent.lsmas : Not found" in version or "systems.innocent.lsmas" not in version:
+        if "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "[xpsnr-signed-stats-v1]" not in version or "[source-unfiltered-probes-v1]" not in version or "systems.innocent.lsmas : Not found" in version or "systems.innocent.lsmas" not in version:
             raise ValueError("The final av1an runtime lacks its compatibility patch or decoder plugin.")
     if before != support.inventory(directory):
         raise ValueError("Running the portable frameserver changed its installed payload.")
@@ -155,8 +155,11 @@ def finish(destination, media, compiler, provenance, lock, archives, python_sour
     shared = [record for record in provenance["additionalSources"] if record["base"] in SHARED_BASES]
     if len(shared) != len(SHARED_BASES):
         raise ValueError("The decoder's shared static library sources are incomplete.")
+    if any("[" + marker + "]" not in version for marker in lock["compatibilityMarkers"]):
+        raise ValueError("The built engine is missing a locked compatibility fix.")
     source = next(record for record in additional if record.get("component") == "av1an")
     additional.remove(source)
     receipt = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "tool": {"id": "av1an", "path": "av1an.exe", "sha256": support.digest(directory / "av1an.exe"), "version": version}, "sourceCommit": lock["inputs"]["av1an"]["commit"], "source": source, "additionalSources": additional, "sharedSources": shared, "sharedMediaProvenanceSha256": support.digest(media / "build-provenance.json"), "licenses": [{**record, "path": "licenses/" + record["path"]} for record in support.inventory(notices_dir)], "buildInputs": [{**record, "path": "build/" + record["path"]} for record in support.inventory(build)], "supportFiles": [{**record, "path": "python/" + record["path"]} for record in support.inventory(python)], "nativeDependencies": imports, "rustCompiler": rust_version, "frameserverCompiler": frameserver["compiler"], "configure": {"frameserver": frameserver["configure"], "decoder": decoder["configure"], "plugin": plugin["configure"]}, "qualification": "Three actual decoded frames and av1an plugin discovery with only this frameserver and System32 on PATH; complete runtime hash inventory unchanged."}
+    receipt["compatibilityMarkers"] = lock["compatibilityMarkers"]
     (directory / "build-provenance.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     print(f"Verified portable av1an source delivery: {directory}", flush=True)

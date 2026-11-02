@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-activity-log"
+description = "Enables the save_activity_log command without any pre-configured scope."
+commands.allow = ["save_activity_log"]
+
+[[permission]]
+identifier = "deny-save-activity-log"
+description = "Denies the save_activity_log command without any pre-configured scope."
+commands.deny = ["save_activity_log"]

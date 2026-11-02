@@ -36,6 +36,21 @@ def stage_ffmpeg(delivery: Path, tools_root: Path, target: str) -> list:
         raise ValueError("The FFmpeg build provenance has a different schema or platform.")
     if {tool["id"] for tool in provenance["tools"]} != {"ffmpeg", "ffprobe"} or len(provenance["tools"]) != 2:
         raise ValueError("The media build must contain exactly the FFmpeg and FFprobe pair.")
+    if provenance.get("encodingPolicy")!="cpu-only":
+        raise ValueError("Jesses requires a CPU-only FFmpeg encoder build receipt; historical hardware-enabled deliveries cannot be staged.")
+    cpu_records=[item for item in provenance.get("buildInputs",[]) if item["path"].endswith("/cpu-encoders.json")]
+    if len(cpu_records)!=1:
+        raise ValueError("The FFmpeg delivery must retain its actual CPU encoder inventory qualification.")
+    cpu_report=json.loads((delivery/package.relative_path(cpu_records[0]["path"])).read_text(encoding="utf-8"))
+    ffmpeg_record=next(item for item in provenance["tools"] if item["id"]=="ffmpeg")
+    if cpu_report.get("encodingPolicy")!="cpu-only" or cpu_report.get("hardwareEncoders")!=[] or cpu_report.get("ffmpegSha256")!=ffmpeg_record["sha256"]:
+        raise ValueError("The CPU encoder inventory differs from the FFmpeg executable being staged.")
+    processing_records = [item for item in provenance.get("buildInputs", []) if item["path"].endswith("/libplacebo-capabilities.json")]
+    if provenance.get("processingPolicy") != "vulkan-libplacebo" or len(processing_records) != 1:
+        raise ValueError("The FFmpeg delivery must qualify Vulkan/libplacebo processing independently of its CPU encoders.")
+    processing = json.loads((delivery / package.relative_path(processing_records[0]["path"])).read_text(encoding="utf-8"))
+    if processing.get("processingPolicy") != "vulkan-libplacebo" or processing.get("ffmpegSha256") != ffmpeg_record["sha256"] or not all(processing.get(name) is True for name in ("vulkan", "libplacebo", "spline", "peakDetection", "applyDolbyVision")):
+        raise ValueError("The Vulkan/libplacebo capability receipt differs from the staged FFmpeg executable.")
     if provenance["source"]["sha256"] != "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635":
         raise ValueError("The package FFmpeg build has an unexpected official source release.")
     if not provenance.get("additionalSources") or not provenance.get("licenses") or not provenance.get("buildInputs"):
@@ -58,7 +73,7 @@ def stage_ffmpeg(delivery: Path, tools_root: Path, target: str) -> list:
     shutil.copytree(delivery, directory)
     def prefix(record):
         return {**record, "path": "ffmpeg/" + record["path"]}
-    common = {"source": prefix(provenance["source"]), "additionalSources": [prefix(record) for record in provenance["additionalSources"]], "licenses": [prefix(record) for record in provenance["licenses"]], "buildInputs": [prefix(record) for record in provenance["buildInputs"]], "buildProvenance": {"path": "ffmpeg/build-provenance.json", "sha256": expected["build-provenance.json"]}, "supportFiles": [prefix(record) for record in provenance.get("supportFiles", [])]}
+    common = {"encodingPolicy":"cpu-only", "source": prefix(provenance["source"]), "additionalSources": [prefix(record) for record in provenance["additionalSources"]], "licenses": [prefix(record) for record in provenance["licenses"]], "buildInputs": [prefix(record) for record in provenance["buildInputs"]], "buildProvenance": {"path": "ffmpeg/build-provenance.json", "sha256": expected["build-provenance.json"]}, "supportFiles": [prefix(record) for record in provenance.get("supportFiles", [])]}
     return [{**prefix(tool), **common} for tool in provenance["tools"]]
 
 
@@ -374,7 +389,7 @@ def download(url: str, expected: str, cache: Path) -> Path:
     return cached
 
 
-def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None, mkvmerge_build: Path | None = None) -> Path:
+def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None, mkvmerge_build: Path | None = None, grav1synth_build: Path | None = None) -> Path:
     host = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "x86_64-unknown-linux-gnu" if sys.platform == "linux" else "unsupported"
     if target != host or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise ValueError("Stage and verify tools on the matching Windows x64 or Linux x64 host.")
@@ -451,12 +466,21 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
             staged.append(stage_extra_encoder(delivery.absolute(), tools_root, target, identifier))
     if mkvmerge_build is not None:
         staged.append(stage_mkvmerge(mkvmerge_build.absolute(), tools_root, target))
+    if grav1synth_build is not None:
+        spec = importlib.util.spec_from_file_location("grav_delivery", ROOT / "scripts/build-package-grav1synth.py")
+        grav = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(grav)
+        staged.append(grav.stage(grav1synth_build.absolute(), tools_root, target))
     available = {tool["id"] for tool in staged}
+    source_provider = forks.get("sourceProvider")
+    if source_provider != "svt-av1-hdr" or source_provider not in available:
+        raise ValueError("The canonical source SVT choice requires its pinned HDR provider.")
+    available.add("svt-av1")
     if "av1an" in available:
         available.update(("VapourSynth", "L-SMASH Works"))
-    manifest = {"schemaVersion": 1, "target": target, "tools": staged,
+    manifest = {"schemaVersion": 1, "target": target, "tools": staged, "sourceSvtProvider": source_provider,
                 "binaryManifestSha256": digest(forks_path), "sourceManifestSha256": digest(sources_path),
-                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
+                "externalTools": [identifier for identifier in ["ffmpeg", "ffprobe", "svt-av1", "x264", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge", "grav1synth", "VapourSynth", "L-SMASH Works"] if identifier not in available]}
     (tools_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     config = destination / "tauri-tools.conf.json"
     config.write_text(json.dumps({"bundle": {"resources": {str(tools_root): "resources/tools/"}}}, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -476,8 +500,9 @@ def main() -> None:
     parser.add_argument("--vpx-build", type=Path, help="Verified standalone VPX delivery")
     parser.add_argument("--x265-build", type=Path, help="Verified standalone x265 delivery")
     parser.add_argument("--mkvmerge-build", type=Path, help="Verified source-complete Windows mkvmerge CLI and DLL delivery")
+    parser.add_argument("--grav1synth-build", type=Path, help="Verified source-pinned grav1synth and private static media libraries")
     args = parser.parse_args()
-    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build, args.aom_build, args.vpx_build, args.x265_build, args.mkvmerge_build)}")
+    print(f"Package configuration: {stage(args.destination, args.target, args.cache, args.ffmpeg_build, args.x264_build, args.svt_build, args.av1an_build, args.aom_build, args.vpx_build, args.x265_build, args.mkvmerge_build, args.grav1synth_build)}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-av1an-recovery-action"
+description = "Enables the av1an_recovery_action command without any pre-configured scope."
+commands.allow = ["av1an_recovery_action"]
+
+[[permission]]
+identifier = "deny-av1an-recovery-action"
+description = "Denies the av1an_recovery_action command without any pre-configured scope."
+commands.deny = ["av1an_recovery_action"]

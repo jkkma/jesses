@@ -1,9 +1,10 @@
 # Portable packages, Scoop and data locations
 
-The manual **Portable Windows package** workflow builds the Windows x64 portable
-ZIP used by Scoop. It uploads artifacts to that workflow run and does not publish
-a release. Windows distribution does not use an NSIS installer. Linux and macOS
-packaging are deferred.
+The manual **Native desktop packages** workflow builds the Windows x64 portable
+ZIP used by Scoop and Linux x64 AppImage/DEB artifacts. The separate
+**macOS native checks and app archives** workflow builds native Apple Silicon and
+Intel development app archives; see [macOS packaging](macos.md). Workflows upload
+artifacts without publishing a release. Windows distribution does not use NSIS.
 
 The workflow includes the pinned SVT-AV1 5fish and SVT-AV1-HDR binaries, their
 matching complete source archives and license/patent notices. These upstream
@@ -11,22 +12,26 @@ builds require an x86-64-v3 CPU. Each native packaging run checks their versions
 before bundling them. Binary and source downloads have pinned SHA-256 hashes.
 
 Windows package builds also compile the official FFmpeg/FFprobe 9.0.1 source
-release with explicit x264, x265, VP9, Opus, MP3, Vorbis, dav1d, zimg, libass
+release with explicit x264, x265, VP9, AOM AV1, SVT-AV1, Opus, MP3, Vorbis, dav1d, zimg, libass
 subtitle rendering and VMAF support.
 All codec libraries are linked statically; native qualification checks that the
 executables import only Windows system DLLs. The isolated compiler is assembled
 from SHA-256 pinned official MSYS2 payloads without changing the user's tools,
 executing package hooks or consulting a moving package index. The package retains
 the exact codec/runtime sources, notices, input lock and build scripts.
-VMAF is built with its default models embedded. The build requires the pinned
+The AV1 wrappers are source-built from pinned complete AOM 3.14.1/SVT-AV1 4.2.0
+archives, with both outer and upstream archive hashes checked. Their original
+license and patent notices accompany the source closure. Actual 8-bit and 10-bit
+encodes run through the final FFmpeg binary before delivery.
+VMAF is built with its default, NEG and 4K models embedded. The build requires the pinned
 model generator and rejects a library that silently omits those models. Windows
 subtitle rendering uses the operating system's DirectWrite font provider.
 
 The retained [Linux FFmpeg build](linux-ffmpeg-package.md) compiles the same media
 pair and static codec libraries from pinned sources, with the ordinary Linux
-C/C++ runtime supplied by the target system. Its recipe and historical receipts
-remain available for future work, but the current packaging workflow does not run
-the Linux lane and they are not Windows release blockers.
+C/C++ runtime supplied by the target system. Its pinned recipe is active in the restored Ubuntu 24.04 packaging lane.
+Historical receipts below remain bounded to their recorded revisions; the final
+changed artifact still requires fresh native qualification.
 
 Windows package builds additionally compile standalone x264 from the pinned
 complete Git source already retained with FFmpeg. The standalone command supports
@@ -52,9 +57,9 @@ before enabling it for an image-metric job; a failed GPU probe keeps the CPU
 scorers selected. The runtime and its corresponding sources remain covered by
 the package manifest.
 Linux also has retained standalone x264/mainline SVT
-source recipes and historical native package evidence, described in the Linux
-build document. Linux packaging, including av1an, is deferred and is not part of
-the active Windows release gate.
+source recipes and native package checks, described in the Linux build
+document. Linux uses external av1an/VapourSynth where the private Windows
+frameserver bundle is unavailable; their actual capabilities are checked per job.
 
 Windows x64 also includes `mkvmerge` for Matroska muxing, chunk timing and metadata
 transfer, with its pinned sources, dependency notices and verified delivery.
@@ -104,8 +109,8 @@ writable persisted data, and generated encode/decode cases. Its receipt distingu
 an existing restricted host from a freshly provisioned Windows image. Native GUI
 and Scoop lifecycle checks remain separate; see the bounded
 [Windows crash recovery qualification](../tests/fixtures/windows-crash-recovery-validation.md).
-Any future Linux reactivation will require fresh native and clean-machine
-qualification for the intended distributions and system libraries.
+The restored Linux and new macOS lanes require fresh native artifact and
+clean-environment qualification for their intended system libraries.
 
 ## Storage
 
@@ -211,14 +216,14 @@ build inputs; byte-for-byte reproducibility across hosts remains a separate gate
 
 The retained Linux recipes use `--target x86_64-unknown-linux-gnu --bundles
 appimage,deb` and the corresponding target directory. They are documented for
-future reactivation and are not run by the current workflow. Every packaging
+the restored Linux packaging lane. Every packaging
 destination must be new: scripts do not overwrite existing artifacts. Windows
 collection only needs the built executable and verified tools; stale installer
 files in the build directory are ignored.
 
 `collect` copies license/dependency records, produces the Windows portable ZIP,
 and records SHA-256 hashes in `SHA256SUMS` and JSON manifests. The retained Linux
-path collects its native bundles only when deliberately reactivated.
+path collects its native AppImage and DEB bundles.
 The manifest records the packaging checkout and whether it had local changes;
 the binary hash identifies the supplied executable. This is not an attestation
 that an independently supplied binary was built from that checkout.

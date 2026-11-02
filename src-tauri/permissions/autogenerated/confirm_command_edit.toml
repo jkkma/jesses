@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-confirm-command-edit"
+description = "Enables the confirm_command_edit command without any pre-configured scope."
+commands.allow = ["confirm_command_edit"]
+
+[[permission]]
+identifier = "deny-confirm-command-edit"
+description = "Denies the confirm_command_edit command without any pre-configured scope."
+commands.deny = ["confirm_command_edit"]

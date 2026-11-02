@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-av1an-recoveries"
+description = "Enables the list_av1an_recoveries command without any pre-configured scope."
+commands.allow = ["list_av1an_recoveries"]
+
+[[permission]]
+identifier = "deny-list-av1an-recoveries"
+description = "Denies the list_av1an_recoveries command without any pre-configured scope."
+commands.deny = ["list_av1an_recoveries"]

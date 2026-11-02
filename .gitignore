@@ -14,3 +14,6 @@ Thumbs.db
 test-results/
 playwright-report/
 __pycache__/
+# Runtime job/history receipts are local user data.
+/logs/
+/crates/media-runtime/logs/

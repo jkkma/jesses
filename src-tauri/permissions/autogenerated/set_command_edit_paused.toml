@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-command-edit-paused"
+description = "Enables the set_command_edit_paused command without any pre-configured scope."
+commands.allow = ["set_command_edit_paused"]
+
+[[permission]]
+identifier = "deny-set-command-edit-paused"
+description = "Denies the set_command_edit_paused command without any pre-configured scope."
+commands.deny = ["set_command_edit_paused"]

@@ -1,11 +1,10 @@
 # Linux FFmpeg package build
 
-Linux native support and packaging are deferred alongside macOS. The recipes,
-locked sources and receipts in this document are retained as historical evidence
-and a possible basis for future work. The current CI and packaging workflows do
-not run Linux native lanes, and this retained material is not an active Windows
-qualification or release blocker. Any reactivation requires fresh native,
-artifact and clean-machine qualification.
+The Linux x64 CI and package lanes are restored for Ubuntu 24.04. The pinned
+recipes below build its media tools, and the package workflow verifies the exact
+AppImage/DEB resources. Historical receipts remain evidence only for their named
+revisions; the newly changed artifacts require fresh native and clean-environment
+qualification. macOS uses a separate [lean external-tool app archive](macos.md).
 
 `scripts/build-package-ffmpeg-linux.py` builds FFmpeg and FFprobe 9.0.1 for Linux
 x86-64. It compiles the linked codec, display-conversion and compression libraries
@@ -14,7 +13,7 @@ Codec libraries are static; the Linux C/C++ runtimes remain ordinary system
 dependencies. This is an Ubuntu 24.04 build lane, not a universal Linux binary.
 
 The lock contains complete MSYS2 source bundles for bzip2, dav1d, LAME, libogg,
-libvorbis, libvpx, x264, Opus, x265, XZ, zimg, zlib, libass, VMAF, FreeType,
+libvorbis, libvpx, x264, Opus, x265, AOM 3.14.1, SVT-AV1 4.2.0, XZ, zimg, zlib, libass, VMAF, FreeType,
 HarfBuzz, FriBidi, fontconfig, Expat, libunibreak, Brotli and libpng. Meson 1.12.0
 also runs from a pinned complete source bundle; the host's older Meson is not used.
 The builder verifies both
@@ -27,11 +26,12 @@ x265 is built at 8, 10 and 12 bits and merged into one static library. FFmpeg ha
 automatic optional-library detection disabled. The final executable dependency
 check rejects codec shared libraries, missing libraries and dependencies on the
 temporary build prefix. Version and actual short encode/display checks run before
-the delivery receipt is written. A real VMAF v0.6.1 model run detects missing
-embedded model data, and an original geometric font tests actual libass rendering.
+the delivery receipt is written. Actual 8-bit and 10-bit AOM/SVT wrapper encodes
+qualify the AV1 ladder routes. Real default, NEG and 4K VMAF model runs detect
+missing embedded model data, and an original geometric font tests actual libass rendering.
 FreeType includes compressed and PNG font support. Fontconfig uses standard Linux
 font/configuration paths; an isolated staged install does not write to `/etc`.
-The historical packaging lane also ran media-runtime fixture gates using the
+The packaging lane runs media-runtime fixture gates using the
 newly built pair.
 
 ## Build and retained sources
@@ -109,7 +109,7 @@ before that lane can publish qualified unsigned packages. Failed Linux bundles
 were retained separately as unqualified diagnostic artifacts for seven days.
 Native GUI operation, clean-machine installation, other Linux distributions,
 signing and release readiness were not established by those runs. Linux and
-macOS are now deferred.
+macOS are tracked separately; the Linux lane is now restored.
 
 ## Linux standalone x264 and mainline SVT-AV1
 
@@ -128,7 +128,7 @@ are `target/package-standalone-linux/x264/delivery` and
 `target/package-standalone-linux/svt-av1/delivery`, accepted by the stager's existing
 `--x264-build` and `--svt-build` options. The driver requires the same Linux x86-64
 GCC/G++, binutils, make, nasm, CMake, Ninja and Git toolchain as the media build;
-it does not install packages or run a package manager. The deferred workflow path
+it does not install packages or run a package manager. The restored workflow path
 uses a pinned runner image and records the installed build-tool versions. This retains
 exact codec sources and recipes, without claiming byte-identical binaries across
 different compiler or system-runtime versions.

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-make-av1an-grain-preset"
+description = "Enables the make_av1an_grain_preset command without any pre-configured scope."
+commands.allow = ["make_av1an_grain_preset"]
+
+[[permission]]
+identifier = "deny-make-av1an-grain-preset"
+description = "Denies the make_av1an_grain_preset command without any pre-configured scope."
+commands.deny = ["make_av1an_grain_preset"]

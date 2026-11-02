@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-batch-output-paths"
+description = "Enables the resolve_batch_output_paths command without any pre-configured scope."
+commands.allow = ["resolve_batch_output_paths"]
+
+[[permission]]
+identifier = "deny-resolve-batch-output-paths"
+description = "Denies the resolve_batch_output_paths command without any pre-configured scope."
+commands.deny = ["resolve_batch_output_paths"]

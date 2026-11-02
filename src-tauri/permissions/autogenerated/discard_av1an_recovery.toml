@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discard-av1an-recovery"
+description = "Enables the discard_av1an_recovery command without any pre-configured scope."
+commands.allow = ["discard_av1an_recovery"]
+
+[[permission]]
+identifier = "deny-discard-av1an-recovery"
+description = "Denies the discard_av1an_recovery command without any pre-configured scope."
+commands.deny = ["discard_av1an_recovery"]

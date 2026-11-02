@@ -51,7 +51,7 @@ class PackageCompilerTests(unittest.TestCase):
             self.assertTrue(probe.comparable_path(extended).is_relative_to(probe.comparable_path(root)))
 
     def test_host_compiler_paths_and_shell_hooks_cannot_enter_the_build(self):
-        names = ["C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "CPATH", "LIBRARY_PATH", "CC", "CXX", "LD", "BASH_ENV", "ENV", "MAKEFLAGS", "PKG_CONFIG", "LD_PRELOAD"]
+        names = ["C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "CPATH", "LIBRARY_PATH", "CC", "CXX", "LD", "BASH_ENV", "ENV", "MAKEFLAGS", "PKG_CONFIG", "LD_PRELOAD", "CMAKE_TOOLCHAIN_FILE", "CMAKE_PREFIX_PATH", "CMAKE_C_COMPILER_LAUNCHER", "GIT_CONFIG_PARAMETERS"]
         with patch.dict(os.environ, {name: "unrelated-host-input" for name in names}):
             result = builder.build_environment("controlled-pkgconfig")
         for name in names:

@@ -27,7 +27,9 @@
       "embeddedArchive": "mingw-w64-bzip2/bzip2-1.0.8.tar.gz",
       "embeddedSha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269",
       "sourceRoot": "bzip2-1.0.8",
-      "licenseFiles": ["LICENSE"]
+      "licenseFiles": [
+        "LICENSE"
+      ]
     },
     {
       "id": "dav1d",
@@ -40,7 +42,10 @@
       "embeddedArchive": "mingw-w64-dav1d/dav1d-1.5.4.tar.xz",
       "embeddedSha256": "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5",
       "sourceRoot": "dav1d-1.5.4",
-      "licenseFiles": ["COPYING", "doc/PATENTS"]
+      "licenseFiles": [
+        "COPYING",
+        "doc/PATENTS"
+      ]
     },
     {
       "id": "lame",
@@ -53,7 +58,10 @@
       "embeddedArchive": "mingw-w64-lame/lame-3.100.tar.gz",
       "embeddedSha256": "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
       "sourceRoot": "lame-3.100",
-      "licenseFiles": ["COPYING", "LICENSE"]
+      "licenseFiles": [
+        "COPYING",
+        "LICENSE"
+      ]
     },
     {
       "id": "libogg",
@@ -66,7 +74,9 @@
       "embeddedArchive": "mingw-w64-libogg/libogg-1.3.6.tar.gz",
       "embeddedSha256": "83e6704730683d004d20e21b8f7f55dcb3383cdf84c0daedf30bde175f774638",
       "sourceRoot": "libogg-1.3.6",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "libvorbis",
@@ -79,7 +89,9 @@
       "embeddedArchive": "mingw-w64-libvorbis/libvorbis-1.3.7.tar.gz",
       "embeddedSha256": "0e982409a9c3fc82ee06e08205b1355e5c6aa4c36bca58146ef399621b0ce5ab",
       "sourceRoot": "libvorbis-1.3.7",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "libvpx",
@@ -92,7 +104,10 @@
       "embeddedArchive": "mingw-w64-libvpx/libvpx-1.17.0.tar.gz",
       "embeddedSha256": "1020f184046187baa2985dbde38e0691f49c44088bca7a1842b0236c6081dc0a",
       "sourceRoot": "libvpx-1.17.0",
-      "licenseFiles": ["LICENSE", "PATENTS"]
+      "licenseFiles": [
+        "LICENSE",
+        "PATENTS"
+      ]
     },
     {
       "id": "x264",
@@ -104,7 +119,9 @@
       "upstream": "https://www.videolan.org/developers/x264.html",
       "gitDirectory": "mingw-w64-x264/x264",
       "gitCommit": "b35605ace3ddf7c1a5d67a2eb553f034aef41d55",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "opus",
@@ -117,7 +134,9 @@
       "embeddedArchive": "mingw-w64-opus/opus-1.6.1.tar.gz",
       "embeddedSha256": "6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1",
       "sourceRoot": "opus-1.6.1",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "x265",
@@ -130,7 +149,9 @@
       "embeddedArchive": "mingw-w64-x265/x265-4.3.tar.gz",
       "embeddedSha256": "83c53e4c8bbb8f1e33ed59e10a7d621d1d7801ca853910c3eb41f038b8ffb121",
       "sourceRoot": "x265_4.3",
-      "licenseFiles": ["COPYING"],
+      "licenseFiles": [
+        "COPYING"
+      ],
       "patches": [
         {
           "path": "mingw-w64-x265/0001-missing-include.patch",
@@ -168,7 +189,9 @@
       "embeddedArchive": "mingw-w64-zimg/zimg-3.0.6.tar.gz",
       "embeddedSha256": "be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577",
       "sourceRoot": "zimg-release-3.0.6",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "zlib",
@@ -181,7 +204,9 @@
       "embeddedArchive": "mingw-w64-zlib/zlib-1.3.2.tar.xz",
       "embeddedSha256": "d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3",
       "sourceRoot": "zlib-1.3.2",
-      "licenseFiles": ["LICENSE"]
+      "licenseFiles": [
+        "LICENSE"
+      ]
     },
     {
       "id": "expat",
@@ -194,7 +219,9 @@
       "embeddedArchive": "mingw-w64-expat/expat-2.8.4.tar.xz",
       "embeddedSha256": "656ae1cc8da3b4ea513bb4e254f33e6243938084c0ec6239da873376b09985a7",
       "sourceRoot": "expat-2.8.4",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "fontconfig",
@@ -207,7 +234,9 @@
       "embeddedArchive": "mingw-w64-fontconfig/fontconfig-2.18.3.tar.gz",
       "embeddedSha256": "9ae01e1d53acdef56010c5451cd34aa41d325b2faccd8606448d8fa01b2496b3",
       "sourceRoot": "fontconfig-2.18.3",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "freetype",
@@ -220,7 +249,11 @@
       "embeddedArchive": "mingw-w64-freetype/freetype-2.14.3.tar.xz",
       "embeddedSha256": "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f",
       "sourceRoot": "freetype-2.14.3",
-      "licenseFiles": ["docs/GPLv2.TXT", "docs/FTL.TXT", "LICENSE.TXT"]
+      "licenseFiles": [
+        "docs/GPLv2.TXT",
+        "docs/FTL.TXT",
+        "LICENSE.TXT"
+      ]
     },
     {
       "id": "fribidi",
@@ -233,7 +266,9 @@
       "embeddedArchive": "mingw-w64-fribidi/fribidi-1.0.16.tar.xz",
       "embeddedSha256": "1b1cde5b235d40479e91be2f0e88a309e3214c8ab470ec8a2744d82a5a9ea05c",
       "sourceRoot": "fribidi-1.0.16",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "harfbuzz",
@@ -246,7 +281,10 @@
       "embeddedArchive": "mingw-w64-harfbuzz/harfbuzz-14.4.0.tar.xz",
       "embeddedSha256": "2357ed966c6ced7bfa720b0640c0231065af01158fbea215093ffa15aed44371",
       "sourceRoot": "harfbuzz-14.4.0",
-      "licenseFiles": ["COPYING", "test/COPYING"]
+      "licenseFiles": [
+        "COPYING",
+        "test/COPYING"
+      ]
     },
     {
       "id": "libass",
@@ -259,7 +297,9 @@
       "embeddedArchive": "mingw-w64-libass/libass-0.17.5.tar.xz",
       "embeddedSha256": "2dca25c0e0c837ddf00b52011b3f82cac1e4ddd3ad018227806b0c2288864acc",
       "sourceRoot": "libass-0.17.5",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     },
     {
       "id": "libunibreak",
@@ -272,7 +312,9 @@
       "embeddedArchive": "mingw-w64-libunibreak/libunibreak-7.0.tar.gz",
       "embeddedSha256": "e4cb1a0d9aebb129c9856ec75e3d98e675997e385cce4e0106ef8f68e09afaa3",
       "sourceRoot": "libunibreak-libunibreak_7_0",
-      "licenseFiles": ["LICENCE"]
+      "licenseFiles": [
+        "LICENCE"
+      ]
     },
     {
       "id": "vmaf",
@@ -285,7 +327,9 @@
       "embeddedArchive": "mingw-w64-vmaf/vmaf-3.2.0.tar.gz",
       "embeddedSha256": "a28f93f3b4fa65601be324587072e32a6a704a304ba7b1aec9b70b3f709bc1dc",
       "sourceRoot": "vmaf-3.2.0",
-      "licenseFiles": ["LICENSE"]
+      "licenseFiles": [
+        "LICENSE"
+      ]
     },
     {
       "id": "brotli",
@@ -298,7 +342,9 @@
       "embeddedArchive": "mingw-w64-brotli/brotli-1.2.0.tar.gz",
       "embeddedSha256": "816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec",
       "sourceRoot": "brotli-1.2.0",
-      "licenseFiles": ["LICENSE"]
+      "licenseFiles": [
+        "LICENSE"
+      ]
     },
     {
       "id": "libpng",
@@ -311,7 +357,43 @@
       "embeddedArchive": "mingw-w64-libpng/libpng-1.6.58.tar.xz",
       "embeddedSha256": "28eb403f51f0f7405249132cecfe82ea5c0ef97f1b32c5a65828814ae0d34775",
       "sourceRoot": "libpng-1.6.58",
-      "licenseFiles": ["LICENSE", "ci/LICENSE_MIT.txt"]
+      "licenseFiles": [
+        "LICENSE",
+        "ci/LICENSE_MIT.txt"
+      ]
+    },
+    {
+      "id": "aom",
+      "version": "3.14.1-2",
+      "url": "https://repo.msys2.org/mingw/sources/mingw-w64-aom-3.14.1-2.src.tar.zst",
+      "sha256": "77b7ac3e29e1fd092133085c692d85d7b5853f02b2d7b2365743f71787a1a41d",
+      "filename": "mingw-w64-aom-3.14.1-2.src.tar.zst",
+      "bundleRoot": "mingw-w64-aom",
+      "upstream": "https://aomedia.googlesource.com/aom/",
+      "embeddedArchive": "mingw-w64-aom/libaom-3.14.1.tar.gz",
+      "embeddedSha256": "44bf90dbd23e734d50e70a8c41c285193922938bd0d3bc2ee56764d181d55ef5",
+      "sourceRoot": "libaom-3.14.1",
+      "licenseFiles": [
+        "LICENSE",
+        "PATENTS"
+      ]
+    },
+    {
+      "id": "svt-av1",
+      "version": "4.2.0-1",
+      "url": "https://repo.msys2.org/mingw/sources/mingw-w64-svt-av1-4.2.0-1.src.tar.zst",
+      "sha256": "816303341956c53c37d2de9180d4bb10cf2365e38b21b06ffd653169edb2c3a7",
+      "filename": "mingw-w64-svt-av1-4.2.0-1.src.tar.zst",
+      "bundleRoot": "mingw-w64-svt-av1",
+      "upstream": "https://gitlab.com/AOMediaCodec/SVT-AV1",
+      "embeddedArchive": "mingw-w64-svt-av1/SVT-AV1-v4.2.0.tar.gz",
+      "embeddedSha256": "c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740",
+      "sourceRoot": "SVT-AV1-v4.2.0",
+      "licenseFiles": [
+        "LICENSE.md",
+        "LICENSE-BSD2.md",
+        "PATENTS.md"
+      ]
     }
   ],
   "buildTools": [
@@ -326,7 +408,13 @@
       "embeddedArchive": "mingw-w64-meson/meson-1.12.0.tar.gz",
       "embeddedSha256": "88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c",
       "sourceRoot": "meson-1.12.0",
-      "licenseFiles": ["COPYING"]
+      "licenseFiles": [
+        "COPYING"
+      ]
     }
-  ]
+  ],
+  "processingSourceLock": {
+    "path": "package-libplacebo-lock.json",
+    "sha256": "96dd42a63d118674c6c252da8e0a50d2de3a8a060ef576ed662847bcaff38861"
+  }
 }

@@ -21,6 +21,16 @@
     "x86_64-unknown-linux-gnu": {
       "runtime": "WebKitGTK 4.1 and GTK 3; packaged on Ubuntu 24.04",
       "artifacts": ["appimage", "deb"]
+    },
+    "aarch64-apple-darwin": {
+      "runtime": "macOS 12 or newer; system WebKit/WKWebView",
+      "distribution": "Ad-hoc signed development .app archive. Media tools are external; see README-macOS.md.",
+      "artifacts": ["appTarGz"]
+    },
+    "x86_64-apple-darwin": {
+      "runtime": "macOS 12 or newer; system WebKit/WKWebView",
+      "distribution": "Ad-hoc signed development .app archive. Media tools are external; see README-macOS.md.",
+      "artifacts": ["appTarGz"]
     }
   },
   "tools": [

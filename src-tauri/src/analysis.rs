@@ -21,6 +21,7 @@ pub struct AnalysisTasks {
 struct Task {
     cancel: watch::Sender<bool>,
     started: bool,
+    pause: media_runtime::supervisor::PauseControl,
     created: Instant,
 }
 
@@ -28,6 +29,7 @@ pub struct RunningAnalysis<'a> {
     owner: &'a AnalysisTasks,
     id: String,
     pub cancel: watch::Receiver<bool>,
+    pub pause: media_runtime::supervisor::PauseControl,
 }
 
 fn failure(code: &str, message: &str) -> AppError {
@@ -62,6 +64,7 @@ impl AnalysisTasks {
             Task {
                 cancel,
                 started: false,
+                pause: Default::default(),
                 created: Instant::now(),
             },
         );
@@ -94,7 +97,24 @@ impl AnalysisTasks {
             owner: self,
             id: id.to_owned(),
             cancel: task.cancel.subscribe(),
+            pause: task.pause.clone(),
         })
+    }
+
+    pub fn set_paused(&self, id: &str, paused: bool) -> Result<(), AppError> {
+        let control = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let task = tasks
+                .get(id)
+                .filter(|task| task.started && !*task.cancel.borrow())
+                .ok_or_else(|| {
+                    failure("ANALYSIS_NOT_RUNNING", "This utility is no longer running.")
+                })?;
+            task.pause.clone()
+        };
+        control
+            .set_paused(paused)
+            .map_err(|cause| AppError::new("PAUSE_FAILED", cause.to_string(), None))
     }
 
     pub fn cancel(&self, id: &str) {

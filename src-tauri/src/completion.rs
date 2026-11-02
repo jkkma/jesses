@@ -285,7 +285,7 @@ pub fn start(app: tauri::AppHandle) {
     });
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn shutdown() -> Result<std::process::Child, String> {
     #[cfg(windows)]
     let mut command = {
@@ -304,6 +304,12 @@ fn shutdown() -> Result<std::process::Child, String> {
         c.arg("poweroff");
         c
     };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("/usr/bin/osascript");
+        command.args(["-e", "tell application \"System Events\" to shut down"]);
+        command
+    };
     command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -311,9 +317,9 @@ fn shutdown() -> Result<std::process::Child, String> {
         .map_err(|e| e.to_string())
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn shutdown() -> Result<std::process::Child, String> {
-    Err("Shutdown is supported on Windows and Linux.".into())
+    Err("Shutdown is supported on Windows, Linux and macOS.".into())
 }
 
 #[cfg(test)]

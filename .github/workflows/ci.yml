@@ -18,6 +18,11 @@ jobs:
           node-version: '24'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: python3 scripts/test-ipc-registration.py
+      - run: python3 scripts/test-package-av1-codecs.py
+      - run: python3 scripts/test-package-macos.py
+      - run: python3 scripts/test-vapoursynth-linux-scorers.py
+      - run: python3 scripts/test-package-grav1synth.py
       - run: pnpm format:check
       - run: pnpm check
       - run: pnpm build
@@ -31,8 +36,8 @@ jobs:
         include:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-          # Linux native qualification is deferred. The guarded steps below are
-          # retained so the lane can be restored deliberately in the future.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -45,10 +50,13 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm cmake ninja-build pkg-config libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg svt-av1 x264 nasm cmake ninja-build meson pkg-config libclang-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
@@ -68,6 +76,12 @@ jobs:
       - name: Build the pinned mainline SVT qualification tool
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-svt.py
+      - name: Build the exact source grain provider and qualify every source film stock
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/build-package-grav1synth.py --destination "$RUNNER_TEMP/jesses-grav1synth"
+          echo "JESSES_GRAV1SYNTH=$RUNNER_TEMP/jesses-grav1synth/delivery/grav1synth" >> "$GITHUB_ENV"
+          JESSES_GRAV1SYNTH="$RUNNER_TEMP/jesses-grav1synth/delivery/grav1synth" cargo test -p media-runtime --test grain_provider --locked -- --ignored --nocapture
       - name: Verify actual FFmpeg, FFprobe, and standalone SVT-AV1 integration
         if: runner.os == 'Linux'
         run: |
@@ -86,7 +100,7 @@ jobs:
         if: runner.os == 'Linux'
         id: ffmpeg-dependencies
         run: |
-          dpkg-query -W -f='${binary:Package}=${Version}\n' gcc gcc-13 g++ g++-13 binutils make nasm pkg-config libc6-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev > "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
+          dpkg-query -W -f='${binary:Package}=${Version}\n' gcc gcc-13 g++ g++-13 binutils make nasm cmake ninja-build pkg-config libc6-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev > "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
           cat "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt"
           printf 'fingerprint=%s\n' "$(sha256sum "$RUNNER_TEMP/jesses-ffmpeg-dependencies.txt" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Cache the exact FFmpeg source build
@@ -94,7 +108,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ffmpeg-9.0.1
-          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg-${{ hashFiles('scripts/ci-install-ffmpeg.py') }}-${{ steps.ffmpeg-dependencies.outputs.fingerprint }}
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg-${{ hashFiles('scripts/ci-install-ffmpeg.py', 'scripts/build-package-ffmpeg-linux.py', 'scripts/package-ffmpeg-linux-lock.json') }}-${{ steps.ffmpeg-dependencies.outputs.fingerprint }}
       - name: Build the verified audio qualification tool pair
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-ffmpeg.py

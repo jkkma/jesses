@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)
     parser.add_argument("--require-media", action="store_true")
-    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge"])
+    parser.add_argument("--require-tool", action="append", default=[], choices=["x264", "svt-av1", "av1an", "aomenc", "vpxenc", "x265", "mkvmerge", "grav1synth"])
     args = parser.parse_args()
     probe = args.probe.resolve(strict=True)
     resources = comparable_path(args.resources)
@@ -42,7 +42,7 @@ def main():
             print(result.stderr, file=sys.stderr, end="")
             raise SystemExit(result.returncode)
         tools = json.loads(result.stdout)
-        expected = {"svt-av1-5fish", "svt-av1-hdr"}
+        expected = {"svt-av1", "svt-av1-5fish", "svt-av1-hdr"}
         expected.update(args.require_tool)
         if args.require_media:
             expected.update(("ffmpeg", "ffprobe"))
@@ -52,6 +52,13 @@ def main():
                 if not tool["available"] or not comparable_path(Path(tool["path"])).is_relative_to(resources):
                     raise ValueError(f"The {tool['id']} capability did not come from this package.")
                 found.add(tool["id"])
+                if tool["id"] == "svt-av1":
+                    manifest = json.loads((resources / "resources/tools/manifest.json").read_text())
+                    if manifest.get("sourceSvtProvider") != "svt-av1-hdr":
+                        raise ValueError("The package does not bind source SVT to its qualified HDR provider.")
+                    provider = next(record for record in manifest["tools"] if record["id"] == manifest["sourceSvtProvider"])
+                    if comparable_path(Path(tool["path"])) != comparable_path(resources / "resources/tools" / provider["path"]):
+                        raise ValueError("Source SVT discovery silently selected a different package encoder.")
         if found != expected:
             raise ValueError("The native probe did not report every required package tool.")
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prepare-command-edit"
+description = "Enables the prepare_command_edit command without any pre-configured scope."
+commands.allow = ["prepare_command_edit"]
+
+[[permission]]
+identifier = "deny-prepare-command-edit"
+description = "Denies the prepare_command_edit command without any pre-configured scope."
+commands.deny = ["prepare_command_edit"]

@@ -8,7 +8,7 @@ export type StandaloneRecoveryPhase = "passOneComplete" | "videoComplete" | "tim
 
 export type QtgmcSettings = { mode: DeinterlaceMode, fieldOrder: FieldOrder, preset: QtgmcPreset, };
 
-export type QtgmcPreset = "faster" | "fast" | "medium" | "slow" | "slower" | "verySlow";
+export type QtgmcPreset = "veryFast" | "faster" | "fast" | "medium" | "slow" | "slower" | "verySlow" | "placebo";
 
 export type CadenceRepairSettings = {
 /**
@@ -35,17 +35,73 @@ export type CompletionStatus = { options: CompletionOptions, armedJobs: number, 
 
 export type ImageOutput = "png" | "jpeg" | "pngSequence" | "jpegSequence" | "gif";
 
-export type ImagePixelFormat = "rgb24" | "rgba" | "rgb48" | "rgba64";
+export type ImagePixelFormat = "rgb24" | "rgba" | "rgb48" | "rgba64" | "yuv420p" | "yuv422p" | "yuv444p";
 
-export type ImageRequest = { "operation": "importSequence",
+export type ImageProcessingSettings = { metadata?: ImageExportMetadata, subtitleBurnIn?: ImageSubtitleSource, framing: VideoFraming, temporal?: TemporalSettings, trim?: VideoTrim, toneMap?: ToneMapSettings, filters?: Array<string>, sourceFilters?: boolean, };
+
+export type ImageSubtitleSource = { "source": "primary", streamIndex: number, } | { "source": "external", inputPath: string, streamIndex: number, offsetMilliseconds?: number, };
+
+export type ImageInputTrack = { inputIndex: number, streamIndex: number, };
+
+export type ImageImplicitAudioTrack = { source: ImageInputTrack,
+/**
+ * Source UI's resolved per-track channel count and channel-scaled bitrate.
+ */
+channels: number, bitrateKbps?: number, normalization?: AudioNormalization, };
+
+export type ImageImplicitAudio = { "mode": "strip" } | { "mode": "copy" } | { "mode": "encode", codec: AudioCodec, tracks: Array<ImageImplicitAudioTrack>, };
+
+export type ImageImplicitSubtitle = "copy" | "strip" | "movText" | "subRip" | "webVtt";
+
+export type ImageImplicitTrackMetadata = { title?: string, language?: string, };
+
+export type ImageImplicitMetadata = { sourceInput?: number, chaptersInput?: number, attachmentInputs: Array<number>, title?: string, language?: string, tracks: Array<ImageImplicitTrackMetadata>, audioDispositions: Array<boolean>, subtitleDispositions: Array<boolean>, };
+
+export type ImageExportMetadata = { inputs: Array<string>, options: ImageImplicitMetadata, };
+
+export type OutputTarget = { "kind": "container", format: ContainerFormat, } | { "kind": "image", format: ImageOutput, };
+
+export type OutputPathRequest = { inputPath: string,
+/**
+ * Literal extensionless output-box value; an embedded extension is retained.
+ */
+outputStem?: string, defaultOutputDirectory?: string, target: OutputTarget, };
+
+export type OutputPathResolution = { outputStem: string, outputPath: string, isDirectory: boolean, numbered: boolean, };
+
+export type ImageRequest = { "operation": "implicitExport", inputs: Array<string>, checked: Array<ImageInputTrack>, currentInput: number, format: ImageOutput, outputPath: string, audio?: ImageImplicitAudio, subtitleCodec?: ImageImplicitSubtitle, metadata?: ImageImplicitMetadata, trim?: VideoTrim,
+/**
+ * Source ChainKeepsFrameCount; it controls only frame-mode trim.
+ */
+keepFrameCount?: boolean, } | { "operation": "importSequence",
 /**
  * Explicit presentation order, independent of the source filenames.
  */
-paths: Array<string>, frameRate: FrameRate, outputPath: string, } | { "operation": "export", inputPath: string, streamIndex: number, startFrame: number, frameCount: number, format: ImageOutput, outputPath: string, width: number | null, pixelFormat?: ImagePixelFormat, };
+paths: Array<string>, frameRate: FrameRate, outputPath: string, } | { "operation": "export", inputPath: string, streamIndex: number, startFrame?: number, frameCount?: number,
+/**
+ * Export every frame after the optional shared picture processing.
+ */
+fullSource?: boolean, format: ImageOutput, outputPath: string, width: number | null, pixelFormat?: ImagePixelFormat,
+/**
+ * GIF palette 3–256 (default 128); JPEG quality 1–31 (default 3).
+ */
+quality?: number, processing?: ImageProcessingSettings, };
 
 export type ImageResult = { outputPath: string, frameCount: number, width: number, height: number, notes: Array<string>, };
 
 export type UtilityRequest = { "kind": "keyframeCut", "request": KeyframeCutRequest } | { "kind": "concat", "request": ConcatRequest } | { "kind": "colorMetadataTransfer", "request": ColorMetadataTransferRequest } | { "kind": "subtitleOcr", "request": SubtitleOcrRequest } | { "kind": "grain", "request": GrainRequest } | { "kind": "crfLadder", "request": CrfLadderRequest } | { "kind": "deinterlaceExport", "request": DeinterlaceExportRequest } | { "kind": "cadenceRepairExport", "request": CadenceRepairExportRequest };
+
+export type UtilityProgress = { rowIndex: number | null, rowCount: number, completedRows: number,
+/**
+ * running, succeeded, failed or skipped.
+ */
+status: string, phase: string, message: string, elapsedSeconds: number, progressSeconds: number | null, durationSeconds: number | null, estimatedRemainingSeconds: number | null, };
+
+export type UtilityBatchRequest = { requests: Array<UtilityRequest>, };
+
+export type UtilityBatchResult = { entries: Array<UtilityBatchEntry>, completed: number, canceled: boolean, };
+
+export type UtilityBatchEntry = { index: number, request: UtilityRequest, result?: UtilityResult, error?: AppError, };
 
 export type UtilityResult = { "kind": "artifact", "result": UtilityArtifact } | { "kind": "subtitleOcr", "result": SubtitleOcrResult } | { "kind": "grainTable", "result": GrainTableResult } | { "kind": "crfLadder", "result": CrfLadderResult };
 
@@ -66,7 +122,11 @@ export type ColorMetadataTransferRequest = {
 /**
  * Supplies the color declaration. Encoded packets are taken from input_path.
  */
-metadataSourcePath: string, metadataSourceVideoStreamIndex: number, inputPath: string, inputVideoStreamIndex: number, outputPath: string, };
+metadataSourcePath: string, metadataSourceVideoStreamIndex: number, inputPath: string, inputVideoStreamIndex: number, outputPath?: string, copyColor?: boolean, copyHdr?: boolean, inPlace?: boolean, };
+
+export type ColorMetadataInspectionRequest = { inputPath: string, videoStreamIndex: number, };
+
+export type ColorMetadataReport = { inputPath: string, videoStreamIndex: number, color: { [key in string]: string }, hdr: { [key in string]: string }, dolbyVisionProfile: number | null, dolbyVisionCompatibility: number | null, sourceFingerprint: string, summary: string, };
 
 export type SubtitleOcrRequest = { inputPath: string, subtitleStreamIndex: number,
 /**
@@ -74,11 +134,11 @@ export type SubtitleOcrRequest = { inputPath: string, subtitleStreamIndex: numbe
  */
 language: string, outputPath: string, };
 
-export type GrainRequest = { "operation": "measure", sourcePath: string, denoisedPath: string, outputTablePath: string, } | { "operation": "extract", inputPath: string, outputTablePath: string, } | { "operation": "apply", inputPath: string, outputPath: string, source: GrainSource, } | { "operation": "rewriteHeaders", inputPath: string, outputPath: string, source: GrainSource, } | { "operation": "remove", inputPath: string, outputPath: string, };
+export type GrainRequest = { "operation": "measureSource", sourcePath: string, outputTablePath: string, denoiseStrength: number, denoisedOutputPath?: string, } | { "operation": "measure", sourcePath: string, denoisedPath: string, outputTablePath: string, } | { "operation": "extract", inputPath: string, outputTablePath: string, } | { "operation": "apply", inputPath: string, outputPath: string, source: GrainSource, } | { "operation": "rewriteHeaders", inputPath: string, outputPath: string, source: GrainSource, } | { "operation": "remove", inputPath: string, outputPath: string, };
 
 export type GrainSource = { "kind": "table", tablePath: string, } | { "kind": "preset", preset: string, } | { "kind": "photonNoise", iso: number, chroma: boolean, };
 
-export type LadderEncoder = "h264" | "hevc" | "av1" | "vp9";
+export type LadderEncoder = "h264" | "hevc" | "av1" | "vp9" | "aomAv1" | "h264Nvenc" | "hevcNvenc";
 
 export type LadderMetric = "none" | "psnr" | "ssim" | "vmaf" | "ssimulacra2" | "butteraugliInf" | "xpsnrWeighted";
 
@@ -90,11 +150,25 @@ preset: string, pixelFormat: string, crfs: Array<number>, sampleCount: number, s
 /**
  * When absent, a documented metric default is used. Ignored for `none`.
  */
-recommendationThreshold: number | null, };
+recommendationThreshold: number | null,
+/**
+ * Human-readable content-preset identity, retained with the result.
+ */
+contentPreset?: string,
+/**
+ * Encoder-native content controls; unsupported fork controls are reported.
+ */
+parameters?: Array<EncoderParameter>, vmafModel?: QualityVmafModel,
+/**
+ * A new directory for validated references and encoded samples.
+ */
+keepSamplesDirectory?: string, };
 
 export type DeinterlaceExportMethod = "qtgmc" | "bwdif" | "yadif";
 
 export type DeinterlaceExportRequest = { inputPath: string, outputPath: string, videoStreamIndex: number, method: DeinterlaceExportMethod, mode: DeinterlaceMode, fieldOrder: FieldOrder, qtgmcPreset: QtgmcPreset, };
+
+export type DeinterlaceResolution = { request?: DeinterlaceExportRequest, message: string, };
 
 export type CadenceRepairExportRequest = { inputPath: string, outputPath: string, videoStreamIndex: number, };
 
@@ -106,15 +180,29 @@ sizeBytes: string, durationSeconds: number | null, sourceFingerprints: Array<str
 
 export type SubtitleOcrResult = { outputPath: string, cueCount: number, language: string, sourceFingerprint: string, message: string, diagnostics: Array<string>, };
 
-export type GrainTableResult = { outputPath: string, segmentCount: number, sourceFingerprints: Array<string>, message: string, diagnostics: Array<string>, };
+export type GrainTableResult = { outputPath: string,
+/**
+ * Measured table bytes only; a retained denoised video is separate.
+ */
+sizeBytes?: string, segmentCount: number, sourceFingerprints: Array<string>, message: string, diagnostics: Array<string>, denoisedOutputPath?: string, };
 
-export type CrfLadderResult = { encoder: LadderEncoder, preset: string, metric: LadderMetric, sourceDurationSeconds: number, sourceSizeBytes: string, sampledSeconds: number, sampledFraction: number, rungs: Array<CrfLadderRung>, recommendationThreshold: number | null, recommendedCrf: number | null, sourceFingerprint: string, message: string, diagnostics: Array<string>, };
+export type CrfLadderResult = { encoder: LadderEncoder, preset: string, metric: LadderMetric, sourceDurationSeconds: number, sourceSizeBytes: string, sampledSeconds: number, sampledFraction: number, rungs: Array<CrfLadderRung>, recommendationThreshold: number | null, recommendedCrf: number | null, sourceFingerprint: string, message: string, diagnostics: Array<string>, contentPreset?: string, parameters: Array<EncoderParameter>, vmafModel: QualityVmafModel, samplesDirectory?: string,
+/**
+ * Complete recursively measured retained directory, only on success.
+ */
+samplesSizeBytes?: string, };
 
 export type CrfLadderRung = { crf: number, encodedBytes: string, encodedSeconds: number, bitrateKbps: number, bytesPerMinute: string, projectedSizeBytes: string, score: number | null, encodeSeconds: number, };
 
 export type ToolInfo = { id: string, name: string, available: boolean, path: string | null, version: string | null, detail: string | null, };
 
-export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, };
+export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
+
+export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean, };
+
+export type ConsoleWindowMode = "hidden" | "visible" | "visibleStayOpen";
+
+export type ResetOnNewFilePreferences = { trim: boolean, frameRate: boolean, resize: boolean, crop: boolean, borders: boolean, deinterlace: boolean, toneMap: boolean, customFilters: boolean, };
 
 export type UserPreferences = { general: GeneralPreferences, recentPaths: Array<string>, revision: number, parameterPresets?: Array<EncoderParameterPreset>, };
 
@@ -166,13 +254,27 @@ export type MediaFile = {
  */
 id: string, path: string, name: string,
 /**
+ * The original folder identity; `path` remains the guarded processing source.
+ */
+source?: MediaSource,
+/**
  * Decimal text preserves byte counts beyond JavaScript's safe integer range.
  */
-sizeBytes: string, durationSeconds: number | null, format: string | null, title?: string, language?: string,
+sizeBytes: string,
+/**
+ * File modification time as signed Unix milliseconds. Unknown for sequences.
+ */
+modifiedAtMs?: number, durationSeconds: number | null, format: string | null, title?: string, language?: string,
 /**
  * Reported bits per second, kept as decimal text without JS rounding.
  */
 bitRate?: string, streams: Array<MediaStream>, };
+
+export type MediaSource = { "kind": "imageSequence", directoryPath: string, frameRate: FrameRate, extension: string, frameCount: number, sequenceFingerprint: string, };
+
+export type ImageSequenceImportRequest = { directoryPath: string, frameRate: FrameRate, };
+
+export type ImageSequenceReleaseRequest = { inputPath: string, sequenceFingerprint: string, };
 
 export type AppError = { code: string, message: string, path: string | null, };
 
@@ -208,6 +310,16 @@ export type AutoCropResult = {
  * None means that the samples did not establish a usable crop.
  */
 crop: CropSettings | null, sourceWidth: number, sourceHeight: number, sampleCount: number, sampledFrames: number, agreementPercent: number, sourceFingerprint: string, message: string, };
+
+export type KeyframeSnapRequest = { inputPath: string, videoStreamIndex: number, positionSeconds: number, };
+
+export type KeyframeSnapResult = { positionSeconds: number | null, sourceFingerprint: string, };
+
+export type FieldDetectionRequest = { inputPath: string, videoStreamIndex: number, };
+
+export type FieldDetectionResult = { order: DetectedFieldOrder, telecined: boolean, sampledFrames: number, topFirstFrames: number, bottomFirstFrames: number, progressiveFrames: number, undeterminedFrames: number, fieldGapRatio: number | null, sourceFingerprint: string, evidence: string, };
+
+export type DetectedFieldOrder = "progressive" | "topFirst" | "bottomFirst" | "undetermined";
 
 export type BitrateRequest = { inputPath: string, streamIndex: number,
 /**
@@ -257,7 +369,11 @@ export type QualityPoint = { frame: number,
  */
 score: number | null, };
 
-export type QualityRequest = { referencePath: string, referenceStreamIndex: number, referenceStartFrame: number, candidatePath: string, candidateStreamIndex: number, candidateStartFrame: number, frameCount: number, metric: QualityMetric, options?: QualityOptions, };
+export type QualityRequest = { referencePath: string, referenceStreamIndex: number, referenceStartFrame?: number, candidatePath: string, candidateStreamIndex: number, candidateStartFrame?: number, frameCount?: number,
+/**
+ * Compare the complete paired decoded timelines, without estimating count.
+ */
+fullSource?: boolean, metric: QualityMetric, options?: QualityOptions, };
 
 export type QualityResult = { metric: QualityMetric, frameCount: number, score: number | null, points: Array<QualityPoint>, referenceFingerprint: string, candidateFingerprint: string, model: string | null, message: string, };
 
@@ -271,11 +387,13 @@ export type DeinterlaceMode = "frame" | "bob";
 
 export type FieldOrder = "topFirst" | "bottomFirst";
 
-export type DeinterlaceSettings = { mode: DeinterlaceMode, fieldOrder: FieldOrder, };
+export type DeinterlaceSettings = { engine?: DeinterlaceEngine, mode: DeinterlaceMode, fieldOrder: FieldOrder, };
+
+export type DeinterlaceEngine = "bwdif" | "yadif";
 
 export type FrameRate = { numerator: number, denominator: number, };
 
-export type ResizeFilter = "nearest" | "bilinear" | "bicubic" | "lanczos";
+export type ResizeFilter = "nearest" | "bilinear" | "bicubic" | "spline" | "area" | "lanczos";
 
 export type TemporalSettings = { deinterlace?: DeinterlaceSettings,
 /**
@@ -304,7 +422,18 @@ export type Av1anTargetMetric = "vmaf" | "ssimulacra2" | "butteraugli" | "xpsnr"
 
 export type Av1anTargetQuality = { metric: Av1anTargetMetric, minimumScoreTenths: number, maximumScoreTenths: number, minimumCrf: number, maximumCrf: number, probes: number, probingRate: number, probeWidth: number, probeHeight: number, };
 
-export type Av1anOptions = { chunkMethod: Av1anChunkMethod, splitMethod: Av1anSplitMethod, sceneDetection: Av1anSceneDetection, maximumChunkFrames: number, minimumSceneFrames: number, sceneDownscaleHeight: number | null, chunkOrder: Av1anChunkOrder, encoderThreads?: number, pixelFormat?: Av1anPixelFormat, maxTries?: number, sceneDetectionSlices?: number, concatMethod?: Av1anConcatMethod, attachSettings?: boolean, targetQuality?: Av1anTargetQuality, };
+export type Av1anOptions = { chunkMethod: Av1anChunkMethod, splitMethod: Av1anSplitMethod, sceneDetection: Av1anSceneDetection, maximumChunkFrames: number, minimumSceneFrames: number, sceneDownscaleHeight: number | null, chunkOrder: Av1anChunkOrder, encoderThreads?: number, pixelFormat?: Av1anPixelFormat, maxTries?: number, sceneDetectionSlices?: number, concatMethod?: Av1anConcatMethod, attachSettings?: boolean,
+/**
+ * Source UI leaves search bounds, probe count/sampling/resolution and
+ * statistic/parameter-copy policy to the qualified AV1AN engine.
+ */
+sourceTargetDefaults?: boolean,
+/**
+ * Source UI derives chunk length from typed output rate/keyframe seconds
+ * and leaves scene-only defaults to the engine. Explicit native options
+ * retain their historical meaning when this compatibility marker is false.
+ */
+sourceWorkflow?: boolean, targetQuality?: Av1anTargetQuality, };
 
 export type Av1anGrainSettings = {
 /**
@@ -318,7 +447,11 @@ export type ToneMapBackend = "cpu" | "auto" | "gpu";
 
 export type ToneMapPeakMode = "manual" | "measured";
 
-export type ToneMapSettings = { algorithm?: ToneMapAlgorithm,
+export type ToneMapSettings = {
+/**
+ * Source UI permits a compatible HDR10 base-layer CPU fallback.
+ */
+sourceWorkflow?: boolean, algorithm?: ToneMapAlgorithm,
 /**
  * Signal peak relative to the fixed 100-nit SDR target.
  */
@@ -342,7 +475,7 @@ offsetMilliseconds?: number,
 /**
  * Omission copies the selected subtitle without changing its format.
  */
-subtitleMode?: SubtitleMode,
+subtitleMode?: SubtitleMode, subtitleBurnIn?: boolean,
 /**
  * None preserves each tag/disposition; empty title or language clears it.
  */
@@ -352,7 +485,11 @@ export type EncodeTrackOverride = { streamIndex: number, title?: string, languag
 
 export type EncodeTrackRef = { inputPath?: string, streamIndex: number, };
 
-export type ExternalAudioSettings = { codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain, };
+export type ExternalAudioSettings = { codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain,
+/**
+ * Measured two-pass normalization, performed over the immutable job span.
+ */
+normalization?: AudioNormalization, };
 
 export type MuxSource = { id: string, inputPath: string, };
 
@@ -364,23 +501,37 @@ title?: string | null, language?: string | null, default?: boolean | null, force
 
 export type MuxRequest = { sources: Array<MuxSource>, tracks: Array<MuxTrack>, metadataSourceId: string, chaptersSourceId: string | null, outputPath: string, };
 
-export type ContainerFormat = "matroska" | "mp4" | "mov" | "webm";
+export type ContainerFormat = "matroska" | "mp4" | "mov" | "webm" | "m4a" | "ogg";
 
-export type VideoRateControl = { "mode": "bitrate", bitrateKbps: number, twoPass: boolean, } | { "mode": "targetSize", targetSizeMib: number, };
+export type VideoRateControl = { "mode": "bitrate", bitrateKbps: number, twoPass: boolean, } | { "mode": "targetSize", targetSizeMib: number, } | { "mode": "targetSizeDecimal", targetSizeTenthsMb: number, };
 
-export type SubtitleMode = "copy" | "subRip" | "ass" | "webVtt" | "burnIn";
+export type SubtitleMode = "copy" | "movText" | "subRip" | "ass" | "webVtt" | "burnIn";
 
 export type SubtitleTrackSettings = {
 /**
  * Original subtitle stream index in the selected source file.
  */
-streamIndex: number, mode: SubtitleMode, };
+streamIndex: number, mode: SubtitleMode,
+/**
+ * Render this track as well as retaining its selected output mode.
+ */
+burnIn?: boolean, };
 
 export type AudioCodec = "copy" | "opus" | "aac" | "flac" | "mp3" | "vorbis" | "eac3";
 
-export type AudioChannels = "preserve" | "mono" | "stereo" | "surround51" | "surround71";
+export type AudioChannels = "preserve" | "mono" | "stereo" | "surround51" | "surround71" | { "explicit": { count: number, layout: AudioChannelLayoutPolicy, } };
 
-export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain, };
+export type AudioChannelLayoutPolicy = "source" | "standard" | "ffmpegDefault";
+
+export type AudioNormalization = { target: LoudnessTarget, };
+
+export type LoudnessTarget = "lufs14" | "lufs16" | "lufs23";
+
+export type AudioTrackSettings = { streamIndex: number, codec: AudioCodec, bitrateKbps: number, channels: AudioChannels, gain?: AudioGain,
+/**
+ * Measured two-pass normalization, performed over the immutable job span.
+ */
+normalization?: AudioNormalization, };
 
 export type AudioGain = { tenthsDb: number,
 /**
@@ -398,7 +549,25 @@ export type CropSettings = { top: number, right: number, bottom: number, left: n
 
 export type BorderSettings = { top: number, right: number, bottom: number, left: number, };
 
-export type VideoFraming = { crop: CropSettings,
+export type VideoMode = "encode" | "copy" | "drop";
+
+export type ResizeMode = "fit" | "height" | "width" | "percent" | "exact";
+
+export type ResizeFill = "pad" | "crop" | "stretch";
+
+export type ResizeSettings = { mode: ResizeMode, width: number, height: number, percent: number, fill: ResizeFill, modulus: number, allowUpscale: boolean, correctAspect: boolean, };
+
+export type BorderRatio = { width: number, height: number, };
+
+export type VideoFraming = {
+/**
+ * Source-relative resize intent; takes precedence over legacy resize_width.
+ */
+resize?: ResizeSettings,
+/**
+ * Pad to a target display ratio after resizing, before explicit borders.
+ */
+borderRatio?: BorderRatio, crop: CropSettings,
 /**
  * Keep the cropped dimensions when omitted; otherwise preserve their aspect ratio.
  */
@@ -415,7 +584,9 @@ export type VideoTrim = { startFrame: number, endFrameExclusive: number,
  */
 time?: VideoTimeTrim, };
 
-export type VideoTimeTrim = { startMilliseconds: number, endMilliseconds: number, };
+export type VideoTimeTrim = { startMilliseconds: number, endMilliseconds: number, seekStrategy?: VideoSeekStrategy, };
+
+export type VideoSeekStrategy = "inputSeek" | "decodeFromStart";
 
 export type EncoderParameter = { name: string, value: string, };
 
@@ -433,12 +604,52 @@ export type EncodeCommandStage = { label: string, executable: string, arguments:
 
 export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
 
-export type EncodeSettings = {
+export type CommandEditRequest = { "kind": "encode", request: EncodeRequest, } | { "kind": "image", request: ImageRequest, } | { "kind": "resumeSaved", id: string, } | { "kind": "resumeNew", id: string, settings: EncodeSettings, };
+
+export type CommandEditReview = { id: string, executableLabel: string, arguments: string, outputPath: string, job?: JobSnapshot, };
+
+export type CommandEditConfirmation = { id: string, arguments: string, };
+
+export type CommandEditResult = { "kind": "encode", job: JobSnapshot, } | { "kind": "image", result: ImageResult, };
+
+export type EditedCommand = { generated: string, arguments: string, };
+
+export type HdrChromaticity = {
+/**
+ * CIE x in units of 1/50000.
+ */
+x: number,
+/**
+ * CIE y in units of 1/50000.
+ */
+y: number, };
+
+export type HdrMasteringDisplay = { red: HdrChromaticity, green: HdrChromaticity, blue: HdrChromaticity, whitePoint: HdrChromaticity, maxLuminanceTenThousandths: number, minLuminanceTenThousandths: number, };
+
+export type HdrContentLight = { maxContent: number, maxAverage: number, };
+
+export type HdrMetadataSettings = { masteringDisplay?: HdrMasteringDisplay, contentLight?: HdrContentLight, dolbyVisionRpuPath?: string, hdr10PlusJsonPath?: string, };
+
+export type OutputMetadata = {
+/**
+ * Omission inherits the selected donor; an empty value clears the tag.
+ */
+title?: string, language?: string, };
+
+export type EncodeSettings = { encodingPreferences?: EncodingPreferences, hdrMetadata?: HdrMetadataSettings,
+/**
+ * Encode the selected video, copy it unchanged, or produce audio-only output.
+ */
+videoMode?: VideoMode,
 /**
  * Additional audio, subtitles and attachments; picture processing stays
  * with the primary video. Metadata and chapter donors are selected below.
  */
 externalTracks?: Array<ExternalTrack>, trackOverrides?: Array<EncodeTrackOverride>, trackOrder?: Array<EncodeTrackRef>, metadataSourcePath?: string, chaptersSourcePath?: string,
+/**
+ * False selects the source UI's None donor. Omission preserves old jobs.
+ */
+copyMetadata?: boolean, copyChapters?: boolean, outputMetadata?: OutputMetadata,
 /**
  * A real QuickTime tmcd data stream copied only into a final MOV file.
  */
@@ -448,13 +659,21 @@ movTimecodeTrack?: EncodeTrackRef, parameters?: Array<EncoderParameter>, tempora
  */
 outputPixelFormat?: Av1anPixelFormat, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>,
 /**
+ * Source rows are opaque FFmpeg graphs, with source per-chunk semantics.
+ */
+sourceFilters?: boolean,
+/**
  * Omission preserves constant-quality encoding and old saved jobs.
  */
 rateControl?: VideoRateControl, toneMap?: ToneMapSettings,
 /**
  * Zero-based start and exclusive end frames. Omission retains the full source.
  */
-trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>,
+trim?: VideoTrim,
+/**
+ * Apply the fork's packet-granular copied-track seek window. This does not enable trimming.
+ */
+sourceTrim?: boolean, subtitles?: Array<SubtitleTrackSettings>,
 /**
  * Per-source framing, applied before video encoding.
  */
@@ -462,7 +681,16 @@ framing: VideoFraming,
 /**
  * Per-source-track overrides; omitted selected audio streams are copied.
  */
-audio: Array<AudioTrackSettings>, backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number, crf: number, preset: number,
+audio: Array<AudioTrackSettings>, backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number,
+/**
+ * NVENC constant-QP mode. Omission preserves the historical CRF/CQ mode.
+ */
+constantQuantizer?: number,
+/**
+ * Compatibility-only former hardware profile marker. Historical jobs
+ * remain readable; active hardware video encoding is unsupported.
+ */
+sourceNvencQuality?: boolean, crf: number, preset: number,
 /**
  * Explicit codec lossless mode. Omission keeps historical lossy behavior.
  */
@@ -503,20 +731,78 @@ export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest,
  * Present only for multi-source remux. The ordinary request is a display
  * summary; this mapping is the immutable execution authority.
  */
-muxRequest?: MuxRequest | null, encodeSettings: EncodeSettings | null, recovery: Av1anRecovery | null, standaloneRecovery?: StandaloneRecovery | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+muxRequest?: MuxRequest | null, encodeSettings: EncodeSettings | null, editedCommand?: EditedCommand, recovery: Av1anRecovery | null, standaloneRecovery?: StandaloneRecovery | null,
+/**
+ * Unique input file bytes observed when execution starts, as decimal text.
+ */
+inputSizeBytes?: string | null,
+/**
+ * Verified output file bytes captured only after successful publication.
+ */
+outputSizeBytes?: string | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+
+export type Av1anRecoveryAction = { "action": "deleteEncode", id: string, } | { "action": "deleteChunks", id: string, } | { "action": "resumeSaved", id: string, } | { "action": "resumeNew", id: string, settings: EncodeSettings, } | { "action": "clearAll", ids: Array<string>, };
+
+export type Av1anRecoveryActionResult = { jobs: Array<JobSnapshot>, };
+
+export type Av1anRecoveryEntry = { job: JobSnapshot,
+/**
+ * Decimal bytes avoid losing precision in JavaScript.
+ */
+encodedBytes: string, chunkCount: number,
+/**
+ * Unix milliseconds; old records with no known timestamp remain unknown.
+ */
+createdAt: number | null, lastRunAt: number | null, };
 
 export type FolderScanRequest = { path: string, recursive: boolean, };
 
 export type FolderScanResult = { paths: Array<string>, errors: Array<AppError>, skippedCount: number, truncated: boolean, };
 
-export type BatchEncodeInput = { temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+export type BatchEncodeInput = {
+/**
+ * Quick's per-file mapped video presence; omitted keeps the batch mode.
+ */
+videoMode?: VideoMode, temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
 
-export type BatchEncodeRequest = { parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputPixelFormat?: Av1anPixelFormat, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>, outputDirectory: string, outputNameTemplate?: string,
+export type BatchNamingValues = { codec: string, quality: string, preset: string, };
+
+export type BatchOutputPathInput = { inputPath: string,
+/**
+ * Dimensions of the source's first video track, as loaded by the UI.
+ */
+width?: number, height?: number, };
+
+export type BatchOutputPathRequest = { inputs: Array<BatchOutputPathInput>, target: OutputTarget, naming: BatchNamingValues, outputNameTemplate?: string, namingDate?: string, defaultOutputDirectory?: string, };
+
+export type BatchOutputPathItem = { inputPath: string, resolution?: OutputPathResolution, error?: AppError, };
+
+export type BatchOutputPaths = { items: Array<BatchOutputPathItem>, };
+
+export type BatchEncodeRequest = { copyMetadata?: boolean, copyChapters?: boolean,
+/**
+ * Source-compatible filename values. Omission retains legacy API naming.
+ */
+sourceNaming?: BatchNamingValues, encodingPreferences?: EncodingPreferences, hdrMetadata?: HdrMetadataSettings, videoMode?: VideoMode, parameters?: Array<EncoderParameter>, av1anOptions?: Av1anOptions, outputPixelFormat?: Av1anPixelFormat, av1anGrain?: Av1anGrainSettings, av1anFilters?: Array<string>, sourceFilters?: boolean, outputContainer?: ContainerFormat, rateControl?: VideoRateControl, backend: EncodeBackend, encoder: VideoEncoder, workers: number, inputs: Array<BatchEncodeInput>,
+/**
+ * With sourceNaming this is the configured default folder: empty/missing
+ * directories fall back beside each original source. Legacy calls require
+ * one existing output folder for the whole batch.
+ */
+outputDirectory: string, outputNameTemplate?: string,
 /**
  * Local calendar date captured once when the batch preview is requested.
  * It is required only when the filename template contains `{date}`.
  */
-namingDate?: string, crf: number, preset: number, lossless: boolean, svtCrfQuarterSteps?: number, svtPreset?: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
+namingDate?: string,
+/**
+ * Compatibility-only legacy quantizer field; hardware encoding is unsupported.
+ */
+constantQuantizer?: number,
+/**
+ * Compatibility-only marker for retired source hardware-encoder jobs.
+ */
+sourceNvencQuality?: boolean, sourceTrim?: boolean, crf: number, preset: number, lossless: boolean, svtCrfQuarterSteps?: number, svtPreset?: number, filmGrain: number, lineartPsyBias: number, texturePsyBias: number, hdrTune: HdrTune, hdr10Fallback: boolean, };
 
 export type BatchEncodeItem = { inputPath: string, outputPath: string | null, request: EncodeRequest | null, error: AppError | null, };
 
