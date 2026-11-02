@@ -26,7 +26,13 @@ fn canceled() -> AppError {
     )
 }
 
-fn expected_bytes(width: u32, height: u32, bit_depth: u8, frames: usize) -> Result<u64, AppError> {
+fn expected_bytes(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    frames: usize,
+    chroma: u16,
+) -> Result<u64, AppError> {
     if width == 0
         || height == 0
         || !width.is_multiple_of(2)
@@ -42,8 +48,21 @@ fn expected_bytes(width: u32, height: u32, bit_depth: u8, frames: usize) -> Resu
     let luma = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| failed("Lossless verification dimensions overflow.", None))?;
+    let chroma_samples = match chroma {
+        420 => luma / 2,
+        422 => luma,
+        444 => luma
+            .checked_mul(2)
+            .ok_or_else(|| failed("Lossless chroma sample count overflow.", None))?,
+        _ => {
+            return Err(failed(
+                "Lossless comparison requires a qualified planar420/422/444 output.",
+                None,
+            ));
+        }
+    };
     let samples = luma
-        .checked_add(luma / 2)
+        .checked_add(chroma_samples)
         .ok_or_else(|| failed("Lossless verification sample count overflow.", None))?;
     let bytes_per_sample = u64::from(bit_depth.div_ceil(8));
     let frame_bytes = samples
@@ -154,7 +173,7 @@ async fn pixel_digest(
     Ok(result.value)
 }
 
-/// Decode the reference and candidate to tightly packed planar 4:2:0 bytes and
+/// Decode the reference and candidate to their identical declared planar bytes and
 /// prove complete frame coverage and byte-for-byte pixel equality.
 pub(super) async fn verify(
     reference: &CommandSpec,
@@ -168,7 +187,48 @@ pub(super) async fn verify(
     if *cancel.borrow() {
         return Err(canceled());
     }
-    let expected = expected_bytes(width, height, bit_depth, frames)?;
+    fn declared(spec: &CommandSpec) -> Result<&str, AppError> {
+        spec.args
+            .windows(2)
+            .rfind(|pair| pair[0] == "-pix_fmt")
+            .and_then(|pair| pair[1].to_str())
+            .ok_or_else(|| {
+                failed(
+                    "The lossless decoder must declare its exact pixel layout.",
+                    Some(spec),
+                )
+            })
+    }
+    let layout = declared(reference)?;
+    if declared(candidate)? != layout {
+        return Err(failed(
+            "Lossless reference and candidate use different pixel layouts.",
+            Some(candidate),
+        ));
+    }
+    let prefix = match layout.get(..6) {
+        Some("yuv420") => 420,
+        Some("yuv422") => 422,
+        Some("yuv444") => 444,
+        _ => {
+            return Err(failed(
+                "Lossless comparison requires planar YUV420/422/444 decoder output.",
+                Some(reference),
+            ));
+        }
+    };
+    let expected_layout = if bit_depth == 8 {
+        format!("yuv{prefix}p")
+    } else {
+        format!("yuv{prefix}p{bit_depth}le")
+    };
+    if layout != expected_layout {
+        return Err(failed(
+            "The declared lossless pixel layout and bit depth disagree.",
+            Some(reference),
+        ));
+    }
+    let expected = expected_bytes(width, height, bit_depth, frames, prefix)?;
     let reference_digest = pixel_digest("lossless reference", reference, expected, cancel).await?;
     let candidate_digest = pixel_digest("lossless candidate", candidate, expected, cancel).await?;
     if reference_digest != candidate_digest {
@@ -230,6 +290,13 @@ mod tests {
     }
 
     const SOURCE: &str = "testsrc2=s=128x72:r=24:d=1,format=yuv420p10le";
+    #[test]
+    fn exact_plane_budgets_cover_subsampled_and_full_chroma() {
+        assert_eq!(expected_bytes(64, 64, 8, 2, 420).unwrap(), 12288);
+        assert_eq!(expected_bytes(64, 64, 8, 2, 422).unwrap(), 16384);
+        assert_eq!(expected_bytes(64, 64, 8, 2, 444).unwrap(), 24576);
+        assert_eq!(expected_bytes(64, 64, 10, 2, 444).unwrap(), 49152);
+    }
 
     #[test]
     fn rawvideo_rewrite_preserves_command_identity_and_working_directory() {

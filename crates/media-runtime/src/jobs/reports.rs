@@ -368,6 +368,7 @@ mod tests {
     fn report() -> AnalysisReport {
         AnalysisReport::Quality {
             request: QualityRequest {
+                full_source: false,
                 options: None,
                 reference_path: "=unsafe<source>\".mkv".into(),
                 reference_stream_index: 4,

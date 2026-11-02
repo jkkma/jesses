@@ -665,9 +665,9 @@ async fn records_cr_progress_and_flushes_partial_final_line() {
 
 #[tokio::test]
 async fn capture_accepts_exact_limit_and_rejects_excess() {
-    assert_eq!(capture(&b"abcd"[..], 4).await.unwrap(), b"abcd");
+    assert_eq!(capture(&b"abcd"[..], 4, false).await.unwrap(), b"abcd");
     assert!(matches!(
-        capture(&b"abcde"[..], 4).await,
+        capture(&b"abcde"[..], 4, false).await,
         Err(SupervisorError::OutputLimit)
     ));
 }

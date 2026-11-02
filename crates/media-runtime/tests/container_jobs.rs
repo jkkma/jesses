@@ -453,6 +453,7 @@ async fn quick_encode_trim_to_mp4_and_convert_imported_mp4_text_back_to_matroska
             encoder: media_core::VideoEncoder::X264,
             preset: 0,
             subtitles: vec![media_core::SubtitleTrackSettings {
+                burn_in: false,
                 stream_index: 1,
                 mode: media_core::SubtitleMode::SubRip,
             }],

@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+mod source_naming;
+pub use source_naming::{resolve_batch_output_paths, resolve_batch_output_paths_cancellable};
+
 const MAX_MEDIA: usize = 500;
 const MAX_ENTRIES: usize = 10_000;
 pub(crate) const MAX_BATCH: usize = 100;
@@ -533,6 +536,13 @@ fn quality_value(request: &BatchEncodeRequest) -> String {
             VideoRateControl::TargetSize { target_size_mib } => {
                 format!("{target_size_mib}MiB")
             }
+            VideoRateControl::TargetSizeDecimal {
+                target_size_tenths_mb,
+            } => format!(
+                "{}.{:01}MB",
+                target_size_tenths_mb / 10,
+                target_size_tenths_mb % 10
+            ),
         };
     }
     if let Some(target) = request
@@ -590,7 +600,13 @@ fn rendered_name(
     index: usize,
     total: usize,
 ) -> Result<String, AppError> {
-    let input = Path::new(&media.path);
+    let original = match &media.source {
+        Some(media_core::MediaSource::ImageSequence { directory_path, .. }) => {
+            directory_path.as_str()
+        }
+        None => media.path.as_str(),
+    };
+    let input = Path::new(original);
     let template = request
         .output_name_template
         .as_deref()
@@ -644,9 +660,9 @@ fn rendered_name(
             ));
         }
         let (replacement, source_name) = match token.to_ascii_lowercase().as_str() {
-            "name" => (safe_stem(input), true),
+            "name" => (if media.source.is_some(){safe_component(&media.name)}else{safe_stem(input)}, true),
             "ext" => (
-                sanitized_fragment(&input.extension().unwrap_or_default().to_string_lossy()),
+                match &media.source{Some(media_core::MediaSource::ImageSequence{..})=>String::new(),None=>sanitized_fragment(&input.extension().unwrap_or_default().to_string_lossy())},
                 false,
             ),
             "index" => (
@@ -777,9 +793,21 @@ pub(crate) async fn inspect_selection(
     settings: &EncodeSettings,
     epoch: u64,
 ) -> Result<MediaFile, AppError> {
+    inspect_selection_cancellable(manager, input, settings, epoch, None).await
+}
+
+async fn inspect_selection_cancellable(
+    manager: &crate::JobManager,
+    input: &BatchEncodeInput,
+    settings: &EncodeSettings,
+    epoch: u64,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<MediaFile, AppError> {
     let path = Path::new(&input.input_path);
     local_absolute(path)?;
-    if input.stream_indices.is_empty()
+    if (input.stream_indices.is_empty()
+        && (settings.video_mode == media_core::VideoMode::Encode
+            || settings.external_tracks.is_empty()))
         || input.stream_indices.iter().collect::<HashSet<_>>().len() != input.stream_indices.len()
     {
         return Err(error(
@@ -788,7 +816,32 @@ pub(crate) async fn inspect_selection(
             path,
         ));
     }
-    manager.inspect_encode_source(input, settings, epoch).await
+    manager
+        .inspect_encode_source(input, settings, epoch, cancel)
+        .await
+}
+
+/// Source per-file no-video snapshots discard inactive picture controls before
+/// any provider/geometry checks, even when every input omits video.
+pub(crate) fn clear_inactive_picture(settings: &mut EncodeSettings) {
+    settings.constant_quantizer = None;
+    settings.source_nvenc_quality = false;
+    settings.hdr_metadata = None;
+    settings.temporal = None;
+    settings.parameters.clear();
+    settings.av1an_options = None;
+    settings.output_pixel_format = None;
+    settings.av1an_grain = None;
+    settings.av1an_filters.clear();
+    settings.rate_control = None;
+    settings.tone_map = None;
+    settings.framing = Default::default();
+    for track in &mut settings.subtitles {
+        track.burn_in = false;
+        if track.mode == media_core::SubtitleMode::BurnIn {
+            track.mode = media_core::SubtitleMode::Copy;
+        }
+    }
 }
 
 pub(crate) async fn preview(
@@ -796,21 +849,42 @@ pub(crate) async fn preview(
     request: BatchEncodeRequest,
     mut reserved: HashSet<String>,
     epoch: u64,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<BatchEncodePreview, AppError> {
-    validate_batch_len(request.inputs.len())?;
-    let directory = PathBuf::from(&request.output_directory);
-    let directory = tokio::task::spawn_blocking(move || writable_directory(&directory))
-        .await
-        .map_err(|e| AppError::new("INVALID_OUTPUT", e.to_string(), None))??;
+    if request.source_naming.is_some() {
+        validate_source_batch_len(request.inputs.len())?;
+    } else {
+        validate_batch_len(request.inputs.len())?;
+    }
+    let directory = if request.source_naming.is_none() {
+        let directory = PathBuf::from(&request.output_directory);
+        Some(
+            tokio::task::spawn_blocking(move || writable_directory(&directory))
+                .await
+                .map_err(|e| AppError::new("INVALID_OUTPUT", e.to_string(), None))??,
+        )
+    } else {
+        None
+    };
     let total = request.inputs.len();
     let mut items = Vec::with_capacity(total);
     for (index, input) in request.inputs.clone().into_iter().enumerate() {
-        let settings = EncodeSettings {
+        check_source_preview_cancel(cancel.as_ref())?;
+        let mut settings = EncodeSettings {
+            constant_quantizer: request.constant_quantizer,
+            source_nvenc_quality: request.source_nvenc_quality,
+            source_trim: request.source_trim,
+            hdr_metadata: request.hdr_metadata.clone(),
+            encoding_preferences: request.encoding_preferences,
+            video_mode: input.video_mode.unwrap_or(request.video_mode),
             external_tracks: Vec::new(),
             track_overrides: Vec::new(),
             track_order: Vec::new(),
             metadata_source_path: None,
             chapters_source_path: None,
+            copy_metadata: request.copy_metadata,
+            copy_chapters: request.copy_chapters,
+            output_metadata: None,
             mov_timecode_track: None,
             temporal: input.temporal,
             parameters: request.parameters.clone(),
@@ -818,6 +892,7 @@ pub(crate) async fn preview(
             output_pixel_format: request.output_pixel_format,
             av1an_grain: request.av1an_grain.clone(),
             av1an_filters: request.av1an_filters.clone(),
+            source_filters: request.source_filters,
             rate_control: request.rate_control,
             tone_map: input.tone_map,
             trim: input.trim,
@@ -839,28 +914,65 @@ pub(crate) async fn preview(
             encoder: request.encoder,
             workers: request.workers,
         };
+        if input.video_mode.is_some() && settings.video_mode != media_core::VideoMode::Encode {
+            clear_inactive_picture(&mut settings);
+        }
         let mut item = BatchEncodeItem {
             input_path: input.input_path.clone(),
             output_path: None,
             request: None,
             error: None,
         };
-        match inspect_selection(manager, &input, &settings, epoch).await {
+        let inspected = if request.backend == EncodeBackend::Av1an
+            && settings.video_mode != media_core::VideoMode::Encode
+        {
+            Err(error(
+                "STREAM_SELECTION_INVALID",
+                "AV1AN requires one selected video for every source file.",
+                Path::new(&input.input_path),
+            ))
+        } else {
+            inspect_selection_cancellable(manager, &input, &settings, epoch, cancel.clone()).await
+        };
+        match inspected {
             Err(error) if matches!(error.code.as_str(), "BATCH_CANCELED" | "APP_CLOSING") => {
                 return Err(error);
             }
             Err(error) => item.error = Some(error),
             Ok(media) => {
-                match rendered_name(&request, &media, input.video_stream_index, index, total)
-                    .and_then(|stem| {
-                        reserve_output(
-                            &directory,
-                            Path::new(&media.path),
-                            &stem,
-                            request.output_container.unwrap_or_default(),
-                            &mut reserved,
-                        )
-                    }) {
+                let proposed = if let Some(naming) = &request.source_naming {
+                    let video = media.streams.iter().find(|stream| stream.kind == "video");
+                    source_naming::resolve_one(
+                        &media_core::BatchOutputPathInput {
+                            input_path: media.path.clone(),
+                            width: video.and_then(|stream| stream.width),
+                            height: video.and_then(|stream| stream.height),
+                        },
+                        media_core::OutputTarget::Container {
+                            format: request.output_container.unwrap_or_default(),
+                        },
+                        naming,
+                        request.output_name_template.as_deref(),
+                        request.naming_date.as_deref(),
+                        Some(&request.output_directory),
+                        index,
+                        total,
+                        &mut reserved,
+                    )
+                    .map(|resolution| PathBuf::from(resolution.output_path))
+                } else {
+                    rendered_name(&request, &media, input.video_stream_index, index, total)
+                        .and_then(|stem| {
+                            reserve_output(
+                                directory.as_ref().expect("legacy batch directory"),
+                                Path::new(&media.path),
+                                &stem,
+                                request.output_container.unwrap_or_default(),
+                                &mut reserved,
+                            )
+                        })
+                };
+                match proposed {
                     Err(error) => item.error = Some(error),
                     Ok(output) => {
                         let output_path = output.to_string_lossy().into_owned();
@@ -879,7 +991,21 @@ pub(crate) async fn preview(
         }
         items.push(item);
     }
+    check_source_preview_cancel(cancel.as_ref())?;
     Ok(BatchEncodePreview { items })
+}
+
+fn check_source_preview_cancel(
+    cancel: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), AppError> {
+    if cancel.is_some_and(|cancel| *cancel.borrow() || cancel.has_changed().is_err()) {
+        return Err(AppError::new(
+            "BATCH_CANCELED",
+            "This batch proposal was canceled before queue admission.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_batch_len(count: usize) -> Result<(), AppError> {
@@ -887,6 +1013,17 @@ pub(crate) fn validate_batch_len(count: usize) -> Result<(), AppError> {
         return Err(AppError::new(
             "BATCH_SIZE_INVALID",
             "Choose between 1 and 100 files for a batch.",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_batch_len(count: usize) -> Result<(), AppError> {
+    if count == 0 {
+        return Err(AppError::new(
+            "BATCH_INVALID",
+            "Choose at least one source file.",
             None,
         ));
     }
@@ -935,17 +1072,28 @@ mod tests {
         let input_path = path.to_string_lossy().into_owned();
         (
             BatchEncodeRequest {
+                copy_metadata: None,
+                copy_chapters: None,
+                source_naming: None,
+                encoding_preferences: None,
+                constant_quantizer: None,
+                source_nvenc_quality: false,
+                source_trim: false,
+                hdr_metadata: None,
+                video_mode: Default::default(),
                 parameters: Vec::new(),
                 av1an_options: None,
                 output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
+                source_filters: false,
                 output_container: None,
                 rate_control: None,
                 backend: EncodeBackend::Standalone,
                 encoder: VideoEncoder::SvtAv1FiveFish,
                 workers: 2,
                 inputs: vec![BatchEncodeInput {
+                    video_mode: None,
                     temporal: None,
                     tone_map: None,
                     trim: None,
@@ -976,12 +1124,14 @@ mod tests {
             },
             MediaFile {
                 id: "naming-fixture".into(),
+                source: None,
                 path: input_path,
                 name: path
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+                modified_at_ms: None,
                 size_bytes: "1".into(),
                 duration_seconds: Some(1.0),
                 format: None,
@@ -1029,6 +1179,26 @@ mod tests {
         )
     }
 
+    #[test]
+    fn sequence_batch_names_use_the_original_dotted_folder_and_no_cache_extension() {
+        let (mut request, mut media) = naming_fixture(Path::new("/cache/frames.mkv"));
+        media.name = "Sequence.v1".into();
+        media.source = Some(media_core::MediaSource::ImageSequence {
+            directory_path: "/pictures/Sequence.v1".into(),
+            frame_rate: media_core::FrameRate {
+                numerator: 30,
+                denominator: 1,
+            },
+            extension: "png".into(),
+            frame_count: 3,
+            sequence_fingerprint: "pinned".into(),
+        });
+        request.output_name_template = Some("{name}{ext}".into());
+        assert_eq!(
+            rendered_name(&request, &media, 3, 0, 1).unwrap(),
+            "Sequence.v1"
+        );
+    }
     #[test]
     fn naming_template_renders_case_insensitive_tokens_from_reviewed_settings() {
         let (mut request, media) = naming_fixture(Path::new("Episode One.MKV"));
@@ -1377,17 +1547,28 @@ mod tests {
         let fixture = Fixture::new();
         let manager = crate::JobManager::new(fixture.0.join("logs"));
         let request = BatchEncodeRequest {
+            copy_metadata: None,
+            copy_chapters: None,
+            source_naming: None,
+            encoding_preferences: None,
+            constant_quantizer: None,
+            source_nvenc_quality: false,
+            source_trim: false,
+            hdr_metadata: None,
+            video_mode: Default::default(),
             parameters: Vec::new(),
             av1an_options: None,
             output_pixel_format: None,
             av1an_grain: None,
             av1an_filters: Vec::new(),
+            source_filters: false,
             output_container: None,
             rate_control: None,
             lossless: false,
             svt_crf_quarter_steps: None,
             svt_preset: None,
             inputs: vec![BatchEncodeInput {
+                video_mode: None,
                 temporal: None,
                 tone_map: None,
                 trim: None,
@@ -1426,21 +1607,41 @@ mod tests {
         );
         for invalid in [
             BatchEncodeRequest {
+                copy_metadata: None,
+                copy_chapters: None,
+                source_naming: None,
+                encoding_preferences: None,
+                constant_quantizer: None,
+                source_nvenc_quality: false,
+                source_trim: false,
+                hdr_metadata: None,
+                video_mode: Default::default(),
                 parameters: Vec::new(),
                 av1an_options: None,
                 output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
+                source_filters: false,
                 output_container: None,
                 film_grain: 1,
                 ..request.clone()
             },
             BatchEncodeRequest {
+                copy_metadata: None,
+                copy_chapters: None,
+                source_naming: None,
+                encoding_preferences: None,
+                constant_quantizer: None,
+                source_nvenc_quality: false,
+                source_trim: false,
+                hdr_metadata: None,
+                video_mode: Default::default(),
                 parameters: Vec::new(),
                 av1an_options: None,
                 output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
+                source_filters: false,
                 output_container: None,
                 hdr10_fallback: true,
                 ..request.clone()
@@ -1504,11 +1705,21 @@ mod tests {
         let manager = crate::JobManager::new(fixture.0.join("logs"));
         let result = manager
             .preview_encode_batch(BatchEncodeRequest {
+                copy_metadata: None,
+                copy_chapters: None,
+                source_naming: None,
+                encoding_preferences: None,
+                constant_quantizer: None,
+                source_nvenc_quality: false,
+                source_trim: false,
+                hdr_metadata: None,
+                video_mode: Default::default(),
                 parameters: Vec::new(),
                 av1an_options: None,
                 output_pixel_format: None,
                 av1an_grain: None,
                 av1an_filters: Vec::new(),
+                source_filters: false,
                 output_container: None,
                 rate_control: None,
                 lossless: false,
@@ -1516,6 +1727,7 @@ mod tests {
                 svt_preset: None,
                 inputs: vec![
                     BatchEncodeInput {
+                        video_mode: None,
                         temporal: None,
                         tone_map: None,
                         trim: None,
@@ -1527,6 +1739,7 @@ mod tests {
                         video_stream_index: 0,
                     },
                     BatchEncodeInput {
+                        video_mode: None,
                         temporal: None,
                         tone_map: None,
                         trim: None,

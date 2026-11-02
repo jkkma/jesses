@@ -1,0 +1,33 @@
+# Reviewable draft; root activates this under .github/workflows at the coordinated snapshot.
+name: Native Windows console qualification
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/native-console-validation-*
+permissions:
+  contents: read
+jobs:
+  console:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-console-only
+      - name: Run standalone native console qualification
+        id: console
+        shell: pwsh
+        run: ./scripts/qualify-windows-console.ps1 -OutputRoot "$env:RUNNER_TEMP/jesses-console-qualification"
+      - name: Retain native receipts and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-console
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/jesses-console-qualification/**/*.json
+            ${{ runner.temp }}/jesses-console-qualification/**/*.txt
+            ${{ runner.temp }}/jesses-console-qualification/**/*.log

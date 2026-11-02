@@ -48,6 +48,14 @@ fn validate_general(value: &GeneralPreferences) -> Result<(), AppError> {
             "the output folder must be an absolute path without control characters",
         ));
     }
+    if !(1..=100).contains(&value.auto_crop_samples) {
+        return Err(error(
+            "automatic crop sample count must be between 1 and 100",
+        ));
+    }
+    if !(1..=120).contains(&value.keyframe_interval_seconds) {
+        return Err(error("keyframe interval must be between 1 and 120 seconds"));
+    }
     Ok(())
 }
 fn path_key(path: &str) -> String {
@@ -151,13 +159,18 @@ impl PreferencesStore {
             record.preferences.recent_paths = normalize(record.preferences.recent_paths)?;
             Ok(record.preferences)
         })();
+        if let Ok(preferences) = &current {
+            crate::supervisor::configure_console_preferences(&preferences.general);
+        }
         Self {
             path,
             current: Mutex::new(current),
         }
     }
     pub fn get(&self) -> Result<UserPreferences, AppError> {
-        self.current.lock().map_err(error)?.clone()
+        let preferences = self.current.lock().map_err(error)?.clone()?;
+        crate::supervisor::configure_console_preferences(&preferences.general);
+        Ok(preferences)
     }
     fn change(
         &self,
@@ -206,6 +219,7 @@ impl PreferencesStore {
             let _ = fs::remove_file(&temporary);
             return Err(error(e));
         }
+        crate::supervisor::configure_console_preferences(&next.general);
         *current = Ok(next.clone());
         Ok(next)
     }
@@ -335,6 +349,67 @@ pub fn recent_path_is_folder(path: String) -> Result<bool, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_settings_defaults_upgrade_old_files_and_preserve_explicit_false() {
+        let dir = fixture();
+        fs::write(dir.join("preferences.json"), br#"{"version":1,"preferences":{"general":{"defaultOutputDirectory":"","recursiveImport":false},"recentPaths":[],"revision":0}}"#).unwrap();
+        let store = PreferencesStore::open(dir.clone());
+        let defaults = store.get().unwrap().general;
+        assert_eq!(defaults.auto_crop_samples, 10);
+        assert_eq!(defaults.keyframe_interval_seconds, 10);
+        assert!(defaults.mp4_faststart && defaults.av1an_console_visible);
+        assert!(
+            defaults.reset_on_new_file.trim
+                && defaults.reset_on_new_file.crop
+                && defaults.reset_on_new_file.deinterlace
+                && defaults.reset_on_new_file.tone_map
+        );
+        assert!(
+            !defaults.reset_on_new_file.frame_rate
+                && !defaults.reset_on_new_file.resize
+                && !defaults.reset_on_new_file.borders
+                && !defaults.reset_on_new_file.custom_filters
+        );
+        let mut edited = defaults;
+        edited.auto_crop_samples = 3;
+        edited.keyframe_interval_seconds = 2;
+        edited.mp4_faststart = false;
+        edited.av1an_console_visible = false;
+        edited.console_window = media_core::ConsoleWindowMode::VisibleStayOpen;
+        edited.reset_on_new_file.trim = false;
+        store
+            .save(SavePreferencesRequest {
+                general: edited.clone(),
+                recent_paths: None,
+            })
+            .unwrap();
+        assert_eq!(
+            PreferencesStore::open(dir.clone()).get().unwrap().general,
+            edited
+        );
+        let bytes = fs::read(dir.join("preferences.json")).unwrap();
+        edited.auto_crop_samples = 0;
+        assert!(
+            store
+                .save(SavePreferencesRequest {
+                    general: edited.clone(),
+                    recent_paths: None
+                })
+                .is_err()
+        );
+        edited.auto_crop_samples = 10;
+        edited.keyframe_interval_seconds = 121;
+        assert!(
+            store
+                .save(SavePreferencesRequest {
+                    general: edited,
+                    recent_paths: None
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(dir.join("preferences.json")).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
     fn fixture() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "jesses-preferences-{}-{}",
@@ -357,6 +432,7 @@ mod tests {
                 general: GeneralPreferences {
                     default_output_directory: dir.display().to_string(),
                     recursive_import: true,
+                    ..GeneralPreferences::default()
                 },
                 recent_paths: None,
             })
@@ -489,6 +565,7 @@ mod tests {
                                         general: GeneralPreferences {
                                             default_output_directory: dir.display().to_string(),
                                             recursive_import: true,
+                                            ..GeneralPreferences::default()
                                         },
                                         recent_paths: None,
                                     })

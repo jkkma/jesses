@@ -1,37 +1,113 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
+/// Inputs for verified dynamic-HDR publication after the encoded checkpoint.
+type DynamicHdrPublication<'a> = (
+    &'a dynamic_hdr::Resources,
+    &'a Path,
+    &'a Path,
+    usize,
+    (u32, u32),
+);
+
 mod alpha;
+pub(crate) mod sequence;
+pub use sequence::{import_image_sequence, release_image_sequence};
+mod attachments;
+pub use attachments::extract_attachment;
 mod audio;
 mod av1an;
 mod av1an_preprocess;
 #[cfg(test)]
 mod batch_tests;
 mod cadence;
+pub(crate) mod command_edit;
 mod container;
+mod conversion;
 mod encode;
+mod source_copy;
+mod source_copy_packets;
+mod source_queue;
+pub(crate) use encode::frame_scan::parse as parse_frame_records;
+pub(crate) fn available_space(path: &Path) -> Result<u64, AppError> {
+    source_normalization::available(path)
+}
+pub(crate) async fn prepare_utility_container<'a>(
+    input: &'a Temporary,
+    output: &Path,
+    id: &str,
+    cancel: &watch::Receiver<bool>,
+    scratch: &'a mut Vec<Temporary>,
+) -> Result<&'a Temporary, AppError> {
+    Ok(
+        container::prepare(input, output, id, cancel, None, None, false, scratch)
+            .await?
+            .unwrap_or(input),
+    )
+}
+pub(crate) async fn verify_utility_packets(
+    ffprobe: &Path,
+    source: &Path,
+    output: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let original = probe(ffprobe, source, cancel, None).await?;
+    let actual = probe(ffprobe, output, cancel, None).await?;
+    if original.streams.len() != actual.streams.len() {
+        return Err(AppError::new(
+            "UTILITY_VALIDATION_FAILED",
+            "Metadata editing changed the stream count.",
+            None,
+        ));
+    }
+    for (left, right) in original.streams.iter().zip(&actual.streams) {
+        if matches!(
+            left.codec_type.as_deref(),
+            Some("video" | "audio" | "subtitle")
+        ) {
+            mux::verify_container_packets(
+                ffprobe,
+                source,
+                left.index,
+                output,
+                right.index,
+                left.codec_name.as_deref() == Some("aac"),
+                cancel,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
 mod encode_settings;
 mod external_tracks;
 pub use encode::preview_encode_plan;
 mod encode_plan;
+mod encoding_preferences;
 pub(crate) mod files;
 mod history;
-mod images;
+pub(crate) mod images;
 pub use images::run_image_job;
+mod dynamic_hdr;
 mod lossless;
 mod metadata;
 mod mux;
+mod output_metadata;
 pub(crate) mod parameters;
 pub(crate) mod qtgmc;
 mod rate_control;
 #[cfg(test)]
 mod real_tests;
+mod recovery_actions;
 #[cfg(test)]
 mod recovery_tests;
 mod reports;
+pub(super) mod source_filters;
+mod source_normalization;
 mod standalone_recovery;
 mod subtitles;
 pub use reports::export_analysis;
+mod source_picture_metadata;
 mod trim;
 
 use std::{
@@ -63,6 +139,7 @@ const MAX_HISTORY: usize = 100;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Entry {
+    command_review: Option<Arc<command_edit::Session>>,
     pause: supervisor::PauseControl,
     snapshot: JobSnapshot,
     cancel: watch::Sender<bool>,
@@ -85,6 +162,7 @@ struct State {
 
 #[derive(Clone)]
 pub struct JobManager {
+    command_edits: command_edit::Sessions,
     state: Arc<Mutex<State>>,
     log_dir: Arc<PathBuf>,
     history: Option<history::History>,
@@ -129,6 +207,7 @@ fn process_error(error: SupervisorError, path: &Path) -> AppError {
 impl JobManager {
     pub fn new(log_dir: PathBuf) -> Self {
         Self {
+            command_edits: Default::default(),
             state: Arc::new(Mutex::new(State::default())),
             log_dir: Arc::new(log_dir),
             history: None,
@@ -144,6 +223,36 @@ impl JobManager {
                 manager.history = Some(history);
                 let mut state = manager.state.lock().await;
                 for mut snapshot in snapshots {
+                    if snapshot.encode_settings.as_ref().is_some_and(|settings| {
+                        settings.backend == media_core::EncodeBackend::Av1an
+                    }) && snapshot.recovery.is_some()
+                    {
+                        let saved = snapshot.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            av1an::restore_interrupted_source_cut(&saved)
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some((settings, command, recovery)))) => {
+                                snapshot.encode_settings = Some(settings);
+                                snapshot.edited_command = command;
+                                snapshot.recovery = Some(recovery);
+                                append_log(&mut snapshot,"Interrupted New Settings source-cut review restored the last committed recipe/source/tool stamps; only remaining cache receipts are retained.".into());
+                            }
+                            Ok(Ok(None)) => {}
+                            Ok(Err(error)) => append_log(
+                                &mut snapshot,
+                                format!(
+                                    "Source-cut review recovery was not admitted: {}",
+                                    error.message
+                                ),
+                            ),
+                            Err(cause) => append_log(
+                                &mut snapshot,
+                                format!("Source-cut review inspection did not complete: {cause}"),
+                            ),
+                        }
+                    }
                     if let Some(settings) = snapshot.encode_settings.as_ref()
                         && settings.backend == media_core::EncodeBackend::Standalone
                     {
@@ -184,6 +293,27 @@ impl JobManager {
                                 format!("Standalone recovery inspection did not complete: {cause}"),
                             ),
                         }
+                    }
+                    if snapshot.recovery.is_none()
+                        && snapshot.standalone_recovery.is_none()
+                        && let Some(settings) = snapshot.encode_settings.as_ref()
+                        && let Err(error) =
+                            source_normalization::discard(&snapshot.id, &snapshot.request, settings)
+                                .and_then(|()| {
+                                    source_normalization::av1an_trim::discard(
+                                        &snapshot.id,
+                                        &snapshot.request,
+                                        settings,
+                                    )
+                                })
+                    {
+                        append_log(
+                            &mut snapshot,
+                            format!(
+                                "Canonical source cleanup during restore was not admitted: {}",
+                                error.message
+                            ),
+                        );
                     }
                     let was_unfinished = !snapshot.state.is_terminal();
                     let is_copy_job = snapshot.encode_settings.is_none();
@@ -277,6 +407,7 @@ impl JobManager {
                     }
                     let (cancel, _) = watch::channel(true);
                     state.entries.push(Entry {
+                        command_review: None,
                         pause: Default::default(),
                         snapshot,
                         cancel,
@@ -341,12 +472,53 @@ impl JobManager {
         &self,
         request: BatchEncodeRequest,
     ) -> Result<BatchEncodePreview, AppError> {
-        encode::validate_settings(&EncodeSettings {
+        self.preview_encode_batch_inner(request, None).await
+    }
+
+    pub async fn preview_encode_batch_cancellable(
+        &self,
+        request: BatchEncodeRequest,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<BatchEncodePreview, AppError> {
+        self.preview_encode_batch_inner(request, Some(cancel)).await
+    }
+
+    async fn preview_encode_batch_inner(
+        &self,
+        request: BatchEncodeRequest,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<BatchEncodePreview, AppError> {
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(batch_canceled());
+        }
+        // Per-file source snapshots can all disable video even when an old
+        // draft retains a hardware selector. Only an effective encode uses it.
+        let validation_mode = if request.inputs.iter().any(|input| {
+            input.video_mode.unwrap_or(request.video_mode) == media_core::VideoMode::Encode
+        }) {
+            media_core::VideoMode::Encode
+        } else {
+            request
+                .inputs
+                .first()
+                .and_then(|input| input.video_mode)
+                .unwrap_or(request.video_mode)
+        };
+        let mut validation = EncodeSettings {
+            encoding_preferences: request.encoding_preferences,
+            constant_quantizer: request.constant_quantizer,
+            source_nvenc_quality: request.source_nvenc_quality,
+            source_trim: request.source_trim,
+            hdr_metadata: request.hdr_metadata.clone(),
+            video_mode: validation_mode,
             external_tracks: Vec::new(),
             track_overrides: Vec::new(),
             track_order: Vec::new(),
             metadata_source_path: None,
             chapters_source_path: None,
+            copy_metadata: request.copy_metadata,
+            copy_chapters: request.copy_chapters,
+            output_metadata: None,
             mov_timecode_track: None,
             parameters: request.parameters.clone(),
             temporal: None,
@@ -354,6 +526,7 @@ impl JobManager {
             output_pixel_format: request.output_pixel_format,
             av1an_grain: request.av1an_grain.clone(),
             av1an_filters: request.av1an_filters.clone(),
+            source_filters: request.source_filters,
             rate_control: request.rate_control,
             tone_map: None,
             trim: None,
@@ -374,7 +547,13 @@ impl JobManager {
             backend: request.backend,
             encoder: request.encoder,
             workers: request.workers,
-        })?;
+        };
+        if validation_mode != media_core::VideoMode::Encode
+            && request.video_mode == media_core::VideoMode::Encode
+        {
+            crate::batch::clear_inactive_picture(&mut validation);
+        }
+        encode::validate_settings(&validation)?;
         let (queued, epoch) = {
             let state = self.state.lock().await;
             let queued: Vec<_> = state
@@ -392,7 +571,7 @@ impl JobManager {
                     .unwrap_or_else(|_| crate::batch::path_key(Path::new(path)))
             })
             .collect();
-        crate::batch::preview(self, request, reserved, epoch).await
+        crate::batch::preview(self, request, reserved, epoch, cancel).await
     }
 
     pub(crate) async fn inspect_encode_source(
@@ -400,11 +579,22 @@ impl JobManager {
         input: &BatchEncodeInput,
         settings: &EncodeSettings,
         epoch: u64,
+        request_cancel: Option<watch::Receiver<bool>>,
     ) -> Result<media_core::MediaFile, AppError> {
         let input = input.clone();
         let settings = settings.clone();
         self.run_preflight(epoch, move |cancel| async move {
-            inspect_encode_source(&input, &settings, &cancel).await
+            if let Some(request_cancel) = request_cancel {
+                if *request_cancel.borrow() { return Err(batch_canceled()); }
+                let (joined, receiver) = watch::channel(false);
+                let work = inspect_encode_source(&input, &settings, &receiver);
+                tokio::pin!(work);
+                tokio::select! {
+                    result = &mut work => result,
+                    _ = wait_cancel(request_cancel) => { joined.send_replace(true); let _ = work.await; Err(batch_canceled()) },
+                    _ = wait_cancel(cancel) => { joined.send_replace(true); let _ = work.await; Err(batch_canceled()) },
+                }
+            } else { inspect_encode_source(&input, &settings, &cancel).await }
         })
         .await
     }
@@ -465,10 +655,11 @@ impl JobManager {
                 return Err(batch_canceled());
             }
             encode::validate_settings(&request.settings)?;
-            files::validate_request(&request.source)?;
+            files::validate_encode_request(&request.source, &request.settings)?;
             let media = crate::batch::inspect_selection(
                 self,
                 &BatchEncodeInput {
+                    video_mode: None,
                     temporal: request.settings.temporal,
                     tone_map: request.settings.tone_map,
                     trim: request.settings.trim,
@@ -531,7 +722,7 @@ impl JobManager {
             .collect();
         let mut normalized = Vec::with_capacity(requests.len());
         for mut request in requests {
-            files::validate_request(&request.source)?;
+            files::validate_encode_request(&request.source, &request.settings)?;
             encode::validate_settings(&request.settings)?;
             let source = Source::open(Path::new(&request.source.input_path))?;
             let output = files::output_path(&request.source, &source)?;
@@ -586,8 +777,11 @@ impl JobManager {
                 request: request.source,
                 mux_request: None,
                 encode_settings: Some(request.settings),
+                edited_command: None,
                 recovery: None,
                 standalone_recovery: None,
+                input_size_bytes: None,
+                output_size_bytes: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec!["Media job admitted with an atomic batch.".into()],
@@ -597,6 +791,7 @@ impl JobManager {
             let (cancel, receiver) = watch::channel(false);
             staged.push((
                 Entry {
+                    command_review: None,
                     pause: Default::default(),
                     snapshot,
                     cancel,
@@ -670,7 +865,23 @@ impl JobManager {
         mux_request: Option<media_core::MuxRequest>,
         allow_queue: bool,
     ) -> Result<JobSnapshot, AppError> {
-        files::validate_request(&request)?;
+        self.admit_job_with_review(request, encode_settings, mux_request, allow_queue, None)
+            .await
+    }
+
+    async fn admit_job_with_review(
+        &self,
+        request: RemuxRequest,
+        encode_settings: Option<EncodeSettings>,
+        mux_request: Option<media_core::MuxRequest>,
+        allow_queue: bool,
+        command_review: Option<Arc<command_edit::Session>>,
+    ) -> Result<JobSnapshot, AppError> {
+        if let Some(settings) = &encode_settings {
+            files::validate_encode_request(&request, settings)?;
+        } else {
+            files::validate_request(&request)?;
+        }
         let mut state = self.state.lock().await;
         if let Some(error) = &state.storage_error {
             return Err(error.clone());
@@ -745,8 +956,11 @@ impl JobManager {
             request,
             mux_request,
             encode_settings,
+            edited_command: None,
             recovery: None,
             standalone_recovery: None,
+            input_size_bytes: None,
+            output_size_bytes: None,
             progress_seconds: None,
             duration_seconds: None,
             logs: vec!["Media job queued.".into()],
@@ -756,7 +970,11 @@ impl JobManager {
         let (cancel, receiver) = watch::channel(false);
         let worker = self.clone();
         let task_id = id.clone();
+        if let Some(review) = &command_review {
+            review.bind_job(&id);
+        }
         state.entries.push(Entry {
+            command_review,
             pause: Default::default(),
             snapshot: snapshot.clone(),
             cancel,
@@ -798,7 +1016,17 @@ impl JobManager {
             guard = turn => Some(guard),
         };
         if slot.is_some() {
-            self.execute(id, cancel, log_path).await;
+            let control = self
+                .state
+                .lock()
+                .await
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .expect("registered job")
+                .pause
+                .clone();
+            supervisor::with_pause(control, self.execute(id, cancel, log_path)).await;
         } else {
             let storage_error = self.state.lock().await.storage_error.clone();
             self.change(&id, |snapshot| {
@@ -820,11 +1048,61 @@ impl JobManager {
                 }
             })
             .await;
+            if let Some(review) = self.command_review(&id).await {
+                review.finish(Some(canceled()));
+            }
         }
         drop(slot);
         self.queue_changed.notify_waiters();
     }
 
+    /// Cache release is serialized with queue admission and durable recovery.
+    pub async fn release_image_sequence(
+        &self,
+        request: media_core::ImageSequenceReleaseRequest,
+        cache_root: PathBuf,
+    ) -> Result<(), AppError> {
+        let state = self.state.clone().lock_owned().await;
+        fn references(value: &serde_json::Value, path: &str) -> bool {
+            match value {
+                serde_json::Value::String(value) => {
+                    value == path
+                        || (Path::new(value).is_absolute()
+                            && std::fs::canonicalize(value).is_ok_and(|value| {
+                                std::fs::canonicalize(path).is_ok_and(|target| value == target)
+                            }))
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter().any(|value| references(value, path))
+                }
+                serde_json::Value::Object(values) => {
+                    values.values().any(|value| references(value, path))
+                }
+                _ => false,
+            }
+        }
+        if !state.preflights.is_empty()
+            || state.entries.iter().any(|entry| {
+                (!entry.snapshot.state.is_terminal()
+                    || entry.snapshot.recovery.is_some()
+                    || entry.snapshot.standalone_recovery.is_some())
+                    && serde_json::to_value(&entry.snapshot)
+                        .is_ok_and(|value| references(&value, &request.input_path))
+            })
+        {
+            return Err(AppError::new(
+                "IMAGE_SEQUENCE_BUSY",
+                "This source is still used by queue admission, an active job or saved recovery.",
+                Some(request.input_path),
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            let _admission_guard = state;
+            sequence::release_image_sequence(request, cache_root)
+        })
+        .await
+        .map_err(|e| AppError::new("IMAGE_SEQUENCE_FAILED", e.to_string(), None))?
+    }
     pub async fn list_jobs(&self) -> Vec<JobSnapshot> {
         self.state
             .lock()
@@ -854,16 +1132,13 @@ impl JobManager {
             .iter_mut()
             .find(|entry| entry.snapshot.id == id)
             .ok_or_else(|| AppError::new("JOB_NOT_FOUND", "The job was not found.", None))?;
-        if !matches!(entry.snapshot.state, JobState::Running | JobState::Paused)
-            || !entry
-                .snapshot
-                .encode_settings
-                .as_ref()
-                .is_some_and(|settings| settings.backend == media_core::EncodeBackend::Av1an)
-        {
+        if !matches!(
+            entry.snapshot.state,
+            JobState::Preparing | JobState::Running | JobState::Paused | JobState::Finalizing
+        ) {
             return Err(AppError::new(
                 "JOB_NOT_PAUSABLE",
-                "Live pause is available while av1an encodes chunks.",
+                "Live pause is available while a media job is preparing, running, or finalizing.",
                 None,
             ));
         }
@@ -880,9 +1155,9 @@ impl JobManager {
         append_log(
             &mut entry.snapshot,
             if paused {
-                "Paused the live av1an process tree. Memory and open files are retained."
+                "Paused the media job process trees. Memory and open files are retained."
             } else {
-                "Continued the live av1an process tree."
+                "Continued the media job process trees."
             }
             .into(),
         );
@@ -967,6 +1242,14 @@ impl JobManager {
     /// Resumes the immutable original job after verifying its recovery locator.
     /// Full source, tool and chunk checks happen again before the encoder starts.
     pub async fn resume_job(&self, id: String) -> Result<JobSnapshot, AppError> {
+        self.resume_job_with_review(id, None).await
+    }
+
+    async fn resume_job_with_review(
+        &self,
+        id: String,
+        command_review: Option<Arc<command_edit::Session>>,
+    ) -> Result<JobSnapshot, AppError> {
         let (original, epoch) = {
             let state = self.state.lock().await;
             if let Some(error) = &state.storage_error {
@@ -986,6 +1269,9 @@ impl JobManager {
                 .ok_or_else(|| {
                     AppError::new("JOB_NOT_FOUND", "The saved job was not found.", None)
                 })?;
+            if let Some(settings) = &entry.snapshot.encode_settings {
+                encode::validate_settings(settings)?;
+            }
             let backend = entry
                 .snapshot
                 .encode_settings
@@ -1086,6 +1372,10 @@ impl JobManager {
         let log_path = self.log_dir.join(format!("{id}.log"));
         let (cancel, receiver) = watch::channel(false);
         let mut entry = state.entries.remove(index);
+        if let Some(review) = &command_review {
+            review.bind_job(&id);
+        }
+        entry.command_review = command_review;
         entry.snapshot.state = JobState::Queued;
         entry.snapshot.error = None;
         entry.snapshot.progress_seconds = None;
@@ -1113,7 +1403,7 @@ impl JobManager {
         Ok(snapshot)
     }
 
-    /// Discard a stopped av1an job's owned recovery files without requiring its
+    /// Discard a stopped encoder job's owned recovery files without requiring its
     /// source media or encoder installation to still be present.
     pub async fn discard_av1an_recovery(&self, id: String) -> Result<JobSnapshot, AppError> {
         let mut state = self.state.lock().await;
@@ -1136,41 +1426,44 @@ impl JobManager {
         let eligible = matches!(
             snapshot.state,
             JobState::Stopped | JobState::Failed | JobState::Interrupted
-        ) && snapshot
-            .encode_settings
-            .as_ref()
-            .is_some_and(|settings| settings.backend == media_core::EncodeBackend::Av1an)
-            && snapshot.recovery.is_some()
+        ) && snapshot.encode_settings.is_some()
+            && (snapshot.recovery.is_some() || snapshot.standalone_recovery.is_some())
             && entry.task.as_ref().is_none_or(|task| task.is_finished());
         if !eligible {
             return Err(AppError::new(
                 "JOB_DISCARD_UNAVAILABLE",
-                "Only a stopped, failed, or interrupted av1an job with saved progress can discard its recovery files after its worker exits.",
+                "Only a stopped, failed or interrupted encoder job with saved progress can discard owned recovery after its worker exits.",
                 None,
             ));
         }
-        av1an::Recovery::discard(
-            &id,
-            &snapshot.request,
-            snapshot
-                .encode_settings
-                .as_ref()
-                .expect("checked av1an settings"),
-            snapshot
-                .recovery
-                .as_ref()
-                .expect("checked recovery locator"),
-        )
-        .await?;
+        let settings = snapshot.encode_settings.as_ref().expect("encoder settings");
+        // Validate and exclusively hold canonical ownership before changing
+        // encoder progress; a foreign entry rejects the whole discard first.
+        let canonical = source_normalization::prepare_discard(&id, &snapshot.request, settings)?;
+        let source_cut =
+            source_normalization::av1an_trim::prepare_discard(&id, &snapshot.request, settings)?;
+        if let Some(locator) = &snapshot.recovery {
+            let _ = locator;
+            av1an::OwnedRecovery::open(&snapshot, false)?.discard()?;
+        } else if let Some(locator) = &snapshot.standalone_recovery {
+            standalone_recovery::discard(&id, &snapshot.request, settings, locator)?;
+        }
+        if let Some(canonical) = canonical {
+            canonical.finish()?;
+        }
+        if let Some(source_cut) = source_cut {
+            source_cut.finish()?;
+        }
         let entry = state
             .entries
             .iter_mut()
             .find(|entry| entry.snapshot.id == id)
             .expect("held job manager state lock");
         entry.snapshot.recovery = None;
+        entry.snapshot.standalone_recovery = None;
         append_log(
             &mut entry.snapshot,
-            "Saved av1an progress was discarded.".into(),
+            "Saved encoder progress and its owned canonical source were discarded.".into(),
         );
         let updated = entry.snapshot.clone();
         self.persist(&mut state).await?;
@@ -1179,6 +1472,7 @@ impl JobManager {
     }
 
     pub async fn cancel_all_jobs(&self) -> Result<Vec<JobSnapshot>, AppError> {
+        self.command_edits.cancel_all();
         let mut state = self.state.lock().await;
         state.submission_epoch = state.submission_epoch.wrapping_add(1);
         for preflight in &state.preflights {
@@ -1206,6 +1500,8 @@ impl JobManager {
 
     /// Prevents new jobs and waits for process-tree and owned-output cleanup.
     pub async fn shutdown(&self) {
+        self.command_edits.cancel_all();
+        self.command_edits.shutdown().await;
         let tasks = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
@@ -1233,6 +1529,7 @@ impl JobManager {
         for task in tasks {
             let _ = task.await;
         }
+        supervisor::shutdown_console_presentations().await;
     }
 
     async fn change(&self, id: &str, update: impl FnOnce(&mut JobSnapshot)) {
@@ -1255,7 +1552,10 @@ impl JobManager {
 
     async fn phase(&self, id: &str, phase: JobState, message: &str) {
         self.change(id, |s| {
-            if !matches!(s.state, JobState::Canceling | JobState::Stopping) {
+            if !matches!(
+                s.state,
+                JobState::Canceling | JobState::Stopping | JobState::Paused
+            ) {
                 s.state = phase;
             }
             append_log(s, message.into());
@@ -1264,6 +1564,7 @@ impl JobManager {
     }
 
     async fn execute(&self, id: String, cancel: watch::Receiver<bool>, log_path: PathBuf) {
+        let command_review = self.command_review(&id).await;
         let snapshot = {
             let state = self.state.lock().await;
             state
@@ -1274,6 +1575,23 @@ impl JobManager {
                 .snapshot
                 .clone()
         };
+        let input_paths = snapshot
+            .mux_request
+            .as_ref()
+            .map(|mapping| {
+                mapping
+                    .sources
+                    .iter()
+                    .map(|source| PathBuf::from(&source.input_path))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![PathBuf::from(&snapshot.request.input_path)]);
+        let input_size = observed_input_bytes(input_paths);
+        self.change(&id, |snapshot| {
+            snapshot.input_size_bytes = input_size;
+            snapshot.output_size_bytes = None;
+        })
+        .await;
         let request = snapshot.request;
         let mut temporary = None;
         let mut scratch = Vec::new();
@@ -1314,7 +1632,43 @@ impl JobManager {
             .chain(scratch.iter_mut())
             .filter_map(|temp| temp.cleanup().err())
             .collect();
+        let result = if result.is_err() {
+            if let Some(review) = &command_review {
+                match self.discard_unconfirmed_command(&id, review).await {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                }
+            } else {
+                let saved = self
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .find(|snapshot| snapshot.id == id);
+                if let Some(saved) = saved {
+                    match tokio::task::spawn_blocking(move || {
+                        av1an::restore_interrupted_source_cut(&saved)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some((settings, command, recovery)))) => {
+                            self.change(&id,|snapshot|{snapshot.encode_settings=Some(settings);snapshot.edited_command=command;snapshot.recovery=Some(recovery);append_log(snapshot,"Uncommitted source preparation was canceled or failed; the prior decoder slot, recipe and completed work were restored.".into());}).await;
+                            result
+                        }
+                        Ok(Ok(None)) => result,
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => {
+                            Err(AppError::new("RECOVERY_INVALID", error.to_string(), None))
+                        }
+                    }
+                } else {
+                    result
+                }
+            }
+        } else {
+            result
+        };
         let saved_log = tokio::fs::metadata(&log_path).await.is_ok();
+        let command_error = result.as_ref().err().cloned();
         // Storage-triggered cancellation is a failure, not a successful user
         // stop. Keep its diagnostic visible even when token cancellation wins.
         let result = match result {
@@ -1376,6 +1730,17 @@ impl JobManager {
             }
         })
         .await;
+        if let Some(review) = command_review {
+            review.finish(command_error);
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.snapshot.id == id)
+            {
+                entry.command_review = None;
+            }
+        }
     }
 
     async fn remux(
@@ -1424,7 +1789,11 @@ impl JobManager {
             .await
             .map_err(|e| files::error("LOG_CREATE_FAILED", e.to_string(), self.log_dir.as_ref()))?;
         check_cancel(cancel)?;
-        *temporary = Some(Temporary::create(&output, id)?);
+        *temporary = Some(Temporary::create_extension(
+            &output,
+            id,
+            container::staging_format(&selected, None).extension(),
+        )?);
         let temp = temporary.as_ref().expect("created temporary");
         let spec = CommandSpec {
             executable: ffmpeg,
@@ -1488,8 +1857,15 @@ impl JobManager {
         )
         .await;
         temp.flush_nonempty_async().await?;
-        let artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
-        metadata::verify(&document, &selected, &artifact)?;
+        let mut artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
+        let (expected, converted_subtitles) =
+            container::normalize_staging(&document, &request.stream_indices, &mut artifact, None)?;
+        metadata::verify_container(
+            &expected,
+            &expected.selected(&request.stream_indices)?,
+            &artifact,
+            &converted_subtitles,
+        )?;
         source.verify()?;
         check_cancel(cancel)?;
         self.finalize(
@@ -1511,18 +1887,80 @@ impl JobManager {
         alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
+        self.finalize_verified(
+            id, cancel, source, external, temporary, output, cadence, alpha, None, scratch,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_verified(
+        &self,
+        id: &str,
+        cancel: &watch::Receiver<bool>,
+        source: &Source,
+        external: Option<&external_tracks::ExternalTracks>,
+        temporary: &Temporary,
+        output: &Path,
+        cadence: Option<container::Cadence>,
+        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
+        dynamic_hdr: Option<DynamicHdrPublication<'_>>,
+        scratch: &mut Vec<Temporary>,
+    ) -> Result<(), AppError> {
+        Box::pin(self.finalize_verified_inner(
+            id,
+            cancel,
+            source,
+            external,
+            temporary,
+            output,
+            cadence,
+            alpha,
+            dynamic_hdr,
+            scratch,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_verified_inner(
+        &self,
+        id: &str,
+        cancel: &watch::Receiver<bool>,
+        source: &Source,
+        external: Option<&external_tracks::ExternalTracks>,
+        temporary: &Temporary,
+        output: &Path,
+        cadence: Option<container::Cadence>,
+        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
+        dynamic_hdr: Option<DynamicHdrPublication<'_>>,
+        scratch: &mut Vec<Temporary>,
+    ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
         // accepted before this point cannot publish an output; after publication
         // the job is succeeded and cancellation is a no-op.
-        let converted = container::prepare(
-            temporary,
-            output,
-            id,
-            cancel,
-            cadence,
-            external.and_then(external_tracks::ExternalTracks::timecode),
-            scratch,
-        )
+        let faststart = self
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .and_then(|entry| entry.snapshot.encode_settings.as_ref())
+            .and_then(|settings| settings.encoding_preferences)
+            .is_some_and(|preferences| preferences.mp4_faststart);
+        let converted = encode::boxed(|| {
+            container::prepare(
+                temporary,
+                output,
+                id,
+                cancel,
+                cadence,
+                external.and_then(external_tracks::ExternalTracks::timecode),
+                faststart,
+                scratch,
+            )
+        })
         .await?;
         let converted_alpha = converted.is_some();
         let temporary = converted.unwrap_or(temporary);
@@ -1581,15 +2019,43 @@ impl JobManager {
             })
             .await;
         }
+        if let Some((resources, ffmpeg, ffprobe, video_index, fps)) = dynamic_hdr {
+            resources
+                .verify_output(ffmpeg, ffprobe, &temporary.path, video_index, fps, cancel)
+                .await?;
+        }
+        if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
+            receipt.verify(temporary, cancel).await?;
+        }
+        self.publish_verified(id, cancel, source, external, temporary, output)
+            .await
+    }
+
+    /// Publish an already-final, fully verified source command output without
+    /// remuxing it through a second FFmpeg process and changing its packet clock.
+    async fn publish_verified(
+        &self,
+        id: &str,
+        cancel: &watch::Receiver<bool>,
+        source: &Source,
+        external: Option<&external_tracks::ExternalTracks>,
+        temporary: &Temporary,
+        output: &Path,
+    ) -> Result<(), AppError> {
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         source.verify()?;
         if let Some(external) = external {
             external.verify()?;
         }
+        let output_size = std::fs::metadata(&temporary.path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len().to_string());
         temporary.publish(output)?;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             entry.snapshot.state = JobState::Succeeded;
+            entry.snapshot.output_size_bytes = output_size;
             entry.snapshot.progress_seconds = entry.snapshot.duration_seconds;
             append_log(
                 &mut entry.snapshot,
@@ -1601,6 +2067,26 @@ impl JobManager {
         let _ = self.persist(&mut state).await;
         Ok(())
     }
+}
+
+fn observed_input_bytes(paths: Vec<PathBuf>) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0_u64;
+    for path in paths {
+        let path = std::fs::canonicalize(path).ok()?;
+        if seen.insert(path.clone()) {
+            if let Some(original_bytes) = sequence::original_size(&path).ok()? {
+                total = total.checked_add(original_bytes)?;
+                continue;
+            }
+            let metadata = std::fs::metadata(path).ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            total = total.checked_add(metadata.len())?;
+        }
+    }
+    Some(total.to_string())
 }
 
 async fn wait_cancel(mut cancel: watch::Receiver<bool>) {
@@ -1664,6 +2150,13 @@ async fn inspect_encode_source(
     let source = tokio::task::spawn_blocking(move || Source::open(&canonical))
         .await
         .map_err(|e| files::error("FILE_UNREADABLE", e.to_string(), &path))??;
+    if settings.backend == media_core::EncodeBackend::Av1an && sequence::is_sequence(&source.path) {
+        return Err(AppError::new(
+            "IMAGE_SEQUENCE_UNSUPPORTED",
+            "AV1AN cannot use an image sequence source. Use Quick Convert, as in Nmkoder.",
+            Some(input.input_path.clone()),
+        ));
+    }
     let executable = discover("ffprobe", cancel).await?;
     let args = [
         "-v",
@@ -1726,7 +2219,7 @@ async fn inspect_encode_source(
             )
         })?
         .to_owned();
-    crate::probe::parse_probe(
+    let mut media = crate::probe::parse_probe(
         &output.stdout,
         canonical,
         source
@@ -1736,7 +2229,9 @@ async fn inspect_encode_source(
             .to_string_lossy()
             .into_owned(),
         size,
-    )
+    )?;
+    sequence::decorate(&mut media)?;
+    Ok(media)
 }
 
 fn validate_encode_preview(
@@ -1744,14 +2239,40 @@ fn validate_encode_preview(
     input: &BatchEncodeInput,
     settings: &EncodeSettings,
 ) -> Result<(), AppError> {
-    let document: Document = serde_json::from_slice(bytes).map_err(|_| {
+    let mut document: Document = serde_json::from_slice(bytes).map_err(|_| {
         AppError::new(
             "PROBE_INVALID_RESPONSE",
             "FFprobe returned unreadable media metadata.",
             None,
         )
     })?;
+    let settings = EncodeSettings {
+        video_stream_index: input.video_stream_index,
+        ..settings.clone()
+    };
+    let effective = if settings.video_mode == media_core::VideoMode::Encode {
+        source_normalization::preview_document(&mut document, &settings)?
+    } else {
+        settings.clone()
+    };
+    let settings = &effective;
     let selected = document.selected(&input.stream_indices)?;
+    if settings.video_mode != media_core::VideoMode::Encode {
+        conversion::validate_settings(settings)?;
+        audio::validate_selection(&selected, settings)?;
+        if settings.video_mode == media_core::VideoMode::Drop
+            && selected
+                .iter()
+                .any(|stream| stream.codec_type.as_deref() == Some("video"))
+        {
+            return Err(AppError::new(
+                "STREAM_SELECTION_INVALID",
+                "Audio-only conversion requires deselected video tracks.",
+                None,
+            ));
+        }
+        return Ok(());
+    }
     let videos: Vec<_> = selected
         .iter()
         .filter(|stream| stream.codec_type.as_deref() == Some("video"))
@@ -1841,6 +2362,21 @@ async fn probe(
     // streams omit the start header entirely; require an actual packet timestamp
     // in that case rather than assuming zero or rejecting a valid timeline.
     for stream in &mut document.streams {
+        if stream.codec_type.as_deref() == Some("data")
+            && selected.is_some_and(|indices| indices.contains(&stream.index))
+        {
+            let timeline = Box::pin(mux::packet_timeline(executable, path, stream.index, cancel))
+                .await?
+                .ok_or_else(|| {
+                    files::error(
+                        "STREAM_SELECTION_INVALID",
+                        "Selected data has no timed packets to preserve.",
+                        path,
+                    )
+                })?;
+            stream.packet_start_time = Some(timeline.min_pts);
+            stream.duration = Some(timeline.max_end.to_string());
+        }
         if (stream.codec_type.as_deref() == Some("subtitle")
             || (stream.codec_type.as_deref() == Some("video") && stream.start_time.is_none()))
             && selected.is_none_or(|indices| indices.contains(&stream.index))
@@ -1975,7 +2511,7 @@ fn remux_arguments(input: &Path, output: &Path, selected: &[&metadata::Stream]) 
     }
     // -y is confined to the uniquely reserved owned temporary sibling. The user
     // destination is never passed to FFmpeg and is published without clobbering.
-    args.extend(["-f", "matroska", "-y"].into_iter().map(OsString::from));
+    container::append_staging_format(&mut args, selected, None);
     args.push(output.as_os_str().to_owned());
     args
 }
@@ -2275,9 +2811,12 @@ mod tests {
                         stream_indices: vec![0],
                     },
                     encode_settings: Some(settings.clone()),
+                    edited_command: None,
                     mux_request: None,
                     recovery: None,
                     standalone_recovery: None,
+                    input_size_bytes: None,
+                    output_size_bytes: None,
                     progress_seconds: Some(1.0),
                     duration_seconds: Some(5.0),
                     logs: vec!["Started with saved settings".into()],

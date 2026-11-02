@@ -15,7 +15,17 @@ pub(super) fn environment_with_changes(
             Some(path.encode_wide().collect()),
         ));
     }
-    for (name, value) in &changes.variables {
+    for (name, value) in changes
+        .variables
+        .iter()
+        .map(|(name, value)| (*name, value))
+        .chain(
+            changes
+                .dynamic_variables
+                .iter()
+                .map(|(name, value)| (name.as_str(), value)),
+        )
+    {
         if name.is_empty()
             || !name
                 .bytes()

@@ -16,7 +16,7 @@ struct ToolSpec {
     version_arg: &'static str,
 }
 
-const TOOLS: [ToolSpec; 11] = [
+const TOOLS: [ToolSpec; 12] = [
     ToolSpec {
         id: "ffmpeg",
         name: "FFmpeg",
@@ -85,6 +85,14 @@ const TOOLS: [ToolSpec; 11] = [
         executables: &["mkvmerge"],
         version_arg: "--version",
     },
+    ToolSpec {
+        id: "grav1synth",
+        name: "grav1synth",
+        executables: &["grav1synth"],
+        // The pinned development commit retains the released version number.
+        // The preset listing is its useful capability and identity surface.
+        version_arg: "presets",
+    },
 ];
 
 fn tool_encoder(id: &str) -> Option<VideoEncoder> {
@@ -102,6 +110,7 @@ fn tool_encoder(id: &str) -> Option<VideoEncoder> {
 
 fn fork_config(encoder: VideoEncoder) -> Option<(&'static str, &'static str, &'static str)> {
     match encoder {
+        VideoEncoder::SvtAv1 => Some(("JESSES_SVT_AV1", "svt-av1-hdr", "SvtAv1EncApp")),
         VideoEncoder::SvtAv1FiveFish => Some((
             "JESSES_SVT_AV1_5FISH",
             "svt-av1-5fish",
@@ -144,14 +153,38 @@ pub(crate) fn managed_encoder_path(encoder: VideoEncoder) -> Result<Option<PathB
 /// Resolve only the requested implementation. A bad explicit override or managed
 /// installation is an error, never permission to run a different PATH encoder.
 pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<PathBuf>, String> {
+    if encoder.is_hardware() {
+        return Ok(None);
+    }
+    let legacy_override =
+        encoder == VideoEncoder::SvtAv1 && env::var_os("JESSES_SVT_AV1").is_some();
     let search = tokio::task::spawn_blocking(move || {
         if let Some((variable, _, alias)) = fork_config(encoder) {
-            let override_path = env::var_os(variable).map(PathBuf::from);
+            let variable = if encoder == VideoEncoder::SvtAv1
+                && env::var_os(variable).is_none()
+                && env::var_os("JESSES_SVT_AV1_HDR").is_some()
+            {
+                "JESSES_SVT_AV1_HDR"
+            } else {
+                variable
+            };
+            let override_path = env::var_os(variable)
+                .or_else(|| {
+                    (encoder == VideoEncoder::SvtAv1)
+                        .then(|| env::var_os("JESSES_SVT_AV1_HDR"))
+                        .flatten()
+                })
+                .map(PathBuf::from);
             resolve_fork_location(
                 override_path.as_deref(),
                 || managed_encoder_path(encoder),
                 || match crate::bundled_tools::find(encoder_tool_id(encoder))? {
                     Some(path) => Ok(Some(path)),
+                    None if encoder == VideoEncoder::SvtAv1 => find_executable_blocking(&[
+                        "SvtAv1EncApp-HDR".to_owned(),
+                        alias.to_owned(),
+                        "svtav1encapp".to_owned(),
+                    ]),
                     None => find_executable_blocking(&[alias.to_owned()]),
                 },
             )
@@ -183,18 +216,81 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
             )
         }
     });
-    match tokio::time::timeout(Duration::from_secs(5), search).await {
+    let found = match tokio::time::timeout(Duration::from_secs(5), search).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(format!("Encoder discovery could not finish: {error}")),
         Err(_) => {
             Err("Encoder discovery timed out while checking its configured locations.".into())
         }
+    }?;
+    if encoder == VideoEncoder::SvtAv1
+        && !legacy_override
+        && let Some(path) = &found
+    {
+        validate_source_svt(path).await?;
     }
+    Ok(found)
+}
+
+fn source_svt_marker() -> Result<&'static str, String> {
+    static MARKER: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            let manifest: serde_json::Value =
+                serde_json::from_str(include_str!("../../../scripts/svt-forks.json"))
+                    .map_err(|cause| cause.to_string())?;
+            let provider = manifest["sourceProvider"]
+                .as_str()
+                .ok_or("The source SVT provider pin is missing.")?;
+            manifest["encoders"]
+                .as_array()
+                .and_then(|values| values.iter().find(|value| value["id"] == provider))
+                .and_then(|value| value["versionMarker"].as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| "The source SVT version pin is missing.".into())
+        })
+        .as_ref()
+        .map(String::as_str)
+        .map_err(Clone::clone)
+}
+
+async fn validate_source_svt(path: &Path) -> Result<(), String> {
+    let output = crate::process::run_tool(
+        path,
+        &[OsString::from("--version")],
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .map_err(|cause| cause.to_string())?;
+    let identity = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() && source_svt_identity_matches(&identity)? {
+        return Ok(());
+    }
+    Err(format!(
+        "The source SVT choice requires the qualified {} provider; {} reports {}. Install that provider. An intentional legacy mainline override must use JESSES_SVT_AV1.",
+        source_svt_marker()?,
+        path.display(),
+        identity.trim()
+    ))
+}
+
+fn source_svt_identity_matches(identity: &str) -> Result<bool, String> {
+    let marker = source_svt_marker()?;
+    Ok(identity.lines().any(|line| {
+        line.trim()
+            .strip_prefix(marker)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+    }))
 }
 
 fn encoder_tool_id(encoder: VideoEncoder) -> &'static str {
     match encoder {
-        VideoEncoder::SvtAv1 => "svt-av1",
+        VideoEncoder::SvtAv1 => "svt-av1-hdr",
         VideoEncoder::SvtAv1FiveFish => "svt-av1-5fish",
         VideoEncoder::SvtAv1Hdr => "svt-av1-hdr",
         VideoEncoder::X264 => "x264",
@@ -282,7 +378,7 @@ pub(crate) fn validate_video_encoder_version(
             .iter()
             .any(|marker| lower.contains(marker));
     let matches = match encoder {
-        VideoEncoder::SvtAv1 => !known_fork,
+        VideoEncoder::SvtAv1 => !known_fork || (hdr && !five_fish),
         VideoEncoder::SvtAv1FiveFish => five_fish && !hdr,
         VideoEncoder::SvtAv1Hdr => hdr && !five_fish,
         VideoEncoder::X264 => lower.starts_with("x264 "),
@@ -339,10 +435,23 @@ fn find_configured_executable(names: &[String]) -> Result<Option<PathBuf>, Strin
 }
 
 fn find_executable_blocking(names: &[String]) -> Result<Option<PathBuf>, String> {
-    let Some(search_path) = env::var_os("PATH") else {
-        return Ok(None);
-    };
-    for directory in env::split_paths(&search_path).filter(|directory| directory.is_absolute()) {
+    let search_path = env::var_os("PATH").unwrap_or_default();
+    let mut directories = env::split_paths(&search_path)
+        .filter(|directory| directory.is_absolute())
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    for directory in [
+        "/opt/homebrew/opt/ffmpeg-full/bin",
+        "/usr/local/opt/ffmpeg-full/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ] {
+        let directory = PathBuf::from(directory);
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    for directory in directories.drain(..) {
         for name in names {
             #[cfg(windows)]
             let filename = format!("{name}.exe");
@@ -554,7 +663,7 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
 /// Checks all known tools concurrently; missing optional tools remain
 /// explicit capability results and do not prevent media inspection.
 pub async fn get_capabilities() -> Vec<ToolInfo> {
-    let (ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge) = tokio::join!(
+    let (ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge, grav) = tokio::join!(
         discover(TOOLS[0]),
         discover(TOOLS[1]),
         discover(TOOLS[2]),
@@ -566,9 +675,10 @@ pub async fn get_capabilities() -> Vec<ToolInfo> {
         discover(TOOLS[8]),
         discover(TOOLS[9]),
         discover(TOOLS[10]),
+        discover(TOOLS[11]),
     );
     vec![
-        ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge,
+        ffmpeg, ffprobe, svt, av1an, x264, five_fish, hdr, aom, vpx, x265, mkvmerge, grav,
     ]
 }
 
@@ -595,6 +705,7 @@ mod tests {
                 assert_eq!(
                     validate_video_encoder_version(requested, version).is_ok(),
                     requested == actual
+                        || (requested == VideoEncoder::SvtAv1 && actual == VideoEncoder::SvtAv1Hdr)
                 );
             }
             assert!(validate_video_encoder_version(requested, "unrelated tool 1.0").is_err());
@@ -606,6 +717,25 @@ mod tests {
         ] {
             assert!(validate_video_encoder_version(VideoEncoder::SvtAv1, fork).is_err());
         }
+    }
+
+    #[test]
+    fn source_svt_identity_requires_qualified_hdr_and_retains_explicit_legacy_mainline() {
+        let qualified = format!("{} (release)", source_svt_marker().unwrap());
+        assert!(source_svt_identity_matches(&qualified).unwrap());
+        for identity in [
+            "SVT-AV1 Encoder Lib v4.2.0",
+            "SVT-AV1-HDR v4.2.0",
+            "SVT-AV1 [5fish] v2.3.260827",
+            &format!("{}bad", source_svt_marker().unwrap()),
+        ] {
+            assert!(!source_svt_identity_matches(identity).unwrap());
+        }
+        assert!(
+            validate_video_encoder_version(VideoEncoder::SvtAv1, "SVT-AV1 Encoder Lib v4.2.0")
+                .is_ok()
+        );
+        assert_eq!(encoder_tool_id(VideoEncoder::SvtAv1), "svt-av1-hdr");
     }
 
     #[test]

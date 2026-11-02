@@ -233,6 +233,9 @@ async fn actual_media_utility_and_image_routes_preserve_source_and_publish_recei
         image_results.push(
             media_runtime::jobs::run_image_job(
                 ImageRequest::Export {
+                    full_source: false,
+                    quality: None,
+                    processing: None,
                     input_path: text(&cut),
                     stream_index: 0,
                     start_frame,
@@ -252,6 +255,9 @@ async fn actual_media_utility_and_image_routes_preserve_source_and_publish_recei
     image_results.push(
         media_runtime::jobs::run_image_job(
             ImageRequest::Export {
+                full_source: false,
+                quality: None,
+                processing: None,
                 input_path: text(&cut),
                 stream_index: 0,
                 start_frame: 12,

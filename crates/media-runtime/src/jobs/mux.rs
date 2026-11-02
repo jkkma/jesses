@@ -467,13 +467,18 @@ impl JobManager {
             .await?;
         }
         let converted =
-            super::container::prepare(temporary, &output, id, cancel, None, None, scratch).await?;
+            super::container::prepare(temporary, &output, id, cancel, None, None, false, scratch)
+                .await?;
         let temporary = converted.unwrap_or(temporary);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         for input in &inputs {
             input.source.verify()?;
         }
+        let output_size = std::fs::metadata(&temporary.path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len().to_string());
         temporary.publish(&output)?;
         if let Some(entry) = state
             .entries
@@ -481,6 +486,7 @@ impl JobManager {
             .find(|entry| entry.snapshot.id == id)
         {
             entry.snapshot.state = JobState::Succeeded;
+            entry.snapshot.output_size_bytes = output_size;
             entry.snapshot.progress_seconds = entry.snapshot.duration_seconds;
             append_log(
                 &mut entry.snapshot,
@@ -493,12 +499,12 @@ impl JobManager {
 }
 
 #[derive(Debug)]
-struct Packet {
-    pts: Option<f64>,
-    dts: Option<f64>,
-    duration: Option<f64>,
-    size: u64,
-    hash: String,
+pub(in crate::jobs) struct Packet {
+    pub(in crate::jobs) pts: Option<f64>,
+    pub(in crate::jobs) dts: Option<f64>,
+    pub(in crate::jobs) duration: Option<f64>,
+    pub(in crate::jobs) size: u64,
+    pub(in crate::jobs) hash: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -567,7 +573,7 @@ fn packet_duration_matches(
             .is_some_and(|dts_delta| timing_matches(actual, Some(dts_delta)))
 }
 
-fn packets(
+pub(in crate::jobs) fn packets(
     reader: &mut dyn Read,
     mut accept: impl FnMut(Packet) -> Result<(), String>,
 ) -> Result<u64, String> {
@@ -632,7 +638,7 @@ fn packets(
     }
 }
 
-fn packet_spec(ffprobe: &Path, input: &Path, index: u32) -> CommandSpec {
+pub(in crate::jobs) fn packet_spec(ffprobe: &Path, input: &Path, index: u32) -> CommandSpec {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -726,6 +732,7 @@ pub(super) async fn verify_packets(
         cancel,
         false,
         false,
+        false,
         0.0,
     )
     .await
@@ -753,6 +760,38 @@ pub(super) async fn verify_shifted_packets(
         cancel,
         false,
         false,
+        false,
+        offset_seconds,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Matroska's leading reordered-video DTS omission is a container convention;
+/// packet order, PTS and the remaining decode clock remain exact authorities.
+pub(super) async fn verify_shifted_video_packets(
+    ffprobe: &Path,
+    source: &Path,
+    source_index: u32,
+    output: &Path,
+    output_index: u32,
+    offset_seconds: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let matroska = matches!(
+        output.extension().and_then(|value| value.to_str()),
+        Some("mkv" | "webm")
+    );
+    compare_packets(
+        ffprobe,
+        source,
+        source_index,
+        output,
+        output_index,
+        cancel,
+        true,
+        matroska,
+        false,
         offset_seconds,
     )
     .await
@@ -776,6 +815,7 @@ pub(super) async fn verify_container_packets(
         output_index,
         cancel,
         true,
+        false,
         allow_aac_duration_reshape,
         0.0,
     )
@@ -791,6 +831,7 @@ async fn compare_packets(
     output_index: u32,
     cancel: &watch::Receiver<bool>,
     reconstruct_initial_dts: bool,
+    omit_initial_dts: bool,
     allow_aac_duration_reshape: bool,
     offset_seconds: f64,
 ) -> Result<Option<f64>, AppError> {
@@ -821,6 +862,8 @@ async fn compare_packets(
         move |reader| {
             let mut missing_initial_dts = 0;
             let mut source_dts_seen = false;
+            let mut target_dts_seen = false;
+            let mut previous_source_dts = None;
             let mut previous_dts = None;
             let mut pending_duration = None;
             let count = packets(reader, |actual| {
@@ -837,14 +880,23 @@ async fn compare_packets(
                     && actual.dts.zip(actual.pts).is_some_and(|(dts, pts)| {
                         dts <= pts && previous_dts.is_none_or(|previous| dts >= previous)
                     });
+                let omitted = omit_initial_dts
+                    && actual.dts.is_none()
+                    && !target_dts_seen
+                    && missing_initial_dts < 16
+                    && expected.dts.zip(expected.pts).is_some_and(|(dts, pts)| {
+                        dts <= pts && previous_source_dts.is_none_or(|previous| dts >= previous)
+                    });
                 source_dts_seen |= expected.dts.is_some();
-                if reconstructed {
+                target_dts_seen |= actual.dts.is_some();
+                previous_source_dts = expected.dts;
+                if reconstructed || omitted {
                     missing_initial_dts += 1;
                 }
                 if expected.hash != actual.hash
                     || expected.size != actual.size
                     || !timing_matches(expected.pts.map(|pts| pts + offset_seconds), actual.pts)
-                    || (!reconstructed
+                    || (!(reconstructed || omitted)
                         && !timing_matches(
                             expected.dts.map(|dts| dts + offset_seconds),
                             actual.dts,
@@ -885,7 +937,10 @@ async fn compare_packets(
             Ok(count)
         },
     );
-    let (original, compare) = tokio::join!(original, compare);
+    // Keep the independent streaming process states off the caller's stack;
+    // final container verification can run inside an already large encoder
+    // future on the ordinary 2 MiB Tokio worker stack.
+    let (original, compare) = tokio::join!(Box::pin(original), Box::pin(compare));
     let compare = compare.map_err(|cause| process_error(cause, output))?;
     let original = original.map_err(|cause| process_error(cause, source))?;
     if !original.status.success()
@@ -1155,5 +1210,102 @@ mod tests {
             "JOB_CANCELED"
         );
         std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires FFmpeg/FFprobe with libx264"]
+    async fn copied_b_frames_keep_payload_pts_and_later_dts_across_matroska_prefix_omission() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-artifacts/mapped-dts")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                super::super::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.mp4");
+        let output = directory.join("copy.mkv");
+        let (_owner, cancel) = watch::channel(false);
+        let ffmpeg = discover("ffmpeg", &cancel).await.unwrap();
+        let ffprobe = discover("ffprobe", &cancel).await.unwrap();
+        let first = std::process::Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=8:duration=2",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-bf",
+                "3",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let second = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-copyts", "-i"])
+            .arg(&source)
+            .args([
+                "-map",
+                "0:v",
+                "-c",
+                "copy",
+                "-avoid_negative_ts",
+                "disabled",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let spec = packet_spec(&ffprobe, &output, 0);
+        let evidence = supervisor::run_streaming_stdout(
+            &spec,
+            cancel.clone(),
+            8192,
+            Duration::from_secs(15),
+            |reader| {
+                let mut missing = 0;
+                let mut present = 0;
+                packets(reader, |packet| {
+                    if packet.dts.is_none() {
+                        missing += 1;
+                    } else {
+                        present += 1;
+                    }
+                    Ok(())
+                })?;
+                Ok((missing, present))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(evidence.status.success());
+        assert!(evidence.value.0 > 0 && evidence.value.0 <= 16 && evidence.value.1 > 0);
+        verify_shifted_video_packets(&ffprobe, &source, 0, &output, 0, 0., &cancel)
+            .await
+            .unwrap();
+        assert!(
+            verify_shifted_packets(&ffprobe, &source, 0, &output, 0, 0., &cancel)
+                .await
+                .is_err()
+        );
+        assert!(
+            verify_shifted_video_packets(&ffprobe, &source, 0, &output, 0, 0.1, &cancel)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

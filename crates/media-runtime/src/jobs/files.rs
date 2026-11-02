@@ -5,6 +5,8 @@ use std::{
 };
 
 use media_core::{AppError, RemuxRequest};
+#[path = "files/replace.rs"]
+mod replace;
 
 pub(super) fn error(code: &str, message: impl Into<String>, path: &Path) -> AppError {
     AppError::new(code, message, Some(path.to_string_lossy().into_owned()))
@@ -57,6 +59,7 @@ pub(crate) struct Source {
     // Windows share mode denies writes and deletion for the whole job.
     file: File,
     fingerprint: Fingerprint,
+    sequence: Option<super::sequence::Guard>,
 }
 
 impl Source {
@@ -94,14 +97,19 @@ impl Source {
         }
         let fingerprint = Fingerprint::read(metadata)
             .map_err(|e| error("FILE_UNREADABLE", e.to_string(), &path))?;
+        let sequence = super::sequence::Guard::open(&path)?;
         Ok(Self {
             path,
             file,
             fingerprint,
+            sequence,
         })
     }
 
     pub fn verify(&self) -> Result<(), AppError> {
+        if let Some(sequence) = &self.sequence {
+            sequence.verify()?;
+        }
         let inspect = || -> std::io::Result<bool> {
             #[cfg(windows)]
             if windows_file_id(&self.file)? != windows_file_id(&File::open(&self.path)?)? {
@@ -141,6 +149,21 @@ impl Source {
 }
 
 pub(super) fn validate_request(request: &RemuxRequest) -> Result<(), AppError> {
+    validate_request_selection(request, false)
+}
+
+pub(super) fn validate_encode_request(
+    request: &RemuxRequest,
+    settings: &media_core::EncodeSettings,
+) -> Result<(), AppError> {
+    validate_request_selection(
+        request,
+        settings.video_mode != media_core::VideoMode::Encode
+            && !settings.external_tracks.is_empty(),
+    )
+}
+
+fn validate_request_selection(request: &RemuxRequest, allow_empty: bool) -> Result<(), AppError> {
     for text in [&request.input_path, &request.output_path] {
         if text.contains('\0') || !Path::new(text).is_absolute() {
             return Err(error(
@@ -164,7 +187,7 @@ pub(super) fn validate_request(request: &RemuxRequest) -> Result<(), AppError> {
         ));
     }
     let mut indices = std::collections::HashSet::new();
-    if request.stream_indices.is_empty()
+    if (!allow_empty && request.stream_indices.is_empty())
         || request
             .stream_indices
             .iter()

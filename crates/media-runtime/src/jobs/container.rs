@@ -1,8 +1,10 @@
 //! The final container uses the verified Matroska stage, plus an optional guarded
 //! QuickTime timecode source. Its owned sibling is verified before publication.
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     ffi::OsString,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -17,12 +19,112 @@ use super::{
 };
 use crate::supervisor::{self, CommandSpec};
 
+mod tx3g;
+
 #[derive(Clone, Copy)]
 pub(super) struct Cadence {
     pub index: u32,
     pub numerator: u32,
     pub denominator: u32,
     pub frames: usize,
+    pub source_iso: Option<SourceIsoReceipt>,
+}
+
+/// Internal only. Sealed before/after full source proof, bound to this owned
+/// pathname and every byte; no settings/IPC value can construct this receipt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SourceIsoReceipt {
+    digest: [u8; 32],
+    length: u64,
+    format: ContainerFormat,
+}
+pub(super) async fn seal_source_iso(
+    input: &Temporary,
+    format: ContainerFormat,
+    cancel: &watch::Receiver<bool>,
+) -> Result<SourceIsoReceipt, AppError> {
+    input.flush_nonempty_async().await?;
+    let mut file = input.clone_file()?;
+    let path = input.path.clone();
+    let cancellation = cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut hash = Sha256::new();
+        let bytes = path.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+        hash.update(format.ffmpeg_format().as_bytes());
+        let mut block = [0u8; 65536];
+        let mut length = 0u64;
+        loop {
+            super::check_cancel(&cancellation)?;
+            let read = file
+                .read(&mut block)
+                .map_err(|error| invalid(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            length += read as u64;
+            hash.update(&block[..read]);
+        }
+        Ok::<_, AppError>(SourceIsoReceipt {
+            digest: hash.finalize().into(),
+            length,
+            format,
+        })
+    })
+    .await
+    .map_err(|error| invalid(error.to_string()))??;
+    input.flush_nonempty_async().await?;
+    Ok(receipt)
+}
+impl SourceIsoReceipt {
+    pub(super) async fn verify(
+        &self,
+        input: &Temporary,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if seal_source_iso(input, self.format, cancel).await? != *self {
+            return Err(invalid(
+                "The fully verified source ISO output changed before publication.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn source_iso_format(
+    output: &Path,
+    selected: &[&Stream],
+    settings: &EncodeSettings,
+) -> Option<ContainerFormat> {
+    if !settings.source_trim
+        || settings.trim.is_none()
+        || settings.backend != media_core::EncodeBackend::Standalone
+        || settings.video_mode != media_core::VideoMode::Encode
+    {
+        return None;
+    }
+    let format = format(output).ok()?;
+    if !matches!(format, ContainerFormat::Mp4 | ContainerFormat::Mov) {
+        return None;
+    }
+    selected
+        .iter()
+        .any(|stream| {
+            stream.codec_type.as_deref() == Some("subtitle")
+                && settings
+                    .subtitles
+                    .iter()
+                    .find(|track| track.stream_index == stream.index)
+                    .map_or(stream.codec_name.as_deref() == Some("mov_text"), |track| {
+                        track.mode == SubtitleMode::MovText
+                            || (track.mode == SubtitleMode::Copy
+                                && stream.codec_name.as_deref() == Some("mov_text"))
+                    })
+        })
+        .then_some(format)
 }
 
 pub(super) struct TimecodeTrack {
@@ -38,7 +140,7 @@ pub(super) fn format(path: &Path) -> Result<ContainerFormat, AppError> {
     path.extension()
         .and_then(|value| value.to_str())
         .and_then(ContainerFormat::from_extension)
-        .ok_or_else(|| invalid("Choose a .mkv, .mp4, .mov or .webm destination."))
+        .ok_or_else(|| invalid("Choose a .mkv, .mp4, .mov, .webm, .m4a or .ogg destination."))
 }
 
 fn tag<'a>(stream: &'a Stream, key: &str) -> Option<&'a str> {
@@ -55,7 +157,7 @@ fn text_codec(codec: &str) -> bool {
 
 fn compatible(container: ContainerFormat, kind: &str, codec: &str) -> bool {
     match container {
-        ContainerFormat::Matroska => codec != "mov_text",
+        ContainerFormat::Matroska => kind != "data" && codec != "mov_text",
         ContainerFormat::Mp4 => match kind {
             "video" => matches!(codec, "h264" | "hevc" | "av1" | "vp9" | "mpeg4"),
             "audio" => matches!(
@@ -66,6 +168,7 @@ fn compatible(container: ContainerFormat, kind: &str, codec: &str) -> bool {
             _ => false,
         },
         ContainerFormat::Mov => match kind {
+            "data" => true,
             "video" => matches!(codec, "h264" | "hevc" | "mpeg4" | "prores" | "mjpeg"),
             "audio" => matches!(
                 codec,
@@ -74,6 +177,8 @@ fn compatible(container: ContainerFormat, kind: &str, codec: &str) -> bool {
             "subtitle" => text_codec(codec),
             _ => false,
         },
+        ContainerFormat::M4a => kind == "audio" && matches!(codec, "aac" | "alac"),
+        ContainerFormat::Ogg => kind == "audio" && matches!(codec, "opus" | "vorbis" | "flac"),
         ContainerFormat::Webm => match kind {
             "video" => matches!(codec, "vp8" | "vp9" | "av1"),
             "audio" => matches!(codec, "opus" | "vorbis"),
@@ -91,7 +196,36 @@ pub(super) fn preflight(
     selected: &[&Stream],
     settings: Option<&EncodeSettings>,
 ) -> Result<(), AppError> {
+    preflight_with_staging(
+        output,
+        document,
+        selected,
+        settings,
+        staging_format(selected, settings),
+    )
+}
+/// Source single-command routes already write their chosen final container.
+pub(super) fn preflight_final(
+    output: &Path,
+    document: &Document,
+    selected: &[&Stream],
+    settings: Option<&EncodeSettings>,
+) -> Result<(), AppError> {
+    preflight_with_staging(output, document, selected, settings, format(output)?)
+}
+fn preflight_with_staging(
+    output: &Path,
+    document: &Document,
+    selected: &[&Stream],
+    settings: Option<&EncodeSettings>,
+    staging: ContainerFormat,
+) -> Result<(), AppError> {
     let container = format(output)?;
+    if container == ContainerFormat::Ogg && !document.chapters.is_empty() {
+        return Err(invalid(
+            "Ogg audio conversion currently requires chapter-free input. Choose Matroska or M4A to retain chapters.",
+        ));
+    }
     for stream in selected {
         let subtitle = settings.and_then(|settings| {
             settings
@@ -101,6 +235,16 @@ pub(super) fn preflight(
         });
         if subtitle.is_some_and(|track| track.mode == SubtitleMode::BurnIn) {
             continue;
+        }
+        if container == ContainerFormat::Ogg
+            && stream
+                .disposition
+                .iter()
+                .any(|(flag, value)| *value != 0 && !(selected.len() == 1 && flag == "default"))
+        {
+            return Err(invalid(
+                "Ogg has no stream disposition flags. Clear explicit track flags or choose Matroska; a single audio track is implicitly the default.",
+            ));
         }
         let kind = stream.codec_type.as_deref().unwrap_or_default();
         if container != ContainerFormat::Matroska
@@ -118,14 +262,16 @@ pub(super) fn preflight(
         }
         let codec = if let Some(track) = subtitle.filter(|track| track.mode != SubtitleMode::Copy) {
             match track.mode {
+                SubtitleMode::MovText => "mov_text",
                 SubtitleMode::Ass => "ass",
                 SubtitleMode::SubRip => "subrip",
                 SubtitleMode::WebVtt => "webvtt",
                 _ => unreachable!("burned track excluded"),
             }
-        } else if let Some(settings) =
-            settings.filter(|settings| settings.video_stream_index == stream.index)
-        {
+        } else if let Some(settings) = settings.filter(|settings| {
+            settings.video_mode == media_core::VideoMode::Encode
+                && settings.video_stream_index == stream.index
+        }) {
             match settings.encoder {
                 media_core::VideoEncoder::X264 | media_core::VideoEncoder::H264Nvenc => "h264",
                 media_core::VideoEncoder::X265
@@ -156,10 +302,14 @@ pub(super) fn preflight(
         // The verified staging format cannot carry tx3g. An explicit text
         // conversion in Quick Convert supplies a supported staging asset.
         if stream.codec_name.as_deref() == Some("mov_text")
+            && staging == ContainerFormat::Matroska
             && !subtitle.is_some_and(|track| {
                 matches!(
                     track.mode,
-                    SubtitleMode::Ass | SubtitleMode::SubRip | SubtitleMode::WebVtt
+                    SubtitleMode::Ass
+                        | SubtitleMode::SubRip
+                        | SubtitleMode::WebVtt
+                        | SubtitleMode::MovText
                 )
             })
         {
@@ -168,7 +318,10 @@ pub(super) fn preflight(
                 stream.index
             )));
         }
-        if matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov) {
+        if matches!(
+            container,
+            ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+        ) {
             if let Some(language) = tag(stream, "language")
                 && (language.len() != 3 || !language.bytes().all(|byte| byte.is_ascii_lowercase()))
             {
@@ -201,14 +354,15 @@ pub(super) fn preflight(
             }
         }
     }
-    if matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov)
-        && document.chapters.iter().any(|chapter| {
-            chapter
-                .tags
-                .keys()
-                .any(|key| !key.eq_ignore_ascii_case("title"))
-        })
-    {
+    if matches!(
+        container,
+        ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+    ) && document.chapters.iter().any(|chapter| {
+        chapter
+            .tags
+            .keys()
+            .any(|key| !key.eq_ignore_ascii_case("title"))
+    }) {
         return Err(invalid(
             "MP4/MOV chapters preserve titles and timing. Other chapter metadata requires Matroska.",
         ));
@@ -223,7 +377,8 @@ fn arguments(
     container: ContainerFormat,
     cadence: Option<Cadence>,
     timecode: Option<&TimecodeTrack>,
-) -> Vec<OsString> {
+    faststart: bool,
+) -> Result<Vec<OsString>, AppError> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -282,26 +437,55 @@ fn arguments(
             // Restore the independently validated frame clock after Matroska's
             // millisecond quantization. Composition timestamps keep their rank,
             // including B-frame packet reordering; packet number is never PTS.
+            let scale = clock.numerator.checked_mul(1000).ok_or_else(|| {
+                invalid("The verified frame clock exceeds the final-container timebase.")
+            })?;
+            let step = u64::from(clock.denominator) * 1000;
+            let origin = stream
+                .packet_start_time
+                .or_else(|| {
+                    stream
+                        .start_time
+                        .as_deref()
+                        .and_then(|time| time.parse::<f64>().ok())
+                })
+                .unwrap_or(0.0);
+            if !origin.is_finite() {
+                return Err(invalid(
+                    "The verified frame clock has no finite mux origin.",
+                ));
+            }
+            let origin_ticks = (origin * f64::from(scale)).round();
+            // A frame-sized timebase cannot represent source mux preroll such
+            // as0.979s at24fps. Keep the proven origin and restore only each
+            // frame's relative ordinal, including reordered composition times.
             filters.push(format!(
-                "setts=pts=round(PTS):dts=round(DTS):duration=1:time_base={}/{}:prescale=1",
-                clock.denominator, clock.numerator
+                "setts=pts=round((PTS-{origin_ticks:.0})/{step})*{step}+{origin_ticks:.0}:dts=round((DTS-{origin_ticks:.0})/{step})*{step}+{origin_ticks:.0}:duration={step}:time_base=1/{scale}:prescale=1"
             ));
         }
         if !filters.is_empty() {
             args.extend([format!("-bsf:{index}").into(), filters.join(",").into()]);
         }
         if stream.codec_type.as_deref() == Some("subtitle") {
+            let target = if container == ContainerFormat::Webm {
+                "webvtt"
+            } else {
+                "mov_text"
+            };
             args.extend([
                 format!("-c:{index}").into(),
-                if container == ContainerFormat::Webm {
-                    "webvtt".into()
+                if stream.codec_name.as_deref() == Some(target) {
+                    "copy"
                 } else {
-                    "mov_text".into()
-                },
+                    target
+                }
+                .into(),
             ]);
         }
-        if matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov)
-            && let Some(title) = tag(stream, "title").or_else(|| tag(stream, "handler_name"))
+        if matches!(
+            container,
+            ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+        ) && let Some(title) = tag(stream, "title").or_else(|| tag(stream, "handler_name"))
         {
             args.extend([
                 format!("-metadata:s:{index}").into(),
@@ -324,8 +508,45 @@ fn arguments(
             },
         ]);
     }
-    if matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov) {
-        args.extend(["-movflags".into(), "use_metadata_tags+write_colr".into()]);
+    if container == ContainerFormat::Ogg {
+        // Vorbis comments are per stream. Keep global metadata in an explicit
+        // namespace so a movie title cannot overwrite an audio track title.
+        if let Some(format) = &document.format {
+            for (key, value) in &format.tags {
+                if metadata::is_derived_stream_tag(key) {
+                    continue;
+                }
+                for stream in &document.streams {
+                    args.extend([
+                        format!("-metadata:s:{}", stream.index).into(),
+                        format!("JESSES_CONTAINER_{key}={value}").into(),
+                    ]);
+                }
+            }
+        }
+    }
+    if container == ContainerFormat::Mov {
+        args.extend(["-write_tmcd".into(), "0".into()]);
+    }
+    if matches!(
+        container,
+        ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+    ) {
+        let mut flags = iso_flags(&document.streams.iter().collect::<Vec<_>>());
+        if faststart && container == ContainerFormat::Mp4 {
+            flags.push_str("+faststart");
+        }
+        args.extend(["-movflags".into(), flags.into()]);
+        if document.streams.iter().any(|stream| {
+            stream
+                .side_data_list
+                .iter()
+                .any(|value| value["side_data_type"] == "DOVI configuration record")
+        }) {
+            // FFmpeg requires this explicit mux mode to retain dvvC/dvcC.
+            // The imported AV1 path independently checks its exact fields.
+            args.extend(["-strict".into(), "unofficial".into()]);
+        }
     }
     args.extend([
         "-f".into(),
@@ -333,16 +554,71 @@ fn arguments(
         "-y".into(),
         output.as_os_str().to_owned(),
     ]);
-    args
+    Ok(args)
 }
 
-fn normalize(
+pub(super) fn normalize(
     expected: &mut Document,
     actual: &mut Document,
     container: ContainerFormat,
 ) -> Result<Vec<u32>, AppError> {
     let mut converted = Vec::new();
-    let iso = matches!(container, ContainerFormat::Mp4 | ContainerFormat::Mov);
+    let iso = matches!(
+        container,
+        ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+    );
+    if container == ContainerFormat::Mov
+        && !expected.streams.iter().any(|stream| {
+            stream.codec_type.as_deref() == Some("data")
+                && stream.codec_tag_string.as_deref() == Some("tmcd")
+        })
+    {
+        // A demuxed video timecode tag is derived from its tmcd association.
+        // It must not synthesize an unchecked data track when none is mapped.
+        for stream in expected
+            .streams
+            .iter_mut()
+            .filter(|stream| stream.codec_type.as_deref() == Some("video"))
+        {
+            stream
+                .tags
+                .retain(|key, _| !key.eq_ignore_ascii_case("timecode"));
+        }
+    }
+    if container == ContainerFormat::Ogg {
+        if let (Some(source_format), Some(actual_format)) = (&expected.format, &mut actual.format) {
+            for (key, value) in &source_format.tags {
+                if metadata::is_derived_stream_tag(key) {
+                    continue;
+                }
+                let comment = format!("JESSES_CONTAINER_{key}");
+                if !actual
+                    .streams
+                    .iter()
+                    .all(|stream| tag(stream, &comment) == Some(value.as_str()))
+                {
+                    return Err(invalid(
+                        "Ogg output did not retain the source container metadata in its audio comments.",
+                    ));
+                }
+                actual_format.tags.insert(key.clone(), value.clone());
+            }
+        }
+        if expected.streams.len() == 1
+            && let Some(stream) = actual.streams.first_mut()
+        {
+            // A sole Ogg stream is the playback default without an authored flag.
+            if expected.streams[0]
+                .disposition
+                .get("default")
+                .copied()
+                .unwrap_or(0)
+                != 0
+            {
+                stream.disposition.insert("default".into(), 1);
+            }
+        }
+    }
     if iso && !expected.chapters.is_empty() {
         let auxiliary = actual.streams.last().filter(|stream| {
             stream.codec_type.as_deref() == Some("data")
@@ -400,6 +676,139 @@ fn normalize(
     Ok(converted)
 }
 
+/// Keep ordinary work in MKV; tx3g needs ISO BMFF and timed data needs MOV.
+/// MOV retains PCM; AV1/VP9 pictures instead require the MP4 muxer.
+pub(super) fn staging_format(
+    selected: &[&Stream],
+    settings: Option<&EncodeSettings>,
+) -> ContainerFormat {
+    if selected
+        .iter()
+        .any(|stream| stream.codec_type.as_deref() == Some("data"))
+    {
+        return ContainerFormat::Mov;
+    }
+    if selected.iter().any(|stream| {
+        if stream.codec_type.as_deref() != Some("subtitle") {
+            return false;
+        }
+        let mode = settings
+            .and_then(|settings| {
+                settings
+                    .subtitles
+                    .iter()
+                    .find(|track| track.stream_index == stream.index)
+            })
+            .map(|track| track.mode)
+            .unwrap_or(SubtitleMode::Copy);
+        mode == SubtitleMode::MovText
+            || (mode == SubtitleMode::Copy && stream.codec_name.as_deref() == Some("mov_text"))
+    }) {
+        let needs_mp4 = selected.iter().any(|stream| {
+            if stream.codec_type.as_deref() != Some("video") {
+                return false;
+            }
+            if let Some(settings) = settings.filter(|settings| {
+                settings.video_mode == media_core::VideoMode::Encode
+                    && settings.video_stream_index == stream.index
+            }) {
+                !matches!(
+                    settings.encoder,
+                    media_core::VideoEncoder::X264
+                        | media_core::VideoEncoder::X265
+                        | media_core::VideoEncoder::X265Standalone
+                )
+            } else {
+                matches!(stream.codec_name.as_deref(), Some("av1" | "vp9"))
+            }
+        });
+        if needs_mp4 {
+            ContainerFormat::Mp4
+        } else {
+            ContainerFormat::Mov
+        }
+    } else {
+        ContainerFormat::Matroska
+    }
+}
+
+fn iso_flags(selected: &[&Stream]) -> String {
+    // Forcing a colr box on an entirely unspecified source invents a limited
+    // range declaration in MP4. Keep unknown signaling unknown during copy.
+    let known = selected.iter().any(|stream| {
+        [
+            &stream.color_range,
+            &stream.color_space,
+            &stream.color_primaries,
+            &stream.color_transfer,
+        ]
+        .into_iter()
+        .any(|value| {
+            value
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "unknown" | "unspecified"))
+        })
+    });
+    if known {
+        "use_metadata_tags+write_colr"
+    } else {
+        "use_metadata_tags"
+    }
+    .into()
+}
+
+pub(super) fn append_staging_format(
+    args: &mut Vec<OsString>,
+    selected: &[&Stream],
+    settings: Option<&EncodeSettings>,
+) {
+    let format = staging_format(selected, settings);
+    append_format_options(args, format, selected);
+    args.extend(["-f".into(), format.ffmpeg_format().into(), "-y".into()]);
+}
+
+pub(super) fn append_format_options(
+    args: &mut Vec<OsString>,
+    format: ContainerFormat,
+    selected: &[&Stream],
+) {
+    if matches!(format, ContainerFormat::Mov | ContainerFormat::Mp4) {
+        args.extend([
+            "-movflags".into(),
+            iso_flags(selected).into(),
+            "-write_tmcd".into(),
+            "0".into(),
+        ]);
+        for (position, stream) in selected
+            .iter()
+            .enumerate()
+            .filter(|(_, stream)| stream.codec_type.as_deref() == Some("data"))
+        {
+            if let Some(tag) = &stream.codec_tag_string {
+                args.extend([format!("-tag:{position}").into(), tag.into()]);
+            }
+        }
+    }
+}
+
+pub(super) fn normalize_staging(
+    expected: &Document,
+    indices: &[u32],
+    actual: &mut Document,
+    settings: Option<&EncodeSettings>,
+) -> Result<(Document, Vec<u32>), AppError> {
+    let selected = expected.selected(indices)?;
+    let mut document = expected.clone();
+    let format = staging_format(&selected, settings);
+    let converted = if matches!(format, ContainerFormat::Mov | ContainerFormat::Mp4) {
+        document.streams = selected.iter().map(|stream| (*stream).clone()).collect();
+        normalize(&mut document, actual, format)?
+    } else {
+        Vec::new()
+    };
+    Ok((document, converted))
+}
+
 /// MP4/MOV assigns the first track of a media kind as default when no track
 /// of that kind is marked default. A user-requested `default: false` on that
 /// first track must not be silently promoted during final normalization.
@@ -408,8 +817,10 @@ pub(super) fn preflight_explicit_defaults(
     selected: &[&Stream],
     explicitly_disabled: &[u32],
 ) -> Result<(), AppError> {
-    if !matches!(format(output)?, ContainerFormat::Mp4 | ContainerFormat::Mov)
-        || explicitly_disabled.is_empty()
+    if !matches!(
+        format(output)?,
+        ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
+    ) || explicitly_disabled.is_empty()
     {
         return Ok(());
     }
@@ -437,6 +848,7 @@ pub(super) fn preflight_explicit_defaults(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare<'a>(
     input: &Temporary,
     output: &Path,
@@ -444,6 +856,7 @@ pub(super) async fn prepare<'a>(
     cancel: &watch::Receiver<bool>,
     cadence: Option<Cadence>,
     timecode: Option<&TimecodeTrack>,
+    faststart: bool,
     scratch: &'a mut Vec<Temporary>,
 ) -> Result<Option<&'a Temporary>, AppError> {
     let container = format(output)?;
@@ -456,7 +869,47 @@ pub(super) async fn prepare<'a>(
     super::check_cancel(cancel)?;
     let ffmpeg = super::discover("ffmpeg", cancel).await?;
     let ffprobe = super::discover("ffprobe", cancel).await?;
-    let document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+    if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
+        if receipt.format != container || format(&input.path)? != container || timecode.is_some() {
+            return Err(invalid(
+                "The sealed source ISO receipt does not match the final container.",
+            ));
+        }
+        receipt.verify(input, cancel).await?;
+        let document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+        super::encode::boxed(|| {
+            verify_final_media(
+                &ffmpeg,
+                &ffprobe,
+                &input.path,
+                &document,
+                container,
+                cadence,
+                cancel,
+            )
+        })
+        .await?;
+        receipt.verify(input, cancel).await?;
+        super::check_cancel(cancel)?;
+        return Ok(None);
+    }
+    let mut document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+    for stream in document
+        .streams
+        .iter_mut()
+        .filter(|stream| stream.codec_type.as_deref() == Some("data"))
+    {
+        let timeline = Box::pin(super::mux::packet_timeline(
+            &ffprobe,
+            &input.path,
+            stream.index,
+            cancel,
+        ))
+        .await?
+        .ok_or_else(|| invalid("Mapped MOV data has no timed packets to preserve."))?;
+        stream.packet_start_time = Some(timeline.min_pts);
+        stream.duration = Some(timeline.max_end.to_string());
+    }
     preflight(
         output,
         &document,
@@ -482,7 +935,8 @@ pub(super) async fn prepare<'a>(
                 container,
                 cadence,
                 timecode,
-            ),
+                faststart,
+            )?,
             cwd: None,
         },
         cancel.clone(),
@@ -526,25 +980,53 @@ pub(super) async fn prepare<'a>(
     }
     for (source, target) in document.streams.iter().zip(&actual.streams) {
         if source.codec_type.as_deref() == Some("subtitle") {
-            let before = trim::read_subtitles(
+            if source.codec_name == target.codec_name {
+                if source.extradata_hash != target.extradata_hash
+                    && !(source.codec_name.as_deref() == Some("mov_text")
+                        && tx3g::equivalent(
+                            &ffprobe,
+                            &input.path,
+                            source,
+                            &artifact.path,
+                            target,
+                            cancel,
+                        )
+                        .await?)
+                {
+                    return Err(invalid(
+                        "The final container changed copied subtitle codec headers or styles.",
+                    ));
+                }
+                Box::pin(super::mux::verify_container_packets(
+                    &ffprobe,
+                    &input.path,
+                    source.index,
+                    &artifact.path,
+                    target.index,
+                    false,
+                    cancel,
+                ))
+                .await?;
+            }
+            let before = Box::pin(trim::read_subtitles(
                 &ffmpeg,
                 &input.path,
                 source.index,
                 source.codec_name.as_deref().unwrap_or_default(),
                 cancel,
-            )
+            ))
             .await?;
-            let after = trim::read_subtitles(
+            let after = Box::pin(trim::read_subtitles(
                 &ffmpeg,
                 &artifact.path,
                 target.index,
                 target.codec_name.as_deref().unwrap_or_default(),
                 cancel,
-            )
+            ))
             .await?;
             super::subtitles::verify_conversion(&before, &after)?;
         } else {
-            let last_duration = super::mux::verify_container_packets(
+            let last_duration = Box::pin(super::mux::verify_container_packets(
                 &ffprobe,
                 &input.path,
                 source.index,
@@ -552,7 +1034,7 @@ pub(super) async fn prepare<'a>(
                 target.index,
                 source.codec_name.as_deref() == Some("aac"),
                 cancel,
-            )
+            ))
             .await?;
             if source.codec_type.as_deref() == Some("audio") {
                 let is_aac = source.codec_name.as_deref() == Some("aac");
@@ -597,55 +1079,131 @@ pub(super) async fn prepare<'a>(
                     || source.color_range != target.color_range
                     || source.sample_aspect_ratio != target.sample_aspect_ratio)
             {
-                return Err(invalid(
-                    "The final container changed video pixel format, color signaling or sample aspect ratio.",
-                ));
+                return Err(invalid(format!(
+                    "The final container changed video pixel/color/aspect declarations for stream {}: {:?} → {:?}.",
+                    source.index,
+                    (
+                        &source.pix_fmt,
+                        &source.color_space,
+                        &source.color_transfer,
+                        &source.color_primaries,
+                        &source.color_range,
+                        &source.sample_aspect_ratio
+                    ),
+                    (
+                        &target.pix_fmt,
+                        &target.color_space,
+                        &target.color_transfer,
+                        &target.color_primaries,
+                        &target.color_range,
+                        &target.sample_aspect_ratio
+                    )
+                )));
             }
         }
     }
-    let decoded = supervisor::run_capture(
-        &CommandSpec {
-            executable: ffmpeg,
-            args: [
-                "-v",
-                "error",
-                "-nostdin",
-                "-xerror",
-                "-err_detect",
-                "explode",
-                "-protocol_whitelist",
-                "file",
-                "-i",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .chain([artifact.path.as_os_str().to_owned()])
-            .chain(
-                ["-map", "0:v?", "-map", "0:a?", "-f", "null", "-"]
+    super::encode::boxed(|| {
+        verify_final_media(
+            &ffmpeg,
+            &ffprobe,
+            &artifact.path,
+            &document,
+            container,
+            cadence,
+            cancel,
+        )
+    })
+    .await?;
+    input.flush_nonempty_async().await?;
+    super::check_cancel(cancel)?;
+    Ok(Some(artifact))
+}
+
+async fn verify_final_media(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    path: &Path,
+    document: &Document,
+    container: ContainerFormat,
+    cadence: Option<Cadence>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    if document
+        .streams
+        .iter()
+        .any(|stream| matches!(stream.codec_type.as_deref(), Some("video" | "audio")))
+    {
+        let decoded = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg.to_owned(),
+                args: [
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-xerror",
+                    "-err_detect",
+                    "explode",
+                    "-protocol_whitelist",
+                    "file",
+                    "-i",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain([path.as_os_str().to_owned()])
+                .chain(
+                    [
+                        "-map",
+                        "0:v?",
+                        "-map",
+                        "0:a?",
+                        "-fps_mode:v",
+                        "passthrough",
+                        "-enc_time_base:v",
+                        "demux",
+                        "-f",
+                        "null",
+                        "-",
+                    ]
                     .into_iter()
                     .map(OsString::from),
-            )
-            .collect(),
-            cwd: None,
-        },
-        cancel.clone(),
-        256 * 1024,
-        Duration::from_secs(24 * 60 * 60),
-    )
-    .await
-    .map_err(|error| super::process_error(error, &artifact.path))?;
-    if !decoded.status.success() || !decoded.stderr.is_empty() {
-        return Err(invalid(
-            "The complete final container did not decode without errors.",
-        ));
+                )
+                .collect(),
+                cwd: None,
+            },
+            cancel.clone(),
+            256 * 1024,
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .await
+        .map_err(|error| super::process_error(error, path))?;
+        if !decoded.status.success() || !decoded.stderr.is_empty() {
+            return Err(invalid(format!(
+                "The complete final container did not decode without errors: {}",
+                String::from_utf8_lossy(&decoded.stderr).trim()
+            )));
+        }
     }
     if let Some(clock) = cadence {
+        let origin = document
+            .streams
+            .iter()
+            .find(|stream| stream.index == clock.index)
+            .and_then(|stream| {
+                stream.packet_start_time.or_else(|| {
+                    stream
+                        .start_time
+                        .as_deref()
+                        .and_then(|value| value.parse::<f64>().ok())
+                })
+            })
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| invalid("The verified final video has no usable mux origin."))?;
         #[derive(serde::Deserialize)]
         struct Frame {
             best_effort_timestamp_time: Option<String>,
         }
         let spec = CommandSpec {
-            executable: ffprobe,
+            executable: ffprobe.to_owned(),
             args: ["-v", "error", "-select_streams"]
                 .into_iter()
                 .map(OsString::from)
@@ -662,7 +1220,7 @@ pub(super) async fn prepare<'a>(
                     .into_iter()
                     .map(OsString::from),
                 )
-                .chain([artifact.path.as_os_str().to_owned()])
+                .chain([path.as_os_str().to_owned()])
                 .collect(),
             cwd: None,
         };
@@ -670,26 +1228,62 @@ pub(super) async fn prepare<'a>(
             let mut index = 0usize;
             let mut valid = true;
             super::encode::frame_scan::parse(reader, |frame: Frame| {
-                let expected = index as f64 * f64::from(clock.denominator) / f64::from(clock.numerator);
+                let expected = origin + index as f64 * f64::from(clock.denominator) / f64::from(clock.numerator);
                 let tolerance = if container == ContainerFormat::Webm { 0.001001 } else { 0.000002 };
                 valid &= frame.best_effort_timestamp_time.and_then(|value|value.parse::<f64>().ok()).is_some_and(|actual| actual.is_finite() && (actual-expected).abs() <= tolerance);
                 index += 1;
             })?;
             if !valid || index != clock.frames { return Err("The final container changed the verified encoded frame count or exact frame clock.".into()); }
             Ok(index)
-        }).await.map_err(|error| super::process_error(error, &artifact.path))?;
+        }).await.map_err(|error| super::process_error(error, path))?;
         if !scan.status.success() || !scan.stderr.is_empty() {
             return Err(invalid("Final encoded frame clock validation failed."));
         }
     }
-    input.flush_nonempty_async().await?;
-    super::check_cancel(cancel)?;
-    Ok(Some(artifact))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn source_iso_receipt_rejects_changed_bytes_and_another_owned_path() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "jesses-iso-seal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let output = root.join("out.mp4");
+        let mut first = Temporary::create_extension(&output, "seal-first", "mp4").unwrap();
+        let mut second = Temporary::create_extension(&output, "seal-second", "mp4").unwrap();
+        for file in [&first, &second] {
+            let mut writer = file.clone_file().unwrap();
+            writer.seek(SeekFrom::Start(0)).unwrap();
+            writer.write_all(b"original ISO payload").unwrap();
+            writer.sync_all().unwrap();
+        }
+        let (_owner, cancel) = watch::channel(false);
+        let receipt = seal_source_iso(&first, ContainerFormat::Mp4, &cancel)
+            .await
+            .unwrap();
+        receipt.verify(&first, &cancel).await.unwrap();
+        assert!(receipt.verify(&second, &cancel).await.is_err());
+        let mut writer = first.clone_file().unwrap();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"modified ISO payload").unwrap();
+        writer.sync_all().unwrap();
+        let error = receipt.verify(&first, &cancel).await.unwrap_err();
+        assert!(error.message.contains("changed before publication"));
+        drop(writer);
+        first.cleanup().unwrap();
+        second.cleanup().unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     fn document() -> Document {
         serde_json::from_value(serde_json::json!({"streams":[
             {"index":0,"codec_type":"video","codec_name":"h264","nb_read_packets":"48","tags":{"title":"Picture"},"disposition":{"default":0}},

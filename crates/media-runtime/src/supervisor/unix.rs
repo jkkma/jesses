@@ -163,7 +163,17 @@ impl OwnedChild {
             if let Some(path) = &environment.path {
                 command.env("PATH", path);
             }
-            for (name, value) in &environment.variables {
+            for (name, value) in environment
+                .variables
+                .iter()
+                .map(|(name, value)| (*name, value))
+                .chain(
+                    environment
+                        .dynamic_variables
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value)),
+                )
+            {
                 if let Some(value) = value {
                     command.env(name, value);
                 } else {

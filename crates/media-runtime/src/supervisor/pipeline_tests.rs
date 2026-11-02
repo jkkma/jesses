@@ -418,3 +418,73 @@ fn public_supervisor_futures_remain_send_on_every_target() {
         Duration::from_secs(1),
     ));
 }
+
+#[tokio::test]
+async fn scoped_pause_halts_both_pipeline_trees_and_cancel_reaps_them() {
+    let (producer, consumer) = fixtures("pause-tree", "pause-tree");
+    let control = PauseControl::default();
+    let active = control.clone();
+    let (owner, receiver) = watch::channel(false);
+    let (events, _unread) = mpsc::channel(64);
+    let producer_spec = producer.spec();
+    let consumer_spec = consumer.spec();
+    let log = producer.0.join("scoped-pause.log");
+    let task = tokio::spawn(async move {
+        with_pause(
+            active,
+            run_pipeline(
+                &producer_spec,
+                &consumer_spec,
+                receiver,
+                events,
+                &log,
+                Duration::from_secs(15),
+            ),
+        )
+        .await
+    });
+    let mut pids = Vec::new();
+    let mut paths = Vec::new();
+    for fixture in [&producer, &consumer] {
+        for index in 0..3 {
+            pids.push(fixture.pid(index).await);
+            let mut path = fixture.0.clone();
+            for _ in 0..index {
+                path.push("child");
+            }
+            paths.push(path.join("ticks"));
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    control.set_paused(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let lengths = paths
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .collect::<Vec<_>>();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lengths,
+        paths
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .collect::<Vec<_>>()
+    );
+    control.set_paused(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        paths
+            .iter()
+            .zip(lengths)
+            .all(|(path, previous)| std::fs::metadata(path).unwrap().len() > previous)
+    );
+    control.set_paused(true).unwrap();
+    owner.send_replace(true);
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::Cancelled)));
+    assert_dead(&pids).await;
+    assert!(control.set_paused(false).is_err());
+}

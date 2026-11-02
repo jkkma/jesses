@@ -28,7 +28,25 @@ mod platform;
 mod ansi;
 #[path = "supervisor/pause.rs"]
 mod pause;
-pub use pause::PauseControl;
+pub(crate) use pause::scoped_pause;
+pub use pause::{PauseControl, with_pause};
+mod console;
+#[cfg(feature = "console-fixture")]
+pub use console::console_fixture_presentations;
+pub(crate) use console::source_tool_console_profile;
+pub use console::{
+    ConsoleProfile, configure_console_preferences, console_helper_main, initialize_console_host,
+    shutdown_console_presentations, with_console_profile,
+};
+
+type CaptureObserver = std::sync::Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
+tokio::task_local! { static CAPTURE_OBSERVER: CaptureObserver; }
+pub(crate) async fn with_capture_observer<T>(
+    observer: CaptureObserver,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    CAPTURE_OBSERVER.scope(observer, future).await
+}
 
 const RECORD_BYTES: usize = 8192;
 const LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -46,6 +64,7 @@ pub struct CommandSpec {
 pub struct ChildEnvironment {
     pub path: Option<OsString>,
     pub variables: Vec<(&'static str, Option<OsString>)>,
+    pub dynamic_variables: Vec<(String, Option<OsString>)>,
 }
 
 impl ChildEnvironment {
@@ -53,6 +72,7 @@ impl ChildEnvironment {
         Self {
             path: Some(path.to_owned()),
             variables: Vec::new(),
+            dynamic_variables: Vec::new(),
         }
     }
 }
@@ -199,12 +219,44 @@ pub async fn run_with_environment(
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
+    console::scope(
+        console::logged_profile(&[spec]),
+        &[spec],
+        cancel,
+        |cancel| {
+            run_with_environment_inner(
+                spec,
+                cancel,
+                events,
+                log_path,
+                time_limit,
+                environment,
+                pause,
+            )
+        },
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn run_with_environment_inner(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    environment: Option<&ChildEnvironment>,
+    pause: Option<&PauseControl>,
+) -> Result<ProcessResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
     let mut child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
-    let attached = pause.map(|control| control.attach(&child)).transpose()?;
+    let pause = pause.cloned().or_else(pause::scoped_pause);
+    let attached = pause
+        .as_ref()
+        .map(|control| control.attach(&child))
+        .transpose()?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (_, _, status) = tokio::try_join!(
@@ -222,7 +274,7 @@ pub async fn run_with_environment(
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = async { if let Some(control)=pause { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
+        _ = async { if let Some(control)=pause.as_ref() { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
         result = execution => result,
     };
     // Explicit cleanup also reaps the leader. The guard handles future abortion.
@@ -266,15 +318,32 @@ pub async fn run_capture_with_environment(
     time_limit: Duration,
     environment: Option<&ChildEnvironment>,
 ) -> Result<CapturedOutput, SupervisorError> {
+    console::scope(console::explicit_profile(), &[spec], cancel, |cancel| {
+        run_capture_inner(spec, cancel, max_bytes, time_limit, environment)
+    })
+    .await
+}
+async fn run_capture_inner(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    max_bytes: usize,
+    time_limit: Duration,
+    environment: Option<&ChildEnvironment>,
+) -> Result<CapturedOutput, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let mut child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
+    let pause = pause::scoped_pause();
+    let _attached = pause
+        .as_ref()
+        .map(|control| control.attach(&child))
+        .transpose()?;
     let (stdout, stderr) = child.take_pipes();
     let execution = async {
         let (stdout, stderr, status) = tokio::try_join!(
-            capture(stdout, max_bytes),
-            capture(stderr, max_bytes),
+            capture(stdout, max_bytes, false),
+            capture(stderr, max_bytes, true),
             async {
                 child
                     .wait_and_terminate_descendants()
@@ -291,7 +360,7 @@ pub async fn run_capture_with_environment(
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        _ = async { if let Some(control) = pause.as_ref() { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
         result = execution => result,
     };
     child
@@ -323,10 +392,31 @@ where
     T: Send + 'static,
     F: FnOnce(&mut dyn io::Read) -> Result<T, String> + Send + 'static,
 {
+    console::scope(console::explicit_profile(), &[spec], cancel, |cancel| {
+        run_streaming_stdout_inner(spec, cancel, stderr_max_bytes, time_limit, parse)
+    })
+    .await
+}
+async fn run_streaming_stdout_inner<T, F>(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    stderr_max_bytes: usize,
+    time_limit: Duration,
+    parse: F,
+) -> Result<StreamedOutput<T>, SupervisorError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn io::Read) -> Result<T, String> + Send + 'static,
+{
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
     let mut child = platform::OwnedChild::spawn(spec)?;
+    let pause = pause::scoped_pause();
+    let _attached = pause
+        .as_ref()
+        .map(|control| control.attach(&child))
+        .transpose()?;
     let (stdout, stderr) = child.take_pipes();
     let (sender, receiver) = mpsc::channel(2);
     let mut parser = tokio::task::spawn_blocking(move || {
@@ -372,7 +462,7 @@ where
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        _ = async { if let Some(control) = pause.as_ref() { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
         result = execution => result,
     };
     // Even a failed tree cleanup must not leave the parser worker blocked. The
@@ -419,6 +509,7 @@ async fn forward_stdout(
             return Ok(());
         }
         bytes.truncate(count);
+        console::emit(0, &bytes);
         if sender.send(bytes).await.is_err() {
             // The parser finished or panicked; its task carries the actual error.
             return Ok(());
@@ -437,6 +528,7 @@ async fn capture_tail(
         if count == 0 {
             return Ok(result);
         }
+        console::emit(1, &buffer[..count]);
         if count >= max_bytes {
             result.clear();
             result.extend_from_slice(&buffer[count - max_bytes..count]);
@@ -468,6 +560,30 @@ pub async fn run_pipeline(
         time_limit,
         None,
         None,
+    )
+    .await
+}
+
+/// A source frameserver pipeline whose final consumer writes an owned path.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pipeline_with_producer_environment(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    producer_environment: &ChildEnvironment,
+) -> Result<PipelineResult, SupervisorError> {
+    run_pipeline_inner(
+        producer_spec,
+        consumer_spec,
+        cancel,
+        events,
+        log_path,
+        time_limit,
+        None,
+        Some(producer_environment),
     )
     .await
 }
@@ -538,6 +654,36 @@ async fn run_pipeline_inner(
     output: Option<std::fs::File>,
     producer_environment: Option<&ChildEnvironment>,
 ) -> Result<PipelineResult, SupervisorError> {
+    console::scope(
+        console::logged_profile(&[producer_spec, consumer_spec]),
+        &[producer_spec, consumer_spec],
+        cancel,
+        |cancel| {
+            run_pipeline_execute(
+                producer_spec,
+                consumer_spec,
+                cancel,
+                events,
+                log_path,
+                time_limit,
+                output,
+                producer_environment,
+            )
+        },
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline_execute(
+    producer_spec: &CommandSpec,
+    consumer_spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    time_limit: Duration,
+    output: Option<std::fs::File>,
+    producer_environment: Option<&ChildEnvironment>,
+) -> Result<PipelineResult, SupervisorError> {
     if *cancel.borrow() {
         return Err(SupervisorError::Cancelled);
     }
@@ -560,6 +706,15 @@ async fn run_pipeline_inner(
                 return Err(SupervisorError::Io(error));
             }
         };
+    let pause = pause::scoped_pause();
+    let _producer_pause = pause
+        .as_ref()
+        .map(|control| control.attach(&producer))
+        .transpose()?;
+    let _consumer_pause = pause
+        .as_ref()
+        .map(|control| control.attach(&consumer))
+        .transpose()?;
     let (producer_stdout, producer_stderr) = producer.take_pipes();
     let consumer_stdin = consumer.take_stdin();
     let (consumer_stdout, consumer_stderr) = consumer.take_output_pipes();
@@ -643,7 +798,7 @@ async fn run_pipeline_inner(
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = tokio::time::sleep(time_limit) => Err(SupervisorError::Timeout),
+        _ = async { if let Some(control) = pause.as_ref() { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
         result = execution => result,
     };
     // Await both cleanups even if one reports failure. Killing both trees also
@@ -697,6 +852,7 @@ async fn read_pipe(stream: &mut (impl AsyncRead + Unpin), buffer: &mut [u8]) -> 
 async fn capture(
     mut stream: impl AsyncRead + Unpin,
     max_bytes: usize,
+    stderr: bool,
 ) -> Result<Vec<u8>, SupervisorError> {
     let mut result = Vec::with_capacity(max_bytes.min(RECORD_BYTES));
     // Capability discovery nests several capture futures in one join. Keep the
@@ -707,9 +863,11 @@ async fn capture(
         if count == 0 {
             return Ok(result);
         }
+        console::emit(u8::from(stderr), &buffer[..count]);
         if result.len().saturating_add(count) > max_bytes {
             return Err(SupervisorError::OutputLimit);
         }
+        let _ = CAPTURE_OBSERVER.try_with(|observer| observer(stderr, &buffer[..count]));
         result.extend_from_slice(&buffer[..count]);
     }
 }
@@ -741,6 +899,14 @@ async fn drain_stage(
             }
             return Ok(());
         }
+        console::emit(
+            match stage {
+                Some("producer") => 2,
+                Some("consumer") => 3,
+                _ => u8::from(stderr),
+            },
+            &buffer[..count],
+        );
         for &byte in &buffer[..count] {
             let Some(byte) = terminal.push(byte) else {
                 continue;
