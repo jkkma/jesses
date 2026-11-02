@@ -1,0 +1,2150 @@
+import { expect, test } from '@playwright/test';
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    const host = globalThis as unknown as Record<string, any>;
+    host.isTauri = true;
+    let callback = 0;
+    host.__eventCallbacks = {};
+    host.__shellCalls = [];
+    host.__jobs = [];
+    host.__reviews = {};
+    let savedPreferences = {
+      general: { defaultOutputDirectory: '', recursiveImport: false },
+      recentPaths: [] as string[],
+      revision: 1,
+    };
+    const pathA = 'C:\\media\\A.mkv',
+      pathB = 'C:\\media\\B.mkv';
+    host.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+    host.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+      transformCallback: (fn: unknown) => {
+        const id = ++callback;
+        host.__eventCallbacks[id] = fn;
+        return id;
+      },
+      unregisterCallback: () => {},
+      invoke: async (command: string, payload: Record<string, any> = {}) => {
+        host.__shellCalls.push({ command, payload });
+        if (command.startsWith('plugin:event|')) return ++callback;
+        if (
+          command === 'get_capabilities' &&
+          localStorage.getItem('test-batch-capabilities') === 'yes'
+        )
+          return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'mkvmerge', 'x264', 'x265'].map(
+            (id) => ({ id, name: id, available: true, path: `/bin/${id}`, version: 'test' }),
+          );
+        if (
+          command === 'get_capabilities' ||
+          command === 'list_jobs' ||
+          command === 'get_storage_locations'
+        )
+          return [];
+        if (command === 'subscribe_jobs') {
+          host.__jobChannel = payload.channel;
+          payload.channel.onmessage(structuredClone(host.__jobs));
+          return;
+        }
+        if (command === 'prepare_command_edit') {
+          const request = payload.request,
+            id = `batch-${Object.keys(host.__reviews).length}`;
+          const job = {
+            id,
+            state: 'preparing',
+            request: request.request.source,
+            encodeSettings: request.request.settings,
+            progressSeconds: 0,
+            durationSeconds: 60,
+            logs: [],
+            error: null,
+            recovery: null,
+            logPath: null,
+          };
+          host.__reviews[id] = { request, job };
+          host.__jobs = [job, ...host.__jobs];
+          host.__jobChannel?.onmessage(structuredClone(host.__jobs));
+          return {
+            id,
+            executableLabel: job.encodeSettings.backend === 'av1an' ? 'av1an' : 'ffmpeg',
+            arguments: '-i input | encoder',
+            outputPath: job.request.outputPath,
+            job,
+          };
+        }
+        if (command === 'confirm_command_edit') {
+          const held = host.__reviews[payload.request.id],
+            job = { ...held.job, state: 'running' };
+          host.__shellCalls.push({
+            command: 'mock_start_encode',
+            payload: { request: held.request.request },
+          });
+          host.__jobs = host.__jobs.map((entry: any) => (entry.id === job.id ? job : entry));
+          host.__jobChannel?.onmessage(structuredClone(host.__jobs));
+          return { kind: 'encode', job };
+        }
+        if (command === 'cancel_command_edit') return;
+        if (command === 'preview_encode_batch')
+          return {
+            items: payload.request.inputs.map((input: any) => ({
+              inputPath: input.inputPath,
+              outputPath: `${input.inputPath}.out.mkv`,
+              error: null,
+              request: {
+                source: {
+                  inputPath: input.inputPath,
+                  outputPath: `${input.inputPath}.out.mkv`,
+                  streamIndices: input.streamIndices,
+                },
+                settings: {
+                  ...payload.request,
+                  videoStreamIndex: input.videoStreamIndex,
+                  audio: input.audio,
+                  framing: input.framing,
+                },
+              },
+            })),
+          };
+        if (command === 'enqueue_encode_batch')
+          return payload.requests.map((request: any, index: number) => ({
+            id: `batch-${index}`,
+            state: 'queued',
+            request: request.source,
+            encodeSettings: request.settings,
+            progressSeconds: 0,
+            durationSeconds: 60,
+            logs: [],
+            error: null,
+            recovery: null,
+            logPath: null,
+          }));
+        if (command === 'start_encode')
+          return {
+            id: 'single-job',
+            state: 'running',
+            request: payload.request.source,
+            encodeSettings: payload.request.settings,
+            progressSeconds: 0,
+            durationSeconds: 2,
+            logs: [],
+            error: null,
+            recovery: null,
+            logPath: null,
+          };
+        if (command === 'list_av1an_recoveries') return [];
+        if (command === 'resolve_output_path') {
+          const request = payload.request;
+          const sequence =
+            request.inputPath === (host.__sequencePath ?? 'C:\\private\\sequence.mkv');
+          const path = sequence
+            ? (host.__sequenceDirectoryPath ?? host.__folderPath ?? 'C:\\media\\frames')
+            : request.inputPath;
+          const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+          const name = sequence
+            ? path.slice(slash + 1)
+            : path.slice(slash + 1).replace(/\.[^.]+$/, '');
+          const folder = request.defaultOutputDirectory || path.slice(0, slash);
+          const stem =
+            request.outputStem ?? `${folder}${folder.includes('\\') ? '\\' : '/'}${name}`;
+          const target = request.target;
+          const ext =
+            target.kind === 'container'
+              ? target.format === 'matroska'
+                ? 'mkv'
+                : target.format
+              : target.format === 'gif'
+                ? 'gif'
+                : '';
+          return {
+            outputStem: stem,
+            outputPath: stem + (ext ? `.${ext}` : ''),
+            isDirectory: !ext,
+            numbered: false,
+          };
+        }
+        if (command === 'get_preferences') return savedPreferences;
+        if (command === 'remember_recent_media') {
+          savedPreferences = {
+            ...savedPreferences,
+            recentPaths: [
+              ...payload.paths,
+              ...savedPreferences.recentPaths.filter((path) => !payload.paths.includes(path)),
+            ],
+            revision: savedPreferences.revision + 1,
+          };
+          return savedPreferences;
+        }
+        if (command === 'save_preferences') {
+          savedPreferences = {
+            ...savedPreferences,
+            ...payload.request,
+            recentPaths: payload.request.recentPaths ?? savedPreferences.recentPaths,
+            revision: savedPreferences.revision + 1,
+          };
+          return savedPreferences;
+        }
+        if (command === 'get_completion_status')
+          return {
+            options: { notify: false, finishAction: 'none' },
+            armedJobs: 0,
+            secondsRemaining: null,
+            error: null,
+          };
+        if (command === 'set_completion_options') {
+          if (host.__completionFailure) throw new Error(host.__completionFailure);
+          return;
+        }
+        if (
+          command === 'plugin:dialog|open' &&
+          host.__failRemembered &&
+          payload.options?.defaultPath
+        ) {
+          host.__failRemembered = false;
+          throw new Error('Remembered folder disappeared');
+        }
+        if (command === 'plugin:dialog|open')
+          return payload.options?.directory
+            ? [host.__folderPath ?? 'C:\\media\\frames']
+            : [pathA, pathB];
+        if (command === 'recent_path_is_folder')
+          return payload.path === (host.__folderPath ?? 'C:\\media\\frames');
+        if (command === 'import_image_sequence')
+          return {
+            id: host.__sequenceId ?? 'seq',
+            path: host.__sequencePath ?? 'C:\\private\\sequence.mkv',
+            name: payload.request.directoryPath.split(/[\\/]/).at(-1),
+            sizeBytes: '300',
+            durationSeconds: 2,
+            format: 'Folder',
+            source: {
+              kind: 'imageSequence',
+              directoryPath: host.__sequenceDirectoryPath ?? payload.request.directoryPath,
+              frameRate: payload.request.frameRate,
+              extension: 'png',
+              frameCount: 60,
+              sequenceFingerprint: 'sha256-test',
+            },
+            streams: [
+              {
+                index: 0,
+                kind: 'video',
+                codec: 'ffv1',
+                width: 320,
+                height: 180,
+                frameRate: '30/1',
+                language: null,
+                title: null,
+              },
+            ],
+          };
+        if (command === 'release_image_sequence') {
+          if (host.__rejectSequenceRelease) throw new Error('busy');
+          return;
+        }
+        if (command === 'probe_media') {
+          const a = payload.path === pathA;
+          return {
+            id: a ? 'a' : 'b',
+            path: payload.path,
+            name: a ? 'A.mkv' : 'B.mkv',
+            sizeBytes: a ? '200' : '100',
+            modifiedAtMs: a ? 1000 : 2000,
+            durationSeconds: 60,
+            format: 'matroska',
+            streams: [
+              {
+                index: 0,
+                kind: 'video',
+                codec: 'h264',
+                width: 320,
+                height: 180,
+                frameRate: '24/1',
+                sampleRate: null,
+                channels: null,
+                language: null,
+                title: null,
+              },
+              {
+                index: 1,
+                kind: 'audio',
+                codec: 'aac',
+                width: null,
+                height: null,
+                frameRate: null,
+                sampleRate: 48000,
+                channels: 2,
+                language: 'eng',
+                title: null,
+              },
+              {
+                index: 2,
+                kind: 'subtitle',
+                codec: 'ass',
+                width: null,
+                height: null,
+                frameRate: null,
+                sampleRate: null,
+                channels: null,
+                language: 'eng',
+                title: null,
+              },
+              ...(!a
+                ? [
+                    {
+                      index: 3,
+                      kind: 'attachment',
+                      codec: 'ttf',
+                      attachmentFilename: 'Font',
+                      width: null,
+                      height: null,
+                      frameRate: null,
+                      sampleRate: null,
+                      channels: null,
+                      language: null,
+                      title: 'Font',
+                    },
+                  ]
+                : []),
+            ],
+          };
+        }
+        if (command === 'begin_media_analysis') return `analysis-${++callback}`;
+        if (command === 'cancel_media_analysis') return;
+        if (command === 'set_media_analysis_paused') return;
+        if (command === 'snap_keyframe')
+          return {
+            positionSeconds: Math.floor(payload.request.positionSeconds / 5) * 5,
+            sourceFingerprint: 'test',
+          };
+        if (command === 'read_color_metadata')
+          return {
+            ...payload.request,
+            color: { color_primaries: 'bt2020' },
+            hdr: { max_cll: '1000' },
+            dolbyVisionProfile: 8,
+            dolbyVisionCompatibility: 1,
+            sourceFingerprint: 'source',
+            summary: 'Color report: BT.2020, MaxCLL 1000, Dolby Vision profile 8.',
+          };
+        if (command === 'run_utility') {
+          if (host.__holdUtility)
+            await new Promise<void>((resolve) => {
+              host.__releaseUtility = resolve;
+            });
+          return (
+            host.__utilityResult ?? {
+              kind: 'grainTable',
+              result: { message: 'Grain table created.' },
+            }
+          );
+        }
+        if (command === 'run_utility_batch') {
+          if (host.__holdUtility)
+            await new Promise<void>((resolve) => {
+              host.__releaseUtility = resolve;
+            });
+          if (host.__utilityBatchResult) return host.__utilityBatchResult;
+          return {
+            entries: payload.request.requests.map((request: any, index: number) => ({
+              index,
+              request,
+              ...(index === 1
+                ? { error: { code: 'TEST', message: 'Second file failed.', path: null } }
+                : { result: { kind: 'grainTable', result: { message: 'Done.' } } }),
+            })),
+            completed: 2,
+            canceled: false,
+          };
+        }
+        if (command === 'resolve_deinterlace')
+          return {
+            request: { ...payload.request, method: 'bwdif', fieldOrder: 'bottomFirst' },
+            message: 'QTGMC unavailable; using BWDIF.',
+          };
+        if (command === 'analyze_bitrate')
+          return (
+            host.__bitrateResult ?? {
+              streamIndex: 0,
+              windowSeconds: 1,
+              packetBytes: '3000',
+              averageMegabitsPerSecond: 2,
+              peakWindowMegabitsPerSecond: 3,
+              sourceFingerprint: 'source',
+              points: [
+                { startSeconds: 0, megabitsPerSecond: 1, packetBytes: '1000' },
+                { startSeconds: 1, megabitsPerSecond: 2, packetBytes: '1000' },
+                { startSeconds: 2, megabitsPerSecond: 3, packetBytes: '1000' },
+              ],
+            }
+          );
+        if (command === 'inspect_utility_capabilities')
+          return {
+            dependencies: [],
+            grainPresets: [],
+            ffmpegEncoders: [],
+            ocrLanguages: [],
+            notes: [],
+          };
+        if (command === 'extract_attachment') return 'C:\\media\\B.mkv Attachments';
+        if (command === 'open_directory') return;
+        if (command === 'preview_frame')
+          return {
+            imageDataUrl:
+              'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            width: 1,
+            height: 1,
+            sourceWidth: 320,
+            sourceHeight: 180,
+            positionSeconds: 12,
+            sourceFingerprint: 'test',
+            toneMapped: false,
+          };
+        throw new Error(`Unexpected ${command}`);
+      },
+    };
+  });
+  await page.goto('/');
+});
+
+test('source shell loads selected tracks, preserves selections, and disables Run on non-task tabs', async ({
+  page,
+}) => {
+  const nav = page.getByRole('navigation', { name: 'Workspace workflows' });
+  await expect(nav.getByRole('button')).toHaveText([
+    'File List',
+    'Track List',
+    'AV1AN',
+    'Quick Convert',
+    'Utilities',
+    'Settings',
+  ]);
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toBeVisible();
+  if (process.env.JESSES_CAPTURE_UI) await page.screenshot({ path: 'target/source-file-list.png' });
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('option', { name: /B.mkv/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await expect(tracks.getByRole('listbox', { name: 'Tracks' }).getByRole('option')).toHaveCount(7);
+  if (process.env.JESSES_CAPTURE_UI)
+    await page.screenshot({ path: 'target/source-track-list.png' });
+  const firstAudio = tracks.getByRole('checkbox', { name: /Include \[#02\]: Audio/ }).first();
+  await firstAudio.uncheck();
+  await nav.getByRole('button', { name: 'File List', exact: true }).click();
+  await nav.getByRole('button', { name: 'Track List', exact: true }).click();
+  await expect(firstAudio).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+  await nav.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+});
+
+test('selected attachment extracts the correct source-scoped stream and opens its folder', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /B.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await expect(tracks.getByRole('button', { name: 'Extract', exact: true })).toHaveCount(0);
+  await tracks.getByRole('option', { name: /Attachment/ }).click();
+  await tracks.getByRole('button', { name: 'Extract', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some((call: any) => call.command === 'open_directory'),
+      ),
+    )
+    .toBe(true);
+  const calls = await page.evaluate(() => (globalThis as any).__shellCalls);
+  expect(calls.find((call: any) => call.command === 'extract_attachment').payload).toMatchObject({
+    inputPath: 'C:\\media\\B.mkv',
+    streamIndex: 3,
+  });
+  expect(calls.find((call: any) => call.command === 'open_directory').payload.path).toBe(
+    'C:\\media\\B.mkv Attachments',
+  );
+});
+
+test('file mode and sort follow the fork controls', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  const files = page.getByRole('region', { name: 'File List' });
+  await expect(files.getByRole('listbox', { name: 'Files' }).getByRole('option')).toHaveCount(2);
+  await files.getByText('Sort…', { exact: true }).click();
+  await files.getByRole('button', { name: 'Most Recent First' }).click();
+  await expect(
+    files.getByRole('listbox', { name: 'Files' }).getByRole('option').first(),
+  ).toContainText('B.mkv');
+  await files.getByLabel('Mode').selectOption('batch');
+  await expect(files.getByLabel('Output Names')).toBeVisible();
+  await page
+    .getByRole('navigation', { name: 'Workspace workflows' })
+    .getByRole('button', { name: 'Track List' })
+    .click();
+  await expect(
+    page.getByText('Manual track selection is not available in Batch Processing Mode.'),
+  ).toBeVisible();
+});
+
+test('utility cards use the shared Run action and cancel metric edits', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('option', { name: /B.mkv/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const utilities = page.getByRole('region', { name: 'Utilities' });
+  await expect(utilities.locator('.card')).toHaveCount(11);
+  if (process.env.JESSES_CAPTURE_UI) await page.screenshot({ path: 'target/source-utilities.png' });
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+  await utilities.getByRole('button', { name: /Get Metrics/ }).click();
+  const dialog = page.getByRole('dialog', { name: 'Quality Metrics' });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel('SSIM', { exact: true }).check();
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await utilities.getByRole('button', { name: /Get Metrics/ }).click();
+  await expect(dialog.getByLabel('SSIM', { exact: true })).not.toBeChecked();
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await expect(page.getByRole('button', { name: 'Run: Metrics calculation' })).toBeEnabled();
+});
+
+test('Settings saves source preferences and reset choices only on OK', async ({ page }) => {
+  await page.addInitScript(() =>
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      get: () => 'Mozilla/5.0 (X11; Linux x86_64)',
+    }),
+  );
+  await page.reload();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('region', { name: 'Settings' });
+  await expect(
+    settings.getByRole('combobox', { name: 'Console window', exact: true }),
+  ).toBeEnabled();
+  await settings
+    .getByRole('combobox', { name: 'Console window', exact: true })
+    .selectOption('visibleStayOpen');
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) =>
+            c.command === 'save_preferences' &&
+            c.payload.request.general.consoleWindow === 'visibleStayOpen',
+        ),
+      ),
+    )
+    .toBe(true);
+  await expect(settings.getByLabel(/Show the av1an console window/)).toBeDisabled();
+  await settings.getByLabel('Auto-crop samples').fill('21');
+  await settings.getByLabel('Auto-crop samples').blur();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) =>
+            c.command === 'save_preferences' && c.payload.request.general.autoCropSamples === 21,
+        ),
+      ),
+    )
+    .toBe(true);
+  await settings.getByRole('button', { name: 'Configure…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Settings To Reset On New File' });
+  await dialog.getByLabel('Resize', { exact: true }).check();
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await settings.getByRole('button', { name: 'Configure…' }).click();
+  await expect(dialog.getByLabel('Resize', { exact: true })).not.toBeChecked();
+  await dialog.getByLabel('Resize', { exact: true }).check();
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) =>
+            c.command === 'save_preferences' && c.payload.request.general.resetOnNewFile?.resize,
+        ),
+      ),
+    )
+    .toBe(true);
+  await expect(settings).toContainText('Resize');
+});
+
+test('Film Grain runs through the shared action with automatic output naming', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility')?.payload
+            .request,
+      ),
+    )
+    .toMatchObject({
+      kind: 'grain',
+      request: {
+        operation: 'measureSource',
+        sourcePath: 'C:\\media\\A.mkv',
+        outputTablePath: '',
+        denoiseStrength: 4,
+      },
+    });
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'Grain table created.',
+  );
+});
+
+test('bitrate chart selection displays range and double click resets it', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Show Bitrate Chart/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate chart' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Bitrate Chart' });
+  const chart = dialog.getByRole('slider', { name: /Bitrate chart/ });
+  const box = await chart.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box!.x + 2, box!.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(box!.x + box!.width - 2, box!.y + 20);
+  await page.mouse.up();
+  await expect(dialog).toContainText('3 samples');
+  await expect(dialog).toContainText('Average 2000k');
+  await chart.dblclick();
+  await expect(dialog).toContainText('Drag to select a range');
+  await chart.focus();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Shift+ArrowRight');
+  await expect(dialog).toContainText('2 samples');
+  await page.keyboard.press('Escape');
+  await expect(dialog).toContainText('Drag to select a range');
+});
+
+test('utility settings restore on reload, retain live edits on close and reset to fork defaults', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ });
+  const open = async () => card.getByRole('button', { name: 'Configure…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
+  await open();
+  await dialog.getByLabel('Denoise strength').fill('7');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await open();
+  await expect(dialog.getByLabel('Denoise strength')).toHaveValue('7');
+  await dialog.getByLabel('Denoise strength').fill('9');
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await open();
+  await expect(dialog.getByLabel('Denoise strength')).toHaveValue('9');
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await open();
+  await expect(dialog.getByLabel('Denoise strength')).toHaveValue('7');
+  await dialog.getByRole('button', { name: 'Reset' }).click();
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await open();
+  await expect(dialog.getByLabel('Denoise strength')).toHaveValue('4');
+});
+
+test('invalid stored utility settings fall back to safe source defaults', async ({ page }) => {
+  await page.evaluate(() =>
+    localStorage.setItem(
+      'jesses.source-utilities.v1',
+      JSON.stringify({
+        grain: { operation: 'bogus', denoise: 9999 },
+        ladder: { encoder: 'bogus', sampleCount: -2 },
+      }),
+    ),
+  );
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const utilities = page.getByRole('region', { name: 'Utilities' });
+  await utilities
+    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Configure…' })
+    .click();
+  const grain = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
+  await expect(grain.getByLabel('Denoise strength')).toHaveValue('4');
+  await grain.getByRole('button', { name: 'Close' }).click();
+  await utilities
+    .getByRole('button', { name: /Sample Encodes/ })
+    .getByRole('button', { name: 'Configure…' })
+    .click();
+  const ladder = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  await expect(ladder.getByLabel('Encoder', { exact: true })).toHaveValue('av1');
+  await expect(ladder.getByLabel('Samples', { exact: true })).toHaveValue('3');
+});
+
+test('deinterlace and sample encode choices persist independently', async ({ page }) => {
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const utilities = page.getByRole('region', { name: 'Utilities' });
+  const openDeint = async () =>
+    utilities
+      .getByRole('button', { name: /Deinterlace Video/ })
+      .getByRole('button', { name: 'Configure…' })
+      .click();
+  const openLadder = async () =>
+    utilities
+      .getByRole('button', { name: /Sample Encodes/ })
+      .getByRole('button', { name: 'Configure…' })
+      .click();
+  const deint = page.getByRole('dialog', { name: 'Configure Deinterlace Video' });
+  const ladder = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  await openDeint();
+  await deint.getByLabel('Deinterlacer').selectOption('yadif');
+  await deint.getByLabel('One frame per field').uncheck();
+  await deint.getByRole('button', { name: 'OK' }).click();
+  await openLadder();
+  await ladder.getByLabel('Encoder', { exact: true }).selectOption('hevc');
+  await ladder.getByLabel('Samples', { exact: true }).fill('5');
+  await ladder.getByRole('button', { name: 'OK' }).click();
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await openDeint();
+  await expect(deint.getByLabel('Deinterlacer')).toHaveValue('yadif');
+  await expect(deint.getByLabel('One frame per field')).not.toBeChecked();
+  await deint.getByRole('button', { name: 'Close' }).click();
+  await openLadder();
+  await expect(ladder.getByLabel('Encoder', { exact: true })).toHaveValue('hevc');
+  await expect(ladder.getByLabel('Preset', { exact: true })).toHaveValue('medium');
+  await expect(ladder.getByLabel('Samples', { exact: true })).toHaveValue('5');
+});
+
+test('automatic utility deinterlace uses resolved method and detected field order', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Deinterlace Video/ })
+    .getByRole('button', { name: 'Configure…' })
+    .click();
+  const dialog = page.getByRole('dialog', { name: 'Configure Deinterlace Video' });
+  await dialog.getByLabel('Deinterlacer').selectOption('automatic');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Deinterlace pass' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility')?.payload
+            .request,
+      ),
+    )
+    .toMatchObject({
+      kind: 'deinterlaceExport',
+      request: { method: 'bwdif', fieldOrder: 'bottomFirst', outputPath: '' },
+    });
+  const resolution = await page.evaluate(
+    () =>
+      (globalThis as any).__shellCalls.find((c: any) => c.command === 'resolve_deinterlace')
+        .payload,
+  );
+  expect(resolution).toMatchObject({
+    automatic: true,
+    request: { method: 'qtgmc', inputPath: 'C:\\media\\A.mkv' },
+  });
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'QTGMC unavailable; using BWDIF.',
+  );
+});
+
+test('source dialog is modal, Escape closes it and focus returns to its opener', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const consoleSelect = page.getByRole('combobox', { name: 'Console window', exact: true });
+  expect((await consoleSelect.boundingBox())!.width).toBeLessThanOrEqual(225);
+  const opener = page
+    .getByRole('region', { name: 'Settings' })
+    .getByRole('button', { name: 'Configure…' });
+  await opener.click();
+  const dialog = page.getByRole('dialog', { name: 'Settings To Reset On New File' });
+  await expect(dialog).toBeVisible();
+  const bounds = await dialog.boundingBox();
+  const viewport = page.viewportSize();
+  expect(bounds).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(Math.abs(bounds!.x + bounds!.width / 2 - viewport!.width / 2)).toBeLessThan(2);
+  expect(Math.abs(bounds!.y + bounds!.height / 2 - viewport!.height / 2)).toBeLessThan(2);
+  await expect
+    .poll(() =>
+      dialog.evaluate((node) => node.matches(':modal') && node.contains(document.activeElement)),
+    )
+    .toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(opener).toBeFocused();
+});
+
+test('Cut Video uses shared time editor, snaps copy start and keeps prior range on close', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Cut Video/ });
+  await card.click();
+  const dialog = page.getByRole('dialog', { name: 'Cut Video' });
+  await expect(dialog.getByLabel('Start', { exact: true })).toHaveValue('00:00:00');
+  await dialog.getByLabel('Start', { exact: true }).fill('12');
+  await dialog.getByLabel('End', { exact: true }).fill('40');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await expect(dialog).toHaveCount(0);
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  await expect(dialog.getByLabel('Start', { exact: true })).toHaveValue('00:00:10');
+  await expect(dialog.getByLabel('End', { exact: true })).toHaveValue('00:00:40');
+  await dialog.getByLabel('End', { exact: true }).fill('50');
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  await expect(dialog.getByLabel('End', { exact: true })).toHaveValue('00:00:40');
+});
+
+test('adding files to a populated list offers checked append or replacement', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Import 2 Files' });
+  await expect(dialog.getByRole('checkbox')).toHaveCount(2);
+  await dialog.getByLabel('A.mkv').uncheck();
+  await dialog.getByRole('button', { name: 'Replace file list' }).click();
+  const options = page
+    .getByRole('region', { name: 'File List' })
+    .getByRole('listbox', { name: 'Files' })
+    .getByRole('option');
+  await expect(options).toHaveCount(1);
+  await expect(options.first()).toContainText('B.mkv');
+});
+
+test('removing the loaded source promotes the first remaining file and loads its tracks', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByRole('button', { name: 'Track List', exact: true }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await expect(tracks.getByRole('listbox', { name: 'Tracks' }).getByRole('option')).toHaveCount(4);
+  await expect(tracks.getByRole('option', { name: /Attachment.*Font/ })).toBeVisible();
+});
+
+test('mode transition clears the assembled tracks and restores a single file on return to mux', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /B.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Track List', exact: true }).click();
+  await expect(
+    page
+      .getByRole('region', { name: 'Track List' })
+      .getByRole('listbox', { name: 'Tracks' })
+      .getByRole('option'),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('mux');
+  await page.getByRole('button', { name: 'Track List', exact: true }).click();
+  await expect(
+    page
+      .getByRole('region', { name: 'Track List' })
+      .getByRole('listbox', { name: 'Tracks' })
+      .getByRole('option'),
+  ).toHaveCount(3);
+});
+
+test('Color Data with no target logs the complete native report without a utility output', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Transfer Color Metadata/ });
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Transfer Color Metadata' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'MaxCLL 1000, Dolby Vision profile 8',
+  );
+  const calls = await page.evaluate(() => (globalThis as any).__shellCalls);
+  expect(calls.find((c: any) => c.command === 'read_color_metadata').payload.request).toEqual({
+    inputPath: 'C:\\media\\A.mkv',
+    videoStreamIndex: 0,
+  });
+  expect(calls.some((c: any) => c.command === 'run_utility')).toBe(false);
+});
+
+test('Sample Encodes parses integer CRFs like the fork and falls back for invalid text', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Sample Encodes/ });
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  let dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  await dialog.getByLabel('CRF values').fill('-4, 10.5, nope');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: CRF ladder' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').at(-1)
+            ?.payload.request?.request?.crfs,
+      ),
+    )
+    .toEqual([25, 30, 35]);
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  await dialog.getByLabel('CRF values').fill('70, 30, 30, -2, 1.5, 20');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: CRF ladder' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').at(-1)
+            ?.payload.request?.request?.crfs,
+      ),
+    )
+    .toEqual([20, 30, 63]);
+});
+
+test('default selectors use per-kind ordinals while requests retain source-scoped stream identities', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const tracks = page.getByRole('region', { name: 'Track List' });
+  await expect(tracks.getByLabel('Default Audio').getByRole('option').first()).toHaveText(
+    '#01 - ENG',
+  );
+  await expect(tracks.getByLabel('Default Subtitles').getByRole('option').nth(1)).toHaveText(
+    '#01 - ENG (ASS)',
+  );
+  await expect(tracks.getByLabel('Default Audio').getByRole('option').first()).toHaveAttribute(
+    'value',
+    '["a",1]',
+  );
+});
+
+test('Color Data sends each source flag combination to the selected target in place', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Transfer Color Metadata/ });
+  const dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  let count = 0;
+  for (const [color, hdr] of [
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ]) {
+    await card.getByRole('button', { name: 'Configure…' }).click();
+    await expect(dialog).toContainText('rewrites that file in place');
+    await dialog.getByLabel('Target Video').selectOption('C:\\media\\B.mkv');
+    await dialog.getByLabel(/Color space/).setChecked(color);
+    await dialog.getByLabel(/HDR metadata/).setChecked(hdr);
+    await dialog.getByRole('button', { name: 'OK' }).click();
+    await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+    count++;
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').length,
+        ),
+      )
+      .toBe(count);
+    const request = await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').at(-1)
+          .payload.request,
+    );
+    expect(request).toMatchObject({
+      kind: 'colorMetadataTransfer',
+      request: {
+        metadataSourcePath: 'C:\\media\\A.mkv',
+        inputPath: 'C:\\media\\B.mkv',
+        outputPath: '',
+        inPlace: true,
+        copyColor: color,
+        copyHdr: hdr,
+      },
+    });
+  }
+});
+
+test('Color Data batch mode only reads each file even after a target was configured', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Transfer Color Metadata/ });
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  let dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  await dialog.getByLabel('Target Video').selectOption('C:\\media\\B.mkv');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  await expect(dialog.getByLabel('Target Video')).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await page.getByRole('button', { name: 'Run Batch: Color data transfer' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'read_color_metadata')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const calls = await page.evaluate(() => (globalThis as any).__shellCalls);
+  expect(calls.filter((c: any) => c.command === 'run_utility')).toHaveLength(0);
+  expect(
+    calls
+      .filter((c: any) => c.command === 'read_color_metadata')
+      .map((c: any) => c.payload.request.inputPath),
+  ).toEqual(['C:\\media\\A.mkv', 'C:\\media\\B.mkv']);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toContainText('Done');
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toContainText('Done');
+});
+
+test('Sample Encodes shows the exact per-encoder source color menus and sends selected format', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Sample Encodes/ });
+  const dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  const wide = ['yuv420p', 'yuv422p', 'yuv444p', 'yuv420p10le', 'yuv422p10le', 'yuv444p10le'];
+  const matrix: [string, string[], string][] = [
+    ['av1', ['yuv420p', 'yuv420p10le'], 'yuv420p10le'],
+    ['aomAv1', wide, 'yuv420p10le'],
+    ['hevc', wide, 'yuv420p'],
+    ['h264', wide, 'yuv420p'],
+    [
+      'vp9',
+      ['yuv420p', 'yuv422p', 'yuva420p', 'yuv444p', 'yuv420p10le', 'yuv422p10le', 'yuv444p10le'],
+      'yuv420p',
+    ],
+  ];
+  let runs = 0;
+  for (const [encoder, options, defaultFormat] of matrix) {
+    await card.getByRole('button', { name: 'Configure…' }).click();
+    expect(
+      await dialog
+        .getByLabel('Encoder', { exact: true })
+        .locator('option')
+        .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
+    ).toEqual(matrix.map((row) => row[0]));
+    await dialog.getByLabel('Encoder', { exact: true }).selectOption(encoder);
+    const color = dialog.getByLabel('Color Format');
+    await expect
+      .poll(() =>
+        color
+          .locator('option')
+          .evaluateAll((nodes) => nodes.map((node) => (node as HTMLOptionElement).value)),
+      )
+      .toEqual(options);
+    await expect(color).toHaveValue(defaultFormat);
+    await color.selectOption(options.at(-1)!);
+    await dialog.getByRole('button', { name: 'OK' }).click();
+    await page.getByRole('button', { name: 'Run: CRF ladder' }).click();
+    runs++;
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').length,
+        ),
+      )
+      .toBe(runs);
+    const request = await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility').at(-1)
+          .payload.request.request,
+    );
+    expect(request).toMatchObject({ encoder, pixelFormat: options.at(-1) });
+  }
+});
+
+for (const width of [800, 1360]) {
+  test(`source Utilities keeps ${width === 800 ? 'two compact' : 'three desktop'} columns at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: width === 800 ? 768 : 850 });
+    await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+    const utilities = page.getByRole('region', { name: 'Utilities' });
+    const cards = utilities.locator('.card');
+    await expect(cards).toHaveCount(11);
+    const first = await cards.nth(0).boundingBox();
+    const second = await cards.nth(1).boundingBox();
+    const third = await cards.nth(2).boundingBox();
+    expect(first && second && third).toBeTruthy();
+    expect(second!.x).toBeGreaterThan(first!.x + first!.width * 0.8);
+    if (width === 800) expect(third!.y).toBeGreaterThan(first!.y + first!.height * 0.8);
+    else expect(third!.x).toBeGreaterThan(second!.x + second!.width * 0.8);
+    await page.screenshot({ path: `/tmp/jesses-utilities-${width}-source.png` });
+    if (width === 800) {
+      const region = await utilities.boundingBox();
+      for (let i = 0; i < 11; i++) {
+        const card = await cards.nth(i).boundingBox();
+        expect(card!.y).toBeGreaterThanOrEqual(region!.y - 1);
+        expect(card!.y + card!.height).toBeLessThanOrEqual(region!.y + region!.height + 1);
+      }
+      expect(await utilities.evaluate((node) => node.scrollHeight <= node.clientHeight)).toBe(true);
+    }
+    await cards.last().scrollIntoViewIfNeeded();
+    const region = await utilities.boundingBox();
+    const last = await cards.last().boundingBox();
+    expect(last!.y + last!.height).toBeLessThanOrEqual(region!.y + region!.height + 1);
+    await cards.last().click();
+    await expect(page.getByRole('button', { name: 'Run: Subtitle OCR' })).toBeEnabled();
+  });
+}
+
+test('image sequence folder prompts for rate, displays original folder, and releases its managed source on removal', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  const prompt = page.getByRole('dialog', { name: 'Enter Frame Rate' });
+  await expect(prompt).toContainText("image sequence 'frames'");
+  await expect(prompt.getByLabel('Frame rate')).toHaveValue('30');
+  await prompt.getByLabel('Frame rate').fill('24000/1001');
+  await prompt.getByRole('button', { name: 'OK' }).click();
+  const row = page.getByRole('option', { name: /frames/ });
+  await expect(row).toHaveAttribute('title', 'C:\\media\\frames');
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'import_image_sequence')
+            ?.payload.request,
+      ),
+    )
+    .toEqual({
+      directoryPath: 'C:\\media\\frames',
+      frameRate: { numerator: 24000, denominator: 1001 },
+    });
+  await expect(page.locator('body')).not.toContainText('private');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'does not support image sequence folders',
+  );
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await row.click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'release_image_sequence')
+            ?.payload.request,
+      ),
+    )
+    .toEqual({ inputPath: 'C:\\private\\sequence.mkv', sequenceFingerprint: 'sha256-test' });
+});
+
+test('image sequence rate prompt validates invalid input and closing uses source default 30', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  const prompt = page.getByRole('dialog', { name: 'Enter Frame Rate' });
+  await prompt.getByLabel('Frame rate').fill('0/0');
+  await prompt.getByRole('button', { name: 'OK' }).click();
+  await expect(prompt.getByRole('alert')).toContainText('positive frame rate');
+  await prompt.getByRole('button', { name: 'Close' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'import_image_sequence')
+            ?.payload.request.frameRate,
+      ),
+    )
+    .toEqual({ numerator: 30, denominator: 1 });
+});
+
+test('sequence decimals follow fork integer rounding and duplicate folders retain the original rate', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  const rate = page.getByRole('dialog', { name: 'Enter Frame Rate' });
+  await rate.getByLabel('Frame rate').fill('23.976');
+  await rate.getByRole('button', { name: 'OK' }).click();
+  await expect(page.getByRole('option', { name: /frames/ })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'import_image_sequence')
+            .length,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.find((c: any) => c.command === 'import_image_sequence')
+          .payload.request.frameRate,
+    ),
+  ).toEqual({ numerator: 24, denominator: 1 });
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Import 1 File' })
+    .getByRole('button', { name: 'Add to file list' })
+    .click();
+  await expect(rate).toHaveCount(0);
+  await expect(page.getByRole('option', { name: /frames/ })).toHaveCount(1);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.filter((c: any) => c.command === 'import_image_sequence')
+          .length,
+    ),
+  ).toBe(1);
+});
+
+test('sequence removal reports retained cache when a job still owns it', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Enter Frame Rate' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await page.getByRole('option', { name: /frames/ }).click();
+  await page.evaluate(() => ((globalThis as any).__rejectSequenceRelease = true));
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'managed sequence is retained',
+  );
+  await expect(page.getByRole('log', { name: 'Recent activity' })).not.toContainText('private');
+});
+
+test('batch name example follows the last encoding tab and its live codec, quality, preset and container', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('x264');
+  await quick.getByLabel('Quality', { exact: true }).fill('19');
+  await quick.getByLabel('Preset / Effort').selectOption('slow');
+  await quick.getByLabel('Container', { exact: true }).selectOption('mp4');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByLabel('Output Names').fill('{name}_{codec}_{crf}_{preset}_{index}');
+  await expect(page.getByText('e.g. A.mkv → A_h264_19_slow_1.mp4')).toBeVisible();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av1an = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av1an.getByLabel('Encoder', { exact: true }).selectOption('x265Standalone');
+  await av1an.getByLabel('Quality', { exact: true }).fill('23');
+  await av1an.getByLabel('Preset / Effort').selectOption('slow');
+  await av1an.getByLabel('Container', { exact: true }).selectOption('webm');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByText('e.g. A.mkv → A_h265_23_slow_1.webm')).toBeVisible();
+});
+
+test('batch utility file rows reflect individual success and failure', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ })
+    .click();
+  await page.getByRole('button', { name: 'Run Batch: Film grain edit' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some((c: any) => c.command === 'run_utility_batch'),
+      ),
+    )
+    .toBe(true);
+  const requests = await page.evaluate(
+    () =>
+      (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility_batch').payload
+        .request.requests,
+  );
+  expect(requests.map((item: any) => item.request.sourcePath)).toEqual([
+    'C:\\media\\A.mkv',
+    'C:\\media\\B.mkv',
+  ]);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toContainText('Done');
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toContainText('Failed');
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toHaveAttribute(
+    'title',
+    'Second file failed.',
+  );
+});
+
+test('batch encode rows follow live job state for each source', async ({ page }) => {
+  await page.evaluate(() => localStorage.setItem('test-batch-capabilities', 'yes'));
+  await page.reload();
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some((c: any) => c.command === 'confirm_command_edit'),
+      ),
+    )
+    .toBe(true);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toContainText('Running');
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toContainText('Queued');
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__jobs = h.__jobs.map((job: any) =>
+      job.id === 'batch-0' ? { ...job, state: 'succeeded' } : job,
+    );
+    h.__jobChannel?.onmessage(structuredClone(h.__jobs));
+  });
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toContainText('Done');
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'confirm_command_edit')
+            .length,
+      ),
+    )
+    .toBe(2);
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    h.__jobs = h.__jobs.map((job: any) =>
+      job.id === 'batch-1'
+        ? {
+            ...job,
+            state: 'failed',
+            error: { code: 'TEST', message: 'Failed to encode.', path: null },
+          }
+        : job,
+    );
+    h.__jobChannel?.onmessage(structuredClone(h.__jobs));
+  });
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toContainText('Failed');
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.filter((c: any) => c.command === 'subscribe_jobs').length,
+    ),
+  ).toBe(1);
+});
+
+test('a dropped sequence folder is remembered and can be reopened from Recent', async ({
+  page,
+}) => {
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) =>
+            c.command === 'plugin:event|listen' && c.payload.event === 'tauri://drag-drop',
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(() => {
+    const h = globalThis as any;
+    const listener = h.__shellCalls.find(
+      (c: any) => c.command === 'plugin:event|listen' && c.payload.event === 'tauri://drag-drop',
+    );
+    h.__eventCallbacks[listener.payload.handler]({
+      event: 'tauri://drag-drop',
+      id: 1,
+      payload: { paths: ['C:\\media\\frames'], position: { x: 0, y: 0 } },
+    });
+  });
+  await page
+    .getByRole('dialog', { name: 'Enter Frame Rate' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await expect(page.getByRole('option', { name: /frames/ })).toBeVisible();
+  await page.getByRole('option', { name: /frames/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByText('Recent…', { exact: true }).click();
+  await page.getByRole('button', { name: 'C:\\media\\frames' }).click();
+  await expect(page.getByRole('dialog', { name: 'Enter Frame Rate' })).toBeVisible();
+  await page
+    .getByRole('dialog', { name: 'Enter Frame Rate' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await expect(page.getByRole('option', { name: /frames/ })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.filter((c: any) => c.command === 'import_image_sequence')
+            .length,
+      ),
+    )
+    .toBe(2);
+});
+
+for (const configured of [false, true]) {
+  test(`dotted sequence source uses ${configured ? 'configured' : 'adjacent'} output folder without exposing cache`, async ({
+    page,
+  }) => {
+    await page.evaluate(() => ((globalThis as any).__folderPath = 'C:\\media\\frames.01'));
+    if (configured) {
+      await page.getByRole('button', { name: 'Settings', exact: true }).click();
+      const folder = page.getByPlaceholder('Leave empty to save next to the source file');
+      await folder.fill('D:\\renders');
+      await folder.blur();
+      await expect
+        .poll(() =>
+          page.evaluate(() =>
+            (globalThis as any).__shellCalls.some(
+              (c: any) =>
+                c.command === 'save_preferences' &&
+                c.payload.request.general.defaultOutputDirectory === 'D:\\renders',
+            ),
+          ),
+        )
+        .toBe(true);
+      await page.getByRole('button', { name: 'File List', exact: true }).click();
+    }
+    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page
+      .getByRole('dialog', { name: 'Enter Frame Rate' })
+      .getByRole('button', { name: 'OK' })
+      .click();
+    await expect(page.getByRole('option', { name: /frames\.01/ })).toBeVisible();
+    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+    const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+    await expect(quick.getByLabel('Output Path', { exact: true })).toHaveValue(
+      configured ? 'D:\\renders\\frames.01' : 'C:\\media\\frames.01',
+    );
+    await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'AV1AN', exact: true })).toContainText(
+      'AV1AN does not support image sequence folders.',
+    );
+  });
+}
+
+test('Quick Convert encodes the managed sequence while output remains beside its original folder', async ({
+  page,
+}) => {
+  await page.evaluate(() => localStorage.setItem('test-batch-capabilities', 'yes'));
+  await page.reload();
+  await page.evaluate(() => ((globalThis as any).__folderPath = 'C:\\media\\frames.01'));
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Enter Frame Rate' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await expect(page.getByRole('option', { name: /frames\.01/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run: Encode' });
+  await expect(run).toBeEnabled();
+  await run.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request.source,
+      ),
+    )
+    .toMatchObject({
+      inputPath: 'C:\\private\\sequence.mkv',
+      outputPath: 'C:\\media\\frames.01.mkv',
+    });
+});
+
+test('Windows exposes the AV1AN console preference while general console mode is always available', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    }),
+  );
+  await page.reload();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('region', { name: 'Settings' });
+  await expect(
+    settings.getByRole('combobox', { name: 'Console window', exact: true }),
+  ).toBeEnabled();
+  await expect(settings.getByLabel('Show the av1an console window', { exact: true })).toBeEnabled();
+});
+
+test('Film Grain Apply replaces existing grain headers as the fork does', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ });
+  await card.getByRole('button', { name: 'Configure…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
+  await dialog.getByLabel('Do', { exact: true }).selectOption('apply');
+  await dialog.getByLabel('Grain from').selectOption('preset');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility')?.payload
+            .request,
+      ),
+    )
+    .toMatchObject({
+      kind: 'grain',
+      request: { operation: 'rewriteHeaders', source: { kind: 'preset', preset: 'Super8' } },
+    });
+});
+
+test('batch naming example uses the full dotted sequence folder name and an empty extension token', async ({
+  page,
+}) => {
+  await page.evaluate(() => ((globalThis as any).__folderPath = 'C:\\media\\frames.01'));
+  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Enter Frame Rate' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await expect(page.getByRole('option', { name: /frames\.01/ })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByLabel('Output Names').fill('{name}-{ext}');
+  await expect(page.getByText('e.g. frames.01 → frames.01-.mkv')).toBeVisible();
+});
+
+for (const reusedCache of [false, true]) {
+  test(`duplicate canonical sequence import selects the loaded row and ${reusedCache ? 'keeps its reused cache' : 'releases only the unused cache'}`, async ({
+    page,
+  }) => {
+    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page
+      .getByRole('dialog', { name: 'Enter Frame Rate' })
+      .getByRole('button', { name: 'OK' })
+      .click();
+    const row = page.getByRole('option', { name: /frames/ });
+    await expect(row).toHaveCount(1);
+    await page.evaluate((reused) => {
+      const host = globalThis as any;
+      host.__folderPath = 'C:\\alias-parent\\frames';
+      host.__sequenceDirectoryPath = 'C:\\media\\frames';
+      host.__sequenceId = 'unused-sequence';
+      host.__sequencePath = reused ? 'C:\\private\\sequence.mkv' : 'C:\\private\\unused.mkv';
+    }, reusedCache);
+    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page
+      .getByRole('dialog', { name: 'Import 1 File' })
+      .getByRole('button', { name: 'Add to file list' })
+      .click();
+    const rate = page.getByRole('dialog', { name: 'Enter Frame Rate' });
+    await rate.getByLabel('Frame rate').fill('24');
+    await rate.getByRole('button', { name: 'OK' }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__shellCalls.filter(
+              (call: any) => call.command === 'import_image_sequence',
+            ).length,
+        ),
+      )
+      .toBe(2);
+    await expect(row).toHaveCount(1);
+    await expect(row).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('button', { name: 'Add Folder…' })).toBeEnabled();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (globalThis as any).__shellCalls
+            .filter((call: any) => call.command === 'release_image_sequence')
+            .map((call: any) => call.payload.request.inputPath),
+        ),
+      )
+      .toEqual(reusedCache ? [] : ['C:\\private\\unused.mkv']);
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    await expect(row).toHaveCount(0);
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (globalThis as any).__shellCalls
+            .filter((call: any) => call.command === 'release_image_sequence')
+            .map((call: any) => call.payload.request.inputPath),
+        ),
+      )
+      .toEqual(
+        reusedCache
+          ? ['C:\\private\\sequence.mkv']
+          : ['C:\\private\\unused.mkv', 'C:\\private\\sequence.mkv'],
+      );
+  });
+}
+
+test('unsupported utility batches show the source-specific warning', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const utilities = page.getByRole('region', { name: 'Utilities' });
+  const cases = [
+    {
+      card: /Get Metrics/,
+      task: 'Metrics calculation',
+      reason:
+        'It compares two loaded files against each other, so a single file means nothing to it.',
+      config: 'Quality Metrics',
+    },
+    {
+      card: /Sample Encodes/,
+      task: 'CRF ladder',
+      reason:
+        'It ends in a results window, which a queue would raise once per file with nobody there',
+    },
+    {
+      card: /Show Bitrate Chart/,
+      task: 'Bitrate chart',
+      reason:
+        'It opens a chart window for the file it analysed, and a queue would raise one per file.',
+    },
+    {
+      card: /Concatenate Into Single MKV/,
+      task: 'Concatenation',
+      reason:
+        'It joins the whole file list into one output, which is the opposite of running per file.',
+    },
+  ];
+  for (const entry of cases) {
+    await utilities.getByRole('button', { name: entry.card }).click();
+    if (entry.config)
+      await page
+        .getByRole('dialog', { name: entry.config })
+        .getByRole('button', { name: 'Close' })
+        .click();
+    await page.getByRole('button', { name: `Run Batch: ${entry.task}` }).click();
+    const warning = page.getByRole('dialog', { name: 'Nmkoder - Warning' });
+    await expect(warning).toContainText(`${entry.task} cannot be run per file.`);
+    await expect(warning).toContainText(entry.reason);
+    await expect(warning).toContainText('Switch the File List tab to Muxing Mode to use it.');
+    await warning.getByRole('button', { name: 'OK' }).click();
+  }
+});
+
+test('utility progress accepts only its active ticket, supports pause and discards late completion after Stop', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ })
+    .click();
+  await page.evaluate(() => {
+    (globalThis as any).__holdUtility = true;
+  });
+  await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility')?.payload
+            .id,
+      ),
+    )
+    .toBeTruthy();
+  const id = await page.evaluate(
+    () => (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility').payload.id,
+  );
+  const emit = async (ticket: string, message: string) =>
+    page.evaluate(
+      ({ ticket, message }) => {
+        const h = globalThis as any;
+        const listener = h.__shellCalls.find(
+          (c: any) => c.command === 'plugin:event|listen' && c.payload.event === 'utility-progress',
+        );
+        h.__eventCallbacks[listener.payload.handler]({
+          event: 'utility-progress',
+          id: 1,
+          payload: {
+            id: ticket,
+            progress: {
+              rowIndex: 0,
+              rowCount: 1,
+              completedRows: 0,
+              status: 'running',
+              phase: 'Denoising',
+              message,
+              elapsedSeconds: 5,
+              progressSeconds: 4,
+              durationSeconds: 12,
+              estimatedRemainingSeconds: 10,
+            },
+          },
+        });
+      },
+      { ticket, message },
+    );
+  await emit('old-ticket', 'Old progress');
+  await expect(page.getByLabel('Current action')).not.toHaveText('Old progress');
+  await emit(id, 'Denoising source');
+  await expect(page.getByLabel('Current action')).toHaveText('Denoising source');
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__shellCalls
+        .filter((c: any) => c.command === 'set_media_analysis_paused')
+        .map((c: any) => c.payload),
+    ),
+  ).toEqual([
+    { id, paused: true },
+    { id, paused: false },
+  ]);
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await page.evaluate(() => (globalThis as any).__releaseUtility());
+  await expect(page.getByLabel('Current action')).toHaveText('Canceled.');
+  await expect(page.getByRole('log', { name: 'Recent activity' })).not.toContainText(
+    'Grain table created.',
+  );
+  expect(
+    await page.evaluate(
+      (id) =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) => c.command === 'cancel_media_analysis' && c.payload.id === id,
+        ),
+      id,
+    ),
+  ).toBe(true);
+});
+
+test('source log Copy and Shutdown when done checkbox preserve their native actions and errors', async ({
+  page,
+}) => {
+  await page.evaluate(() =>
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (value: string) => {
+          (globalThis as any).__copiedLog = value;
+        },
+      },
+    }),
+  );
+  await page
+    .getByRole('region', { name: 'Activity log' })
+    .getByRole('button', { name: 'Copy', exact: true })
+    .click();
+  expect(await page.evaluate(() => (globalThis as any).__copiedLog)).toMatch(
+    /\[INFO\].*workspace ready\.\n/,
+  );
+  const checkbox = page.getByLabel('Shutdown when done');
+  await checkbox.check();
+  await expect(checkbox).toBeChecked();
+  await checkbox.uncheck();
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__shellCalls
+        .filter((c: any) => c.command === 'set_completion_options')
+        .map((c: any) => c.payload.options),
+    ),
+  ).toEqual([
+    { notify: false, finishAction: 'shutdown' },
+    { notify: false, finishAction: 'none' },
+  ]);
+  await page.evaluate(() => {
+    (globalThis as any).__completionFailure = 'Shutdown refused';
+  });
+  await checkbox.click();
+  await expect(page.getByRole('alert')).toContainText('Shutdown refused');
+  await expect(checkbox).not.toBeChecked();
+  await page.evaluate(() => {
+    (globalThis as any).__completionFailure = '';
+  });
+  await checkbox.check();
+  await expect(checkbox).toBeChecked();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('native media picker retries without a remembered folder when that folder disappears', async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    localStorage.setItem('jesses.last-browsed-directory', 'C:\\missing');
+    (globalThis as any).__failRemembered = true;
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toBeVisible();
+  const dialogs = await page.evaluate(() =>
+    (globalThis as any).__shellCalls
+      .filter((c: any) => c.command === 'plugin:dialog|open')
+      .map((c: any) => c.payload.options),
+  );
+  expect(dialogs).toHaveLength(2);
+  expect(dialogs[0].defaultPath).toBe('C:\\missing');
+  expect(dialogs[1].defaultPath).toBeUndefined();
+});
+
+test('Repair Frame Cadence sends the source video identity and does not import its output', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Repair Frame Cadence/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Cadence repair' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((c: any) => c.command === 'run_utility')?.payload
+            .request,
+      ),
+    )
+    .toMatchObject({
+      kind: 'cadenceRepairExport',
+      request: { inputPath: 'C:\\media\\A.mkv', outputPath: '', videoStreamIndex: 0 },
+    });
+  expect(
+    await page.evaluate(
+      () => (globalThis as any).__shellCalls.filter((c: any) => c.command === 'probe_media').length,
+    ),
+  ).toBe(2);
+});
+
+test('historical hardware Sample Encodes preferences visibly select a valid CPU default', async ({
+  page,
+}) => {
+  await page.evaluate(() =>
+    localStorage.setItem(
+      'jesses.source-utilities.v1',
+      JSON.stringify({ ladder: { encoder: 'hevcNvenc', preset: 'p7', pixel: 'p010le' } }),
+    ),
+  );
+  await page.reload();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Sample Encodes/ })
+    .getByRole('button', { name: 'Configure…' })
+    .click();
+  const dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
+  await expect(dialog.getByLabel('Encoder', { exact: true })).toHaveValue('av1');
+  await expect(dialog.getByLabel('Preset', { exact: true })).toHaveValue('4');
+  await expect(dialog.getByLabel('Color Format', { exact: true })).toHaveValue('yuv420p10le');
+  expect(
+    await dialog
+      .getByLabel('Encoder', { exact: true })
+      .locator('option')
+      .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
+  ).toEqual(['av1', 'aomAv1', 'hevc', 'h264', 'vp9']);
+});
+
+test('utility completion reports measured output size and elapsed time', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Repair Frame Cadence/ })
+    .click();
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdUtility = true;
+    host.__utilityResult = {
+      kind: 'artifact',
+      result: {
+        outputPath: 'C:\\media\\A_fixed.mkv',
+        sizeBytes: '100',
+        message: 'Created.',
+        operation: 'cadence',
+        durationSeconds: 60,
+        sourceFingerprints: [],
+        diagnostics: [],
+      },
+    };
+  });
+  await page.getByRole('button', { name: 'Run: Cadence repair' }).click();
+  await expect
+    .poll(() => page.evaluate(() => typeof (globalThis as any).__releaseUtility))
+    .toBe('function');
+  await page.evaluate(() => (globalThis as any).__releaseUtility());
+  await expect(
+    page.getByText(
+      /Done - A_fixed\.mkv: 200 B → 100 B \(-50%\) - finished in (?:\d+ms|\d+s|\d\d:\d\d(?::\d\d)?)\./,
+    ),
+  ).toBeVisible();
+  await expect(page.getByText(/Output: A_fixed\.mkv: 200 B → 100 B \(-50%\)/)).toBeVisible();
+});
+
+test('utility batch totals count only measured successful outputs', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Repair Frame Cadence/ })
+    .click();
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdUtility = true;
+    host.__utilityBatchResult = {
+      entries: [
+        {
+          index: 0,
+          result: {
+            kind: 'artifact',
+            result: { outputPath: 'C:\\media\\A_fixed.mkv', sizeBytes: '100', message: 'Created.' },
+          },
+        },
+        { index: 1, error: { code: 'TEST', message: 'Failed.', path: null } },
+      ],
+      completed: 1,
+      canceled: false,
+    };
+  });
+  await page.getByRole('button', { name: 'Run Batch: Cadence repair' }).click();
+  await expect
+    .poll(() => page.evaluate(() => typeof (globalThis as any).__releaseUtility))
+    .toBe('function');
+  await page.evaluate(() => (globalThis as any).__releaseUtility());
+  await expect(page.getByLabel('Current action')).toContainText('1/2 finished, 1 failed');
+  await expect(page.getByLabel('Current action')).toContainText(
+    'Total size: 200 B → 100 B (-50%).',
+  );
+});
+
+test('packet bitrate reports stream and per-kind totals', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Read Bitrates/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate reading' }).click();
+  const log = page.getByRole('log', { name: 'Recent activity' });
+  await expect(log).toContainText(
+    'Stream #0 (video) - Bitrate: 2000 kbps - Size: 2.9 KB (1500.0%)',
+  );
+  await expect(log).toContainText(
+    'Total Video Bitrate: 2000 kbps - Total Video Size: 2.9 KB (1500.0%)',
+  );
+  await expect(log).toContainText('Total Audio Bitrate: 2000 kbps');
+  await expect(log).toContainText('Total Subtitle Bitrate: 2000 kbps');
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__shellCalls
+        .filter((call: any) => call.command === 'analyze_bitrate')
+        .every((call: any) => call.payload.sourceChart === false),
+    ),
+  ).toBe(true);
+});
+
+test('bitrate chart rejects an empty analysis instead of opening an empty graph', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.evaluate(() => {
+    (globalThis as any).__bitrateResult = { points: [] };
+  });
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Show Bitrate Chart/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate chart' }).click();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'No frames could be read',
+  );
+  await expect(page.getByRole('dialog', { name: 'Bitrate Chart' })).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__shellCalls.find((call: any) => call.command === 'analyze_bitrate')
+          .payload.sourceChart,
+    ),
+  ).toBe(true);
+});
+
+for (const receipt of ['table', 'retained-ladder', 'private-ladder'] as const)
+  test(`native measured ${receipt} receipt reaches source completion`, async ({ page }) => {
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('option', { name: /A.mkv/ }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+    await page
+      .getByRole('region', { name: 'Utilities' })
+      .getByRole('button', { name: receipt === 'table' ? /Film Grain/ : /Sample Encodes/ })
+      .click();
+    await page.evaluate((receipt) => {
+      const h = globalThis as any;
+      h.__utilityResult =
+        receipt === 'table'
+          ? {
+              kind: 'grainTable',
+              result: {
+                outputPath: 'C:\\media\\only-table.tbl',
+                sizeBytes: '100',
+                denoisedOutputPath: 'C:\\media\\separate-denoised.mkv',
+                segmentCount: 1,
+                message: 'Table measured.',
+                diagnostics: [],
+                sourceFingerprints: [],
+              },
+            }
+          : {
+              kind: 'crfLadder',
+              result: {
+                encoder: 'h264',
+                preset: 'ultrafast',
+                metric: 'none',
+                rungs: [],
+                parameters: [],
+                diagnostics: [],
+                message: 'Samples measured.',
+                sourceDurationSeconds: 12,
+                sourceSizeBytes: '200',
+                sampledSeconds: 1,
+                sampledFraction: 1 / 12,
+                recommendationThreshold: null,
+                recommendedCrf: null,
+                sourceFingerprint: 'test',
+                vmafModel: 'standard',
+                ...(receipt === 'retained-ladder'
+                  ? { samplesDirectory: 'C:\\media\\retained-samples', samplesSizeBytes: '300' }
+                  : {}),
+              },
+            };
+    }, receipt);
+    await page
+      .getByRole('button', {
+        name: receipt === 'table' ? 'Run: Film grain edit' : 'Run: CRF ladder',
+        exact: true,
+      })
+      .click();
+    const log = page.getByRole('log', { name: 'Recent activity' });
+    if (receipt === 'private-ladder') {
+      await expect(log).toContainText('Samples measured.');
+      await expect(log).not.toContainText('Output:');
+    } else {
+      await expect(log).toContainText(
+        receipt === 'table'
+          ? 'Output: only-table.tbl: 200 B → 100 B (-50%)'
+          : 'Output: retained-samples: 200 B → 300 B (+50%)',
+      );
+    }
+  });
+
+test('native measured grain table bytes contribute to source batch totals', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Film Grain/ })
+    .click();
+  await page.evaluate(() => {
+    (globalThis as any).__utilityBatchResult = {
+      entries: [
+        {
+          index: 0,
+          result: {
+            kind: 'grainTable',
+            result: {
+              outputPath: 'C:\\media\\table.tbl',
+              sizeBytes: '100',
+              denoisedOutputPath: 'C:\\media\\not-counted.mkv',
+              message: 'Measured table.',
+              diagnostics: [],
+              sourceFingerprints: [],
+              segmentCount: 1,
+            },
+          },
+        },
+        { index: 1, error: { code: 'TEST', message: 'Failed.', path: null } },
+      ],
+      completed: 1,
+      canceled: false,
+    };
+  });
+  await page.getByRole('button', { name: 'Run Batch: Film grain edit', exact: true }).click();
+  await expect(page.getByLabel('Current action')).toContainText(
+    'Total size: 200 B → 100 B (-50%).',
+  );
+  await expect(page.getByLabel('Current action')).toContainText('1/2 finished, 1 failed');
+});

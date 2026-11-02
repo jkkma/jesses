@@ -122,6 +122,14 @@ fn settings(encoder: media_core::VideoEncoder) -> media_core::EncodeSettings {
             ("bframes", "4"),
             ("b-adapt", "0"),
             ("aq-mode", "2"),
+            ("cabac", "1"),
+            ("8x8dct", "1"),
+            ("psy", "1"),
+            ("dct-decimate", "0"),
+            ("mbtree", "0"),
+            ("scenecut", "40"),
+            ("deblock", "-2:1"),
+            ("psy-rd", "1.2:0.15"),
         ],
         X265 => &[
             ("ref", "3"),
@@ -129,11 +137,43 @@ fn settings(encoder: media_core::VideoEncoder) -> media_core::EncodeSettings {
             ("b-adapt", "0"),
             ("sao", "0"),
             ("cutree", "0"),
+            ("deblock", "-2:1"),
+            ("psy-rd", "1.5"),
+            ("qcomp", "0.65"),
+            ("aq-strength", "0.8"),
+            ("rc-grain", "0"),
+            ("hdr10-opt", "0"),
+            ("ctu", "32"),
+            ("min-cu-size", "8"),
+            ("me", "hex"),
         ],
         Vp9 => &[
             ("aq-mode", "2"),
             ("lag-in-frames", "16"),
             ("auto-alt-ref", "1"),
+            ("deadline", "good"),
+            ("tune", "ssim"),
+            ("tune-content", "screen"),
+            ("sharpness", "2"),
+            ("static-thresh", "0"),
+            ("error-resilient", "default"),
+            ("arnr-maxframes", "3"),
+            ("arnr-strength", "2"),
+            ("frame-parallel", "1"),
+            ("drop-threshold", "0"),
+        ],
+        SvtAv1 => &[
+            ("aq-mode", "2"),
+            ("enable-tf", "0"),
+            ("hierarchical-levels", "3"),
+            ("tune", "0"),
+            ("scm", "0"),
+            ("variance-octile", "4"),
+            ("luminance-qp-bias", "10"),
+            ("enable-dlf", "2"),
+            ("chroma-qm-min", "10"),
+            ("enable-overlays", "1"),
+            ("hbd-mds", "1"),
         ],
         _ => &[
             ("aq-mode", "2"),
@@ -206,6 +246,14 @@ async fn installed_catalogs_and_actual_overrides_keep_their_native_and_library_v
             "{encoder:?}: {:?} {:?}",
             job.error,
             job.logs
+        );
+        assert_eq!(
+            job.input_size_bytes,
+            Some(std::fs::metadata(&input).unwrap().len().to_string())
+        );
+        assert_eq!(
+            job.output_size_bytes,
+            Some(std::fs::metadata(&output).unwrap().len().to_string())
         );
         let mut command = args(&[
             "-v",
