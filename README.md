@@ -32,7 +32,9 @@ loudness and explicit flat gain. General preferences and recent media persist.
 Windows distribution is a portable ZIP, installed and updated through Scoop.
 Portable packages and bundled media tools are being qualified. This is a
 development build; final Windows artifacts, Scoop persistence and clean-machine checks
-remain in progress. Linux and macOS native support are deferred.
+remain in progress. Linux AppImage/DEB and native Apple Silicon/Intel macOS
+app-archive lanes are active; their final artifact checks remain separate. See
+[macOS setup](docs/macos.md) and [packaging](docs/packaging.md).
 
 ## Media utilities and source inspection
 
@@ -151,11 +153,11 @@ Completed phase checkpoints remain available for explicit Resume. Omitted
 rate settings retain CRF behavior in old jobs. av1an supports CRF and per-chunk perceptual quality targets.
 See [rate-control qualification](tests/fixtures/rate-control-validation.md).
 
-**H.264 NVENC** and **HEVC NVENC** use FFmpeg's NVIDIA encoders. Admission executes
-a bounded one-frame initialization with the selected depth and mode, so a missing
-or incompatible NVIDIA GPU or driver produces an actionable capability error
-before source encoding. The Windows qualification host has an AMD GPU; its negative
-hardware rejection is evidence for the gate, not a positive NVENC output claim.
+**CPU video encoders only.** Hardware encoding choices and execution are
+excluded. Historical hardware job records remain readable and fail clearly if
+resumed as hardware encodes; copying their media remains supported. Vulkan
+processing, libplacebo Spline tone mapping and GPU-assisted metrics remain
+available. Packaged FFmpeg is checked against the CPU encoder inventory policy.
 
 Encoding supports validated constant-frame-rate SDR video with
 explicit color metadata and 4:2:0 8-bit or 10-bit input. Square pixels remain the
@@ -630,9 +632,9 @@ Build a native executable with embedded frontend assets:
 pnpm tauri build --debug --no-bundle
 ```
 
-Native CI targets Windows x64. Linux and macOS native support are deferred. The
-frontend job uses an Ubuntu browser/build host, which does not establish Linux
-product support. Local unsigned Windows artifact checks are recorded in the
+Native CI targets Windows x64, Linux x64, and Apple Silicon/Intel macOS. The
+frontend browser/build job remains separate from native execution. Platform
+artifact and runtime checks are recorded in the
 [packaging documentation](docs/packaging.md); final artifact, Scoop lifecycle and
 clean-machine qualification remain separate gates.
 
@@ -651,10 +653,12 @@ directly with argument arrays, bounded output, and timeouts. Job supervision use
 atomic Job Object assignment on Windows 10+ and process groups on Unix. Unix tools
 must not deliberately detach from their process group. Binary pipelines use
 bounded buffers and owned file handles, require success from both stages, and
-stop both trees on failure. Linux and macOS native UI qualification are deferred.
+stop both trees on failure. Native app startup and interactive workflow
+qualification remain distinct from compilation and browser checks.
 
-The activity panel retains at most 200 entries in memory. Only its open/closed
-state persists; source lists and media metadata are session-only.
+The activity panel retains at most 200 entries in memory and offers copy, save,
+clear and log-folder actions. Its visibility/height, the current tab and native
+window geometry persist; source lists and media metadata are session-only.
 
 See [icon assets](assets/branding/README.md) for the master artwork and generated desktop formats.
 

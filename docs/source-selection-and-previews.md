@@ -120,3 +120,35 @@ the bundled runtime currently rejects it because `havsfunc` is absent.
 
 See [FFmpeg's display-rotation option](https://ffmpeg.org/ffmpeg.html#Video-Options)
 for the counterclockwise metadata convention.
+
+## Image-sequence folders
+
+Add Folder loads one top-level still-image sequence and asks for FPS (default 30).
+The original folder supplies the File List name, original image codec/size/FPS,
+recent entry and output basename, including dots in folder names. A managed source
+supplies ordinary preview/crop/trim and Quick Convert processing; its cache path
+must never become an output default. Supported extensions are PNG/JPG/JPEG/BMP/WebP,
+with one extension selected after stable culture filename ordering. Names need
+no consecutive numeric suffix. The original ordered frames/FPS are immutable
+across queueing, session restore and native encoder recovery.
+
+AV1AN and utilities that require an original encoded bitstream exclude folders.
+Packet-bitrate charts also reject rather than measuring managed cache compression.
+Removing a source may release its verified cache when no preview, queued job or
+saved recovery uses it. Application exit retains durable sources for restoration.
+See [the source contract and evidence](encoding-parity.md#folder-image-sequence-sources).
+
+The native source proof uses three real-media tests for PNG16 alpha/JPEG order,
+chosen FPS, original codec/size metadata, thumbnail/crop, trimmed lossless 4:4:4
+encoding, changed originals, no-clobber and active cancellation, plus native
+stop/restart/resume and blocked cache release while recovery is retained.
+A runnable .NET 10 comparison covers 52 mixed case/accent/punctuation names across
+invariant/current and six culture/sort cases, with Swedish/Turkish environment
+selection. Linux execution is qualified; Windows/macOS native locale acquisition
+awaits their host checks. The culture and exact imported order remain pinned in
+receipts across later locale changes.
+
+Canonical duplicate-folder imports select the existing loaded row and release
+only a newly imported, unreferenced processing source. A reused processing path
+still referenced by any loaded row is retained. Focused browser tests exercise
+both cases and removal, together with original dotted-folder naming.
