@@ -339,7 +339,7 @@ async fn live_pause_halts_descendants_is_idempotent_and_cancel_kills_paused_tree
     let active = control.clone();
     let (owner, cancel) = watch::channel(false);
     let (events, _receiver) = mpsc::channel(64);
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         run_with_pause(
             &spec,
             cancel,
@@ -377,7 +377,10 @@ async fn live_pause_halts_descendants_is_idempotent_and_cancel_kills_paused_tree
             .map(|path| std::fs::metadata(path).unwrap().len())
             .collect::<Vec<_>>()
     );
-    control.set_paused(false).unwrap();
+    if let Err(error) = control.set_paused(false) {
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        panic!("could not resume paused tree: {error}; operation result: {result:?}");
+    }
     control.set_paused(false).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     for (path, previous) in paths.iter().zip(lengths) {
@@ -425,11 +428,10 @@ async fn live_pause_excludes_suspended_time_from_timeout() {
         fixture.pid(2).await,
     ];
     control.set_paused(true).unwrap();
+    let paused_result = tokio::time::timeout(Duration::from_millis(2300), &mut task).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(2300), &mut task)
-            .await
-            .is_err(),
-        "suspended time consumed the encode timeout"
+        paused_result.is_err(),
+        "operation finished while its tree was suspended: {paused_result:?}"
     );
     control.set_paused(false).unwrap();
     // Allow the remaining two-second active limit plus Windows' five-second

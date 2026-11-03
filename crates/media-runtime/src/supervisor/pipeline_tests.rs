@@ -150,7 +150,8 @@ async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file()
     let (_cancel, receiver) = watch::channel(false);
     let (events, _unread) = mpsc::channel(1);
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        // Include startup and the native five-second tree teardown budget.
+        Duration::from_secs(10),
         run_pipeline_to_file(
             &producer.spec(),
             &consumer.spec(),
@@ -163,7 +164,15 @@ async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file()
     )
     .await
     .unwrap();
-    assert!(result.is_err());
+    assert!(
+        matches!(
+            result,
+            Err(SupervisorError::Io(_)
+                | SupervisorError::StageFailed { .. }
+                | SupervisorError::EarlyConsumerExit)
+        ),
+        "the invalid sink must fail IO or its writer, not timeout or cleanup: {result:?}"
+    );
     assert_eq!(std::fs::read(&output_path).unwrap(), b"preserve");
     // A sink error can occur before the tool helper itself starts. Every known
     // PID must be terminated; native job ownership also covers unobserved ones.
@@ -210,7 +219,7 @@ async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file()
     ];
     cancel.send(true).unwrap();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), task)
+        tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()
             .unwrap(),
@@ -429,7 +438,7 @@ async fn scoped_pause_halts_both_pipeline_trees_and_cancel_reaps_them() {
     let producer_spec = producer.spec();
     let consumer_spec = consumer.spec();
     let log = producer.0.join("scoped-pause.log");
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         with_pause(
             active,
             run_pipeline(
@@ -470,7 +479,10 @@ async fn scoped_pause_halts_both_pipeline_trees_and_cancel_reaps_them() {
             .map(|path| std::fs::metadata(path).unwrap().len())
             .collect::<Vec<_>>()
     );
-    control.set_paused(false).unwrap();
+    if let Err(error) = control.set_paused(false) {
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        panic!("could not resume paused pipeline: {error}; operation result: {result:?}");
+    }
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         paths

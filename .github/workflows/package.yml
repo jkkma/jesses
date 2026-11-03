@@ -141,6 +141,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: python scripts/build-package-mkvmerge.py --destination "$RUNNER_TEMP/jesses-mkvmerge"
+      - name: Verify native parallel scene detection with pinned Windows AV1AN and L-SMASH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $delivery = Join-Path $env:RUNNER_TEMP 'jesses-av1an/delivery'
+          $frameserver = Join-Path $delivery 'python/Lib/site-packages/vapoursynth'
+          $ffmpeg = Join-Path $env:RUNNER_TEMP 'jesses-ffmpeg/delivery'
+          $svt = Join-Path $env:RUNNER_TEMP 'jesses-svt/delivery'
+          $mkvmerge = Join-Path $env:RUNNER_TEMP 'jesses-mkvmerge/delivery'
+          # AV1AN validates its default encoder and concatenator even for --sc-only.
+          $env:PATH = "$delivery;$frameserver;$ffmpeg;$svt;$mkvmerge;$env:PATH"
+          $env:VSSCRIPT_PATH = Join-Path $frameserver 'vsscript.dll'
+          $env:JESSES_TEST_AV1AN = Join-Path $delivery 'av1an.exe'
+          cargo test -p media-runtime --lib --locked jobs::av1an::scenes::tests::native_parallel_prepass_covers_all_source_frames -- --ignored --exact --nocapture
       - name: Include optional Vulkan scoring with per-job CPU fallback
         if: runner.os == 'Windows'
         shell: bash

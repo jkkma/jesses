@@ -17,6 +17,7 @@ static WRITE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 thread_local! {
     static REMOVE_ENUMERATED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CUT_SLOT_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn error(path: &Path, message: impl Into<String>) -> AppError {
@@ -480,6 +481,10 @@ fn write_cut_slot(
         output
             .write_all(&buffer[..count])
             .map_err(|cause| error(path, cause.to_string()))?;
+        #[cfg(test)]
+        if let Some(hook) = CUT_SLOT_WRITE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
     }
     output
         .sync_all()
@@ -3866,24 +3871,19 @@ mod tests {
         owned.workspace.save().unwrap();
         let (sender, cancel) = watch::channel(false);
         let observed = slot.clone();
-        let length = next_stamp.length;
-        let monitor = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(3) {
-                if fs::metadata(&observed)
-                    .is_ok_and(|metadata| metadata.len() > 0 && metadata.len() < length)
-                {
-                    sender.send_replace(true);
-                    return true;
-                }
-                std::thread::yield_now();
-            }
-            false
+        // Cancel after one actual write rather than racing a monitor thread
+        // against a fast filesystem copy. The remaining recovery path is real.
+        CUT_SLOT_WRITE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(fs::metadata(&observed).unwrap().len(), 65536);
+                sender.send_replace(true);
+            }));
         });
         let error =
             write_cut_slot(&next_stamp, &slot, &old_stamp.identity, Some(&cancel)).unwrap_err();
         assert_eq!(error.code, "JOB_CANCELED");
-        assert!(monitor.join().unwrap());
+        assert_eq!(identity(&slot).unwrap(), old_stamp.identity);
+        assert_eq!(fs::read(&slot).unwrap(), vec![0x22; 65536]);
         assert_ne!(digest(&slot, None).unwrap(), old_stamp);
         let snapshot:media_core::JobSnapshot=serde_json::from_value(serde_json::json!({"id":"owned-job","state":"canceled","request":owned.workspace.manifest.request,"encodeSettings":next_settings,"recovery":owned.summary(),"progressSeconds":null,"durationSeconds":null,"logs":[],"error":null,"logPath":null})).unwrap();
         drop(owned);
