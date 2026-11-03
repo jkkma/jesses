@@ -200,7 +200,11 @@ jobs:
           cargo test -p media-runtime --test utility_containers --locked -- --ignored --nocapture --test-threads=1
           cargo test -p media-runtime --test analysis_jobs --test bitrate_jobs --test loudness_jobs --test quality_jobs --test trim_jobs --test subtitle_jobs --test ffmpeg_video_jobs --test mux_jobs --test image_jobs --locked -- --ignored --test-threads=1
           # Bundled QTGMC is evaluated against real frames by the dependency merger above.
-          cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip qtgmc
+          cargo test -p media-runtime --test x264_jobs --test container_jobs --test temporal_jobs --test parameter_jobs --test rate_control_jobs --locked -- --include-ignored --test-threads=1 --skip qtgmc
+          # Physical Vulkan and an external Dolby Vision fixture are separate equipped-host gates.
+          # All headless HDR checks, including Auto fallback and held-Spline rejection, still run.
+          test ! -e "$RUNNER_TEMP/jesses-no-vulkan-device.json"
+          VK_DRIVER_FILES="$RUNNER_TEMP/jesses-no-vulkan-device.json" cargo test -p media-runtime --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip selected_spline_uses_physical_vulkan_while_final_encoder_is_cpu --skip profile5_rpu_gpu_job_renders_complete_sdr_output
       - name: Qualify portable av1an with external tools and conflicting runtimes unavailable
         if: runner.os == 'Windows'
         shell: pwsh

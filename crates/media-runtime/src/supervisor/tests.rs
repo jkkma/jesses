@@ -95,6 +95,23 @@ fn spawn_fixture_child(path: &Path, mode: &str) {
     let _child = command.spawn().unwrap();
 }
 
+fn fixture_stdout_file() -> std::fs::File {
+    #[cfg(unix)]
+    use std::os::fd::AsFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsHandle;
+
+    let stdout = std::io::stdout();
+    stdout.lock().flush().unwrap();
+    #[cfg(unix)]
+    let owned = stdout.as_fd().try_clone_to_owned().unwrap();
+    #[cfg(windows)]
+    let owned = stdout.as_handle().try_clone_to_owned().unwrap();
+    // Stdout suppresses EBADF as a successful no-op. Use the actual descriptor
+    // so the relay exercises native write errors even on a read-only sink.
+    std::fs::File::from(owned)
+}
+
 /// A separate invocation of this test binary acts as a deterministic native tool.
 #[test]
 #[ignore = "subprocess fixture invoked by supervisor tests"]
@@ -204,24 +221,14 @@ fn fake_tool() {
             std::io::stderr()
                 .write_all(b"binary relay diagnostic\n")
                 .unwrap();
-            let mut stdout = std::io::stdout().lock();
+            let mut stdout = fixture_stdout_file();
             std::io::copy(&mut std::io::stdin().lock(), &mut stdout).unwrap();
             stdout.flush().unwrap();
             std::process::exit(0);
         }
         "seekable-consumer" => {
             use std::io::{Seek, SeekFrom};
-            #[cfg(unix)]
-            use std::os::fd::AsFd;
-            #[cfg(windows)]
-            use std::os::windows::io::AsHandle;
-            let stdout = std::io::stdout();
-            stdout.lock().flush().unwrap();
-            #[cfg(unix)]
-            let owned = stdout.as_fd().try_clone_to_owned().unwrap();
-            #[cfg(windows)]
-            let owned = stdout.as_handle().try_clone_to_owned().unwrap();
-            let mut file = std::fs::File::from(owned);
+            let mut file = fixture_stdout_file();
             // IVF encoders write a provisional header, then seek back to record
             // their final frame count. A pipe relay cannot support this contract.
             file.seek(SeekFrom::Start(0)).unwrap();

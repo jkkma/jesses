@@ -159,9 +159,16 @@ jobs:
       - name: Verify installed encoder catalogs, advanced overrides and command plans
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test parameter_jobs --locked -- --ignored
-      - name: Verify HDR and HLG rendering, SDR pixel arithmetic and metadata removal
+      - name: Verify CPU HDR rendering, no-device fallback, SDR pixels and metadata removal
         if: runner.os == 'Linux'
-        run: cargo test -p media-runtime --test tone_map_jobs --locked -- --include-ignored
+        run: |
+          # Positive Vulkan and external Dolby Vision fixture gates require an equipped host.
+          # An absent ICD explicitly exercises Auto CPU fallback and held-Spline rejection.
+          export JESSES_FFMPEG="$(command -v ffmpeg)"
+          export JESSES_FFPROBE="$(command -v ffprobe)"
+          export VK_DRIVER_FILES="$RUNNER_TEMP/jesses-no-vulkan-device.json"
+          test ! -e "$VK_DRIVER_FILES"
+          cargo test -p media-runtime --test tone_map_jobs --locked -- --include-ignored --test-threads=1 --skip selected_spline_uses_physical_vulkan_while_final_encoder_is_cpu --skip profile5_rpu_gpu_job_renders_complete_sdr_output
       - name: Verify bitrate, target size, fresh two-pass producers and cancellation
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test rate_control_jobs --locked -- --include-ignored

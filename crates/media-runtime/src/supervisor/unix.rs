@@ -92,8 +92,6 @@ impl PauseTarget {
             io::Error::new(io::ErrorKind::NotFound, "The process tree has ended.")
         })?;
         let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
-        #[cfg(test)]
-        eprintln!("supervisor pause pgid={pgid} signal={signal}");
         if unsafe { libc::kill(-pgid, signal) } == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -187,8 +185,6 @@ impl OwnedChild {
         command.process_group(0);
         let child = command.spawn()?;
         let pgid = child.id().expect("new child has a pid") as i32;
-        #[cfg(test)]
-        eprintln!("supervisor spawned pgid={pgid} cwd={:?}", spec.cwd);
         Ok(Self {
             pause: Arc::new(Mutex::new(Some(pgid))),
             child,
@@ -217,17 +213,10 @@ impl OwnedChild {
         )
     }
 
-    #[cfg_attr(test, track_caller)]
     fn terminate_tree(&mut self) -> io::Result<()> {
         if self.terminated {
             return Ok(());
         }
-        #[cfg(test)]
-        eprintln!(
-            "supervisor SIGKILL pgid={} caller={}",
-            self.pgid,
-            std::panic::Location::caller()
-        );
         // SAFETY: pgid belongs to the newly created process group, never ours.
         if unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == -1 {
             let error = io::Error::last_os_error();
@@ -271,16 +260,13 @@ impl OwnedChild {
             return Ok(false);
         }
         let pid = unsafe { info.si_pid() };
-        #[cfg(test)]
-        if pid != 0 {
-            eprintln!(
-                "supervisor waitid pgid={} result={result} pid={pid} code={} status={}",
-                self.pgid,
+        // Darwin can return CLD_STOPPED here despite WEXITED-only options.
+        // A stopped leader still pins the owned group and must not trigger teardown.
+        Ok(pid == self.pgid
+            && matches!(
                 info.si_code,
-                unsafe { info.si_status() }
-            );
-        }
-        Ok(pid != 0)
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -290,8 +276,6 @@ impl OwnedChild {
         if self.tree_exited {
             return Ok(());
         }
-        #[cfg(test)]
-        eprintln!("supervisor awaiting group exit pgid={}", self.pgid);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             // SIGKILL delivery is asynchronous. Keep the leader unreaped so
@@ -302,14 +286,10 @@ impl OwnedChild {
             #[cfg(target_os = "macos")]
             let live = macos::group_has_live_members(self.pgid)?;
             if !live {
-                #[cfg(test)]
-                eprintln!("supervisor group exited pgid={}", self.pgid);
                 self.tree_exited = true;
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                #[cfg(test)]
-                eprintln!("supervisor group exit deadline pgid={}", self.pgid);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "The process group did not finish terminating.",
@@ -326,8 +306,6 @@ impl OwnedChild {
                 self.close_pause();
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 self.wait_for_tree_exit().await?;
-                #[cfg(test)]
-                eprintln!("supervisor reaping completed leader pgid={}", self.pgid);
                 return self.child.wait().await;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -339,8 +317,6 @@ impl OwnedChild {
         self.close_pause();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.wait_for_tree_exit().await?;
-        #[cfg(test)]
-        eprintln!("supervisor reaping terminated leader pgid={}", self.pgid);
         self.child.wait().await?;
         Ok(())
     }

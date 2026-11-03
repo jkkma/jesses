@@ -1,5 +1,7 @@
 //! Opt-in native gate: `cargo test -p media-runtime --test tone_map_jobs -- --include-ignored`.
-//! All sources are synthesized locally; no user media is read or modified.
+//! Most sources are synthesized locally; the opt-in Dolby Vision GPU gate
+//! requires its explicitly supplied fixture. Physical-GPU gates stay separate
+//! from hosted CI's no-device CPU fallback and rejection checks.
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -822,7 +824,7 @@ async fn standalone_svt_builds_receive_sdr_pixels_and_no_hdr_metadata() {
 
 #[tokio::test]
 #[ignore = "requires native HDR x265/x264 tools; optionally set JESSES_HDR_TEST_BUNDLE to a verified package root"]
-async fn measured_gpu_or_bundle_cpu_fallback_and_manual_reinhard_finish_sdr_jobs() {
+async fn measured_auto_and_manual_reinhard_finish_sdr_jobs() {
     let bundle = std::env::var_os("JESSES_HDR_TEST_BUNDLE");
     if let Some(root) = &bundle {
         media_runtime::configure_bundled_tools(PathBuf::from(root)).unwrap();
@@ -830,15 +832,12 @@ async fn measured_gpu_or_bundle_cpu_fallback_and_manual_reinhard_finish_sdr_jobs
     let fixture = Fixture::new();
     let input = hdr_source(&fixture, "smpte2084", 24).await;
     let original = std::fs::read(&input).unwrap();
-    let routes = if bundle.is_some() {
-        vec![("measured-auto", "auto", "measured", "hable")]
-    } else {
-        vec![
-            ("measured-auto", "auto", "measured", "hable"),
-            ("measured-spline", "gpu", "measured", "spline"),
-            ("manual-reinhard", "cpu", "manual", "reinhard"),
-        ]
-    };
+    // Dedicated physical-GPU tests above qualify Spline rendering. Auto must
+    // also succeed on a CPU-only host, with an explicit reason for fallback.
+    let routes = [
+        ("measured-auto", "auto", "measured", "hable"),
+        ("manual-reinhard", "cpu", "manual", "reinhard"),
+    ];
     for (name, backend, peak_mode, algorithm) in routes {
         let destination = fixture.0.join(format!("{name}.mkv"));
         let mut request = request(&input, &destination, VideoEncoder::X264, 4);
@@ -870,15 +869,22 @@ async fn measured_gpu_or_bundle_cpu_fallback_and_manual_reinhard_finish_sdr_jobs
                 logs.contains("CPU zscale tone mapping with Reinhard curve"),
                 "{logs}"
             );
-        } else if bundle.is_some() {
-            assert!(logs.contains("CPU zscale tone mapping"), "{logs}");
-            assert!(logs.contains("GPU unavailable"), "{logs}");
+        } else if logs.contains("GPU libplacebo tone mapping") {
+            assert!(logs.contains("per-frame peak detection"), "{logs}");
+            assert!(!logs.contains("CPU fallback selected"), "{logs}");
+        } else {
             assert!(
                 logs.contains("sampled"),
                 "PQ peak sampling did not complete: {logs}"
             );
-        } else {
-            assert!(logs.contains("GPU libplacebo tone mapping"), "{logs}");
+            assert!(
+                logs.contains("CPU zscale tone mapping with Hable curve"),
+                "{logs}"
+            );
+            assert!(
+                logs.contains("GPU unavailable") && logs.contains("CPU fallback selected"),
+                "{logs}"
+            );
         }
         let document = probe(&destination, &["-show_streams", "-count_frames"]).await;
         let video = document["streams"]
