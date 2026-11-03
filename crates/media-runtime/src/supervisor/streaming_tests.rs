@@ -203,7 +203,8 @@ async fn streaming_parser_cannot_succeed_with_unread_stdout() {
     )
     .await;
     assert!(
-        matches!(result, Err(SupervisorError::OutputParse(error)) if error.contains("consuming all stdout"))
+        matches!(&result, Err(SupervisorError::OutputParse(error)) if error.contains("consuming all stdout")),
+        "unexpected unread-stdout result: {result:?}"
     );
 }
 
