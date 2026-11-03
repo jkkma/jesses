@@ -736,19 +736,40 @@ async fn canceling_active_x264_reaps_encoder_and_preserves_source_without_publis
         .expect("The canceled encoder must release its file handles");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
-async fn missing_x264_reports_its_tool_without_starting_the_pipeline() {
+async fn missing_x264_on_bounded_path_reports_its_tool_without_starting_the_pipeline() {
+    // macOS intentionally searches standard Homebrew prefixes outside PATH.
+    // Its installed x264 cannot be made absent by changing this child PATH.
+    missing_x264_fixture(false).await;
+}
+
+#[tokio::test]
+async fn unavailable_configured_x264_rejects_without_probing_or_starting_the_pipeline() {
+    missing_x264_fixture(true).await;
+}
+
+async fn missing_x264_fixture(configured: bool) {
     let fixture = Fixture::new();
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    for name in ["ffmpeg", "ffprobe"] {
+    let placeholders: &[&str] = if configured {
+        // A valid native PATH candidate must never rescue a bad explicit choice.
+        &["ffmpeg", "ffprobe", "x264"]
+    } else {
+        &["ffmpeg", "ffprobe"]
+    };
+    for name in placeholders {
         let name = if cfg!(windows) {
             format!("{name}.exe")
         } else {
-            name.into()
+            (*name).into()
         };
-        // Discovery finds these owned executable placeholders. Neither should
-        // run: x264 is absent and the admission fails before version checks.
+        // Discovery finds these owned executable placeholders. None should
+        // run: admission fails before media/version checks. If FFprobe is
+        // started, its native test binary rejects the probe arguments and the
+        // job reports SOURCE_NORMALIZATION_INVALID instead of the required
+        // encoder-discovery error.
         let executable = std::env::current_exe().unwrap();
         let placeholder = bin.join(name);
         if std::fs::hard_link(&executable, &placeholder).is_err() {
@@ -756,7 +777,15 @@ async fn missing_x264_reports_its_tool_without_starting_the_pipeline() {
         }
     }
     std::fs::write(fixture.0.join("source.mkv"), b"source preserved").unwrap();
-    std::fs::write(fixture.0.join("missing-x264-helper"), b"owned fixture").unwrap();
+    std::fs::write(
+        fixture.0.join("missing-x264-helper"),
+        if configured {
+            b"configured".as_slice()
+        } else {
+            b"search-path".as_slice()
+        },
+    )
+    .unwrap();
     output(
         command(std::env::current_exe().unwrap())
             .args(["--exact", "missing_x264_child", "--ignored", "--nocapture"])
@@ -769,13 +798,14 @@ async fn missing_x264_reports_its_tool_without_starting_the_pipeline() {
 #[ignore = "helper subprocess for missing-x264 isolation"]
 fn missing_x264_child() {
     let root = std::env::current_dir().unwrap();
-    if std::fs::read(root.join("missing-x264-helper"))
+    let configured = match std::fs::read(root.join("missing-x264-helper"))
         .ok()
         .as_deref()
-        != Some(b"owned fixture")
     {
-        return;
-    }
+        Some(b"configured") => true,
+        Some(b"search-path") => false,
+        _ => return,
+    };
     // This exact helper runs alone in a separate process, before any runtime
     // or discovery workers exist. The parent test process keeps its PATH.
     unsafe {
@@ -783,15 +813,18 @@ fn missing_x264_child() {
         for variable in ["JESSES_FFMPEG", "JESSES_FFPROBE", "JESSES_X264"] {
             std::env::remove_var(variable);
         }
+        if configured {
+            std::env::set_var("JESSES_X264", root.join("missing-selected-x264.exe"));
+        }
     }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(missing_x264_job(root));
+        .block_on(missing_x264_job(root, configured));
 }
 
-async fn missing_x264_job(root: PathBuf) {
+async fn missing_x264_job(root: PathBuf, configured: bool) {
     let input = root.join("source.mkv");
     let destination = root.join("output.mkv");
     let manager = JobManager::new(root.join("logs"));
@@ -800,8 +833,26 @@ async fn missing_x264_job(root: PathBuf) {
     let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
     manager.shutdown().await;
     assert_eq!(result.state, JobState::Failed, "{result:#?}");
-    assert_eq!(result.error.as_ref().unwrap().code, "TOOL_MISSING");
-    assert!(result.error.as_ref().unwrap().message.contains("x264"));
+    let error = result.error.as_ref().unwrap();
+    assert_eq!(
+        error.code,
+        if configured {
+            "TOOL_DISCOVERY_FAILED"
+        } else {
+            "TOOL_MISSING"
+        },
+        "{result:#?}"
+    );
+    assert!(error.message.contains("x264"), "{error:?}");
+    if configured {
+        assert!(error.message.contains("JESSES_X264"), "{error:?}");
+        assert!(
+            error.message.contains("missing-selected-x264.exe"),
+            "{error:?}"
+        );
+    }
+    assert!(result.progress_seconds.is_none(), "{result:#?}");
+    assert!(result.duration_seconds.is_none(), "{result:#?}");
     assert!(!destination.exists());
     assert_eq!(std::fs::read(input).unwrap(), b"source preserved");
     assert_no_partial_output(&root);
