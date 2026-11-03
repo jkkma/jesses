@@ -803,15 +803,25 @@ async fn run_pipeline_execute(
     };
     // Await both cleanups even if one reports failure. Killing both trees also
     // releases any blocking anonymous-pipe IO still finishing on Windows.
+    #[cfg(test)]
+    eprintln!("supervisor pipeline execution ended: {result:?}");
     let (producer_cleanup, consumer_cleanup) =
         tokio::join!(producer.terminate_and_wait(), consumer.terminate_and_wait(),);
+    #[cfg(test)]
+    eprintln!(
+        "supervisor pipeline cleanup: producer={producer_cleanup:?} consumer={consumer_cleanup:?}"
+    );
     producer_cleanup.map_err(SupervisorError::Cleanup)?;
     consumer_cleanup.map_err(SupervisorError::Cleanup)?;
     let output_result = if consumer_output_done {
         Ok(())
     } else {
+        #[cfg(test)]
+        eprintln!("supervisor pipeline draining consumer output after cleanup");
         consumer_output.await
     };
+    #[cfg(test)]
+    eprintln!("supervisor pipeline consumer output completed: {output_result:?}");
     output_result?;
     log.lock().await.flush().await?;
     result

@@ -163,7 +163,16 @@ async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file()
         ),
     )
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        let log = std::fs::read(producer.0.join("pipeline.log")).unwrap_or_default();
+        let tail = &log[log.len().saturating_sub(RECORD_BYTES)..];
+        panic!(
+            "invalid sink exceeded startup/cleanup bound: {error}; producer pid={:?}; consumer pid={:?}; diagnostic tail={}",
+            std::fs::read_to_string(producer.0.join("pid")),
+            std::fs::read_to_string(consumer.0.join("pid")),
+            String::from_utf8_lossy(tail)
+        );
+    });
     assert!(
         matches!(
             result,

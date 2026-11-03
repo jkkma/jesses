@@ -47,6 +47,7 @@ async fn discovers_tools_and_probes_a_synthetic_multistream_file() {
             "av1an",
             "ffmpeg",
             "ffprobe",
+            "grav1synth",
             "mkvmerge",
             "svt-av1",
             "svt-av1-5fish",
