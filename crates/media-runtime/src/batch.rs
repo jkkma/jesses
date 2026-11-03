@@ -1068,6 +1068,100 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn create_test_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        use std::{
+            io::{Error, ErrorKind},
+            os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+            path::{Component, Prefix},
+            ptr::null_mut,
+        };
+        use windows_sys::Win32::{
+            Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            },
+            System::{
+                IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT,
+                SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
+            },
+        };
+
+        let target = fs::canonicalize(target)?;
+        if !matches!(target.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Junction fixture needs a local drive target",
+            ));
+        }
+        // The canonical target starts with the four-unit Win32 verbatim prefix.
+        // A mount point stores the DOS path and its equivalent NT substitute.
+        const NT_PREFIX: &str = r"\??\";
+        let print_name: Vec<_> = target.as_os_str().encode_wide().skip(4).collect();
+        let substitute_length = (NT_PREFIX.len() + print_name.len()) * 2;
+        let print_length = print_name.len() * 2;
+        let print_offset = substitute_length + 2;
+        let data_length = 8 + print_offset + print_length + 2;
+        let buffer_length = 8 + data_length;
+        if buffer_length > MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Junction fixture target is too long",
+            ));
+        }
+        // REPARSE_DATA_BUFFER mount-point variant: byte offsets are relative
+        // to PathBuffer, and name lengths exclude each UTF-16 terminator.
+        let mut buffer = Vec::with_capacity(buffer_length);
+        buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        for field in [
+            data_length,
+            0,
+            0,
+            substitute_length,
+            print_offset,
+            print_length,
+        ] {
+            buffer.extend((field as u16).to_le_bytes());
+        }
+        for unit in NT_PREFIX
+            .encode_utf16()
+            .chain(print_name.iter().copied())
+            .chain([0])
+            .chain(print_name.iter().copied())
+            .chain([0])
+        {
+            buffer.extend(unit.to_le_bytes());
+        }
+
+        // The enclosing Fixture owns this new directory even if setup fails.
+        fs::create_dir(link)?;
+        let directory = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)?;
+        let mut returned = 0;
+        // SAFETY: the directory handle and byte buffer live across this
+        // synchronous call. No output buffer or overlapped operation is used.
+        let success = unsafe {
+            DeviceIoControl(
+                directory.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                buffer.len() as u32,
+                null_mut(),
+                0,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        if success == 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn naming_fixture(path: &Path) -> (BatchEncodeRequest, MediaFile) {
         let input_path = path.to_string_lossy().into_owned();
         (
@@ -1351,7 +1445,7 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.0.join("media");
         let nested = root.join("nested");
-        let outside = fixture.0.join("outside");
+        let outside = fixture.0.join("outside 日本語");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&nested).unwrap();
         fs::create_dir(&outside).unwrap();
@@ -1364,51 +1458,12 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &linked).unwrap();
         #[cfg(windows)]
-        {
-            let script = fixture.0.join("create-junction.ps1");
-            fs::write(
-                &script,
-                "New-Item -ItemType Junction -Path (Join-Path $PSScriptRoot 'media\\linked outside') -Target (Join-Path $PSScriptRoot 'outside') -ErrorAction Stop | Out-Null",
-            )
-            .unwrap();
-            let (_owner, cancel) = tokio::sync::watch::channel(false);
-            let result = tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(crate::supervisor::run_capture(
-                    &crate::supervisor::CommandSpec {
-                        executable: std::env::var_os("SystemRoot")
-                            .map(PathBuf::from)
-                            .unwrap()
-                            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-                        // PowerShell -File accepts ordinary native arguments;
-                        // cmd /C uses its own incompatible quoting grammar.
-                        args: [
-                            "-NoProfile",
-                            "-NonInteractive",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                        ]
-                        .into_iter()
-                        .map(std::ffi::OsString::from)
-                        .chain([script.into_os_string()])
-                        .collect(),
-                        cwd: None,
-                    },
-                    cancel,
-                    65536,
-                    // Cold PowerShell startup can exceed five seconds while
-                    // the Windows CI runner starts the parallel runtime tests.
-                    // This bounds fixture setup, not folder-scan performance.
-                    std::time::Duration::from_secs(30),
-                ))
-                .expect("PowerShell must create the owned test junction within 30 seconds");
-            assert!(
-                result.status.success(),
-                "Could not create owned test junction: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        create_test_junction(&outside, &linked).expect("Create the owned test junction");
+        assert!(is_link(&fs::symlink_metadata(&linked).unwrap()));
+        assert_eq!(
+            fs::canonicalize(&linked).unwrap(),
+            fs::canonicalize(&outside).unwrap()
+        );
         let flat = scan_folder(&root, false, MAX_MEDIA, MAX_ENTRIES).unwrap();
         assert_eq!(flat.paths.len(), 2);
         assert!(flat.paths[0].contains("a 日本語"));

@@ -22,6 +22,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '12.0'
       CARGO_BUILD_JOBS: '2'
+      JESSES_MACOS_PACKAGE_DIR: jesses-macos-package-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -59,15 +60,16 @@ jobs:
       - name: Build ad-hoc signed native application
         run: pnpm tauri build --target ${{ matrix.target }} --bundles app --config src-tauri/tauri.macos.conf.json
       - name: Verify exact app and create development archive
-        run: python3 scripts/package-macos.py --app target/${{ matrix.target }}/release/bundle/macos/jesses.app --destination target/macos-package --target ${{ matrix.target }} --native --launch-smoke
+        # Keep the fresh archive destination outside the restored Cargo cache.
+        run: python3 scripts/package-macos.py --app target/${{ matrix.target }}/release/bundle/macos/jesses.app --destination "$RUNNER_TEMP/$JESSES_MACOS_PACKAGE_DIR" --target ${{ matrix.target }} --native --launch-smoke
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: jesses-${{ matrix.target }}-development
           path: |
-            target/macos-package/*.tar.gz
-            target/macos-package/SHA256SUMS
-            target/macos-package/*.log
-            target/macos-package/payload/macos-package-manifest.json
+            ${{ runner.temp }}/${{ env.JESSES_MACOS_PACKAGE_DIR }}/*.tar.gz
+            ${{ runner.temp }}/${{ env.JESSES_MACOS_PACKAGE_DIR }}/SHA256SUMS
+            ${{ runner.temp }}/${{ env.JESSES_MACOS_PACKAGE_DIR }}/*.log
+            ${{ runner.temp }}/${{ env.JESSES_MACOS_PACKAGE_DIR }}/payload/macos-package-manifest.json
           if-no-files-found: warn
           retention-days: 14
