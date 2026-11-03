@@ -33,8 +33,8 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!("Failed framing fixture retained at {}", self.0.display());
+        if std::thread::panicking() || std::env::var_os("JESSES_KEEP_TEST_ARTIFACTS").is_some() {
+            eprintln!("Retained framing fixture at {}", self.0.display());
             return;
         }
         // Every file is owned exclusively by this newly created test fixture.
@@ -523,6 +523,10 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         (VideoEncoder::X264, 8, false, BordersOnly),
         (VideoEncoder::X264, 8, true, BordersOnly),
     ] {
+        // Standalone SVT normalizes full-range source samples to limited YUV.
+        // Source interpretation remains independent of the encoded output range.
+        let output_full = full && !encoder.is_svt();
+        let context = format!("{encoder:?}/{depth}/source_full={full}/{case:?}");
         let fixture = Fixture::new();
         let input = fixture.0.join("- crop's & $ % 日本語.mkv");
         let destination = fixture.0.join("resized café & 東京.mkv");
@@ -556,6 +560,14 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
             "{encoder:?}/{depth}/{full}/{case:?}: {result:#?}"
         );
         assert_eq!(result.encode_settings.as_ref(), Some(&request.settings));
+        if full && encoder.is_svt() {
+            let logs = result.logs.join("\n");
+            assert!(
+                logs.contains("requires limited-range YUV")
+                    && logs.contains("converts full-range source samples before encoding"),
+                "{context}: normalization was not reported: {logs}"
+            );
+        }
         let actual = probe(
             &destination,
             &[
@@ -577,6 +589,11 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
             ],
         )
         .await;
+        assert_eq!(
+            source["streams"][1]["color_range"],
+            if full { "pc" } else { "tv" },
+            "{context}: source range changed: {source}"
+        );
         let streams = actual["streams"].as_array().unwrap();
         assert_eq!(streams.len(), 4);
         let video = &streams[2];
@@ -591,19 +608,24 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         );
         assert_eq!(video["nb_read_frames"], "48");
         assert_eq!(video["sample_aspect_ratio"], "1:1");
-        assert_eq!(video["color_range"], if full { "pc" } else { "tv" });
+        assert_eq!(
+            video["color_range"],
+            if output_full { "pc" } else { "tv" },
+            "{context}: encoded output range differs: {video}"
+        );
         for field in ["color_space", "color_transfer", "color_primaries"] {
-            assert_eq!(video[field], "bt709");
+            assert_eq!(video[field], "bt709", "{context}: {field}: {video}");
         }
         assert_eq!(
             video["pix_fmt"],
             if encoder.is_svt() || depth == 10 {
                 "yuv420p10le"
-            } else if full {
+            } else if output_full {
                 "yuvj420p"
             } else {
                 "yuv420p"
-            }
+            },
+            "{context}: encoded pixel format differs: {video}"
         );
         let frames = probe(
             &destination,
@@ -634,17 +656,18 @@ async fn framing_preserves_timing_tracks_depth_and_applies_the_requested_pixels(
         if request.settings.crf == 0 {
             let filter = case.reference_filter(full);
             let expected = decoded_pixels(&input, "0:1", filter.as_deref(), 8, full, 48).await;
-            let actual = decoded_pixels(&destination, "0:2", None, 8, full, 48).await;
-            assert_lossless_reference(&actual, &expected, case, full);
+            let actual = decoded_pixels(&destination, "0:2", None, 8, output_full, 48).await;
+            assert_lossless_reference(&actual, &expected, case, output_full);
         } else {
             let output_depth = if encoder.is_svt() { 10 } else { depth };
-            let pixels = decoded_pixels(&destination, "0:2", None, output_depth, full, 3).await;
+            let pixels =
+                decoded_pixels(&destination, "0:2", None, output_depth, output_full, 3).await;
             assert_border_levels(
                 &pixels,
                 case.content_size(),
                 request.settings.framing,
                 output_depth,
-                full,
+                output_full,
             );
         }
         assert_eq!(std::fs::read(&input).unwrap(), original);
