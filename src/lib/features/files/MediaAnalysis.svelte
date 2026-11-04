@@ -221,7 +221,7 @@
     font: inherit;
     color: inherit;
     border: 1px solid var(--border);
-    border-radius: 5px;
+    border-radius: var(--radius);
     background: var(--background);
     padding: 6px 8px;
   }

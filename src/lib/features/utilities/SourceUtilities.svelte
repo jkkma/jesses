@@ -1821,7 +1821,7 @@
     min-height: 84px;
     padding: 10px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius);
     background: var(--background);
     cursor: pointer;
   }

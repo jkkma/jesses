@@ -91,7 +91,7 @@
     padding: 0;
     overflow: hidden;
     border: 1px solid var(--rule);
-    border-radius: 0.35rem;
+    border-radius: var(--radius);
     background: var(--background);
     color: var(--muted-foreground);
   }

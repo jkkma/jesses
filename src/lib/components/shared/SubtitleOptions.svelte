@@ -91,7 +91,7 @@
     min-height: 2.35rem;
     padding: 0.4rem 0.6rem;
     border: 1px solid var(--border);
-    border-radius: 0.4rem;
+    border-radius: var(--radius);
     background: var(--background);
     color: var(--foreground);
   }

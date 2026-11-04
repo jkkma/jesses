@@ -392,7 +392,7 @@
   .source-preview {
     margin-top: 16px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
     min-width: 0;
   }
   .preview-toggle {
@@ -402,7 +402,7 @@
     width: 100%;
     padding: 12px;
     border: 0;
-    border-radius: 8px;
+    border-radius: var(--radius);
     color: inherit;
     background: transparent;
     text-align: left;
@@ -478,7 +478,7 @@
   }
   .preview-placeholder,
   .crop-proposal {
-    border-radius: 6px;
+    border-radius: var(--radius);
     background: var(--muted);
     padding: 12px;
   }

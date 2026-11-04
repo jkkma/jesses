@@ -77,6 +77,7 @@ export async function installSourceEncodeFixture(page: Page) {
       unregisterCallback: () => {},
       invoke: async (command: string, payload: any = {}) => {
         calls.push({ command, payload });
+        if (command === 'plugin:window|is_maximized') return false;
         if (command === 'plugin:dialog|open') return state.__pickerPaths ?? [selectedMedia.path];
         if (command === 'plugin:dialog|save') {
           if (state.__holdSave) await state.__holdSave;

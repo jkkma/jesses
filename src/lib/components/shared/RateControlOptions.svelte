@@ -129,7 +129,7 @@
     gap: 0.45rem;
     padding: 0.85rem;
     border: 1px solid var(--border);
-    border-radius: 0.5rem;
+    border-radius: var(--radius);
   }
   .rate-control.expanded {
     grid-column: 1 / -1;
@@ -155,7 +155,7 @@
     color: inherit;
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 0.35rem;
+    border-radius: var(--radius);
   }
   select {
     width: min(100%, 19rem);

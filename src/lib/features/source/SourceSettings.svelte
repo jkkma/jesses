@@ -239,7 +239,7 @@
     min-width: 0;
     padding: 0.4rem;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--background);
     color: var(--foreground);
   }
@@ -262,7 +262,7 @@
   button {
     padding: 0.4rem 0.7rem;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
   }

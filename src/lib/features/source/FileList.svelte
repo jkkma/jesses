@@ -201,7 +201,7 @@
     background: var(--background);
     color: var(--foreground);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     padding: 0.45rem;
   }
   select {
@@ -217,7 +217,7 @@
   .rows {
     position: relative;
     overflow: auto;
-    border-radius: 5px;
+    border-radius: var(--radius);
     background: var(--background);
   }
   .rows > button {
@@ -258,7 +258,7 @@
   summary {
     padding: 0.4rem 0.7rem;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
     cursor: pointer;

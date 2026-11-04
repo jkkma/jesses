@@ -32,6 +32,7 @@
     X,
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
+  import WindowControls from '$lib/components/WindowControls.svelte';
   import FileInspector from '$lib/features/files/FileInspector.svelte';
   import SourceFileList from '$lib/features/source/FileList.svelte';
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
@@ -1279,12 +1280,22 @@
 />
 
 <div class="app-shell" class:compact-utilities={view === 'utilities' && !logUserAdjusted}>
-  <header class="app-header">
-    <div class="brand">
-      <img src="/app-icon.png" width="30" height="30" alt="" />
-      <div class="brand-wordmark">jesses</div>
-      <span class="version">v{appVersion}</span>
+  <header class="app-header" data-tauri-drag-region={desktop ? '' : undefined}>
+    <div class="brand" data-tauri-drag-region={desktop ? '' : undefined}>
+      <img
+        src="/app-icon.png"
+        width="20"
+        height="20"
+        alt=""
+        draggable="false"
+        data-tauri-drag-region={desktop ? '' : undefined}
+      />
+      <div class="brand-wordmark" data-tauri-drag-region={desktop ? '' : undefined}>jesses</div>
+      <span class="version" data-tauri-drag-region={desktop ? '' : undefined}>v{appVersion}</span>
     </div>
+    {#if desktop}
+      <WindowControls onerror={(message) => addLog(message, 'error')} />
+    {/if}
   </header>
   <div class="work-area">
     <nav class="workspace-nav" aria-label="Workspace workflows">
@@ -1587,22 +1598,34 @@
   .app-shell {
     height: 100vh;
     min-height: 680px;
-    padding: 10px;
+    padding: 0 10px 10px;
     gap: 8px;
     background: var(--background);
     color: var(--foreground);
   }
   .app-header {
-    min-height: 29px;
-    padding: 0;
+    height: 32px;
+    min-height: 32px;
+    margin: 0 -10px -4px;
+    padding: 0 0 0 10px;
     display: flex;
     align-items: center;
+    justify-content: space-between;
     border: 0;
     background: transparent;
   }
+  .app-header[data-tauri-drag-region] {
+    user-select: none;
+    -webkit-app-region: drag;
+  }
   .brand {
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
+  }
+  .brand img {
+    width: 20px;
+    height: 20px;
+    border-radius: var(--radius);
   }
   .brand-wordmark {
     color: var(--foreground);
@@ -1620,7 +1643,7 @@
     display: flex;
     flex-direction: column;
     padding: 8px;
-    border-radius: 8px;
+    border-radius: var(--radius);
     background: var(--card);
     overflow: hidden;
   }
@@ -1674,7 +1697,7 @@
   .log-splitter {
     height: 5px;
     flex: 0 0 5px;
-    border-radius: 3px;
+    border-radius: var(--radius);
     background: var(--rule);
     cursor: ns-resize;
     touch-action: none;
@@ -1700,7 +1723,7 @@
   .status-bar button {
     padding: 0.38rem 0.7rem;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
     font-size: 12px;
@@ -1717,7 +1740,7 @@
     background: var(--background);
     color: var(--foreground);
     border: 0;
-    border-radius: 5px;
+    border-radius: var(--radius);
     font:
       11px Consolas,
       monospace;
@@ -1789,11 +1812,8 @@
   .brand-wordmark {
     letter-spacing: 0.11em;
     text-transform: uppercase;
-    font-size: 18px;
+    font-size: 16px;
     font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
-  }
-  .brand img {
-    filter: grayscale(1) contrast(0.9);
   }
   .version {
     letter-spacing: 0.06em;
@@ -1805,7 +1825,6 @@
   }
   .workspace-nav {
     gap: 4px;
-    border-bottom: 1px solid var(--border);
   }
   .workspace-nav button {
     position: relative;

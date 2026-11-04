@@ -379,7 +379,7 @@
   }
   .rows {
     background: var(--background);
-    border-radius: 5px;
+    border-radius: var(--radius);
     overflow: auto;
   }
   .rows > div {
@@ -407,7 +407,7 @@
   summary {
     padding: 0.38rem 0.75rem;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
     cursor: pointer;

@@ -385,7 +385,7 @@
     position: relative;
     height: 8px;
     background: var(--muted);
-    border-radius: 4px;
+    border-radius: var(--radius);
   }
   .range div {
     position: absolute;

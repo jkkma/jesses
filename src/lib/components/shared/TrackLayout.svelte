@@ -222,7 +222,7 @@
   .track-layout {
     margin: 2px 14px 14px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
     min-width: 0;
   }
   summary {
@@ -272,7 +272,7 @@
     width: 100%;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--background);
     color: var(--foreground);
     font: inherit;
@@ -302,7 +302,7 @@
   .move-actions button {
     min-width: 24px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--background);
     cursor: pointer;
   }

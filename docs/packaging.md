@@ -6,6 +6,15 @@ ZIP used by Scoop and Linux x64 AppImage/DEB artifacts. The separate
 Intel development app archives; see [macOS packaging](macos.md). Workflows upload
 artifacts without publishing a release. Windows distribution does not use NSIS.
 
+For application-only patches, the manual **Windows release executable** workflow
+builds an MSVC release executable from the selected ref and records its source
+revision and SHA-256. It does not publish or bundle media tools. When reusing an
+unchanged tool payload from a previous release, verify that release archive's
+published SHA-256 and its complete package manifest before extracting resources.
+Use `package-desktop.py collect --tool-resources` to assemble the new executable
+with those verified tools, then verify the new archive and generate its Scoop
+manifest. Retain the tool sources, licenses, and provenance alongside the binaries.
+
 The workflow includes the pinned SVT-AV1 5fish and SVT-AV1-HDR binaries, their
 matching complete source archives and license/patent notices. These upstream
 builds require an x86-64-v3 CPU. Each native packaging run checks their versions

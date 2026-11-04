@@ -343,7 +343,7 @@
     min-width: 0;
     margin: 10px 0 0;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
   }
   summary {
     padding: 11px 12px;

@@ -249,7 +249,7 @@
   .external-tracks {
     margin: 2px 14px 14px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
     min-width: 0;
   }
   summary {
@@ -317,7 +317,7 @@
     min-width: 0;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--background);
     color: var(--foreground);
     font: inherit;
@@ -346,7 +346,7 @@
   .stale-row button {
     padding: 4px 7px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--background);
     cursor: pointer;
   }

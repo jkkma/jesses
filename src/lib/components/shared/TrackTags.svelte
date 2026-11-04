@@ -122,7 +122,7 @@
     min-width: 0;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     color: var(--foreground);
     background: var(--background);
     font: inherit;

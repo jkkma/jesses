@@ -90,7 +90,7 @@
     gap: 0.5rem;
     padding: 0.7rem;
     border: 1px solid var(--border);
-    border-radius: 0.4rem;
+    border-radius: var(--radius);
   }
   p {
     margin: 0;
@@ -104,6 +104,6 @@
     justify-self: start;
     padding: 0.4rem 0.65rem;
     border: 1px solid var(--border);
-    border-radius: 0.3rem;
+    border-radius: var(--radius);
   }
 </style>

@@ -206,7 +206,7 @@
   input[type='text'] {
     border: 1px solid var(--border);
     background: var(--background);
-    border-radius: 5px;
+    border-radius: var(--radius);
     padding: 8px 10px;
   }
   input:focus-visible {

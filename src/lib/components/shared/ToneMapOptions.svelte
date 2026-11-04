@@ -126,7 +126,7 @@
 <style>
   .tone-map-options {
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
     padding: 12px;
     display: grid;
     gap: 8px;
@@ -152,7 +152,7 @@
     max-width: 100%;
     border: 1px solid var(--border);
     background: var(--background);
-    border-radius: 5px;
+    border-radius: var(--radius);
     padding: 7px;
   }
   p {

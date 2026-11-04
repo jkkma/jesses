@@ -1,0 +1,46 @@
+name: Windows release executable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - name: Build production executable with embedded frontend
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+      - name: Record source revision and executable digest
+        shell: pwsh
+        run: |
+          $binary = 'target/x86_64-pc-windows-msvc/release/jesses.exe'
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          @{
+            version = $version
+            revision = $env:GITHUB_SHA
+            target = 'x86_64-pc-windows-msvc'
+            profile = 'release'
+            sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -LiteralPath 'target/release-build.json' -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jesses-windows-release-executable
+          path: |
+            target/x86_64-pc-windows-msvc/release/jesses.exe
+            target/release-build.json
+          if-no-files-found: error
+          retention-days: 14

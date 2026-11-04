@@ -412,7 +412,7 @@
   .av1an-options {
     grid-column: 1 / -1;
     border: 1px solid var(--border);
-    border-radius: 0.5rem;
+    border-radius: var(--radius);
     min-width: 0;
   }
   summary {
@@ -465,7 +465,7 @@
     color: inherit;
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 0.35rem;
+    border-radius: var(--radius);
   }
   .wide-control select {
     width: min(100%, 19rem);

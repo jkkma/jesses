@@ -393,7 +393,7 @@
     color: var(--foreground);
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     padding: 6px 8px;
     cursor: pointer;
   }
@@ -431,7 +431,7 @@
     color: var(--foreground);
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     padding: 7px 9px;
   }
   input:focus-visible,
@@ -468,7 +468,7 @@
     flex-wrap: wrap;
     gap: 4px 14px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius);
     margin: 8px 0;
     padding: 2px 9px;
   }

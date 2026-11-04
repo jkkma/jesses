@@ -185,7 +185,7 @@
   .grain {
     grid-column: 1 / -1;
     border: 1px solid var(--border);
-    border-radius: 0.5rem;
+    border-radius: var(--radius);
     min-width: 0;
   }
   summary {
@@ -229,7 +229,7 @@
   select,
   input[type='number'] {
     border: 1px solid var(--border);
-    border-radius: 0.3rem;
+    border-radius: var(--radius);
     padding: 0.45rem;
   }
   p {

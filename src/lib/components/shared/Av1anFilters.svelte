@@ -48,7 +48,7 @@
   .filters {
     grid-column: 1/-1;
     border: 1px solid var(--border);
-    border-radius: 0.5rem;
+    border-radius: var(--radius);
     min-width: 0;
   }
   summary {
@@ -76,7 +76,7 @@
     font-family: monospace;
     font-size: 0.8rem;
     border: 1px solid var(--border);
-    border-radius: 0.3rem;
+    border-radius: var(--radius);
     resize: vertical;
   }
   p {

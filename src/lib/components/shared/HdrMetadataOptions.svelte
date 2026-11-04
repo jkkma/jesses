@@ -216,7 +216,7 @@
   .hdr-options {
     grid-column: 1 / -1;
     border: 1px solid var(--border);
-    border-radius: 0.5rem;
+    border-radius: var(--radius);
     padding: 0.8rem;
   }
   summary {
@@ -255,7 +255,7 @@
     color: inherit;
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 0.3rem;
+    border-radius: var(--radius);
   }
   .dynamic {
     display: flex;
@@ -266,7 +266,7 @@
   }
   .dynamic button {
     border: 1px solid var(--border);
-    border-radius: 0.3rem;
+    border-radius: var(--radius);
     padding: 0.4rem 0.6rem;
     background: var(--background);
     color: inherit;
