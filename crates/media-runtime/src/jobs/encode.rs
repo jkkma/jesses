@@ -1002,6 +1002,7 @@ impl JobManager {
             }
             normalization.apply_mux(&mut args, &budget_selected)?;
             subtitle_assets.apply_mux(&mut args, &budget_selected);
+            keep_last_codec_options(&mut args);
             tokio::fs::create_dir_all(self.log_dir.as_ref())
                 .await
                 .map_err(|e| {
@@ -1556,7 +1557,7 @@ impl JobManager {
             let attachment = super::encode_settings::SettingsAttachment::prepare(&temp.path, &format!("{attempt_id}-review"), settings)?;
             let mut mux = mux_args(&source.path, &encoded_path, &temp.path, &output_selected, &plan, settings, &external);
             if let Some(trim) = &prepared_trim { trim.apply_mux(&mut mux, &output_selected, &audio_filters)?; }
-            normalization.apply_mux(&mut mux, &output_selected)?; subtitle_assets.apply_mux(&mut mux, &output_selected);
+            normalization.apply_mux(&mut mux, &output_selected)?; subtitle_assets.apply_mux(&mut mux, &output_selected); keep_last_codec_options(&mut mux);
             if let Some(attachment) = &attachment { attachment.apply(&mut mux, output_selected.iter().filter(|stream| stream.codec_type.as_deref() == Some("attachment")).count()); }
             commands.push(super::command_edit::format_command(&CommandSpec { executable: ffmpeg.clone(), args: mux, cwd: None }));
             let program = commands.join(" &&\n");
@@ -1702,6 +1703,7 @@ impl JobManager {
                         }
                         normalization.apply_mux(&mut args, &output_selected)?;
                         subtitle_assets.apply_mux(&mut args, &output_selected);
+                        keep_last_codec_options(&mut args);
                         if let Some(attachment) = &review_attachment {
                             attachment.apply(
                                 &mut args,
@@ -2277,6 +2279,7 @@ impl JobManager {
             }
             normalization.apply_mux(&mut mux_arguments, &output_selected)?;
             subtitle_assets.apply_mux(&mut mux_arguments, &output_selected);
+            keep_last_codec_options(&mut mux_arguments);
             if let Some(attachment) = &settings_attachment {
                 attachment.apply(
                     &mut mux_arguments,
@@ -2967,6 +2970,35 @@ fn svt_frame_counter(line: &str) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Later mux steps may replace a stream's copy with a conversion (for example
+/// `-c:2 mov_text`). Keep only the last codec option for each output stream so
+/// FFmpeg receives exactly one.
+fn keep_last_codec_options(args: &mut Vec<OsString>) {
+    let stream = |arg: &OsString| {
+        arg.to_str()
+            .and_then(|text| {
+                text.strip_prefix("-c:")
+                    .or_else(|| text.strip_prefix("-codec:"))
+            })
+            .and_then(|index| index.parse::<usize>().ok())
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut superseded = std::collections::BTreeSet::new();
+    for position in (0..args.len().saturating_sub(1)).rev() {
+        if let Some(stream) = stream(&args[position])
+            && !seen.insert(stream)
+        {
+            superseded.extend([position, position + 1]);
+        }
+    }
+    let mut position = 0;
+    args.retain(|_| {
+        let keep = !superseded.contains(&position);
+        position += 1;
+        keep
+    });
+}
+
 /// Container, stream and settings checks that need only stream headers.
 async fn preflight_streams(
     source: &Source,
@@ -4014,8 +4046,6 @@ fn mux_args(
         external.metadata_input_index(settings).to_string().into(),
         "-map_chapters".into(),
         external.chapters_input_index(settings).to_string().into(),
-        "-c".into(),
-        "copy".into(),
     ]);
     if settings
         .hdr_metadata
@@ -4044,8 +4074,12 @@ fn mux_args(
         let (input_index, stream_index) = external.input_stream(stream.index);
         let converted_audio =
             audio::converted(settings).find(|track| track.stream_index == stream.index);
+        // One codec option per output stream: a global `-c copy` beside a
+        // converted track's `-c:N` makes FFmpeg warn about multiple options.
         if let Some(track) = converted_audio {
             audio::append_arguments(&mut args, index, track, stream);
+        } else {
+            args.extend([format!("-c:{index}").into(), "copy".into()]);
         }
         if settings.copy_metadata != Some(false)
             || stream.codec_type.as_deref() == Some("attachment")
@@ -4330,6 +4364,59 @@ mod tests {
         }
         assert_eq!(cleared.len(), 9);
         assert!(!args.iter().any(|arg| arg == "-metadata:s:0"));
+    }
+
+    /// FFmpeg warns "Multiple -codec options specified for stream N" when a
+    /// global `-c copy` and a converted track's `-c:N` both match a stream.
+    #[test]
+    fn mux_gives_each_output_stream_exactly_one_codec_option() {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"0"},
+            "streams":[
+                {"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"},
+                {"index":1,"codec_type":"audio","codec_name":"eac3","channels":6,"channel_layout":"5.1(side)","sample_rate":"48000"},
+                {"index":3,"codec_type":"subtitle","codec_name":"subrip"}
+            ]
+        })).unwrap();
+        let selected = document.selected(&[0, 1, 3]).unwrap();
+        let settings = EncodeSettings {
+            audio: vec![
+                serde_json::from_value(serde_json::json!({
+                    "streamIndex":1,"codec":"opus","bitrateKbps":128,"channels":"stereo"
+                }))
+                .unwrap(),
+            ],
+            ..EncodeSettings::default()
+        };
+        let plan = Plan::build(&document, &selected, &settings).unwrap();
+        let mut args = mux_args(
+            Path::new("input.mkv"),
+            Path::new("video.ivf"),
+            Path::new("output.mkv"),
+            &selected,
+            &plan,
+            &settings,
+            &super::external_tracks::ExternalTracks::default(),
+        );
+        // A later mux step converts the subtitle.
+        let last = args.len() - 1;
+        args.splice(last..last, ["-c:2".into(), "mov_text".into()]);
+        keep_last_codec_options(&mut args);
+        let codecs: Vec<_> = args
+            .windows(2)
+            .filter(|pair| {
+                let flag = pair[0].to_str().unwrap();
+                flag == "-c" || flag == "-codec" || flag.starts_with("-c:")
+            })
+            .map(|pair| {
+                format!(
+                    "{} {}",
+                    pair[0].to_str().unwrap(),
+                    pair[1].to_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(codecs, ["-c:0 copy", "-c:1 libopus", "-c:2 mov_text"]);
     }
 
     #[tokio::test]
