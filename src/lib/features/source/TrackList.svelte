@@ -361,10 +361,19 @@
 </section>
 
 <style>
+  /* The track rows take the space left by the other controls and scroll
+     inside it. A fixed minimum height pushed the list's last rows below the
+     visible workspace, where the wheel could not reach them. */
   .track-list {
-    display: grid;
+    display: flex;
+    flex-direction: column;
     gap: 0.6rem;
-    height: 100%;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+  }
+  .track-list > :not(.track-body) {
+    flex: none;
   }
   .format-info {
     margin: 0;
@@ -372,12 +381,15 @@
     font-size: 12px;
   }
   .track-body {
+    flex: 1 1 0;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(200px, 384px);
+    grid-template-rows: minmax(0, 1fr);
     gap: 10px;
-    min-height: 300px;
+    min-height: 7rem;
   }
   .rows {
+    min-height: 0;
     background: var(--background);
     border-radius: var(--radius);
     overflow: auto;
