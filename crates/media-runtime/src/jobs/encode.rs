@@ -506,9 +506,14 @@ impl JobManager {
             .streams
             .iter()
             .find(|stream| stream.index == settings.video_stream_index)
-            .is_some_and(super::source_picture_metadata::needs_enrichment)
+            .is_some_and(|video| {
+                super::source_picture_metadata::needs_enrichment(video, settings.tone_map.is_some())
+            })
         {
-            self.change(id,|snapshot|append_log(snapshot,"Inspecting decoded source color and static HDR declarations omitted by stream headers.".into())).await;
+            self.change(id, |snapshot| {
+                append_log(snapshot, "Reading the first decoded pictures for color and static HDR declarations omitted by stream headers.".into())
+            })
+            .await;
             Box::pin(super::source_picture_metadata::enrich(
                 &ffprobe,
                 &source.path,
