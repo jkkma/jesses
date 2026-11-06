@@ -10,7 +10,11 @@ The Jesses UI now forwards the live modifier through the existing Run control an
 AV1AN recovery actions. A 900-pixel source-style modal presents a monospaced
 multiline editor with the fork's title, explanatory sentence, and Run button.
 The UI prepares each held command, checks Shift when preparation returns, and
-either shows the editor or confirms the unchanged arguments. Closing, Escape,
+either shows the editor or confirms the unchanged arguments. Preparation runs
+the real pre-encode work and can take minutes, so a single Run (and an AV1AN
+Resume) also honors Shift held at the click; only batch items read Shift live
+as each file reaches its command. The job log says whether the confirmed
+command was edited or the unchanged generated command. Closing, Escape,
 empty text, or Stop cancels the held session; a cleared item in a batch is
 reported failed and later items continue, while Stop cancels the current item
 and skips the rest. The batch captures its files, settings, output-name template

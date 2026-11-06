@@ -1081,8 +1081,15 @@
     if (register) untrack(() => register(view, action));
   });
   type RunOptions = { editCommand?: boolean; isShiftHeld?: () => boolean };
+  // Batch processing checks Shift separately as each file reaches its command,
+  // as in the source fork.
   function reviewThisFile(options: RunOptions) {
     return options.isShiftHeld ? options.isShiftHeld() : !!options.editCommand;
+  }
+  // A single run honors Shift held at the click: preparation can take minutes,
+  // and the key is rarely still down when the command is ready.
+  function reviewSingleFile(options: RunOptions) {
+    return !!options.editCommand || !!options.isShiftHeld?.();
   }
   function batchNamingValues() {
     const codec =
@@ -1210,7 +1217,7 @@
       const target = event.target as HTMLElement;
       if (event.key === 'Enter' && (target === node || target.getAttribute('role') === 'option')) {
         event.preventDefault();
-        void recoveryAction('resumeSaved');
+        void recoveryAction('resumeSaved', event.shiftKey);
         return;
       }
       if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -1236,6 +1243,7 @@
   }
   async function recoveryAction(
     action: 'deleteEncode' | 'deleteChunks' | 'resumeSaved' | 'resumeNew' | 'clearAll',
+    shiftAtClick = false,
   ) {
     if (recoveryBusy) return;
     const id = recoverySelected;
@@ -1277,7 +1285,7 @@
         const reviewed = await reviewAndRun(
           command,
           controller.signal,
-          () => readShiftState?.() ?? false,
+          () => shiftAtClick || (readShiftState?.() ?? false),
         );
         if (!reviewed) {
           if (!controller.signal.aborted)
@@ -3144,7 +3152,7 @@
       const reviewed = await reviewAndRun(
         { kind: 'image', request: { ...request, outputPath: resolved.outputPath } },
         controller.signal,
-        () => reviewThisFile(options),
+        () => reviewSingleFile(options),
       );
       if (!reviewed) {
         imageProgressDescription = 'Canceled.';
@@ -3599,7 +3607,7 @@
       if (runMode === 'batch') await runBatch(request, options, controller);
       else {
         const reviewed = await reviewAndRun({ kind: 'encode', request }, controller.signal, () =>
-          reviewThisFile(options),
+          reviewSingleFile(options),
         );
         if (!reviewed) {
           if (!controller.signal.aborted)
@@ -4348,10 +4356,12 @@
       onclick={() => void recoveryAction('deleteChunks')}>Delete Chunks</button
     ><button
       disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('resumeNew')}>Resume (New Settings)</button
+      onclick={(event) => void recoveryAction('resumeNew', event.shiftKey)}
+      >Resume (New Settings)</button
     ><button
       disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('resumeSaved')}>Resume (Saved Settings)</button
+      onclick={(event) => void recoveryAction('resumeSaved', event.shiftKey)}
+      >Resume (Saved Settings)</button
     >
   </div>
 </SourceDialog>

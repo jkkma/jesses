@@ -538,13 +538,20 @@ impl JobManager {
             .await?;
         // Only confirmed text enters durable history. A close/empty decision
         // never writes an argument override or starts a media encoder.
+        // The UI confirms every held command, with or without showing the
+        // editor, so the log states what runs rather than claiming a review.
+        let edited = decision.arguments != decision.generated.trim();
         self.change(id, |snapshot| {
-            snapshot.edited_command =
-                (decision.arguments != decision.generated.trim()).then(|| decision.clone());
+            snapshot.edited_command = edited.then(|| decision.clone());
             snapshot.state = JobState::Running;
             append_log(
                 snapshot,
-                "Command review confirmed; running the reviewed task.".into(),
+                if edited {
+                    "Edited command confirmed; running the edited task."
+                } else {
+                    "Generated command confirmed unchanged; running it."
+                }
+                .into(),
             );
         })
         .await;
