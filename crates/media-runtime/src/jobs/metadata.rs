@@ -165,6 +165,39 @@ impl Document {
             .reduce(f64::max)
             .or_else(|| self.duration())
     }
+
+    /// The end every output must reach: the longest selected video, audio or
+    /// data track. Text subtitle tracks may end with an empty "clear" cue whose
+    /// duration runs past the picture and sound (MP4 mov_text does this), and
+    /// converting such a track drops that empty cue. Subtitle tails therefore
+    /// only bound the permitted end; they set the required end only when the
+    /// selection has no other media, and then only for copied subtitles.
+    /// Converted cues are verified separately against every readable cue.
+    pub fn required_duration(
+        &self,
+        streams: &[&Stream],
+        converted_subtitles: &[u32],
+    ) -> Option<f64> {
+        let media = streams
+            .iter()
+            .copied()
+            .filter(|s| matches!(s.codec_type.as_deref(), Some("video" | "audio" | "data")))
+            .collect::<Vec<_>>();
+        if !media.is_empty() {
+            return self.selected_duration(&media);
+        }
+        let copied = streams
+            .iter()
+            .copied()
+            .filter(|s| {
+                s.codec_type.as_deref() == Some("subtitle")
+                    && !converted_subtitles.contains(&s.index)
+            })
+            .collect::<Vec<_>>();
+        (!copied.is_empty())
+            .then(|| self.selected_duration(&copied))
+            .flatten()
+    }
 }
 
 /// Computed stream statistics and encoder provenance describe the old bitstream
@@ -502,7 +535,11 @@ fn verify_inner(
             return Err(fail("The output chapter metadata changed."));
         }
     }
-    if let Some(expected) = source.selected_duration(selected).filter(|v| *v > 0.0) {
+    let permitted = source.selected_duration(selected).filter(|v| *v > 0.0);
+    let required = source
+        .required_duration(selected, converted_subtitles)
+        .filter(|v| *v > 0.0);
+    if let Some(permitted) = permitted.or(required) {
         let actual = output
             .duration()
             .ok_or_else(|| fail("The output duration could not be validated."))?;
@@ -512,8 +549,10 @@ fn verify_inner(
         // duration (138 ms at 8 kHz), even after decoded samples are trimmed.
         // Decoded start and sample count remain separately checked, including
         // final padding; neither codec permits arbitrary audible extension.
-        let tolerance = 0.1_f64.max(expected * 0.0001);
-        let mut latest_end = expected + tolerance;
+        // The lower bound comes from picture, sound and data only; a longer
+        // subtitle tail may raise the upper bound but never the required end.
+        let tolerance = 0.1_f64.max(permitted * 0.0001);
+        let mut latest_end = permitted.max(required.unwrap_or(0.0)) + tolerance;
         for track in audio.iter().filter(|track| {
             matches!(
                 track.codec,
@@ -538,10 +577,12 @@ fn verify_inner(
                 latest_end = latest_end.max(end + samples / rate + 0.002);
             }
         }
-        if actual < expected - tolerance || actual > latest_end {
+        let lower = required.map(|required| required - tolerance);
+        if lower.is_some_and(|lower| actual < lower) || actual > latest_end {
             return Err(fail(&format!(
                 "The output duration differs from the selected source tracks: observed {actual:.6}s, expected {expected:.6}s (allowed {lower:.6}..{latest_end:.6}s).",
-                lower = expected - tolerance
+                expected = required.unwrap_or(permitted),
+                lower = lower.unwrap_or(0.0),
             )));
         }
     }
@@ -559,6 +600,55 @@ mod tests {
             {"index":2,"codec_type":"audio","codec_name":"flac","channels":2,"nb_read_packets":"96","tags":{"LANGUAGE":"jpn","title":"Original"}},
             {"index":5,"codec_type":"attachment","extradata_hash":"SHA256:fixture","tags":{"filename":"font.ttf","mimetype":"application/x-truetype-font"}}
         ],"chapters":[{"start_time":"0","end_time":"2","tags":{"title":"Opening"}}],"format":{"duration":"2","tags":{"title":"Sample","ENCODER":"source tool"}}})).unwrap()
+    }
+
+    /// MP4 mov_text tracks end with an empty two-byte "clear" sample whose
+    /// duration can run seconds past the picture. Converting to SRT drops it.
+    fn subtitle_tail(output_duration: &str) -> (Document, Document) {
+        let source: Document = serde_json::from_value(json!({"streams":[
+            {"index":0,"codec_type":"video","codec_name":"hevc","width":64,"height":64,"duration":"600.058000","nb_read_packets":"14387"},
+            {"index":1,"codec_type":"audio","codec_name":"eac3","channels":6,"sample_rate":"48000","duration":"600.032000","nb_read_packets":"18751"},
+            {"index":3,"codec_type":"subtitle","codec_name":"mov_text","duration":"607.983000","nb_read_packets":"240"}
+        ],"format":{"duration":"607.983000"}}))
+        .unwrap();
+        let mut output = source.clone();
+        output.format.as_mut().unwrap().duration = Some(output_duration.into());
+        (source, output)
+    }
+
+    #[test]
+    fn converted_subtitle_tails_do_not_set_the_required_duration() {
+        let (source, output) = subtitle_tail("600.058000");
+        let selected = source.selected(&[0, 1, 3]).unwrap();
+        verify_container(&source, &selected, &output, &[3]).unwrap();
+        // A copied track keeps its packets, but its tail still only bounds the end.
+        verify(&source, &selected, &output).unwrap();
+        // Picture and sound remain strictly required.
+        let (source, short) = subtitle_tail("599.500000");
+        let error = verify_container(&source, &selected, &short, &[3]).unwrap_err();
+        assert_eq!(error.code, "OUTPUT_VALIDATION_FAILED");
+        assert!(
+            error.message.contains("expected 600.058000s"),
+            "{}",
+            error.message
+        );
+        // The subtitle tail is the most any output may extend to.
+        let (source, long) = subtitle_tail("608.200000");
+        assert!(verify_container(&source, &selected, &long, &[3]).is_err());
+        let (source, tail) = subtitle_tail("607.983000");
+        verify_container(&source, &selected, &tail, &[3]).unwrap();
+    }
+
+    #[test]
+    fn subtitle_only_selections_keep_copied_ends_and_skip_converted_tails() {
+        let (source, output) = subtitle_tail("600.058000");
+        let selected = source.selected(&[3]).unwrap();
+        let mut output = output;
+        output.streams = vec![source.streams[2].clone()];
+        verify_container(&source, &selected, &output, &[3]).unwrap();
+        assert!(verify(&source, &selected, &output).is_err());
+        assert_eq!(source.required_duration(&selected, &[3]), None);
+        assert_eq!(source.required_duration(&selected, &[]), Some(607.983));
     }
 
     #[test]
