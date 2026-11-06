@@ -2588,6 +2588,30 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+    /// A presentation time without decoded properties. Only the packet-timing
+    /// validator accepts it, after its first frame was fully decoded.
+    pub(in crate::jobs) fn timestamp_only(time: String) -> Self {
+        Self {
+            best_effort_timestamp_time: Some(time),
+            interlaced_frame: None,
+            top_field_first: None,
+            width: None,
+            height: None,
+            pix_fmt: None,
+            sample_aspect_ratio: None,
+            chroma_location: None,
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            color_range: None,
+            side_data_list: Vec::new(),
+        }
+    }
+
+    pub(in crate::jobs) fn timestamp(&self) -> Option<&str> {
+        self.best_effort_timestamp_time.as_deref()
+    }
+
     pub(in crate::jobs) fn source_queue_shape(&self) -> Self {
         let mut frame = self.clone();
         frame.best_effort_timestamp_time = None;
@@ -4321,6 +4345,86 @@ mod tests {
                 .validate_frames(&decoded, &source.streams[0], true)
                 .is_err()
         );
+    }
+
+    /// Packet timing plans the same count and frame clock as the complete
+    /// decoded validator and rejects the same timing defects. Properties of
+    /// later frames remain the decoded scan's job; the first frame is checked.
+    #[test]
+    fn packet_timing_matches_the_decoded_validator_for_cadence_and_count() {
+        let source = source();
+        let new_plan = || {
+            Plan::build(
+                &source,
+                &source.selected(&[0]).unwrap(),
+                &EncodeSettings::default(),
+            )
+            .unwrap()
+        };
+        let timing = |plan: &Plan, frames: &Frames| {
+            let mut validation = Validation::timing(plan.clone(), source.streams[0].clone());
+            validation.push(&frames.frames[0]);
+            for frame in &frames.frames[1..] {
+                validation.push(&Frame::timestamp_only(
+                    frame.best_effort_timestamp_time.clone().unwrap(),
+                ));
+            }
+            validation.finish()
+        };
+        for (num, den) in [(24000, 1001), (2997, 125)] {
+            let plan = new_plan();
+            let frames = long_cfr_frames(num, den);
+            let (planned, count) = timing(&plan, &frames).unwrap();
+            let mut decoded = plan.clone();
+            assert_eq!(
+                decoded
+                    .validate_source_frames(&frames, &source.streams[0])
+                    .unwrap(),
+                count
+            );
+            assert_eq!(
+                (
+                    planned.fps_num,
+                    planned.fps_den,
+                    planned.cadence_reconciled,
+                    planned.tolerance
+                ),
+                (
+                    decoded.fps_num,
+                    decoded.fps_den,
+                    decoded.cadence_reconciled,
+                    decoded.tolerance
+                )
+            );
+        }
+        for defect in ["gap", "duplicate", "offset"] {
+            let mut frames = long_cfr_frames(2997, 125);
+            match defect {
+                "gap" => {
+                    for frame in &mut frames.frames[20_000..] {
+                        let time = seconds(frame.best_effort_timestamp_time.as_deref()).unwrap();
+                        frame.best_effort_timestamp_time = Some(format!("{:.6}", time + 0.042));
+                    }
+                }
+                "duplicate" => {
+                    frames.frames[20_000].best_effort_timestamp_time =
+                        frames.frames[19_999].best_effort_timestamp_time.clone()
+                }
+                _ => frames.frames[0].best_effort_timestamp_time = Some("0.010".into()),
+            }
+            assert!(timing(&new_plan(), &frames).is_err(), "{defect}");
+        }
+        let mut later = long_cfr_frames(24000, 1001);
+        later.frames[20_000].color_primaries = Some("bt2020".into());
+        assert!(timing(&new_plan(), &later).is_ok());
+        assert!(
+            new_plan()
+                .validate_source_frames(&later, &source.streams[0])
+                .is_err()
+        );
+        let mut first = long_cfr_frames(24000, 1001);
+        first.frames[0].color_primaries = Some("bt2020".into());
+        assert!(timing(&new_plan(), &first).is_err());
     }
 
     #[test]

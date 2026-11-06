@@ -108,6 +108,7 @@ mod standalone_recovery;
 mod subtitles;
 pub use reports::export_analysis;
 mod source_picture_metadata;
+mod source_timing;
 mod trim;
 
 use std::{
@@ -1908,6 +1909,8 @@ impl JobManager {
         dynamic_hdr: Option<DynamicHdrPublication<'_>>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
+        // A source verified beside its encoder must pass before publication.
+        source_timing::settle(cancel).await?;
         Box::pin(self.finalize_verified_inner(
             id,
             cancel,

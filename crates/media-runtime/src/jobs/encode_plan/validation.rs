@@ -8,6 +8,7 @@ pub(in crate::jobs) struct Validation {
     source: bool,
     first: bool,
     discovery_error: Option<AppError>,
+    timing_only: bool,
 }
 
 impl Validation {
@@ -18,7 +19,19 @@ impl Validation {
             source: !encoded,
             first: true,
             discovery_error: None,
+            timing_only: false,
         }
+    }
+
+    /// Source planning from packet presentation times. The first frame must be
+    /// a real decoded frame: it is discovered and checked completely. Later
+    /// frames carry only their time, which receives the unchanged cadence
+    /// check. The complete decoded scan must still validate every frame.
+    pub(in crate::jobs) fn timing(plan: Plan, stream: Stream) -> Self {
+        let mut validation = Self::new(plan, stream, false);
+        validation.timing_only = true;
+        validation.declared.timing_only = true;
+        validation
     }
 
     #[cfg(test)]
@@ -42,8 +55,10 @@ impl Validation {
                     candidate.fps_num = 2997;
                     candidate.fps_den = 125;
                     candidate.cadence_reconciled = true;
-                    self.alternative =
-                        Some(Cadence::new(candidate, self.declared.stream.clone(), false));
+                    let mut alternative =
+                        Cadence::new(candidate, self.declared.stream.clone(), false);
+                    alternative.timing_only = self.timing_only;
+                    self.alternative = Some(alternative);
                 }
             }
         }
@@ -86,6 +101,8 @@ struct Cadence {
     error: Option<AppError>,
     previous_time: Option<f64>,
     source_queue: Option<super::super::source_queue::Cursor>,
+    /// After the first frame, check presentation times only (packet timing).
+    timing_only: bool,
 }
 
 impl Cadence {
@@ -117,6 +134,7 @@ impl Cadence {
             error: None,
             previous_time: None,
             source_queue,
+            timing_only: false,
         }
     }
 
@@ -181,6 +199,9 @@ impl Cadence {
             return Err(unsupported(
                 "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
             ));
+        }
+        if self.timing_only && self.count > 0 {
+            return Ok(());
         }
         if let Some(queue) = &mut self.source_queue {
             return queue.push(frame);

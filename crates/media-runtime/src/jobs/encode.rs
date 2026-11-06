@@ -55,21 +55,36 @@ impl JobManager {
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
+        // The decoded source scan may run beside the encoder. Its failure
+        // raises this job-scoped cancellation, so the encoder stops early.
+        let verification = super::source_timing::Verification::new(cancel);
+        let job_cancel = verification.cancel();
         let execution = self.encode_mode(
-            id, request, settings, cancel, log_path, temporary, scratch, None,
+            id,
+            request,
+            settings,
+            &job_cancel,
+            log_path,
+            temporary,
+            scratch,
+            None,
         );
-        if (settings.source_filters || settings.tone_map.is_some_and(|tone| tone.source_workflow))
-            && settings.backend == media_core::EncodeBackend::Standalone
-            && !settings.source_nvenc_quality
-        {
-            super::source_filters::with_observer(
-                super::source_filters::Observation::new(Path::new(&request.output_path)),
-                execution,
-            )
-            .await
-        } else {
-            execution.await
-        }
+        let execution = async {
+            if (settings.source_filters
+                || settings.tone_map.is_some_and(|tone| tone.source_workflow))
+                && settings.backend == media_core::EncodeBackend::Standalone
+                && !settings.source_nvenc_quality
+            {
+                super::source_filters::with_observer(
+                    super::source_filters::Observation::new(Path::new(&request.output_path)),
+                    execution,
+                )
+                .await
+            } else {
+                execution.await
+            }
+        };
+        verification.run(cancel, execution).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -727,14 +742,18 @@ impl JobManager {
             .iter()
             .find(|stream| stream.index == plan.video_index)
             .expect("validated video selection");
-        self.change(id, |snapshot| {
-            snapshot.progress_seconds = Some(0.0);
-            snapshot.duration_seconds = document.duration().filter(|duration| *duration > 0.0);
-            append_log(snapshot, "Decoding the complete source to verify every frame timestamp, progressive scan, color, and HDR metadata with bounded memory.".into());
-        }).await;
         let declared_rate = (plan.fps_num, plan.fps_den);
         let frame_count = self
-            .scan_frames(id, &ffprobe, &source.path, &mut plan, video, false, cancel)
+            .source_frames(
+                id,
+                &ffprobe,
+                &source.path,
+                &mut plan,
+                video,
+                document.duration(),
+                preview.is_some(),
+                cancel,
+            )
             .await?;
         let dynamic_hdr =
             super::dynamic_hdr::Resources::prepare(settings, frame_count, cancel).await?;
@@ -1118,7 +1137,7 @@ impl JobManager {
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("Validated {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
+            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if super::source_timing::pending() {"Encoding"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
             if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
             }
@@ -2792,6 +2811,68 @@ impl JobManager {
         Ok(())
     }
 
+    /// Plan the source frame count and cadence. When packet timestamps can
+    /// stand in for decoded frames, plan from them and the first decoded frames
+    /// and verify every decoded frame beside the encoder (see `source_timing`).
+    /// Otherwise decode the complete source first, as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn source_frames(
+        &self,
+        id: &str,
+        ffprobe: &Path,
+        input: &Path,
+        plan: &mut Plan,
+        stream: &metadata::Stream,
+        duration: Option<f64>,
+        preview: bool,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<usize, AppError> {
+        let concurrent = super::source_timing::available();
+        if preview || concurrent {
+            self.change(id, |snapshot| {
+                append_log(snapshot, "Planning source frames from every packet timestamp and the first decoded frames.".into())
+            })
+            .await;
+            match super::source_timing::plan_from_packets(ffprobe, input, plan, stream, cancel)
+                .await?
+            {
+                Ok((planned, count)) => {
+                    if concurrent && !preview {
+                        super::source_timing::spawn(
+                            self.clone(),
+                            id.to_owned(),
+                            ffprobe.to_owned(),
+                            input.to_owned(),
+                            plan.clone(),
+                            stream.clone(),
+                            super::source_timing::Expected::new(&planned, count),
+                        );
+                        self.change(id, |snapshot| {
+                            append_log(snapshot, format!("Planned {count} constant-rate frames from packet timestamps. The complete decoded source (every timestamp, progressive scan, color, HDR and Dolby Vision metadata) is verified alongside the encoder; the job fails and nothing is published if any frame is rejected."))
+                        })
+                        .await;
+                    }
+                    *plan = planned;
+                    return Ok(count);
+                }
+                Err(reason) => {
+                    self.change(id, |snapshot| {
+                        append_log(snapshot, format!("Packet timing cannot stand in for decoded frames ({reason}); decoding the complete source before encoding."))
+                    })
+                    .await;
+                }
+            }
+        }
+        self.change(id, |snapshot| {
+            snapshot.progress_seconds = Some(0.0);
+            snapshot.duration_seconds = duration.filter(|duration| *duration > 0.0);
+            append_log(snapshot, "Decoding the complete source to verify every frame timestamp, progressive scan, color, and HDR metadata with bounded memory.".into());
+        })
+        .await;
+        self.scan_frames(id, ffprobe, input, plan, stream, false, cancel)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn scan_frames(
         &self,
@@ -2924,17 +3005,11 @@ pub(in crate::jobs) async fn frame_scan(
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(8);
-    let mut args = frame_scan_args(input, stream.index, threads);
-    if !encoded && plan.source_is_vp9_alpha() {
-        let input_position = args
-            .iter()
-            .position(|arg| arg == "-i")
-            .expect("frame scan input");
-        args.splice(
-            input_position..input_position,
-            ["-c:v".into(), "libvpx-vp9".into()],
-        );
-    }
+    let args = if encoded {
+        frame_scan_args(input, stream.index, threads)
+    } else {
+        source_scan_args(input, stream.index, threads, plan)
+    };
     let mut validation = Validation::new(plan.clone(), stream.clone(), encoded);
     let output = supervisor::run_streaming_stdout(
         &CommandSpec {
@@ -2996,6 +3071,27 @@ pub(in crate::jobs) async fn frame_scan(
     })?;
     *plan = validated;
     Ok(count)
+}
+
+/// Source frame scan arguments, selecting libvpx for VP9 alpha sources.
+pub(in crate::jobs) fn source_scan_args(
+    input: &Path,
+    index: u32,
+    threads: usize,
+    plan: &Plan,
+) -> Vec<OsString> {
+    let mut args = frame_scan_args(input, index, threads);
+    if plan.source_is_vp9_alpha() {
+        let input_position = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("frame scan input");
+        args.splice(
+            input_position..input_position,
+            ["-c:v".into(), "libvpx-vp9".into()],
+        );
+    }
+    args
 }
 
 pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
@@ -4453,6 +4549,168 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("decoded") || line.contains("Decoding")),
             "{:#?}",
+            job.logs
+        );
+        assert!(!output.exists());
+    }
+
+    /// Packets with a constant clock can hide a decoded-frame defect. The
+    /// encoder starts from the packet plan, but the complete decoded scan
+    /// beside it must still fail the job and publish nothing.
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe, and standalone SvtAv1EncApp"]
+    async fn decoded_defects_after_the_packet_plan_fail_without_publication() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "jesses-encode-background-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let run = |args: Vec<String>| {
+            let ffmpeg = ffmpeg.clone();
+            let cancel = cancel.clone();
+            async move {
+                let result = supervisor::run_capture(
+                    &CommandSpec {
+                        executable: ffmpeg,
+                        args: args.into_iter().map(OsString::from).collect(),
+                        cwd: None,
+                    },
+                    cancel,
+                    64 * 1024,
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        };
+        // Two Annex B segments with in-band parameter sets: the second one
+        // declares different color primaries from the first frame onward.
+        let mut joined = Vec::new();
+        for (name, primaries) in [("a.h264", "bt709"), ("b.h264", "bt470bg")] {
+            let path = fixture.0.join(name);
+            let tags = format!(
+                "setparams=field_mode=prog:range=tv:color_primaries={primaries}:color_trc=bt709:colorspace=bt709"
+            );
+            run([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=128x96:r=24",
+                "-t",
+                "1",
+                "-vf",
+                &tags,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-bf",
+                "0",
+                "-g",
+                "24",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_primaries",
+                primaries,
+                "-chroma_sample_location",
+                "left",
+                "-f",
+                "h264",
+            ]
+            .into_iter()
+            .map(String::from)
+            .chain([path.to_string_lossy().into_owned()])
+            .collect())
+            .await;
+            joined.extend(std::fs::read(&path).unwrap());
+        }
+        let raw = fixture.0.join("joined.h264");
+        std::fs::write(&raw, joined).unwrap();
+        let input = fixture.0.join("source.mkv");
+        run([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "h264",
+            "-framerate",
+            "24",
+            "-i",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain([raw.to_string_lossy().into_owned()])
+        .chain(
+            ["-c", "copy", "-f", "matroska"]
+                .into_iter()
+                .map(String::from),
+        )
+        .chain([input.to_string_lossy().into_owned()])
+        .collect())
+        .await;
+        let output = fixture.0.join("output.mkv");
+        let manager = JobManager::new(fixture.0.join("logs"));
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    preset: 12,
+                    ..EncodeSettings::default()
+                },
+            })
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let job = manager
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.id == job.id)
+                    .unwrap();
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        assert_eq!(job.state, JobState::Failed, "{job:#?}");
+        assert!(
+            job.logs.iter().any(|line| line.starts_with("Planned 48 ")),
+            "{:#?}",
+            job.logs
+        );
+        let error = job.error.as_ref().unwrap();
+        assert!(
+            error.message.contains("color metadata differs"),
+            "{error:?}\n{:#?}",
             job.logs
         );
         assert!(!output.exists());
