@@ -834,6 +834,46 @@ mod tests {
             ..Default::default()
         }
     }
+    /// The Advanced tab groups controls by category. Catalogs merged for one
+    /// encoder must spell each category one way ("Rate Control", not also
+    /// "Rate control"; "&" rather than "and").
+    #[test]
+    fn each_encoder_lists_every_category_under_one_spelling() {
+        let key = |group: &str| {
+            group
+                .to_ascii_lowercase()
+                .replace(" and ", " & ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let check = |label: String, specs: Vec<Spec>| {
+            let mut seen = std::collections::BTreeMap::new();
+            for spec in specs {
+                if let Some(previous) = seen.insert(key(spec.group), spec.group) {
+                    assert_eq!(previous, spec.group, "{label}");
+                }
+            }
+        };
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::SvtAv1FiveFish,
+            VideoEncoder::SvtAv1Hdr,
+            VideoEncoder::AomAv1,
+            VideoEncoder::X264,
+            VideoEncoder::X265,
+            VideoEncoder::X265Standalone,
+            VideoEncoder::Vp9,
+            VideoEncoder::VpxStandalone,
+        ] {
+            check(format!("{encoder:?}"), specs(encoder));
+        }
+        use media_core::LadderEncoder as L;
+        for encoder in [L::H264, L::Hevc, L::Av1, L::Vp9, L::AomAv1] {
+            check(format!("ladder {encoder:?}"), library_specs(encoder));
+        }
+    }
+
     #[test]
     fn only_catalog_scalars_can_reach_nested_or_native_parsers() {
         for name in [

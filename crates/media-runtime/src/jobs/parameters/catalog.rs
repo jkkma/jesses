@@ -180,10 +180,10 @@ fn choice_list(
 }
 
 pub(super) fn x264() -> Vec<Spec> {
-    let tuning = "Tuning and profile";
-    let motion = "Frames and motion";
-    let quant = "Quantization and texture";
-    let rate = "Rate control";
+    let tuning = "Tuning & Profile";
+    let motion = "Frames & Motion";
+    let quant = "Quantization & Texture";
+    let rate = "Rate Control";
     vec![
         choice_list(
             "tune",
@@ -478,12 +478,12 @@ pub(super) fn x264() -> Vec<Spec> {
 }
 
 pub(super) fn svt() -> Vec<Spec> {
-    let visual = "Visual quality";
-    let quant = "Quantization and bit allocation";
-    let rate = "Rate control";
+    let visual = "Visual Quality";
+    let quant = "Quantization & Bit Allocation";
+    let rate = "Rate Control";
     let filter = "Filtering";
-    let grain = "Film grain and noise";
-    let tools = "Encoding tools";
+    let grain = "Film Grain & Noise";
+    let tools = "Encoding Tools";
     vec![
         number(
             "keyint",
