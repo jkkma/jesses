@@ -534,6 +534,44 @@
       jobs[0],
   );
 
+  // Mirror each job's own log into the Log pane: phase, tool and warning lines
+  // as they arrive, then the final error. Encoder progress lines are left to
+  // the progress bar, and jobs already present when the pane connects are not
+  // replayed.
+  const jobLogCursors = new Map<string, { last: string | undefined; finished: boolean }>();
+  let jobLogsPrimed = false;
+  const progressLine =
+    /^(?:\[(?:consumer|producer)\]\s*)?(?:Encoding:?\s+\d+(?:\/\d+)?\s+Frames|Encoding frame\s+\d+|frame=\s*\d+|Encoding\s*$)/;
+  function mirrorJobLogs(snapshot: JobSnapshot[]) {
+    for (const job of snapshot) {
+      const lines = job.logs ?? [];
+      const finished = terminalJob(job.state);
+      const cursor = jobLogCursors.get(job.id);
+      if (!cursor && !jobLogsPrimed) {
+        jobLogCursors.set(job.id, { last: lines.at(-1), finished });
+        continue;
+      }
+      if (cursor?.finished) continue;
+      // Job logs are a bounded window; continue after the last line already
+      // shown, or show the whole window when it has moved past that line.
+      const seen = cursor?.last === undefined ? -1 : lines.lastIndexOf(cursor.last);
+      const failed = finished && (job.state === 'failed' || job.state === 'interrupted');
+      const message = failed ? job.error?.message : undefined;
+      for (const line of lines.slice(seen + 1))
+        if (!progressLine.test(line) && line !== message)
+          addLog(line, /\b(?:error|failed)\b/i.test(line) ? 'error' : 'info');
+      if (failed) {
+        if (message) addLog(message, 'error');
+        addLog(
+          `Did not finish${job.error?.code ? ` (${job.error.code})` : ''}.${job.logPath ? ` Job log: ${job.logPath}` : ''}`,
+          'error',
+        );
+      }
+      jobLogCursors.set(job.id, { last: lines.at(-1), finished });
+    }
+    jobLogsPrimed = true;
+  }
+
   async function connectJobs() {
     if (!desktop || jobsConnecting) return;
     jobsConnecting = true;
@@ -545,6 +583,7 @@
         if (jobsDisposed) return;
         jobs = snapshot;
         jobsConnected = true;
+        mirrorJobLogs(snapshot);
       });
       if (jobsDisposed) stop();
       else stopJobSubscription = stop;
