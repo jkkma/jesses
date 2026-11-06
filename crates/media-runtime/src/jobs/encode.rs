@@ -194,6 +194,23 @@ impl JobManager {
             super::source_normalization::inspect(request, settings, cancel).await?;
         let existing = super::source_normalization::exists(id, request)?;
         let mut required = super::source_normalization::needs(&document, settings, false)?;
+        if !existing && required {
+            // A canonical source decodes the complete video. Check the selection
+            // and destination against stream headers before that pass.
+            let ffprobe = discover("ffprobe", cancel).await?;
+            let output = files::output_path(request, &original)?;
+            let headers = probe(
+                &ffprobe,
+                &original.path,
+                cancel,
+                Some(&request.stream_indices),
+            )
+            .await?;
+            preflight_streams(
+                &original, request, settings, &headers, &output, &ffprobe, cancel,
+            )
+            .await?;
+        }
         if !existing && !required {
             let result = boxed(|| {
                 self.encode_video_mode(
@@ -478,6 +495,13 @@ impl JobManager {
             Some(&request.stream_indices),
         )
         .await?;
+        // Run every header-only check before any decode pass, so an impossible
+        // destination fails in seconds rather than after a frame-by-frame scan.
+        // The checks repeat below against the final decoded-color metadata.
+        let external = preflight_streams(
+            &source, request, settings, &document, &output, &ffprobe, cancel,
+        )
+        .await?;
         if document
             .streams
             .iter()
@@ -514,10 +538,6 @@ impl JobManager {
             settings
         };
         let selected = document.selected(&request.stream_indices)?;
-        let external = super::external_tracks::ExternalTracks::prepare(
-            &source, request, settings, &document, &ffprobe, cancel,
-        )
-        .await?;
         let mut output_document = external.extend_document(&document, settings);
         let mux_settings = external.mux_settings(settings);
         let preflight_indices =
@@ -2861,6 +2881,31 @@ fn svt_frame_counter(line: &str) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Container, stream and settings checks that need only stream headers.
+async fn preflight_streams(
+    source: &Source,
+    request: &RemuxRequest,
+    settings: &EncodeSettings,
+    document: &Document,
+    output: &Path,
+    ffprobe: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<super::external_tracks::ExternalTracks, AppError> {
+    let external = super::external_tracks::ExternalTracks::prepare(
+        source, request, settings, document, ffprobe, cancel,
+    )
+    .await?;
+    let output_document = external.extend_document(document, settings);
+    let mux_settings = external.mux_settings(settings);
+    let indices = external.output_indices(document, request.stream_indices.clone(), settings)?;
+    let selected = output_document.selected(&indices)?;
+    audio::validate_selection(&selected, &mux_settings)?;
+    super::trim::validate_selection(&selected, &mux_settings)?;
+    super::subtitles::validate_selection(&selected, &mux_settings)?;
+    container::preflight(output, &output_document, &selected, Some(&mux_settings))?;
+    Ok(external)
+}
+
 pub(in crate::jobs) async fn frame_scan(
     ffprobe: &Path,
     input: &Path,
@@ -4289,6 +4334,123 @@ mod tests {
                 .to_string_lossy()
                 .contains(".partial.")
         }));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe, and standalone SvtAv1EncApp"]
+    async fn incompatible_tracks_fail_before_any_source_decode_pass() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "jesses-encode-preflight-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let cues = fixture.0.join("cues.srt");
+        std::fs::write(&cues, "1\n00:00:00,000 --> 00:00:00,500\nHello\n").unwrap();
+        let input = fixture.0.join("source.mp4");
+        let output = fixture.0.join("output.mkv");
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        // No color tags: the decoded-color enrichment pass would be needed.
+        let mut args: Vec<OsString> = [
+            "-v",
+            "error",
+            "-nostdin",
+            "-n",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=128x96:r=24",
+            "-i",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args.push(cues.as_os_str().to_owned());
+        args.extend(
+            [
+                "-t",
+                "1",
+                "-map",
+                "0:v",
+                "-map",
+                "1:s",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:s",
+                "mov_text",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        args.push(input.as_os_str().to_owned());
+        let (_sender, cancel) = watch::channel(false);
+        let generated = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args,
+                cwd: None,
+            },
+            cancel,
+            64 * 1024,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let manager = JobManager::new(fixture.0.join("logs"));
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1],
+                },
+                settings: EncodeSettings {
+                    preset: 12,
+                    ..EncodeSettings::default()
+                },
+            })
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let job = manager
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.id == job.id)
+                    .unwrap();
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        let error = job.error.as_ref().expect("incompatible copy fails");
+        assert_eq!(error.code, "CONTAINER_INCOMPATIBLE", "{job:#?}");
+        assert!(error.message.contains("SubRip"), "{}", error.message);
+        assert!(
+            !job.logs
+                .iter()
+                .any(|line| line.contains("decoded") || line.contains("Decoding")),
+            "{:#?}",
+            job.logs
+        );
+        assert!(!output.exists());
     }
 
     #[tokio::test]

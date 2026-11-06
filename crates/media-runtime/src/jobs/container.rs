@@ -213,6 +213,23 @@ pub(super) fn preflight_final(
 ) -> Result<(), AppError> {
     preflight_with_staging(output, document, selected, settings, format(output)?)
 }
+/// Suggest only changes that can help: a Matroska destination is already the
+/// most permissive container, so it never recommends choosing Matroska again.
+fn incompatible_remedy(container: ContainerFormat, kind: &str) -> &'static str {
+    match (container, kind) {
+        (ContainerFormat::Matroska, "subtitle") => {
+            "Convert it to SubRip, ASS or WebVTT, or deselect that track."
+        }
+        (ContainerFormat::Matroska, "data") => {
+            "Deselect that track, or choose MOV to keep data tracks."
+        }
+        (ContainerFormat::Matroska, _) => "Change its encoder, or deselect that track.",
+        (_, "attachment") => {
+            "Attachments require Matroska. Choose Matroska or deselect that track."
+        }
+        _ => "Choose Matroska, change its encoder, or deselect that track.",
+    }
+}
 fn preflight_with_staging(
     output: &Path,
     document: &Document,
@@ -294,9 +311,10 @@ fn preflight_with_staging(
         };
         if !compatible(container, kind, codec) {
             return Err(invalid(format!(
-                "Stream {} ({kind}, {codec}) is incompatible with {}. Choose Matroska, change its encoder, or deselect that track. Attachments require Matroska.",
+                "Stream {} ({kind}, {codec}) is incompatible with {}. {}",
                 stream.index,
-                container.extension().to_uppercase()
+                container.extension().to_uppercase(),
+                incompatible_remedy(container, kind),
             )));
         }
         // The verified staging format cannot carry tx3g. An explicit text
@@ -1352,6 +1370,26 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+    #[test]
+    fn incompatible_track_advice_never_suggests_the_chosen_container() {
+        let mut doc = document();
+        doc.streams[1].codec_name = Some("mov_text".into());
+        let check = |doc: &Document, output: &str| {
+            let selected = doc.streams.iter().collect::<Vec<_>>();
+            preflight(Path::new(output), doc, &selected, None)
+                .unwrap_err()
+                .message
+        };
+        let message = check(&doc, "output.mkv");
+        assert!(message.contains("incompatible with MKV"), "{message}");
+        assert!(message.contains("SubRip"), "{message}");
+        assert!(!message.contains("Choose Matroska"), "{message}");
+        assert!(!message.contains("Attachments"), "{message}");
+        doc.streams[1].codec_name = Some("hdmv_pgs_subtitle".into());
+        let message = check(&doc, "output.mp4");
+        assert!(message.contains("Choose Matroska"), "{message}");
+        assert!(!message.contains("Attachments"), "{message}");
     }
     #[test]
     fn only_expected_chapter_auxiliary_track_is_accepted_and_titles_are_normalized() {
