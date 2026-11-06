@@ -84,6 +84,7 @@
     subtitleError,
     subtitleSummary,
   } from './subtitle-options';
+  import { adjustedOutputTitle, type OutputPictureChange } from './output-title';
   import type { SubtitleTrackSettings } from '$lib/ipc/generated';
   import { terminalJob } from './job-state';
   import FramingOptions from './FramingOptions.svelte';
@@ -774,7 +775,7 @@
   function outputMetadataValue(source: MediaFile) {
     return (
       outputMetadataEdits[source.id] ?? {
-        title: source.title ?? '',
+        title: adjustedOutputTitle(source.title ?? '', outputPictureChange),
         language: source.language ?? '',
       }
     );
@@ -1405,6 +1406,18 @@
   const desktop = isDesktop();
   const chunked = $derived(backend === 'av1an');
   const encodingVideo = $derived(chunked || videoMode === 'encode');
+  // An unedited default title follows the output picture: a resized or
+  // tone-mapped encode does not keep the source's "2160p ... DV.HDR10+" tokens.
+  const outputPictureChange = $derived<OutputPictureChange>({
+    toneMapped: encodingVideo && toneMap.enabled,
+    ...(encodingVideo && framing.resizeEnabled
+      ? {
+          height: ['fit', 'height', 'exact'].includes(framing.resizeMode)
+            ? (framing.resizeHeight ?? null)
+            : null,
+        }
+      : {}),
+  });
   const encoder = $derived(selectedEncoder);
   const parameterCatalog = $derived(
     !toolsLoading ? (parameterCatalogs[`${toolsRevision}:${backend}:${encoder}`] ?? null) : null,
