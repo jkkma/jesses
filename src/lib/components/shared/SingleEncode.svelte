@@ -1065,6 +1065,7 @@
       run: (options?: RunOptions) => start(false, options),
       reset: resetSourceSettings,
       canRun: enabled,
+      blockedReason: enabled ? undefined : (runBlockedReason ?? undefined),
       batchNaming: naming,
       label: `${mode === 'batch' ? 'Run Batch' : 'Run'}: ${av1anMode ? 'AV1AN encode' : 'Encode'}`,
       active: inFlight,
@@ -1578,6 +1579,7 @@
       backend,
       selectedVideo,
       toneMap.enabled,
+      outputContainer,
     ),
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
@@ -1797,6 +1799,11 @@
       ? 'This selected external track type cannot be included by the encoder.'
       : null;
   });
+  // Track-selection and container problems are decided on other tabs, so the
+  // shell repeats them beside Run instead of leaving a silently disabled button.
+  const runBlockedReason = $derived(
+    sourceTrackIssue ?? containerIssue ?? (encodingVideo ? subtitleIssue : null),
+  );
   const noVideoForRun = $derived(
     !chunked &&
       fileMode === 'mux' &&
@@ -4285,6 +4292,10 @@
       AV1AN does not support image sequence folders.
     </p>{/if}{#if sourceTrackIssue}<p role="alert">
       {sourceTrackIssue}
+    </p>{/if}{#if containerIssue}<p role="alert">
+      {containerIssue}
+    </p>{/if}{#if encodingVideo && subtitleIssue}<p role="alert">
+      {subtitleIssue}
     </p>{/if}{#if parsedHdr.error}<p role="alert">{parsedHdr.error}</p>{/if}{#if gridGrainIssue}<p
       role="alert"
     >
@@ -4794,6 +4805,11 @@
   }
   p {
     font-size: 12px;
+  }
+  /* A reason that blocks Run must read as an error, not as a hint. */
+  p[role='alert'] {
+    color: var(--destructive);
+    font-weight: 600;
   }
   table {
     width: 100%;

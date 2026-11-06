@@ -245,6 +245,9 @@
     Object.values(workspaceActions).find((candidate) => candidate?.active),
   );
   const displayAction = $derived(runningAction ?? action);
+  const runBlockedReason = $derived(
+    !runningAction && action && !action.canRun ? action.blockedReason : undefined,
+  );
   const currentActionText = $derived.by(() => {
     if (displayAction?.active)
       return (
@@ -1525,9 +1528,16 @@
         onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
         >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
       ><button type="button" onclick={stopQueue}>Stop</button>{/if}
+    {#if runBlockedReason}<span
+        id="run-blocked-reason"
+        class="run-blocked"
+        role="alert"
+        title={runBlockedReason}>{runBlockedReason}</span
+      >{/if}
     <button
       type="button"
       class="run-button"
+      aria-describedby={runBlockedReason ? 'run-blocked-reason' : undefined}
       disabled={!action?.canRun || !!runningAction || !desktop}
       onclick={(event) =>
         action?.run({ editCommand: event.shiftKey, isShiftHeld: () => shiftHeld })}
@@ -1801,6 +1811,18 @@
     color: var(--primary-foreground);
     background: var(--primary);
     font-weight: 600;
+  }
+  .status-bar .run-blocked {
+    max-width: 46ch;
+    color: var(--destructive);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.3;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
   }
   /* Paper shell and menu selection stay compact at desktop and laptop widths. */
   .app-shell {

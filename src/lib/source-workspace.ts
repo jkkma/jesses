@@ -24,6 +24,8 @@ export type WorkspaceAction = {
   pause?: () => Promise<void>;
   stop?: () => void;
   canRun: boolean;
+  /** Why Run is unavailable, shown beside the Run button as an error. */
+  blockedReason?: string;
   label: string;
 };
 

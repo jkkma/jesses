@@ -1,4 +1,5 @@
 import type {
+  ContainerFormat,
   EncodeBackend,
   MediaStream,
   SubtitleMode,
@@ -41,7 +42,22 @@ export function subtitleError(
   backend: EncodeBackend,
   video?: MediaStream,
   toneMapped = false,
+  container?: ContainerFormat,
 ): string | null {
+  // Matroska cannot store MP4 timed text, so copying it fails before encoding.
+  const copiedMovText =
+    container === 'matroska'
+      ? streams.find((stream) => {
+          if (stream.kind !== 'subtitle' || stream.codec !== 'mov_text') return false;
+          if (!included.includes(stream.index)) return false;
+          const track = tracks.find((track) => track.streamIndex === stream.index);
+          return !track || (track.mode === 'copy' && !track.burnIn);
+        })
+      : undefined;
+  if (copiedMovText)
+    return backend === 'standalone'
+      ? `Subtitle #${copiedMovText.index} is MP4 text (mov_text), which MKV cannot store. Choose SubRip, ASS or WebVTT for it in Subtitles, or deselect it.`
+      : `Subtitle #${copiedMovText.index} is MP4 text (mov_text), which MKV cannot store. Deselect it; subtitle conversion requires standalone encoding.`;
   const selected = selectedSubtitles(tracks, included);
   if (selected.length && backend !== 'standalone')
     return 'Subtitle conversion and burn-in require standalone encoding.';
