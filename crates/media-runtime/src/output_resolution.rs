@@ -79,10 +79,14 @@ pub(crate) fn resolve_reserved(
     if !preferred.is_absolute() || preferred.to_str().is_none_or(|value| value.contains('\0')) {
         return Err(invalid("Choose an absolute local output stem.", &preferred));
     }
+    // The stem and path are shown and edited in the UI. Windows canonical
+    // paths are verbatim (`\\?\C:\...`); keep that form only where it is
+    // required (over-long or reserved names), as dunce does.
     let directory = preferred
         .parent()
         .and_then(|parent| fs::canonicalize(parent).ok())
         .filter(|parent| parent.is_dir())
+        .map(|parent| dunce::simplified(&parent).to_path_buf())
         .ok_or_else(|| invalid("Choose an existing output folder.", &preferred))?;
     let name = preferred
         .file_name()
@@ -175,7 +179,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = dunce::canonicalize(&root).unwrap();
         let source = root.join("film.part.one.mkv");
         fs::write(&source, b"original").unwrap();
         let request = |stem: Option<String>, target| OutputPathRequest {
@@ -192,6 +196,20 @@ mod tests {
             Path::new(&result.output_path),
             root.join("film.part.one (1).mkv")
         );
+        // User-facing paths never carry the Windows verbatim prefix, even when
+        // the source path was given in verbatim form.
+        assert!(!result.output_stem.starts_with(r"\\?\"));
+        assert!(!result.output_path.starts_with(r"\\?\"));
+        #[cfg(windows)]
+        {
+            let mut verbatim = request(None, container);
+            verbatim.input_path = format!(r"\\?\{}", source.display());
+            let resolved = resolve_output_path(verbatim).await.unwrap();
+            assert_eq!(
+                Path::new(&resolved.output_stem),
+                root.join("film.part.one (1)")
+            );
+        }
         fs::create_dir(&result.output_path).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("gone"), root.join("film.part.one (2).mkv")).unwrap();

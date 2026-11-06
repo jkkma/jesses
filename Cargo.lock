@@ -2180,6 +2180,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "dolby_vision",
+ "dunce",
  "hdr10plus",
  "icu_collator",
  "icu_locale_core",
