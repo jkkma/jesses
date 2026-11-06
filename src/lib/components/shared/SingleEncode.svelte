@@ -1982,7 +1982,11 @@
           source?.streams.some(
             (stream) => stream.index === row.streamIndex && stream.kind === 'video',
           ),
-      )?.streamIndex ?? source?.streams.find((stream) => stream.kind === 'video')?.index
+      )?.streamIndex ??
+      (
+        source?.streams.find((stream) => stream.kind === 'video' && !stream.attachedPic) ??
+        source?.streams.find((stream) => stream.kind === 'video')
+      )?.index
     );
   }
   function reset(

@@ -293,6 +293,12 @@ pub(crate) fn parse_probe(
                         _ => None,
                     }
                 }),
+                attached_pic: stream
+                    .disposition
+                    .as_ref()
+                    .and_then(|value| value.get("attached_pic"))
+                    .is_some_and(|flag| flag.as_u64() == Some(1) || flag.as_bool() == Some(true))
+                    .then_some(true),
                 attachment_filename: tag(&tags, "filename"),
                 attachment_mime_type: tag(&tags, "mimetype"),
                 width: stream.width,
@@ -603,6 +609,20 @@ mod tests {
         assert_eq!(parsed.streams[3].is_default, None);
         let json = serde_json::to_value(parsed).unwrap();
         assert_eq!(json["streams"][0]["bitRate"], "9007199254740993");
+        assert!(json["streams"][0].get("attachedPic").is_none());
+    }
+
+    #[test]
+    fn cover_art_is_marked_as_an_attached_picture() {
+        let parsed = parse_probe(br#"{"streams":[
+          {"index":0,"codec_type":"video","codec_name":"hevc","disposition":{"default":1,"attached_pic":0}},
+          {"index":28,"codec_type":"video","codec_name":"mjpeg","disposition":{"default":0,"attached_pic":1}}
+        ],"format":{}}"#,
+            "source.mp4".into(), "source.mp4".into(), 1).unwrap();
+        assert_eq!(parsed.streams[0].attached_pic, None);
+        assert_eq!(parsed.streams[1].attached_pic, Some(true));
+        let json = serde_json::to_value(parsed).unwrap();
+        assert_eq!(json["streams"][1]["attachedPic"], true);
     }
 
     #[test]

@@ -222,7 +222,12 @@ export type MediaStream = {
 /**
  * Original source stream index, independent of presentation order.
  */
-index: number, kind: string, codec: string | null, codecTag?: string, codecLongName?: string, profile?: string, bitRate?: string, durationSeconds?: number, averageFrameRate?: string, nominalFrameRate?: string, isDefault?: boolean, attachmentFilename?: string, attachmentMimeType?: string, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
+index: number, kind: string, codec: string | null, codecTag?: string, codecLongName?: string, profile?: string, bitRate?: string, durationSeconds?: number, averageFrameRate?: string, nominalFrameRate?: string, isDefault?: boolean,
+/**
+ * A still picture such as cover art (`attached_pic` disposition), not a
+ * playable video track. Present only when the disposition is set.
+ */
+attachedPic?: boolean, attachmentFilename?: string, attachmentMimeType?: string, width: number | null, height: number | null, sampleAspectRatio?: string, displayAspectRatio?: string,
 /**
  * Reported display-matrix rotation, in degrees as finite decimal text.
  */

@@ -288,10 +288,15 @@
     const existing = new Set(
       trackSelection.map((row) => JSON.stringify([row.sourceId, row.streamIndex])),
     );
+    // Cover art (attached pictures) is a still image, not a second picture
+    // track; it starts unchecked and never counts as the source's video.
     let hasVideo = trackSelection.some((row) =>
       files
         .find((file) => file.id === row.sourceId)
-        ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === 'video'),
+        ?.streams.some(
+          (stream) =>
+            stream.index === row.streamIndex && stream.kind === 'video' && !stream.attachedPic,
+        ),
     );
     const additions: TrackSelection[] = [];
     for (const file of chosen) {
@@ -305,13 +310,14 @@
           streamIndex: stream.index,
           included:
             stream.codec?.toLowerCase() !== 'unknown' &&
+            !stream.attachedPic &&
             !(stream.kind === 'video' && alreadyHadVideo),
           title: stream.title ?? '',
           language: stream.language ?? '',
           defaultFlag: stream.isDefault ?? null,
           forcedFlag: null,
         });
-        if (stream.kind === 'video') hasVideo = true;
+        if (stream.kind === 'video' && !stream.attachedPic) hasVideo = true;
       }
     }
     let next = [...trackSelection, ...additions];

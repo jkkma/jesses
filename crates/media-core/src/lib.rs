@@ -176,6 +176,11 @@ pub struct MediaStream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub is_default: Option<bool>,
+    /// A still picture such as cover art (`attached_pic` disposition), not a
+    /// playable video track. Present only when the disposition is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attached_pic: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attachment_filename: Option<String>,

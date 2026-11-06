@@ -1244,6 +1244,7 @@ mod tests {
                     average_frame_rate: None,
                     nominal_frame_rate: None,
                     is_default: None,
+                    attached_pic: None,
                     attachment_filename: None,
                     attachment_mime_type: None,
                     width: Some(1920),
