@@ -18,7 +18,8 @@
 //! fails the job, and `finalize_verified` publishes nothing until the scan has
 //! passed. Sources whose packets cannot stand in for decoded frames (missing
 //! timestamps, discarded or corrupt packets, a first decoded frame that is not
-//! the first packet time) keep the previous blocking scan.
+//! the first packet time, possibly field-coded video) keep the previous
+//! blocking scan.
 use super::encode_plan::{Frame, Plan, Validation};
 use super::*;
 use std::sync::Arc;
@@ -283,6 +284,16 @@ pub(in crate::jobs) async fn plan_from_packets(
     stream: &metadata::Stream,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Result<(Plan, usize), Fallback>, AppError> {
+    // Field-coded video can store each field as its own packet, so packets
+    // would not count frames. Such sources keep the blocking decoded scan.
+    if plan.accepts_field_coded_source()
+        || matches!(
+            stream.field_order.as_deref(),
+            Some("tt" | "bb" | "tb" | "bt")
+        )
+    {
+        return Ok(Err("the source may be field-coded".into()));
+    }
     let times = match packet_times(ffprobe, input, stream.index, cancel).await? {
         Ok(times) => times,
         Err(reason) => return Ok(Err(reason)),

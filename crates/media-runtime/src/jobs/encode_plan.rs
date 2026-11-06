@@ -1535,6 +1535,16 @@ impl Plan {
             .is_some_and(temporal::Transform::requires_qtgmc)
     }
 
+    /// Deinterlacing and cadence repair accept interlaced or telecined
+    /// sources, whose fields may be stored as separate packets.
+    pub(in crate::jobs) fn accepts_field_coded_source(&self) -> bool {
+        self.temporal.as_ref().is_some_and(|transform| {
+            transform.settings.deinterlace.is_some()
+                || transform.settings.qtgmc.is_some()
+                || transform.settings.cadence_repair.is_some()
+        })
+    }
+
     /// av1an derives its scene/chunk frame count before applying `--ffmpeg`.
     /// Timeline-changing filters therefore run once into a verified lossless
     /// source which all scene, chunk and quality-reference readers share.
