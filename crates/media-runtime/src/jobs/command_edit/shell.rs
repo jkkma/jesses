@@ -66,11 +66,14 @@ impl PreparedShell {
                 executable: std::env::var_os("COMSPEC")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+                // An explicit relative path: hardened systems set
+                // NoDefaultCurrentDirectoryInExePath, which stops CMD from
+                // searching the current directory for a bare script name.
                 args: vec![
                     "/D".into(),
                     "/V:OFF".into(),
                     "/C".into(),
-                    "jesses.stats-main.cmd".into(),
+                    r".\jesses.stats-main.cmd".into(),
                 ],
                 cwd: Some(directory.path.clone()),
             };

@@ -429,13 +429,19 @@ mod tests {
             let prepared =
                 PreparedShell::new(&text, Some(root.clone()), &root.join("test.log"), None)
                     .unwrap();
+            // Hardened systems stop CMD from running bare names out of the
+            // current directory; every script must still be found.
+            let mut environment = prepared.environment.clone();
+            environment
+                .variables
+                .push(("NoDefaultCurrentDirectoryInExePath", Some("1".into())));
             let (_owner, cancel) = watch::channel(false);
             let result = supervisor::run_capture_with_environment(
                 &prepared.command,
                 cancel,
                 1024 * 1024,
                 Duration::from_secs(30),
-                Some(&prepared.environment),
+                Some(&environment),
             )
             .await
             .unwrap();
