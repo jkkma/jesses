@@ -20,7 +20,9 @@ impl Fixture {
             ));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::create_dir(&path).unwrap();
-        Self(fs::canonicalize(path).unwrap())
+        // Resolved destinations are user-facing and never carry the Windows
+        // verbatim prefix, so compare them against the same plain form.
+        Self(dunce::canonicalize(path).unwrap())
     }
     fn source(&self, directory: &str, name: &str) -> PathBuf {
         let directory = self.0.join(directory);
