@@ -942,10 +942,16 @@ impl Timeline {
         // Matroska AAC can decode a complete final frame despite a shorter
         // packet duration. MP4 applies that already-declared duration as a
         // discard boundary. Permit only the padding proven by that last packet.
+        // A track that starts after zero is read through an empty edit, and
+        // FFmpeg's MP4 reader compares the final frame's offset timestamp with
+        // the unshifted media duration, discarding that start offset as well.
+        // The muxed packets were compared separately; this bounds only the
+        // decode of the final frame, and never a whole frame.
         let declared_padding = aac_last_duration
             .filter(|duration| *duration > 0.0)
             .map(|duration| {
-                (1024.0 / f64::from(self.rate) - duration).clamp(0.0, 1023.0 / f64::from(self.rate))
+                (1024.0 / f64::from(self.rate) - duration + self.start.max(0.0))
+                    .clamp(0.0, 1023.0 / f64::from(self.rate))
             })
             .unwrap_or(0.0);
         let source_end = self.start + self.samples as f64 / f64::from(self.rate);
@@ -1569,6 +1575,52 @@ mod tests {
         assert!(
             source
                 .verify_container(&output, 0.001, Some(0.023))
+                .is_err()
+        );
+    }
+
+    /// FFmpeg reads an MP4 track that starts after zero through an empty edit,
+    /// then trims the final AAC frame against a duration without that offset.
+    /// The muxed packets are byte-checked separately; only the decode of the
+    /// final frame may lose the offset, and never a whole frame.
+    #[test]
+    fn delayed_mp4_aac_may_lose_only_its_start_offset_from_the_final_frame() {
+        let source = Timeline {
+            start: 0.015,
+            samples: 617 * 1024,
+            rate: 48_000,
+            tolerance: 0.002,
+            minimum_residual: -0.0007,
+            maximum_residual: 0.0007,
+        };
+        let mut output = Timeline {
+            samples: source.samples - 736,
+            ..source.clone()
+        };
+        // Matroska declared 21 ms for the last 1024-sample frame (16 samples
+        // of padding); FFmpeg's reader also counted the 720-sample offset.
+        source
+            .verify_container(&output, 0.001, Some(0.021))
+            .unwrap();
+        // Losing more than the offset, declared padding and 2 ms still fails.
+        output.samples = source.samples - 900;
+        assert!(
+            source
+                .verify_container(&output, 0.001, Some(0.021))
+                .is_err()
+        );
+        // So does the same loss on a track that starts at zero.
+        let undelayed = Timeline {
+            start: 0.0,
+            ..source.clone()
+        };
+        let output = Timeline {
+            samples: source.samples - 736,
+            ..undelayed.clone()
+        };
+        assert!(
+            undelayed
+                .verify_container(&output, 0.001, Some(0.021))
                 .is_err()
         );
     }
