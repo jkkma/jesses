@@ -135,8 +135,16 @@ async fn packaged_provider_measures_padded_decoder_strides_at_eight_and_ten_bits
     ));
     std::fs::create_dir(&root).unwrap();
     let (_owner, cancel) = watch::channel(false);
-    let ffmpeg =
-        std::env::var_os("JESSES_FFMPEG").map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from);
+    // The supervisor runs exactly this path: on Windows it neither searches
+    // PATH nor adds ".exe". Discovery also honours JESSES_FFMPEG.
+    let ffmpeg = media_runtime::get_capabilities()
+        .await
+        .into_iter()
+        .find(|tool| tool.id == "ffmpeg")
+        .filter(|tool| tool.available)
+        .and_then(|tool| tool.path)
+        .map(PathBuf::from)
+        .expect("FFmpeg is available");
     for format in ["yuv420p", "yuv420p10le"] {
         let input = root.join(format!("{format}.mkv"));
         let output = root.join(format!("{format}.tbl"));

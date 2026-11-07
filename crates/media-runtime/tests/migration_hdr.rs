@@ -12,16 +12,33 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
+/// The supervisor runs exactly the path it is given: on Windows it neither
+/// searches PATH nor adds ".exe". Resolve tools the way the app does.
+async fn tool_path(id: &str) -> PathBuf {
+    static TOOLS: tokio::sync::OnceCell<Vec<media_runtime::ToolInfo>> =
+        tokio::sync::OnceCell::const_new();
+    let tool = TOOLS
+        .get_or_init(|| Box::pin(media_runtime::get_capabilities()))
+        .await
+        .iter()
+        .find(|tool| tool.id == id)
+        .unwrap();
+    assert!(tool.available, "Required tool unavailable: {tool:?}");
+    PathBuf::from(tool.path.as_ref().unwrap())
+}
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        // Parallel tests can read the same clock value on Windows.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "jesses-authored-hdr-{}-{}",
+            "jesses-authored-hdr-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -81,7 +98,7 @@ async fn manual_mastering_and_content_light_are_written_by_all_hdr_routes() {
     args.push(input.as_os_str().to_owned());
     let generated = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
@@ -146,7 +163,7 @@ async fn manual_mastering_and_content_light_are_written_by_all_hdr_routes() {
         let (_owner, cancel) = watch::channel(false);
         let probe = supervisor::run_capture(
             &CommandSpec {
-                executable: "ffprobe".into(),
+                executable: tool_path("ffprobe").await,
                 args: vec![
                     "-v".into(),
                     "error".into(),
@@ -265,7 +282,7 @@ async fn dynamic_imports_match_every_frame_and_reject_wrong_lengths() {
     args.push(input.as_os_str().to_owned());
     let generated = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
@@ -362,7 +379,7 @@ async fn pq_and_hlg_canonicalization_preserve_static_metadata_pixels_and_audio()
         let (_owner, cancel) = watch::channel(false);
         let result = supervisor::run_capture(
             &CommandSpec {
-                executable: "ffmpeg".into(),
+                executable: tool_path("ffmpeg").await,
                 args,
                 cwd: None,
             },

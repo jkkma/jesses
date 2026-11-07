@@ -12,6 +12,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
+/// The supervisor runs exactly the path it is given: on Windows it neither
+/// searches PATH nor adds ".exe". Resolve tools the way the app does.
+async fn tool_path(id: &str) -> PathBuf {
+    static TOOLS: tokio::sync::OnceCell<Vec<media_runtime::ToolInfo>> =
+        tokio::sync::OnceCell::const_new();
+    let tool = TOOLS
+        .get_or_init(|| Box::pin(media_runtime::get_capabilities()))
+        .await
+        .iter()
+        .find(|tool| tool.id == id)
+        .unwrap();
+    assert!(tool.available, "Required tool unavailable: {tool:?}");
+    PathBuf::from(tool.path.as_ref().unwrap())
+}
 
 #[tokio::test]
 #[ignore = "requires FFmpeg/FFprobe MPEG-TS MPEG2/MP2 and standalone x264"]
@@ -48,7 +62,7 @@ async fn transport_stream_audio_lead_keeps_packet_timestamps_after_normalization
     args.push(input.as_os_str().to_owned());
     let result = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
@@ -86,7 +100,7 @@ async fn transport_stream_audio_lead_keeps_packet_timestamps_after_normalization
     let (_owner, cancel) = watch::channel(false);
     let probe = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffprobe".into(),
+            executable: tool_path("ffprobe").await,
             args: vec![
                 "-v".into(),
                 "error".into(),
@@ -130,13 +144,16 @@ async fn transport_stream_audio_lead_keeps_packet_timestamps_after_normalization
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        // Parallel tests can read the same clock value on Windows.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "jesses-migration-{}-{}",
+            "jesses-migration-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -187,7 +204,7 @@ async fn generate(path: &Path) {
     args.push(path.as_os_str().to_owned());
     let output = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
@@ -344,7 +361,7 @@ async fn true_audio_only_input_and_sample_trim_and_keyframe_copy_trim() {
     let (_owner, cancel) = watch::channel(false);
     let generated = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args: vec![
                 "-v".into(),
                 "error".into(),
@@ -466,7 +483,7 @@ async fn copy_video_conversion_preserves_chapters_metadata_and_requested_order()
     let (_owner, cancel) = watch::channel(false);
     let generated = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args: vec![
                 "-v".into(),
                 "error".into(),
@@ -574,7 +591,7 @@ async fn every_resize_intent_runs_through_verified_lossless_x264() {
     args.push(input.as_os_str().to_owned());
     let generated = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
@@ -719,7 +736,7 @@ async fn accepts_untagged_sdr_anamorphic_small_and_high_rate_sources_with_verifi
         let (_owner, cancel) = watch::channel(false);
         let generated = supervisor::run_capture(
             &CommandSpec {
-                executable: "ffmpeg".into(),
+                executable: tool_path("ffmpeg").await,
                 args,
                 cwd: None,
             },
@@ -814,7 +831,7 @@ async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_v
             let (_owner, cancel) = watch::channel(false);
             let generated = supervisor::run_capture(
                 &CommandSpec {
-                    executable: "ffmpeg".into(),
+                    executable: tool_path("ffmpeg").await,
                     args: vec![
                         "-v".into(),
                         "error".into(),
@@ -856,7 +873,7 @@ async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_v
         let (_owner, cancel) = watch::channel(false);
         let generated = supervisor::run_capture(
             &CommandSpec {
-                executable: "ffmpeg".into(),
+                executable: tool_path("ffmpeg").await,
                 args,
                 cwd: None,
             },
@@ -947,7 +964,7 @@ async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_v
                 let (_owner, cancel) = watch::channel(false);
                 let result = supervisor::run_capture(
                     &CommandSpec {
-                        executable: "ffmpeg".into(),
+                        executable: tool_path("ffmpeg").await,
                         args: vec![
                             "-v".into(),
                             "error".into(),

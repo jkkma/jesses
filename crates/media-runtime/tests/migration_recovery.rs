@@ -12,16 +12,33 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
+/// The supervisor runs exactly the path it is given: on Windows it neither
+/// searches PATH nor adds ".exe". Resolve tools the way the app does.
+async fn tool_path(id: &str) -> PathBuf {
+    static TOOLS: tokio::sync::OnceCell<Vec<media_runtime::ToolInfo>> =
+        tokio::sync::OnceCell::const_new();
+    let tool = TOOLS
+        .get_or_init(|| Box::pin(media_runtime::get_capabilities()))
+        .await
+        .iter()
+        .find(|tool| tool.id == id)
+        .unwrap();
+    assert!(tool.available, "Required tool unavailable: {tool:?}");
+    PathBuf::from(tool.path.as_ref().unwrap())
+}
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        // Parallel tests can read the same clock value on Windows.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "jesses-normalized-recovery-{}-{}",
+            "jesses-normalized-recovery-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -38,7 +55,7 @@ async fn generate(path: &Path) {
     args.push(path.as_os_str().to_owned());
     let output = supervisor::run_capture(
         &CommandSpec {
-            executable: "ffmpeg".into(),
+            executable: tool_path("ffmpeg").await,
             args,
             cwd: None,
         },
