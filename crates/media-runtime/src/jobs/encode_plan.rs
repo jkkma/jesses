@@ -632,6 +632,16 @@ fn rational(text: Option<&str>) -> Option<(u32, u32)> {
     (a > 0 && b > 0).then_some((a, b))
 }
 
+/// How far an encoded frame's timestamp may sit from the planned clock. The
+/// output container may quantize a fine time base, Matroska to milliseconds.
+pub(in crate::jobs) fn encoded_timestamp_tolerance(stream: &Stream) -> f64 {
+    rational(stream.time_base.as_deref())
+        .map(|(n, d)| f64::from(n) / f64::from(d))
+        .unwrap_or(0.000001)
+        .clamp(0.000001, 0.001)
+        + 0.000002
+}
+
 fn seconds(text: Option<&str>) -> Option<f64> {
     text?.parse::<f64>().ok().filter(|v| v.is_finite())
 }

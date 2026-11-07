@@ -21,6 +21,7 @@ mod av1an_preprocess;
 #[cfg(test)]
 mod batch_tests;
 mod cadence;
+mod codec_config;
 pub(crate) mod command_edit;
 mod container;
 mod conversion;
@@ -93,6 +94,7 @@ mod lossless;
 mod metadata;
 mod mux;
 mod output_metadata;
+mod packet_clock;
 pub(crate) mod parameters;
 pub(crate) mod qtgmc;
 mod rate_control;

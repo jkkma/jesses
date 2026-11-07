@@ -895,6 +895,8 @@ pub(super) async fn prepare<'a>(
         }
         receipt.verify(input, cancel).await?;
         let document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+        // The sealed file is the staging file, whose encoded video the encode
+        // already decoded completely and validated frame by frame.
         super::encode::boxed(|| {
             verify_final_media(
                 &ffmpeg,
@@ -903,6 +905,7 @@ pub(super) async fn prepare<'a>(
                 &document,
                 container,
                 cadence,
+                true,
                 cancel,
             )
         })
@@ -1120,6 +1123,23 @@ pub(super) async fn prepare<'a>(
             }
         }
     }
+    // `cadence` is given only by an encode whose staging video was decoded
+    // completely and validated frame by frame, or proven a byte-identical copy
+    // of a stream that was. Its packets were compared byte for byte above; with
+    // the same codec configuration, this copy decodes to the same frames. A
+    // rewritten configuration (for example, the MOV range flag) is decoded again.
+    let encoded_video_copied = cadence.is_some_and(|clock| {
+        document
+            .streams
+            .iter()
+            .zip(&actual.streams)
+            .any(|(source, target)| {
+                source.index == clock.index
+                    && source.codec_type.as_deref() == Some("video")
+                    && target.codec_type.as_deref() == Some("video")
+                    && source.extradata_hash == target.extradata_hash
+            })
+    });
     super::encode::boxed(|| {
         verify_final_media(
             &ffmpeg,
@@ -1128,6 +1148,7 @@ pub(super) async fn prepare<'a>(
             &document,
             container,
             cadence,
+            encoded_video_copied,
             cancel,
         )
     })
@@ -1137,6 +1158,66 @@ pub(super) async fn prepare<'a>(
     Ok(Some(artifact))
 }
 
+/// The `ffmpeg -f null` arguments that decode every video and audio stream of
+/// the final file except a verified encoded video, or `None` when nothing is
+/// left to decode.
+fn final_decode_args(
+    path: &Path,
+    document: &Document,
+    verified_video: Option<u32>,
+) -> Option<Vec<OsString>> {
+    let decoded = |stream: &&Stream| {
+        matches!(stream.codec_type.as_deref(), Some("video" | "audio"))
+            && Some(stream.index) != verified_video
+    };
+    let mut maps: Vec<OsString> = Vec::new();
+    let mut video = false;
+    if verified_video.is_none() {
+        if !document.streams.iter().any(|stream| decoded(&stream)) {
+            return None;
+        }
+        maps.extend(["-map", "0:v?", "-map", "0:a?"].map(OsString::from));
+        video = true;
+    } else {
+        for stream in document.streams.iter().filter(decoded) {
+            video |= stream.codec_type.as_deref() == Some("video");
+            maps.extend(["-map".into(), format!("0:{}", stream.index).into()]);
+        }
+        if maps.is_empty() {
+            return None;
+        }
+    }
+    let mut args: Vec<OsString> = [
+        "-v",
+        "error",
+        "-nostdin",
+        "-xerror",
+        "-err_detect",
+        "explode",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain([path.as_os_str().to_owned()])
+    .chain(maps)
+    .collect();
+    if video {
+        args.extend(
+            ["-fps_mode:v", "passthrough", "-enc_time_base:v", "demux"].map(OsString::from),
+        );
+    }
+    args.extend(["-f", "null", "-"].map(OsString::from));
+    Some(args)
+}
+
+/// Decodes the final file and checks the encoded frame clock. With
+/// `encoded_video_copied`, the caller has proven that the encoded video is a
+/// byte-identical copy, with the same codec configuration, of a stream that
+/// was already decoded completely and validated. That stream is then not
+/// decoded again, and its clock is read from packet timestamps.
+#[allow(clippy::too_many_arguments)]
 async fn verify_final_media(
     ffmpeg: &Path,
     ffprobe: &Path,
@@ -1144,48 +1225,17 @@ async fn verify_final_media(
     document: &Document,
     container: ContainerFormat,
     cadence: Option<Cadence>,
+    encoded_video_copied: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
-    if document
-        .streams
-        .iter()
-        .any(|stream| matches!(stream.codec_type.as_deref(), Some("video" | "audio")))
-    {
+    let verified_video = cadence
+        .filter(|_| encoded_video_copied)
+        .map(|clock| clock.index);
+    if let Some(args) = final_decode_args(path, document, verified_video) {
         let decoded = supervisor::run_capture(
             &CommandSpec {
                 executable: ffmpeg.to_owned(),
-                args: [
-                    "-v",
-                    "error",
-                    "-nostdin",
-                    "-xerror",
-                    "-err_detect",
-                    "explode",
-                    "-protocol_whitelist",
-                    "file",
-                    "-i",
-                ]
-                .into_iter()
-                .map(OsString::from)
-                .chain([path.as_os_str().to_owned()])
-                .chain(
-                    [
-                        "-map",
-                        "0:v?",
-                        "-map",
-                        "0:a?",
-                        "-fps_mode:v",
-                        "passthrough",
-                        "-enc_time_base:v",
-                        "demux",
-                        "-f",
-                        "null",
-                        "-",
-                    ]
-                    .into_iter()
-                    .map(OsString::from),
-                )
-                .collect(),
+                args,
                 cwd: None,
             },
             cancel.clone(),
@@ -1216,6 +1266,26 @@ async fn verify_final_media(
             })
             .filter(|value| value.is_finite())
             .ok_or_else(|| invalid("The verified final video has no usable mux origin."))?;
+        let tolerance = if container == ContainerFormat::Webm {
+            0.001001
+        } else {
+            0.000002
+        };
+        if verified_video.is_some() {
+            return super::packet_clock::verify(
+                ffprobe,
+                path,
+                clock.index,
+                super::packet_clock::Expected {
+                    origin,
+                    frame_seconds: f64::from(clock.denominator) / f64::from(clock.numerator),
+                    tolerance,
+                    frames: clock.frames,
+                },
+                cancel,
+            )
+            .await;
+        }
         #[derive(serde::Deserialize)]
         struct Frame {
             best_effort_timestamp_time: Option<String>,
@@ -1247,7 +1317,6 @@ async fn verify_final_media(
             let mut valid = true;
             super::encode::frame_scan::parse(reader, |frame: Frame| {
                 let expected = origin + index as f64 * f64::from(clock.denominator) / f64::from(clock.numerator);
-                let tolerance = if container == ContainerFormat::Webm { 0.001001 } else { 0.000002 };
                 valid &= frame.best_effort_timestamp_time.and_then(|value|value.parse::<f64>().ok()).is_some_and(|actual| actual.is_finite() && (actual-expected).abs() <= tolerance);
                 index += 1;
             })?;
@@ -1307,6 +1376,40 @@ mod tests {
             {"index":0,"codec_type":"video","codec_name":"h264","nb_read_packets":"48","tags":{"title":"Picture"},"disposition":{"default":0}},
             {"index":2,"codec_type":"subtitle","codec_name":"ass","nb_read_packets":"2","tags":{"language":"eng"},"disposition":{"default":0}}
         ],"chapters":[{"start_time":"0","end_time":"2","tags":{"title":"Chapter"}}]})).unwrap()
+    }
+    #[test]
+    fn final_decode_skips_only_the_verified_encoded_video() {
+        let mut document: Document = serde_json::from_value(serde_json::json!({"streams":[
+            {"index":0,"codec_type":"video","codec_name":"av1"},
+            {"index":1,"codec_type":"audio","codec_name":"opus"},
+            {"index":2,"codec_type":"video","codec_name":"mjpeg"},
+            {"index":3,"codec_type":"subtitle","codec_name":"mov_text"}
+        ]}))
+        .unwrap();
+        let path = Path::new("final.mp4");
+        let text = |args: Vec<OsString>| {
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let everything = text(final_decode_args(path, &document, None).unwrap());
+        assert!(
+            everything.contains("-map 0:v? -map 0:a? -fps_mode:v passthrough"),
+            "{everything}"
+        );
+        let others = text(final_decode_args(path, &document, Some(0)).unwrap());
+        assert!(
+            others.contains("-map 0:1 -map 0:2 -fps_mode:v passthrough"),
+            "{others}"
+        );
+        assert!(!others.contains("-map 0:0"), "{others}");
+        document.streams.retain(|stream| stream.index != 2);
+        let audio = text(final_decode_args(path, &document, Some(0)).unwrap());
+        assert!(audio.ends_with("-map 0:1 -f null -"), "{audio}");
+        document.streams.retain(|stream| stream.index != 1);
+        assert!(final_decode_args(path, &document, Some(0)).is_none());
+        assert!(final_decode_args(path, &document, None).is_some());
     }
     #[test]
     fn container_preflight_rejects_unsupported_codecs_tags_empty_tracks_and_dispositions() {

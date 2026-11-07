@@ -114,13 +114,8 @@ impl Cadence {
                     .map(|regions| regions.cursor(plan.output_origin))
             })
             .flatten();
-        // Output containers may quantize a fine source time base to milliseconds.
         let tolerance = if encoded {
-            rational(stream.time_base.as_deref())
-                .map(|(n, d)| f64::from(n) / f64::from(d))
-                .unwrap_or(0.000001)
-                .clamp(0.000001, 0.001)
-                + 0.000002
+            encoded_timestamp_tolerance(&stream)
         } else {
             plan.tolerance
         };
