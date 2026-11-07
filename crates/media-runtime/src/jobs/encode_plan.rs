@@ -2757,6 +2757,7 @@ mod tests {
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 1,
                     mp4_faststart: true,
+                    full_output_verification: true,
                 }),
                 ..Default::default()
             };
@@ -2802,6 +2803,7 @@ mod tests {
             encoding_preferences: Some(media_core::EncodingPreferences {
                 keyframe_interval_seconds: 1,
                 mp4_faststart: false,
+                full_output_verification: true,
             }),
             ..Default::default()
         };

@@ -2396,6 +2396,7 @@
               encodingPreferences: {
                 keyframeIntervalSeconds: sourcePreferences.keyframeIntervalSeconds ?? 10,
                 mp4Faststart: sourcePreferences.mp4Faststart ?? true,
+                fullOutputVerification: sourcePreferences.fullOutputVerification ?? false,
               },
             }
           : {}),

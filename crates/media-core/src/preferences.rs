@@ -55,6 +55,10 @@ pub struct GeneralPreferences {
     pub zero_indexed_streams: bool,
     #[ts(optional, as = "Option<_>")]
     pub mp4_faststart: bool,
+    /// Decode every frame of the finished video before publishing. Off, the
+    /// output is checked from packets, headers, and a few decoded frames.
+    #[ts(optional, as = "Option<_>")]
+    pub full_output_verification: bool,
     #[ts(optional, as = "Option<_>")]
     pub av1an_console_visible: bool,
     #[ts(optional, as = "Option<_>")]
@@ -71,6 +75,7 @@ impl Default for GeneralPreferences {
             keyframe_interval_seconds: 10,
             zero_indexed_streams: false,
             mp4_faststart: true,
+            full_output_verification: false,
             av1an_console_visible: true,
             reset_on_new_file: ResetOnNewFilePreferences::default(),
         }
@@ -83,6 +88,10 @@ impl Default for GeneralPreferences {
 pub struct EncodingPreferences {
     pub keyframe_interval_seconds: u16,
     pub mp4_faststart: bool,
+    /// Absent in plans saved before this option: those use fast verification.
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub full_output_verification: bool,
 }
 
 impl From<&GeneralPreferences> for EncodingPreferences {
@@ -90,6 +99,7 @@ impl From<&GeneralPreferences> for EncodingPreferences {
         Self {
             keyframe_interval_seconds: value.keyframe_interval_seconds,
             mp4_faststart: value.mp4_faststart,
+            full_output_verification: value.full_output_verification,
         }
     }
 }

@@ -28,6 +28,10 @@ pub(super) struct Cadence {
     pub denominator: u32,
     pub frames: usize,
     pub source_iso: Option<SourceIsoReceipt>,
+    /// Decode the encoded video of the final file again whenever its copy is
+    /// not proven identical to the verified staging video. Off (fast output
+    /// verification), it is never decoded here; its clock is read from packets.
+    pub full_verification: bool,
 }
 
 /// Internal only. Sealed before/after full source proof, bound to this owned
@@ -896,7 +900,7 @@ pub(super) async fn prepare<'a>(
         receipt.verify(input, cancel).await?;
         let document = super::probe(&ffprobe, &input.path, cancel, None).await?;
         // The sealed file is the staging file, whose encoded video the encode
-        // already decoded completely and validated frame by frame.
+        // already verified at its chosen level.
         super::encode::boxed(|| {
             verify_final_media(
                 &ffmpeg,
@@ -1123,22 +1127,24 @@ pub(super) async fn prepare<'a>(
             }
         }
     }
-    // `cadence` is given only by an encode whose staging video was decoded
-    // completely and validated frame by frame, or proven a byte-identical copy
-    // of a stream that was. Its packets were compared byte for byte above; with
-    // the same codec configuration, this copy decodes to the same frames. A
-    // rewritten configuration (for example, the MOV range flag) is decoded again.
+    // `cadence` is given only by an encode. With full verification, its staging
+    // video was decoded completely and validated frame by frame, or proven a
+    // byte-identical copy of a stream that was. Its packets were compared byte
+    // for byte above; with the same codec configuration, this copy decodes to
+    // the same frames. A rewritten configuration (for example, the MOV range
+    // flag) is decoded again. Fast verification never decodes it here.
     let encoded_video_copied = cadence.is_some_and(|clock| {
-        document
-            .streams
-            .iter()
-            .zip(&actual.streams)
-            .any(|(source, target)| {
-                source.index == clock.index
-                    && source.codec_type.as_deref() == Some("video")
-                    && target.codec_type.as_deref() == Some("video")
-                    && source.extradata_hash == target.extradata_hash
-            })
+        !clock.full_verification
+            || document
+                .streams
+                .iter()
+                .zip(&actual.streams)
+                .any(|(source, target)| {
+                    source.index == clock.index
+                        && source.codec_type.as_deref() == Some("video")
+                        && target.codec_type.as_deref() == Some("video")
+                        && source.extradata_hash == target.extradata_hash
+                })
     });
     super::encode::boxed(|| {
         verify_final_media(
