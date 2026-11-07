@@ -1017,6 +1017,7 @@ mod tests {
             encoding_preferences: Some(media_core::EncodingPreferences {
                 keyframe_interval_seconds: 2,
                 mp4_faststart: true,
+                full_output_verification: true,
             }),
             av1an_options: Some(media_core::Av1anOptions {
                 source_workflow: true,

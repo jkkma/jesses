@@ -1,6 +1,8 @@
 //! Durable whole-phase checkpoints for standalone encoders. Recovery never
 //! resumes inside an encoder process: an unfinished phase is rerun from the
-//! last artifact whose complete bytes and decoded structure were verified.
+//! last artifact whose complete bytes were sealed and whose structure was
+//! verified at the job's output verification level (every frame decoded, or
+//! the frame count read from packets in fast verification).
 use super::{
     check_cancel,
     files::{self, Source, Temporary, WorkspaceLock},

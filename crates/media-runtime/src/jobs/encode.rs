@@ -2071,6 +2071,7 @@ impl JobManager {
                         } else {
                             None
                         },
+                        full_output_verification(settings),
                         cancel,
                     )
                     .await?;
@@ -2212,24 +2213,41 @@ impl JobManager {
                     } else {
                         plan.validate_encoded_stream(video, encoded)?;
                     }
-                    let mut checkpoint_plan = plan.clone();
-                    let decoded = self
-                        .scan_frames(
-                            id,
+                    if decodes_output(settings, &plan) {
+                        let mut checkpoint_plan = plan.clone();
+                        let decoded = self
+                            .scan_frames(
+                                id,
+                                &ffprobe,
+                                &wrapped.path,
+                                &mut checkpoint_plan,
+                                encoded,
+                                true,
+                                cancel,
+                            )
+                            .await?;
+                        if decoded != frame_count {
+                            return Err(files::error(
+                                "ENCODE_VALIDATION_FAILED",
+                                "The timed standalone encoder checkpoint did not decode to the exact planned frame count.",
+                                &wrapped.path,
+                            ));
+                        }
+                    } else {
+                        // The muxed output receives the decoded-frame sample.
+                        super::packet_clock::verify(
                             &ffprobe,
                             &wrapped.path,
-                            &mut checkpoint_plan,
-                            encoded,
-                            true,
+                            0,
+                            super::packet_clock::Expected {
+                                origin: plan.output_origin,
+                                frame_seconds: plan.frame_seconds(),
+                                tolerance: super::encode_plan::encoded_timestamp_tolerance(encoded),
+                                frames: frame_count,
+                            },
                             cancel,
                         )
                         .await?;
-                    if decoded != frame_count {
-                        return Err(files::error(
-                            "ENCODE_VALIDATION_FAILED",
-                            "The timed standalone encoder checkpoint did not decode to the exact planned frame count.",
-                            &wrapped.path,
-                        ));
                     }
                     if let Some(recovery) = standalone_recovery.as_mut() {
                         let summary = recovery
@@ -2484,7 +2502,36 @@ impl JobManager {
                     .hdr_metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.dolby_vision_rpu_path.is_some());
-            if copied_wrapper
+            let mut final_video_plan = plan.clone();
+            final_video_plan.output_origin = plan.encoded_mux_origin();
+            if !decodes_output(settings, &plan) {
+                // Fast verification: every frame's count and clock from packet
+                // timestamps, and the first decoded frames against the plan.
+                let sampled =
+                    frame_sample(&ffprobe, &temp.path, &final_video_plan, encoded, cancel).await?;
+                super::packet_clock::verify(
+                    &ffprobe,
+                    &temp.path,
+                    video_position as u32,
+                    super::packet_clock::Expected {
+                        origin: final_video_plan.output_origin,
+                        frame_seconds: plan.frame_seconds(),
+                        tolerance: super::encode_plan::encoded_timestamp_tolerance(encoded),
+                        frames: frame_count,
+                    },
+                    cancel,
+                )
+                .await?;
+                self.change(id, |snapshot| {
+                    append_log(
+                        snapshot,
+                        format!(
+                            "Fast output verification: all {frame_count} frames are on the planned clock by their packet timestamps, and the first {sampled} decoded frames match the plan. The whole video was not decoded; turn on full output verification in Settings to decode every frame."
+                        ),
+                    )
+                })
+                .await;
+            } else if copied_wrapper
                 && prove_copied_video(
                     &ffprobe,
                     &intermediate.path,
@@ -2506,8 +2553,6 @@ impl JobManager {
                 })
                 .await;
             } else {
-                let mut final_video_plan = plan.clone();
-                final_video_plan.output_origin = plan.encoded_mux_origin();
                 let decoded_count = self
                     .scan_frames(
                         id,
@@ -2767,6 +2812,7 @@ impl JobManager {
                 } else {
                     None
                 },
+                full_verification: decodes_output(settings, &plan),
             }),
             plan.has_alpha().then_some((
                 &plan,
@@ -3069,15 +3115,89 @@ pub(in crate::jobs) async fn frame_scan(
     progress: Option<watch::Sender<f64>>,
 ) -> Result<usize, AppError> {
     check_cancel(cancel)?;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(8);
+    let threads = scan_threads();
     let args = if encoded {
         frame_scan_args(input, stream.index, threads)
     } else {
         source_scan_args(input, stream.index, threads, plan)
     };
+    validate_frames(
+        ffprobe, input, args, plan, stream, encoded, None, cancel, progress,
+    )
+    .await
+}
+
+fn scan_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8)
+}
+
+/// Frames that fast output verification decodes and validates. They carry the
+/// stream's per-frame properties (dimensions, aspect, bit depth, scan, color,
+/// HDR side data); packet timestamps give every frame's clock.
+const SAMPLE_FRAMES: usize = 16;
+
+/// Packets read for the sample. A decoder outputs frames in presentation
+/// order, but a reordered (B-frame) stream decodes some early frames from
+/// later packets: stopping after `SAMPLE_FRAMES` packets would leave gaps. H.264
+/// and HEVC reorder by at most 16 pictures, so the first `SAMPLE_FRAMES`
+/// frames decoded from this many packets are complete.
+const SAMPLE_PACKETS: usize = 64;
+
+/// Decodes and validates the first frames of an encoded stream without
+/// changing `plan`. Returns the number of frames checked.
+async fn frame_sample(
+    ffprobe: &Path,
+    input: &Path,
+    plan: &Plan,
+    stream: &metadata::Stream,
+    cancel: &watch::Receiver<bool>,
+) -> Result<usize, AppError> {
+    check_cancel(cancel)?;
+    let mut args = frame_scan_args(input, stream.index, scan_threads());
+    let input_position = args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("frame scan input");
+    args.splice(
+        input_position..input_position,
+        [
+            "-read_intervals".into(),
+            format!("%+#{SAMPLE_PACKETS}").into(),
+        ],
+    );
+    let mut sampled = plan.clone();
+    validate_frames(
+        ffprobe,
+        input,
+        args,
+        &mut sampled,
+        stream,
+        true,
+        Some(SAMPLE_FRAMES),
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// Validates the frames that `args` make FFprobe decode: every frame, or the
+/// first `limit` in presentation order (later ones are read and ignored).
+#[allow(clippy::too_many_arguments)]
+async fn validate_frames(
+    ffprobe: &Path,
+    input: &Path,
+    args: Vec<OsString>,
+    plan: &mut Plan,
+    stream: &metadata::Stream,
+    encoded: bool,
+    limit: Option<usize>,
+    cancel: &watch::Receiver<bool>,
+    progress: Option<watch::Sender<f64>>,
+) -> Result<usize, AppError> {
     let mut validation = Validation::new(plan.clone(), stream.clone(), encoded);
+    let mut remaining = limit.unwrap_or(usize::MAX);
     let output = supervisor::run_streaming_stdout(
         &CommandSpec {
             executable: ffprobe.to_owned(),
@@ -3090,6 +3210,10 @@ pub(in crate::jobs) async fn frame_scan(
         move |reader| {
             let mut last_update = std::time::Instant::now();
             frame_scan::parse(reader, |frame| {
+                if remaining == 0 {
+                    return;
+                }
+                remaining -= 1;
                 validation.push(&frame);
                 if last_update.elapsed() >= Duration::from_millis(500) {
                     if let Some(progress) = &progress {
@@ -3184,6 +3308,21 @@ pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize)
     args
 }
 
+/// Whether the user asked to decode every frame of the finished video before
+/// publishing. Plans saved without the preference use fast verification.
+fn full_output_verification(settings: &media_core::EncodeSettings) -> bool {
+    settings
+        .encoding_preferences
+        .is_some_and(|preferences| preferences.full_output_verification)
+}
+
+/// Whether the encoded output is decoded completely. A source-queue plan has
+/// per-region clocks that the constant-rate packet check cannot represent, so
+/// it is always decoded.
+fn decodes_output(settings: &media_core::EncodeSettings, plan: &Plan) -> bool {
+    full_output_verification(settings) || plan.has_source_queue()
+}
+
 /// Proves that stream `index` of `staging` decodes to the same frames as
 /// `verified`, a video-only file that was decoded completely with every frame
 /// validated against `plan`, without decoding it again. Every packet must be
@@ -3248,6 +3387,7 @@ async fn prove_copied_video(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_video_checkpoint(
     ffprobe: &Path,
     checkpoint: &Temporary,
@@ -3255,6 +3395,7 @@ async fn validate_video_checkpoint(
     plan: &mut Plan,
     expected_frames: &mut usize,
     producer: Option<super::source_filters::ProducerClock>,
+    decode: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let document = if plan.encoder == VideoEncoder::X265Standalone {
@@ -3320,6 +3461,14 @@ async fn validate_video_checkpoint(
         })?;
     }
     plan.validate_elementary_checkpoint(source, encoded)?;
+    // Full verification decodes every frame. Fast verification counts packets:
+    // these encoders write exactly one packet (access unit, temporal unit, or
+    // superframe) per frame.
+    let (count, entry) = if decode {
+        ("-count_frames", "stream=nb_read_frames")
+    } else {
+        ("-count_packets", "stream=nb_read_packets")
+    };
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -3327,9 +3476,9 @@ async fn validate_video_checkpoint(
         "explode",
         "-select_streams",
         "0",
-        "-count_frames",
+        count,
         "-show_entries",
-        "stream=nb_read_frames",
+        entry,
         "-of",
         "default=nokey=1:noprint_wrappers=1",
         "-i",
@@ -3357,9 +3506,15 @@ async fn validate_video_checkpoint(
     if !result.status.success() || !result.stderr.is_empty() || frames != Some(*expected_frames) {
         return Err(files::error(
             "ENCODE_VALIDATION_FAILED",
-            format!(
-                "The complete video checkpoint did not decode to the planned {expected_frames} frames."
-            ),
+            if decode {
+                format!(
+                    "The complete video checkpoint did not decode to the planned {expected_frames} frames."
+                )
+            } else {
+                format!(
+                    "The complete video checkpoint does not contain the planned {expected_frames} frames."
+                )
+            },
             &checkpoint.path,
         ));
     }
@@ -5325,6 +5480,7 @@ mod tests {
         preset: u8,
         extension: &str,
         audio_codec: &str,
+        full_output_verification: bool,
     ) -> (Fixture, PathBuf, JobSnapshot, usize) {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -5406,6 +5562,11 @@ mod tests {
                 settings: EncodeSettings {
                     encoder,
                     preset,
+                    encoding_preferences: Some(media_core::EncodingPreferences {
+                        keyframe_interval_seconds: 10,
+                        mp4_faststart: true,
+                        full_output_verification,
+                    }),
                     ..EncodeSettings::default()
                 },
             })
@@ -5427,6 +5588,7 @@ mod tests {
     }
 
     const COPY_PROVEN: &str = "byte-identical copy of the decoded and verified timing wrapper";
+    const FAST_VERIFIED: &str = "Fast output verification: all";
 
     async fn assert_encoded(output: &Path, codec: &str, frames: usize) {
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
@@ -5441,7 +5603,7 @@ mod tests {
     #[ignore = "requires real FFmpeg, FFprobe, mkvmerge, and standalone x265"]
     async fn x265_mp4_proves_each_copy_instead_of_decoding_it_again() {
         let (_fixture, output, job, frames) =
-            encode_with_audio(VideoEncoder::X265Standalone, 0, "mp4", "aac").await;
+            encode_with_audio(VideoEncoder::X265Standalone, 0, "mp4", "aac", true).await;
         assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
         assert!(
             job.logs.iter().any(|line| line.contains(COPY_PROVEN)),
@@ -5455,7 +5617,7 @@ mod tests {
     #[ignore = "requires real FFmpeg, FFprobe, mkvmerge, and standalone vpxenc"]
     async fn vpxenc_webm_proves_each_copy_instead_of_decoding_it_again() {
         let (_fixture, output, job, frames) =
-            encode_with_audio(VideoEncoder::VpxStandalone, 8, "webm", "libopus").await;
+            encode_with_audio(VideoEncoder::VpxStandalone, 8, "webm", "libopus", true).await;
         assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
         assert!(
             job.logs.iter().any(|line| line.contains(COPY_PROVEN)),
@@ -5469,10 +5631,157 @@ mod tests {
     #[ignore = "requires real FFmpeg, FFprobe, and standalone SvtAv1EncApp"]
     async fn svt_av1_mp4_reads_the_copied_clock_from_packets() {
         let (_fixture, output, job, frames) =
-            encode_with_audio(VideoEncoder::SvtAv1, 12, "mp4", "aac").await;
+            encode_with_audio(VideoEncoder::SvtAv1, 12, "mp4", "aac", true).await;
         assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
         // No timing wrapper: the staging file is decoded and validated once.
         assert!(!job.logs.iter().any(|line| line.contains(COPY_PROVEN)));
+        assert!(!job.logs.iter().any(|line| line.contains(FAST_VERIFIED)));
         assert_encoded(&output, "av1", frames).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual real-media qualification; set JESSES_SAMPLE_INPUT to a short clip"]
+    async fn encodes_external_sample_with_fast_and_full_output_verification() {
+        let Some(input) = std::env::var_os("JESSES_SAMPLE_INPUT").map(PathBuf::from) else {
+            eprintln!(
+                "External sample encode was NOT run: set JESSES_SAMPLE_INPUT to a short clip."
+            );
+            return;
+        };
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let document = probe(&ffprobe, &input, &cancel, None).await.unwrap();
+        let first = |kind: &str| {
+            document
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type.as_deref() == Some(kind))
+                .map(|stream| stream.index)
+        };
+        let all = document
+            .streams
+            .iter()
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        let picture_and_sound = [first("video"), first("audio")]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // A Dolby Vision source needs its RPU imported from a file or the
+        // HDR10 fallback, which only SVT-AV1 offers.
+        let dolby_vision = document.streams.iter().any(|stream| {
+            stream.side_data_list.iter().any(|value| {
+                value["side_data_type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.contains("DOVI"))
+            })
+        });
+        if dolby_vision {
+            eprintln!("x265 skipped: the source carries Dolby Vision.");
+        }
+        // MP4 takes picture and sound; deselected tracks may end later.
+        let cases = [
+            (VideoEncoder::SvtAv1, 12, "mkv", &all),
+            (VideoEncoder::X265Standalone, 0, "mkv", &all),
+            (VideoEncoder::SvtAv1, 12, "mp4", &picture_and_sound),
+            (VideoEncoder::X265Standalone, 0, "mp4", &picture_and_sound),
+        ]
+        .into_iter()
+        .filter(|(encoder, ..)| encoder.is_svt() || !dolby_vision);
+        for (encoder, preset, extension, stream_indices) in cases {
+            for full_output_verification in [false, true] {
+                let nonce = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let fixture = Fixture(
+                    std::env::temp_dir()
+                        .join(format!("jesses-sample-{}-{nonce}", std::process::id())),
+                );
+                std::fs::create_dir(&fixture.0).unwrap();
+                let output = fixture.0.join(format!("output.{extension}"));
+                let manager = JobManager::new(fixture.0.join("logs"));
+                let started = std::time::Instant::now();
+                manager
+                    .start_encode(EncodeRequest {
+                        source: RemuxRequest {
+                            input_path: input.to_string_lossy().into_owned(),
+                            output_path: output.to_string_lossy().into_owned(),
+                            stream_indices: stream_indices.clone(),
+                        },
+                        settings: EncodeSettings {
+                            encoder,
+                            preset,
+                            // SVT-AV1 carries HDR10+ sources as static HDR10.
+                            hdr10_fallback: encoder.is_svt(),
+                            encoding_preferences: Some(media_core::EncodingPreferences {
+                                keyframe_interval_seconds: 10,
+                                mp4_faststart: true,
+                                full_output_verification,
+                            }),
+                            // MP4 cannot hold arbitrary Matroska stream tags.
+                            copy_metadata: (extension == "mp4").then_some(false),
+                            ..EncodeSettings::default()
+                        },
+                    })
+                    .await
+                    .unwrap();
+                let job = tokio::time::timeout(Duration::from_secs(1800), async {
+                    loop {
+                        let job = manager.list_jobs().await.remove(0);
+                        if job.state.is_terminal() {
+                            return job;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                manager.shutdown().await;
+                let mode = if full_output_verification {
+                    "full"
+                } else {
+                    "fast"
+                };
+                eprintln!(
+                    "{encoder:?} to {extension}, {mode} verification: {:?} in {:.1}s",
+                    job.state,
+                    started.elapsed().as_secs_f64()
+                );
+                for line in job.logs.iter().filter(|line| {
+                    line.contains(FAST_VERIFIED)
+                        || line.contains(COPY_PROVEN)
+                        || line.starts_with("Verified all")
+                }) {
+                    eprintln!("  {line}");
+                }
+                assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+                assert_eq!(
+                    job.logs.iter().any(|line| line.contains(FAST_VERIFIED)),
+                    !full_output_verification
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe, mkvmerge, SvtAv1EncApp, x265, and vpxenc"]
+    async fn fast_verification_checks_every_frame_clock_without_decoding_the_output() {
+        for (encoder, preset, extension, audio, codec) in [
+            (VideoEncoder::SvtAv1, 12, "mkv", "aac", "av1"),
+            (VideoEncoder::X265Standalone, 0, "mp4", "aac", "hevc"),
+            (VideoEncoder::VpxStandalone, 8, "webm", "libopus", "vp9"),
+        ] {
+            let (_fixture, output, job, frames) =
+                encode_with_audio(encoder, preset, extension, audio, false).await;
+            assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+            assert!(
+                job.logs.iter().any(|line| line.contains(FAST_VERIFIED)),
+                "{:#?}",
+                job.logs
+            );
+            assert!(!job.logs.iter().any(|line| line.contains(COPY_PROVEN)));
+            assert_encoded(&output, codec, frames).await;
+        }
     }
 }

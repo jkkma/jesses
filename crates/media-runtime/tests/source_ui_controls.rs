@@ -199,6 +199,7 @@ async fn exact_time_seek_resize_and_global_keyframe_faststart_controls_execute()
                 encoding_preferences: Some(EncodingPreferences {
                     keyframe_interval_seconds: 1,
                     mp4_faststart: index == 0,
+                    full_output_verification: true,
                 }),
                 trim: Some(VideoTrim {
                     start_frame: 0,

@@ -196,9 +196,18 @@ export type CrfLadderRung = { crf: number, encodedBytes: string, encodedSeconds:
 
 export type ToolInfo = { id: string, name: string, available: boolean, path: string | null, version: string | null, detail: string | null, };
 
-export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
+export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean,
+/**
+ * Decode every frame of the finished video before publishing. Off, the
+ * output is checked from packets, headers, and a few decoded frames.
+ */
+fullOutputVerification?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
 
-export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean, };
+export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean,
+/**
+ * Absent in plans saved before this option: those use fast verification.
+ */
+fullOutputVerification?: boolean, };
 
 export type ConsoleWindowMode = "hidden" | "visible" | "visibleStayOpen";
 

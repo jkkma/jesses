@@ -166,6 +166,16 @@
       onchange={(e) => void savePatch({ mp4Faststart: e.currentTarget.checked })}
     /> Web-optimize MP4 output (+faststart)</label
   >
+  <label
+    class="check"
+    title="Off: the finished video's frame count and timing are checked from its packets, and only its first frames are decoded. On: every frame is decoded before the file is published, which also catches damaged picture data but adds a full decode."
+    ><input
+      type="checkbox"
+      checked={saved.fullOutputVerification ?? false}
+      disabled={!isDesktop()}
+      onchange={(e) => void savePatch({ fullOutputVerification: e.currentTarget.checked })}
+    /> Decode every frame of the finished video before publishing (slower)</label
+  >
   <label class="check"
     ><input
       type="checkbox"
