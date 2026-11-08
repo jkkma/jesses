@@ -96,7 +96,7 @@ test('a webview reload follows the existing copy job through failure without rep
     job,
   );
   await page.reload();
-  await expect(page.getByLabel('Current action')).toHaveText('Running: Encode...');
+  await expect(page.getByLabel('Current action')).toHaveText('Encoding 25% · 0:03 of 0:12');
   await expect(page.getByLabel('Task progress')).toHaveAttribute('value', '3');
   await page.evaluate(() => {
     const host = globalThis as any;
@@ -367,7 +367,7 @@ test('Stop cancels the running copy job and reflects the terminal snapshot', asy
     .toBe(true);
   await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
-  await expect(page.getByLabel('Current action')).toHaveText('Running: Encode...');
+  await expect(page.getByLabel('Current action')).toHaveText('Encoding 0% · 0:00 of 0:12');
   await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect

@@ -51,6 +51,11 @@
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
+  import { liveJobProgress } from '$lib/components/shared/job-progress';
+  import {
+    ProgressEstimator,
+    type ProgressEstimate,
+  } from '$lib/components/shared/progress-estimate';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
   import CompletionPanel from '$lib/features/tools/CompletionPanel.svelte';
   import SourceUtilities from '$lib/features/utilities/SourceUtilities.svelte';
@@ -248,21 +253,17 @@
   const runBlockedReason = $derived(
     !runningAction && action && !action.canRun ? action.blockedReason : undefined,
   );
+  // Image and batch runs describe their own progress. A single encode stays
+  // "active" through its whole preparation (the command is prepared, then
+  // confirmed) without a description, so the live job's status speaks for it.
+  const actionProgress = $derived(
+    displayAction?.active && displayAction.progressDescription ? displayAction : undefined,
+  );
   const currentActionText = $derived.by(() => {
+    if (actionProgress) return actionProgress.progressDescription!;
+    if (liveProgress) return liveProgress.text;
     if (displayAction?.active)
-      return (
-        displayAction.progressDescription ||
-        `Running: ${displayAction.label.replace(/^Run(?: Batch)?:\s*/, '')}...`
-      );
-    if (currentJob && !terminalJob(currentJob.state)) {
-      const task =
-        currentJob.encodeSettings?.backend === 'av1an'
-          ? 'AV1AN encode'
-          : currentJob.encodeSettings
-            ? 'Encode'
-            : 'Task';
-      return `${currentJob.state === 'paused' ? 'Paused' : 'Running'}: ${task}...`;
-    }
+      return `Running: ${displayAction.label.replace(/^Run(?: Batch)?:\s*/, '')}...`;
     if (lastActionStatus) return lastActionStatus;
     if (!currentJob) return '';
     if (currentJob.state === 'succeeded') return 'Done.';
@@ -533,6 +534,29 @@
       jobs.filter((job) => job.state === 'queued').at(-1) ??
       jobs[0],
   );
+  // Rate and time left come only from progress observed while this window is open.
+  const liveJob = $derived(currentJob && !terminalJob(currentJob.state) ? currentJob : undefined);
+  const progressEstimator = new ProgressEstimator();
+  let progressEstimate = $state<ProgressEstimate | null>(null);
+  $effect(() => {
+    const job = liveJob,
+      duration = job?.durationSeconds ?? null;
+    progressEstimator.observe(
+      job?.state === 'running' ? `${job.id}:${job.state}` : null,
+      job?.progressSeconds ?? null,
+      performance.now(),
+    );
+    progressEstimate = progressEstimator.estimate(performance.now(), duration);
+  });
+  $effect(() => {
+    if (liveJob?.state !== 'running') return;
+    const duration = liveJob.durationSeconds ?? null;
+    const timer = setInterval(() => {
+      progressEstimate = progressEstimator.estimate(performance.now(), duration);
+    }, 1_000);
+    return () => clearInterval(timer);
+  });
+  const liveProgress = $derived(liveJob ? liveJobProgress(liveJob, progressEstimate) : null);
 
   // Mirror each job's own log into the Log pane: phase, tool and warning lines
   // as they arrive, then the final error. Encoder progress lines are left to
@@ -1539,14 +1563,21 @@
   <footer class="status-bar">
     <div class="current-action">
       <span aria-label="Current action" title={currentActionText}>{currentActionText}</span
-      ><progress
-        aria-label="Task progress"
-        max={displayAction?.active ? 1 : currentJob?.durationSeconds || 1}
-        value={displayAction?.active
-          ? (displayAction.progress ?? 0)
-          : currentJob?.progressSeconds || 0}
-        aria-valuetext={displayAction?.active ? displayAction.progressDescription : undefined}
-      ></progress>
+      >{#if actionProgress}<progress
+          aria-label="Task progress"
+          max={1}
+          value={actionProgress.progress ?? 0}
+          aria-valuetext={actionProgress.progressDescription}
+
+        ></progress>{:else if liveProgress ? liveProgress.value === null : displayAction?.active}<progress
+          aria-label="Task progress"
+          aria-valuetext={currentActionText}
+        ></progress>{:else}<progress
+          aria-label="Task progress"
+          max={liveProgress?.max ?? (currentJob?.durationSeconds || 1)}
+          value={liveProgress?.value ?? (currentJob?.progressSeconds || 0)}
+          aria-valuetext={liveProgress?.text}
+        ></progress>{/if}
     </div>
     <label
       ><input
@@ -1844,6 +1875,32 @@
     width: 100%;
     height: 8px;
     accent-color: var(--primary);
+  }
+  /* A step without a measurable fraction (preparation, final checks) must
+     still look busy; the native indeterminate bar can render as a bare track. */
+  .status-bar progress:indeterminate {
+    appearance: none;
+    border: 0;
+    background:
+      linear-gradient(90deg, transparent, var(--primary), transparent) -40% 0 / 40% 100% no-repeat,
+      var(--rule);
+    animation: status-progress-sweep 1.4s ease-in-out infinite;
+  }
+  .status-bar progress:indeterminate::-webkit-progress-bar {
+    background: transparent;
+  }
+  @keyframes status-progress-sweep {
+    to {
+      background-position:
+        140% 0,
+        0 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-bar progress:indeterminate {
+      animation: none;
+      background: repeating-linear-gradient(135deg, var(--primary) 0 6px, var(--rule) 6px 12px);
+    }
   }
   .status-bar label {
     white-space: nowrap;
