@@ -81,6 +81,7 @@
   import {
     defaultSubtitles,
     selectedSubtitles,
+    storableSubtitleMode,
     subtitleError,
     subtitleSummary,
   } from './subtitle-options';
@@ -973,19 +974,33 @@
       burn = videoMode === 'encode' && !chunked && file?.id === mainFile?.id ? burnIndex : '',
       source = file,
       selected = included,
-      strip = stripSubs;
+      strip = stripSubs,
+      container = outputContainer,
+      route = backend;
     untrack(() => {
       subtitles = defaultSubtitles(source?.streams ?? []).map((track) => {
         const retained = selected.includes(track.streamIndex) && !strip;
         const burning = String(track.streamIndex) === burn;
+        const stream = source?.streams.find((stream) => stream.index === track.streamIndex);
         return {
           ...track,
-          mode: burning && !retained ? 'burnIn' : mode,
+          mode:
+            burning && !retained ? 'burnIn' : storableSubtitleMode(mode, stream, container, route),
           ...(burning && retained ? { burnIn: true } : {}),
         };
       });
     });
   });
+  /** Copied MP4 text tracks that become SubRip because MKV cannot store them. */
+  const convertedMovText = $derived(
+    subtitles.filter(
+      (track) =>
+        subtitleMode === 'copy' &&
+        track.mode === 'subRip' &&
+        included.includes(track.streamIndex) &&
+        !stripSubs,
+    ).length,
+  );
   function setAudio() {
     audio = (file?.streams ?? [])
       .filter((s) => s.kind === 'audio')
@@ -2521,9 +2536,14 @@
                           ...(subtitleMode !== 'copy' ? { subtitleMode } : {}),
                           subtitleBurnIn: true,
                         }
-                    : subtitleMode !== 'copy'
-                      ? { subtitleMode }
-                      : {}
+                    : ((mode) => (mode !== 'copy' ? { subtitleMode: mode } : {}))(
+                        storableSubtitleMode(
+                          subtitleMode,
+                          source.streams.find((stream) => stream.index === row.streamIndex),
+                          outputContainer,
+                          backend,
+                        ),
+                      )
                   : {}),
                 ...(applyMetadata ? metadataValue(row) : {}),
                 ...(row.defaultFlag !== null ? { default: row.defaultFlag } : {}),
@@ -2791,7 +2811,15 @@
                           mode: burnRetained ? batchState.subtitleMode : ('burnIn' as const),
                           ...(burnRetained ? { burnIn: true } : {}),
                         }
-                      : { streamIndex: stream.index, mode: batchState.subtitleMode },
+                      : {
+                          streamIndex: stream.index,
+                          mode: storableSubtitleMode(
+                            batchState.subtitleMode,
+                            stream,
+                            batchState.outputContainer,
+                            backend,
+                          ),
+                        },
                   )
                   .filter((track) => track.mode !== 'copy' || track.burnIn),
               }
@@ -4122,7 +4150,11 @@
           >{#each mainFile?.streams.filter((s) => s.kind === 'subtitle') ?? [] as stream, index}<option
               value={String(stream.index)}>{burnLabel(stream, index)}</option
             >{/each}</select
-        >
+        >{#if convertedMovText}<p class="geometry-readout subtitle-note">
+            {convertedMovText === 1
+              ? 'The MP4 text subtitle is converted to SubRip, because MKV cannot store MP4 text.'
+              : `${convertedMovText} MP4 text subtitles are converted to SubRip, because MKV cannot store MP4 text.`}
+          </p>{/if}
       </div>
     {:else if settingsTab === 'metadata'}
       <div class="metadata-head">
@@ -4746,6 +4778,11 @@
     font-size: 11px;
     line-height: 12px;
     color: var(--muted-foreground);
+  }
+  .subtitle-note {
+    margin-top: 4px;
+    white-space: normal;
+    line-height: 15px;
   }
   @media (max-width: 1050px) {
     .video-columns {

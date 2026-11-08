@@ -13,6 +13,26 @@ export function defaultSubtitles(streams: MediaStream[]): SubtitleTrackSettings[
     .map((stream) => ({ streamIndex: stream.index, mode: 'copy' }));
 }
 
+/**
+ * Matroska cannot store MP4 timed text (mov_text). In copy mode, standalone
+ * encoding converts just those tracks to SubRip, which keeps their text and
+ * timing, instead of refusing to run. Other tracks are still copied.
+ */
+export function storableSubtitleMode(
+  mode: SubtitleMode,
+  stream: MediaStream | undefined,
+  container: ContainerFormat | undefined,
+  backend: EncodeBackend,
+): SubtitleMode {
+  return mode === 'copy' &&
+    container === 'matroska' &&
+    backend === 'standalone' &&
+    stream?.kind === 'subtitle' &&
+    stream.codec === 'mov_text'
+    ? 'subRip'
+    : mode;
+}
+
 export function selectedSubtitles(
   tracks: SubtitleTrackSettings[],
   included: number[],
