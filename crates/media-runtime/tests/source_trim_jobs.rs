@@ -5,6 +5,16 @@ use serde_json::{Value, json};
 #[path = "common/source_trim_fixture.rs"]
 mod fixture;
 use fixture::*;
+
+/// The decoded-frame and audio-sample evidence these tests read is produced
+/// only with thorough verification.
+fn thorough(settings: &mut EncodeSettings) {
+    settings.encoding_preferences = Some(EncodingPreferences {
+        keyframe_interval_seconds: 10,
+        mp4_faststart: true,
+        full_output_verification: true,
+    });
+}
 #[tokio::test]
 #[ignore = "requires qualified FFmpeg9 libx264, libvpx-vp9 and AAC"]
 async fn source_copy_trim_preserves_ffmpeg_preroll_ass_packets_and_common_video_clock() {
@@ -117,6 +127,7 @@ async fn source_copy_trim_mixed_conversion_external_offsets_and_nonzero_origins(
    {"inputPath":external,"streamIndex":1,"offsetMilliseconds":offset},
    {"inputPath":converted,"streamIndex":1,"offsetMilliseconds":100,"audio":{"codec":"flac","bitrateKbps":128,"channels":"preserve"}}
   ])).unwrap();
+        thorough(&mut req.settings);
         let manager = JobManager::new(f.0.join("logs"));
         let job = manager.start_encode(req).await.unwrap();
         let result = terminal(&manager, &job.id).await;
@@ -466,6 +477,7 @@ async fn source_trim_verifies_decoded_frames_through_the_trim_end() {
         let trim = serde_json::from_value(json!({"startFrame":0,"endFrameExclusive":end})).unwrap();
         let mut req = request(&input, &out, trim);
         req.source.stream_indices = vec![0];
+        thorough(&mut req.settings);
         let manager = JobManager::new(f.0.join("logs"));
         let job = manager.start_encode(req).await.unwrap();
         let result = terminal(&manager, &job.id).await;
@@ -538,6 +550,7 @@ async fn source_trim_decodes_converted_audio_only_through_the_trim_end() {
         channels: AudioChannels::Preserve,
         gain: None,
     }];
+    thorough(&mut req.settings);
     let manager = JobManager::new(f.0.join("logs"));
     let job = manager.start_encode(req).await.unwrap();
     let result = terminal(&manager, &job.id).await;

@@ -819,14 +819,18 @@ async fn bounded_authored_audio_timestamp_jitter_uses_sample_clock_without_sampl
         "fixture must exercise authored quantization beyond2ms: {residual}"
     );
     let manager = JobManager::new(fixture.0.join("logs"));
-    let started = manager
-        .start_encode(request(
-            &jittered,
-            &destination,
-            vec![track(1, AudioCodec::Opus, AudioChannels::Preserve)],
-        ))
-        .await
-        .unwrap();
+    let mut jittered_request = request(
+        &jittered,
+        &destination,
+        vec![track(1, AudioCodec::Opus, AudioChannels::Preserve)],
+    );
+    // The source continuity evidence comes from thorough verification.
+    jittered_request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 10,
+        mp4_faststart: true,
+        full_output_verification: true,
+    });
+    let started = manager.start_encode(jittered_request).await.unwrap();
     let completed = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
     manager.shutdown().await;
     assert_eq!(completed.state, JobState::Succeeded, "{completed:#?}");
