@@ -267,6 +267,10 @@
   let videoIndex = $state<number | undefined>();
   let videoMode = $state<'encode' | 'copy' | 'drop'>('encode');
   let selectedEncoder = $state<VideoEncoder>('svtAv1');
+  // The two SVT builds listed in the codec menu share AV1 ranges and a 10-bit default.
+  const listedSvt = (value: string) => value === 'svtAv1' || value === 'svtAv1Hdr';
+  const tenBitDefault = (value: string) =>
+    listedSvt(value) || value === 'aomAv1' || value === 'vpxStandalone';
   // Editable historical drafts receive a visible CPU default; stored jobs are
   // still admitted with their original settings and reject hardware encoding.
   $effect(() => {
@@ -1119,6 +1123,7 @@
       (
         {
           svtAv1: 'av1',
+          svtAv1Hdr: 'av1',
           aomAv1: 'av1',
           vpxStandalone: 'vp9',
           x264: 'h264',
@@ -1474,13 +1479,13 @@
         ].includes(p.label),
       )
       .reverse();
-    if (encoder === 'svtAv1')
+    if (listedSvt(encoder))
       return {
         ...base,
         crfMin: 0,
         crfMax: 63,
         defaultCrf: chunked ? 35 : 30,
-        defaultPreset: 4,
+        defaultPreset: encoder === 'svtAv1' ? 4 : base.defaultPreset,
         presets: numbers(12),
       };
     if (encoder === 'aomAv1')
@@ -1523,7 +1528,7 @@
       p42210 = y('yuv422p10le', 'YUV - 4:2:2 - 10 bit'),
       p444 = y('yuv444p', 'YUV - 4:4:4 - 8 bit'),
       p44410 = y('yuv444p10le', 'YUV - 4:4:4 - 10 bit');
-    if (encoder === 'svtAv1') return [p420, p42010];
+    if (listedSvt(encoder)) return [p420, p42010];
     if (encoder === 'vpxStandalone')
       return [
         p420,
@@ -2056,10 +2061,7 @@
     av1an = defaultAv1an(useInfrastructurePreferences, true);
     av1anGrain = undefined;
     av1anFilters = chunked && usePreferences ? readAv1anPreferences(true).filters : [];
-    outputPixelFormat =
-      encoder === 'svtAv1' || encoder === 'aomAv1' || encoder === 'vpxStandalone'
-        ? 'yuv420p10le'
-        : 'yuv420p';
+    outputPixelFormat = tenBitDefault(encoder) ? 'yuv420p10le' : 'yuv420p';
     if (chunked) av1an = { ...av1an, pixelFormat: outputPixelFormat };
     crf = options.defaultCrf;
     preset = options.defaultPreset;
@@ -2115,16 +2117,14 @@
     untrack(() => {
       const identity = source ? JSON.stringify([chosen, source]) : null;
       if (chosen !== lastEncoder) {
-        if (chunked) workers = Math.max(1, workerBaseline - (chosen === 'svtAv1' ? 2 : 0));
+        if (chunked) workers = Math.max(1, workerBaseline - (listedSvt(chosen) ? 2 : 0));
         parameters = [];
         hdrMetadata = undefined;
         updateRaw({});
         if (rate.mode === 'quality') crf = options.defaultCrf;
         preset = options.defaultPreset;
-        outputPixelFormat =
-          chosen === 'svtAv1' || chosen === 'aomAv1' || chosen === 'vpxStandalone'
-            ? 'yuv420p10le'
-            : 'yuv420p';
+        hdrTune = options.defaultHdrTune;
+        outputPixelFormat = tenBitDefault(chosen) ? 'yuv420p10le' : 'yuv420p';
         if (chunked) av1an = { ...av1an, pixelFormat: outputPixelFormat };
         lastEncoder = chosen;
       }
@@ -3725,12 +3725,7 @@
                   if (selectedEncoder === videoChoice) {
                     if (rate.mode === 'quality') crf = options.defaultCrf;
                     preset = options.defaultPreset;
-                    outputPixelFormat =
-                      selectedEncoder === 'svtAv1' ||
-                      selectedEncoder === 'aomAv1' ||
-                      selectedEncoder === 'vpxStandalone'
-                        ? 'yuv420p10le'
-                        : 'yuv420p';
+                    outputPixelFormat = tenBitDefault(selectedEncoder) ? 'yuv420p10le' : 'yuv420p';
                     if (chunked) av1an = { ...av1an, pixelFormat: outputPixelFormat };
                   }
                   selectedEncoder = videoChoice as VideoEncoder;
@@ -3745,12 +3740,14 @@
                 >H.265 / HEVC (x265)</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="svtAv1"
                 >AV1 (SVT-AV1)</option
-              ><option value="aomAv1">AV1 (AOM)</option><option value="gif"
-                >GIF [Animated GIF]</option
-              ><option value="png">PNG [Image Sequence]</option><option value="jpg"
-                >JPEG [Image Sequence]</option
-              >{:else}<option value="aomAv1">AV1 (AOM)</option><option value="svtAv1"
-                >AV1 (SVT-AV1)</option
+              ><option value="svtAv1Hdr">AV1 (SVT-AV1-HDR)</option><option value="aomAv1"
+                >AV1 (AOM)</option
+              ><option value="gif">GIF [Animated GIF]</option><option value="png"
+                >PNG [Image Sequence]</option
+              ><option value="jpg">JPEG [Image Sequence]</option>{:else}<option value="aomAv1"
+                >AV1 (AOM)</option
+              ><option value="svtAv1">AV1 (SVT-AV1)</option><option value="svtAv1Hdr"
+                >AV1 (SVT-AV1-HDR)</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="x265Standalone"
                 >H.265 / HEVC (x265)</option
               ><option value="x264">H.264 / AVC (x264)</option>{/if}
@@ -4282,7 +4279,7 @@
             bind:value={workers}
             oninput={(event) => {
               const n = event.currentTarget.valueAsNumber;
-              if (Number.isInteger(n)) workerBaseline = n + (encoder === 'svtAv1' ? 2 : 0);
+              if (Number.isInteger(n)) workerBaseline = n + (listedSvt(encoder) ? 2 : 0);
             }}
           /><label for="threads">Threads per Worker</label><input
             id="threads"

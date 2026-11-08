@@ -687,6 +687,33 @@ test('source YADIF selection resolves into typed deinterlace settings', async ({
   });
 });
 
+test('source codec menu runs the SVT-AV1-HDR build with 10-bit output', async ({ page }) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('x264');
+  await expect(quick.getByLabel('Color Format')).toHaveValue('yuv420p');
+  await quick.getByLabel('Codec', { exact: true }).selectOption('svtAv1Hdr');
+  await expect(quick.getByLabel('Color Format')).toHaveValue('yuv420p10le');
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/output');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(async () =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const request = calls.find((c: any) => c.command === 'mock_start_encode').payload.request;
+  expect(request.settings).toMatchObject({
+    encoder: 'svtAv1Hdr',
+    outputPixelFormat: 'yuv420p10le',
+    hdrTune: 'filmGrain',
+  });
+});
+
 test('source menus and codec-dependent options match the CPU-only user scope', async ({ page }) => {
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
@@ -699,6 +726,7 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
     'H.265 / HEVC (x265)',
     'VP9 (VPX)',
     'AV1 (SVT-AV1)',
+    'AV1 (SVT-AV1-HDR)',
     'AV1 (AOM)',
     'GIF [Animated GIF]',
     'PNG [Image Sequence]',
@@ -774,6 +802,13 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
       ],
     },
     {
+      codec: 'svtAv1Hdr',
+      quality: '30',
+      preset: '2',
+      presets: Array.from({ length: 13 }, (_, i) => String(i)),
+      colors: ['YUV - 4:2:0 - 8 bit', 'YUV - 4:2:0 - 10 bit'],
+    },
+    {
       codec: 'aomAv1',
       quality: '30',
       preset: '6',
@@ -836,6 +871,7 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
   expect(await a.getByLabel('Encoder').locator('option').allTextContents()).toEqual([
     'AV1 (AOM)',
     'AV1 (SVT-AV1)',
+    'AV1 (SVT-AV1-HDR)',
     'VP9 (VPX)',
     'H.265 / HEVC (x265)',
     'H.264 / AVC (x264)',

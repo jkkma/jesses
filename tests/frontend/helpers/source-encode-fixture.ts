@@ -94,6 +94,7 @@ export async function installSourceEncodeFixture(page: Page) {
             'ffmpeg',
             'ffprobe',
             'svt-av1',
+            'svt-av1-hdr',
             'av1an',
             'mkvmerge',
             'x264',
