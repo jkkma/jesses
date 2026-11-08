@@ -437,11 +437,19 @@ async fn held_copy_seek_cancel_collision_mutation_and_b_frame_input_keep_owned_p
             if action == "collision" {
                 std::fs::write(&output, b"later owner").unwrap();
             }
+            let original = std::fs::read(&donor).unwrap();
+            // Windows: a held job keeps its sources open without write sharing,
+            // so the mutation itself is refused (ERROR_SHARING_VIOLATION) and
+            // the source stays intact. Elsewhere the write lands and the job
+            // must detect it.
             let mutated = if action == "mutation" {
-                let mut bytes = std::fs::read(&donor).unwrap();
+                let mut bytes = original.clone();
                 bytes.extend_from_slice(b"later owner mutation");
-                std::fs::write(&donor, &bytes).unwrap();
-                Some(bytes)
+                match std::fs::write(&donor, &bytes) {
+                    Ok(()) => Some(bytes),
+                    Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) => None,
+                    Err(error) => panic!("mutating the donor failed: {error}"),
+                }
             } else {
                 None
             };
@@ -468,18 +476,24 @@ async fn held_copy_seek_cancel_collision_mutation_and_b_frame_input_keep_owned_p
                     assert_eq!(job.error.unwrap().code, "OUTPUT_EXISTS");
                     assert_eq!(std::fs::read(&output).unwrap(), b"later owner");
                 }
-                "mutation" => {
-                    assert_eq!(job.state, JobState::Failed, "{job:?}");
-                    assert!(
-                        job.error
-                            .unwrap()
-                            .message
-                            .to_lowercase()
-                            .contains("changed")
-                    );
-                    assert!(!output.exists());
-                    assert_eq!(std::fs::read(&donor).unwrap(), mutated.unwrap());
-                }
+                "mutation" => match mutated {
+                    Some(mutated) => {
+                        assert_eq!(job.state, JobState::Failed, "{job:?}");
+                        assert!(
+                            job.error
+                                .unwrap()
+                                .message
+                                .to_lowercase()
+                                .contains("changed")
+                        );
+                        assert!(!output.exists());
+                        assert_eq!(std::fs::read(&donor).unwrap(), mutated);
+                    }
+                    None => {
+                        assert_eq!(job.state, JobState::Succeeded, "{job:?}");
+                        assert_eq!(std::fs::read(&donor).unwrap(), original);
+                    }
+                },
                 _ => unreachable!(),
             }
         }

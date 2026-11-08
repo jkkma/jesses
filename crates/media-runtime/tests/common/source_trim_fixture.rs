@@ -39,10 +39,20 @@ pub fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(Into::into).collect()
 }
 pub fn run(name: &str, values: Vec<OsString>) -> Vec<u8> {
-    let result = std::process::Command::new(tool(name))
-        .args(values)
-        .output()
-        .unwrap();
+    run_command(std::process::Command::new(tool(name)).args(values))
+}
+/// Run a tool from `dir`, so a filter graph can name a file there plainly, as
+/// the app does. Absolute Windows paths would need the drive colon and every
+/// backslash escaped for FFmpeg's filter parser.
+pub fn run_in(dir: &Path, name: &str, values: Vec<OsString>) -> Vec<u8> {
+    run_command(
+        std::process::Command::new(tool(name))
+            .args(values)
+            .current_dir(dir),
+    )
+}
+fn run_command(command: &mut std::process::Command) -> Vec<u8> {
+    let result = command.output().unwrap();
     assert!(
         result.status.success(),
         "{}",

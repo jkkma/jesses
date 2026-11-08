@@ -127,12 +127,12 @@ async fn source_trim_external_ass_burn_retains_original_animation_clock() {
         a.push(input.into());
         a.extend(args(&["-map", "0:v", "-vf"]));
         a.push(format!(
-            "setpts=PTS-({shift:.3})/TB,subtitles=filename='{}',setpts=PTS+({shift:.3})/TB,trim=start_frame=24:end_frame=72,setpts=PTS-STARTPTS",
-            external.display()
+            "setpts=PTS-({shift:.3})/TB,subtitles=filename={},setpts=PTS+({shift:.3})/TB,trim=start_frame=24:end_frame=72,setpts=PTS-STARTPTS",
+            external.file_name().unwrap().to_str().unwrap()
         ).into());
         a.extend(args(&["-c:v", "ffv1"]));
         a.push(reference.clone().into());
-        run("ffmpeg", a);
+        run_in(&f.0, "ffmpeg", a);
         let actual_pixels = pixels(&output);
         let reference_pixels = pixels(&reference);
         assert!(
@@ -189,7 +189,10 @@ async fn source_trim_converts_and_burns_intact_animated_ass_as_independent_consu
             a.push(input.clone().into());
             a.extend(args(&["-map", "0:v", "-vf"]));
             let mut graph = if burn {
-                format!("subtitles=filename='{}':si=0,", input.display())
+                format!(
+                    "subtitles=filename={}:si=0,",
+                    input.file_name().unwrap().to_str().unwrap()
+                )
             } else {
                 String::new()
             };
@@ -197,7 +200,7 @@ async fn source_trim_converts_and_burns_intact_animated_ass_as_independent_consu
             a.push(graph.into());
             a.extend(args(&["-c:v", "ffv1"]));
             a.push(picture.clone().into());
-            run("ffmpeg", a);
+            run_in(&f.0, "ffmpeg", a);
             let (actual_pixels, reference_pixels) = (pixels(&out), pixels(&picture));
             assert!(
                 actual_pixels == reference_pixels,
