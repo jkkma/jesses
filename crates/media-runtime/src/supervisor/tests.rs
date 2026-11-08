@@ -672,6 +672,94 @@ async fn records_cr_progress_and_flushes_partial_final_line() {
     assert_eq!(records, ["one", "two", "last"]);
 }
 
+// SvtAv1EncApp --progress 2 as captured: CRLF lines around bare-CR redraws.
+const SVT_PROGRESS: &[u8] = b"banner\r\nEncoding          \rEncoding: 1 Frames\rEncoding: 2 Frames\rEncoding: 3 Frames\rEncoding: 3 Frames\r\nSUMMARY\r\n";
+
+async fn staged_records(input: &[u8], interval: Duration) -> (Vec<String>, Vec<String>) {
+    let fixture = Fixture::new("small");
+    let path = fixture.0.join("progress.log");
+    let log = Mutex::new(RotatingLog::open(&path).await.unwrap());
+    let (sender, mut receiver) = mpsc::channel(32);
+    drain_stage_every(input, true, Some("consumer"), &sender, &log, interval)
+        .await
+        .unwrap();
+    log.lock().await.flush().await.unwrap();
+    let mut events = Vec::new();
+    while let Ok(ProcessEvent::Stderr(value)) = receiver.try_recv() {
+        events.push(value);
+    }
+    let lines = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (events, lines)
+}
+
+#[tokio::test]
+async fn job_log_thins_progress_redraws_while_events_keep_every_record() {
+    let (events, lines) = staged_records(SVT_PROGRESS, Duration::from_secs(3600)).await;
+    assert_eq!(
+        events,
+        [
+            "[consumer] banner",
+            "[consumer] Encoding          ",
+            "[consumer] Encoding: 1 Frames",
+            "[consumer] Encoding: 2 Frames",
+            "[consumer] Encoding: 3 Frames",
+            "[consumer] Encoding: 3 Frames",
+            "[consumer] SUMMARY",
+        ]
+    );
+    assert_eq!(
+        lines,
+        [
+            "[stderr] [consumer] banner",
+            "[stderr] [consumer] Encoding: 3 Frames",
+            "[stderr] [consumer] SUMMARY",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn job_log_keeps_each_redraw_once_its_interval_has_passed() {
+    let (_, lines) = staged_records(SVT_PROGRESS, Duration::ZERO).await;
+    assert_eq!(
+        lines,
+        [
+            "[stderr] [consumer] banner",
+            "[stderr] [consumer] Encoding          ",
+            "[stderr] [consumer] Encoding: 1 Frames",
+            "[stderr] [consumer] Encoding: 2 Frames",
+            "[stderr] [consumer] Encoding: 3 Frames",
+            "[stderr] [consumer] Encoding: 3 Frames",
+            "[stderr] [consumer] SUMMARY",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn job_log_keeps_the_last_redraw_when_output_ends_mid_progress() {
+    let (_, lines) = staged_records(
+        b"start\r\nframe=1\rframe=2\rframe=3\r",
+        Duration::from_secs(3600),
+    )
+    .await;
+    assert_eq!(
+        lines,
+        ["[stderr] [consumer] start", "[stderr] [consumer] frame=3"]
+    );
+    let (_, lines) = staged_records(b"frame=1\rframe=2\rtail", Duration::from_secs(3600)).await;
+    assert_eq!(
+        lines,
+        [
+            "[stderr] [consumer] frame=1",
+            "[stderr] [consumer] frame=2",
+            "[stderr] [consumer] tail",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn capture_accepts_exact_limit_and_rejects_excess() {
     assert_eq!(capture(&b"abcd"[..], 4, false).await.unwrap(), b"abcd");

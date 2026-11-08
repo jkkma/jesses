@@ -881,21 +881,60 @@ async fn drain(
     drain_stage(stream, stderr, None, events, log).await
 }
 
+/// Progress meters (SVT-AV1, x264, FFmpeg stats) redraw one line with a bare
+/// carriage return several times a second. Every redraw still reaches the
+/// job's events, but the job log keeps at most one per interval plus the
+/// latest redraw before other output, so a long encode cannot fill the log
+/// and rotate its command line and warnings away.
+const REDRAW_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 async fn drain_stage(
-    mut stream: impl AsyncRead + Unpin,
+    stream: impl AsyncRead + Unpin,
     stderr: bool,
     stage: Option<&str>,
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
 ) -> Result<(), SupervisorError> {
+    drain_stage_every(stream, stderr, stage, events, log, REDRAW_LOG_INTERVAL).await
+}
+
+async fn drain_stage_every(
+    mut stream: impl AsyncRead + Unpin,
+    stderr: bool,
+    stage: Option<&str>,
+    events: &mpsc::Sender<ProcessEvent>,
+    log: &Mutex<RotatingLog>,
+    interval: Duration,
+) -> Result<(), SupervisorError> {
+    let output = StageOutput {
+        stderr,
+        stage,
+        events,
+        log,
+    };
+    let mut redraws = Redraws {
+        interval,
+        logged: None,
+        held: None,
+    };
     let mut buffer = [0; RECORD_BYTES];
     let mut pending = Vec::with_capacity(RECORD_BYTES);
+    // A record ended by '\r' is a redraw unless '\n' follows (a CRLF line).
+    // Its event is sent at once; only the log waits for the next byte.
+    let mut carriage: Option<(Vec<u8>, bool)> = None;
     let mut terminal = ansi::Filter::default();
     loop {
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {
+            if let Some((record, logged)) = carriage.take()
+                && !logged
+            {
+                redraws.held = Some(record);
+            }
+            redraws.release(None, &output).await?;
             if !pending.is_empty() {
-                record_stage(&pending, stderr, stage, events, log).await?;
+                output.event(&pending);
+                output.log(&pending).await?;
             }
             return Ok(());
         }
@@ -911,15 +950,45 @@ async fn drain_stage(
             let Some(byte) = terminal.push(byte) else {
                 continue;
             };
-            if byte == b'\r' || byte == b'\n' {
+            if byte == b'\n' {
+                match carriage.take() {
+                    Some((record, false)) => {
+                        redraws.release(Some(&record), &output).await?;
+                        output.log(&record).await?;
+                    }
+                    Some((_, true)) => {}
+                    None if !pending.is_empty() => {
+                        output.event(&pending);
+                        redraws.release(Some(&pending), &output).await?;
+                        output.log(&pending).await?;
+                        pending.clear();
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            if let Some((record, logged)) = carriage.take()
+                && !logged
+            {
+                redraws.held = Some(record);
+            }
+            if byte == b'\r' {
                 if !pending.is_empty() {
-                    record_stage(&pending, stderr, stage, events, log).await?;
-                    pending.clear();
+                    output.event(&pending);
+                    let logged = redraws.due();
+                    if logged {
+                        redraws.release(Some(&pending), &output).await?;
+                        output.log(&pending).await?;
+                        redraws.logged = Some(tokio::time::Instant::now());
+                    }
+                    carriage = Some((std::mem::take(&mut pending), logged));
                 }
             } else {
                 pending.push(byte);
                 if pending.len() == RECORD_BYTES {
-                    record_stage(&pending, stderr, stage, events, log).await?;
+                    output.event(&pending);
+                    redraws.release(Some(&pending), &output).await?;
+                    output.log(&pending).await?;
                     pending.clear();
                 }
             }
@@ -927,35 +996,71 @@ async fn drain_stage(
     }
 }
 
-async fn record_stage(
-    bytes: &[u8],
+struct StageOutput<'a> {
     stderr: bool,
-    stage: Option<&str>,
-    events: &mpsc::Sender<ProcessEvent>,
-    log: &Mutex<RotatingLog>,
-) -> io::Result<()> {
-    let staged = stage.map(|stage| {
-        let mut staged = format!("[{stage}] ").into_bytes();
-        staged.extend_from_slice(bytes);
-        staged
-    });
-    log.lock()
-        .await
-        .write_record(staged.as_deref().unwrap_or(bytes), stderr)
-        .await?;
-    // Consumer stdout stays parseable; stderr events identify their stage.
-    let event_bytes = if stderr {
-        staged.as_deref().unwrap_or(bytes)
-    } else {
-        bytes
-    };
-    let text = String::from_utf8_lossy(event_bytes).into_owned();
-    let _ = events.try_send(if stderr {
-        ProcessEvent::Stderr(text)
-    } else {
-        ProcessEvent::Stdout(text)
-    });
-    Ok(())
+    stage: Option<&'a str>,
+    events: &'a mpsc::Sender<ProcessEvent>,
+    log: &'a Mutex<RotatingLog>,
+}
+
+impl StageOutput<'_> {
+    fn staged(&self, bytes: &[u8]) -> Vec<u8> {
+        match self.stage {
+            Some(stage) => {
+                let mut staged = format!("[{stage}] ").into_bytes();
+                staged.extend_from_slice(bytes);
+                staged
+            }
+            None => bytes.to_vec(),
+        }
+    }
+
+    async fn log(&self, bytes: &[u8]) -> io::Result<()> {
+        self.log
+            .lock()
+            .await
+            .write_record(&self.staged(bytes), self.stderr)
+            .await
+    }
+
+    fn event(&self, bytes: &[u8]) {
+        // Consumer stdout stays parseable; stderr events identify their stage.
+        let text = if self.stderr {
+            String::from_utf8_lossy(&self.staged(bytes)).into_owned()
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        let _ = self.events.try_send(if self.stderr {
+            ProcessEvent::Stderr(text)
+        } else {
+            ProcessEvent::Stdout(text)
+        });
+    }
+}
+
+struct Redraws {
+    interval: Duration,
+    logged: Option<tokio::time::Instant>,
+    /// The latest redraw not yet written to the log.
+    held: Option<Vec<u8>>,
+}
+
+impl Redraws {
+    fn due(&self) -> bool {
+        self.logged
+            .is_none_or(|logged| logged.elapsed() >= self.interval)
+    }
+
+    /// Writes the held redraw before `next` so the log keeps the last progress
+    /// state, unless `next` repeats it.
+    async fn release(&mut self, next: Option<&[u8]>, output: &StageOutput<'_>) -> io::Result<()> {
+        if let Some(held) = self.held.take()
+            && next != Some(held.as_slice())
+        {
+            output.log(&held).await?;
+        }
+        Ok(())
+    }
 }
 
 struct RotatingLog {
