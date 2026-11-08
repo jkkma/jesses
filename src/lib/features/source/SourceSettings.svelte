@@ -168,13 +168,13 @@
   >
   <label
     class="check"
-    title="Off: the finished video's frame count and timing are checked from its packets, and only its first frames are decoded. On: every frame is decoded before the file is published, which also catches damaged picture data but adds a full decode."
+    title="Off: the finished file is checked by its frame and stream counts only, and an interrupted job is rerun from the start. On: the source and tools are fingerprinted so an interrupted job can resume, every frame is decoded, and every track of the output is re-checked."
     ><input
       type="checkbox"
       checked={saved.fullOutputVerification ?? false}
       disabled={!isDesktop()}
       onchange={(e) => void savePatch({ fullOutputVerification: e.currentTarget.checked })}
-    /> Decode every frame of the finished video before publishing (slower)</label
+    /> Thorough verification (slower)</label
   >
   <label class="check"
     ><input

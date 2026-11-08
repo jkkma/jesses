@@ -198,14 +198,17 @@ export type ToolInfo = { id: string, name: string, available: boolean, path: str
 
 export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean,
 /**
- * Decode every frame of the finished video before publishing. Off, the
- * output is checked from packets, headers, and a few decoded frames.
+ * Thorough verification. Off (default), an encode checks only the
+ * finished file's frame and stream counts and keeps no resume workspace.
+ * On, the source and tools are fingerprinted for resume, every output
+ * frame is decoded and every track is re-checked.
  */
 fullOutputVerification?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
 
 export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean,
 /**
- * Absent in plans saved before this option: those use fast verification.
+ * Absent in plans saved before this option: those run without thorough
+ * verification.
  */
 fullOutputVerification?: boolean, };
 

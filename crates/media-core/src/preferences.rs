@@ -55,8 +55,10 @@ pub struct GeneralPreferences {
     pub zero_indexed_streams: bool,
     #[ts(optional, as = "Option<_>")]
     pub mp4_faststart: bool,
-    /// Decode every frame of the finished video before publishing. Off, the
-    /// output is checked from packets, headers, and a few decoded frames.
+    /// Thorough verification. Off (default), an encode checks only the
+    /// finished file's frame and stream counts and keeps no resume workspace.
+    /// On, the source and tools are fingerprinted for resume, every output
+    /// frame is decoded and every track is re-checked.
     #[ts(optional, as = "Option<_>")]
     pub full_output_verification: bool,
     #[ts(optional, as = "Option<_>")]
@@ -88,7 +90,8 @@ impl Default for GeneralPreferences {
 pub struct EncodingPreferences {
     pub keyframe_interval_seconds: u16,
     pub mp4_faststart: bool,
-    /// Absent in plans saved before this option: those use fast verification.
+    /// Absent in plans saved before this option: those run without thorough
+    /// verification.
     #[serde(default)]
     #[ts(optional, as = "Option<_>")]
     pub full_output_verification: bool,

@@ -687,6 +687,38 @@ test('source YADIF selection resolves into typed deinterlace settings', async ({
   });
 });
 
+test('thorough verification is off by default and travels with the encode request', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('region', { name: 'Settings' });
+  const thorough = settings.getByLabel('Thorough verification (slower)');
+  await expect(thorough).not.toBeChecked();
+  await thorough.check();
+  await expect
+    .poll(() =>
+      page.evaluate(() => (globalThis as any).__preferences.general.fullOutputVerification),
+    )
+    .toBe(true);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/output');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(async () =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const request = calls.find((c: any) => c.command === 'mock_start_encode').payload.request;
+  expect(request.settings.encodingPreferences.fullOutputVerification).toBe(true);
+});
+
 test('source codec menu runs the SVT-AV1-HDR build with 10-bit output', async ({ page }) => {
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
