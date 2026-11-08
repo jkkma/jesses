@@ -336,6 +336,49 @@ async fn source_trim_subtitle_formats_and_no_audio_keep_source_mux_clocks() {
     }
 }
 
+/// SVT-AV1 writes raw IVF temporal units, while Matroska and MP4 store AV1
+/// without temporal delimiters. Trims that keep a copied or converted track
+/// must still prove the muxed picture against the encoded video.
+#[tokio::test]
+#[ignore = "requires qualified CPU FFmpeg9 libx264 and SvtAv1EncApp"]
+async fn source_trim_svt_av1_keeps_copied_and_converted_tracks() {
+    for (mode, extension, streams) in [
+        (SubtitleMode::SubRip, "mkv", vec![0, 2]),
+        (SubtitleMode::MovText, "mp4", vec![0, 2]),
+        (SubtitleMode::Copy, "mkv", vec![0, 1]),
+    ] {
+        let f = Fixture::new();
+        let input = fixture(&f);
+        let out = f.0.join(format!("actual.{extension}"));
+        let trim = serde_json::from_value(json!({"startFrame":24,"endFrameExclusive":72})).unwrap();
+        let mut req = request(&input, &out, trim);
+        req.source.stream_indices = streams.clone();
+        req.settings.encoder = VideoEncoder::SvtAv1;
+        req.settings.preset = 12;
+        req.settings.crf = 40;
+        if streams.contains(&2) {
+            req.settings.subtitles = vec![SubtitleTrackSettings {
+                stream_index: 2,
+                mode,
+                burn_in: false,
+            }];
+        }
+        let manager = JobManager::new(f.0.join("logs"));
+        let job = manager.start_encode(req).await.unwrap();
+        let done = terminal(&manager, &job.id).await;
+        manager.shutdown().await;
+        assert_eq!(
+            done.state,
+            JobState::Succeeded,
+            "{mode:?} {extension}: {:?}",
+            done.error
+        );
+        let actual = probe(&out);
+        assert_eq!(actual["streams"][0]["codec_name"], "av1");
+        assert_eq!(packets(&actual, 0).len(), 48);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires qualified CPU FFmpeg9 libx264/libvpx-vp9 and authored PGS"]
 async fn source_bitmap_trim_modes_render_on_source_clock_before_crop() {

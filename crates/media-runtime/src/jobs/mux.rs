@@ -822,6 +822,105 @@ pub(super) async fn verify_container_packets(
     .await
 }
 
+/// IVF stores each AV1 temporal unit with its temporal delimiter OBU. The AV1
+/// mappings for Matroska and ISO BMFF store the same picture without temporal
+/// delimiters (FFmpeg also drops padding, tile-list and redundant frame-header
+/// OBUs), so every copied packet is legitimately shorter than the IVF unit.
+/// Compare such a source through a plain stream copy into the output's own
+/// container, which applies exactly that mapping and the same timestamp
+/// rounding; payload, count, order and clock are then checked as usual.
+async fn av1_container_reference(
+    source: &Path,
+    source_index: u32,
+    output: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<Temporary>, AppError> {
+    let extension = output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let Some(extension) = extension.filter(|extension| extension != "ivf") else {
+        return Ok(None);
+    };
+    let path = source.to_owned();
+    let av1_ivf = tokio::task::spawn_blocking(move || {
+        let mut header = [0u8; 12];
+        std::fs::File::open(&path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .is_ok_and(|()| &header[..4] == b"DKIF" && &header[8..12] == b"AV01")
+    })
+    .await
+    .map_err(|cause| AppError::new("OUTPUT_VALIDATION_FAILED", cause.to_string(), None))?;
+    if !av1_ivf {
+        return Ok(None);
+    }
+    let ffmpeg = discover("ffmpeg", cancel).await?;
+    let mut reference = Temporary::create_extension(
+        output,
+        &format!(
+            "av1-container-reference-{}-{}",
+            std::process::id(),
+            super::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        &extension,
+    )?;
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(source.as_os_str().to_owned());
+    args.extend(
+        [
+            "-map".to_owned(),
+            format!("0:{source_index}"),
+            "-c".into(),
+            "copy".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-map_chapters".into(),
+            "-1".into(),
+            "-y".into(),
+        ]
+        .map(OsString::from),
+    );
+    args.push(reference.path.as_os_str().to_owned());
+    reference.close_for_path_writer()?;
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffmpeg,
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        1024 * 1024,
+        Duration::from_secs(3600),
+    )
+    .await;
+    let rebound = reference.reopen_after_path_writer();
+    let result = result.map_err(|cause| process_error(cause, source))?;
+    rebound?;
+    if !result.status.success() {
+        return Err(AppError::new(
+            "OUTPUT_VALIDATION_FAILED",
+            format!(
+                "The AV1 container reference for the copied-packet comparison failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ),
+            Some(source.to_string_lossy().into_owned()),
+        ));
+    }
+    reference.flush_nonempty_async().await?;
+    Ok(Some(reference))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compare_packets(
     ffprobe: &Path,
@@ -835,6 +934,18 @@ async fn compare_packets(
     allow_aac_duration_reshape: bool,
     offset_seconds: f64,
 ) -> Result<Option<f64>, AppError> {
+    let container_reference = Box::pin(av1_container_reference(
+        source,
+        source_index,
+        output,
+        cancel,
+    ))
+    .await?;
+    let (source, source_index) = container_reference
+        .as_ref()
+        .map_or((source, source_index), |reference| {
+            (reference.path.as_path(), 0)
+        });
     let source_spec = packet_spec(ffprobe, source, source_index);
     let output_spec = packet_spec(ffprobe, output, output_index);
     let (sender, receiver) = blocking_channel::sync_channel(32);
