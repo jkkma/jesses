@@ -1165,7 +1165,7 @@ impl JobManager {
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if super::source_timing::pending() {"Encoding"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
+            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if super::source_timing::pending() {"Will encode"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
             if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
             }
@@ -1411,6 +1411,19 @@ impl JobManager {
                 VideoEncoder::X265Standalone => "hevc",
                 _ => "mkv",
             };
+            // Hashing a large source takes a while before the encoder starts.
+            let source_bytes = tokio::fs::metadata(&source.path)
+                .await
+                .map_or(0, |metadata| metadata.len());
+            self.phase(
+                id,
+                JobState::Preparing,
+                &format!(
+                    "Fingerprinting the {:.1} GB source and the tools so an interrupted encode can resume safely.",
+                    source_bytes as f64 / 1_000_000_000.0
+                ),
+            )
+            .await;
             let prepared = super::standalone_recovery::Recovery::prepare(
                 id,
                 request,
