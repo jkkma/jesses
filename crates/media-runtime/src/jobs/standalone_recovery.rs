@@ -137,10 +137,34 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
     })
 }
 
-fn external_source_stamps(
+/// An external source fingerprint, or the primary source named again as a
+/// donor (Quick Convert names it as metadata and chapter donor). That entry
+/// takes the source's own digest instead of reading the same file twice.
+enum ExternalStamp {
+    Ready(Stamp),
+    Source(PathBuf),
+}
+
+/// The recorded fingerprints: a shared entry is the source digest under the
+/// donor's own path, exactly what hashing the donor separately records.
+fn with_source(external: &[ExternalStamp], source: &Stamp) -> Vec<Stamp> {
+    external
+        .iter()
+        .map(|stamp| match stamp {
+            ExternalStamp::Ready(stamp) => stamp.clone(),
+            ExternalStamp::Source(path) => Stamp {
+                path: path.clone(),
+                ..source.clone()
+            },
+        })
+        .collect()
+}
+
+fn external_stamps(
     settings: &EncodeSettings,
+    source: Option<&Path>,
     cancel: Option<&watch::Receiver<bool>>,
-) -> Result<Vec<Stamp>, AppError> {
+) -> Result<Vec<ExternalStamp>, AppError> {
     let mut paths = BTreeSet::new();
     let mut guards = Vec::new();
     for path in super::external_tracks::additional_source_paths(settings) {
@@ -150,14 +174,33 @@ fn external_source_stamps(
         }
     }
     guards.sort_by(|left, right| left.path.cmp(&right.path));
+    let source = source.map(identity).transpose()?;
     guards
         .iter()
         .map(|guard| {
-            let stamp = digest(&guard.path, cancel)?;
+            let stamp = if source.is_some() && source == Some(identity(&guard.path)?) {
+                ExternalStamp::Source(guard.path.clone())
+            } else {
+                ExternalStamp::Ready(digest(&guard.path, cancel)?)
+            };
             guard.verify()?;
             Ok(stamp)
         })
         .collect()
+}
+
+/// Every external source hashed on its own, as resume verification requires.
+fn external_source_stamps(
+    settings: &EncodeSettings,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Vec<Stamp>, AppError> {
+    Ok(external_stamps(settings, None, cancel)?
+        .into_iter()
+        .map(|stamp| match stamp {
+            ExternalStamp::Ready(stamp) => stamp,
+            ExternalStamp::Source(_) => unreachable!("no source digest is shared here"),
+        })
+        .collect())
 }
 
 fn verify_external_sources(
@@ -328,12 +371,45 @@ struct Manifest {
     source_qtgmc: Option<SourceQtgmc>,
 }
 
+/// A fresh job's source digest is first written at its first checkpoint, after
+/// the encoder ran, so it is taken beside the encoder instead of before it.
+/// The job holds the source open read-only for its whole run (Windows denies
+/// writers; elsewhere its fingerprint is rechecked), so the hashed bytes are
+/// the encoded bytes. A resume compares the digest first, so it hashes first.
+enum SourceStamp {
+    Ready(Stamp),
+    Hashing(Hashing),
+}
+
+struct Hashing {
+    task: Option<tokio::task::JoinHandle<Result<Stamp, AppError>>>,
+    stop: watch::Sender<bool>,
+}
+
+impl Hashing {
+    fn start(path: PathBuf) -> Self {
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::task::spawn_blocking(move || digest(&path, Some(&stopped)));
+        Self {
+            task: Some(task),
+            stop,
+        }
+    }
+}
+
+impl Drop for Hashing {
+    /// An abandoned job stops reading its source instead of hashing on.
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
+}
+
 struct Seed {
     id: String,
     request: RemuxRequest,
     settings: EncodeSettings,
-    source: Stamp,
-    external_sources: Vec<Stamp>,
+    source: SourceStamp,
+    external_sources: Vec<ExternalStamp>,
     tools: Vec<Stamp>,
     plan: Vec<String>,
     total_frames: u64,
@@ -651,11 +727,17 @@ impl Recovery {
         let source_path = source.to_owned();
         let cancel_copy = cancel.clone();
         let external_settings = settings.clone();
+        let resume = locator.is_some();
         let (source_stamp, external_sources, tool_guards, tool_stamps) =
             tokio::task::spawn_blocking(move || {
-                let source_stamp = digest(&source_path, Some(&cancel_copy))?;
-                let external_sources =
-                    external_source_stamps(&external_settings, Some(&cancel_copy))?;
+                let source_stamp = resume
+                    .then(|| digest(&source_path, Some(&cancel_copy)))
+                    .transpose()?;
+                let external_sources = external_stamps(
+                    &external_settings,
+                    Some(source_path.as_path()),
+                    Some(&cancel_copy),
+                )?;
                 let guards = tools
                     .iter()
                     .map(|path| Source::open(path))
@@ -672,7 +754,10 @@ impl Recovery {
             id: id.to_owned(),
             request: request.clone(),
             settings: settings.clone(),
-            source: source_stamp,
+            source: match source_stamp {
+                Some(stamp) => SourceStamp::Ready(stamp),
+                None => SourceStamp::Hashing(Hashing::start(source.to_owned())),
+            },
             external_sources,
             tools: tool_stamps,
             plan,
@@ -706,10 +791,14 @@ impl Recovery {
             if manifest.settings != seed.settings {
                 changed.push("settings");
             }
-            if manifest.source != seed.source {
+            if !matches!(&seed.source, SourceStamp::Ready(stamp) if *stamp == manifest.source) {
                 changed.push("source content");
             }
-            if manifest.external_sources != seed.external_sources {
+            let external_sources = match &seed.source {
+                SourceStamp::Ready(source) => Some(with_source(&seed.external_sources, source)),
+                SourceStamp::Hashing(_) => None,
+            };
+            if external_sources.as_ref() != Some(&manifest.external_sources) {
                 changed.push("external source content");
             }
             if manifest.tools != seed.tools {
@@ -909,10 +998,34 @@ impl Recovery {
         Ok(())
     }
 
+    /// Waits for a fresh job's source digest; a canceled wait keeps the digest
+    /// running for a later checkpoint.
+    async fn settle_source(&mut self, cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
+        let SourceStamp::Hashing(hashing) = &mut self.seed.source else {
+            return Ok(());
+        };
+        let task = hashing.task.as_mut().expect("source digest still running");
+        let mut cancel = cancel.clone();
+        let joined = tokio::select! {
+            joined = task => joined,
+            Ok(_) = cancel.wait_for(|canceled| *canceled) => return Err(super::canceled()),
+        };
+        let stamp = joined.map_err(|cause| error(&self.root, cause.to_string()))??;
+        self.seed.source = SourceStamp::Ready(stamp);
+        Ok(())
+    }
+
     fn ensure_workspace(&mut self, initial: StandaloneRecoveryPhase) -> Result<(), AppError> {
         if self.manifest.is_some() {
             return Ok(());
         }
+        let SourceStamp::Ready(source) = &self.seed.source else {
+            return Err(error(
+                &self.root,
+                "The source fingerprint was not settled before the first checkpoint.",
+            ));
+        };
+        let source = source.clone();
         fs::create_dir(&self.root).map_err(|cause| error(&self.root, cause.to_string()))?;
         let (directory_guard, lock) = lock_workspace(&self.root)?;
         let manifest = Manifest {
@@ -921,8 +1034,8 @@ impl Recovery {
             directory: identity(&self.root)?,
             request: self.seed.request.clone(),
             settings: self.seed.settings.clone(),
-            source: self.seed.source.clone(),
-            external_sources: self.seed.external_sources.clone(),
+            external_sources: with_source(&self.seed.external_sources, &source),
+            source,
             tools: self.seed.tools.clone(),
             plan: self.seed.plan.clone(),
             total_frames: self.seed.total_frames,
@@ -954,8 +1067,13 @@ impl Recovery {
         )
     }
 
-    pub fn checkpoint_pass_one(&mut self, stats: &Stats) -> Result<StandaloneRecovery, AppError> {
+    pub async fn checkpoint_pass_one(
+        &mut self,
+        stats: &Stats,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<StandaloneRecovery, AppError> {
         stats.verify_stats()?;
+        self.settle_source(cancel).await?;
         self.ensure_workspace(StandaloneRecoveryPhase::PassOneComplete)?;
         let target = self.root.join(format!(
             "uncommitted-stats-{}-{}",
@@ -993,6 +1111,7 @@ impl Recovery {
         phase: StandaloneRecoveryPhase,
         cancel: &watch::Receiver<bool>,
     ) -> Result<StandaloneRecovery, AppError> {
+        self.settle_source(cancel).await?;
         self.ensure_workspace(phase)?;
         let (label, extension) = match phase {
             StandaloneRecoveryPhase::VideoComplete => ("video", self.seed.video_extension.as_str()),
@@ -1424,7 +1543,7 @@ mod tests {
                     id: "job-1".into(),
                     request,
                     settings: EncodeSettings::default(),
-                    source: digest(&self.source, None).unwrap(),
+                    source: SourceStamp::Ready(digest(&self.source, None).unwrap()),
                     external_sources: vec![],
                     tools: vec![tool_stamp],
                     plan: vec!["verified plan".into()],
@@ -1518,15 +1637,17 @@ mod tests {
         assert!(recovery.summary().is_none());
         let stats = Stats::create(&fixture.output, "test-stats").unwrap();
         fs::write(stats.path.join("jesses.stats"), b"complete pass one").unwrap();
-        let pass = recovery.checkpoint_pass_one(&stats).unwrap();
-        assert_eq!(pass.phase, StandaloneRecoveryPhase::PassOneComplete);
-        assert_eq!(pass.completed_frames, 0);
-        let video = fixture.video("video");
         let (_owner, cancel) = watch::channel(false);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let pass = runtime
+            .block_on(recovery.checkpoint_pass_one(&stats, &cancel))
+            .unwrap();
+        assert_eq!(pass.phase, StandaloneRecoveryPhase::PassOneComplete);
+        assert_eq!(pass.completed_frames, 0);
+        let video = fixture.video("video");
         let video_summary = runtime
             .block_on(recovery.checkpoint_video(
                 &video,
@@ -1583,6 +1704,123 @@ mod tests {
         assert!(!root.exists());
     }
 
+    #[tokio::test]
+    async fn fresh_prepare_hashes_the_source_beside_the_encoder() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let (_owner, cancel) = watch::channel(false);
+        let mut prepared = Recovery::prepare(
+            "job-1",
+            &request,
+            &EncodeSettings::default(),
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "ivf",
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            prepared.recovery.seed.source,
+            SourceStamp::Hashing(_)
+        ));
+        let video = fixture.video("video");
+        prepared
+            .recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.recovery.manifest.as_ref().unwrap().source,
+            digest(&fixture.source, None).unwrap()
+        );
+        prepared.recovery.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_source_digest_wait_keeps_the_digest_for_the_next_checkpoint() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let (_owner, active) = watch::channel(false);
+        let mut prepared = Recovery::prepare(
+            "job-1",
+            &request,
+            &EncodeSettings::default(),
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "ivf",
+            None,
+            &active,
+        )
+        .await
+        .unwrap();
+        let (_canceler, canceled) = watch::channel(true);
+        assert!(prepared.recovery.settle_source(&canceled).await.is_err());
+        prepared.recovery.settle_source(&active).await.unwrap();
+        assert!(matches!(
+            prepared.recovery.seed.source,
+            SourceStamp::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn dropping_a_fresh_recovery_stops_its_source_digest() {
+        let fixture = Fixture::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let hashing = Hashing::start(fixture.source.clone());
+        let stopped = hashing.stop.subscribe();
+        drop(hashing);
+        assert!(*stopped.borrow());
+    }
+
+    #[tokio::test]
+    async fn resume_prepare_still_hashes_the_source_before_comparing() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let (_owner, cancel) = watch::channel(false);
+        let mut recovery = fixture.recovery(false, "ivf");
+        let locator = recovery
+            .checkpoint_video(
+                &fixture.video("video"),
+                StandaloneRecoveryPhase::VideoComplete,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        drop(recovery);
+        fs::write(&fixture.source, b"edited source").unwrap();
+        let resumed = Recovery::prepare(
+            "job-1",
+            &request,
+            &EncodeSettings::default(),
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "ivf",
+            Some(locator),
+            &cancel,
+        )
+        .await;
+        assert!(
+            resumed
+                .err()
+                .is_some_and(|error| error.message.contains("source content"))
+        );
+    }
+
     #[test]
     fn interrupted_pass_one_directory_does_not_block_a_fresh_checkpoint() {
         let fixture = Fixture::new();
@@ -1596,7 +1834,13 @@ mod tests {
 
         let stats = Stats::create(&fixture.output, "fresh-stats").unwrap();
         fs::write(stats.path.join("jesses.stats"), b"complete pass one").unwrap();
-        let summary = recovery.checkpoint_pass_one(&stats).unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        let summary = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(recovery.checkpoint_pass_one(&stats, &cancel))
+            .unwrap();
         assert_eq!(summary.phase, StandaloneRecoveryPhase::PassOneComplete);
         let manifest = recovery.manifest.as_ref().unwrap();
         let committed = stats_path(manifest).unwrap().unwrap();
@@ -1729,6 +1973,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_as_its_own_donor_shares_the_source_fingerprint() {
+        let fixture = Fixture::new();
+        let source = fixture.source.to_string_lossy().into_owned();
+        // Quick Convert names the source itself as metadata and chapter donor.
+        let settings = EncodeSettings {
+            metadata_source_path: Some(source.clone()),
+            chapters_source_path: Some(source),
+            ..Default::default()
+        };
+        let (_, cancel) = watch::channel(false);
+        let request = fixture.request();
+        let mut prepared = Recovery::prepare(
+            "job-1",
+            &request,
+            &settings,
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "mkv",
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            prepared.recovery.seed.external_sources.as_slice(),
+            [ExternalStamp::Source(_)]
+        ));
+        let locator = prepared
+            .recovery
+            .checkpoint_video(
+                &fixture.video("shared-donor-video"),
+                StandaloneRecoveryPhase::VideoComplete,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        // The record matches a donor hashed on its own, so resume checks and
+        // records written before the source was shared both still agree.
+        assert_eq!(
+            prepared
+                .recovery
+                .manifest
+                .as_ref()
+                .unwrap()
+                .external_sources,
+            external_source_stamps(&settings, None).unwrap()
+        );
+        drop(prepared);
+        assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
+        let resumed = Recovery::prepare(
+            "job-1",
+            &request,
+            &settings,
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "mkv",
+            Some(locator),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resumed.recovery.phase(),
+            Some(StandaloneRecoveryPhase::VideoComplete)
+        );
+    }
+
+    #[tokio::test]
     async fn donor_and_hdr_resource_sources_are_fingerprinted_for_standalone_resume() {
         let fixture = Fixture::new();
         let metadata = fixture.directory.join("metadata.mka");
@@ -1834,8 +2152,11 @@ mod tests {
             input_path: external.to_string_lossy().into_owned(),
             stream_index: 0,
         }];
-        recovery.seed.external_sources =
-            external_source_stamps(&recovery.seed.settings, None).unwrap();
+        recovery.seed.external_sources = external_source_stamps(&recovery.seed.settings, None)
+            .unwrap()
+            .into_iter()
+            .map(ExternalStamp::Ready)
+            .collect();
         let root = recovery.root.clone();
         let (_, cancel) = watch::channel(false);
         let video = fixture.video("cleanup-video");

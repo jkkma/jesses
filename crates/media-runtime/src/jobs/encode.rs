@@ -1411,17 +1411,24 @@ impl JobManager {
                 VideoEncoder::X265Standalone => "hevc",
                 _ => "mkv",
             };
-            // Hashing a large source takes a while before the encoder starts.
+            // A resume hashes a large source before the encoder starts; a
+            // fresh encode hashes it alongside, before its first checkpoint.
             let source_bytes = tokio::fs::metadata(&source.path)
                 .await
                 .map_or(0, |metadata| metadata.len());
+            let gigabytes = source_bytes as f64 / 1_000_000_000.0;
             self.phase(
                 id,
                 JobState::Preparing,
-                &format!(
-                    "Fingerprinting the {:.1} GB source and the tools so an interrupted encode can resume safely.",
-                    source_bytes as f64 / 1_000_000_000.0
-                ),
+                &if locator.is_some() {
+                    format!(
+                        "Fingerprinting the {gigabytes:.1} GB source and the tools so an interrupted encode can resume safely."
+                    )
+                } else {
+                    format!(
+                        "Fingerprinting the tools and any other input files; the {gigabytes:.1} GB source is fingerprinted while it encodes so an interrupted encode can resume safely."
+                    )
+                },
             )
             .await;
             let prepared = super::standalone_recovery::Recovery::prepare(
@@ -2079,7 +2086,8 @@ impl JobManager {
                         let summary = standalone_recovery
                             .as_mut()
                             .expect("standalone recovery")
-                            .checkpoint_pass_one(stats)?;
+                            .checkpoint_pass_one(stats, cancel)
+                            .await?;
                         self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
                             .await;
                     }
