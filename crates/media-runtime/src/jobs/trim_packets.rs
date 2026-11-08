@@ -1,10 +1,10 @@
 //! Bounded packet evidence for the fork's copied-track seek. The reference mux
 //! fixes packet selection; an independent source scan proves payload/order and
 //! one common output clock, including FFmpeg's negative subtitle-PTS clamp.
-use crate::jobs::{mux, process_error};
+use crate::jobs::{metadata::Document, mux, process_error};
 use crate::supervisor;
 use media_core::AppError;
-use std::{path::Path, sync::mpsc, time::Duration};
+use std::{future::Future, path::Path, pin::Pin, sync::mpsc, task::Poll, time::Duration};
 use tokio::sync::watch;
 
 #[derive(Debug)]
@@ -12,6 +12,40 @@ pub(super) struct Evidence {
     pub first: Option<f64>,
     pub end: Option<f64>,
     pub packets: u64,
+}
+
+pub(super) type Check<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Drives a batch of per-track checks together and returns their results in
+/// the batch's order. Each check owns its FFprobe processes, so the batch size
+/// bounds how many run at once; dropping the batch stops them all.
+pub(super) async fn join_in_order<T>(checks: Vec<Check<'_, T>>) -> Vec<T> {
+    let mut checks: Vec<_> = checks.into_iter().map(Some).collect();
+    let mut results: Vec<Option<T>> = checks.iter().map(|_| None).collect();
+    std::future::poll_fn(|context| {
+        let mut pending = false;
+        for (slot, result) in checks.iter_mut().zip(results.iter_mut()) {
+            if let Some(check) = slot {
+                match check.as_mut().poll(context) {
+                    Poll::Ready(value) => {
+                        *result = Some(value);
+                        *slot = None;
+                    }
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    results
+        .into_iter()
+        .map(|result| result.expect("every joined check completed"))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,17 +248,19 @@ async fn compare_reference(
 /// Subtitle encoding is deliberately performed by the same source seek/mux
 /// command, so compare every encoded access unit and its actual shared clock.
 /// Original subtitle payloads are not copied packets after codec conversion.
+/// The callers probe the reference and output once for all of their tracks.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn verify_converted_reference(
     ffprobe: &Path,
     reference: &Path,
+    reference_document: &Document,
     reference_index: u32,
     output: &Path,
+    output_document: &Document,
     output_index: u32,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Evidence, AppError> {
-    let expected_header = Box::pin(crate::jobs::probe(ffprobe, reference, cancel, None)).await?;
-    let actual_header = Box::pin(crate::jobs::probe(ffprobe, output, cancel, None)).await?;
-    let expected_header = expected_header
+    let expected_header = reference_document
         .streams
         .iter()
         .find(|stream| stream.index == reference_index)
@@ -235,7 +271,7 @@ pub(super) async fn verify_converted_reference(
                 None,
             )
         })?;
-    let actual_header = actual_header
+    let actual_header = output_document
         .streams
         .iter()
         .find(|stream| stream.index == output_index)
@@ -410,6 +446,20 @@ pub(super) async fn infer_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn joined_checks_run_together_and_keep_their_order() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let waits: Check<'_, u32> = Box::pin(async move { receiver.await.unwrap() });
+        let sends: Check<'_, u32> = Box::pin(async move {
+            sender.send(2).unwrap();
+            1
+        });
+        // Run one after another, the first check would wait forever.
+        assert_eq!(join_in_order(vec![waits, sends]).await, [2, 1]);
+        assert!(join_in_order::<u32>(Vec::new()).await.is_empty());
+    }
+
     #[tokio::test]
     #[ignore = "requires qualified CPU FFmpeg/FFprobe and MOV_TEXT"]
     async fn converted_movtext_reference_rejects_changed_payload_despite_equal_movie_duration() {
@@ -497,12 +547,16 @@ mod tests {
             before.streams[1].extradata_hash,
             after.streams[1].extradata_hash
         );
-        verify_converted_reference(&ffprobe, &movies[0], 1, &movies[0], 1, &cancel)
-            .await
-            .unwrap();
-        let error = verify_converted_reference(&ffprobe, &movies[0], 1, &movies[1], 1, &cancel)
-            .await
-            .unwrap_err();
+        verify_converted_reference(
+            &ffprobe, &movies[0], &before, 1, &movies[0], &before, 1, &cancel,
+        )
+        .await
+        .unwrap();
+        let error = verify_converted_reference(
+            &ffprobe, &movies[0], &before, 1, &movies[1], &after, 1, &cancel,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, "TOOL_FAILED");
         assert!(
             error

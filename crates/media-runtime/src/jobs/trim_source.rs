@@ -26,6 +26,9 @@ struct Track {
     subtitle: bool,
     conversion: Option<&'static str>,
 }
+/// Copied/converted track checks each read the reference and output once;
+/// this many run at a time instead of strictly one after another.
+const TRACK_CHECKS_AT_ONCE: usize = 4;
 pub(super) struct SourceTrim {
     tracks: Vec<Track>,
     reference: PathBuf,
@@ -303,45 +306,86 @@ impl SourceTrim {
         };
         let reference = joint
             .as_ref()
-            .map_or(self.reference.as_path(), |(temporary, _)| {
+            .map_or(self.reference.as_path(), |(temporary, _, _)| {
                 temporary.path.as_path()
             });
         let reference_origin = joint
             .as_ref()
-            .map_or(self.origin_hint, |(_, origin)| *origin);
+            .map_or(self.origin_hint, |(_, origin, _)| *origin);
         let mux_origin = origin;
-        let mut max_end = 0.0_f64;
-        for (reference_index, track) in self.tracks.iter().enumerate() {
-            let output_index = selected
-                .iter()
-                .position(|stream| stream.index == track.index)
-                .expect("selected copied trim");
-            let evidence = if track.conversion.is_some() {
-                packets::verify_converted_reference(
-                    ffprobe,
-                    reference,
-                    reference_index as u32,
-                    output,
-                    output_index as u32,
-                    cancel,
-                )
-                .await?
-            } else {
-                packets::verify(
-                    ffprobe,
-                    &track.path,
-                    track.source_index,
-                    reference,
-                    reference_index as u32,
-                    output,
-                    output_index as u32,
-                    track.clock,
-                    mux_origin,
-                    track.subtitle,
-                    cancel,
-                )
-                .await?
+        // Converted tracks compare codec headers from one probe of each file
+        // rather than re-probing both whole files for every track.
+        let headers = if self.tracks.iter().any(|track| track.conversion.is_some()) {
+            let reference_document = match &joint {
+                Some((_, _, document)) => document.clone(),
+                None => Box::pin(super::super::probe(ffprobe, reference, cancel, None)).await?,
             };
+            let output_document =
+                Box::pin(super::super::probe(ffprobe, output, cancel, None)).await?;
+            Some((reference_document, output_document))
+        } else {
+            None
+        };
+        let tracks: Vec<_> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(reference_index, track)| {
+                let output_index = selected
+                    .iter()
+                    .position(|stream| stream.index == track.index)
+                    .expect("selected copied trim");
+                (reference_index as u32, output_index as u32, track)
+            })
+            .collect();
+        // Each check reads both files once on its own; a few run together.
+        // A failing batch stops the rest, so the first failing track in order
+        // still reports the error, as when every track ran one by one.
+        let mut evidence = Vec::with_capacity(tracks.len());
+        for batch in tracks.chunks(TRACK_CHECKS_AT_ONCE) {
+            let checks = batch
+                .iter()
+                .map(|&(reference_index, output_index, track)| {
+                    let check: packets::Check<'_, _> = match (&headers, track.conversion) {
+                        (Some((reference_document, output_document)), Some(_)) => {
+                            Box::pin(packets::verify_converted_reference(
+                                ffprobe,
+                                reference,
+                                reference_document,
+                                reference_index,
+                                output,
+                                output_document,
+                                output_index,
+                                cancel,
+                            ))
+                        }
+                        _ => Box::pin(packets::verify(
+                            ffprobe,
+                            &track.path,
+                            track.source_index,
+                            reference,
+                            reference_index,
+                            output,
+                            output_index,
+                            track.clock,
+                            mux_origin,
+                            track.subtitle,
+                            cancel,
+                        )),
+                    };
+                    check
+                })
+                .collect();
+            let results = packets::join_in_order(checks).await;
+            let failed = results.iter().any(Result::is_err);
+            evidence.extend(results);
+            if failed {
+                break;
+            }
+        }
+        let mut max_end = 0.0_f64;
+        for ((_, _, track), evidence) in tracks.iter().zip(evidence) {
+            let evidence = evidence?;
             if let Some(end) = evidence
                 .end
                 .filter(|_| track.conversion != Some("mov_text"))
@@ -408,7 +452,7 @@ impl SourceTrim {
         video: &Path,
         output: &Path,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<(Temporary, f64), AppError> {
+    ) -> Result<(Temporary, f64, Document), AppError> {
         let extension = self
             .reference
             .extension()
@@ -496,7 +540,7 @@ impl SourceTrim {
             .ok_or_else(|| {
                 unsupported("The joint subtitle reference has no usable picture clock.")
             })?;
-        Ok((temporary, origin))
+        Ok((temporary, origin, document))
     }
 }
 fn window(
