@@ -93,6 +93,7 @@ mod dynamic_hdr;
 mod lossless;
 mod metadata;
 mod mux;
+mod output_counts;
 mod output_metadata;
 mod packet_clock;
 pub(crate) mod parameters;
