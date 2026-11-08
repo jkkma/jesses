@@ -202,11 +202,14 @@ impl Document {
 
 /// Computed stream statistics and encoder provenance describe the old bitstream
 /// after transcoding. Copied streams keep these tags; encodes must clear them.
+/// Stream tags a container derives or writes itself rather than carrying
+/// over. A track's `creation_time` is the MP4 mdhd/tkhd timestamp; Matroska
+/// has no per-track creation time, so FFmpeg drops it there.
 pub(super) fn is_derived_stream_tag(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     matches!(
         key.as_str(),
-        "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes"
+        "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes" | "creation_time"
     ) || key.starts_with("_statistics_")
         || ["duration-", "encoder-"].iter().any(|prefix| {
             key.strip_prefix(prefix).is_some_and(|suffix| {
@@ -231,10 +234,22 @@ fn stable_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
 }
 
 fn tags_preserved(source: &BTreeMap<String, String>, output: &BTreeMap<String, String>) -> bool {
+    changed_tag(source, output).is_none()
+}
+
+/// The first expected stream tag the output lost or changed, with its value there.
+fn changed_tag(
+    source: &BTreeMap<String, String>,
+    output: &BTreeMap<String, String>,
+) -> Option<(String, String, Option<String>)> {
     let output = stable_tags(output);
     stable_tags(source)
-        .iter()
-        .all(|(k, v)| output.get(k) == Some(v))
+        .into_iter()
+        .find(|(key, value)| output.get(key) != Some(value))
+        .map(|(key, value)| {
+            let actual = output.get(&key).cloned();
+            (key, value, actual)
+        })
 }
 
 fn format_tags_preserved(
@@ -500,10 +515,13 @@ fn verify_inner(
         {
             return Err(fail("The output attachment contents changed."));
         }
-        if !tags_preserved(&expected.tags, &actual.tags) {
-            return Err(fail(
-                "The output did not preserve the selected stream metadata.",
-            ));
+        if let Some((key, value, found)) = changed_tag(&expected.tags, &actual.tags) {
+            return Err(fail(&format!(
+                "The output did not preserve the selected stream metadata (source stream {}, output stream {}: {key}={value:?}, found {}).",
+                expected.index,
+                actual.index,
+                found.map_or_else(|| "no such tag".into(), |found| format!("{found:?}")),
+            )));
         }
         for (flag, value) in &expected.disposition {
             if actual.disposition.get(flag).copied().unwrap_or(0) != *value {
@@ -664,6 +682,28 @@ mod tests {
         assert!(!tags_preserved(&source, &output));
         output.insert("TITLE".into(), "Changed".into());
         assert!(!format_tags_preserved(&source, &output));
+    }
+
+    #[test]
+    fn stream_creation_time_is_container_bookkeeping() {
+        // MP4 reports each track's mdhd/tkhd time as a creation_time tag;
+        // Matroska has no per-track creation time and FFmpeg drops it.
+        let source = BTreeMap::from([
+            ("creation_time".into(), "2026-11-02T16:43:18.000000Z".into()),
+            ("language".into(), "eng".into()),
+            ("handler_name".into(), "VideoHandler".into()),
+        ]);
+        let output = BTreeMap::from([
+            ("language".into(), "eng".into()),
+            ("HANDLER_NAME".into(), "VideoHandler".into()),
+            ("DURATION".into(), "00:05:00.008000000".into()),
+        ]);
+        assert!(tags_preserved(&source, &output));
+        let renamed = BTreeMap::from([("language".into(), "eng".into())]);
+        assert_eq!(
+            changed_tag(&source, &renamed),
+            Some(("handler_name".into(), "VideoHandler".into(), None))
+        );
     }
 
     #[test]
