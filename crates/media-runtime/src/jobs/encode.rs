@@ -1443,13 +1443,18 @@ impl JobManager {
                 VideoEncoder::X265Standalone => "hevc",
                 _ => "mkv",
             };
-            // A resume hashes a large source before the encoder starts; a
-            // fresh encode hashes it alongside, before its first checkpoint.
-            let source_bytes = tokio::fs::metadata(&source.path)
-                .await
-                .map_or(0, |metadata| metadata.len());
-            let gigabytes = source_bytes as f64 / 1_000_000_000.0;
-            self.phase(
+            // Without thorough verification nothing is kept for resume: an
+            // interrupted job is rerun from the start.
+            if !thorough {
+                None
+            } else {
+                // A resume hashes a large source before the encoder starts; a
+                // fresh encode hashes it alongside, before its first checkpoint.
+                let source_bytes = tokio::fs::metadata(&source.path)
+                    .await
+                    .map_or(0, |metadata| metadata.len());
+                let gigabytes = source_bytes as f64 / 1_000_000_000.0;
+                self.phase(
                 id,
                 JobState::Preparing,
                 &if locator.is_some() {
@@ -1463,36 +1468,37 @@ impl JobManager {
                 },
             )
             .await;
-            let prepared = super::standalone_recovery::Recovery::prepare(
-                id,
-                request,
-                authority_settings.unwrap_or(settings),
-                &source.path,
-                tools,
-                signature,
-                recovery_frames,
-                two_pass,
-                extension,
-                locator,
-                cancel,
-            )
-            .await?;
-            let super::standalone_recovery::Prepared {
-                recovery: workspace,
-                video,
-                timed_video,
-                final_stage,
-                stats,
-            } = prepared;
-            if let Some(summary) = workspace.summary() {
-                self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
-                    .await;
+                let prepared = super::standalone_recovery::Recovery::prepare(
+                    id,
+                    request,
+                    authority_settings.unwrap_or(settings),
+                    &source.path,
+                    tools,
+                    signature,
+                    recovery_frames,
+                    two_pass,
+                    extension,
+                    locator,
+                    cancel,
+                )
+                .await?;
+                let super::standalone_recovery::Prepared {
+                    recovery: workspace,
+                    video,
+                    timed_video,
+                    final_stage,
+                    stats,
+                } = prepared;
+                if let Some(summary) = workspace.summary() {
+                    self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
+                        .await;
+                }
+                standalone_stats = stats;
+                standalone_timed = timed_video;
+                standalone_final = final_stage;
+                standalone_recovery = Some(workspace);
+                video
             }
-            standalone_stats = stats;
-            standalone_timed = timed_video;
-            standalone_final = final_stage;
-            standalone_recovery = Some(workspace);
-            video
         };
         // A resumed final stage is a committed recovery checkpoint, not an
         // attempt owned by execute's unconditional cleanup. Keep its durable
@@ -1710,13 +1716,14 @@ impl JobManager {
                 boxed(|| prepared.validate_source_filters(&ffprobe, &plan, cancel)).await?;
             source.verify()?;
         }
+        // The decoded identity only records the QTGMC render for resume.
         if source_qtgmc
             && !source_qtgmc_checkpoint_ready
             && let Some(prepared) = &qtgmc
+            && let Some(recovery) = standalone_recovery.as_mut()
         {
             let identity =
                 boxed(|| prepared.decoded_identity(&ffmpeg, frame_count, cancel)).await?;
-            let recovery = standalone_recovery.as_mut().expect("standalone recovery");
             boxed(|| recovery.remember_source_qtgmc(&prepared.video.path, identity, cancel))
                 .await?;
             boxed(|| recovery.verify_source_qtgmc(&prepared.video.path, cancel)).await?;
@@ -2115,13 +2122,13 @@ impl JobManager {
                     if two_pass && pass == 1 {
                         let stats = stats.as_ref().expect("two-pass stats");
                         stats.verify_stats()?;
-                        let summary = standalone_recovery
-                            .as_mut()
-                            .expect("standalone recovery")
-                            .checkpoint_pass_one(stats, cancel)
-                            .await?;
-                        self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
+                        if let Some(recovery) = standalone_recovery.as_mut() {
+                            let summary = recovery.checkpoint_pass_one(stats, cancel).await?;
+                            self.change(id, |snapshot| {
+                                snapshot.standalone_recovery = Some(summary)
+                            })
                             .await;
+                        }
                     }
                 }
                 if video_ready {
@@ -2169,34 +2176,26 @@ impl JobManager {
                         )
                         .await?;
                     }
-                    if source_qtgmc && let Some(prepared) = &qtgmc {
-                        boxed(|| {
-                            standalone_recovery
-                                .as_ref()
-                                .expect("standalone recovery")
-                                .verify_source_qtgmc(&prepared.video.path, cancel)
-                        })
-                        .await?;
-                    }
-                    if settings.source_filters {
-                        standalone_recovery
-                            .as_mut()
-                            .expect("standalone recovery")
-                            .remember_source_filter_contract(
+                    if let Some(recovery) = standalone_recovery.as_mut() {
+                        if source_qtgmc && let Some(prepared) = &qtgmc {
+                            boxed(|| recovery.verify_source_qtgmc(&prepared.video.path, cancel))
+                                .await?;
+                        }
+                        if settings.source_filters {
+                            recovery.remember_source_filter_contract(
                                 plan.source_filter_contract(frame_count),
                             )?;
+                        }
+                        let summary = recovery
+                            .checkpoint_video(
+                                intermediate,
+                                media_core::StandaloneRecoveryPhase::VideoComplete,
+                                cancel,
+                            )
+                            .await?;
+                        self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
+                            .await;
                     }
-                    let summary = standalone_recovery
-                        .as_mut()
-                        .expect("standalone recovery")
-                        .checkpoint_video(
-                            intermediate,
-                            media_core::StandaloneRecoveryPhase::VideoComplete,
-                            cancel,
-                        )
-                        .await?;
-                    self.change(id, |snapshot| snapshot.standalone_recovery = Some(summary))
-                        .await;
                 }
             }
             let needs_timing_wrapper = (settings.backend == media_core::EncodeBackend::Standalone
@@ -5939,6 +5938,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe and x264"]
+    async fn default_two_pass_encode_needs_no_resume_workspace() {
+        fn two_pass(settings: &mut EncodeSettings) {
+            settings.rate_control = Some(media_core::VideoRateControl::Bitrate {
+                bitrate_kbps: 300,
+                two_pass: true,
+            });
+        }
+        let (_fixture, _output, job, _frames) =
+            encode_with_audio(VideoEncoder::X264, 5, "mkv", "aac", false, two_pass).await;
+        assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+        assert!(job.standalone_recovery.is_none(), "{job:#?}");
+        assert!(
+            !job.logs
+                .iter()
+                .any(|line| line.starts_with("Fingerprinting")),
+            "{:#?}",
+            job.logs
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires real FFmpeg, FFprobe, mkvmerge, SvtAv1EncApp, x265, and vpxenc"]
     async fn default_encode_checks_only_frame_and_stream_counts() {
         fn plain(_: &mut EncodeSettings) {}
@@ -6001,6 +6022,14 @@ mod tests {
                 !job.logs.iter().any(|line| {
                     line.contains(FAST_VERIFIED) || line.starts_with("Verified all")
                 })
+            );
+            assert!(job.standalone_recovery.is_none(), "{job:#?}");
+            assert!(
+                !job.logs
+                    .iter()
+                    .any(|line| line.starts_with("Fingerprinting")),
+                "{:#?}",
+                job.logs
             );
             if let Some(width) = width {
                 let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
