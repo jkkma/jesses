@@ -447,3 +447,117 @@ async fn source_direct_trim_copies_complete_pgs_display_sets_with_source_seek_cl
     }
     assert_eq!(packets(&actual, 1).len(), 48);
 }
+
+/// A trim only needs its own frames decoded and verified: the scan beside the
+/// encoder stops after the trim end plus look-ahead, and still covers the whole
+/// source when that margin reaches the end.
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg9 libx264 and libvpx-vp9"]
+async fn source_trim_verifies_decoded_frames_through_the_trim_end() {
+    for (end, expected) in [
+        (12, "Verified the first 76 decoded source frames"),
+        (72, "Verified all 96 decoded source frames"),
+    ] {
+        let f = Fixture::new();
+        let input = fixture(&f);
+        let out = f.0.join("target.mkv");
+        let trim = serde_json::from_value(json!({"startFrame":0,"endFrameExclusive":end})).unwrap();
+        let mut req = request(&input, &out, trim);
+        req.source.stream_indices = vec![0];
+        let manager = JobManager::new(f.0.join("logs"));
+        let job = manager.start_encode(req).await.unwrap();
+        let result = terminal(&manager, &job.id).await;
+        manager.shutdown().await;
+        assert_eq!(
+            result.state,
+            JobState::Succeeded,
+            "{end}: {:?}",
+            result.error
+        );
+        assert!(
+            result.logs.iter().any(|line| line.starts_with(expected)),
+            "{end}: {:#?}",
+            result.logs
+        );
+        assert_eq!(packets(&probe(&out), 0).len(), end as usize);
+    }
+}
+
+/// Converted audio in a trim is decoded only through the trim end plus margin,
+/// and the clipped timeline still passes the complete output verification.
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg9 libx264, libvpx-vp9 and libopus"]
+async fn source_trim_decodes_converted_audio_only_through_the_trim_end() {
+    let f = Fixture::new();
+    let input = f.0.join("long.mkv");
+    let mut a = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=96x64:r=24:d=30",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=30",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-g",
+        "48",
+        "-c:a",
+        "aac",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-chroma_sample_location",
+        "left",
+    ]);
+    a.push(input.clone().into());
+    run("ffmpeg", a);
+    let out = f.0.join("target.mkv");
+    let trim = serde_json::from_value(json!({"startFrame":0,"endFrameExclusive":48})).unwrap();
+    let mut req = request(&input, &out, trim);
+    req.source.stream_indices = vec![0, 1];
+    req.settings.audio = vec![AudioTrackSettings {
+        normalization: None,
+        stream_index: 1,
+        codec: AudioCodec::Opus,
+        bitrate_kbps: 96,
+        channels: AudioChannels::Preserve,
+        gain: None,
+    }];
+    let manager = JobManager::new(f.0.join("logs"));
+    let job = manager.start_encode(req).await.unwrap();
+    let result = terminal(&manager, &job.id).await;
+    manager.shutdown().await;
+    assert_eq!(result.state, JobState::Succeeded, "{:?}", result.error);
+    assert!(
+        result
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Decoding selected audio through the trim end")),
+        "{:#?}",
+        result.logs
+    );
+    assert!(
+        result
+            .logs
+            .iter()
+            .any(|line| line
+                .starts_with("Source audio stream 1: Validated audio: 96000 source samples")),
+        "{:#?}",
+        result.logs
+    );
+    let actual = probe(&out);
+    assert_eq!(actual["streams"][1]["codec_name"], "opus");
+}

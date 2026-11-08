@@ -146,7 +146,7 @@ impl Expected {
         let fail = |message: String| AppError::new("DECODE_VALIDATION_FAILED", message, None);
         if count != self.count {
             return Err(fail(format!(
-                "The complete source decoded to {count} frames, but its packets list {} frames.",
+                "The decoded source scan produced {count} frames, but its packets list {} frames.",
                 self.count
             )));
         }
@@ -166,8 +166,21 @@ impl Expected {
     }
 }
 
-/// Start the complete decoded-source scan beside the encoder. `plan` is the
-/// plan before any frame was seen, exactly what the blocking scan received.
+/// Frames past a trim's end that are still decoded and verified, covering any
+/// look-ahead a filter or frame-rate conversion may read beyond the last
+/// selected frame.
+pub(in crate::jobs) const TRIM_LOOKAHEAD_FRAMES: usize = 64;
+
+/// How many leading source frames a trim ending at `end_frame` needs verified.
+pub(in crate::jobs) fn trim_scan_frames(end_frame: usize, total: usize) -> usize {
+    end_frame.saturating_add(TRIM_LOOKAHEAD_FRAMES).min(total)
+}
+
+/// Start the decoded-source scan beside the encoder. `plan` is the plan before
+/// any frame was seen, exactly what the blocking scan received. With `limit`,
+/// only that many leading frames (a trim's frames plus look-ahead) are decoded
+/// and verified; the packet plan already checked every packet's timestamp.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::jobs) fn spawn(
     manager: JobManager,
     id: String,
@@ -176,6 +189,7 @@ pub(in crate::jobs) fn spawn(
     plan: Plan,
     stream: metadata::Stream,
     expected: Expected,
+    limit: Option<usize>,
 ) {
     let verification = VERIFICATION
         .try_with(Clone::clone)
@@ -194,10 +208,20 @@ pub(in crate::jobs) fn spawn(
     let handle = tokio::spawn(async move {
         let scan = async {
             let mut plan = plan;
-            let count = super::encode::frame_scan(
-                &ffprobe, &input, &mut plan, &stream, false, &cancel, None,
-            )
-            .await?;
+            let count = match limit {
+                Some(limit) => {
+                    super::encode::source_prefix_scan(
+                        &ffprobe, &input, &mut plan, &stream, limit, &cancel,
+                    )
+                    .await?
+                }
+                None => {
+                    super::encode::frame_scan(
+                        &ffprobe, &input, &mut plan, &stream, false, &cancel, None,
+                    )
+                    .await?
+                }
+            };
             expected.check(&plan, count)?;
             Ok::<_, AppError>(count)
         };
@@ -213,7 +237,11 @@ pub(in crate::jobs) fn spawn(
                     .change(&id, |snapshot| {
                         append_log(
                             snapshot,
-                            format!("Verified all {count} decoded source frames: timestamps, progressive scan, dimensions, color, HDR and Dolby Vision metadata."),
+                            if limit.is_some() {
+                                format!("Verified the first {count} decoded source frames, through the trim end and its look-ahead: timestamps, progressive scan, dimensions, color, HDR and Dolby Vision metadata.")
+                            } else {
+                                format!("Verified all {count} decoded source frames: timestamps, progressive scan, dimensions, color, HDR and Dolby Vision metadata.")
+                            },
                         )
                     })
                     .await;

@@ -1062,7 +1062,23 @@ pub(super) async fn scan(
     encoded: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Timeline, AppError> {
-    scan_with_tolerance(ffprobe, input, stream, encoded, None, cancel).await
+    scan_with_tolerance(ffprobe, input, stream, encoded, None, None, cancel).await
+}
+
+/// Seconds of source audio decoded past a trim's end, so the clipped timeline
+/// is always complete even when audio and video clocks differ slightly.
+pub(super) const TRIM_AUDIO_MARGIN_SECONDS: f64 = 10.0;
+
+/// Scan a source track only as far as `seconds` past its first packet. A trim
+/// needs the timeline through its end; the rest of a long track is never used.
+pub(super) async fn scan_until(
+    ffprobe: &Path,
+    input: &Path,
+    stream: &metadata::Stream,
+    seconds: f64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Timeline, AppError> {
+    scan_with_tolerance(ffprobe, input, stream, false, None, Some(seconds), cancel).await
 }
 
 /// The app-created Matroska stage may add one extra millisecond tick at a
@@ -1077,7 +1093,7 @@ pub(super) async fn scan_container_source(
 ) -> Result<Timeline, AppError> {
     let rate = sample_rate(stream)?;
     let tolerance = (4.0 * continuity_tick(stream) + 1.0 / f64::from(rate)).clamp(0.002, 0.0041);
-    scan_with_tolerance(ffprobe, input, stream, false, Some(tolerance), cancel).await
+    scan_with_tolerance(ffprobe, input, stream, false, Some(tolerance), None, cancel).await
 }
 
 /// Scans a copied final-container track while permitting only the continuity
@@ -1096,7 +1112,7 @@ pub(super) async fn scan_container_output(
         .abs()
         .max(source.maximum_residual.abs());
     let tolerance = (inherited + 0.002001).clamp(0.002, 0.006);
-    scan_with_tolerance(ffprobe, input, stream, true, Some(tolerance), cancel).await
+    scan_with_tolerance(ffprobe, input, stream, true, Some(tolerance), None, cancel).await
 }
 
 async fn scan_with_tolerance(
@@ -1105,6 +1121,7 @@ async fn scan_with_tolerance(
     stream: &metadata::Stream,
     encoded: bool,
     tolerance: Option<f64>,
+    until_seconds: Option<f64>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Timeline, AppError> {
     let mut timeline = Timeline {
@@ -1147,12 +1164,14 @@ async fn scan_with_tolerance(
             "frame=best_effort_timestamp_time,nb_samples,sample_rate,channels,channel_layout",
             "-of",
             "json",
-            "-i",
         ]
         .into_iter()
         .map(OsString::from),
     );
-    args.push(input.as_os_str().to_owned());
+    if let Some(seconds) = until_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0) {
+        args.extend(["-read_intervals".into(), format!("%+{seconds:.3}").into()]);
+    }
+    args.extend(["-i".into(), input.as_os_str().to_owned()]);
     let output = supervisor::run_streaming_stdout(
         &CommandSpec {
             executable: ffprobe.to_owned(),

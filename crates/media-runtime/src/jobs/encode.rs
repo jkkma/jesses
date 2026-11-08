@@ -682,6 +682,20 @@ impl JobManager {
             .await?;
         }
         let mut audio_timelines = Vec::new();
+        // A trim keeps audio only up to its end (its timeline is clipped below);
+        // decoding the rest of a long source track would be wasted work.
+        let trim_audio_until = settings
+            .trim
+            .filter(|_| plan.fps_num > 0 && plan.fps_den > 0)
+            .map(|trim| {
+                trim.time.map_or_else(
+                    || {
+                        f64::from(trim.end_frame_exclusive) * f64::from(plan.fps_den)
+                            / f64::from(plan.fps_num)
+                    },
+                    |time| f64::from(time.end_milliseconds) / 1_000.0,
+                ) + audio::TRIM_AUDIO_MARGIN_SECONDS
+            });
         for track in audio::converted(&mux_settings) {
             let (audio_path, source_track) = external
                 .audio_source(track.stream_index)
@@ -710,15 +724,27 @@ impl JobManager {
                 )
                 .await?;
             }
+            // External tracks keep their complete scan: their bounds set the
+            // expected output duration below.
+            let until =
+                trim_audio_until.filter(|_| external.audio_source(track.stream_index).is_none());
             self.phase(
                 id,
                 JobState::Preparing,
-                "Decoding selected audio to verify its complete sample timeline.",
+                if until.is_some() {
+                    "Decoding selected audio through the trim end to verify its sample timeline."
+                } else {
+                    "Decoding selected audio to verify its complete sample timeline."
+                },
             )
             .await;
-            let timeline = audio::scan(&ffprobe, audio_path, source_track, false, cancel)
-                .await?
-                .shifted(external.offset_seconds(track.stream_index));
+            let timeline = match until {
+                Some(seconds) => {
+                    audio::scan_until(&ffprobe, audio_path, source_track, seconds, cancel).await?
+                }
+                None => audio::scan(&ffprobe, audio_path, source_track, false, cancel).await?,
+            }
+            .shifted(external.offset_seconds(track.stream_index));
             if external.audio_source(track.stream_index).is_some() {
                 let (start, end) = timeline.bounds();
                 let expected = output_document
@@ -751,6 +777,7 @@ impl JobManager {
                 &mut plan,
                 video,
                 document.duration(),
+                settings.trim,
                 preview.is_some(),
                 cancel,
             )
@@ -2897,7 +2924,8 @@ impl JobManager {
 
     /// Plan the source frame count and cadence. When packet timestamps can
     /// stand in for decoded frames, plan from them and the first decoded frames
-    /// and verify every decoded frame beside the encoder (see `source_timing`).
+    /// and verify the decoded frames beside the encoder (see `source_timing`):
+    /// every frame, or for a trim every frame through its end plus look-ahead.
     /// Otherwise decode the complete source first, as before.
     #[allow(clippy::too_many_arguments)]
     async fn source_frames(
@@ -2908,6 +2936,7 @@ impl JobManager {
         plan: &mut Plan,
         stream: &metadata::Stream,
         duration: Option<f64>,
+        trim: Option<media_core::VideoTrim>,
         preview: bool,
         cancel: &watch::Receiver<bool>,
     ) -> Result<usize, AppError> {
@@ -2922,17 +2951,48 @@ impl JobManager {
             {
                 Ok((planned, count)) => {
                     if concurrent && !preview {
+                        // Frames after a trim's end are never encoded; the
+                        // packet plan has already checked all of their times.
+                        let limit = trim
+                            .map(|trim| {
+                                super::trim::Interval::build(
+                                    trim,
+                                    count,
+                                    planned.fps_num,
+                                    planned.fps_den,
+                                )
+                            })
+                            .transpose()?
+                            .map(|interval| {
+                                super::source_timing::trim_scan_frames(
+                                    interval.source_end_frame,
+                                    count,
+                                )
+                            })
+                            .filter(|&frames| frames < count);
+                        let mut scan_plan = plan.clone();
+                        if limit.is_some() {
+                            // A short prefix cannot show the drift that chose
+                            // the packet plan's cadence; check against it.
+                            scan_plan.fps_num = planned.fps_num;
+                            scan_plan.fps_den = planned.fps_den;
+                            scan_plan.cadence_reconciled = planned.cadence_reconciled;
+                        }
                         super::source_timing::spawn(
                             self.clone(),
                             id.to_owned(),
                             ffprobe.to_owned(),
                             input.to_owned(),
-                            plan.clone(),
+                            scan_plan,
                             stream.clone(),
-                            super::source_timing::Expected::new(&planned, count),
+                            super::source_timing::Expected::new(&planned, limit.unwrap_or(count)),
+                            limit,
                         );
                         self.change(id, |snapshot| {
-                            append_log(snapshot, format!("Planned {count} constant-rate frames from packet timestamps. The complete decoded source (every timestamp, progressive scan, color, HDR and Dolby Vision metadata) is verified alongside the encoder; the job fails and nothing is published if any frame is rejected."))
+                            append_log(snapshot, match limit {
+                                Some(frames) => format!("Planned {count} constant-rate frames from packet timestamps. The first {frames} decoded source frames (through the trim end and its look-ahead: every timestamp, progressive scan, color, HDR and Dolby Vision metadata) are verified alongside the encoder; the job fails and nothing is published if any frame is rejected."),
+                                None => format!("Planned {count} constant-rate frames from packet timestamps. The complete decoded source (every timestamp, progressive scan, color, HDR and Dolby Vision metadata) is verified alongside the encoder; the job fails and nothing is published if any frame is rejected."),
+                            })
                         })
                         .await;
                     }
@@ -3123,6 +3183,44 @@ pub(in crate::jobs) async fn frame_scan(
     };
     validate_frames(
         ffprobe, input, args, plan, stream, encoded, None, cancel, progress,
+    )
+    .await
+}
+
+/// Decodes and validates the first `frames` source frames in presentation
+/// order. FFprobe stops reading after enough packets to output them, with the
+/// same reorder margin the encoded-output sample uses.
+pub(in crate::jobs) async fn source_prefix_scan(
+    ffprobe: &Path,
+    input: &Path,
+    plan: &mut Plan,
+    stream: &metadata::Stream,
+    frames: usize,
+    cancel: &watch::Receiver<bool>,
+) -> Result<usize, AppError> {
+    check_cancel(cancel)?;
+    let mut args = source_scan_args(input, stream.index, scan_threads(), plan);
+    let input_position = args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("frame scan input");
+    args.splice(
+        input_position..input_position,
+        [
+            "-read_intervals".into(),
+            format!("%+#{}", frames.saturating_add(SAMPLE_PACKETS)).into(),
+        ],
+    );
+    validate_frames(
+        ffprobe,
+        input,
+        args,
+        plan,
+        stream,
+        false,
+        Some(frames),
+        cancel,
+        None,
     )
     .await
 }
