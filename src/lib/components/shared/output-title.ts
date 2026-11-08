@@ -21,6 +21,16 @@ export type OutputPictureChange = {
   height?: number | null;
 };
 
+/**
+ * The default output path is named after the source file, so the same
+ * release tokens are rewritten in its file name. The folder is left alone.
+ */
+export function adjustedOutputStem(stem: string, change: OutputPictureChange): string {
+  const cut = Math.max(stem.lastIndexOf('/'), stem.lastIndexOf('\\')) + 1;
+  const name = adjustedOutputTitle(stem.slice(cut), change);
+  return name ? stem.slice(0, cut) + name : stem;
+}
+
 export function adjustedOutputTitle(title: string, change: OutputPictureChange): string {
   let next = title;
   if (change.height !== undefined) {

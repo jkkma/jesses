@@ -85,7 +85,11 @@
     subtitleError,
     subtitleSummary,
   } from './subtitle-options';
-  import { adjustedOutputTitle, type OutputPictureChange } from './output-title';
+  import {
+    adjustedOutputStem,
+    adjustedOutputTitle,
+    type OutputPictureChange,
+  } from './output-title';
   import type { SubtitleTrackSettings } from '$lib/ipc/generated';
   import { terminalJob } from './job-state';
   import FramingOptions from './FramingOptions.svelte';
@@ -360,6 +364,9 @@
   let trim = $state(defaultTrim());
   let toneMap = $state(defaultToneMap());
   let destination = $state('');
+  // The suggested output stem before picture adjustments, while the path is
+  // unedited. Typing or browsing for a path clears it.
+  let suggestedStem = $state<string | null>(null);
   // Prevent a slow filesystem lookup or picker from overwriting a newer edit.
   let destinationRevision = 0;
   let suggestionPending = $state(false);
@@ -1433,6 +1440,12 @@
         }
       : {}),
   });
+  // An unedited default file name follows the output picture like the title.
+  $effect(() => {
+    const base = suggestedStem,
+      change = outputPictureChange;
+    if (base !== null) untrack(() => (destination = adjustedOutputStem(base, change)));
+  });
   const encoder = $derived(selectedEncoder);
   const parameterCatalog = $derived(
     !toolsLoading ? (parameterCatalogs[`${toolsRevision}:${backend}:${encoder}`] ?? null) : null,
@@ -1970,15 +1983,18 @@
     const revision = ++destinationRevision,
       target = outputTarget();
     suggestionPending = true;
-    destination = sourceOutputBase(source);
+    suggestedStem = sourceOutputBase(source);
+    destination = adjustedOutputStem(suggestedStem, outputPictureChange);
     try {
       const result = await resolveOutputPath({
         inputPath: source.path,
         defaultOutputDirectory: sourcePreferences?.defaultOutputDirectory,
         target,
       });
-      if (revision === destinationRevision && mainFile?.id === source.id)
-        destination = result.outputStem;
+      if (revision === destinationRevision && mainFile?.id === source.id) {
+        suggestedStem = result.outputStem;
+        destination = adjustedOutputStem(result.outputStem, outputPictureChange);
+      }
     } catch (cause) {
       if (revision === destinationRevision && mainFile?.id === source.id)
         onlog?.(`Could not suggest an output path: ${errorMessage(cause)}`);
@@ -2084,6 +2100,7 @@
     else {
       ++destinationRevision;
       suggestionPending = false;
+      suggestedStem = null;
       destination = '';
     }
     error = null;
@@ -2120,6 +2137,7 @@
         else {
           ++destinationRevision;
           suggestionPending = false;
+          suggestedStem = null;
           destination = '';
         }
       }
@@ -2261,6 +2279,7 @@
             match[1].toLowerCase(),
           );
         destination = match && (chunked || known) ? selected.slice(0, -match[0].length) : selected;
+        suggestedStem = null;
       }
     } catch (cause) {
       if (isCurrentDraft(generation, identity)) error = errorMessage(cause);
@@ -4338,6 +4357,7 @@
       oninput={() => {
         ++destinationRevision;
         suggestionPending = false;
+        suggestedStem = null;
       }}
     /><button onclick={chooseOutput} aria-label="Browse output path">…</button>{#if chunked}<button
         onclick={() => void openRecoveries()}
