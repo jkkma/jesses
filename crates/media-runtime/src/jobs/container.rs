@@ -147,6 +147,15 @@ pub(super) fn format(path: &Path) -> Result<ContainerFormat, AppError> {
         .ok_or_else(|| invalid("Choose a .mkv, .mp4, .mov, .webm, .m4a or .ogg destination."))
 }
 
+/// Header probes carry no packet counts. Only a selected subtitle bound for a
+/// container other than Matroska needs one: `preflight` rejects it when empty.
+pub(super) fn needs_cue_counts(output: &Path, document: &Document, selected: &[u32]) -> bool {
+    format(output).is_ok_and(|container| container != ContainerFormat::Matroska)
+        && document.streams.iter().any(|stream| {
+            selected.contains(&stream.index) && stream.codec_type.as_deref() == Some("subtitle")
+        })
+}
+
 fn tag<'a>(stream: &'a Stream, key: &str) -> Option<&'a str> {
     stream
         .tags
@@ -1339,6 +1348,32 @@ async fn verify_final_media(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cue_counts_are_needed_only_for_subtitles_outside_matroska() {
+        let document: Document = serde_json::from_value(serde_json::json!({"streams": [
+            {"index": 0, "codec_type": "video"},
+            {"index": 1, "codec_type": "subtitle"}
+        ]}))
+        .unwrap();
+        assert!(!needs_cue_counts(
+            Path::new("/out/a.mkv"),
+            &document,
+            &[0, 1]
+        ));
+        assert!(needs_cue_counts(
+            Path::new("/out/a.mp4"),
+            &document,
+            &[0, 1]
+        ));
+        assert!(needs_cue_counts(
+            Path::new("/out/a.mov"),
+            &document,
+            &[0, 1]
+        ));
+        assert!(!needs_cue_counts(Path::new("/out/a.mp4"), &document, &[0]));
+    }
+
     #[tokio::test]
     async fn source_iso_receipt_rejects_changed_bytes_and_another_owned_path() {
         use std::io::Write;

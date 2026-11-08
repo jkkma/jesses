@@ -2310,8 +2310,23 @@ async fn probe(
     cancel: &watch::Receiver<bool>,
     selected: Option<&[u32]>,
 ) -> Result<Document, AppError> {
-    check_cancel(cancel)?;
-    let args = [
+    probe_with(executable, path, cancel, selected, true).await
+}
+
+/// Stream headers without the whole-file packet count. Subtitle first-packet
+/// times need a count and are not read; a video stream that declares no start
+/// still gets its first packet time, because planning reads it.
+async fn probe_headers(
+    executable: &Path,
+    path: &Path,
+    cancel: &watch::Receiver<bool>,
+    selected: Option<&[u32]>,
+) -> Result<Document, AppError> {
+    probe_with(executable, path, cancel, selected, false).await
+}
+
+fn probe_args(count_packets: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
         "-v",
         "error",
         "-protocol_whitelist",
@@ -2321,15 +2336,27 @@ async fn probe(
         "-show_format",
         "-show_streams",
         "-show_chapters",
-        "-count_packets",
-        "-show_data_hash",
-        "sha256",
-        "-i",
     ]
     .into_iter()
     .map(OsString::from)
-    .chain(std::iter::once(path.as_os_str().to_owned()))
     .collect();
+    if count_packets {
+        args.push("-count_packets".into());
+    }
+    args.extend(["-show_data_hash", "sha256", "-i"].map(OsString::from));
+    args
+}
+
+async fn probe_with(
+    executable: &Path,
+    path: &Path,
+    cancel: &watch::Receiver<bool>,
+    selected: Option<&[u32]>,
+    count_packets: bool,
+) -> Result<Document, AppError> {
+    check_cancel(cancel)?;
+    let mut args = probe_args(count_packets);
+    args.push(path.as_os_str().to_owned());
     let output = supervisor::run_capture(
         &CommandSpec {
             executable: executable.to_owned(),
@@ -2383,14 +2410,16 @@ async fn probe(
             stream.packet_start_time = Some(timeline.min_pts);
             stream.duration = Some(timeline.max_end.to_string());
         }
-        if (stream.codec_type.as_deref() == Some("subtitle")
-            || (stream.codec_type.as_deref() == Some("video") && stream.start_time.is_none()))
+        let video_without_start =
+            stream.codec_type.as_deref() == Some("video") && stream.start_time.is_none();
+        let has_packets = stream
+            .nb_read_packets
+            .as_deref()
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| n > 0);
+        if (stream.codec_type.as_deref() == Some("subtitle") || video_without_start)
             && selected.is_none_or(|indices| indices.contains(&stream.index))
-            && stream
-                .nb_read_packets
-                .as_deref()
-                .and_then(|n| n.parse::<u64>().ok())
-                .is_some_and(|n| n > 0)
+            && (has_packets || (!count_packets && video_without_start))
         {
             stream.packet_start_time =
                 Some(first_packet_start(executable, path, stream.index, cancel).await?);
@@ -2550,6 +2579,24 @@ pub(crate) fn validate_imported_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_args_count_packets_only_when_asked() {
+        let counted = probe_args(true);
+        let headers = probe_args(false);
+        for args in [&counted, &headers] {
+            for flag in [
+                "-show_streams",
+                "-show_format",
+                "-show_chapters",
+                "-show_data_hash",
+            ] {
+                assert!(args.iter().any(|arg| arg == flag), "{flag}");
+            }
+        }
+        assert!(counted.iter().any(|arg| arg == "-count_packets"));
+        assert!(!headers.iter().any(|arg| arg == "-count_packets"));
+    }
 
     #[tokio::test]
     #[ignore = "requires installed FFmpeg and FFprobe"]

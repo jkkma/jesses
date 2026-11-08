@@ -503,13 +503,27 @@ impl JobManager {
             })
             .await;
         }
-        let mut document = probe(
+        // Stream headers are enough to plan. The whole file is read for packet
+        // counts only for thorough verification, or when a selected subtitle is
+        // bound for a container that rejects empty subtitle tracks.
+        let mut document = probe_headers(
             &ffprobe,
             &source.path,
             cancel,
             Some(&request.stream_indices),
         )
         .await?;
+        if thorough_verification(settings)
+            || container::needs_cue_counts(&output, &document, &request.stream_indices)
+        {
+            document = probe(
+                &ffprobe,
+                &source.path,
+                cancel,
+                Some(&request.stream_indices),
+            )
+            .await?;
+        }
         // Run every header-only check before any decode pass, so an impossible
         // destination fails in seconds rather than after a frame-by-frame scan.
         // The checks repeat below against the final decoded-color metadata.
@@ -2128,7 +2142,7 @@ impl JobManager {
                         } else {
                             None
                         },
-                        full_output_verification(settings),
+                        thorough_verification(settings),
                         cancel,
                     )
                     .await?;
@@ -3436,9 +3450,9 @@ pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize)
     args
 }
 
-/// Whether the user asked to decode every frame of the finished video before
-/// publishing. Plans saved without the preference use fast verification.
-fn full_output_verification(settings: &media_core::EncodeSettings) -> bool {
+/// Whether the user turned on thorough verification. Plans saved without the
+/// preference run without it.
+fn thorough_verification(settings: &media_core::EncodeSettings) -> bool {
     settings
         .encoding_preferences
         .is_some_and(|preferences| preferences.full_output_verification)
@@ -3448,7 +3462,7 @@ fn full_output_verification(settings: &media_core::EncodeSettings) -> bool {
 /// per-region clocks that the constant-rate packet check cannot represent, so
 /// it is always decoded.
 fn decodes_output(settings: &media_core::EncodeSettings, plan: &Plan) -> bool {
-    full_output_verification(settings) || plan.has_source_queue()
+    thorough_verification(settings) || plan.has_source_queue()
 }
 
 /// Proves that stream `index` of `staging` decodes to the same frames as
@@ -4585,6 +4599,28 @@ fn mux_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thorough_verification_follows_the_saved_switch() {
+        let with = |full_output_verification| media_core::EncodeSettings {
+            encoding_preferences: Some(media_core::EncodingPreferences {
+                keyframe_interval_seconds: 10,
+                mp4_faststart: true,
+                full_output_verification,
+            }),
+            ..media_core::EncodeSettings::default()
+        };
+        assert!(!thorough_verification(
+            &media_core::EncodeSettings::default()
+        ));
+        assert!(!thorough_verification(&with(false)));
+        assert!(thorough_verification(&with(true)));
+        let saved: media_core::EncodingPreferences = serde_json::from_value(
+            serde_json::json!({"keyframeIntervalSeconds": 10, "mp4Faststart": true}),
+        )
+        .unwrap();
+        assert!(!saved.full_output_verification);
+    }
     struct Fixture(PathBuf);
     impl Drop for Fixture {
         fn drop(&mut self) {
