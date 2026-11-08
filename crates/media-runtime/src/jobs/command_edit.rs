@@ -722,7 +722,11 @@ pub(crate) fn quote(value: &str) -> String {
 }
 
 pub(crate) fn format_command(command: &CommandSpec) -> String {
-    let mut text = std::iter::once(command.executable.to_string_lossy().into_owned())
+    // CMD can neither launch a program nor `cd` by a verbatim (`\\?\C:\...`)
+    // path; use the plain spelling wherever one exists. Arguments keep their
+    // spelling: the tools accept both and recovery matches owned paths.
+    let executable = dunce::simplified(&command.executable);
+    let mut text = std::iter::once(executable.to_string_lossy().into_owned())
         .chain(
             command
                 .args
@@ -734,7 +738,10 @@ pub(crate) fn format_command(command: &CommandSpec) -> String {
         .join(" ");
     if let Some(directory) = &command.cwd {
         let cd = if cfg!(windows) { "cd /d" } else { "cd" };
-        text = format!("({cd} {} && {text})", quote(&directory.to_string_lossy()));
+        text = format!(
+            "({cd} {} && {text})",
+            quote(&dunce::simplified(directory).to_string_lossy())
+        );
     }
     text
 }

@@ -181,8 +181,10 @@ async fn source_copy_trim_held_commands_and_batch_freeze_source_semantics() {
                 .unwrap()
                 .source_trim
         );
+        // `echo` exists in both the POSIX shell and Windows CMD that run
+        // confirmed commands; `printf` is not a CMD command.
         let arguments = if edited {
-            format!("{} && printf source-trim-edited", review.arguments)
+            format!("{} && echo source-trim-edited", review.arguments)
         } else {
             review.arguments
         };

@@ -1579,6 +1579,15 @@ impl JobManager {
                     if !two_pass || pass == 2 { encoded_path = native.path.clone(); }
                     path_outputs.push(native);
                     String::new()
+                } else if cfg!(windows) {
+                    // CMD cannot redirect into a file this job still holds open,
+                    // so the program writes a review-owned file released while it runs.
+                    let extension = pass_output.path.extension().and_then(|extension| extension.to_str()).unwrap_or("mkv");
+                    let target = Temporary::create_extension(&output, &format!("{attempt_id}-review-video-{pass}"), extension)?;
+                    let redirect = format!(" > {}", super::command_edit::quote(&target.path.to_string_lossy()));
+                    if !two_pass || pass == 2 { encoded_path = target.path.clone(); }
+                    path_outputs.push(target);
+                    redirect
                 } else {
                     format!(" > {}", super::command_edit::quote(&pass_output.path.to_string_lossy()))
                 };

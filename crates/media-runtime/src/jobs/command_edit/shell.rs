@@ -40,6 +40,11 @@ impl PreparedShell {
                 .map(Ok)
                 .unwrap_or_else(std::env::current_dir)
                 .map_err(|cause| files::error("COMMAND_EDIT_INVALID", cause.to_string(), log))?;
+            // CMD refuses a verbatim (`\\?\C:\...`) current directory as a UNC
+            // path and falls back to the Windows folder, where the scripts are
+            // not found. Give it the plain spelling wherever one exists.
+            let root = dunce::simplified(&directory.path).to_path_buf();
+            let original = dunce::simplified(&original).to_path_buf();
             let plan = windows::Plan::new(program, &original)?;
             for (name, body) in plan.scripts {
                 let path = directory.path.join(name);
@@ -57,10 +62,9 @@ impl PreparedShell {
                     })?;
             }
             let mut environment = environment.cloned().unwrap_or_default();
-            environment.variables.push((
-                "JESSES_COMMAND_ROOT",
-                Some(directory.path.as_os_str().to_owned()),
-            ));
+            environment
+                .variables
+                .push(("JESSES_COMMAND_ROOT", Some(root.as_os_str().to_owned())));
             environment.dynamic_variables.extend(plan.literals);
             let command = CommandSpec {
                 executable: std::env::var_os("COMSPEC")
@@ -75,7 +79,7 @@ impl PreparedShell {
                     "/C".into(),
                     r".\jesses.stats-main.cmd".into(),
                 ],
-                cwd: Some(directory.path.clone()),
+                cwd: Some(root),
             };
             Ok(Self {
                 command,
