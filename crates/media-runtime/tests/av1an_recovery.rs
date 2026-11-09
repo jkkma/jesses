@@ -1033,6 +1033,12 @@ async fn qualify_options(
     let source_bytes = std::fs::read(&input).unwrap();
     let mut original_request = request(&input, &destination, encoder);
     original_request.settings.av1an_options = options;
+    // The decoded audio evidence checked below comes only from thorough runs.
+    original_request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 10,
+        mp4_faststart: true,
+        full_output_verification: true,
+    });
     if options
         .and_then(|options| options.target_quality)
         .is_some_and(|target| target.metric != media_core::Av1anTargetMetric::Vmaf)
