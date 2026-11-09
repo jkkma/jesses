@@ -56,7 +56,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg mkvtoolnix svt-av1 x264 nasm cmake ninja-build meson pkg-config libclang-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf ffmpeg mkvtoolnix svt-av1 x264 x265 vpx-tools nasm cmake ninja-build meson pkg-config libclang-dev libx264-dev libx265-dev libvpx-dev libopus-dev libmp3lame-dev libvorbis-dev libogg-dev libdav1d-dev libzimg-dev libass-dev zlib1g-dev libbz2-dev liblzma-dev
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check
@@ -84,12 +84,7 @@ jobs:
           JESSES_GRAV1SYNTH="$RUNNER_TEMP/jesses-grav1synth/delivery/grav1synth" cargo test -p media-runtime --test grain_provider --locked -- --ignored --nocapture
       - name: Verify actual FFmpeg, FFprobe, and standalone SVT-AV1 integration
         if: runner.os == 'Linux'
-        run: |
-          # QTGMC needs a separately qualified VapourSynth/plugin installation.
-          # The native scene prepass needs the pinned AV1AN/VSPipe/L-SMASH stack;
-          # package.yml runs that exact test after building its Windows delivery.
-          cargo test -p media-runtime --lib --locked -- --include-ignored --skip qtgmc --skip jobs::av1an::scenes::tests::native_parallel_prepass_covers_all_source_frames
-          cargo test -p media-runtime --test real_tools --locked -- --include-ignored
+        run: cargo test -p media-runtime --test real_tools --locked -- --include-ignored
       - name: Verify standalone x264 integration
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test x264_jobs --locked -- --include-ignored
@@ -114,6 +109,15 @@ jobs:
       - name: Build the verified audio qualification tool pair
         if: runner.os == 'Linux'
         run: python3 scripts/ci-install-ffmpeg.py
+      - name: Verify encode jobs against the pinned FFmpeg and standalone encoders
+        if: runner.os == 'Linux'
+        run: |
+          # Uses the pinned FFmpeg 9.0.1 pair the packages ship (now first on
+          # PATH), not the distribution's FFmpeg 6.1, which lacks setts prescale.
+          # QTGMC needs a separately qualified VapourSynth/plugin installation.
+          # The native scene prepass needs the pinned AV1AN/VSPipe/L-SMASH stack;
+          # package.yml runs that exact test after building its Windows delivery.
+          cargo test -p media-runtime --lib --locked -- --include-ignored --skip qtgmc --skip jobs::av1an::scenes::tests::native_parallel_prepass_covers_all_source_frames
       - name: Verify per-track audio codec conversion
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored
