@@ -1969,6 +1969,20 @@ impl JobManager {
             )
         })
         .await?;
+        if converted.is_some()
+            && let Some(clock) = cadence.filter(|clock| !clock.full_verification)
+        {
+            self.change(id, |snapshot| {
+                append_log(
+                    snapshot,
+                    format!(
+                        "Final container check: {} video frames and every planned stream.",
+                        clock.frames
+                    ),
+                )
+            })
+            .await;
+        }
         let converted_alpha = converted.is_some();
         let temporary = converted.unwrap_or(temporary);
         if converted_alpha

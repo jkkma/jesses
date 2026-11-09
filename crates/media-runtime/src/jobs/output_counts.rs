@@ -1,5 +1,6 @@
-//! The default encode's only output check: the finished file holds the planned
-//! number of video frames and the planned streams, in order.
+//! The default encode's only output check: the finished file (the staging file,
+//! then any final container converted from it) holds the planned number of
+//! video frames and the planned streams, in order.
 use super::{files, metadata::Document, process_error};
 use crate::supervisor::{self, CommandSpec};
 use media_core::AppError;
@@ -13,14 +14,22 @@ fn failed(message: String) -> AppError {
 /// `kinds` lists the planned streams' codec types in output order and
 /// `video_position` is the encoded video's place among them. The encoders
 /// write one packet (access unit, temporal unit or superframe) per frame.
+/// An MP4/MOV file's trailing chapter track is not a planned stream.
 pub(super) fn check(
     document: &Document,
     kinds: &[&str],
     video_position: usize,
     frames: usize,
 ) -> Result<(), AppError> {
-    let actual: Vec<&str> = document
-        .streams
+    let streams = match document.streams.split_last() {
+        Some((last, planned))
+            if !document.chapters.is_empty() && super::container::is_chapter_track(last) =>
+        {
+            planned
+        }
+        _ => &document.streams[..],
+    };
+    let actual: Vec<&str> = streams
         .iter()
         .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
         .collect();
@@ -29,8 +38,7 @@ pub(super) fn check(
             "The finished file's streams are {actual:?}; {kinds:?} were planned."
         )));
     }
-    let counted = document
-        .streams
+    let counted = streams
         .get(video_position)
         .and_then(|stream| stream.nb_read_packets.as_deref())
         .and_then(|value| value.parse::<usize>().ok());
@@ -59,7 +67,7 @@ pub(super) async fn verify(
         "error",
         "-count_packets",
         "-show_entries",
-        "stream=index,codec_type,nb_read_packets",
+        "stream=index,codec_type,codec_name,codec_tag_string,nb_read_packets:stream_tags=handler_name:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -146,6 +154,25 @@ mod tests {
             let error = check(&picture_and_sound(), kinds, 0, 48).unwrap_err();
             assert_eq!(error.code, "OUTPUT_VALIDATION_FAILED");
         }
+    }
+
+    #[test]
+    fn an_mp4_chapter_track_is_not_a_planned_stream() {
+        let mut value = serde_json::json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "nb_read_packets": "48"},
+                {"index": 1, "codec_type": "audio", "nb_read_packets": "70"},
+                {"index": 2, "codec_type": "data", "codec_name": "bin_data",
+                 "codec_tag_string": "text", "tags": {"handler_name": "SubtitleHandler"}}
+            ],
+            "chapters": [{"start_time": "0.000000", "end_time": "1.000000"}]
+        });
+        let with_chapters: Document = serde_json::from_value(value.clone()).unwrap();
+        assert!(check(&with_chapters, &["video", "audio"], 0, 48).is_ok());
+        // Without chapters the same track is an unplanned stream.
+        value["chapters"] = serde_json::json!([]);
+        let without_chapters: Document = serde_json::from_value(value).unwrap();
+        assert!(check(&without_chapters, &["video", "audio"], 0, 48).is_err());
     }
 
     #[test]

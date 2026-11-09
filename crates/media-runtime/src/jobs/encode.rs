@@ -1444,8 +1444,10 @@ impl JobManager {
                 _ => "mkv",
             };
             // Without thorough verification nothing is kept for resume: an
-            // interrupted job is rerun from the start.
-            if !thorough {
+            // interrupted job is rerun from the start. A workspace saved
+            // earlier (by a thorough run or a previous version) still resumes,
+            // so its work is used and it is removed when the job succeeds.
+            if !thorough && locator.is_none() {
                 None
             } else {
                 // A resume hashes a large source before the encoder starts; a
@@ -3443,7 +3445,7 @@ pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize)
 
 /// Whether the user turned on thorough verification. Plans saved without the
 /// preference run without it.
-fn thorough_verification(settings: &media_core::EncodeSettings) -> bool {
+pub(super) fn thorough_verification(settings: &media_core::EncodeSettings) -> bool {
     settings
         .encoding_preferences
         .is_some_and(|preferences| preferences.full_output_verification)
@@ -5753,6 +5755,7 @@ mod tests {
     const COPY_PROVEN: &str = "byte-identical copy of the decoded and verified timing wrapper";
     const FAST_VERIFIED: &str = "Fast output verification: all";
     const OUTPUT_CHECKED: &str = "Output check:";
+    const FINAL_CHECKED: &str = "Final container check:";
 
     async fn assert_encoded(output: &Path, codec: &str, frames: usize) {
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
@@ -5959,6 +5962,348 @@ mod tests {
         );
     }
 
+    /// Encodes one second of video with sound, a SubRip track converted to MP4
+    /// text and two chapters, so FFmpeg writes MP4/MOV staging with a chapter
+    /// track that reads back as a trailing data stream.
+    async fn encode_text_with_chapters(
+        encoder: VideoEncoder,
+        preset: u8,
+        extension: &str,
+        full_output_verification: bool,
+    ) -> (Fixture, PathBuf, JobSnapshot) {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("jesses-chapters-{}-{nonce}", std::process::id())),
+        );
+        std::fs::create_dir(&fixture.0).unwrap();
+        let subtitles = fixture.0.join("cues.srt");
+        std::fs::write(&subtitles, "1\n00:00:00,100 --> 00:00:00,600\nHello\n").unwrap();
+        let chapters = fixture.0.join("chapters.txt");
+        std::fs::write(
+            &chapters,
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=500\nEND=1000\ntitle=Two\n",
+        )
+        .unwrap();
+        let input = fixture.0.join("source.mkv");
+        let output = fixture.0.join(format!("output.{extension}"));
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let generated = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args: [
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-n",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=128x96:r=24000/1001",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000",
+                    "-i",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain([subtitles.as_os_str().to_owned()])
+                .chain(["-f", "ffmetadata", "-i"].map(OsString::from))
+                .chain([chapters.as_os_str().to_owned()])
+                .chain(
+                    [
+                        "-t",
+                        "1",
+                        "-map",
+                        "0",
+                        "-map",
+                        "1",
+                        "-map",
+                        "2",
+                        "-map_chapters",
+                        "3",
+                        "-c:v",
+                        "ffv1",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-ac",
+                        "2",
+                        "-c:a",
+                        "aac",
+                        "-c:s",
+                        "srt",
+                    ]
+                    .map(OsString::from),
+                )
+                .chain([input.as_os_str().to_owned()])
+                .collect(),
+                cwd: None,
+            },
+            cancel,
+            64 * 1024,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let manager = JobManager::new(fixture.0.join("logs"));
+        manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1, 2],
+                },
+                settings: EncodeSettings {
+                    encoder,
+                    preset,
+                    subtitles: vec![media_core::SubtitleTrackSettings {
+                        stream_index: 2,
+                        mode: media_core::SubtitleMode::MovText,
+                        burn_in: false,
+                    }],
+                    encoding_preferences: Some(media_core::EncodingPreferences {
+                        keyframe_interval_seconds: 10,
+                        mp4_faststart: true,
+                        full_output_verification,
+                    }),
+                    ..EncodeSettings::default()
+                },
+            })
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                let job = manager.list_jobs().await.remove(0);
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        (fixture, output, job)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe, SvtAv1EncApp and x264"]
+    async fn default_mp4_and_mov_outputs_with_chapters_pass_the_count_check() {
+        // AV1 needs MP4 staging; H.264 is staged in MOV.
+        for (encoder, preset, extension) in [
+            (VideoEncoder::SvtAv1, 12, "mp4"),
+            (VideoEncoder::X264, 5, "mov"),
+        ] {
+            let (_fixture, output, job) =
+                encode_text_with_chapters(encoder, preset, extension, false).await;
+            assert_eq!(job.state, JobState::Succeeded, "{extension}: {job:#?}");
+            assert!(
+                job.logs.iter().any(|line| line.starts_with(OUTPUT_CHECKED)),
+                "{:#?}",
+                job.logs
+            );
+            assert!(
+                job.logs.iter().any(|line| line.starts_with(FINAL_CHECKED)),
+                "{:#?}",
+                job.logs
+            );
+            let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+            let (_sender, cancel) = watch::channel(false);
+            let document = probe(&ffprobe, &output, &cancel, None).await.unwrap();
+            assert_eq!(document.chapters.len(), 2, "{extension}");
+            assert_eq!(
+                document.streams[2].codec_name.as_deref(),
+                Some("mov_text"),
+                "{extension}"
+            );
+        }
+    }
+
+    /// Sets every saved `fullOutputVerification` in a JSON file to false.
+    fn turn_thorough_off(path: &Path) {
+        fn walk(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, entry) in map.iter_mut() {
+                        if key == "fullOutputVerification" {
+                            *entry = serde_json::Value::Bool(false);
+                        } else {
+                            walk(entry);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        walk(&mut value);
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe and x264"]
+    async fn a_saved_workspace_resumes_with_thorough_verification_off() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "jesses-saved-resume-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let input = fixture.0.join("source.mkv");
+        let output = fixture.0.join("output.mkv");
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let generated = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args: [
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-n",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=640x360:rate=24:duration=4",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=duration=4:sample_rate=48000",
+                    "-c:v",
+                    "ffv1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "pcm_s16le",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain([input.as_os_str().to_owned()])
+                .collect(),
+                cwd: None,
+            },
+            cancel,
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let logs = fixture.0.join("logs");
+        let history = fixture.0.join("history");
+        // A thorough two-pass job keeps a workspace; stop it after pass one.
+        let manager = JobManager::open(logs.clone(), history.clone()).await;
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1],
+                },
+                settings: EncodeSettings {
+                    encoder: VideoEncoder::X264,
+                    preset: 9,
+                    rate_control: Some(media_core::VideoRateControl::Bitrate {
+                        bitrate_kbps: 500,
+                        two_pass: true,
+                    }),
+                    encoding_preferences: Some(media_core::EncodingPreferences {
+                        keyframe_interval_seconds: 10,
+                        mp4_faststart: true,
+                        full_output_verification: true,
+                    }),
+                    ..EncodeSettings::default()
+                },
+            })
+            .await
+            .unwrap();
+        let snapshot = |manager: &JobManager| {
+            let manager = manager.clone();
+            let id = job.id.clone();
+            async move {
+                manager
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let current = snapshot(&manager).await;
+                assert!(!current.state.is_terminal(), "{current:#?}");
+                if current
+                    .standalone_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| {
+                        recovery.phase == media_core::StandaloneRecoveryPhase::PassOneComplete
+                    })
+                {
+                    manager.stop_job(job.id.clone()).await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let finish = |manager: JobManager| async move {
+            tokio::time::timeout(Duration::from_secs(120), async {
+                loop {
+                    let current = snapshot(&manager).await;
+                    if current.state.is_terminal() {
+                        return current;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        };
+        let stopped = finish(manager.clone()).await;
+        assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+        let workspace = PathBuf::from(&stopped.standalone_recovery.as_ref().unwrap().workspace);
+        manager.shutdown().await;
+        drop(manager);
+        // The job and its workspace now look like one saved with the switch off.
+        turn_thorough_off(&history.join("jobs.json"));
+        turn_thorough_off(&workspace.join("manifest.json"));
+        let manager = JobManager::open(logs, history).await;
+        manager.resume_job(job.id.clone()).await.unwrap();
+        let resumed = finish(manager.clone()).await;
+        manager.shutdown().await;
+        assert_eq!(resumed.state, JobState::Succeeded, "{resumed:#?}");
+        assert!(
+            resumed
+                .logs
+                .iter()
+                .any(|line| line.starts_with("Resuming after verified pass one")),
+            "{:#?}",
+            resumed.logs
+        );
+        assert!(resumed.standalone_recovery.is_none(), "{resumed:#?}");
+        assert!(!workspace.exists());
+    }
+
     #[tokio::test]
     #[ignore = "requires real FFmpeg, FFprobe, mkvmerge, SvtAv1EncApp, x265, and vpxenc"]
     async fn default_encode_checks_only_frame_and_stream_counts() {
@@ -6028,6 +6373,14 @@ mod tests {
                 !job.logs
                     .iter()
                     .any(|line| line.starts_with("Fingerprinting")),
+                "{:#?}",
+                job.logs
+            );
+            // MP4 and WebM are converted from Matroska staging; the final
+            // file gets the same count check instead of the thorough battery.
+            assert_eq!(
+                job.logs.iter().any(|line| line.starts_with(FINAL_CHECKED)),
+                extension != "mkv",
                 "{:#?}",
                 job.logs
             );

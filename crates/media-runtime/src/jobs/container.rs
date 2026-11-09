@@ -28,9 +28,10 @@ pub(super) struct Cadence {
     pub denominator: u32,
     pub frames: usize,
     pub source_iso: Option<SourceIsoReceipt>,
-    /// Decode the encoded video of the final file again whenever its copy is
-    /// not proven identical to the verified staging video. Off (fast output
-    /// verification), it is never decoded here; its clock is read from packets.
+    /// Thorough verification: re-check every converted track and decode the
+    /// encoded video of the final file again whenever its copy is not proven
+    /// identical to the verified staging video. Off, the final file is checked
+    /// only by its streams and its video frame count.
     pub full_verification: bool,
 }
 
@@ -154,6 +155,16 @@ pub(super) fn needs_cue_counts(output: &Path, document: &Document, selected: &[u
         && document.streams.iter().any(|stream| {
             selected.contains(&stream.index) && stream.codec_type.as_deref() == Some("subtitle")
         })
+}
+
+/// FFmpeg writes MP4/MOV chapters as a text track that reads back as a
+/// trailing data stream. It is not a mapped stream: every remux writes it again
+/// from the chapters.
+pub(super) fn is_chapter_track(stream: &Stream) -> bool {
+    stream.codec_type.as_deref() == Some("data")
+        && stream.codec_name.as_deref() == Some("bin_data")
+        && stream.codec_tag_string.as_deref() == Some("text")
+        && tag(stream, "handler_name") == Some("SubtitleHandler")
 }
 
 fn tag<'a>(stream: &'a Stream, key: &str) -> Option<&'a str> {
@@ -651,12 +662,10 @@ pub(super) fn normalize(
         }
     }
     if iso && !expected.chapters.is_empty() {
-        let auxiliary = actual.streams.last().filter(|stream| {
-            stream.codec_type.as_deref() == Some("data")
-                && stream.codec_name.as_deref() == Some("bin_data")
-                && stream.codec_tag_string.as_deref() == Some("text")
-                && tag(stream, "handler_name") == Some("SubtitleHandler")
-        });
+        let auxiliary = actual
+            .streams
+            .last()
+            .filter(|stream| is_chapter_track(stream));
         if actual.streams.len() != expected.streams.len() + 1 || auxiliary.is_none() {
             return Err(invalid(
                 "MP4/MOV chapter track structure could not be verified.",
@@ -900,6 +909,9 @@ pub(super) async fn prepare<'a>(
     super::check_cancel(cancel)?;
     let ffmpeg = super::discover("ffmpeg", cancel).await?;
     let ffprobe = super::discover("ffprobe", cancel).await?;
+    // Only an encode passes a cadence. Without thorough verification its final
+    // file is checked like its staging file: by streams and video frame count.
+    let full_verification = cadence.is_none_or(|clock| clock.full_verification);
     if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
         if receipt.format != container || format(&input.path)? != container || timecode.is_some() {
             return Err(invalid(
@@ -907,6 +919,12 @@ pub(super) async fn prepare<'a>(
             ));
         }
         receipt.verify(input, cancel).await?;
+        if !full_verification {
+            // The sealed file is the staging file, whose counts the encode
+            // already checked.
+            super::check_cancel(cancel)?;
+            return Ok(None);
+        }
         let document = super::probe(&ffprobe, &input.path, cancel, None).await?;
         // The sealed file is the staging file, whose encoded video the encode
         // already verified at its chosen level.
@@ -928,6 +946,9 @@ pub(super) async fn prepare<'a>(
         return Ok(None);
     }
     let mut document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+    if !document.chapters.is_empty() && document.streams.last().is_some_and(is_chapter_track) {
+        document.streams.pop();
+    }
     for stream in document
         .streams
         .iter_mut()
@@ -986,6 +1007,26 @@ pub(super) async fn prepare<'a>(
         )));
     }
     artifact.flush_nonempty_async().await?;
+    if let Some(clock) = cadence.filter(|_| !full_verification) {
+        let kinds: Vec<&str> = document
+            .streams
+            .iter()
+            .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
+            .chain(timecode.map(|_| "data"))
+            .collect();
+        super::output_counts::verify(
+            &ffprobe,
+            &artifact.path,
+            &kinds,
+            clock.index as usize,
+            clock.frames,
+            cancel,
+        )
+        .await?;
+        input.flush_nonempty_async().await?;
+        super::check_cancel(cancel)?;
+        return Ok(Some(artifact));
+    }
     let mut actual = super::probe(&ffprobe, &artifact.path, cancel, None).await?;
     let mut expected = document.clone();
     if let Some(timecode) = timecode {
