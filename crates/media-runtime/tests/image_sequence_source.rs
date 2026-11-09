@@ -564,6 +564,12 @@ async fn native_stop_restart_resume_pins_sequence_images_and_blocks_recovery_cac
                     bitrate_kbps: 500,
                     two_pass: true,
                 }),
+                // Only thorough runs keep a resume workspace.
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                    full_output_verification: true,
+                }),
                 ..Default::default()
             },
         })

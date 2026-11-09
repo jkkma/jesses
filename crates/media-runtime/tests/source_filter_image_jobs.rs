@@ -375,6 +375,12 @@ async fn source_image_graphs_execute_once_for_normal_held_and_edited_outputs() {
             }),
             ..Default::default()
         }),
+        // Only thorough runs keep a resume workspace.
+        encoding_preferences: Some(media_core::EncodingPreferences {
+            keyframe_interval_seconds: 10,
+            mp4_faststart: true,
+            full_output_verification: true,
+        }),
         ..Default::default()
     };
     let selected = EncodeRequest {

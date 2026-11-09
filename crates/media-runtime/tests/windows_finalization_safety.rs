@@ -241,6 +241,13 @@ fn request(input: &Path, output: &Path, encoder: VideoEncoder) -> EncodeRequest 
             video_stream_index: 0,
             crf: 30,
             preset: if encoder == VideoEncoder::X264 { 0 } else { 12 },
+            // These jobs stop and resume from their recovery workspace, which
+            // only thorough runs keep.
+            encoding_preferences: Some(media_core::EncodingPreferences {
+                keyframe_interval_seconds: 10,
+                mp4_faststart: true,
+                full_output_verification: true,
+            }),
             ..Default::default()
         },
     }

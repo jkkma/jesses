@@ -1300,6 +1300,12 @@ async fn stop_reopen_resume_binds_external_bytes_and_preserves_saved_work() {
         media_core::AudioCodec::Aac,
         media_core::AudioChannels::Stereo,
     ));
+    // Only thorough runs keep a resume workspace.
+    request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 10,
+        mp4_faststart: true,
+        full_output_verification: true,
+    });
     let started = manager.start_encode(request.clone()).await.unwrap();
     let checkpoint = tokio::time::timeout(Duration::from_secs(60), async {
         loop {

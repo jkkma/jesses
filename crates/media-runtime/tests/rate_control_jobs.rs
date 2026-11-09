@@ -428,6 +428,12 @@ async fn cancel_each_pass_reaps_tools_and_retains_only_verified_phase_recovery()
                         bitrate_kbps: 300,
                         two_pass: true,
                     }),
+                    // Only thorough runs keep a resume workspace.
+                    encoding_preferences: Some(media_core::EncodingPreferences {
+                        keyframe_interval_seconds: 10,
+                        mp4_faststart: true,
+                        full_output_verification: true,
+                    }),
                     ..EncodeSettings::default()
                 },
             })

@@ -684,6 +684,13 @@ async fn final_publication_collision_preserves_destination_and_recovery() {
             VideoEncoder::SvtAv1 => 12,
             _ => unreachable!("bounded output-safety workflow matrix"),
         };
+        // The standalone case checks its recovery workspace, which only
+        // thorough runs keep.
+        encode.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+            keyframe_interval_seconds: 10,
+            mp4_faststart: true,
+            full_output_verification: true,
+        });
         let submitted = manager.start_encode(encode).await.unwrap();
         let owned_matroska = wait_for_owned_matroska(&manager, &submitted.id).await;
         assert!(
