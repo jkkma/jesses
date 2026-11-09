@@ -4,8 +4,10 @@ Qualifies a Jesses Windows portable archive without using user-installed media t
 
 .DESCRIPTION
 The runner verifies and extracts one portable archive into a Scoop-shaped disposable
-tree, puts the program files behind a read/execute-only ACL, and keeps application
-data in a separate writable persist directory. A native package discovery probe and
+tree, puts the program files behind a read/execute-only ACL for the run, and keeps
+application data in a separate writable persist directory. The program tree's
+inherited ACL and writable attributes are restored when the run ends, pass or fail,
+so the evidence directory can be deleted normally. A native package discovery probe and
 small generated x264/SVT-AV1 media fixtures run with a cleared environment and a
 system-only PATH. The original archive and all package payloads are hash-checked.
 
@@ -581,6 +583,24 @@ function Set-ProgramReadOnly {
     return $identity
 }
 
+# Undoes Set-ProgramReadOnly so the evidence tree stays deletable by the user
+# who ran the qualification. The owner keeps the right to rewrite the ACL, so
+# the inherited ACL is restored before the read-only attributes are cleared.
+function Restore-ProgramWritable {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot, [Parameter(Mandatory = $true)][object[]]$Records, [Parameter(Mandatory = $true)][string]$AclLog)
+    if (-not [System.IO.Directory]::Exists($PackageRoot)) { return }
+    $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
+    $output = & $icacls $PackageRoot "/reset" "/T" "/C" "/Q" 2>&1
+    $exitCode = $LASTEXITCODE
+    [System.IO.File]::AppendAllText($AclLog, "`r`n" + ($output -join "`r`n"), [System.Text.Encoding]::UTF8)
+    if ($exitCode -ne 0) { throw "icacls could not restore the program tree's inherited ACL (see $AclLog)." }
+    $paths = @($Records | ForEach-Object { Join-Path $PackageRoot (([string]$_.path).Replace("/", [System.IO.Path]::DirectorySeparatorChar)) })
+    $paths += Join-Path $PackageRoot "package-manifest.json"
+    foreach ($path in $paths) {
+        if ([System.IO.File]::Exists($path)) { (Get-Item -LiteralPath $path -Force).IsReadOnly = $false }
+    }
+}
+
 # Dot-sourcing is supported only so the focused test suite can exercise helper
 # functions (especially timeout cleanup) without running a qualification.
 if ($MyInvocation.InvocationName -eq ".") {
@@ -654,6 +674,7 @@ $receipt = [ordered]@{
     checks = @()
 }
 
+$programRestricted = $false
 try {
     if ($Scope -eq "FreshImage" -and ($ambientHits.Count -gt 0 -or $ambientManagedPresent -or $inheritedJessesVariables.Count -gt 0)) {
         throw "FreshImage scope requires no ambient media tools, managed Jesses tools, or JESSES_* overrides. Use RestrictedHost for a sanitized host run."
@@ -705,6 +726,7 @@ try {
         (Join-Path $packageRoot "resources\tools\mkvmerge\mkvmerge.exe")
     )) { Get-PeMachine $binary | Out-Null }
 
+    $programRestricted = $true
     $identity = Set-ProgramReadOnly $packageRoot $package.records (Join-Path $logs "program-acl.log")
     $rootCreateDenied = $false
     try {
@@ -883,6 +905,16 @@ catch {
     throw
 }
 finally {
+    if ($programRestricted) {
+        try {
+            Restore-ProgramWritable $packageRoot $package.records (Join-Path $logs "program-acl.log")
+            $receipt.programAccessRestored = $true
+        }
+        catch {
+            $receipt.programAccessRestored = $false
+            Write-Warning "Could not make the program tree deletable again: $($_.Exception.Message) Run: icacls `"$packageRoot`" /reset /T, then attrib -R `"$packageRoot\*`" /S /D"
+        }
+    }
     $receipt.completedAt = [DateTime]::UtcNow.ToString("o")
     try {
         $receipt | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $receiptPath -Encoding UTF8

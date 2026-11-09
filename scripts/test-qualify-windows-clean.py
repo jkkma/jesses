@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -186,6 +187,46 @@ public static class CleanProcessFixture
         self.assertEqual(receipt["status"], "failed")
         self.assertFalse(receipt["qualifiesFreshImage"])
         return result, evidence, receipt
+
+    @staticmethod
+    def reset_tree_access(path: Path) -> None:
+        """Test-only cleanup so a failing assertion cannot leave an undeletable tree."""
+        if path.exists():
+            icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+            subprocess.run([str(icacls), str(path), "/reset", "/T", "/C", "/Q"], capture_output=True)
+            subprocess.run(["attrib.exe", "-R", str(path / "*"), "/S", "/D"], capture_output=True)
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_program_tree_is_deletable_after_a_run_fails_past_the_acl_step(self) -> None:
+        native = self.require_native_fixture().read_bytes()
+        files = self.base_files()
+        for path in (
+            "jesses.exe",
+            "resources/tools/ffmpeg/ffmpeg.exe",
+            "resources/tools/ffmpeg/ffprobe.exe",
+            "resources/tools/x264/x264.exe",
+            "resources/tools/svt-av1/SvtAv1EncApp.exe",
+            "resources/tools/svt-av1-5fish/SvtAv1EncApp.exe",
+            "resources/tools/svt-av1-hdr/SvtAv1EncApp.exe",
+            "resources/tools/av1an/av1an.exe",
+            "resources/tools/mkvmerge/mkvmerge.exe",
+        ):
+            files[path] = native
+        archive = self.write_archive("past-acl.zip", files)
+        # The fixture rejects the discovery probe's arguments, so the run fails
+        # after the program tree has been restricted.
+        self.probe.write_bytes(native)
+        evidence = self.root / "past-acl-evidence"
+        try:
+            _, evidence, receipt = self.run_failure(archive, evidence.name)
+            self.assertTrue(receipt.get("permissions", {}).get("programReadExecuteAcl"), receipt)
+            program = evidence / "scoop" / "apps" / "jesses" / "clean-image"
+            self.assertTrue(program.is_dir())
+            # An ordinary user delete, with no ownership or ACL changes, must work.
+            shutil.rmtree(evidence)
+            self.assertFalse(evidence.exists())
+        finally:
+            self.reset_tree_access(evidence)
 
     def test_traversal_entry_is_rejected_without_escape(self) -> None:
         files = self.base_files()

@@ -58,8 +58,11 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\qualify-window
 
 The evidence destination must not exist. The runner never deletes or overwrites
 it. Preserve `qualification.json` and the `logs` directory together. The extracted
-program tree intentionally retains its restricted ACL, and generated fixtures stay
-under the disposable persisted-data tree.
+program tree is read/execute-only only while the checks run: when the run ends,
+passed or failed, the runner restores its inherited ACL and clears the read-only
+attributes, records `programAccessRestored` in the receipt, and leaves the evidence
+directory deletable by the user who ran it. Generated fixtures stay under the
+disposable persisted-data tree.
 
 For Windows Sandbox, enable and provision Sandbox outside this procedure, map the
 input folder read-only, map a separate empty output folder writable, and run the
