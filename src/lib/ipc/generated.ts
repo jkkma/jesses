@@ -199,9 +199,10 @@ export type ToolInfo = { id: string, name: string, available: boolean, path: str
 export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean,
 /**
  * Thorough verification. Off (default), an encode checks only the
- * finished file's frame and stream counts and keeps no resume workspace.
- * On, the source and tools are fingerprinted for resume, every output
- * frame is decoded and every track is re-checked.
+ * finished file's frame and stream counts and keeps no resume workspace
+ * (AV1AN keeps its own chunk resume). On, the source and tools are
+ * fingerprinted for resume, every output frame is decoded and every track
+ * is re-checked.
  */
 fullOutputVerification?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
 

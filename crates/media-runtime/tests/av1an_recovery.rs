@@ -1511,6 +1511,41 @@ async fn segment_fixed_chunks_stop_reopen_and_resume_exact_source() {
 }
 
 #[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg and 5fish with actual Segment decoding"]
+async fn default_segment_chunks_skip_the_decoded_segment_recheck() {
+    use media_core::{Av1anChunkMethod, Av1anChunkOrder, Av1anOptions, Av1anSplitMethod};
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("segments.mkv");
+    synthesize(&input, false).await;
+    let mut encode = request(&input, &destination, VideoEncoder::SvtAv1FiveFish);
+    encode.settings.av1an_options = Some(Av1anOptions {
+        chunk_method: Av1anChunkMethod::Segment,
+        split_method: Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 120,
+        minimum_scene_frames: 12,
+        scene_downscale_height: None,
+        chunk_order: Av1anChunkOrder::Sequential,
+        ..Default::default()
+    });
+    let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
+    manager.ready().await.unwrap();
+    let job = manager.start_encode(encode).await.unwrap();
+    let finished = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert!(
+        !finished
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Verifying the complete decoded segment sequence")),
+        "{:#?}",
+        finished.logs
+    );
+    assert!(destination.is_file());
+}
+
+#[tokio::test]
 #[ignore = "requires actual av1an, libvmaf, L-SMASH and 5fish"]
 async fn vmaf_target_controls_with_framing_stop_reopen_and_resume() {
     use media_core::{Av1anOptions, Av1anSceneDetection, Av1anTargetQuality};

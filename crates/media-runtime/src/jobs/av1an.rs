@@ -642,20 +642,24 @@ impl JobManager {
             let _ = tokio::fs::remove_file(staged_video.as_ref().unwrap()).await;
         }
         recovery.retire_launch(&launch_directory).await?;
-        if matches!(
-            configured.chunk_method,
-            media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment
-        ) {
-            self.change(id, |snapshot| {
-                append_log(
-                    snapshot,
-                    "Verifying the complete decoded segment sequence against the original source."
-                        .into(),
-                )
-            })
-            .await;
+        // Decoding the joined segments against the source only re-checks
+        // av1an's result; the finished file's frame count is checked anyway.
+        if super::encode::thorough_verification(settings) {
+            if matches!(
+                configured.chunk_method,
+                media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment
+            ) {
+                self.change(id, |snapshot| {
+                    append_log(
+                        snapshot,
+                        "Verifying the complete decoded segment sequence against the original source."
+                            .into(),
+                    )
+                })
+                .await;
+            }
+            recovery.verify_segments(ffmpeg, input, cancel).await?;
         }
-        recovery.verify_segments(ffmpeg, input, cancel).await?;
         video.flush_nonempty_async().await?;
         if settings.source_filters {
             // Source graphs run inside each engine chunk. The queue/done

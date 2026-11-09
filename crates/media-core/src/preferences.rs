@@ -56,9 +56,10 @@ pub struct GeneralPreferences {
     #[ts(optional, as = "Option<_>")]
     pub mp4_faststart: bool,
     /// Thorough verification. Off (default), an encode checks only the
-    /// finished file's frame and stream counts and keeps no resume workspace.
-    /// On, the source and tools are fingerprinted for resume, every output
-    /// frame is decoded and every track is re-checked.
+    /// finished file's frame and stream counts and keeps no resume workspace
+    /// (AV1AN keeps its own chunk resume). On, the source and tools are
+    /// fingerprinted for resume, every output frame is decoded and every track
+    /// is re-checked.
     #[ts(optional, as = "Option<_>")]
     pub full_output_verification: bool,
     #[ts(optional, as = "Option<_>")]
