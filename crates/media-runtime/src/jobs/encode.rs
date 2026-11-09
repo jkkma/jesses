@@ -507,8 +507,9 @@ impl JobManager {
         // what the encode needs and checks the finished file's counts.
         let thorough = thorough_verification(settings);
         // Stream headers are enough to plan. The whole file is read for packet
-        // counts only for thorough verification, or when a selected subtitle is
-        // bound for a container that rejects empty subtitle tracks.
+        // counts only for thorough verification, when a selected subtitle is
+        // bound for a container that rejects empty subtitle tracks, or when a
+        // MOV timecode track must hold exactly one packet.
         let mut document = probe_headers(
             &ffprobe,
             &source.path,
@@ -516,7 +517,10 @@ impl JobManager {
             Some(&request.stream_indices),
         )
         .await?;
-        if thorough || container::needs_cue_counts(&output, &document, &request.stream_indices) {
+        if thorough
+            || settings.mov_timecode_track.is_some()
+            || container::needs_cue_counts(&output, &document, &request.stream_indices)
+        {
             document = probe(
                 &ffprobe,
                 &source.path,
