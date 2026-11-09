@@ -15,10 +15,10 @@ A 5-minute trim of an 18 GB 4K Dolby Vision MP4, encoded to 1080p AV1 with
 SVT-AV1-HDR, Spline (GPU) tone mapping, two Opus tracks and 25 subtitles
 converted to SubRip, spent most of its non-encoding time verifying:
 
-| Phase | First run | After the uncommitted speedups |
-| --- | --- | --- |
-| Preparation (until the encoder starts) | 2:29 | 1:45 |
-| Finishing (after the encoder exits) | ~1:27 | 0:16 |
+| Phase                                  | First run | After the uncommitted speedups |
+| -------------------------------------- | --------- | ------------------------------ |
+| Preparation (until the encoder starts) | 2:29      | 1:45                           |
+| Finishing (after the encoder exits)    | ~1:27     | 0:16                           |
 
 The remaining preparation time is mostly a whole-file packet count and hash of
 the source (~16 s), a separate decode of the trimmed range (~51 s, now partly
@@ -64,42 +64,42 @@ comparison.
 
 Before encoding:
 
-| Pass | Default run |
-| --- | --- |
-| Source header probe | Header only: no `-count_packets`, no `-show_data_hash` over the whole file. Values that later steps need from it keep coming from a pass that already reads them (see "Values to keep"). |
-| Tool version and capability checks, audio delay/conversion fixture encodes, SVT `--help` | Kept: about a second in total, and they fail early with a clear message. |
-| Packet-timestamp frame plan and first-frame read | Kept (builds the plan; no decode). |
-| Background decode of the trimmed range (`source_timing` spawn and `settle`) | Skipped. |
-| Audio decode up to the trim end (`audio::scan_until`) | Kept (builds the audio cut). |
-| Full-track audio scan without a trim (`audio::scan`) | Only where its start value is needed (MP4/MOV AAC priming); otherwise skipped. |
-| Tone-map GPU probe and peak measurement | Kept (builds the tone map). CPU-chain `check_tools` is a gate; kept, it is milliseconds. |
-| Trim interval, subtitle cue clipping, chapters, subtitle conversion | Kept. |
-| Standalone recovery `prepare` (source and tool SHA-256, external source fingerprints) | Skipped; no recovery workspace. |
+| Pass                                                                                     | Default run                                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source header probe                                                                      | Header only: no `-count_packets`, no `-show_data_hash` over the whole file. Values that later steps need from it keep coming from a pass that already reads them (see "Values to keep"). |
+| Tool version and capability checks, audio delay/conversion fixture encodes, SVT `--help` | Kept: about a second in total, and they fail early with a clear message.                                                                                                                 |
+| Packet-timestamp frame plan and first-frame read                                         | Kept (builds the plan; no decode).                                                                                                                                                       |
+| Background decode of the trimmed range (`source_timing` spawn and `settle`)              | Skipped.                                                                                                                                                                                 |
+| Audio decode up to the trim end (`audio::scan_until`)                                    | Kept (builds the audio cut).                                                                                                                                                             |
+| Full-track audio scan without a trim (`audio::scan`)                                     | Only where its start value is needed (MP4/MOV AAC priming); otherwise skipped.                                                                                                           |
+| Tone-map GPU probe and peak measurement                                                  | Kept (builds the tone map). CPU-chain `check_tools` is a gate; kept, it is milliseconds.                                                                                                 |
+| Trim interval, subtitle cue clipping, chapters, subtitle conversion                      | Kept.                                                                                                                                                                                    |
+| Standalone recovery `prepare` (source and tool SHA-256, external source fingerprints)    | Skipped; no recovery workspace.                                                                                                                                                          |
 
 During encoding:
 
-| Pass | Default run |
-| --- | --- |
-| Producer and encoder pipeline | Unchanged. |
-| `Source::verify` identity guard before each pass | Kept (file identity only; reads nothing). |
-| Encoded-video checkpoint validation (`validate_video_checkpoint`) | Skipped; the final frame-count check replaces it. |
-| Recovery checkpoint copies (`checkpoint_video`, `checkpoint_pass_one`) | Skipped. |
+| Pass                                                                   | Default run                                       |
+| ---------------------------------------------------------------------- | ------------------------------------------------- |
+| Producer and encoder pipeline                                          | Unchanged.                                        |
+| `Source::verify` identity guard before each pass                       | Kept (file identity only; reads nothing).         |
+| Encoded-video checkpoint validation (`validate_video_checkpoint`)      | Skipped; the final frame-count check replaces it. |
+| Recovery checkpoint copies (`checkpoint_video`, `checkpoint_pass_one`) | Skipped.                                          |
 
 After encoding:
 
-| Pass | Default run |
-| --- | --- |
-| Mux | Unchanged. |
-| Output probe | One probe of the finished file: stream list plus the video stream's packet count. The job fails with `OUTPUT_VALIDATION_FAILED`, removes its temporary and publishes nothing when the video frame count differs from the plan, or the output's streams differ in number or type from the planned output streams (selected source tracks plus external tracks). |
-| Copied/converted track comparisons (`trim_source` verify, external and data stream packet comparisons) | Skipped. |
-| Metadata comparisons against the expected document | Skipped. |
-| Subtitle re-reads (trim and conversion) | Skipped. |
-| Output audio decode and timeline check | Skipped. |
-| Packet-clock check and 16-frame sample | Skipped. |
-| Full output decode | Skipped (as today when the switch is off). |
-| Dynamic HDR output verification | Skipped. |
-| Recovery checkpoint of the final file | Skipped. |
-| Source identity guard and atomic publish | Kept. |
+| Pass                                                                                                   | Default run                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mux                                                                                                    | Unchanged.                                                                                                                                                                                                                                                                                                                                                     |
+| Output probe                                                                                           | One probe of the finished file: stream list plus the video stream's packet count. The job fails with `OUTPUT_VALIDATION_FAILED`, removes its temporary and publishes nothing when the video frame count differs from the plan, or the output's streams differ in number or type from the planned output streams (selected source tracks plus external tracks). |
+| Copied/converted track comparisons (`trim_source` verify, external and data stream packet comparisons) | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Metadata comparisons against the expected document                                                     | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Subtitle re-reads (trim and conversion)                                                                | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Output audio decode and timeline check                                                                 | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Packet-clock check and 16-frame sample                                                                 | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Full output decode                                                                                     | Skipped (as today when the switch is off).                                                                                                                                                                                                                                                                                                                     |
+| Dynamic HDR output verification                                                                        | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Recovery checkpoint of the final file                                                                  | Skipped.                                                                                                                                                                                                                                                                                                                                                       |
+| Source identity guard and atomic publish                                                               | Kept.                                                                                                                                                                                                                                                                                                                                                          |
 
 ## Thorough run (switch on)
 

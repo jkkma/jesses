@@ -79,12 +79,14 @@ Expected: three commits by `jkkma` as author and committer; only `.claude/` untr
 ### Task 2: One switch and a header-only source probe
 
 **Files:**
+
 - Modify: `crates/media-runtime/src/jobs/encode.rs` (~3441 helper, ~2131 and ~3451 callers, ~506 source probe)
 - Modify: `crates/media-runtime/src/jobs.rs` (~2307-2399 `probe`)
 - Modify: `crates/media-runtime/src/jobs/container.rs` (new fn near `preflight`, ~271)
 - Test: test modules in the same three files
 
 **Interfaces:**
+
 - Produces: `fn thorough_verification(settings: &media_core::EncodeSettings) -> bool` in encode.rs (rename of `full_output_verification`; same body).
 - Produces: `async fn probe_headers(executable: &Path, path: &Path, cancel: &watch::Receiver<bool>, selected: Option<&[u32]>) -> Result<Document, AppError>` in jobs.rs.
 - Produces: `fn probe_args(count_packets: bool) -> Vec<OsString>` (private, jobs.rs), used by `probe` and `probe_headers`.
@@ -159,9 +161,11 @@ Expected: all pass (457 passed).
 ### Task 3: Skip the pre-encode verification passes
 
 **Files:**
+
 - Modify: `crates/media-runtime/src/jobs/encode.rs`: `source_frames` (~2961-3048) and its caller (~772-783); the audio timeline loop (~728-759); the "Will encode"/"Validated" log (~1168); AV1AN `prepared.validate` (~1280-1282); the real-tool test at ~5897; `decoded_defects_after_the_packet_plan_fail_without_publication` (~5030)
 
 **Interfaces:**
+
 - Consumes: `thorough_verification` (Task 2).
 - Produces: `source_frames(&self, id, ffprobe, input, plan, stream, duration, trim, preview, thorough: bool, cancel)`.
 - Produces: the test `default_encode_checks_only_frame_and_stream_counts`, extended by Tasks 4 and 5.
@@ -208,10 +212,12 @@ Expected: both ignored tests pass; library suite passes.
 ### Task 4: Keep a resume workspace only in thorough runs
 
 **Files:**
+
 - Modify: `crates/media-runtime/src/jobs/encode.rs`: standalone branch (~1357-1463), QTGMC identity (~1681-1691), pass-one checkpoint (~2083-2093), checkpoint block (~2135-2162)
 - Test: `default_encode_checks_only_frame_and_stream_counts`; new `default_two_pass_encode_needs_no_resume_workspace` (encode.rs tests)
 
 **Interfaces:**
+
 - Consumes: `thorough_verification` (Task 2).
 - Produces: `standalone_recovery: Option<Recovery>` is `None` for every default run.
 
@@ -249,10 +255,12 @@ Expected: pass.
 ### Task 5: Check only frame and stream counts after the mux
 
 **Files:**
+
 - Create: `crates/media-runtime/src/jobs/output_counts.rs`; register `mod output_counts;` after `mod output_metadata;` in `crates/media-runtime/src/jobs.rs` (~96)
 - Modify: `crates/media-runtime/src/jobs/encode.rs`: `validate_video_checkpoint` (~3519-3650) and its call (~2106-2134); post-mux block (~2396-2847); `finalize_verified` call (~2854-2887); tests at ~5772 and ~5760
 
 **Interfaces:**
+
 - Consumes: `thorough_verification`, `probe_headers` (Task 2).
 - Produces: `pub(super) fn check(document: &metadata::Document, kinds: &[&str], video_position: usize, frames: usize) -> Result<(), AppError>`.
 - Produces: `pub(super) async fn verify(ffprobe: &Path, output: &Path, kinds: &[&str], video_position: usize, frames: usize, cancel: &watch::Receiver<bool>) -> Result<(), AppError>`.
@@ -315,6 +323,7 @@ Expected: all pass; clippy exits 0.
 ### Task 6: Relabel the switch
 
 **Files:**
+
 - Modify: `src/lib/features/source/SourceSettings.svelte` (~169-178)
 - Modify: `crates/media-core/src/preferences.rs` (~58-61, ~91-94 doc comments)
 - Regenerate: `src/lib/ipc/generated.ts` via `pnpm contracts`
@@ -325,13 +334,19 @@ Expected: all pass; clippy exits 0.
 - [ ] **Step 1: Write the failing Playwright test**
 
 ```ts
-test('thorough verification is off by default and travels with the encode request', async ({ page }) => {
+test('thorough verification is off by default and travels with the encode request', async ({
+  page,
+}) => {
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const settings = page.getByRole('region', { name: 'Settings' });
   const thorough = settings.getByLabel('Thorough verification (slower)');
   await expect(thorough).not.toBeChecked();
   await thorough.check();
-  await expect.poll(() => page.evaluate(() => (globalThis as any).__preferences.general.fullOutputVerification)).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() => (globalThis as any).__preferences.general.fullOutputVerification),
+    )
+    .toBe(true);
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
@@ -339,7 +354,13 @@ test('thorough verification is off by default and travels with the encode reques
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Output Path', { exact: true }).fill('/media/output');
   await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
-  await expect.poll(() => page.evaluate(() => (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'))).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
   const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
   const request = calls.find((c: any) => c.command === 'mock_start_encode').payload.request;
   expect(request.settings.encodingPreferences.fullOutputVerification).toBe(true);
@@ -374,6 +395,7 @@ Expected: test passes; contracts in sync; svelte-check 0 errors; prettier clean.
 - [ ] **Step 1: Run the ignored real-tool suites that exercise encode jobs**
 
 Run each, in the real-tool environment:
+
 - `cargo test -p media-runtime --lib -- --ignored jobs::encode`
 - `cargo test -p media-runtime --test source_trim_jobs -- --ignored`
 - the same for `source_subtitle_trim_jobs`, `source_copy_trim_jobs`, `trim_jobs`, `audio_jobs`, `tone_map_jobs`, `source_ui_controls`, `migration_hdr`.
