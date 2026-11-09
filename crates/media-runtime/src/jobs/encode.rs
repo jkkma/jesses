@@ -3751,6 +3751,13 @@ fn decoder_args_with_subtitles(
     } else {
         plan
     };
+    // FFmpeg 6.x subtracts the file's start time, which an AAC track's codec
+    // delay can place half a frame before the video. Passed through to the
+    // Y4M frame clock, two frames would then round to the same tick. Start the
+    // producer timeline at zero after every other filter; FFmpeg 7+ already
+    // delivers such files from zero, and trims inside the graph are unaffected.
+    let zero_timeline =
+        !plan.cadence_reconciled && !plan.has_source_filters() && !plan.uses_source_output_trim();
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -3854,11 +3861,19 @@ fn decoder_args_with_subtitles(
                 bitmap,
             )
         };
+        let (filter, label) = if zero_timeline {
+            (
+                format!("{filter};[jesses_video]setpts=PTS-STARTPTS[jesses_timeline]"),
+                "[jesses_timeline]",
+            )
+        } else {
+            (filter, "[jesses_video]")
+        };
         args.extend([
             "-filter_complex".into(),
             filter.into(),
             "-map".into(),
-            "[jesses_video]".into(),
+            label.into(),
         ]);
     } else {
         args.extend(["-map".into(), format!("0:{}", plan.video_index).into()]);
@@ -3866,6 +3881,14 @@ fn decoder_args_with_subtitles(
             plan.decoder_filter()
         } else {
             plan.decoder_filter_with_text(text)
+        };
+        let filter = if zero_timeline {
+            Some(filter.map_or_else(
+                || "setpts=PTS-STARTPTS".to_owned(),
+                |filter| format!("{filter},setpts=PTS-STARTPTS"),
+            ))
+        } else {
+            filter
         };
         if let Some(filter) = filter {
             args.extend(["-vf".into(), filter.into()]);
@@ -4831,6 +4854,59 @@ mod tests {
             })
             .collect();
         assert_eq!(codecs, ["-c:0 copy", "-c:1 libopus", "-c:2 mov_text"]);
+    }
+
+    fn producer_plan() -> (Document, Plan) {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"-0.021"},
+            "streams":[
+                {"index":0,"codec_type":"video","codec_name":"ffv1","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":2,"channel_layout":"stereo","sample_rate":"48000","start_time":"-0.021"}
+            ]
+        }))
+        .unwrap();
+        let selected = document.selected(&[0, 1]).unwrap();
+        let plan = Plan::build(&document, &selected, &EncodeSettings::default()).unwrap();
+        (document, plan)
+    }
+
+    fn argument_after<'a>(args: &'a [OsString], flag: &str) -> &'a str {
+        let position = args.iter().position(|arg| arg == flag).expect(flag);
+        args[position + 1].to_str().unwrap()
+    }
+
+    /// FFmpeg 6.x shifts every stream by the file's start time, which an AAC
+    /// track's codec delay makes about half a 23.976 fps frame early. Passed
+    /// through to Y4M, two frames then round to the same tick and the muxer
+    /// stops. The producer timeline therefore starts at zero after all other
+    /// filters, as FFmpeg 7+ already delivers for such files.
+    #[test]
+    fn passthrough_producer_starts_its_timeline_at_zero() {
+        let (_, plan) = producer_plan();
+        let args = decoder_args(Path::new("input.mkv"), &plan);
+        assert_eq!(argument_after(&args, "-fps_mode"), "passthrough");
+        assert!(
+            argument_after(&args, "-vf").ends_with(",setpts=PTS-STARTPTS"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn bitmap_subtitle_producer_starts_its_timeline_at_zero() {
+        let (_, plan) = producer_plan();
+        let args = decoder_args_with_subtitles(
+            Path::new("input.mkv"),
+            &plan,
+            None,
+            Some((Path::new("subtitles.mkv"), 0, 0.0)),
+        );
+        assert_eq!(argument_after(&args, "-fps_mode"), "passthrough");
+        let label = argument_after(&args, "-map");
+        assert!(
+            argument_after(&args, "-filter_complex")
+                .ends_with(&format!("setpts=PTS-STARTPTS{label}")),
+            "{args:?}"
+        );
     }
 
     /// A source title such as "BTM DDP5.1 Atmos" names the source codec and
