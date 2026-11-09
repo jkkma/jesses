@@ -219,7 +219,10 @@ public static class CleanProcessFixture
         evidence = self.root / "past-acl-evidence"
         try:
             _, evidence, receipt = self.run_failure(archive, evidence.name)
-            self.assertTrue(receipt.get("permissions", {}).get("programReadExecuteAcl"), receipt)
+            # The restriction was applied and then lifted. An elevated runner can
+            # still write through the restricted ACL, so the run may stop at that
+            # check instead of at discovery; both happen after the restriction.
+            self.assertIs(receipt.get("programAccessRestored"), True, receipt)
             program = evidence / "scoop" / "apps" / "jesses" / "clean-image"
             self.assertTrue(program.is_dir())
             # An ordinary user delete, with no ownership or ACL changes, must work.
