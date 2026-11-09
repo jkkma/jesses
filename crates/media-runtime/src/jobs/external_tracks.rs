@@ -658,21 +658,19 @@ impl ExternalTracks {
         for stream in &mut document.streams {
             super::output_metadata::strip_stream(stream, settings);
         }
+        for stream in &mut document.streams {
+            if let Some(metadata) = self.track_metadata(stream, settings) {
+                metadata.apply(stream);
+            }
+        }
         document.streams.extend(self.tracks.iter().map(|track| {
             let mut stream = track.stream.clone();
             super::output_metadata::strip_stream(&mut stream, settings);
-            track.metadata.apply(&mut stream);
+            if let Some(metadata) = self.track_metadata(&stream, settings) {
+                metadata.apply(&mut stream);
+            }
             stream
         }));
-        for track in &settings.track_overrides {
-            if let Some(stream) = document
-                .streams
-                .iter_mut()
-                .find(|stream| stream.index == track.stream_index)
-            {
-                TrackMetadata::primary(track).apply(stream);
-            }
-        }
         if let Some(slot) = self.metadata_input {
             document.format = self.inputs[self.mux_inputs[slot].input]
                 .document
@@ -830,18 +828,59 @@ impl ExternalTracks {
         Ok(())
     }
 
-    pub fn track_metadata(&self, index: u32, settings: &EncodeSettings) -> Option<TrackMetadata> {
-        self.tracks
+    /// The title, language and flags written for one output stream. A
+    /// converted audio track whose title names its source format ("DDP5.1
+    /// Atmos") is retitled for the written codec and layout, whether the title
+    /// was set explicitly or would be copied from the source tags.
+    pub fn track_metadata(
+        &self,
+        stream: &Stream,
+        settings: &EncodeSettings,
+    ) -> Option<TrackMetadata> {
+        let external = self
+            .tracks
             .iter()
-            .find(|track| track.stream.index == index)
-            .map(|track| track.metadata.clone())
-            .or_else(|| {
-                settings
-                    .track_overrides
-                    .iter()
-                    .find(|track| track.stream_index == index)
-                    .map(TrackMetadata::primary)
-            })
+            .find(|track| track.stream.index == stream.index);
+        let mut metadata = external.map(|track| track.metadata.clone()).or_else(|| {
+            settings
+                .track_overrides
+                .iter()
+                .find(|track| track.stream_index == stream.index)
+                .map(TrackMetadata::primary)
+        });
+        let converted = external
+            .map_or_else(
+                || {
+                    settings
+                        .audio
+                        .iter()
+                        .find(|track| track.stream_index == stream.index)
+                },
+                |track| track.audio.as_ref(),
+            )
+            .filter(|track| track.codec != AudioCodec::Copy);
+        if let Some(track) = converted {
+            let title = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone())
+                .or_else(|| {
+                    (settings.copy_metadata != Some(false))
+                        .then(|| {
+                            stream
+                                .tags
+                                .iter()
+                                .find(|(key, _)| key.eq_ignore_ascii_case("title"))
+                                .map(|(_, value)| value.clone())
+                        })
+                        .flatten()
+                });
+            if let Some(title) = title.and_then(|title| {
+                audio::converted_title(&title, track.codec, audio::expected_channels(stream, track))
+            }) {
+                metadata.get_or_insert_with(TrackMetadata::default).title = Some(title);
+            }
+        }
+        metadata
     }
 
     pub fn verify_metadata_overrides(
@@ -862,7 +901,7 @@ impl ExternalTracks {
             )
         });
         for (source, actual) in selected.iter().zip(&output.streams) {
-            if let Some(options) = self.track_metadata(source.index, settings) {
+            if let Some(options) = self.track_metadata(source, settings) {
                 for (key, expected) in [("title", &options.title), ("language", &options.language)]
                 {
                     if let Some(expected) = expected {

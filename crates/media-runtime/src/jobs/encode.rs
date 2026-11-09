@@ -981,7 +981,7 @@ impl JobManager {
             .iter()
             .filter(|stream| {
                 external
-                    .track_metadata(stream.index, settings)
+                    .track_metadata(stream, settings)
                     .is_some_and(|options| options.default == Some(false))
             })
             .map(|stream| stream.index)
@@ -4496,7 +4496,7 @@ fn mux_args(
                 disposition.into()
             },
         ]);
-        if let Some(options) = external.track_metadata(stream.index, settings) {
+        if let Some(options) = external.track_metadata(stream, settings) {
             for (key, value) in [
                 ("title", options.title.clone()),
                 ("handler_name", options.title),
@@ -4831,6 +4831,69 @@ mod tests {
             })
             .collect();
         assert_eq!(codecs, ["-c:0 copy", "-c:1 libopus", "-c:2 mov_text"]);
+    }
+
+    /// A source title such as "BTM DDP5.1 Atmos" names the source codec and
+    /// channel layout. Once that track is converted, the output title must
+    /// name what was actually written, whether the title came from Quick
+    /// Convert's track override or only from the copied source tag.
+    #[test]
+    fn mux_retitles_converted_audio_whose_title_names_the_source_format() {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"0"},
+            "streams":[
+                {"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"},
+                {"index":1,"codec_type":"audio","codec_name":"eac3","channels":6,"channel_layout":"5.1(side)","sample_rate":"48000","tags":{"title":"BTM DDP5.1 Atmos"}}
+            ]
+        }))
+        .unwrap();
+        let selected = document.selected(&[0, 1]).unwrap();
+        let audio = vec![
+            serde_json::from_value(serde_json::json!({
+                "streamIndex":1,"codec":"opus","bitrateKbps":128,"channels":"stereo"
+            }))
+            .unwrap(),
+        ];
+        let with_override = EncodeSettings {
+            audio: audio.clone(),
+            track_overrides: vec![
+                serde_json::from_value(serde_json::json!({
+                    "streamIndex":1,"title":"BTM DDP5.1 Atmos","language":"eng","default":true
+                }))
+                .unwrap(),
+            ],
+            ..EncodeSettings::default()
+        };
+        let tags_only = EncodeSettings {
+            audio,
+            ..EncodeSettings::default()
+        };
+        for settings in [with_override, tags_only] {
+            let plan = Plan::build(&document, &selected, &settings).unwrap();
+            let args = mux_args(
+                Path::new("input.mkv"),
+                Path::new("video.ivf"),
+                Path::new("output.mkv"),
+                &selected,
+                &plan,
+                &settings,
+                &super::external_tracks::ExternalTracks::default(),
+            );
+            let audio_tags: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-metadata:s:1")
+                .map(|pair| pair[1].to_str().unwrap())
+                .collect();
+            assert!(audio_tags.contains(&"title=BTM Opus 2.0"), "{audio_tags:?}");
+            assert!(
+                audio_tags.contains(&"handler_name=BTM Opus 2.0"),
+                "{audio_tags:?}"
+            );
+            assert!(
+                !audio_tags.iter().any(|tag| tag.contains("DDP")),
+                "{audio_tags:?}"
+            );
+        }
     }
 
     #[tokio::test]

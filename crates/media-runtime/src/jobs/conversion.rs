@@ -167,7 +167,7 @@ fn arguments_for_inputs(
                 flags.into()
             },
         ]);
-        if let Some(overrides) = external.track_metadata(stream.index, settings) {
+        if let Some(overrides) = external.track_metadata(stream, settings) {
             for (key, value) in [
                 ("title", overrides.title.clone()),
                 ("handler_name", overrides.title),

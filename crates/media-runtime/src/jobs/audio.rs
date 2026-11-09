@@ -31,6 +31,179 @@ fn encoder_name(codec: AudioCodec) -> &'static str {
     }
 }
 
+// Release-style audio words, longest first. A space accepts one optional
+// separator, so "e ac 3" also matches "EAC3", "E-AC-3" and "E.AC.3".
+const FORMAT_WORDS: &[&str] = &[
+    "dolby digital plus",
+    "dolby digital",
+    "dolby truehd",
+    "dolby atmos",
+    "truehd",
+    "atmos",
+    "dts hd ma",
+    "dts hd hra",
+    "dts hd",
+    "dts:x",
+    "dts x",
+    "dts es",
+    "dts",
+    "ddpa",
+    "ddp",
+    "dd+",
+    "dd",
+    "e ac 3",
+    "ac 3",
+    "he aac",
+    "aac lc",
+    "lc aac",
+    "aac",
+    "flac",
+    "alac",
+    "lpcm",
+    "pcm",
+    "opus",
+    "mp3",
+    "mp2",
+    "vorbis",
+];
+
+fn is_separator(byte: u8) -> bool {
+    matches!(byte, b' ' | b'.' | b'_' | b'-')
+}
+
+fn word_end(title: &[u8], at: usize, word: &str) -> Option<usize> {
+    let mut end = at;
+    for expected in word.bytes() {
+        if expected == b' ' {
+            if title.get(end).copied().is_some_and(is_separator) {
+                end += 1;
+            }
+        } else if title
+            .get(end)
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(&expected))
+        {
+            end += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(end)
+}
+
+/// A channel layout such as "5.1", "7.1.4" or "2.0ch".
+fn layout_end(title: &[u8], at: usize) -> Option<usize> {
+    let digit = |index: usize| title.get(index).is_some_and(u8::is_ascii_digit);
+    if !(digit(at) && title.get(at + 1) == Some(&b'.') && digit(at + 2)) {
+        return None;
+    }
+    let mut end = at + 3;
+    if title.get(end) == Some(&b'.') && digit(end + 1) {
+        end += 2;
+    }
+    if title
+        .get(end..end + 2)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b"ch"))
+    {
+        end += 2;
+    }
+    Some(end)
+}
+
+fn format_token_end(title: &[u8], at: usize) -> Option<usize> {
+    if at > 0 && title[at - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    let bounded = |end: usize| {
+        !title
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'+')
+    };
+    for word in FORMAT_WORDS {
+        if let Some(mut end) = word_end(title, at, word) {
+            let layout = if title.get(end).copied().is_some_and(is_separator) {
+                end + 1
+            } else {
+                end
+            };
+            if let Some(layout) = layout_end(title, layout) {
+                end = layout;
+            }
+            if bounded(end) {
+                return Some(end);
+            }
+        }
+    }
+    layout_end(title, at).filter(|end| bounded(*end))
+}
+
+/// A source title such as "BTM DDP5.1 Atmos" names the source codec and
+/// channel layout. After conversion those words are replaced by the codec and
+/// layout actually written ("BTM Opus 2.0"); other words are kept. Titles
+/// without such words, and titles that already match, return `None`.
+pub(super) fn converted_title(
+    title: &str,
+    codec: AudioCodec,
+    channels: Option<u32>,
+) -> Option<String> {
+    let name = match codec {
+        AudioCodec::Copy => return None,
+        AudioCodec::Opus => "Opus",
+        AudioCodec::Aac => "AAC",
+        AudioCodec::Flac => "FLAC",
+        AudioCodec::Mp3 => "MP3",
+        AudioCodec::Vorbis => "Vorbis",
+        AudioCodec::Eac3 => "E-AC-3",
+    };
+    let label = match channels {
+        Some(1) => format!("{name} 1.0"),
+        Some(2) => format!("{name} 2.0"),
+        Some(6) => format!("{name} 5.1"),
+        Some(7) => format!("{name} 6.1"),
+        Some(8) => format!("{name} 7.1"),
+        _ => name.to_owned(),
+    };
+    let bytes = title.as_bytes();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(end) = format_token_end(bytes, at) {
+            spans.push((at, end));
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    let mut result = String::with_capacity(title.len());
+    let mut cursor = 0;
+    for (number, (start, end)) in spans.iter().copied().enumerate() {
+        let between = &title[cursor..start];
+        if number == 0 {
+            result.push_str(between);
+            result.push_str(&label);
+        } else {
+            // Later words are dropped together with the separators before them.
+            result.push_str(
+                between.trim_end_matches(|c: char| c.is_ascii() && is_separator(c as u8)),
+            );
+        }
+        cursor = end;
+    }
+    result.push_str(&title[cursor..]);
+    for empty in ["()", "[]"] {
+        result = result.replace(empty, "");
+    }
+    while result.contains("  ") {
+        result = result.replace("  ", " ");
+    }
+    let result = result
+        .trim_end_matches(|c: char| c.is_ascii() && is_separator(c as u8))
+        .to_owned();
+    (result != title).then_some(result)
+}
+
 pub(super) fn converted(settings: &EncodeSettings) -> impl Iterator<Item = &AudioTrackSettings> {
     settings
         .audio
@@ -1302,6 +1475,74 @@ mod tests {
             {"index":1,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"44100","channels":2,"channel_layout":"stereo"},
             {"index":2,"codec_type":"audio","sample_rate":"48000","channels":6,"channel_layout":"5.1"}
         ]})).unwrap()
+    }
+    #[test]
+    fn converted_titles_name_the_written_codec_and_layout() {
+        for (title, codec, channels, expected) in [
+            (
+                "BTM DDP5.1 Atmos",
+                AudioCodec::Opus,
+                Some(2),
+                "BTM Opus 2.0",
+            ),
+            (
+                "English - Dolby TrueHD 7.1 Atmos",
+                AudioCodec::Aac,
+                Some(6),
+                "English - AAC 5.1",
+            ),
+            ("DTS-HD.MA.5.1", AudioCodec::Flac, Some(6), "FLAC 5.1"),
+            (
+                "Main [E-AC-3 5.1]",
+                AudioCodec::Opus,
+                Some(2),
+                "Main [Opus 2.0]",
+            ),
+            ("AAC2.0", AudioCodec::Eac3, Some(6), "E-AC-3 5.1"),
+            (
+                "Commentary (DD+ 2.0)",
+                AudioCodec::Mp3,
+                Some(1),
+                "Commentary (MP3 1.0)",
+            ),
+            (
+                "English 5.1",
+                AudioCodec::Vorbis,
+                Some(2),
+                "English Vorbis 2.0",
+            ),
+            (
+                "Main (DDP5.1) (Atmos)",
+                AudioCodec::Opus,
+                Some(2),
+                "Main (Opus 2.0)",
+            ),
+            ("BTM DDP5.1 Atmos", AudioCodec::Opus, None, "BTM Opus"),
+            ("BTM DDP5.1 Atmos", AudioCodec::Opus, Some(3), "BTM Opus"),
+        ] {
+            assert_eq!(
+                converted_title(title, codec, channels).as_deref(),
+                Some(expected),
+                "{title}"
+            );
+        }
+    }
+    #[test]
+    fn converted_titles_without_format_words_are_left_alone() {
+        for title in [
+            "Commentary",
+            "The Addams Family",
+            "Director's Cut",
+            "Stereo Mix",
+            "",
+            "Opus 2.0",
+        ] {
+            assert_eq!(
+                converted_title(title, AudioCodec::Opus, Some(2)),
+                None,
+                "{title}"
+            );
+        }
     }
     #[test]
     fn rejects_duplicate_wrong_unselected_and_invalid_audio_options() {
