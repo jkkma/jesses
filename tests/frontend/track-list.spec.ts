@@ -1,6 +1,55 @@
 import { expect, test } from '@playwright/test';
 import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
+for (const height of [600, 720]) {
+  test(`track action menus stay inside the workspace at ${height} px`, async ({ page }) => {
+    await page.setViewportSize({ width: 1152, height });
+    await installSourceEncodeFixture(page);
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    const panel = page.getByRole('region', { name: 'Track List' });
+    if (height === 600) await panel.getByRole('option').first().click();
+    for (const name of ['Select…', 'Sort…']) {
+      const menu = panel
+        .locator('details')
+        .filter({ has: page.locator('summary', { hasText: name }) });
+      await menu.locator('summary').click();
+      const workspace = (await page.locator('main').boundingBox())!;
+      for (const button of await menu.getByRole('button').all()) {
+        await button.scrollIntoViewIfNeeded();
+        const box = (await button.boundingBox())!;
+        expect(box.y).toBeGreaterThanOrEqual(workspace.y);
+        expect(box.y + box.height).toBeLessThanOrEqual(workspace.y + workspace.height);
+      }
+      await menu.locator('summary').click();
+    }
+    await panel.getByText('Select…', { exact: true }).click();
+    await panel.getByRole('button', { name: 'Check None', exact: true }).click();
+    for (const checkbox of await panel.getByRole('checkbox').all())
+      await expect(checkbox).not.toBeChecked();
+  });
+}
+
+for (const [sampleRate, displayed] of [
+  [48000, '48 kHz'],
+  [44100, '44.1 kHz'],
+] as const) {
+  test(`audio details display ${sampleRate} Hz in the correct units`, async ({ page }) => {
+    await installSourceEncodeFixture(page);
+    await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'audio' ? { ...stream, sampleRate } : stream,
+      ),
+    });
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    const panel = page.getByRole('region', { name: 'Track List' });
+    await panel.getByRole('option').filter({ hasText: 'Audio (AAC)' }).click();
+    await expect(panel.locator('pre')).toContainText(`Sample Rate: ${displayed}`);
+  });
+}
+
 // A long track list scrolls inside its own box. That box must fit the visible
 // workspace, or its last rows sit below the page edge while the list is
 // already fully scrolled and the mouse wheel cannot reach them.

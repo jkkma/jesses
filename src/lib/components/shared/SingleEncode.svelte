@@ -1973,7 +1973,19 @@
       };
     return { kind: 'container', format: outputContainer };
   }
+  function destinationStem(value: string, target: OutputTarget): string {
+    const path = value.trim();
+    // Sequence destinations are literal directory names. File destinations
+    // accept either a stem or a filename, just like the output picker.
+    if (
+      target.kind === 'image' &&
+      (target.format === 'pngSequence' || target.format === 'jpegSequence')
+    )
+      return path;
+    return path.replace(/\.(?:mp4|mkv|webm|mov|m4a|ogg|gif|png|jpe?g)$/i, '');
+  }
   function targetPath(stem: string, target: OutputTarget): string {
+    stem = destinationStem(stem, target);
     if (target.kind === 'container')
       return `${stem}.${target.format === 'matroska' ? 'mkv' : target.format}`;
     return target.format === 'gif'
@@ -2022,7 +2034,11 @@
       target = outputTarget(),
       inputPath = file.path;
     try {
-      const result = await resolveOutputPath({ inputPath, outputStem: stem, target });
+      const result = await resolveOutputPath({
+        inputPath,
+        outputStem: destinationStem(stem, target),
+        target,
+      });
       if (revision === destinationRevision && destination === stem && file?.path === inputPath)
         destination = result.outputStem;
     } catch (cause) {
@@ -3197,7 +3213,7 @@
     try {
       const resolved = await resolveOutputPath({
         inputPath: current.path,
-        outputStem: stem.trim(),
+        outputStem: destinationStem(stem, { kind: 'image', format }),
         target: { kind: 'image', format },
       });
       if (controller.signal.aborted) {
@@ -3426,7 +3442,7 @@
               ? batchItem.resolution!
               : await resolveOutputPath({
                   inputPath: entry.path,
-                  outputStem: choice.destination.trim(),
+                  outputStem: destinationStem(choice.destination, { kind: 'image', format }),
                   target: { kind: 'image', format },
                 });
           if (controller.signal.aborted) throw new Error('Canceled');
@@ -3621,7 +3637,7 @@
       if (runMode !== 'batch') {
         const resolved = await resolveOutputPath({
           inputPath: runSource.path,
-          outputStem: runStem,
+          outputStem: destinationStem(runStem, runTarget),
           target: runTarget,
         });
         request = { ...request, source: { ...request.source, outputPath: resolved.outputPath } };

@@ -22,6 +22,28 @@
   let selected = $state('');
   let extracting = $state(false);
   let extractError = $state('');
+  function fitMenu(menu: HTMLDivElement) {
+    const details = menu.closest('details')!;
+    const workspace = menu.closest('main')!;
+    const update = () => {
+      if (!details.open) return;
+      const top = Math.max(0, workspace.getBoundingClientRect().top);
+      menu.style.maxHeight = `${Math.max(0, details.getBoundingClientRect().top - top - 4)}px`;
+    };
+    const observer = new ResizeObserver(update);
+    observer.observe(workspace);
+    const rows = menu.closest('section')?.querySelector('.track-body');
+    if (rows) observer.observe(rows);
+    details.addEventListener('toggle', update);
+    window.addEventListener('resize', update);
+    return {
+      destroy() {
+        observer.disconnect();
+        details.removeEventListener('toggle', update);
+        window.removeEventListener('resize', update);
+      },
+    };
+  }
   async function extract(row: TrackSelection) {
     extracting = true;
     extractError = '';
@@ -73,7 +95,7 @@
     } else if (item.kind === 'audio') {
       lines.push(
         `Title: ${item.title?.trim() || 'None'}`,
-        `Sample Rate: ${item.sampleRate && item.sampleRate > 1 ? `${item.sampleRate} KHz` : 'None'}`,
+        `Sample Rate: ${item.sampleRate && item.sampleRate > 1 ? `${item.sampleRate / 1000} kHz` : 'None'}`,
         `Channels: ${item.channels || 'Unknown'}${item.channelLayout ? ` as ${item.channelLayout}` : ''}`,
         `Language: ${item.language || 'Unknown'}`,
       );
@@ -284,7 +306,7 @@
   <div class="actions">
     <details>
       <summary>Select…</summary>
-      <div class="menu">
+      <div class="menu" use:fitMenu>
         {#each [['all', 'Check All'], ['none', 'Check None'], ['invert', 'Invert Selection'], ['video', 'All Video Tracks'], ['audio', 'All Audio Tracks'], ['subtitle', 'All Subtitle Tracks'], ['first', 'First Track Of Each Type'], ['firstLanguage', 'First Track Of Each Language Per Type']] as [value, label]}<button
             type="button"
             disabled={blocked}
@@ -297,7 +319,7 @@
     </details>
     <details>
       <summary>Sort…</summary>
-      <div class="menu">
+      <div class="menu" use:fitMenu>
         {#each [['language:asc', 'Language (A-Z)'], ['language:desc', 'Language (Z-A)'], ['title:asc', 'Title (A-Z)'], ['title:desc', 'Title (Z-A)'], ['codec:asc', 'Codec (A-Z)'], ['codec:desc', 'Codec (Z-A)']] as [value, label]}<button
             type="button"
             disabled={blocked}
@@ -432,6 +454,9 @@
   }
   .menu {
     position: absolute;
+    bottom: 100%;
+    box-sizing: border-box;
+    overflow-y: auto;
     right: 0;
     z-index: 4;
     width: 250px;
