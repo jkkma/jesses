@@ -1,8 +1,7 @@
 name: macOS native checks and app archives
 
+# macOS support is deferred; keep validation available for explicit manual runs.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
