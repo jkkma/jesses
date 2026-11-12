@@ -6448,8 +6448,11 @@ mod tests {
         turn_thorough_off(&workspace.join("manifest.json"));
         let manager = JobManager::open(logs, history).await;
         manager.resume_job(job.id.clone()).await.unwrap();
-        let resumed = finish(manager.clone()).await;
+        finish(manager.clone()).await;
         manager.shutdown().await;
+        // Publication marks success before owned-workspace cleanup finishes.
+        // Read the final snapshot after shutdown has joined the worker.
+        let resumed = snapshot(&manager).await;
         assert_eq!(resumed.state, JobState::Succeeded, "{resumed:#?}");
         assert!(
             resumed
