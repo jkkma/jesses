@@ -117,7 +117,10 @@ jobs:
           # QTGMC needs a separately qualified VapourSynth/plugin installation.
           # The native scene prepass needs the pinned AV1AN/VSPipe/L-SMASH stack;
           # package.yml runs that exact test after building its Windows delivery.
-          cargo test -p media-runtime --lib --locked -- --include-ignored --skip qtgmc --skip jobs::av1an::scenes::tests::native_parallel_prepass_covers_all_source_frames
+          # The proof-call fixture also needs that complete package and runs there.
+          export JESSES_FFMPEG="$(command -v ffmpeg)"
+          export JESSES_FFPROBE="$(command -v ffprobe)"
+          cargo test -p media-runtime --lib --locked -- --include-ignored --skip qtgmc --skip jobs::av1an::scenes::tests::native_parallel_prepass_covers_all_source_frames --skip jobs::av1an::tests::basic_source_workflow_never_enters_either_detailed_proof
       - name: Verify per-track audio codec conversion
         if: runner.os == 'Linux'
         run: cargo test -p media-runtime --test audio_jobs --locked -- --include-ignored

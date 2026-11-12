@@ -2143,6 +2143,10 @@ impl JobManager {
                                 snapshot.standalone_recovery = Some(summary)
                             })
                             .await;
+                            #[cfg(test)]
+                            if tests::STOP_AFTER_PASS_ONE.replace(false) {
+                                self.stop_job(id.to_owned()).await?;
+                            }
                         }
                     }
                 }
@@ -4639,6 +4643,12 @@ fn mux_args(
 mod tests {
     use super::*;
 
+    thread_local! {
+        // The current-thread resume fixture stops at the committed boundary,
+        // without racing a short second pass through job-status polling.
+        pub(super) static STOP_AFTER_PASS_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[test]
     fn thorough_verification_follows_the_saved_switch() {
         let with = |full_output_verification| media_core::EncodeSettings {
@@ -6374,6 +6384,7 @@ mod tests {
         let history = fixture.0.join("history");
         // A thorough two-pass job keeps a workspace; stop it after pass one.
         let manager = JobManager::open(logs.clone(), history.clone()).await;
+        STOP_AFTER_PASS_ONE.set(true);
         let job = manager
             .start_encode(EncodeRequest {
                 source: RemuxRequest {
@@ -6410,25 +6421,6 @@ mod tests {
                     .unwrap()
             }
         };
-        tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                let current = snapshot(&manager).await;
-                assert!(!current.state.is_terminal(), "{current:#?}");
-                if current
-                    .standalone_recovery
-                    .as_ref()
-                    .is_some_and(|recovery| {
-                        recovery.phase == media_core::StandaloneRecoveryPhase::PassOneComplete
-                    })
-                {
-                    manager.stop_job(job.id.clone()).await.unwrap();
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .unwrap();
         let finish = |manager: JobManager| async move {
             tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
@@ -6444,6 +6436,10 @@ mod tests {
         };
         let stopped = finish(manager.clone()).await;
         assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+        assert_eq!(
+            stopped.standalone_recovery.as_ref().unwrap().phase,
+            media_core::StandaloneRecoveryPhase::PassOneComplete
+        );
         let workspace = PathBuf::from(&stopped.standalone_recovery.as_ref().unwrap().workspace);
         manager.shutdown().await;
         drop(manager);

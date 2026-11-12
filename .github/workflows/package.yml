@@ -220,6 +220,9 @@ jobs:
             python @gateArguments
             if ($LASTEXITCODE -ne 0) { throw 'The packaged av1an native gate failed.' }
           }
+          $env:JESSES_TEST_TOOL_RESOURCES = "$env:RUNNER_TEMP/jesses-bundled-tools"
+          cargo test -p media-runtime --lib --locked jobs::av1an::tests::basic_source_workflow_never_enters_either_detailed_proof -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'The packaged av1an verification policy gate failed.' }
       - name: Build portable application
         shell: bash
         run: |
