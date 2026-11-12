@@ -1761,13 +1761,33 @@ mod tests {
         )
         .await
         .unwrap();
+        // Hold the digest result pending: an already completed digest may
+        // legitimately win the select against cancellation.
+        let SourceStamp::Hashing(hashing) = &mut prepared.recovery.seed.source else {
+            panic!("fresh source digest must still be owned by recovery");
+        };
+        let task = hashing.task.take().unwrap();
+        let (finish, pending) = tokio::sync::oneshot::channel();
+        hashing.task = Some(tokio::spawn(async move {
+            pending.await.unwrap();
+            task.await.unwrap()
+        }));
         let (_canceler, canceled) = watch::channel(true);
         assert!(prepared.recovery.settle_source(&canceled).await.is_err());
+        assert!(matches!(
+            prepared.recovery.seed.source,
+            SourceStamp::Hashing(_)
+        ));
+        finish.send(()).unwrap();
         prepared.recovery.settle_source(&active).await.unwrap();
         assert!(matches!(
             prepared.recovery.seed.source,
             SourceStamp::Ready(_)
         ));
+        let SourceStamp::Ready(stamp) = &prepared.recovery.seed.source else {
+            unreachable!();
+        };
+        assert_eq!(stamp, &digest(&fixture.source, None).unwrap());
     }
 
     #[test]
