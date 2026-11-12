@@ -168,7 +168,7 @@
   >
   <label
     class="check"
-    title="Off: the finished file is checked by its frame and stream counts only, and an interrupted job is rerun from the start (AV1AN keeps its own chunk resume). On: the source and tools are fingerprinted so an interrupted job can resume, every frame is decoded, and every track of the output is re-checked."
+    title="Off: normal checks confirm the output and its frame and stream counts. Some AV1AN timing changes or resumed jobs with changed settings require additional checks. An interrupted job restarts, except AV1AN can resume saved chunks. On: the source and tools are fingerprinted for resume, every output frame is decoded, and every track is re-checked."
     ><input
       type="checkbox"
       checked={saved.fullOutputVerification ?? false}

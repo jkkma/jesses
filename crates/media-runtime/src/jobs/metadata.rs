@@ -85,6 +85,16 @@ fn clock_seconds(text: &str) -> Option<f64> {
     Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
+pub(super) fn track_duration(stream: &Stream) -> Option<f64> {
+    stream.duration.as_deref().and_then(seconds).or_else(|| {
+        stream
+            .tags
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("duration"))
+            .and_then(|(_, value)| clock_seconds(value))
+    })
+}
+
 impl Document {
     pub fn duration(&self) -> Option<f64> {
         self.format
@@ -154,14 +164,7 @@ impl Document {
                     Some("video" | "audio" | "subtitle" | "data")
                 )
             })
-            .filter_map(|s| {
-                s.duration.as_deref().and_then(seconds).or_else(|| {
-                    s.tags
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("duration"))
-                        .and_then(|(_, v)| clock_seconds(v))
-                })
-            })
+            .filter_map(|stream| track_duration(stream))
             .reduce(f64::max)
             .or_else(|| self.duration())
     }

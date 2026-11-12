@@ -310,9 +310,21 @@ export async function installSourceEncodeFixture(page: Page) {
           return structuredClone(state.__testJobs);
         }
         if (command === 'set_job_paused') {
+          state.__pausePreviousStates ??= {};
           state.__testJobs = state.__testJobs.map((entry: any) =>
             entry.id === payload.id
-              ? { ...entry, state: payload.paused ? 'paused' : 'running' }
+              ? {
+                  ...entry,
+                  state: payload.paused
+                    ? ((state.__pausePreviousStates[entry.id] = entry.state), 'paused')
+                    : (state.__pausePreviousStates[entry.id] ?? 'running'),
+                  logs: [
+                    ...entry.logs,
+                    payload.paused
+                      ? 'Paused the media job process trees. Memory and open files are retained.'
+                      : 'Continued the media job process trees.',
+                  ],
+                }
               : entry,
           );
           emitJobs();

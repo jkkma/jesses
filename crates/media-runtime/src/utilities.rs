@@ -350,24 +350,7 @@ fn diagnostic_tail(bytes: &[u8]) -> String {
     let raw = String::from_utf8_lossy(bytes);
     let text = raw
         .lines()
-        .filter(|line| {
-            !line.split_once('=').is_some_and(|(key, _)| {
-                matches!(
-                    key,
-                    "frame"
-                        | "fps"
-                        | "bitrate"
-                        | "total_size"
-                        | "out_time_us"
-                        | "out_time_ms"
-                        | "out_time"
-                        | "dup_frames"
-                        | "drop_frames"
-                        | "speed"
-                        | "progress"
-                ) || (key.starts_with("stream_") && key.ends_with("_q"))
-            })
-        })
+        .filter(|line| !supervisor::is_ffmpeg_progress_line(line))
         .collect::<Vec<_>>()
         .join("\n");
     let chars: Vec<char> = text.chars().collect();

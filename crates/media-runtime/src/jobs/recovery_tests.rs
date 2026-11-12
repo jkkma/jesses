@@ -62,6 +62,63 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn live_pause_and_continue_restore_av1an_verification_phase() {
+    let fixture = Fixture::new();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let slot = manager.execution.lock().await;
+    let job = manager.enqueue_encode(fixture.request()).await.unwrap();
+    manager
+        .phase(&job.id, JobState::Running, "Encoding chunks.")
+        .await;
+    manager
+        .change(&job.id, |snapshot| snapshot.progress_seconds = Some(30.0))
+        .await;
+    manager
+        .phase_with_fresh_progress(&job.id, JobState::Finalizing, "Verifying AV1AN chunks.")
+        .await;
+    let verifying = manager.list_jobs().await.remove(0);
+    assert_eq!(verifying.state, JobState::Finalizing);
+    assert_eq!(verifying.progress_seconds, None);
+    let pause = manager.state.lock().await.entries[0].pause.clone();
+    supervisor::with_pause(pause, async {
+        assert_eq!(
+            manager
+                .set_job_paused(job.id.clone(), true)
+                .await
+                .unwrap()
+                .state,
+            JobState::Paused
+        );
+        manager
+            .phase(
+                &job.id,
+                JobState::Finalizing,
+                "Checking the joined AV1AN video.",
+            )
+            .await;
+        assert_eq!(manager.list_jobs().await[0].state, JobState::Paused);
+        let continued = manager.set_job_paused(job.id.clone(), false).await.unwrap();
+        assert_eq!(continued.state, JobState::Finalizing);
+        assert_eq!(continued.progress_seconds, None);
+    })
+    .await;
+    manager.cancel_job(job.id.clone()).await.unwrap();
+    drop(slot);
+    let task = manager.state.lock().await.entries[0].task.take().unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        manager
+            .set_job_paused(job.id, false)
+            .await
+            .unwrap_err()
+            .code,
+        "JOB_NOT_PAUSABLE"
+    );
+    assert_eq!(manager.list_jobs().await[0].state, JobState::Canceled);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn stop_waits_for_workers_and_does_not_publish_or_claim_unsaved_progress() {
     let fixture = Fixture::new();
     let manager = JobManager::new(fixture.0.join("logs"));
@@ -179,6 +236,7 @@ async fn history_capacity_never_prunes_recoverable_work() {
             state.entries.push(Entry {
                 command_review: None,
                 pause: Default::default(),
+                phase_before_pause: None,
                 snapshot: JobSnapshot {
                     id: format!("saved-{index}"),
                     state: JobState::Stopped,

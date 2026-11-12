@@ -83,6 +83,25 @@ pub enum ProcessEvent {
     Stderr(String),
 }
 
+pub(crate) fn is_ffmpeg_progress_line(line: &str) -> bool {
+    line.split_once('=').is_some_and(|(key, _)| {
+        matches!(
+            key,
+            "frame"
+                | "fps"
+                | "bitrate"
+                | "total_size"
+                | "out_time_us"
+                | "out_time_ms"
+                | "out_time"
+                | "dup_frames"
+                | "drop_frames"
+                | "speed"
+                | "progress"
+        ) || (key.starts_with("stream_") && key.ends_with("_q"))
+    })
+}
+
 #[derive(Debug)]
 pub struct ProcessResult {
     pub status: ExitStatus,

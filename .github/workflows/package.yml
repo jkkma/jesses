@@ -215,6 +215,7 @@ jobs:
             $runner = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq $testSuite -and $_.executable })
             if ($runner.Count -ne 1) { throw 'Expected one exact native test runner.' }
             $gateArguments = @('scripts/qualify-package-av1an.py', '--runner', $runner[0].executable, '--resources', "$env:RUNNER_TEMP/jesses-bundled-tools", '--receipt', "$env:RUNNER_TEMP/jesses-portable-$testSuite.json")
+            if ($testSuite -eq 'av1an_jobs') { $gateArguments += '--verify-video-only' }
             if ($testSuite -eq 'av1an_recovery') { $gateArguments += @('--skip-test', 'configured_source_readers_and_fixed_chunks_stop_reopen_and_resume') }
             python @gateArguments
             if ($LASTEXITCODE -ne 0) { throw 'The packaged av1an native gate failed.' }

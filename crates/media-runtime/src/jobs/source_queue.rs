@@ -59,6 +59,15 @@ struct Header {
 fn normalized(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !matches!(*value, "unknown" | "unspecified" | "N/A"))
 }
+pub(super) fn stream_rate(stream: &Stream) -> Option<(u32, u32)> {
+    stream
+        .avg_frame_rate
+        .as_deref()
+        .or(stream.r_frame_rate.as_deref())
+        .and_then(|rate| rate.split_once('/'))
+        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .filter(|(n, d)| *n > 0 && *d > 0)
+}
 impl Header {
     fn from_stream(stream: &Stream) -> Self {
         Self {
@@ -80,13 +89,7 @@ impl Header {
             range: stream.color_range.clone(),
             chroma: stream.chroma_location.clone(),
             side_data: stream.side_data_list.clone(),
-            rate: stream
-                .avg_frame_rate
-                .as_deref()
-                .or(stream.r_frame_rate.as_deref())
-                .and_then(|rate| rate.split_once('/'))
-                .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
-                .filter(|(n, d)| *n > 0 && *d > 0),
+            rate: stream_rate(stream),
             duration: stream.duration.clone().or_else(|| {
                 stream
                     .tags
@@ -411,6 +414,8 @@ pub(in crate::jobs) async fn seal(
     policy: CountPolicy,
     cancel: &watch::Receiver<bool>,
 ) -> Result<ChunkContract, AppError> {
+    #[cfg(test)]
+    super::av1an::tests::CHUNK_PROOF_CALLS.with(|calls| calls.set(calls.get() + 1));
     let source = Source::open(path)?;
     let (bytes, file_sha256) = file_digest(&source, cancel).await?;
     // Elementary H.264/HEVC chunks have no mux timestamps. Their immutable

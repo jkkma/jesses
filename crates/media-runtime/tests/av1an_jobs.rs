@@ -1047,6 +1047,122 @@ async fn av1an_filtered_non_vmaf_targets_score_the_verified_processed_source() {
 }
 
 #[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
+async fn source_queue_default_skips_decode_and_reference_join_while_thorough_keeps_them() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    synthesize(&input, "160x120", 48).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+
+    for (name, thorough, raw_filter, resample, extension) in [
+        ("default", false, false, false, "mkv"),
+        ("thorough", true, false, false, "mkv"),
+        ("raw-filter", false, true, false, "webm"),
+        ("resample", false, false, true, "mkv"),
+    ] {
+        let output = fixture.0.join(format!("{name}.{extension}"));
+        let mut encode = request(&input, &output, 12);
+        encode.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+        encode.settings.workers = 1;
+        encode.settings.av1an_options = Some(media_core::Av1anOptions {
+            chunk_method: media_core::Av1anChunkMethod::Select,
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            maximum_chunk_frames: 0,
+            encoder_threads: Some(1),
+            concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+            source_workflow: true,
+            ..Default::default()
+        });
+        encode.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+            keyframe_interval_seconds: 10,
+            mp4_faststart: true,
+            full_output_verification: thorough,
+        });
+        if raw_filter {
+            encode.settings.source_filters = true;
+            encode.settings.av1an_filters = vec!["crop=144:112".into()];
+            encode.settings.audio.push(media_core::AudioTrackSettings {
+                stream_index: 1,
+                codec: media_core::AudioCodec::Opus,
+                bitrate_kbps: 96,
+                channels: media_core::AudioChannels::Preserve,
+                gain: None,
+                normalization: None,
+            });
+        }
+        if resample {
+            encode.settings.temporal = Some(media_core::TemporalSettings {
+                frame_rate: Some(media_core::FrameRate {
+                    numerator: 30,
+                    denominator: 1,
+                }),
+                ..Default::default()
+            });
+        }
+        let began = std::time::Instant::now();
+        let started = manager.start_encode(encode).await.unwrap();
+        let job = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+        assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+        eprintln!(
+            "{name} published after {:.2}s",
+            began.elapsed().as_secs_f64()
+        );
+        assert_eq!(
+            job.logs
+                .iter()
+                .any(|line| line.starts_with("Verifying AV1AN chunks (")),
+            thorough || resample,
+            "decoded chunk proof should follow the verification and source-count policy: {:?}",
+            job.logs
+        );
+        assert_eq!(
+            job.logs
+                .iter()
+                .any(|line| line
+                    == "Checking the joined AV1AN video against the sealed chunk queue."),
+            thorough || resample,
+            "reference join proof should follow the verification and source-count policy"
+        );
+        let decoded = probe(&output).await;
+        let streams = decoded["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0]["codec_type"], "audio");
+        assert_eq!(streams[1]["codec_name"], "av1");
+        assert_eq!(streams[1]["width"], if raw_filter { 144 } else { 160 });
+        assert_eq!(streams[1]["height"], if raw_filter { 112 } else { 120 });
+        assert_eq!(
+            streams[1]["nb_read_frames"],
+            if resample { "60" } else { "48" }
+        );
+        if resample {
+            assert_eq!(streams[1]["r_frame_rate"], "30/1");
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("resamples frames"))
+            );
+        }
+        if raw_filter {
+            assert_eq!(streams[0]["codec_name"], "opus");
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.starts_with("Final container check: 48 video frames"))
+            );
+            assert!(
+                !job.logs
+                    .iter()
+                    .any(|line| line.starts_with("Output check:")),
+                "the temporary staging file does not need its own frame count"
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, SVT-AV1, VapourSynth and L-SMASH on PATH"]
 async fn canceling_running_av1an_stops_workers_and_releases_output_handles() {
     let fixture = Fixture::new();

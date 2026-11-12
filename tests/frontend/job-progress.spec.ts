@@ -71,6 +71,26 @@ test('final checks without a frame count stay indeterminate, with them they meas
   expect(scanning.value).toBe(150);
 });
 
+test('pausing verification preserves its last step instead of reporting an encoding percentage', () => {
+  const progress = liveJobProgress(
+    job({
+      state: 'paused',
+      encodeSettings: { backend: 'av1an' },
+      progressSeconds: null,
+      durationSeconds: 305,
+      logs: [
+        'Verifying AV1AN chunks (12/55 decoded).',
+        'Paused the media job process trees. Memory and open files are retained.',
+      ],
+    }),
+    null,
+  );
+  expect(progress.text).toContain('Paused');
+  expect(progress.text).toContain('file checks may continue');
+  expect(progress.text).toContain('Verifying AV1AN chunks (12/55 decoded).');
+  expect(progress.value).toBeNull();
+});
+
 test('queued, paused, AV1AN and plain tasks keep their own labels', () => {
   expect(liveJobProgress(job({ state: 'queued' }), null).text).toBe('Queued: encode...');
   expect(
@@ -146,4 +166,52 @@ test('a single encode in preparation shows the live job step, not a blank bar', 
     'Preparing encode: Planning source frames from every packet timestamp and the first decoded frames.',
   );
   await expect(bar).not.toHaveAttribute('value');
+});
+
+test('finalizing updates stay visible through pause and continue without encoding estimates', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs = [
+      {
+        id: 'finalizing',
+        state: 'finalizing',
+        request: {
+          inputPath: '/media/in.mkv',
+          outputPath: '/media/out.webm',
+          streamIndices: [0, 1],
+        },
+        encodeSettings: { backend: 'av1an', encoder: 'svtAv1' },
+        progressSeconds: null,
+        durationSeconds: 305,
+        logs: ['Verifying AV1AN chunks (12/55 decoded).'],
+        error: null,
+        recovery: null,
+        logPath: null,
+      },
+    ];
+    host.__emitJobs();
+  });
+  const status = page.getByLabel('Current action');
+  const bar = page.getByLabel('Task progress');
+  await expect(status).toContainText('Verifying AV1AN chunks (12/55 decoded).');
+  await expect(bar).not.toHaveAttribute('value');
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await expect(status).toContainText('Paused');
+  await expect(status).toContainText('file checks may continue');
+  await expect(status).toContainText('Verifying AV1AN chunks (12/55 decoded).');
+  await expect(bar).not.toHaveAttribute('value');
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  await expect(status).toContainText('Finishing');
+  await expect(status).toContainText('Verifying AV1AN chunks (12/55 decoded).');
+  await expect(status).not.toContainText('realtime');
+  await expect(status).not.toContainText('left');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs[0].logs.push('Checking the joined AV1AN video against the sealed chunk queue.');
+    host.__emitJobs();
+  });
+  await expect(status).toContainText('Checking the joined AV1AN video');
 });

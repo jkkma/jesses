@@ -1,7 +1,10 @@
-//! The default encode's only output check: the finished file (the staging file,
-//! then any final container converted from it) holds the planned number of
-//! video frames and the planned streams, in order.
-use super::{files, metadata::Document, process_error};
+//! Check the default encode's finished file for the planned streams and video
+//! packet count, plus the applicable AV1AN video header fields.
+use super::{
+    files,
+    metadata::{Document, Stream, track_duration},
+    process_error,
+};
 use crate::supervisor::{self, CommandSpec};
 use media_core::AppError;
 use std::{ffi::OsString, path::Path, time::Duration};
@@ -11,16 +14,53 @@ fn failed(message: String) -> AppError {
     AppError::new("OUTPUT_VALIDATION_FAILED", message, None)
 }
 
-/// `kinds` lists the planned streams' codec types in output order and
-/// `video_position` is the encoded video's place among them. The encoders
-/// write one packet (access unit, temporal unit or superframe) per frame.
+#[derive(Clone, Copy)]
+pub(super) struct VideoCheck {
+    pub codec: &'static str,
+    pub dimensions: (u32, u32),
+    pub frame_seconds: Option<f64>,
+}
+
+impl VideoCheck {
+    fn verify(self, video: &Stream, frames: usize) -> Result<(), AppError> {
+        if video.codec_name.as_deref() != Some(self.codec)
+            || video.width.zip(video.height) != Some(self.dimensions)
+        {
+            return Err(failed(format!(
+                "The finished video has codec {:?} and dimensions {:?}; expected {} at {:?}.",
+                video.codec_name,
+                video.width.zip(video.height),
+                self.codec,
+                self.dimensions,
+            )));
+        }
+        // Matroska's track duration can include its start offset. Compare a
+        // declared track duration only when the video starts at zero, and
+        // allow the container's end-of-last-frame rounding.
+        if let Some(frame_seconds) = self.frame_seconds
+            && video
+                .start_time
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|start| start.abs() <= 0.001)
+            && let Some(duration) = track_duration(video)
+            && (duration - frames as f64 * frame_seconds).abs() > frame_seconds + 0.001
+        {
+            return Err(failed(format!(
+                "The finished video declares a {duration:.3}s duration; {frames} frames at the joined rate require {:.3}s.",
+                frames as f64 * frame_seconds,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `kinds` lists the planned streams' codec types in output order.
 /// An MP4/MOV file's trailing chapter track is not a planned stream.
-pub(super) fn check(
-    document: &Document,
+pub(super) fn check_streams<'a>(
+    document: &'a Document,
     kinds: &[&str],
-    video_position: usize,
-    frames: usize,
-) -> Result<(), AppError> {
+) -> Result<&'a [Stream], AppError> {
     let streams = match document.streams.split_last() {
         Some((last, planned))
             if !document.chapters.is_empty() && super::container::is_chapter_track(last) =>
@@ -38,6 +78,18 @@ pub(super) fn check(
             "The finished file's streams are {actual:?}; {kinds:?} were planned."
         )));
     }
+    Ok(streams)
+}
+
+fn check(
+    document: &Document,
+    kinds: &[&str],
+    video_position: usize,
+    frames: usize,
+) -> Result<(), AppError> {
+    // The encoders write one packet (access unit, temporal unit or superframe)
+    // per frame. `video_position` is the encoded video's place among streams.
+    let streams = check_streams(document, kinds)?;
     let counted = streams
         .get(video_position)
         .and_then(|stream| stream.nb_read_packets.as_deref())
@@ -60,6 +112,7 @@ pub(super) async fn verify(
     kinds: &[&str],
     video_position: usize,
     frames: usize,
+    video_check: Option<VideoCheck>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let mut args: Vec<OsString> = [
@@ -67,7 +120,7 @@ pub(super) async fn verify(
         "error",
         "-count_packets",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,nb_read_packets:stream_tags=handler_name:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_read_packets:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -88,7 +141,7 @@ pub(super) async fn verify(
     )
     .await
     .map_err(|cause| process_error(cause, output))?;
-    if !result.status.success() {
+    if !result.status.success() || (video_check.is_some() && !result.stderr.is_empty()) {
         return Err(files::error(
             "OUTPUT_VALIDATION_FAILED",
             format!(
@@ -105,16 +158,125 @@ pub(super) async fn verify(
             output,
         )
     })?;
-    check(&document, kinds, video_position, frames).map_err(|error| AppError {
-        path: Some(output.to_string_lossy().into_owned()),
-        ..error
-    })
+    check(&document, kinds, video_position, frames)
+        .and_then(|()| match video_check {
+            Some(check) => check.verify(&document.streams[video_position], frames),
+            None => Ok(()),
+        })
+        .map_err(|error| AppError {
+            path: Some(output.to_string_lossy().into_owned()),
+            ..error
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::jobs::metadata::Document;
+
+    #[tokio::test]
+    #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
+    async fn basic_probe_rejects_a_missing_track_and_a_physically_truncated_container() {
+        let (_sender, cancel) = watch::channel(false);
+        let ffmpeg = super::super::discover("ffmpeg", &cancel).await.unwrap();
+        let ffprobe = super::super::discover("ffprobe", &cancel).await.unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "jesses-basic-output-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(root);
+        let valid = fixture.0.join("valid.mkv");
+        let no_audio = fixture.0.join("no-audio.mkv");
+        let truncated = fixture.0.join("truncated.mkv");
+        for (output, include_audio) in [(&valid, true), (&no_audio, false)] {
+            let mut args: Vec<OsString> = [
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=10:duration=1.2",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+            if include_audio {
+                args.extend(
+                    [
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=duration=1.2",
+                        "-c:a",
+                        "pcm_s16le",
+                    ]
+                    .map(OsString::from),
+                );
+            }
+            args.extend(["-c:v", "libx264", "-preset", "ultrafast"].map(OsString::from));
+            args.push(output.as_os_str().to_owned());
+            let result = supervisor::run_capture(
+                &CommandSpec {
+                    executable: ffmpeg.clone(),
+                    args,
+                    cwd: None,
+                },
+                cancel.clone(),
+                64 * 1024,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let bytes = std::fs::read(&valid).unwrap();
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        let expectation = Some(VideoCheck {
+            codec: "h264",
+            dimensions: (64, 64),
+            frame_seconds: Some(0.1),
+        });
+        verify(
+            &ffprobe,
+            &valid,
+            &["video", "audio"],
+            0,
+            12,
+            expectation,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        for output in [no_audio, truncated] {
+            let failure = verify(
+                &ffprobe,
+                &output,
+                &["video", "audio"],
+                0,
+                12,
+                expectation,
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.code, "OUTPUT_VALIDATION_FAILED", "{failure:?}");
+        }
+    }
 
     fn document(streams: serde_json::Value) -> Document {
         serde_json::from_value(serde_json::json!({ "streams": streams })).unwrap()

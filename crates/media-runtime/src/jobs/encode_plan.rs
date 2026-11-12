@@ -411,6 +411,7 @@ pub(super) struct Plan {
     source_av1an_input_rate: (u32, u32),
     source_av1an_workflow: bool,
     source_queue: Option<std::sync::Arc<super::source_queue::Regions>>,
+    basic_source_queue: bool,
     pub cadence_reconciled: bool,
     pub tolerance: f64,
     pub primaries: u8,
@@ -1262,6 +1263,7 @@ impl Plan {
                     .av1an_options
                     .is_some_and(|options| options.source_workflow),
             source_queue: None,
+            basic_source_queue: false,
             cadence_reconciled: false,
             tolerance,
             primaries: if tone_map.is_some() {
@@ -1387,6 +1389,45 @@ impl Plan {
     }
     pub(in crate::jobs) fn has_source_queue(&self) -> bool {
         self.source_queue.is_some()
+    }
+    pub(super) fn has_basic_source_queue(&self) -> bool {
+        self.basic_source_queue
+    }
+    pub(super) fn basic_source_video_check(&self) -> Option<super::output_counts::VideoCheck> {
+        self.basic_source_queue
+            .then(|| super::output_counts::VideoCheck {
+                codec: self.output_codec(),
+                dimensions: (self.width, self.height),
+                frame_seconds: (!self.source_filters).then(|| self.frame_seconds()),
+            })
+    }
+    pub(super) fn requires_source_queue_clock_proof(&self) -> bool {
+        self.source_av1an_base_clock
+    }
+    pub(super) fn observe_source_queue_header(
+        &mut self,
+        stream: &Stream,
+        queue_rate: (u32, u32),
+    ) -> Result<(), AppError> {
+        if self.source_filters {
+            self.observe_source_filter_stream(stream, None)?;
+        } else {
+            if stream.codec_name.as_deref() != Some(self.output_codec())
+                || !self.matches_output_format(stream.pix_fmt.as_deref())
+                || (stream.width, stream.height) != (Some(self.width), Some(self.height))
+            {
+                return Err(AppError::new(
+                    "ENCODE_VALIDATION_FAILED",
+                    "The joined AV1AN video does not match the planned codec, pixel format or dimensions.",
+                    None,
+                ));
+            }
+            self.output_sar = aspect::parse_source(stream.sample_aspect_ratio.as_deref())?;
+        }
+        (self.fps_num, self.fps_den) =
+            super::source_queue::stream_rate(stream).unwrap_or(queue_rate);
+        self.basic_source_queue = true;
+        Ok(())
     }
     pub fn without_source_filter_rows(&self) -> Self {
         let mut plan = self.clone();

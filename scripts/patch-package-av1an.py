@@ -1,4 +1,4 @@
-"""Apply pinned timestamp, segment, scorer, software-probe and metric fixes."""
+"""Apply pinned timestamp, segment, scorer, probe, metric and video-only fixes."""
 
 import argparse
 import difflib
@@ -19,7 +19,8 @@ def patch_source(source, archive_path, patch_path):
     with archive_path.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != SOURCE_SHA256:
             raise ValueError("The av1an patch requires the exact pinned upstream archive.")
-    paths = ["av1an-core/src/context.rs", "av1an/src/main.rs", "av1an-core/src/encoder/mod.rs", "av1an-core/src/encoder/tests.rs", "av1an-core/src/vapoursynth.rs", "av1an-core/src/metrics/xpsnr.rs", "av1an-core/src/metrics/vmaf.rs", "av1an-core/src/target_quality.rs", "av1an-core/src/settings.rs", "av1an-core/src/split/mod.rs"]
+    concat_path = "av1an-core/src/concat/mod.rs"
+    paths = ["av1an-core/src/context.rs", "av1an/src/main.rs", "av1an-core/src/encoder/mod.rs", "av1an-core/src/encoder/tests.rs", "av1an-core/src/vapoursynth.rs", "av1an-core/src/metrics/xpsnr.rs", "av1an-core/src/metrics/vmaf.rs", "av1an-core/src/target_quality.rs", "av1an-core/src/settings.rs", "av1an-core/src/split/mod.rs", concat_path]
     original = {}
     with tarfile.open(archive_path) as archive:
         for path in paths:
@@ -334,6 +335,83 @@ mod source_probe_filter_tests {
     segment = original[paths[9]]
     if '"-vsync"' in segment or segment.count('        "-fps_mode",\n        "passthrough",') != 1:
         raise ValueError("The pinned source segment FFmpeg 9 behavior is absent.")
+    context = changed[paths[0]]
+    for before, after in [
+        ("""        crossbeam_utils::thread::scope(|s| -> anyhow::Result<()> {
+            // vapoursynth audio is currently unsupported
+            let audio_thread = (self.args.input.is_video()
+""", """        // Jesses applies the audio and subtitle recipe after the video join.
+        // Its existing flags remove every stream that could enter audio.mkv.
+        let include_audio_sidecar = !self.args.audio_params.iter().map(String::as_str)
+            .eq(["-an", "-sn", "-dn", "-map", "-0:t?"]);
+        crossbeam_utils::thread::scope(|s| -> anyhow::Result<()> {
+            // vapoursynth audio is currently unsupported
+            let audio_thread = (include_audio_sidecar
+                && self.args.input.is_video()
+"""),
+        ("""            // TODO add explicit parameter to concatenation functions to control whether
+            // audio is also muxed in
+""", ""),
+        ("""                        self.args.encoder,
+                        total_chunks,
+                        if self.args.ignore_frame_mismatch {
+""", """                        self.args.encoder,
+                        total_chunks,
+                        include_audio_sidecar,
+                        if self.args.ignore_frame_mismatch {
+"""),
+        ("""                    concat::ffmpeg(self.args.temp.as_ref(), self.args.output_file.as_ref())?;
+""", """                    concat::ffmpeg(
+                        self.args.temp.as_ref(),
+                        self.args.output_file.as_ref(),
+                        include_audio_sidecar,
+                    )?;
+"""),
+    ]:
+        if context.count(before) != 1:
+            raise ValueError("The pinned video-only encode and concat call sites changed.")
+        context = context.replace(before, after)
+    changed[paths[0]] = context
+
+    concat = original[concat_path]
+    for before, after in [
+        ("""    num_chunks: usize,
+    output_fps: Option<Rational64>,
+""", """    num_chunks: usize,
+    include_audio_sidecar: bool,
+    output_fps: Option<Rational64>,
+"""),
+        ("""    let audio_file = PathBuf::from(&temp_dir).join("audio.mkv");
+    let audio_file = PathAbs::new(&audio_file)?;
+    let audio_file = audio_file.as_path().exists().then(|| fix_path(audio_file));
+""", """    let audio_file = if include_audio_sidecar {
+        let file = PathAbs::new(PathBuf::from(&temp_dir).join("audio.mkv"))?;
+        file.as_path().exists().then(|| fix_path(file))
+    } else {
+        None
+    };
+"""),
+        ("""pub fn ffmpeg(temp: &Path, output: &Path) -> anyhow::Result<()> {
+""", """pub fn ffmpeg(temp: &Path, output: &Path, include_audio_sidecar: bool) -> anyhow::Result<()> {
+"""),
+        ("""    let audio_file = {
+        let file = temp.join("audio.mkv");
+        (file.exists() && file.metadata().expect("file should have metadata").len() > 1000)
+            .then_some(file)
+    };
+""", """    let audio_file = if include_audio_sidecar {
+        let file = temp.join("audio.mkv");
+        (file.exists() && file.metadata().expect("file should have metadata").len() > 1000)
+            .then_some(file)
+    } else {
+        None
+    };
+"""),
+    ]:
+        if concat.count(before) != 1:
+            raise ValueError("The pinned FFmpeg or mkvmerge audio sidecar handling changed.")
+        concat = concat.replace(before, after)
+    changed[concat_path] = concat
     patch_text = "".join("".join(difflib.unified_diff(original[path].splitlines(keepends=True), value.splitlines(keepends=True), fromfile="a/" + path, tofile="b/" + path)) for path, value in changed.items())
     with patch_path.open("x", encoding="utf-8", newline="\n") as output:
         output.write(patch_text)

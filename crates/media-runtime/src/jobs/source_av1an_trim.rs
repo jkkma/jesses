@@ -186,6 +186,14 @@ fn arguments(input: &Path, output: &Path, section: &Section) -> Vec<OsString> {
     ])
     .collect()
 }
+
+fn copy_diagnostic(event: ProcessEvent) -> Option<String> {
+    match event {
+        ProcessEvent::Stdout(line) if supervisor::is_ffmpeg_progress_line(&line) => None,
+        ProcessEvent::Stdout(line) | ProcessEvent::Stderr(line) => Some(line),
+    }
+}
+
 fn publish_source(temporary: &mut Temporary, output: &Path) -> Result<Source, AppError> {
     let expected = file_identity(&temporary.clone_file()?)?;
     temporary.publish(output)?;
@@ -403,7 +411,7 @@ impl Prepared {
                 workspace,
             });
         }
-        manager.phase(id,JobState::Preparing,"Stream-copying the source AV1AN section with the fork's original keyframe/preroll semantics.").await;
+        manager.phase_with_fresh_progress(id,JobState::Preparing,"Stream-copying the source AV1AN section with the fork's original keyframe/preroll semantics.").await;
         let guard = rate_control::Stats::durable(&root, false)?;
         let directory = identity(&root)?;
         let mut creating = Creating {
@@ -481,11 +489,23 @@ impl Prepared {
                     snapshot.log_path = Some(copy_log.to_string_lossy().into_owned());
                     snapshot.duration_seconds =
                         Some((section.end_ms - section.start_ms) as f64 / 1000.0);
-                    snapshot.progress_seconds = Some(0.0);
                 })
                 .await;
-            let (sender, events) = tokio::sync::mpsc::channel(256);
-            let observer = manager.observe_encode(id, events, None);
+            // The cut's copy clock measures only this subprocess. Keep its
+            // progress protocol in the dedicated tool log and report the
+            // preparation steps independently of the upcoming encode.
+            let (sender, mut events) = tokio::sync::mpsc::channel(256);
+            let observer_manager = manager.clone();
+            let job_id = id.to_owned();
+            let observer = tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if let Some(line) = copy_diagnostic(event) {
+                        observer_manager
+                            .change(&job_id, |snapshot| append_log(snapshot, line))
+                            .await;
+                    }
+                }
+            });
             let run = supervisor::run(
                 &CommandSpec {
                     executable: ffmpeg.clone(),
@@ -511,6 +531,13 @@ impl Prepared {
                     ),
                 ));
             }
+            manager
+                .phase_with_fresh_progress(
+                    id,
+                    JobState::Preparing,
+                    "Verifying the stream-copied AV1AN section.",
+                )
+                .await;
             temporary.flush_nonempty_async().await?;
             let actual = probe(&ffprobe, &temporary.path, cancel, None).await?;
             let proof = packets::verify(
@@ -767,6 +794,35 @@ pub(in crate::jobs) fn discard_variants_except(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_activity_keeps_diagnostics_from_both_streams() {
+        for line in [
+            "frame=1200",
+            "fps=0.00",
+            "stream_0_0_q=-1.0",
+            "bitrate=9299.4kbits/s",
+            "total_size=23288052",
+            "out_time_us=20034000",
+            "out_time_ms=20034000",
+            "out_time=00:00:20.034000",
+            "dup_frames=0",
+            "drop_frames=0",
+            "speed=618x",
+            "progress=end",
+        ] {
+            assert_eq!(copy_diagnostic(ProcessEvent::Stdout(line.into())), None);
+            assert_eq!(
+                copy_diagnostic(ProcessEvent::Stderr(line.into())).as_deref(),
+                Some(line)
+            );
+        }
+        let diagnostic = "diagnostic=unexpected stdout";
+        assert_eq!(
+            copy_diagnostic(ProcessEvent::Stdout(diagnostic.into())).as_deref(),
+            Some(diagnostic)
+        );
+    }
 
     #[test]
     fn published_cut_adopts_immutable_source_without_writable_alias() {

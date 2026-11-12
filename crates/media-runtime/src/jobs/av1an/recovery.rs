@@ -2,6 +2,7 @@
 //! never sufficient authority to run saved commands or remove a directory.
 use super::*;
 use crate::jobs::files::WorkspaceLock;
+use crate::jobs::source_queue::{self, ChunkContract, Regions};
 use media_core::{Av1anRecovery, RecoveryPhase, VideoEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,9 +16,13 @@ use std::{
 const LIMIT: usize = 16 * 1024 * 1024;
 static WRITE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
+type DigestReadHook = Box<dyn FnMut(&Path)>;
+#[cfg(test)]
 thread_local! {
     static REMOVE_ENUMERATED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CUT_SLOT_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static COUNT_SOURCE_HASHES: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
+    static DIGEST_FIRST_READ_HOOK: std::cell::RefCell<Option<DigestReadHook>> = const { std::cell::RefCell::new(None) };
 }
 
 fn error(path: &Path, message: impl Into<String>) -> AppError {
@@ -103,6 +108,14 @@ fn tool_contents_match(saved: &[Stamp], current: &[Stamp]) -> bool {
 }
 
 fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
+    #[cfg(test)]
+    COUNT_SOURCE_HASHES.with(|counter| {
+        if let Some((counted, reads)) = counter.borrow_mut().as_mut()
+            && counted == path
+        {
+            *reads += 1;
+        }
+    });
     let before = identity(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
@@ -128,6 +141,14 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
             .map_err(|e| error(path, e.to_string()))?;
         if read == 0 {
             break;
+        }
+        #[cfg(test)]
+        if length == 0 {
+            DIGEST_FIRST_READ_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(path);
+                }
+            });
         }
         length += read as u64;
         hasher.update(&bytes[..read]);
@@ -276,6 +297,84 @@ struct Chunk {
     decoded_contract: Option<super::super::source_queue::ChunkContract>,
 }
 
+struct SourceSealBatch {
+    manifest: Manifest,
+    tools: [Source; 2],
+    pending: usize,
+}
+
+impl SourceSealBatch {
+    async fn prove<F: Future<Output = ()>>(
+        &self,
+        cancel: &watch::Receiver<bool>,
+        mut report: impl FnMut(usize, usize) -> F,
+    ) -> Result<BTreeMap<String, ChunkContract>, AppError> {
+        let total = self.manifest.completed.len();
+        let mut verified = total - self.pending;
+        report(verified, total).await;
+        let mut contracts = BTreeMap::new();
+        for (name, chunk) in &self.manifest.completed {
+            if chunk.decoded_contract.is_some() {
+                continue;
+            }
+            check_cancel(cancel)?;
+            let contract = super::super::encode::boxed(|| {
+                source_queue::seal(
+                    &self.tools[0].path,
+                    &self.tools[1].path,
+                    &chunk.file.path,
+                    chunk.frames,
+                    queue_settings(&self.manifest).encoder,
+                    queue_count_policy(&self.manifest),
+                    cancel,
+                )
+            })
+            .await?;
+            verify_chunk_contract(chunk, &contract)?;
+            contracts.insert(name.clone(), contract);
+            verified += 1;
+            report(verified, total).await;
+        }
+        Ok(contracts)
+    }
+}
+
+fn verify_chunk_contract(chunk: &Chunk, contract: &ChunkContract) -> Result<(), AppError> {
+    if contract.source_frames != chunk.frames
+        || contract.bytes != chunk.file.length
+        || format!(
+            "{:x}",
+            sha2::digest::Output::<Sha256>::from(contract.file_sha256)
+        ) != chunk.file.sha256
+    {
+        return Err(error(
+            &chunk.file.path,
+            "The decoded contract differs from its immutable source chunk receipt.",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) struct SourceJoin {
+    pub(super) regions: Arc<Regions>,
+    pub(super) rate: (u32, u32),
+    pub(super) chunks: Vec<super::source_queue_concat::SealedChunk>,
+    pub(super) method: media_core::Av1anConcatMethod,
+    pub(super) source_rate: (u32, u32),
+    pub(super) force_rate: bool,
+}
+
+pub(super) enum SourceJoinMode {
+    Basic {
+        frames: usize,
+        rate: (u32, u32),
+        method: media_core::Av1anConcatMethod,
+    },
+    Detailed {
+        reason: &'static str,
+    },
+}
+
 /// Immutable authority for an already sealed engine queue. New argv belongs
 /// to Manifest.settings/params/filter; it cannot rewrite these old commands.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +482,10 @@ struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target_scenes: Option<Stamp>,
     completed: BTreeMap<String, Chunk>,
+    /// A workspace may retain changed-source or manually edited chunks even
+    /// after a later attempt returns to the frozen queue settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_chunk_history_needs_proof: Option<bool>,
     #[serde(default)]
     segments: Vec<Stamp>,
     intermediate: Identity,
@@ -429,6 +532,30 @@ fn queue_count_policy(manifest: &Manifest) -> super::super::source_queue::CountP
         super::super::source_queue::CountPolicy::SourceTypedResample
     } else {
         super::super::source_queue::CountPolicy::ExactSourceFrames
+    }
+}
+
+fn source_recipe_changed(manifest: &Manifest, recipe: &QueueRecipe) -> bool {
+    recipe.source != manifest.source
+        || recipe.original_source != manifest.original_source
+        || recipe.source_filter != manifest.source_filter
+        || recipe.settings.encoder != manifest.settings.encoder
+        || recipe.pixel_format != manifest.pixel_format
+}
+
+fn record_source_chunk_provenance(manifest: &mut Manifest) {
+    if manifest.queue_recipe.as_ref().is_some_and(|recipe| {
+        manifest.edited_command.is_some() || source_recipe_changed(manifest, recipe)
+    }) {
+        manifest.source_chunk_history_needs_proof = Some(true);
+    }
+}
+
+fn source_concat_method(settings: &EncodeSettings) -> media_core::Av1anConcatMethod {
+    if super::encoder::uses_mkvmerge(settings.encoder, settings) {
+        media_core::Av1anConcatMethod::Mkvmerge
+    } else {
+        media_core::Av1anConcatMethod::Ffmpeg
     }
 }
 fn queue_options(manifest: &Manifest) -> media_core::Av1anOptions {
@@ -1157,6 +1284,9 @@ impl Workspace {
         if receipts.total_frames != queue_frames(&self.manifest)
             || receipts.completed_frames > receipts.total_frames
             || receipts.queued_chunks == 0
+            || (required
+                && (receipts.completed_frames != receipts.total_frames
+                    || receipts.completed.len() != receipts.queued_chunks))
             || receipts
                 .script_path
                 .as_ref()
@@ -1327,6 +1457,7 @@ impl Workspace {
                     "Completed chunk length differs from its receipt.",
                 ));
             }
+            record_source_chunk_provenance(&mut self.manifest);
             self.manifest.completed.insert(
                 chunk.name,
                 Chunk {
@@ -1340,6 +1471,9 @@ impl Workspace {
         Ok(())
     }
     fn verify_saved(&self, cancel: Option<&watch::Receiver<bool>>) -> Result<(), AppError> {
+        if let Some(cancel) = cancel {
+            check_cancel(cancel)?;
+        }
         if let Some(recipe) = &self.manifest.queue_recipe {
             for stamp in recipe.tools.iter().chain(std::iter::once(
                 recipe.original_source.as_ref().unwrap_or(&recipe.source),
@@ -1391,6 +1525,98 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    fn verify_source_seal(&self, cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
+        self.verify_owner()?;
+        self.verify_saved(Some(cancel))?;
+        if self.manifest.queue_recipe.is_none() {
+            for tool in &self.manifest.tools {
+                if digest(&tool.path, Some(cancel))? != *tool {
+                    return Err(error(&tool.path, "A frozen source queue tool changed."));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_source_seal(
+        &self,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Option<SourceSealBatch>, AppError> {
+        if !source_workflow(&self.manifest.settings) {
+            return Ok(None);
+        }
+        check_cancel(cancel)?;
+        let tools = self
+            .manifest
+            .queue_recipe
+            .as_ref()
+            .map_or(&self.manifest.tools, |recipe| &recipe.tools);
+        let [ffmpeg, ffprobe, ..] = tools.as_slice() else {
+            return Err(error(
+                &self.root,
+                "The saved source queue has no qualified FFmpeg pair.",
+            ));
+        };
+        let pending = self
+            .manifest
+            .completed
+            .values()
+            .filter(|chunk| chunk.decoded_contract.is_none())
+            .count();
+        if pending == 0 {
+            // The join and New Settings action verify their own saved inputs.
+            return Ok(None);
+        }
+        // On Windows these handles prevent writes/deletion during proof. A
+        // fresh content and identity check still brackets the whole batch.
+        let tools = [Source::open(&ffmpeg.path)?, Source::open(&ffprobe.path)?];
+        self.verify_source_seal(cancel)?;
+        Ok(Some(SourceSealBatch {
+            manifest: self.manifest.clone(),
+            tools,
+            pending,
+        }))
+    }
+
+    fn commit_source_seal(
+        &mut self,
+        batch: &SourceSealBatch,
+        contracts: BTreeMap<String, ChunkContract>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        if self.manifest != batch.manifest {
+            return Err(error(
+                &self.root,
+                "The saved source queue changed during decoded chunk verification.",
+            ));
+        }
+        // Do not checkpoint a proof made against changed bytes or a stale
+        // recipe. One transaction publishes the batch, leaving existing
+        // completed chunks and proofs usable if verification is interrupted.
+        self.verify_source_seal(cancel)?;
+        let path = self.root.join("manifest.json");
+        let saved: Manifest = serde_json::from_slice(&bytes(&path)?)
+            .map_err(|cause| error(&path, cause.to_string()))?;
+        if saved != batch.manifest {
+            return Err(error(
+                &path,
+                "The durable source queue changed during verification.",
+            ));
+        }
+        check_cancel(cancel)?;
+        self.transaction(|workspace| {
+            for (name, contract) in contracts {
+                workspace
+                    .manifest
+                    .completed
+                    .get_mut(&name)
+                    .expect("unchanged batch manifest")
+                    .decoded_contract = Some(contract);
+            }
+            Ok(())
+        })
     }
 
     fn target_artifacts(&self) -> Result<Vec<PathBuf>, AppError> {
@@ -2044,69 +2270,10 @@ impl OwnedRecovery {
         &mut self,
         cancel: &watch::Receiver<bool>,
     ) -> Result<(), AppError> {
-        if !source_workflow(&self.workspace.manifest.settings) {
-            return Ok(());
-        }
-        self.workspace.verify_saved(Some(cancel))?;
-        let tools = self
-            .workspace
-            .manifest
-            .queue_recipe
-            .as_ref()
-            .map_or(&self.workspace.manifest.tools, |recipe| &recipe.tools);
-        if tools.len() < 2 {
-            return Err(error(
-                &self.workspace.root,
-                "The saved source queue has no qualified FFmpeg pair.",
-            ));
-        }
-        for tool in tools {
-            if digest(&tool.path, Some(cancel))? != *tool {
-                return Err(error(&tool.path, "A frozen source queue tool changed."));
-            }
-        }
-        let (ffmpeg, ffprobe) = (tools[0].path.clone(), tools[1].path.clone());
-        let pending = self
-            .workspace
-            .manifest
-            .completed
-            .iter()
-            .filter(|(_, chunk)| chunk.decoded_contract.is_none())
-            .map(|(name, chunk)| (name.clone(), chunk.clone()))
-            .collect::<Vec<_>>();
-        for (name, chunk) in pending {
-            let policy = queue_count_policy(&self.workspace.manifest);
-            let contract = super::super::encode::boxed(|| {
-                super::super::source_queue::seal(
-                    &ffmpeg,
-                    &ffprobe,
-                    &chunk.file.path,
-                    chunk.frames,
-                    queue_settings(&self.workspace.manifest).encoder,
-                    policy,
-                    cancel,
-                )
-            })
-            .await?;
-            if contract.bytes != chunk.file.length
-                || format!(
-                    "{:x}",
-                    sha2::digest::Output::<Sha256>::from(contract.file_sha256)
-                ) != chunk.file.sha256
-            {
-                return Err(error(
-                    &chunk.file.path,
-                    "The decoded source chunk does not match its sealed byte receipt.",
-                ));
-            }
-            self.workspace.verify_saved(Some(cancel))?;
+        if let Some(batch) = self.workspace.prepare_source_seal(cancel)? {
+            let contracts = batch.prove(cancel, |_, _| std::future::ready(())).await?;
             self.workspace
-                .manifest
-                .completed
-                .get_mut(&name)
-                .expect("owned completed chunk")
-                .decoded_contract = Some(contract);
-            self.workspace.save()?;
+                .commit_source_seal(&batch, contracts, cancel)?;
         }
         Ok(())
     }
@@ -2225,6 +2392,7 @@ impl OwnedRecovery {
             fs::create_dir(&encode).map_err(|e| error(&encode, e.to_string()))?;
         }
         w.manifest.completed.clear();
+        w.manifest.source_chunk_history_needs_proof = Some(false);
         w.manifest.phase = RecoveryPhase::Encoding;
         w.manifest.final_video = None;
         let video = video_path(&w.root, queue_settings(&w.manifest));
@@ -2356,124 +2524,22 @@ impl OwnedRecovery {
 }
 
 impl Recovery {
-    pub(in crate::jobs) async fn seal_source_chunks(
+    pub(super) async fn seal_source_chunks<F: Future<Output = ()> + Send>(
         &self,
         cancel: &watch::Receiver<bool>,
+        report: impl FnMut(usize, usize) -> F + Send,
     ) -> Result<(), AppError> {
-        let pending = self
-            .with(|workspace| {
-                if !source_workflow(&workspace.manifest.settings) {
-                    return Ok(None);
-                }
-                workspace.verify_saved(None)?;
-                let tools = workspace
-                    .manifest
-                    .queue_recipe
-                    .as_ref()
-                    .map_or(&workspace.manifest.tools, |recipe| &recipe.tools);
-                if tools.len() < 2 {
-                    return Err(error(
-                        &workspace.root,
-                        "The source queue has no qualified FFmpeg pair.",
-                    ));
-                }
-                let policy = queue_count_policy(&workspace.manifest);
-                Ok(Some((
-                    tools[0].path.clone(),
-                    tools[1].path.clone(),
-                    queue_settings(&workspace.manifest).encoder,
-                    policy,
-                    workspace
-                        .manifest
-                        .completed
-                        .iter()
-                        .filter(|(_, chunk)| chunk.decoded_contract.is_none())
-                        .map(|(name, chunk)| (name.clone(), chunk.clone()))
-                        .collect::<Vec<_>>(),
-                )))
-            })
+        let preparing = cancel.clone();
+        let batch = self
+            .with(move |workspace| workspace.prepare_source_seal(&preparing))
             .await?;
-        let Some((ffmpeg, ffprobe, encoder, policy, pending)) = pending else {
-            return Ok(());
-        };
-        for (name, chunk) in pending {
-            let contract = super::super::encode::boxed(|| {
-                super::super::source_queue::seal(
-                    &ffmpeg,
-                    &ffprobe,
-                    &chunk.file.path,
-                    chunk.frames,
-                    encoder,
-                    policy,
-                    cancel,
-                )
-            })
-            .await?;
-            if contract.bytes != chunk.file.length
-                || format!(
-                    "{:x}",
-                    sha2::digest::Output::<Sha256>::from(contract.file_sha256)
-                ) != chunk.file.sha256
-            {
-                return Err(error(
-                    &chunk.file.path,
-                    "The decoded source chunk differs from its sealed byte receipt.",
-                ));
-            }
-            self.with(move |workspace| {
-                workspace.transaction(|workspace| {
-                    workspace.verify_saved(None)?;
-                    let current = workspace.manifest.completed.get_mut(&name).ok_or_else(|| {
-                        error(
-                            &workspace.root,
-                            "The source completed-chunk receipt disappeared.",
-                        )
-                    })?;
-                    if current.frames != chunk.frames || current.file != chunk.file {
-                        return Err(error(
-                            &chunk.file.path,
-                            "The source completed-chunk receipt changed during decode proof.",
-                        ));
-                    }
-                    current.decoded_contract = Some(contract);
-                    Ok(())
-                })
-            })
-            .await?;
+        if let Some(batch) = batch {
+            let contracts = batch.prove(cancel, report).await?;
+            let cancel = cancel.clone();
+            self.with(move |workspace| workspace.commit_source_seal(&batch, contracts, &cancel))
+                .await?;
         }
         Ok(())
-    }
-    pub(in crate::jobs) async fn source_regions(
-        &self,
-    ) -> Result<Option<(Arc<super::super::source_queue::Regions>, (u32, u32))>, AppError> {
-        self.with(|workspace| {
-            if !source_workflow(&workspace.manifest.settings) {
-                return Ok(None);
-            }
-            workspace.verify_saved(None)?;
-            let chunks = workspace
-                .manifest
-                .completed
-                .values()
-                .map(|chunk| {
-                    chunk.decoded_contract.clone().ok_or_else(|| {
-                        error(
-                            &chunk.file.path,
-                            "The source queue has an unsealed decoded chunk.",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let regions = super::super::source_queue::Regions::new(chunks)?;
-            if regions.source_frames() != queue_frames(&workspace.manifest) {
-                return Err(error(
-                    &workspace.root,
-                    "Decoded source chunks do not cover the complete frozen source ordinals.",
-                ));
-            }
-            Ok(Some((regions, queue_rate(&workspace.manifest))))
-        })
-        .await
     }
     pub(in crate::jobs) async fn queue_frame_count(&self) -> Result<usize, AppError> {
         self.with(|workspace| {
@@ -2486,66 +2552,107 @@ impl Recovery {
         })
         .await
     }
-    pub(in crate::jobs) async fn source_join_inputs(
+
+    pub(super) async fn source_join_mode(
         &self,
-    ) -> Result<
-        Option<(
-            Vec<super::source_queue_concat::SealedChunk>,
-            media_core::Av1anConcatMethod,
-            (u32, u32),
-            bool,
-        )>,
-        AppError,
-    > {
-        self.with(|workspace| {
+        requires_clock: bool,
+    ) -> Result<Option<SourceJoinMode>, AppError> {
+        self.with(move |workspace| {
+            let manifest = &workspace.manifest;
+            if !source_workflow(&manifest.settings) {
+                return Ok(None);
+            }
+            workspace.verify_owner()?;
+            let recipe = manifest.queue_recipe.as_ref().ok_or_else(|| {
+                error(&workspace.root, "The joined source video has no frozen queue.")
+            })?;
+            if manifest
+                .completed
+                .values()
+                .try_fold(0u64, |total, chunk| total.checked_add(chunk.frames))
+                != Some(recipe.total_frames)
+                || manifest.completed.is_empty()
+            {
+                return Err(error(
+                    &workspace.root,
+                    "The completed chunk receipts do not cover the frozen source queue.",
+                ));
+            }
+            let reason = if super::super::encode::thorough_verification(&manifest.settings) {
+                Some("Thorough verification is enabled.")
+            } else if requires_clock {
+                Some("The original Dolby Vision base-layer clock needs decoded timing verification.")
+            } else if recipe.ignore_frame_mismatch
+                || super::options::source_resamples(&manifest.settings, workspace.source_rate)
+            {
+                Some("The source queue resamples frames and needs its actual decoded count and clock.")
+            } else if source_recipe_changed(manifest, recipe)
+                || manifest.source_chunk_history_needs_proof.unwrap_or_else(|| {
+                    // Old workspaces with contracts do not record whether an
+                    // earlier New Settings attempt changed the retained video.
+                    manifest.completed.values().any(|chunk| chunk.decoded_contract.is_some())
+                })
+            {
+                Some("The saved queue may contain chunks from a changed source recipe or an edited command.")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Ok(Some(SourceJoinMode::Detailed { reason }));
+            }
+            let frames = usize::try_from(recipe.total_frames).map_err(|_| {
+                error(&workspace.root, "The source queue frame count exceeds this platform.")
+            })?;
+            Ok(Some(SourceJoinMode::Basic { frames, rate: queue_rate(manifest), method: source_concat_method(&manifest.settings) }))
+        })
+        .await
+    }
+    pub(super) async fn source_join_inputs(
+        &self,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Option<SourceJoin>, AppError> {
+        let cancel = cancel.clone();
+        self.with(move |workspace| {
             if !source_workflow(&workspace.manifest.settings) {
                 return Ok(None);
             }
-            workspace.verify_saved(None)?;
-            let chunks = workspace
-                .manifest
-                .completed
-                .values()
-                .map(|chunk| {
-                    let contract = chunk.decoded_contract.as_ref().ok_or_else(|| {
-                        error(
-                            &chunk.file.path,
-                            "The source join needs a decoded contract for every sealed chunk.",
-                        )
-                    })?;
-                    if contract.source_frames != chunk.frames
-                        || contract.bytes != chunk.file.length
-                        || format!(
-                            "{:x}",
-                            sha2::digest::Output::<Sha256>::from(contract.file_sha256)
-                        ) != chunk.file.sha256
-                    {
-                        return Err(error(
-                            &chunk.file.path,
-                            "The decoded contract differs from its immutable source chunk receipt.",
-                        ));
-                    }
-                    Ok(super::source_queue_concat::SealedChunk {
-                        path: chunk.file.path.clone(),
-                        bytes: contract.bytes,
-                        sha256: contract.file_sha256,
-                        source_frames: contract.source_frames,
-                        decoded_frames: contract.frames,
-                    })
-                })
-                .collect::<Result<Vec<_>, AppError>>()?;
+            workspace.verify_source_seal(&cancel)?;
+            let mut chunks = Vec::with_capacity(workspace.manifest.completed.len());
+            let mut contracts = Vec::with_capacity(chunks.capacity());
+            for chunk in workspace.manifest.completed.values() {
+                let contract = chunk.decoded_contract.as_ref().ok_or_else(|| {
+                    error(
+                        &chunk.file.path,
+                        "The source join needs a decoded contract for every sealed chunk.",
+                    )
+                })?;
+                verify_chunk_contract(chunk, contract)?;
+                chunks.push(super::source_queue_concat::SealedChunk {
+                    path: chunk.file.path.clone(),
+                    bytes: contract.bytes,
+                    sha256: contract.file_sha256,
+                    source_frames: contract.source_frames,
+                    decoded_frames: contract.frames,
+                });
+                contracts.push(contract.clone());
+            }
+            let regions = Regions::new(contracts)?;
+            if regions.source_frames() != queue_frames(&workspace.manifest) {
+                return Err(error(
+                    &workspace.root,
+                    "Decoded source chunks do not cover the complete frozen source ordinals.",
+                ));
+            }
             let settings = &workspace.manifest.settings;
-            let method = if super::encoder::uses_mkvmerge(settings.encoder, settings) {
-                media_core::Av1anConcatMethod::Mkvmerge
-            } else {
-                media_core::Av1anConcatMethod::Ffmpeg
-            };
-            Ok(Some((
+            let method = source_concat_method(settings);
+            Ok(Some(SourceJoin {
+                regions,
+                rate: queue_rate(&workspace.manifest),
                 chunks,
                 method,
-                workspace.source_rate,
-                !super::options::source_resamples(settings, workspace.source_rate),
-            )))
+                source_rate: workspace.source_rate,
+                force_rate: !super::options::source_resamples(settings, workspace.source_rate),
+            }))
         })
         .await
     }
@@ -2862,6 +2969,7 @@ impl Recovery {
                     target_scenes: None,
                     segments: Vec::new(),
                     completed: BTreeMap::new(),
+                    source_chunk_history_needs_proof: Some(false),
                     intermediate: identity(&intermediate.path)?,
                     final_video: None,
                 };
@@ -3224,16 +3332,22 @@ impl Recovery {
         })
         .await
     }
-    pub(in crate::jobs) async fn finalizing(&self) -> Result<Av1anRecovery, AppError> {
-        self.with(|w| {
+    pub(in crate::jobs) async fn finalizing(
+        &self,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Av1anRecovery, AppError> {
+        let cancel = cancel.clone();
+        self.with(move |w| {
             w.transaction(|w| {
                 for chunk in &w.chunks {
+                    check_cancel(&cancel)?;
                     chunk.verify()?;
                 }
                 w.manifest.final_video = Some(digest(
                     &video_path(&w.root, queue_settings(&w.manifest)),
-                    None,
+                    Some(&cancel),
                 )?);
+                check_cancel(&cancel)?;
                 w.manifest.phase = RecoveryPhase::Finalizing;
                 Ok(())
             })?;
@@ -3733,6 +3847,7 @@ mod tests {
                 target_artifacts: Vec::new(),
                 target_scenes: None,
                 completed: BTreeMap::new(),
+                source_chunk_history_needs_proof: Some(false),
                 segments: Vec::new(),
                 intermediate: identity(&intermediate.path).unwrap(),
                 final_video: None,
@@ -3775,6 +3890,330 @@ mod tests {
             source_filter: manifest.source_filter.clone(),
             ignore_frame_mismatch,
         }
+    }
+
+    fn source_seal_fixture(fixture: &Fixture, count: u64, decode: bool) -> (Workspace, Temporary) {
+        let (mut workspace, video) = fixture.workspace();
+        let (ffmpeg, ffprobe) = if decode {
+            let ffmpeg =
+                PathBuf::from(std::env::var_os("JESSES_FFMPEG").expect("set JESSES_FFMPEG"));
+            let ffprobe = std::env::var_os("JESSES_FFPROBE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    ffmpeg.with_file_name(if cfg!(windows) {
+                        "ffprobe.exe"
+                    } else {
+                        "ffprobe"
+                    })
+                });
+            (ffmpeg, ffprobe)
+        } else {
+            let ffmpeg = fixture.0.join("ffmpeg");
+            let ffprobe = fixture.0.join("ffprobe");
+            fs::write(&ffmpeg, b"test ffmpeg bytes").unwrap();
+            fs::write(&ffprobe, b"test ffprobe bytes").unwrap();
+            (ffmpeg, ffprobe)
+        };
+        workspace.manifest.total_frames = 2 * count;
+        workspace.manifest.settings.encoder = VideoEncoder::X264;
+        workspace.manifest.settings.av1an_options = Some(media_core::Av1anOptions {
+            source_workflow: true,
+            ..Default::default()
+        });
+        workspace.manifest.tools = vec![
+            digest(&ffmpeg, None).unwrap(),
+            digest(&ffprobe, None).unwrap(),
+        ];
+        workspace.manifest.queue_recipe = Some(frozen_source_recipe(&workspace, false));
+        let directory = workspace.root.join("chunks/encode");
+        fs::create_dir_all(&directory).unwrap();
+        let encoded = directory.join("00000.h264");
+        if decode {
+            let output = std::process::Command::new(&ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=24",
+                    "-frames:v",
+                    "2",
+                    "-c:v",
+                    "libx264",
+                    "-f",
+                    "h264",
+                ])
+                .arg(&encoded)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            fs::write(&encoded, b"test chunk bytes").unwrap();
+        }
+        for index in 0..count {
+            let name = format!("{index:05}");
+            let path = directory.join(format!("{name}.h264"));
+            if index != 0 {
+                fs::copy(&encoded, &path).unwrap();
+            }
+            workspace.manifest.completed.insert(
+                name,
+                Chunk {
+                    frames: 2,
+                    file: digest(&path, None).unwrap(),
+                    decoded_contract: None,
+                },
+            );
+        }
+        workspace.save().unwrap();
+        (workspace, video)
+    }
+
+    #[tokio::test]
+    async fn source_join_mode_uses_recipe_and_count_provenance_not_unrelated_settings() {
+        let fixture = Fixture::new();
+        let (workspace, _video) = source_seal_fixture(&fixture, 2, false);
+        let recovery = Recovery {
+            root: workspace.root.clone(),
+            finalizing: true,
+            resume_chunks: true,
+            inner: Arc::new(StdMutex::new(workspace)),
+        };
+        recovery
+            .with(|workspace| {
+                workspace.manifest.settings.workers = 4;
+                workspace.manifest.settings.crf = 20;
+                workspace
+                    .manifest
+                    .settings
+                    .av1an_options
+                    .as_mut()
+                    .unwrap()
+                    .concat_method = media_core::Av1anConcatMethod::Ffmpeg;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            recovery.source_join_mode(false).await.unwrap(),
+            Some(SourceJoinMode::Basic {
+                frames: 4,
+                rate: (24, 1),
+                ..
+            })
+        ));
+        recovery
+            .with(|workspace| {
+                workspace.manifest.source_filter = Some("hflip".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("changed source recipe"))
+        );
+        recovery
+            .with(|workspace| {
+                record_source_chunk_provenance(&mut workspace.manifest);
+                workspace.manifest.source_filter = None;
+                workspace.save()?;
+                let path = workspace.root.join("manifest.json");
+                workspace.manifest = serde_json::from_slice(&bytes(&path)?)
+                    .map_err(|cause| error(&path, cause.to_string()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("changed source recipe"))
+        );
+        recovery
+            .with(|workspace| {
+                workspace.manifest.source_chunk_history_needs_proof = Some(false);
+                workspace.manifest.edited_command = Some(media_core::EditedCommand {
+                    generated: "generated".into(),
+                    arguments: "edited".into(),
+                });
+                record_source_chunk_provenance(&mut workspace.manifest);
+                workspace.manifest.edited_command = None;
+                workspace.save()?;
+                let path = workspace.root.join("manifest.json");
+                workspace.manifest = serde_json::from_slice(&bytes(&path)?)
+                    .map_err(|cause| error(&path, cause.to_string()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("edited command"))
+        );
+        recovery
+            .with(|workspace| {
+                workspace.manifest.source_chunk_history_needs_proof = Some(false);
+                workspace
+                    .manifest
+                    .queue_recipe
+                    .as_mut()
+                    .unwrap()
+                    .ignore_frame_mismatch = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("resamples frames"))
+        );
+        recovery
+            .with(|workspace| {
+                workspace.manifest.completed.remove("00000");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery.source_join_mode(false).await.err().unwrap().code,
+            "RECOVERY_INVALID"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
+    async fn sealing_multiple_decoded_chunks_hashes_the_source_only_twice() {
+        let fixture = Fixture::new();
+        let (workspace, _video) = source_seal_fixture(&fixture, 4, true);
+        COUNT_SOURCE_HASHES.with(|counter| {
+            *counter.borrow_mut() = Some((workspace.manifest.source.path.clone(), 0))
+        });
+        let mut recovery = OwnedRecovery { workspace };
+        let (_sender, cancel) = watch::channel(false);
+        let result = recovery.seal_source_chunks(&cancel).await;
+        let (_, reads) = COUNT_SOURCE_HASHES.with(|counter| counter.borrow_mut().take().unwrap());
+        result.unwrap();
+        assert!(
+            recovery
+                .workspace
+                .manifest
+                .completed
+                .values()
+                .all(|chunk| chunk.decoded_contract.is_some())
+        );
+        assert_eq!(
+            reads, 2,
+            "all pending chunks must share the before/after source hashes"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
+    async fn active_source_seal_rejects_same_length_tamper_after_the_chunk_decodes() {
+        let fixture = Fixture::new();
+        let (workspace, _video) = source_seal_fixture(&fixture, 2, true);
+        let chunk = workspace.manifest.completed["00000"].file.path.clone();
+        let original = fs::read(&chunk).unwrap();
+        let mut tampered = original.clone();
+        tampered[0] ^= 1;
+        let manifest_path = workspace.root.join("manifest.json");
+        let saved = fs::read(&manifest_path).unwrap();
+        let recovery = Recovery {
+            root: workspace.root.clone(),
+            finalizing: false,
+            resume_chunks: true,
+            inner: Arc::new(StdMutex::new(workspace)),
+        };
+        let (_sender, cancel) = watch::channel(false);
+        let result = recovery
+            .seal_source_chunks(&cancel, |verified, _| {
+                if verified == 1 {
+                    fs::write(&chunk, &tampered).unwrap();
+                }
+                std::future::ready(())
+            })
+            .await;
+        assert_eq!(result.unwrap_err().code, "RECOVERY_INVALID");
+        assert_eq!(fs::read(&manifest_path).unwrap(), saved);
+        fs::write(&chunk, original).unwrap();
+        recovery
+            .seal_source_chunks(&cancel, |_, _| std::future::ready(()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery
+                .source_join_inputs(&cancel)
+                .await
+                .unwrap()
+                .unwrap()
+                .chunks
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn source_seal_cancellation_during_full_hash_keeps_saved_receipts() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = source_seal_fixture(&fixture, 1, false);
+        let source = workspace.manifest.source.path.clone();
+        let (sender, cancel) = watch::channel(false);
+        let batch = workspace.prepare_source_seal(&cancel).unwrap().unwrap();
+        let manifest_path = workspace.root.join("manifest.json");
+        let saved = fs::read(&manifest_path).unwrap();
+        DIGEST_FIRST_READ_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == source {
+                    sender.send_replace(true);
+                }
+            }))
+        });
+        let result = workspace.commit_source_seal(&batch, BTreeMap::new(), &cancel);
+        DIGEST_FIRST_READ_HOOK.with(|hook| hook.borrow_mut().take());
+        assert_eq!(result.unwrap_err().code, "JOB_CANCELED");
+        assert_eq!(fs::read(&manifest_path).unwrap(), saved);
+        workspace.verify_saved(None).unwrap();
+    }
+
+    #[test]
+    fn source_seal_rejects_replaced_source_and_concurrent_manifest_changes() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = source_seal_fixture(&fixture, 1, false);
+        let (_sender, cancel) = watch::channel(false);
+        let batch = workspace.prepare_source_seal(&cancel).unwrap().unwrap();
+        let manifest_path = workspace.root.join("manifest.json");
+        let saved = fs::read(&manifest_path).unwrap();
+        let source = workspace.manifest.source.path.clone();
+        let original = fixture.0.join("original-source.mkv");
+        drop(workspace._source.take());
+        fs::rename(&source, &original).unwrap();
+        fs::copy(&original, &source).unwrap();
+        let result = workspace.commit_source_seal(&batch, BTreeMap::new(), &cancel);
+        assert_eq!(result.unwrap_err().code, "RECOVERY_INVALID");
+        assert_eq!(fs::read(&manifest_path).unwrap(), saved);
+        fs::remove_file(&source).unwrap();
+        fs::rename(original, &source).unwrap();
+        workspace.manifest.last_run_at = Some(1);
+        workspace.save().unwrap();
+        let updated = fs::read(&manifest_path).unwrap();
+        let result = workspace.commit_source_seal(&batch, BTreeMap::new(), &cancel);
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("saved source queue changed")
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), updated);
+        workspace.manifest.last_run_at = batch.manifest.last_run_at;
+        let result = workspace.commit_source_seal(&batch, BTreeMap::new(), &cancel);
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("durable source queue changed")
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), updated);
     }
 
     #[test]

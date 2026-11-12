@@ -209,10 +209,12 @@ async fn joined(
                 "0",
                 "-i",
             ]);
-            a.push(manifest.as_os_str().to_owned());
+            // FFmpeg's concat demuxer on Windows cannot resolve relative
+            // entries against a verbatim \\?\ manifest pathname.
+            a.push(manifest.file_name().unwrap().to_owned());
             a.extend(args(&["-map", "0", "-c", "copy"]));
             a.push(output.path.as_os_str().to_owned());
-            run(&tools.ffmpeg, a, None).await;
+            run(&tools.ffmpeg, a, Some(f.0.clone())).await;
         }
     }
     output.reopen_after_path_writer().unwrap();

@@ -1515,6 +1515,7 @@ impl JobManager {
         let staging_format = source_final_iso
             .unwrap_or_else(|| container::staging_format(&output_selected, Some(&mux_settings)));
         let mut source_iso_receipt = None;
+        let mut repack_kinds = None;
         if standalone_final.is_none() {
             *temporary = Some(if let Some(recovery) = recovery.as_ref() {
                 // A forced host exit cannot run Temporary::drop. Keep av1an's final
@@ -1879,27 +1880,23 @@ impl JobManager {
                         self.change(id, |snapshot| snapshot.recovery = None).await;
                         return Ok(());
                     }
-                    let summary = recovery.finalizing().await?;
+                    let summary = recovery.finalizing(cancel).await?;
                     self.change(id, |snapshot| snapshot.recovery = Some(summary))
                         .await;
                 } else {
-                    self.change(id,|snapshot|append_log(snapshot,"Reusing the verified durable AV1 intermediate; continuing output finalization.".into())).await;
-                    if settings.source_filters {
-                        let actual =
-                            probe(&ffprobe, &intermediate.path, cancel, Some(&[0])).await?;
-                        let stream = actual.streams.first().ok_or_else(|| {
-                            files::error(
-                                "ENCODE_VALIDATION_FAILED",
-                                "The saved filtered AV1AN stage has no video.",
-                                &intermediate.path,
-                            )
-                        })?;
-                        plan.observe_source_filter_stream(stream, None)?;
-                    }
+                    self.phase_with_fresh_progress(
+                        id,
+                        JobState::Finalizing,
+                        "Checking the saved AV1AN intermediate before finalizing output.",
+                    )
+                    .await;
                     if settings
                         .av1an_options
                         .is_some_and(|options| options.source_workflow)
-                        && let Some(actual) = super::av1an::verify_source_join(
+                    {
+                        if let Some(actual) = super::av1an::verify_source_join(
+                            self,
+                            id,
                             &ffmpeg,
                             &ffprobe,
                             mkvmerge.as_deref(),
@@ -1909,8 +1906,20 @@ impl JobManager {
                             cancel,
                         )
                         .await?
-                    {
-                        frame_count = actual;
+                        {
+                            frame_count = actual;
+                        }
+                    } else if settings.source_filters {
+                        let actual =
+                            probe_headers(&ffprobe, &intermediate.path, cancel, Some(&[0])).await?;
+                        let stream = actual.streams.first().ok_or_else(|| {
+                            files::error(
+                                "ENCODE_VALIDATION_FAILED",
+                                "The saved filtered AV1AN stage has no video.",
+                                &intermediate.path,
+                            )
+                        })?;
+                        plan.observe_source_filter_stream(stream, None)?;
                     }
                 }
             } else {
@@ -2359,13 +2368,11 @@ impl JobManager {
                 snapshot.log_path = Some(log_path.to_string_lossy().into_owned())
             })
             .await;
-            self.change(id, |snapshot| {
-            if !matches!(snapshot.state, JobState::Canceling | JobState::Stopping) {
-                snapshot.state = JobState::Finalizing;
-            }
-            snapshot.progress_seconds = None;
-            append_log(snapshot, "Muxing encoded video, applying selected audio settings, and preserving subtitles, metadata, chapters, and attachments.".into());
-        }).await;
+            self.phase_with_fresh_progress(
+                id,
+                JobState::Finalizing,
+                "Muxing encoded video, applying selected audio settings, and preserving subtitles, metadata, chapters, and attachments.",
+            ).await;
             let mux_log = log_path.with_extension("mux.log");
             let settings_attachment =
                 super::encode_settings::SettingsAttachment::prepare(&temp.path, id, settings)?;
@@ -2441,25 +2448,33 @@ impl JobManager {
                     .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
                     .chain(settings_attachment.as_ref().map(|_| "attachment"))
                     .collect();
-                super::output_counts::verify(
-                    &ffprobe,
-                    &temp.path,
-                    &kinds,
-                    video_position,
-                    frame_count,
-                    cancel,
-                )
-                .await?;
-                self.change(id, |snapshot| {
-                    append_log(
-                        snapshot,
-                        format!(
-                            "Output check: {frame_count} video frames and {} streams, as planned. Thorough verification is off; turn it on in Settings to also re-check every frame and track.",
-                            kinds.len()
-                        ),
+                if plan.has_basic_source_queue()
+                    && source_final_iso.is_none()
+                    && container::format(&output)? != media_core::ContainerFormat::Matroska
+                {
+                    repack_kinds = Some(kinds);
+                } else {
+                    super::output_counts::verify(
+                        &ffprobe,
+                        &temp.path,
+                        &kinds,
+                        video_position,
+                        frame_count,
+                        plan.basic_source_video_check(),
+                        cancel,
                     )
-                })
-                .await;
+                    .await?;
+                    self.change(id, |snapshot| {
+                        append_log(
+                            snapshot,
+                            format!(
+                                "Output check: {frame_count} video frames and {} streams, as planned. Thorough verification is off; turn it on in Settings to also re-check every frame and track.",
+                                kinds.len()
+                            ),
+                        )
+                    })
+                    .await;
+                }
             } else {
                 let mut artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
                 if let Some(attachment) = &settings_attachment {
@@ -2912,6 +2927,8 @@ impl JobManager {
                     None
                 },
                 full_verification: thorough,
+                basic_video_check: plan.basic_source_video_check(),
+                expected_kinds: repack_kinds.as_deref(),
             }),
             plan.has_alpha().then_some((
                 &plan,
@@ -4548,7 +4565,10 @@ fn mux_args(
             }
             display_num /= a;
             display_den /= a;
-            if !settings.source_filters && !plan.has_source_queue() {
+            if !settings.source_filters
+                && !plan.has_source_queue()
+                && !plan.has_basic_source_queue()
+            {
                 args.extend([
                     format!("-aspect:{index}").into(),
                     format!("{display_num}:{display_den}").into(),

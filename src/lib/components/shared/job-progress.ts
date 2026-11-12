@@ -5,12 +5,14 @@ import type { ProgressEstimate } from './progress-estimate';
 // ("    Last message repeated"); bookkeeping lines name files, not progress.
 const toolOutput = /^(?:\s|\[)/;
 const bookkeeping = /^(?:Tool|Owned temporary [^:]+|Mux log|[\w -]+ log): /;
+const pauseControl = /^(?:Paused|Continued) the media job process trees\./;
 
 /** The newest step the job reported, such as "Fingerprinting the source...". */
 export function latestStep(logs: readonly string[]): string | null {
   for (let index = logs.length - 1; index >= 0; index -= 1) {
     const line = logs[index];
-    if (!line.trim() || toolOutput.test(line) || bookkeeping.test(line)) continue;
+    if (!line.trim() || toolOutput.test(line) || bookkeeping.test(line) || pauseControl.test(line))
+      continue;
     return line.trim();
   }
   return null;
@@ -63,8 +65,11 @@ export function liveJobProgress(
       return { text: `Queued: ${task}...`, value: null, max };
     case 'paused':
       return {
-        text: `Paused${percent !== null ? ` at ${percent}%` : ''}: ${task}`,
-        value: progress ?? 0,
+        text:
+          percent === null && step
+            ? `Paused processes; file checks may continue: ${step}`
+            : `Paused${percent !== null ? ` at ${percent}%` : ''}: ${task}`,
+        value: progress,
         max,
       };
     case 'running': {

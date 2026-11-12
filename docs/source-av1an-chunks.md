@@ -71,14 +71,22 @@ to own old encoder commands, while current global filters and selected concat
 arguments apply as the pinned engine specifies. New Settings does not delete
 verified completed chunks or repartition their original scene queue.
 
-Every retained chunk has a complete decoded property/count receipt bound to
-its file identity, size and SHA-256. The final join is independently reproduced
-using the selected concat method, with no encoder/filter replay. Complete
-packet/header/order/timestamp equality and a strictly increasing independent
-decoded clock authorize the actual per-region geometry and frame count. The
-final mux still checks complete decode and exact copied video packets. This
-permits the demonstrated valid mixed-size result without widening historical
-fixed-geometry validation.
+Ordinary exact-count encodes and Saved resumes with an unchanged source
+recipe use the frozen chunk count and a joined-video header check. The muxed
+output is checked for its planned streams, video packet count, codec and
+dimensions. Declared video duration is checked for a known cadence starting
+at zero.
+Saved chunks still have identity, size and SHA-256 receipts.
+
+New Settings obtains decoded property/count receipts for retained chunks when
+the user selects that action. Mixed-source or resampled queues and the Dolby
+Vision base-layer clock still need decoded region or timing evidence. Those
+jobs and jobs with Thorough verification enabled independently reproduce the
+join with the selected concat method. Packet/header/order/timestamp equality
+and a strictly increasing decoded clock establish the actual per-region
+geometry and frame count. Older workspaces with decoded contracts and no
+mixed-chunk provenance use this detailed join check conservatively. Thorough
+verification also checks complete final decode and exact copied video packets.
 
 For source copied cuts, a stable owned decoder slot preserves the original
 queue's source path while immutable cut variants preserve rollback authority.
@@ -91,9 +99,10 @@ replacement retains original boundaries and fails with the source's EOF or
 identity, queue bytes, completed payloads and foreign workspace files fail
 closed. An initial queue made without a cut keeps its original source command.
 
-Saved resume from an already Finalizing checkpoint reconstructs the same sealed
-regions and independent concat clock before final mux; it does not rerun chunk
-encoders. The regression reproduced the former fixed-geometry rejection before
+Saved resume from an already Finalizing checkpoint reuses the sealed joined
+video. Mixed or otherwise detailed queues reconstruct their sealed regions and
+independent concat clock before the final mux. The regression reproduced the
+former fixed-geometry rejection before
 the repair. `source-finalizing-green.log` passes1/1 in62.78s and
 `native-source-finalizing-saved.json` proves120 mixed-size frames and region
 pixels, identical stage/final packets, unchanged chunk invocation count,

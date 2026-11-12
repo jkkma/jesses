@@ -1403,6 +1403,144 @@ async fn qualify_options(
 }
 
 #[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
+async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verification() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("resumed.mkv");
+    let history = fixture.0.join("history");
+    let logs = fixture.0.join("logs");
+    synthesize(&input, false).await;
+    let source_bytes = std::fs::read(&input).unwrap();
+    let mut original = request(&input, &destination, VideoEncoder::SvtAv1Hdr);
+    original.settings.av1an_options = Some(media_core::Av1anOptions {
+        source_workflow: true,
+        chunk_method: media_core::Av1anChunkMethod::Select,
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        encoder_threads: Some(1),
+        concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+        ..Default::default()
+    });
+    original.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 1,
+        mp4_faststart: true,
+        full_output_verification: false,
+    });
+
+    let manager = JobManager::open(logs.clone(), history.clone()).await;
+    let started = manager.start_encode(original.clone()).await.unwrap();
+    let partial = wait_for(&manager, &started.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.completed_frames > 0)
+    })
+    .await;
+    assert_eq!(partial.state, JobState::Running, "{partial:#?}");
+    manager.stop_job(started.id.clone()).await.unwrap();
+    let stopped = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+    assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+    manager.shutdown().await;
+    drop(manager);
+
+    let recovery = stopped.recovery.as_ref().unwrap();
+    assert_eq!(recovery.phase, RecoveryPhase::Encoding);
+    assert!((1..FRAMES).contains(&recovery.completed_frames));
+    assert_eq!(recovery.total_frames, FRAMES);
+    assert!(!destination.exists());
+    let workspace = PathBuf::from(&recovery.workspace);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("manifest.json")).unwrap()).unwrap();
+    let retained: Vec<_> = manifest["completed"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, chunk)| {
+            assert!(chunk["decoded_contract"].is_null());
+            RetainedFile::read(workspace.join("chunks/encode").join(format!("{name}.ivf")))
+        })
+        .collect();
+    assert!(!retained.is_empty());
+    assert_eq!(manifest["source_chunk_history_needs_proof"], false);
+
+    let manager = JobManager::open(logs, history).await;
+    manager.ready().await.unwrap();
+    let saved = manager.list_jobs().await.remove(0);
+    assert_eq!(saved.state, JobState::Stopped);
+    assert_eq!(saved.recovery.as_ref(), Some(recovery));
+    assert_eq!(saved.request, original.source);
+    assert_eq!(saved.encode_settings.as_ref(), Some(&original.settings));
+    manager.resume_job(saved.id.clone()).await.unwrap();
+    let reuse = format!("encoding resumed with {}/", retained.len());
+    let resumed = wait_for(&manager, &saved.id, |job| {
+        job.logs.iter().any(|line| line.contains(&reuse))
+    })
+    .await;
+    assert_eq!(resumed.state, JobState::Running, "{resumed:#?}");
+    for file in &retained {
+        file.assert_unchanged();
+    }
+    eprintln!(
+        "Retained {} unchanged chunks covering {} source frames; {}",
+        retained.len(),
+        recovery.completed_frames,
+        resumed
+            .logs
+            .iter()
+            .find(|line| line.contains(&reuse))
+            .unwrap()
+    );
+
+    let finished = wait_for(&manager, &saved.id, |job| job.state.is_terminal()).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    manager.shutdown().await;
+    assert!(
+        finished
+            .logs
+            .iter()
+            .any(|line| line == "Checking the joined AV1AN video header.")
+    );
+    assert!(
+        finished
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Output check: 720 video frames and 4 streams"))
+    );
+    assert!(
+        !finished
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Verifying AV1AN chunks (")
+                || line == "Checking the joined AV1AN video against the sealed chunk queue.")
+    );
+    assert!(!workspace.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), source_bytes);
+    let document: Value = serde_json::from_slice(
+        &output(
+            Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=codec_type,codec_name,nb_read_frames",
+                    "-of",
+                    "json",
+                ])
+                .arg(&destination),
+        )
+        .await,
+    )
+    .unwrap();
+    let streams = document["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 4);
+    assert_eq!(streams[1]["codec_name"], "av1");
+    assert_eq!(streams[1]["nb_read_frames"], FRAMES.to_string());
+    eprintln!(
+        "Basic Saved output decoded all {FRAMES} frames, kept four streams, and preserved the source."
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires pinned av1an, 5fish, FFmpeg, VapourSynth and L-SMASH"]
 async fn fivefish_stop_reopen_reject_mismatches_and_resume_existing_chunks() {
     qualify(VideoEncoder::SvtAv1FiveFish, false).await;

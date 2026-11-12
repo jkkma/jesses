@@ -145,9 +145,20 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 struct Entry {
     command_review: Option<Arc<command_edit::Session>>,
     pause: supervisor::PauseControl,
+    phase_before_pause: Option<JobState>,
     snapshot: JobSnapshot,
     cancel: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Entry {
+    fn set_active_phase(&mut self, phase: JobState) {
+        match self.snapshot.state {
+            JobState::Paused => self.phase_before_pause = Some(phase),
+            JobState::Canceling | JobState::Stopping => {}
+            _ => self.snapshot.state = phase,
+        }
+    }
 }
 
 struct Preflight {
@@ -413,6 +424,7 @@ impl JobManager {
                     state.entries.push(Entry {
                         command_review: None,
                         pause: Default::default(),
+                        phase_before_pause: None,
                         snapshot,
                         cancel,
                         task: None,
@@ -797,6 +809,7 @@ impl JobManager {
                 Entry {
                     command_review: None,
                     pause: Default::default(),
+                    phase_before_pause: None,
                     snapshot,
                     cancel,
                     task: None,
@@ -980,6 +993,7 @@ impl JobManager {
         state.entries.push(Entry {
             command_review,
             pause: Default::default(),
+            phase_before_pause: None,
             snapshot: snapshot.clone(),
             cancel,
             task: None,
@@ -1152,11 +1166,12 @@ impl JobManager {
             .await
             .map_err(|e| AppError::new("PAUSE_FAILED", e.to_string(), None))?
             .map_err(|e| AppError::new("PAUSE_FAILED", e.to_string(), None))?;
-        entry.snapshot.state = if paused {
-            JobState::Paused
-        } else {
-            JobState::Running
-        };
+        if paused && entry.snapshot.state != JobState::Paused {
+            entry.phase_before_pause = Some(entry.snapshot.state);
+            entry.snapshot.state = JobState::Paused;
+        } else if !paused && entry.snapshot.state == JobState::Paused {
+            entry.snapshot.state = entry.phase_before_pause.take().unwrap_or(JobState::Running);
+        }
         append_log(
             &mut entry.snapshot,
             if paused {
@@ -1538,12 +1553,17 @@ impl JobManager {
     }
 
     async fn change(&self, id: &str, update: impl FnOnce(&mut JobSnapshot)) {
+        self.change_entry(id, |entry| update(&mut entry.snapshot))
+            .await;
+    }
+
+    async fn change_entry(&self, id: &str, update: impl FnOnce(&mut Entry)) {
         let mut state = self.state.lock().await;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             let before = entry.snapshot.state;
             let recovery_before = entry.snapshot.recovery.clone();
             let standalone_before = entry.snapshot.standalone_recovery.clone();
-            update(&mut entry.snapshot);
+            update(entry);
             if entry.snapshot.state != before
                 || entry.snapshot.recovery != recovery_before
                 || entry.snapshot.standalone_recovery != standalone_before
@@ -1556,14 +1576,18 @@ impl JobManager {
     }
 
     async fn phase(&self, id: &str, phase: JobState, message: &str) {
-        self.change(id, |s| {
-            if !matches!(
-                s.state,
-                JobState::Canceling | JobState::Stopping | JobState::Paused
-            ) {
-                s.state = phase;
-            }
-            append_log(s, message.into());
+        self.change_entry(id, |entry| {
+            entry.set_active_phase(phase);
+            append_log(&mut entry.snapshot, message.into());
+        })
+        .await;
+    }
+
+    async fn phase_with_fresh_progress(&self, id: &str, phase: JobState, message: &str) {
+        self.change_entry(id, |entry| {
+            entry.set_active_phase(phase);
+            entry.snapshot.progress_seconds = None;
+            append_log(&mut entry.snapshot, message.into());
         })
         .await;
     }
@@ -1888,7 +1912,7 @@ impl JobManager {
         external: Option<&external_tracks::ExternalTracks>,
         temporary: &Temporary,
         output: &Path,
-        cadence: Option<container::Cadence>,
+        cadence: Option<container::Cadence<'_>>,
         alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
@@ -1907,7 +1931,7 @@ impl JobManager {
         external: Option<&external_tracks::ExternalTracks>,
         temporary: &Temporary,
         output: &Path,
-        cadence: Option<container::Cadence>,
+        cadence: Option<container::Cadence<'_>>,
         alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         dynamic_hdr: Option<DynamicHdrPublication<'_>>,
         scratch: &mut Vec<Temporary>,
@@ -1938,7 +1962,7 @@ impl JobManager {
         external: Option<&external_tracks::ExternalTracks>,
         temporary: &Temporary,
         output: &Path,
-        cadence: Option<container::Cadence>,
+        cadence: Option<container::Cadence<'_>>,
         alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         dynamic_hdr: Option<DynamicHdrPublication<'_>>,
         scratch: &mut Vec<Temporary>,

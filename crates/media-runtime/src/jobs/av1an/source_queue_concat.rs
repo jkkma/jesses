@@ -238,6 +238,8 @@ async fn reference(
     format: &str,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Temporary, AppError> {
+    #[cfg(test)]
+    super::tests::REFERENCE_JOIN_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut output = reserve(
         joined,
         "reference",
@@ -334,7 +336,7 @@ async fn reference(
     }
     Ok(output)
 }
-fn only_video(document: &Document, path: &Path) -> Result<Stream, AppError> {
+pub(super) fn only_video(document: &Document, path: &Path) -> Result<Stream, AppError> {
     if document.streams.len() != 1
         || document.streams[0].index != 0
         || document.streams[0].codec_type.as_deref() != Some("video")
@@ -345,6 +347,31 @@ fn only_video(document: &Document, path: &Path) -> Result<Stream, AppError> {
         ));
     }
     Ok(document.streams[0].clone())
+}
+pub(super) fn joined_format<'a>(
+    document: &'a Document,
+    path: &Path,
+    method: Av1anConcatMethod,
+) -> Result<&'a str, AppError> {
+    let format = document
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.as_deref())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "The joined source stage has no container declaration.",
+            )
+        })?;
+    if !matches!(format, "ivf" | "matroska,webm")
+        || (method == Av1anConcatMethod::Mkvmerge && format != "matroska,webm")
+    {
+        return Err(invalid(
+            path,
+            "The source concat stage uses an unsupported method/container pair.",
+        ));
+    }
+    Ok(format)
 }
 fn headers(expected: &Stream, actual: &Stream, path: &Path) -> Result<(), AppError> {
     if expected.codec_name != actual.codec_name
@@ -500,24 +527,7 @@ async fn verify_inner(
     let identity = temporary_digest(joined, cancel).await?;
     let actual_document = probe(ffprobe, &joined.path, cancel, Some(&[0])).await?;
     let actual = only_video(&actual_document, &joined.path)?;
-    let format = actual_document
-        .format
-        .as_ref()
-        .and_then(|format| format.format_name.as_deref())
-        .ok_or_else(|| {
-            invalid(
-                &joined.path,
-                "The joined source stage has no container declaration.",
-            )
-        })?;
-    if !matches!(format, "ivf" | "matroska,webm")
-        || (method == Av1anConcatMethod::Mkvmerge && format != "matroska,webm")
-    {
-        return Err(invalid(
-            &joined.path,
-            "The source concat stage uses an unsupported method/container pair.",
-        ));
-    }
+    let format = joined_format(&actual_document, &joined.path, method)?;
     let reference = reference(
         ffmpeg, mkvmerge, joined, chunks, method, rate, force_rate, format, cancel,
     )

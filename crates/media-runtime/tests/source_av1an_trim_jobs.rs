@@ -122,6 +122,32 @@ async fn source_av1an_cut_precedes_review_keeps_requested_duration_preroll_and_o
         )
         .await
         .unwrap();
+    let prepared = review.job.as_ref().unwrap();
+    let raw_copy_log = std::fs::read_to_string(
+        f.0.join("logs")
+            .join(format!("{}.source-cut.log", prepared.id)),
+    )
+    .unwrap();
+    assert!(raw_copy_log.contains("[stdout] progress=end"));
+    assert!(
+        prepared
+            .logs
+            .iter()
+            .all(|line| !line.starts_with("progress=") && !line.starts_with("out_time_")),
+        "FFmpeg progress belongs in the source-cut log, not the preparation activity: {:?}",
+        prepared.logs
+    );
+    assert!(
+        prepared
+            .logs
+            .iter()
+            .any(|line| line == "Verifying the stream-copied AV1AN section."),
+        "source-cut packet verification should report its own preparation step"
+    );
+    assert_eq!(
+        prepared.progress_seconds, None,
+        "the source-copy clock must not carry into the reviewed AV1AN encode"
+    );
     let cut = only_cut(&f);
     let actual = probe(&cut);
     assert_eq!(

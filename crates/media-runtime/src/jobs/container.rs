@@ -22,7 +22,7 @@ use crate::supervisor::{self, CommandSpec};
 mod tx3g;
 
 #[derive(Clone, Copy)]
-pub(super) struct Cadence {
+pub(super) struct Cadence<'a> {
     pub index: u32,
     pub numerator: u32,
     pub denominator: u32,
@@ -33,6 +33,10 @@ pub(super) struct Cadence {
     /// identical to the verified staging video. Off, the final file is checked
     /// only by its streams and its video frame count.
     pub full_verification: bool,
+    pub basic_video_check: Option<super::output_counts::VideoCheck>,
+    /// Original stream plan when a default AV1AN count is deferred to the
+    /// rewritten container. The staging header cannot define expectations.
+    pub expected_kinds: Option<&'a [&'a str]>,
 }
 
 /// Internal only. Sealed before/after full source proof, bound to this owned
@@ -417,7 +421,7 @@ fn arguments(
     output: &Path,
     document: &Document,
     container: ContainerFormat,
-    cadence: Option<Cadence>,
+    cadence: Option<Cadence<'_>>,
     timecode: Option<&TimecodeTrack>,
     faststart: bool,
 ) -> Result<Vec<OsString>, AppError> {
@@ -894,7 +898,7 @@ pub(super) async fn prepare<'a>(
     output: &Path,
     id: &str,
     cancel: &watch::Receiver<bool>,
-    cadence: Option<Cadence>,
+    cadence: Option<Cadence<'_>>,
     timecode: Option<&TimecodeTrack>,
     faststart: bool,
     scratch: &'a mut Vec<Temporary>,
@@ -945,7 +949,19 @@ pub(super) async fn prepare<'a>(
         super::check_cancel(cancel)?;
         return Ok(None);
     }
-    let mut document = super::probe(&ffprobe, &input.path, cancel, None).await?;
+    let mut document = if let Some(kinds) = cadence.and_then(|clock| clock.expected_kinds) {
+        // Count video once after rewriting the file. Before the rewrite only
+        // subtitle compatibility can require counts from the staging file.
+        let headers = if kinds.contains(&"subtitle") {
+            super::probe(&ffprobe, &input.path, cancel, None).await?
+        } else {
+            super::probe_headers(&ffprobe, &input.path, cancel, None).await?
+        };
+        super::output_counts::check_streams(&headers, kinds)?;
+        headers
+    } else {
+        super::probe(&ffprobe, &input.path, cancel, None).await?
+    };
     if !document.chapters.is_empty() && document.streams.last().is_some_and(is_chapter_track) {
         document.streams.pop();
     }
@@ -1008,18 +1024,24 @@ pub(super) async fn prepare<'a>(
     }
     artifact.flush_nonempty_async().await?;
     if let Some(clock) = cadence.filter(|_| !full_verification) {
-        let kinds: Vec<&str> = document
-            .streams
-            .iter()
-            .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
-            .chain(timecode.map(|_| "data"))
-            .collect();
+        let mut kinds: Vec<&str> = clock.expected_kinds.map_or_else(
+            || {
+                document
+                    .streams
+                    .iter()
+                    .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
+                    .collect()
+            },
+            <[&str]>::to_vec,
+        );
+        kinds.extend(timecode.map(|_| "data"));
         super::output_counts::verify(
             &ffprobe,
             &artifact.path,
             &kinds,
             clock.index as usize,
             clock.frames,
+            clock.basic_video_check,
             cancel,
         )
         .await?;
@@ -1280,7 +1302,7 @@ async fn verify_final_media(
     path: &Path,
     document: &Document,
     container: ContainerFormat,
-    cadence: Option<Cadence>,
+    cadence: Option<Cadence<'_>>,
     encoded_video_copied: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {

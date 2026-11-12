@@ -25,10 +25,12 @@ pub(super) use recovery::{
     CommandRecipe, OwnedRecovery, PreparedSource, Recovery, restore_interrupted_source_cut,
 };
 
-/// Rebuild the complete decoded-region and join clock authority for either a
-/// freshly encoded stage or a sealed stage reused during Saved finalization.
+/// Admit the joined video for either a fresh encode or Saved finalization.
+/// Only detailed mode rebuilds decoded regions and an independent join clock.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::jobs) async fn verify_source_join(
+    manager: &JobManager,
+    id: &str,
     ffmpeg: &Path,
     ffprobe: &Path,
     mkvmerge: Option<&Path>,
@@ -37,34 +39,84 @@ pub(in crate::jobs) async fn verify_source_join(
     plan: &mut Plan,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Option<usize>, AppError> {
-    super::encode::boxed(|| recovery.seal_source_chunks(cancel)).await?;
-    let Some((regions, rate)) = recovery.source_regions().await? else {
+    let Some(mode) = recovery
+        .source_join_mode(plan.requires_source_queue_clock_proof())
+        .await?
+    else {
         return Ok(None);
     };
-    let (chunks, method, source_rate, force_rate) =
-        recovery.source_join_inputs().await?.ok_or_else(|| {
-            files::error(
-                "RECOVERY_INVALID",
-                "The source join lost its sealed queue authority.",
-                &video.path,
-            )
-        })?;
+    let reason = match mode {
+        recovery::SourceJoinMode::Basic {
+            frames,
+            rate,
+            method,
+        } => {
+            manager
+                .phase(
+                    id,
+                    JobState::Finalizing,
+                    "Checking the joined AV1AN video header.",
+                )
+                .await;
+            let document = super::probe_headers(ffprobe, &video.path, cancel, Some(&[0])).await?;
+            source_queue_concat::joined_format(&document, &video.path, method)?;
+            let stream = source_queue_concat::only_video(&document, &video.path)?;
+            plan.observe_source_queue_header(&stream, rate)?;
+            return Ok(Some(frames));
+        }
+        recovery::SourceJoinMode::Detailed { reason } => reason,
+    };
+    manager
+        .change(id, |snapshot| append_log(snapshot, reason.into()))
+        .await;
+    manager
+        .phase(
+            id,
+            JobState::Finalizing,
+            "Checking AV1AN source, tools and saved chunk fingerprints.",
+        )
+        .await;
+    super::encode::boxed(|| {
+        recovery.seal_source_chunks(cancel, |verified, total| async move {
+            manager
+                .phase(
+                    id,
+                    JobState::Finalizing,
+                    &format!("Verifying AV1AN chunks ({verified}/{total} decoded)."),
+                )
+                .await;
+        })
+    })
+    .await?;
+    manager
+        .phase(
+            id,
+            JobState::Finalizing,
+            "Checking the joined AV1AN video against the sealed chunk queue.",
+        )
+        .await;
+    let Some(join) = recovery.source_join_inputs(cancel).await? else {
+        return Ok(None);
+    };
     let (header, clock) = super::encode::boxed(|| {
         source_queue_concat::verify_with_clock(
             ffmpeg,
             ffprobe,
             mkvmerge,
             video,
-            &chunks,
-            method,
-            source_rate,
-            force_rate,
+            &join.chunks,
+            join.method,
+            join.source_rate,
+            join.force_rate,
             cancel,
         )
     })
     .await?;
-    let regions = regions.with_reference_header(&header, clock)?;
-    plan.source_queue_regions(regions, rate);
+    if plan.has_source_filters() {
+        plan.observe_source_filter_stream(&header, None)?;
+    }
+    let regions = join.regions.with_reference_header(&header, clock)?;
+    plan.source_queue_regions(regions, join.rate);
     Ok(plan.source_queue_frame_count())
 }
 
@@ -188,8 +240,9 @@ pub(super) fn arguments(
         ("--log-file", log.as_os_str().to_owned()),
         ("--workers", settings.workers.to_string().into()),
         ("--video-params", params.into()),
-        // av1an starts with `-map 0`; disabling audio/subtitles/data still
-        // leaves attachments, which its concat step mistakes for valid audio.
+        // Exclude attachments as well as audio, subtitles and data. The
+        // packaged av1an recognizes this exact sequence as video-only and
+        // skips creating or reading audio.mkv.
         ("--audio-params", "-an -sn -dn -map -0:t?".into()),
     ] {
         args.extend([key.into(), value]);
@@ -554,6 +607,14 @@ impl JobManager {
         })
         .await;
         let _ = event_task.await;
+        if result.as_ref().is_ok_and(|result| result.status.success()) {
+            self.phase_with_fresh_progress(
+                id,
+                JobState::Finalizing,
+                "Verifying the completed AV1AN encode stage.",
+            )
+            .await;
+        }
         recovery.seal_target_artifacts().await?;
         let stage_cleanup = launch.cleanup();
         // The image guard is released by cleanup; release the directory guard
@@ -661,12 +722,20 @@ impl JobManager {
             recovery.verify_segments(ffmpeg, input, cancel).await?;
         }
         video.flush_nonempty_async().await?;
-        if settings.source_filters {
+        if settings
+            .av1an_options
+            .is_some_and(|options| options.source_workflow)
+        {
+            verify_source_join(
+                self, id, ffmpeg, ffprobe, mkvmerge, recovery, video, plan, cancel,
+            )
+            .await?;
+        } else if settings.source_filters {
             // Source graphs run inside each engine chunk. The queue/done
             // receipts and engine FRAME MISMATCH gate retain frame authority;
             // only the actual coded geometry/SAR is learned here, never by
             // replaying arbitrary filters over the whole source.
-            let actual = super::probe(ffprobe, &video.path, cancel, Some(&[0])).await?;
+            let actual = super::probe_headers(ffprobe, &video.path, cancel, Some(&[0])).await?;
             let stream = actual.streams.first().ok_or_else(|| {
                 files::error(
                     "ENCODE_VALIDATION_FAILED",
@@ -675,12 +744,6 @@ impl JobManager {
                 )
             })?;
             plan.observe_source_filter_stream(stream, None)?;
-        }
-        if settings
-            .av1an_options
-            .is_some_and(|options| options.source_workflow)
-        {
-            verify_source_join(ffmpeg, ffprobe, mkvmerge, recovery, video, plan, cancel).await?;
         }
         if encoder::video_extension(settings.encoder, settings) == "ivf"
             && !settings
@@ -831,9 +894,140 @@ fn normalize_ivf(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use media_core::VideoEncoder;
+
+    thread_local! {
+        pub(in crate::jobs) static CHUNK_PROOF_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static REFERENCE_JOIN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[tokio::test]
+    #[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
+    async fn basic_source_workflow_never_enters_either_detailed_proof() {
+        let resources =
+            std::env::var_os("JESSES_TEST_TOOL_RESOURCES").expect("set bundled resources");
+        crate::configure_bundled_tools(resources.into()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "jesses-source-proof-calls-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let input = root.join("source.mkv");
+        let (_owner, cancel) = watch::channel(false);
+        let ffmpeg = super::super::discover("ffmpeg", &cancel).await.unwrap();
+        let source = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args: [
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=96x64:rate=24:duration=1",
+                    "-c:v",
+                    "ffv1",
+                    "-color_primaries",
+                    "bt709",
+                    "-color_trc",
+                    "bt709",
+                    "-colorspace",
+                    "bt709",
+                    "-color_range",
+                    "tv",
+                    "-chroma_sample_location",
+                    "left",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain([input.as_os_str().to_owned()])
+                .collect(),
+                cwd: None,
+            },
+            cancel,
+            64 * 1024,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert!(
+            source.status.success(),
+            "{}",
+            String::from_utf8_lossy(&source.stderr)
+        );
+        let manager = JobManager::new(root.join("logs"));
+        for (thorough, resample) in [(false, false), (true, false), (false, true)] {
+            CHUNK_PROOF_CALLS.set(0);
+            REFERENCE_JOIN_CALLS.set(0);
+            let request = EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: root
+                        .join(format!("{thorough}-{resample}.mkv"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    backend: media_core::EncodeBackend::Av1an,
+                    encoder: VideoEncoder::SvtAv1Hdr,
+                    workers: 1,
+                    preset: 12,
+                    crf: 40,
+                    av1an_options: Some(media_core::Av1anOptions {
+                        source_workflow: true,
+                        chunk_method: media_core::Av1anChunkMethod::Select,
+                        split_method: media_core::Av1anSplitMethod::FixedChunks,
+                        encoder_threads: Some(1),
+                        concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+                        ..Default::default()
+                    }),
+                    temporal: resample.then_some(media_core::TemporalSettings {
+                        frame_rate: Some(media_core::FrameRate {
+                            numerator: 30,
+                            denominator: 1,
+                        }),
+                        ..Default::default()
+                    }),
+                    encoding_preferences: Some(media_core::EncodingPreferences {
+                        keyframe_interval_seconds: 10,
+                        mp4_faststart: true,
+                        full_output_verification: thorough,
+                    }),
+                    ..Default::default()
+                },
+            };
+            let submitted = manager.start_encode(request).await.unwrap();
+            let finished = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let job = manager
+                        .list_jobs()
+                        .await
+                        .into_iter()
+                        .find(|job| job.id == submitted.id)
+                        .unwrap();
+                    if job.state.is_terminal() {
+                        break job;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+            let calls = (CHUNK_PROOF_CALLS.get(), REFERENCE_JOIN_CALLS.get());
+            eprintln!(
+                "thorough={thorough} resample={resample}: chunk/reference proof calls {calls:?}"
+            );
+            assert_eq!(calls, if thorough || resample { (1, 1) } else { (0, 0) });
+        }
+        manager.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn source_zero_quality_is_literal_and_distinct_from_explicit_lossless_for_all_adapters() {
         let (document, _) = fixture_plan(0);
