@@ -64,8 +64,9 @@ async function setup(page: Page, hold = false) {
                 title: null,
               })),
             };
-          if (command === 'begin_media_analysis') return 'bitrate-ticket';
-          if (command === 'cancel_media_analysis') return;
+          if (command === 'begin_media_analysis')
+            return payload.forImport ? 'import-reservation' : 'bitrate-ticket';
+          if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
           if (command === 'analyze_bitrate') {
             if (hold)
               await new Promise<void>((resolve) => {
@@ -160,8 +161,12 @@ test('Stop cancels a packet scan and discards a late chart completion', async ({
   await expect.poll(async () => (await calls(page, 'analyze_bitrate')).length).toBe(1);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect
-    .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
-    .toBeGreaterThan(0);
+    .poll(async () =>
+      (await calls(page, 'cancel_media_analysis')).some(
+        (call) => call.payload.id === 'bitrate-ticket',
+      ),
+    )
+    .toBe(true);
   await page.evaluate(() =>
     (globalThis as unknown as { __bitrateMock: Mock }).__bitrateMock.release?.(),
   );

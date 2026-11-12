@@ -10,6 +10,8 @@ pub(crate) enum ProcessError {
     Timeout,
     #[error("The tool produced more output than the inspection limit allows.")]
     OutputLimit,
+    #[error("The inspection was canceled.")]
+    Cancelled,
 }
 
 pub(crate) struct ProcessOutput {
@@ -39,6 +41,17 @@ pub(crate) async fn run_tool_with_environment(
     environment: Option<&supervisor::ChildEnvironment>,
 ) -> Result<ProcessOutput, ProcessError> {
     let (_owner, cancel) = tokio::sync::watch::channel(false);
+    run_tool_cancellable(executable, args, time_limit, max_bytes, environment, cancel).await
+}
+
+pub(crate) async fn run_tool_cancellable(
+    executable: &Path,
+    args: &[OsString],
+    time_limit: Duration,
+    max_bytes: usize,
+    environment: Option<&supervisor::ChildEnvironment>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<ProcessOutput, ProcessError> {
     let output = supervisor::run_capture_with_environment(
         &CommandSpec {
             executable: executable.to_owned(),
@@ -54,6 +67,7 @@ pub(crate) async fn run_tool_with_environment(
     .map_err(|error| match error {
         SupervisorError::Timeout => ProcessError::Timeout,
         SupervisorError::OutputLimit => ProcessError::OutputLimit,
+        SupervisorError::Cancelled => ProcessError::Cancelled,
         SupervisorError::Io(error) | SupervisorError::Cleanup(error) => ProcessError::Io(error),
         error => ProcessError::Io(io::Error::other(error)),
     })?;

@@ -25,6 +25,17 @@ fn child(args: &[std::ffi::OsString]) -> Option<i32> {
     let milliseconds = args[1].to_string_lossy().parse::<u64>().unwrap();
     let code = args[2].to_string_lossy().parse::<i32>().unwrap();
     let marker = PathBuf::from(&args[3]);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE};
+        let mut mode = 0;
+        let terminal = unsafe { GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mut mode) } != 0;
+        std::fs::write(
+            marker.with_extension("terminal"),
+            if terminal { b"yes".as_slice() } else { b"no" },
+        )
+        .unwrap();
+    }
     let started = Instant::now();
     let mut ticks = std::fs::OpenOptions::new()
         .create(true)
@@ -60,7 +71,14 @@ fn main() {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(windows::qualify(root));
+        if args.first().is_some_and(|arg| arg == "--fixture-gui-host") {
+            runtime.block_on(windows::qualify_gui_host(
+                PathBuf::from(&args[1]),
+                PathBuf::from(&args[2]),
+            ));
+        } else {
+            runtime.block_on(windows::qualify(root));
+        }
     }
     #[cfg(not(windows))]
     {
@@ -154,6 +172,47 @@ mod windows {
     async fn no_orphans() {
         wait_for(|| snapshots().is_empty()).await;
     }
+    async fn run_av1an(
+        spec: CommandSpec,
+        cancel: watch::Receiver<bool>,
+        log: PathBuf,
+    ) -> Result<supervisor::ProcessResult, SupervisorError> {
+        let (events, _receiver) = tokio::sync::mpsc::channel(16);
+        supervisor::with_console_profile(ConsoleProfile::Av1an, || {
+            supervisor::run(&spec, cancel, events, &log, Duration::from_secs(30))
+        })
+        .await
+    }
+    pub async fn qualify_gui_host(root: PathBuf, tool: PathBuf) {
+        settings(ConsoleWindowMode::Hidden, true);
+        let (_owner, cancel) = watch::channel(false);
+        let marker = root.join("gui-terminal.ticks");
+        let log = root.join("gui-terminal.log");
+        let output = run_av1an(spec(&tool, &marker, 100, 0), cancel, log.clone())
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read(marker.with_extension("terminal")).unwrap(),
+            b"yes"
+        );
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.contains("PowerShell 7.") && log.contains(TEXT));
+        no_orphans().await;
+    }
+
+    fn create_gui_host(host: &Path, destination: &Path) {
+        let mut pe = std::fs::read(host).unwrap();
+        let header = u32::from_le_bytes(pe[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&pe[header..header + 4], b"PE\0\0");
+        // PE optional header Subsystem sits at offset 68 for PE32 and PE32+.
+        // This test copy exercises the same detached loader mode as release.
+        let subsystem = header + 4 + 20 + 68;
+        assert_eq!(pe[subsystem..subsystem + 2], 3u16.to_le_bytes());
+        pe[subsystem..subsystem + 2].copy_from_slice(&2u16.to_le_bytes());
+        std::fs::write(destination, pe).unwrap();
+    }
+
     pub async fn qualify(root: PathBuf) {
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -291,27 +350,35 @@ mod windows {
         settings(ConsoleWindowMode::Hidden, true);
         let (_owner, cancel) = watch::channel(false);
         let marker = root.join("av1an.ticks");
-        let task = tokio::spawn(capture(
+        let log = root.join("av1an.log");
+        let task = tokio::spawn(run_av1an(
             spec(&av1an, &marker, 100, 0),
             cancel,
-            ConsoleProfile::Av1an,
+            log.clone(),
         ));
         let (title, _) = visible().await;
-        assert!(title.contains("av1an"));
+        assert!(title.contains("av1an · PowerShell 7"));
         wait_for(|| marker.with_extension("finished").exists()).await;
+        assert_eq!(
+            std::fs::read(marker.with_extension("terminal")).unwrap(),
+            b"yes",
+            "AV1AN needs terminal-backed stderr for individual chunk bars"
+        );
         let start = Instant::now();
         let output = task.await.unwrap().unwrap();
         assert!(output.status.success());
         assert!(start.elapsed() >= Duration::from_millis(4900));
         assert!(start.elapsed() < Duration::from_secs(9));
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.contains("PowerShell 7.") && log.contains(TEXT));
         no_orphans().await;
         proof.push(serde_json::json!({"case":"separate AV1AN visible fixed5s tail","passed":true}));
         settings(ConsoleWindowMode::VisibleStayOpen, false);
         let (_owner, cancel) = watch::channel(false);
-        let task = tokio::spawn(capture(
+        let task = tokio::spawn(run_av1an(
             spec(&av1an, &root.join("av1an-hidden.ticks"), 100, 0),
             cancel,
-            ConsoleProfile::Av1an,
+            root.join("av1an-hidden.log"),
         ));
         assert!(task.await.unwrap().unwrap().status.success());
         assert!(snapshots().is_empty());
@@ -378,14 +445,14 @@ mod windows {
         proof.push(serde_json::json!({"case":"pipeline keeps all binary bytes out of console text","passed":true}));
         settings(ConsoleWindowMode::Hidden, true);
         let (owner, cancel) = watch::channel(false);
-        let task = tokio::spawn(capture(
-            spec(&av1an, &root.join("av1an-tail-stop.ticks"), 100, 0),
+        let marker = root.join("av1an-tail-stop.ticks");
+        let task = tokio::spawn(run_av1an(
+            spec(&av1an, &marker, 100, 0),
             cancel,
-            ConsoleProfile::Av1an,
+            root.join("av1an-tail-stop.log"),
         ));
-        let (_, directory) = visible().await;
-        wait_for(|| std::fs::metadata(directory.join("finished.json")).is_ok_and(|m| m.len() > 0))
-            .await;
+        visible().await;
+        wait_for(|| marker.with_extension("finished").is_file()).await;
         assert!(!task.is_finished());
         owner.send_replace(true);
         assert!(matches!(
@@ -415,6 +482,30 @@ mod windows {
         assert!(matches!(b.await.unwrap(), Err(SupervisorError::Cancelled)));
         assert!(snapshots().is_empty());
         proof.push(serde_json::json!({"case":"concurrent helpers are all canceled and joined at shutdown","passed":true}));
+        let gui_host = root.join("gui-console-fixture.exe");
+        create_gui_host(&host, &gui_host);
+        let (_owner, cancel) = watch::channel(false);
+        let result = capture(
+            CommandSpec {
+                executable: gui_host,
+                args: vec![
+                    "--fixture-gui-host".into(),
+                    root.as_os_str().to_owned(),
+                    av1an.as_os_str().to_owned(),
+                ],
+                cwd: None,
+            },
+            cancel,
+            ConsoleProfile::Hidden,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "GUI relay host: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        proof.push(serde_json::json!({"case":"GUI-subsystem host attaches to the PowerShell 7 console and preserves relay pipes","passed":true}));
         std::fs::write(
             root.join("console-qualification.json"),
             serde_json::to_vec_pretty(&proof).unwrap(),

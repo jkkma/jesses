@@ -58,4 +58,4 @@ pub use media_core::{
     JobSnapshot, JobState, RecoveryPhase, RemuxRequest, VideoEncoder, VideoFraming,
 };
 pub use media_core::{MuxRequest, MuxSource, MuxTrack};
-pub use probe::probe_media;
+pub use probe::{probe_media, probe_media_cancellable};

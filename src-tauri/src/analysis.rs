@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,6 +16,7 @@ use tokio::sync::watch;
 pub struct AnalysisTasks {
     sequence: AtomicU64,
     tasks: Mutex<HashMap<String, Task>>,
+    closing: AtomicBool,
 }
 
 struct Task {
@@ -23,6 +24,20 @@ struct Task {
     started: bool,
     pause: media_runtime::supervisor::PauseControl,
     created: Instant,
+    kind: TicketKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TicketKind {
+    Analysis,
+    PendingImport,
+    Import,
+}
+
+impl Task {
+    fn expired(&self) -> bool {
+        self.kind != TicketKind::Import && self.created.elapsed() >= Duration::from_secs(30)
+    }
 }
 
 pub struct RunningAnalysis<'a> {
@@ -38,15 +53,45 @@ fn failure(code: &str, message: &str) -> AppError {
 
 impl AnalysisTasks {
     pub fn is_running(&self) -> bool {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .any(|task| task.started || task.created.elapsed() < Duration::from_secs(30))
-    }
-    pub fn begin(&self) -> Result<String, AppError> {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.retain(|_, task| task.started || task.created.elapsed() < Duration::from_secs(30));
+        tasks.retain(|_, task| task.started || !task.expired());
+        !tasks.is_empty()
+    }
+
+    pub fn begin(&self) -> Result<String, AppError> {
+        self.reserve(TicketKind::Analysis)
+    }
+
+    pub fn begin_import(&self) -> Result<String, AppError> {
+        self.reserve(TicketKind::PendingImport)
+    }
+
+    pub fn claim_import(&self, id: &str) -> Result<(), AppError> {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(task) = tasks
+            .get_mut(id)
+            .filter(|task| task.kind == TicketKind::PendingImport && !task.expired())
+        else {
+            return Err(failure(
+                "ANALYSIS_CANCELLED",
+                "The import reservation was canceled or expired.",
+            ));
+        };
+        if self.closing.load(Ordering::Acquire) {
+            return Err(failure("ANALYSIS_CANCELLED", "The application is closing."));
+        }
+        // A page can disappear before receiving the begin reply. Only a page
+        // that acknowledges its ticket can keep the reservation beyond expiry.
+        task.kind = TicketKind::Import;
+        Ok(())
+    }
+
+    fn reserve(&self, kind: TicketKind) -> Result<String, AppError> {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closing.load(Ordering::Acquire) {
+            return Err(failure("ANALYSIS_CANCELLED", "The application is closing."));
+        }
+        tasks.retain(|_, task| task.started || !task.expired());
         if tasks.len() >= 4 {
             return Err(failure(
                 "ANALYSIS_BUSY",
@@ -66,6 +111,7 @@ impl AnalysisTasks {
                 started: false,
                 pause: Default::default(),
                 created: Instant::now(),
+                kind,
             },
         );
         Ok(id)
@@ -85,11 +131,17 @@ impl AnalysisTasks {
                 "This source inspection has already started.",
             ));
         }
-        if task.created.elapsed() >= Duration::from_secs(30) {
+        if task.expired() {
             tasks.remove(id);
             return Err(failure(
                 "ANALYSIS_CANCELLED",
                 "Source inspection expired before it started.",
+            ));
+        }
+        if task.kind == TicketKind::PendingImport {
+            return Err(failure(
+                "ANALYSIS_NOT_READY",
+                "The import reservation has not been claimed.",
             ));
         }
         task.started = true;
@@ -136,6 +188,7 @@ impl AnalysisTasks {
     }
 
     pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
         self.cancel_all();
         loop {
             if self
@@ -153,11 +206,15 @@ impl AnalysisTasks {
 
 impl Drop for RunningAnalysis<'_> {
     fn drop(&mut self) {
-        self.owner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        let mut tasks = self.owner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = tasks.get_mut(&self.id)
+            && task.kind == TicketKind::Import
+            && !*task.cancel.borrow()
+        {
+            task.started = false;
+        } else {
+            tasks.remove(&self.id);
+        }
     }
 }
 
@@ -203,6 +260,62 @@ mod tests {
         assert!(tasks.run(&a).is_err());
     }
 
+    #[test]
+    fn import_ticket_stays_active_across_idle_gaps_and_releases_after_probe_cleanup() {
+        let tasks = AnalysisTasks::default();
+        let id = tasks.begin_import().unwrap();
+        assert!(tasks.run(&id).is_err());
+        tasks.claim_import(&id).unwrap();
+        tasks.tasks.lock().unwrap().get_mut(&id).unwrap().created =
+            Instant::now() - Duration::from_secs(31);
+        assert!(tasks.is_running());
+        let first = tasks.run(&id).unwrap();
+        assert!(tasks.run(&id).is_err());
+        drop(first);
+        assert!(tasks.is_running(), "The import is active between probes");
+        let second = tasks.run(&id).unwrap();
+        tasks.cancel(&id);
+        assert!(*second.cancel.borrow());
+        assert!(
+            tasks.is_running(),
+            "The canceled probe still owns its process"
+        );
+        drop(second);
+        assert!(!tasks.is_running());
+        assert!(tasks.run(&id).is_err());
+    }
+
+    #[tokio::test]
+    async fn lost_import_reply_expires_after_navigation_during_admission() {
+        let tasks = AnalysisTasks::default();
+        let monitor = crate::completion::CompletionMonitor::default();
+        let held_admission = monitor.admit_work().await.unwrap();
+        let pending = async {
+            let _admission = monitor.admit_work().await.unwrap();
+            tasks.begin_import().unwrap()
+        };
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("Import ignored the completion admission lock"),
+            _ = std::future::ready(()) => {}
+        }
+
+        // A page load can cancel existing tickets while an old IPC reply is
+        // still waiting for admission and cannot reach its original document.
+        tasks.cancel_all();
+        drop(held_admission);
+        let id = pending.await;
+        tasks.tasks.lock().unwrap().get_mut(&id).unwrap().created =
+            Instant::now() - Duration::from_secs(31);
+        assert!(
+            !tasks.is_running(),
+            "A lost import reply kept shutdown blocked"
+        );
+        assert!(tasks.tasks.lock().unwrap().is_empty());
+        assert!(tasks.claim_import(&id).is_err());
+    }
+
     #[tokio::test]
     async fn shutdown_cancels_and_waits_for_owned_work() {
         let tasks = AnalysisTasks::default();
@@ -213,5 +326,27 @@ mod tests {
         drop(running);
         tasks.shutdown().await;
         assert!(tasks.tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn window_close_rejects_new_probes_while_waiting_for_active_probe_cleanup() {
+        let tasks = AnalysisTasks::default();
+        let id = tasks.begin().unwrap();
+        let running = tasks.run(&id).unwrap();
+        let closing = tasks.shutdown();
+        tokio::pin!(closing);
+        tokio::select! {
+            biased;
+            _ = &mut closing => panic!("Window close skipped active probe cleanup"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(*running.cancel.borrow());
+        assert!(
+            tasks.begin().is_err(),
+            "A late probe entered after window close"
+        );
+        drop(running);
+        closing.await;
+        assert!(!tasks.is_running());
     }
 }

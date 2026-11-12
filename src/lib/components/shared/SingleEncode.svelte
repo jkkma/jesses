@@ -251,9 +251,17 @@
     ontracklist?: () => void;
     isShiftHeld?: () => boolean;
   } = $props();
+  const av1anBatchSource = $derived(
+    backend === 'av1an' && fileMode === 'batch'
+      ? files.find(
+          (entry) => entry.source?.kind !== 'imageSequence' && entry.streams.some(batchVideo),
+        )
+      : undefined,
+  );
   // Quick Convert encodes the checked video source; the loaded main file remains
   // the source of the fork's subtitle-burn selector and metadata defaults.
   const file = $derived.by(() => {
+    if (av1anBatchSource) return av1anBatchSource;
     if (backend === 'av1an' || fileMode === 'batch') return mainFile;
     const video = tracks.find(
       (row) =>
@@ -1655,10 +1663,11 @@
           : 'Source bit depth',
   );
   const selectedVideoSupported = $derived(
-    (!chunked && fileMode === 'batch') ||
-      (!encodingVideo && videoMode === 'drop') ||
-      (videos.some((stream) => stream.index === videoIndex) &&
-        (!chunked || videoIndex === videos[0]?.index)),
+    fileMode === 'batch'
+      ? !chunked || !!av1anBatchSource
+      : (!encodingVideo && videoMode === 'drop') ||
+          (videos.some((stream) => stream.index === videoIndex) &&
+            (!chunked || videoIndex === videos.find((stream) => !stream.attachedPic)?.index)),
   );
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const externalIssue = $derived(
@@ -1856,7 +1865,12 @@
   // Track-selection and container problems are decided on other tabs, so the
   // shell repeats them beside Run instead of leaving a silently disabled button.
   const runBlockedReason = $derived(
-    sourceTrackIssue ?? containerIssue ?? (encodingVideo ? subtitleIssue : null),
+    sourceTrackIssue ??
+      containerIssue ??
+      (encodingVideo ? subtitleIssue : null) ??
+      (chunked && fileMode === 'batch' && files.length > 0 && !av1anBatchSource
+        ? 'AV1AN requires at least one movie video stream in the batch.'
+        : null),
   );
   const noVideoForRun = $derived(
     !chunked &&
@@ -1877,6 +1891,9 @@
       (stream.kind === 'data' &&
         ['tmcd', 'gpmd'].includes(stream.codecTag?.trim().toLowerCase() ?? ''))
     );
+  }
+  function batchVideo(stream: import('$lib/ipc/generated').MediaStream) {
+    return stream.kind === 'video' && !stream.attachedPic && sourceKnownStream(stream);
   }
   function logDroppedStreams(
     streams: import('$lib/ipc/generated').MediaStream[],
@@ -1899,7 +1916,11 @@
       fileMode === 'batch' &&
       (videoChoice === 'drop' ||
         !files.some((source) =>
-          source.streams.some((stream) => stream.kind === 'video' && sourceKnownStream(stream)),
+          source.streams.some((stream) =>
+            videoChoice === 'copy'
+              ? stream.kind === 'video' && sourceKnownStream(stream)
+              : batchVideo(stream),
+          ),
         )),
   );
   const canQueue = $derived(
@@ -2047,6 +2068,7 @@
   }
 
   function checkedVideoIndex(source: MediaFile | undefined) {
+    if (chunked && fileMode === 'batch') return source?.streams.find(batchVideo)?.index;
     return (
       tracks.find(
         (row) =>
@@ -2751,8 +2773,11 @@
             'No tracks are selected. Please select at least one track to use.';
         const chosen = checked
           .filter(
-            ({ kind }) =>
-              !(kind === 'video' && !chunked && batchState.videoChoice === 'drop') &&
+            ({ kind, attachedPic }) =>
+              !(
+                kind === 'video' &&
+                (batchState.videoChoice === 'drop' || (batchState.encodingVideo && attachedPic))
+              ) &&
               !(kind === 'audio' && batchState.stripAudio) &&
               !(
                 kind === 'subtitle' &&

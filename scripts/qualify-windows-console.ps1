@@ -14,7 +14,7 @@ try {
   & cargo run -p media-runtime --locked --target x86_64-pc-windows-msvc --features console-fixture --example windows_console_fixture -- $destination 2>&1 | Tee-Object -FilePath $commandLog
   if ($LASTEXITCODE -ne 0) { throw "Native console fixture failed with exit $LASTEXITCODE. See $commandLog" }
   $receipt = Get-Content -LiteralPath (Join-Path $destination 'console-qualification.json') -Raw | ConvertFrom-Json
-  if ($receipt.Count -ne 12 -or @($receipt | Where-Object { $_.passed -ne $true }).Count -ne 0) { throw 'The complete twelve-case native receipt was not produced.' }
+  if ($receipt.Count -ne 13 -or @($receipt | Where-Object { $_.passed -ne $true }).Count -ne 0) { throw 'The complete thirteen-case native receipt was not produced.' }
   Write-Output "Native Windows console qualification passed: $destination"
   if ($env:GITHUB_OUTPUT) { "receipt-directory=$destination" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
 } finally { Pop-Location }

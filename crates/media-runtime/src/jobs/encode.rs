@@ -1872,12 +1872,8 @@ impl JobManager {
                             scratch,
                         )
                         .await?;
-                        if let Some(mut attempt) = temporary.take() {
-                            attempt.cleanup()?;
-                        }
                         drop(durable);
-                        recovery.cleanup().await?;
-                        self.change(id, |snapshot| snapshot.recovery = None).await;
+                        self.cleanup_published_av1an(id, recovery, temporary).await;
                         return Ok(());
                     }
                     let summary = recovery.finalizing(cancel).await?;
@@ -2956,34 +2952,7 @@ impl JobManager {
         drop(standalone_final);
         drop(durable);
         if let Some(recovery) = recovery {
-            // Close and unlink the current attempt before removing its parent
-            // workspace on Windows. If its identity check fails, retain the
-            // entire workspace: inferring ownership of the replacement from
-            // its location would violate the no-clobber boundary.
-            let attempt_cleanup = match temporary.take() {
-                Some(mut attempt) => attempt.cleanup(),
-                None => Ok(()),
-            };
-            let cleanup = match attempt_cleanup {
-                Ok(()) => recovery.cleanup().await,
-                Err(error) => Err(error),
-            };
-            match cleanup {
-                Ok(()) => self.change(id, |snapshot| snapshot.recovery = None).await,
-                Err(error) => {
-                    self.change(id, |snapshot| {
-                        append_log(
-                            snapshot,
-                            format!(
-                                "Output succeeded; recovery files were retained: {}",
-                                error.message
-                            ),
-                        );
-                        snapshot.error = Some(error.clone());
-                    })
-                    .await
-                }
-            }
+            self.cleanup_published_av1an(id, &recovery, temporary).await;
         }
         if let Some(recovery) = standalone_recovery {
             // A resumed durable stage must stay in the inventory until verified
@@ -3013,6 +2982,37 @@ impl JobManager {
             }
         }
         Ok(())
+    }
+
+    async fn cleanup_published_av1an(
+        &self,
+        id: &str,
+        recovery: &super::av1an::Recovery,
+        temporary: &mut Option<Temporary>,
+    ) {
+        // Unlink the owned attempt before its parent. A failed ownership check
+        // retains the workspace, and cleanup cannot undo successful publication.
+        let cleanup = match temporary
+            .take()
+            .map_or(Ok(()), |mut attempt| attempt.cleanup())
+        {
+            Ok(()) => recovery.cleanup().await,
+            Err(error) => Err(error),
+        };
+        self.change(id, |snapshot| match cleanup {
+            Ok(()) => snapshot.recovery = None,
+            Err(error) => {
+                append_log(
+                    snapshot,
+                    format!(
+                        "Output succeeded; recovery files were retained: {}",
+                        error.message
+                    ),
+                );
+                snapshot.error = Some(error);
+            }
+        })
+        .await;
     }
 
     /// Plan the source frame count and cadence. When packet timestamps can

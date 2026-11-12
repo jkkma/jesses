@@ -57,7 +57,6 @@
     type ProgressEstimate,
   } from '$lib/components/shared/progress-estimate';
   import ToolsPanel from '$lib/features/tools/ToolsPanel.svelte';
-  import CompletionPanel from '$lib/features/tools/CompletionPanel.svelte';
   import SourceUtilities from '$lib/features/utilities/SourceUtilities.svelte';
   import SavedJobs from '$lib/features/utilities/SavedJobs.svelte';
   import { encoderChoices, encoderOptions } from '$lib/components/shared/encoder-options';
@@ -69,6 +68,8 @@
     scanMediaFolder,
     getCapabilities,
     isDesktop,
+    beginMediaImport,
+    endMediaImport,
     probeMedia,
     subscribeDrop,
     subscribeJobs,
@@ -88,10 +89,13 @@
     saveActivityLog,
     openDirectory,
     extractAttachment,
+    getCompletionStatus,
     setCompletionOptions,
+    cancelFinishAction,
   } from '$lib/ipc/client';
   import { restoreAndTrackWindow } from '$lib/window-state';
   import type {
+    CompletionStatus,
     EncodeRequest,
     JobSnapshot,
     RemuxRequest,
@@ -110,7 +114,12 @@
   type View = 'files' | 'tracks' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   type ImportEntry = { path: string; detectFolder: boolean };
-  type ImportSession = { generation: number; folders: string[]; completed: string[] };
+  type ImportSession = {
+    generation: number;
+    folders: string[];
+    completed: string[];
+    ticket: string | null;
+  };
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
   let view = $state<View>('files');
@@ -192,12 +201,15 @@
   let fileMode = $state<FileListMode>('mux');
   let batchNameTemplate = $state('{name}');
   let trackSelection = $state<TrackSelection[]>([]);
+  let noDefaultSubtitles = $state(false);
   let workspaceActions = $state<Partial<Record<TaskView, WorkspaceAction>>>({});
   let lastActionStatus = $state('');
   let lastTaskTab = $state<'convert' | 'av1an' | 'utilities'>('av1an');
-  let shutdownWhenDone = $state(false);
+  let completionStatus = $state<CompletionStatus>();
+  const shutdownWhenDone = $derived(completionStatus?.options.finishAction === 'shutdown');
   let shutdownError = $state('');
   let updatingShutdown = $state(false);
+  let completionGeneration = 0;
   const mainSource = $derived(files.find((file) => file.id === mainSourceId));
   const taskSource = $derived(fileMode === 'batch' ? files[0] : mainSource);
   const batchExample = $derived.by(() => {
@@ -315,7 +327,8 @@
             !(stream.kind === 'video' && alreadyHadVideo),
           title: stream.title ?? '',
           language: stream.language ?? '',
-          defaultFlag: stream.isDefault ?? null,
+          defaultFlag:
+            stream.kind === 'subtitle' && noDefaultSubtitles ? false : (stream.isDefault ?? null),
           forcedFlag: null,
         });
         if (stream.kind === 'video' && !stream.attachedPic) hasVideo = true;
@@ -323,6 +336,7 @@
     }
     let next = [...trackSelection, ...additions];
     for (const kind of ['audio', 'subtitle']) {
+      if (kind === 'subtitle' && noDefaultSubtitles) continue;
       const candidates = next.filter(
         (row) =>
           row.included &&
@@ -343,6 +357,7 @@
     if (previous === 'mux' && next === 'batch') {
       mainSourceId = null;
       trackSelection = [];
+      noDefaultSubtitles = false;
     }
     fileMode = next;
     if (previous === 'batch' && next === 'mux' && files.length === 1 && !trackSelection.length)
@@ -391,17 +406,26 @@
     addLog(`Extracted attachment from ${source.name}.`);
     await openDirectory(folder);
   }
-  async function setShutdown(checked: boolean) {
+  async function updateCompletion(action: () => Promise<CompletionStatus>) {
+    if (updatingShutdown) return;
+    ++completionGeneration;
     updatingShutdown = true;
     shutdownError = '';
     try {
-      await setCompletionOptions({ notify: false, finishAction: checked ? 'shutdown' : 'none' });
-      shutdownWhenDone = checked;
+      completionStatus = await action();
     } catch (cause) {
       shutdownError = errorMessage(cause);
     } finally {
       updatingShutdown = false;
     }
+  }
+  function setShutdown(checked: boolean) {
+    return updateCompletion(() =>
+      setCompletionOptions({
+        notify: completionStatus?.options.notify ?? false,
+        finishAction: checked ? 'shutdown' : 'none',
+      }),
+    );
   }
   function resizeLog(event: PointerEvent) {
     const startY = event.clientY;
@@ -832,7 +856,7 @@
   function beginImport() {
     fileQuery = '';
     const generation = ++importGeneration;
-    importSession = { generation, folders: [], completed: [] };
+    importSession = { generation, folders: [], completed: [], ticket: null };
     importQueue = [];
     activePath = null;
     importing = true;
@@ -842,18 +866,40 @@
     return generation;
   }
 
-  function finishImport(generation: number) {
-    if (generation !== importGeneration) return;
-    if (
-      importSession?.generation === generation &&
-      importSession.folders.length === 0 &&
-      importSession.completed.length === 0
-    )
-      importSession = null;
+  async function releaseImport(ticket: string | null | undefined) {
+    if (!ticket) return;
+    try {
+      await endMediaImport(ticket);
+    } catch (error) {
+      addLog(`Could not release the media import: ${errorMessage(error)}`, 'error');
+    }
+  }
+
+  async function reserveImport(generation: number) {
+    const session = importSession;
+    if (session?.generation !== generation) return false;
+    const ticket = await beginMediaImport();
+    if (importSession !== session) {
+      await releaseImport(ticket);
+      return false;
+    }
+    session.ticket = ticket;
+    return true;
+  }
+
+  async function finishImport(generation: number) {
+    if (importSession?.generation !== generation) return;
+    const ticket = importSession.ticket;
+    const recent = takeImportRecents(generation);
     activePath = null;
     importing = false;
     importingName = '';
     if (fileMode === 'mux' && files.length === 1 && !mainSourceId) loadTracks([files[0].id], false);
+    try {
+      if (recent.length) await rememberMedia(recent);
+    } finally {
+      await releaseImport(ticket);
+    }
   }
 
   function stopImport() {
@@ -861,14 +907,14 @@
     finishSequencePrompt?.(null);
     finishSequencePrompt = undefined;
     sequencePrompt = null;
+    void releaseImport(importSession?.ticket);
     const recent = takeImportRecents(importGeneration);
     ++importGeneration;
     importQueue = [];
     activePath = null;
     importing = false;
     importingName = '';
-    importNotice =
-      'Stopped importing. Completed files are kept. The current scan or probe may finish in the background.';
+    importNotice = 'Stopped importing. Completed files are kept.';
     addLog('Stopped importing; pending files and late results are discarded.');
     if (recent.length) void rememberMedia(recent);
   }
@@ -923,7 +969,7 @@
             }
             continue;
           }
-          const media = await probeMedia(path);
+          const media = await probeMedia(path, importSession?.ticket ?? undefined);
           if (generation !== importGeneration) return;
           recordImportRecent(generation, 'completed', media.path);
           if (!files.some((file) => file.id === media.id)) {
@@ -940,9 +986,7 @@
         }
       }
     } finally {
-      const recent = takeImportRecents(generation);
-      finishImport(generation);
-      if (recent.length) await rememberMedia(recent);
+      await finishImport(generation);
     }
   }
 
@@ -952,12 +996,22 @@
       queueImportPaths(paths, detectFolders);
       return;
     }
-    const selection = await chooseImportItems(paths);
-    if (!selection?.paths.length) return;
-    if (selection.replace) clearFiles();
     const generation = beginImport();
-    queueImportPaths(selection.paths, detectFolders);
-    await drainImport(generation);
+    try {
+      if (!(await reserveImport(generation))) return;
+      const selection = await chooseImportItems(paths);
+      if (generation !== importGeneration || !selection?.paths.length) return;
+      if (selection.replace) clearFiles();
+      queueImportPaths(selection.paths, detectFolders);
+      await drainImport(generation);
+    } catch (error) {
+      if (generation !== importGeneration) return;
+      const message = errorMessage(error);
+      importErrors = [...importErrors, { name: 'Media import', message }];
+      addLog(message, 'error');
+    } finally {
+      await finishImport(generation);
+    }
   }
 
   async function addFiles() {
@@ -965,6 +1019,7 @@
     const generation = beginImport();
     importingName = 'Choosing files';
     try {
+      if (!(await reserveImport(generation))) return;
       const paths = await chooseMediaFiles();
       if (generation !== importGeneration) return;
       const selection = await chooseImportItems(paths);
@@ -978,7 +1033,7 @@
       importErrors = [...importErrors, { name: 'File picker', message }];
       addLog(`Could not open file picker: ${message}`, 'error');
     } finally {
-      finishImport(generation);
+      await finishImport(generation);
     }
   }
 
@@ -987,6 +1042,7 @@
     const generation = beginImport();
     importingName = 'Choosing folder';
     try {
+      if (!(await reserveImport(generation))) return;
       const paths = await chooseMediaFolder();
       if (generation !== importGeneration || !paths.length) return;
       const selection = await chooseImportItems(paths);
@@ -1000,7 +1056,7 @@
       importErrors = [...importErrors, { name: 'Folder import', message }];
       addLog(`Could not import folder: ${message}`, 'error');
     } finally {
-      finishImport(generation);
+      await finishImport(generation);
     }
   }
 
@@ -1035,6 +1091,7 @@
     const generation = beginImport();
     importingName = fileName(path);
     try {
+      if (!(await reserveImport(generation))) return;
       const folder = await recentPathIsFolder(path);
       if (generation !== importGeneration) return;
       if (folder) {
@@ -1074,7 +1131,7 @@
         }
       }
     } finally {
-      finishImport(generation);
+      await finishImport(generation);
     }
   }
 
@@ -1095,7 +1152,10 @@
           loadTracks([mainSourceId], false);
       }
     }
-    if (!files.length) fileQuery = '';
+    if (!files.length) {
+      fileQuery = '';
+      noDefaultSubtitles = false;
+    }
     if (selectedId === id) selectedId = files[0]?.id ?? null;
     if (file) {
       addLog(`Removed ${file.name} from the workspace.`);
@@ -1116,6 +1176,7 @@
     selectedFileIds = [];
     mainSourceId = null;
     trackSelection = [];
+    noDefaultSubtitles = false;
     addLog('Source list cleared.');
   }
 
@@ -1230,7 +1291,24 @@
     let disposed = false;
     let unlisten: (() => void) | undefined;
     let stopWindowTracking: (() => void) | undefined;
+    let completionTimer: ReturnType<typeof setInterval> | undefined;
     if (desktop) {
+      let readingCompletion = false;
+      async function refreshCompletion() {
+        if (readingCompletion || updatingShutdown) return;
+        const generation = completionGeneration;
+        readingCompletion = true;
+        try {
+          const status = await getCompletionStatus();
+          if (!disposed && generation === completionGeneration) completionStatus = status;
+        } catch {
+          // Keep the last confirmed state until the next poll.
+        } finally {
+          readingCompletion = false;
+        }
+      }
+      void refreshCompletion();
+      completionTimer = setInterval(refreshCompletion, 1000);
       void restoreAndTrackWindow()
         .then((stop) => {
           if (disposed) stop();
@@ -1255,7 +1333,11 @@
     }
     return () => {
       disposed = true;
+      clearInterval(completionTimer);
       ++importGeneration;
+      const importTicket = importSession?.ticket;
+      importSession = null;
+      void releaseImport(importTicket);
       unlisten?.();
       stopWindowTracking?.();
       jobsDisposed = true;
@@ -1418,7 +1500,11 @@
           tracks={trackSelection}
           mainFile={mainSource}
           mode={fileMode}
-          onchange={(next) => (trackSelection = next)}
+          {noDefaultSubtitles}
+          onchange={(next, disableDefaultSubtitles) => {
+            trackSelection = next;
+            if (disableDefaultSubtitles !== undefined) noDefaultSubtitles = disableDefaultSubtitles;
+          }}
           onextract={extractSelectedAttachment}
         />
       {:else if view === 'tools'}
@@ -1560,6 +1646,25 @@
         </div>{/each}
     </div>
   </section>
+  {#if completionStatus && completionStatus.options.finishAction !== 'none'}
+    <aside class="finish-action">
+      <span role="status" aria-label="Finish action">
+        {completionStatus.options.finishAction === 'shutdown'
+          ? 'Computer shutdown'
+          : 'Close jesses'}
+        {completionStatus.secondsRemaining === null
+          ? ` armed for ${completionStatus.armedJobs} job${completionStatus.armedJobs === 1 ? '' : 's'}.`
+          : ` (${completionStatus.secondsRemaining} seconds remaining).`}
+      </span>
+      <button
+        type="button"
+        onclick={() => updateCompletion(cancelFinishAction)}
+        disabled={updatingShutdown}
+      >
+        Cancel finish action
+      </button>
+    </aside>
+  {/if}
   <footer class="status-bar">
     <div class="current-action">
       <span aria-label="Current action" title={currentActionText}>{currentActionText}</span
@@ -1620,7 +1725,9 @@
       >{action?.label ?? 'Run'}</button
     >
   </footer>
-  {#if shutdownError}<p role="alert">{shutdownError}</p>{/if}
+  {#if shutdownError || completionStatus?.error}<p role="alert">
+      {shutdownError || completionStatus?.error}
+    </p>{/if}
 </div>
 
 <SourceDialog
@@ -1806,7 +1913,8 @@
     gap: 5px;
   }
   .log-bar button,
-  .status-bar button {
+  .status-bar button,
+  .finish-action button {
     padding: 0.38rem 0.7rem;
     border: 0;
     border-radius: var(--radius);
@@ -1815,7 +1923,8 @@
     font-size: 12px;
   }
   .log-bar button:disabled,
-  .status-bar button:disabled {
+  .status-bar button:disabled,
+  .finish-action button:disabled {
     opacity: 0.5;
   }
   .log-entries {
@@ -1854,6 +1963,15 @@
     background: transparent;
     border: 0;
     color: var(--foreground);
+    font-size: 13px;
+  }
+  .finish-action {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 8px;
+    border: 1px solid var(--primary);
     font-size: 13px;
   }
   .current-action {

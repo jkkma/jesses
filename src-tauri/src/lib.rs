@@ -382,11 +382,24 @@ fn get_storage_locations(paths: State<'_, paths::AppPaths>) -> Vec<(String, Stri
 
 #[tauri::command]
 async fn begin_media_analysis(
+    for_import: Option<bool>,
     tasks: State<'_, analysis::AnalysisTasks>,
     monitor: State<'_, completion::CompletionMonitor>,
 ) -> Result<String, AppError> {
     let _admission = monitor.admit_work().await?;
-    tasks.begin()
+    if for_import == Some(true) {
+        tasks.begin_import()
+    } else {
+        tasks.begin()
+    }
+}
+
+#[tauri::command]
+fn claim_media_import(
+    id: String,
+    tasks: State<'_, analysis::AnalysisTasks>,
+) -> Result<(), AppError> {
+    tasks.claim_import(&id)
 }
 
 #[tauri::command]
@@ -722,8 +735,21 @@ async fn release_image_sequence(
         .await
 }
 #[tauri::command]
-async fn probe_media(path: String) -> Result<MediaFile, AppError> {
-    media_runtime::probe_media(path).await
+async fn probe_media(
+    path: String,
+    import_id: Option<String>,
+    tasks: State<'_, analysis::AnalysisTasks>,
+    monitor: State<'_, completion::CompletionMonitor>,
+) -> Result<MediaFile, AppError> {
+    let running = {
+        let _admission = monitor.admit_work().await?;
+        let id = match import_id {
+            Some(id) => id,
+            None => tasks.begin()?,
+        };
+        tasks.run(&id)?
+    };
+    media_runtime::probe_media_cancellable(path, running.cancel.clone()).await
 }
 
 #[tauri::command]
@@ -781,6 +807,7 @@ fn invoke_settings(invoke: tauri::ipc::Invoke) -> bool {
 fn invoke_analysis(invoke: tauri::ipc::Invoke) -> bool {
     let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
         begin_media_analysis,
+        claim_media_import,
         cancel_media_analysis,
         preview_frame,
         snap_keyframe,
@@ -860,6 +887,7 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "save_activity_log"
         | "open_directory" => invoke_settings(invoke),
         "begin_media_analysis"
+        | "claim_media_import"
         | "cancel_media_analysis"
         | "preview_frame"
         | "snap_keyframe"
@@ -974,6 +1002,7 @@ pub fn run() {
             main_window
                 .on_page_load(|window, payload| {
                     if payload.event() == tauri::webview::PageLoadEvent::Started {
+                        window.state::<analysis::AnalysisTasks>().cancel_all();
                         let jobs = Arc::clone(&window.state::<Jobs>().manager);
                         tauri::async_runtime::spawn(async move {
                             let _ = jobs.cancel_command_reviews().await;

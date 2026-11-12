@@ -335,7 +335,7 @@ export async function installSourceEncodeFixture(page: Page) {
           if (state.__holdAnalysis) await state.__holdAnalysis;
           return id;
         }
-        if (command === 'cancel_media_analysis') return;
+        if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
         if (command === 'snap_keyframe') {
           if (state.__holdSnaps)
             return await new Promise((resolve, reject) => {

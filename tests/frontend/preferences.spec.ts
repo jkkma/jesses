@@ -98,6 +98,8 @@ async function setup(page: Page) {
             };
           return false;
         }
+        if (command === 'begin_media_analysis' && payload.forImport) return 'import-reservation';
+        if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
         if (command === 'probe_media')
           return {
             id: String(payload.path),

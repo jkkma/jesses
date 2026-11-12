@@ -1,6 +1,88 @@
 import { expect, test } from '@playwright/test';
 import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} batch excludes attached cover images from video encoding`, async ({ page }) => {
+    await installSourceEncodeFixture(page);
+    const movie = { ...source.streams[0], fieldOrder: 'progressive' };
+    const cover = { ...movie, index: 3, codec: 'mjpeg', attachedPic: true };
+    await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), {
+      ...source,
+      streams: [movie, ...source.streams.slice(1), cover],
+    });
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    await page
+      .getByRole('button', {
+        name: workflow === 'AV1AN' ? 'Run Batch: AV1AN encode' : 'Run Batch: Encode',
+        exact: true,
+      })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__sourceCalls.find(
+              (call: any) => call.command === 'preview_encode_batch',
+            )?.payload.request.inputs[0],
+        ),
+      )
+      .toMatchObject({ videoStreamIndex: 0, streamIndices: [0, 1, 2] });
+  });
+}
+
+test('AV1AN batch validates a movie when the first input has no video', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  const audio = {
+    ...source,
+    id: 'audio',
+    path: '/media/audio.mka',
+    name: 'audio.mka',
+    streams: [source.streams[1]],
+  };
+  await page.evaluate(
+    (inputs) => {
+      const host = globalThis as any;
+      host.__pickerPaths = inputs.map((item) => item.path);
+      host.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [audio, source],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run Batch: AV1AN encode', exact: true });
+  await expect(run).toBeEnabled();
+  await run.click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls
+          .find((call: any) => call.command === 'preview_encode_batch')
+          ?.payload.request.inputs.map((input: any) => input.inputPath),
+      ),
+    )
+    .toEqual([audio.path, source.path]);
+});
+
+test('AV1AN batch explains why cover art alone cannot be encoded', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), {
+    ...source,
+    streams: [{ ...source.streams[0], codec: 'mjpeg', attachedPic: true }, source.streams[1]],
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run Batch: AV1AN encode', exact: true });
+  await expect(run).toBeDisabled();
+  await expect(run).toHaveAccessibleDescription(
+    'AV1AN requires at least one movie video stream in the batch.',
+  );
+});
+
 test('canceling the source image-sequence folder picker leaves import ready', async ({ page }) => {
   await installSourceEncodeFixture(page);
   await page.evaluate(() => ((globalThis as any).__pickerPaths = []));

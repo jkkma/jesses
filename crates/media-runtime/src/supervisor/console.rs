@@ -16,7 +16,6 @@ pub(super) enum Mode {
     Hidden,
     Visible,
     StayOpen,
-    Av1anTail,
 }
 static POLICY: AtomicU8 = AtomicU8::new(4);
 tokio::task_local! {static PROFILE:ConsoleProfile;static OUTPUT:Output;}
@@ -55,19 +54,21 @@ fn mode(policy: u8, profile: ConsoleProfile, windows: bool) -> Mode {
     }
     match profile {
         ConsoleProfile::Hidden => Mode::Hidden,
-        ConsoleProfile::Av1an => {
-            if policy & 4 != 0 {
-                Mode::Av1anTail
-            } else {
-                Mode::Hidden
-            }
-        }
+        ConsoleProfile::Av1an => Mode::Hidden,
         ConsoleProfile::General => match policy & 3 {
             1 => Mode::Visible,
             2 => Mode::StayOpen,
             _ => Mode::Hidden,
         },
     }
+}
+
+#[cfg(windows)]
+pub(super) use windows::run_av1an_terminal;
+
+#[cfg(windows)]
+pub(super) fn av1an_terminal_enabled(profile: ConsoleProfile) -> bool {
+    profile == ConsoleProfile::Av1an && POLICY.load(Ordering::Acquire) & 4 != 0
 }
 pub(super) fn logged_profile(specs: &[&CommandSpec]) -> ConsoleProfile {
     if let Ok(profile) = PROFILE.try_with(|value| *value) {
@@ -240,7 +241,7 @@ mod tests {
             assert_eq!(mode(policy, ConsoleProfile::Hidden, true), Mode::Hidden);
         }
         assert_eq!(mode(4, ConsoleProfile::General, true), Mode::Hidden);
-        assert_eq!(mode(4, ConsoleProfile::Av1an, true), Mode::Av1anTail);
+        assert_eq!(mode(4, ConsoleProfile::Av1an, true), Mode::Hidden);
         assert_eq!(mode(1, ConsoleProfile::General, true), Mode::Visible);
         assert_eq!(mode(2, ConsoleProfile::General, true), Mode::StayOpen);
         assert_eq!(mode(2, ConsoleProfile::Av1an, true), Mode::Hidden);

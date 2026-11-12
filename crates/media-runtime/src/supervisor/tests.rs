@@ -680,7 +680,7 @@ async fn staged_records(input: &[u8], interval: Duration) -> (Vec<String>, Vec<S
     let path = fixture.0.join("progress.log");
     let log = Mutex::new(RotatingLog::open(&path).await.unwrap());
     let (sender, mut receiver) = mpsc::channel(32);
-    drain_stage_every(input, true, Some("consumer"), &sender, &log, interval)
+    drain_stage_every(input, true, Some("consumer"), &sender, &log, interval, None)
         .await
         .unwrap();
     log.lock().await.flush().await.unwrap();
@@ -718,6 +718,49 @@ async fn job_log_thins_progress_redraws_while_events_keep_every_record() {
             "[stderr] [consumer] Encoding: 3 Frames",
             "[stderr] [consumer] SUMMARY",
         ]
+    );
+}
+
+#[tokio::test]
+async fn conpty_cursor_redraws_are_thinned_and_raw_terminal_output_is_preserved() {
+    // A Windows ConPTY capture has cursor positions between full-width redraws,
+    // and CRLF for real diagnostic lines. Shorten its padding for this test.
+    let input = concat!(
+        "\x1b[?9001h\x1b[Hdiagnostic before 日本語\r\n",
+        "\x1b[?25h[Chunk  1] 10 frames   [Chunk  3] 9 frames   ",
+        "\x1b[3;142H\x1b[?25l\x1b[2;1H[Chunk  1] 20 frames   [Chunk  3] 19 frames   ",
+        "\x1b[?25h\x1b[3;141H\r\ndiagnostic after café\r\n\x1b[?9001l",
+    )
+    .as_bytes();
+    let fixture = Fixture::new("conpty-redraw");
+    let log_path = fixture.0.join("progress.log");
+    let relay_path = fixture.0.join("terminal.bin");
+    let mut relay = tokio::fs::File::create(&relay_path).await.unwrap();
+    let log = Mutex::new(RotatingLog::open(&log_path).await.unwrap());
+    let (sender, _receiver) = mpsc::channel(16);
+    drain_stage_every(
+        input,
+        true,
+        None,
+        &sender,
+        &log,
+        Duration::from_secs(3600),
+        Some(&mut relay),
+    )
+    .await
+    .unwrap();
+    log.lock().await.flush().await.unwrap();
+    relay.flush().await.unwrap();
+    assert_eq!(std::fs::read(relay_path).unwrap(), input);
+    let records = std::fs::read_to_string(log_path).unwrap();
+    let lines = records.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        [
+            "[stderr] diagnostic before 日本語",
+            "[stderr] [Chunk  1] 20 frames   [Chunk  3] 19 frames",
+            "[stderr] diagnostic after café",
+        ],
     );
 }
 

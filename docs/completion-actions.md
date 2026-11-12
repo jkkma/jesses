@@ -1,8 +1,7 @@
 # Completion notifications and finish actions
 
-Open **When the queue finishes** below the job list. Enable notifications or
-choose to close jesses or shut down the computer, then select **Apply to this queue**.
-The app requires an active or queued job before arming a finish action.
+Select **Shutdown when done** in the footer while a job is active or queued.
+The footer shows the armed job count and the shutdown countdown.
 
 These choices exist only in the current process; restarting jesses resets them.
 Historical successes never arm an action. Every job in the armed queue must
@@ -10,8 +9,8 @@ succeed. A failure, cancellation, stop or missing history entry disarms it.
 Additional queued work joins the queue and resets any countdown.
 
 After successful completion, a 60-second countdown appears. **Cancel finish
-action** disarms it immediately. Active media inspections and utilities defer the
-countdown. No force-close flag is sent to the operating system. Windows and Linux
+action** disarms it immediately. Active media imports, inspections and utilities
+defer the countdown. No force-close flag is sent to the operating system. Windows and Linux
 may decline shutdown according to their permissions and session policy; the UI
 shows the error.
 

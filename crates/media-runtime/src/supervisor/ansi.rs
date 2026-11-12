@@ -14,6 +14,13 @@ enum State {
 }
 
 impl Filter {
+    pub(super) fn push_console(&mut self, byte: u8) -> Option<u8> {
+        // ConPTY represents an in-place screen redraw with cursor motion.
+        // Preserve a record boundary in diagnostics when there is no CR/LF.
+        let redraw = matches!(self.0, State::Csi) && matches!(byte, b'A' | b'F' | b'H' | b'f');
+        self.push(byte).or(redraw.then_some(b'\r'))
+    }
+
     pub(super) fn push(&mut self, byte: u8) -> Option<u8> {
         // A malformed/truncated control sequence must not hide later records.
         if matches!(byte, b'\r' | b'\n') {

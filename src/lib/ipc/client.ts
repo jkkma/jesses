@@ -554,9 +554,26 @@ export async function chooseMediaFiles(): Promise<string[]> {
   return result;
 }
 
-export async function probeMedia(path: string): Promise<MediaFile> {
+export async function beginMediaImport(): Promise<string> {
   requireDesktop();
-  return invoke<MediaFile>('probe_media', { path });
+  const id = await invoke<string>('begin_media_analysis', { forImport: true });
+  try {
+    await invoke('claim_media_import', { id });
+    return id;
+  } catch (error) {
+    await endMediaImport(id).catch(() => {});
+    throw error;
+  }
+}
+
+export function endMediaImport(id: string): Promise<void> {
+  requireDesktop();
+  return invoke('cancel_media_analysis', { id });
+}
+
+export async function probeMedia(path: string, importId?: string): Promise<MediaFile> {
+  requireDesktop();
+  return invoke<MediaFile>('probe_media', { path, importId });
 }
 
 export async function chooseMediaFolder(): Promise<string[]> {

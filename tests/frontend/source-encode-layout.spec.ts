@@ -112,7 +112,7 @@ for (const { width, height } of [
               numbered: false,
             };
           }
-          if (command === 'cancel_media_analysis') return;
+          if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
           if (command === 'detect_fields')
             return {
               order: 'undetermined',

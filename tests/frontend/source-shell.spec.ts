@@ -16,6 +16,12 @@ test.beforeEach(async ({ page }) => {
     };
     const pathA = 'C:\\media\\A.mkv',
       pathB = 'C:\\media\\B.mkv';
+    host.__completionStatus = {
+      options: { notify: false, finishAction: 'none' },
+      armedJobs: 0,
+      secondsRemaining: null,
+      error: null,
+    };
     host.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
     host.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
@@ -183,16 +189,25 @@ test.beforeEach(async ({ page }) => {
           };
           return savedPreferences;
         }
-        if (command === 'get_completion_status')
-          return {
-            options: { notify: false, finishAction: 'none' },
+        if (command === 'get_completion_status') return structuredClone(host.__completionStatus);
+        if (command === 'set_completion_options') {
+          if (host.__completionFailure) throw new Error(host.__completionFailure);
+          host.__completionStatus = {
+            options: payload.options,
+            armedJobs: payload.options.finishAction === 'none' ? 0 : 1,
+            secondsRemaining: null,
+            error: null,
+          };
+          return structuredClone(host.__completionStatus);
+        }
+        if (command === 'cancel_finish_action') {
+          host.__completionStatus = {
+            options: { ...host.__completionStatus.options, finishAction: 'none' },
             armedJobs: 0,
             secondsRemaining: null,
             error: null,
           };
-        if (command === 'set_completion_options') {
-          if (host.__completionFailure) throw new Error(host.__completionFailure);
-          return;
+          return structuredClone(host.__completionStatus);
         }
         if (
           command === 'plugin:dialog|open' &&
@@ -205,7 +220,7 @@ test.beforeEach(async ({ page }) => {
         if (command === 'plugin:dialog|open')
           return payload.options?.directory
             ? [host.__folderPath ?? 'C:\\media\\frames']
-            : [pathA, pathB];
+            : (host.__mediaPaths ?? [pathA, pathB]);
         if (command === 'recent_path_is_folder')
           return payload.path === (host.__folderPath ?? 'C:\\media\\frames');
         if (command === 'import_image_sequence')
@@ -244,9 +259,9 @@ test.beforeEach(async ({ page }) => {
         if (command === 'probe_media') {
           const a = payload.path === pathA;
           return {
-            id: a ? 'a' : 'b',
+            id: payload.path === 'C:\\media\\C.mkv' ? 'c' : a ? 'a' : 'b',
             path: payload.path,
-            name: a ? 'A.mkv' : 'B.mkv',
+            name: payload.path === 'C:\\media\\C.mkv' ? 'C.mkv' : a ? 'A.mkv' : 'B.mkv',
             sizeBytes: a ? '200' : '100',
             modifiedAtMs: a ? 1000 : 2000,
             durationSeconds: 60,
@@ -309,14 +324,16 @@ test.beforeEach(async ({ page }) => {
           };
         }
         if (command === 'begin_media_analysis') return `analysis-${++callback}`;
-        if (command === 'cancel_media_analysis') return;
+        if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
         if (command === 'set_media_analysis_paused') return;
         if (command === 'snap_keyframe')
           return {
             positionSeconds: Math.floor(payload.request.positionSeconds / 5) * 5,
             sourceFingerprint: 'test',
           };
-        if (command === 'read_color_metadata')
+        if (command === 'read_color_metadata') {
+          if (host.__holdColorRead)
+            await new Promise<void>((resolve) => (host.__releaseColorRead = resolve));
           return {
             ...payload.request,
             color: { color_primaries: 'bt2020' },
@@ -326,6 +343,7 @@ test.beforeEach(async ({ page }) => {
             sourceFingerprint: 'source',
             summary: 'Color report: BT.2020, MaxCLL 1000, Dolby Vision profile 8.',
           };
+        }
         if (command === 'run_utility') {
           if (host.__holdUtility)
             await new Promise<void>((resolve) => {
@@ -965,6 +983,60 @@ test('default selectors use per-kind ordinals while requests retain source-scope
     'value',
     '["a",1]',
   );
+});
+
+test('an in-place color transfer keeps its original target during donor inspection', async ({
+  page,
+}) => {
+  const [donor, originalTarget, nextTarget] = ['A', 'B', 'C'].map(
+    (name) => `C:\\media\\${name}.mkv`,
+  );
+  await page.evaluate(
+    (paths) => {
+      const host = globalThis as any;
+      host.__mediaPaths = paths;
+      host.__holdColorRead = true;
+    },
+    [donor, originalTarget, nextTarget],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /C.mkv/ })).toBeVisible();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const configure = page
+    .getByRole('button', { name: /Transfer Color Metadata/ })
+    .getByRole('button', { name: 'Configure…' });
+  const dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  await configure.click();
+  await dialog.getByLabel('Target Video').selectOption(originalTarget);
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+  await expect(page.getByRole('log')).toContainText('from A.mkv to B.mkv');
+  await configure.click();
+  await dialog.getByLabel('Target Video').selectOption(nextTarget);
+  await dialog.getByLabel(/HDR metadata/).uncheck();
+  await dialog.getByRole('button', { name: 'OK' }).click();
+  await page.getByRole('button', { name: /Repair Frame Cadence/ }).click();
+  await expect(page.getByLabel('Current action')).toHaveText('Running: Color data transfer...');
+  await page.evaluate(() => (globalThis as any).__releaseColorRead());
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__shellCalls.find((call: any) => call.command === 'run_utility')
+            ?.payload.request,
+      ),
+    )
+    .toMatchObject({
+      kind: 'colorMetadataTransfer',
+      request: {
+        inputPath: originalTarget,
+        metadataSourcePath: donor,
+        inPlace: true,
+        copyHdr: true,
+      },
+    });
 });
 
 test('Color Data sends each source flag combination to the selected target in place', async ({
@@ -1830,6 +1902,32 @@ test('source log Copy and Shutdown when done checkbox preserve their native acti
   await checkbox.check();
   await expect(checkbox).toBeChecked();
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('the footer reflects native shutdown countdown, cancellation and disarm', async ({ page }) => {
+  const checkbox = page.getByLabel('Shutdown when done');
+  await checkbox.check();
+  await expect(checkbox).toBeChecked();
+  await page.evaluate(() => ((globalThis as any).__completionStatus.secondsRemaining = 59));
+  await expect(page.getByRole('status', { name: 'Finish action' })).toContainText(
+    '59 seconds remaining',
+  );
+  await page.getByRole('button', { name: 'Cancel finish action' }).click();
+  await expect(checkbox).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Cancel finish action' })).toHaveCount(0);
+
+  await checkbox.check();
+  await expect(checkbox).toBeChecked();
+  await page.evaluate(() => {
+    (globalThis as any).__completionStatus = {
+      options: { notify: false, finishAction: 'none' },
+      armedJobs: 0,
+      secondsRemaining: null,
+      error: 'Operating system rejected shutdown.',
+    };
+  });
+  await expect(checkbox).not.toBeChecked();
+  await expect(page.getByRole('alert')).toContainText('Operating system rejected shutdown.');
 });
 
 test('native media picker retries without a remembered folder when that folder disappears', async ({

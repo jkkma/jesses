@@ -14,6 +14,8 @@ use windows_sys::Win32::System::Console::{
 };
 const FLAG: &str = "--jesses-owned-console";
 const LIMIT: u64 = 4 * 1024 * 1024;
+mod av1an;
+pub(in crate::supervisor) use av1an::run_av1an_terminal;
 static HOST: OnceLock<PathBuf> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE: OnceLock<StdMutex<BTreeMap<u64, Active>>> = OnceLock::new();
@@ -78,20 +80,16 @@ impl Session {
             .map_err(|_| io::Error::other("Console registry was poisoned."))?;
         registry.retain(|_, entry| !entry.task.is_finished());
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let title = if mode == Mode::Av1anTail {
-            "av1an".to_owned()
-        } else {
-            format!(
-                "Jesses {} · {}-{}",
-                specs
-                    .first()
-                    .and_then(|spec| spec.executable.file_stem())
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("media"),
-                std::process::id(),
-                id
-            )
-        };
+        let title = format!(
+            "Jesses {} · {}-{}",
+            specs
+                .first()
+                .and_then(|spec| spec.executable.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("media"),
+            std::process::id(),
+            id
+        );
         let mut directory = crate::jobs::images::Directory::new(&std::env::temp_dir())
             .map_err(|error| io::Error::other(error.message))?;
         let spool = directory.path.join("diagnostics.jsonl");
@@ -133,7 +131,6 @@ impl Session {
                 state_path.as_os_str().to_owned(),
                 match mode {
                     Mode::StayOpen => "stay",
-                    Mode::Av1anTail => "av1an",
                     _ => "visible",
                 }
                 .into(),
@@ -287,8 +284,7 @@ where
             session.joined().await.map_err(SupervisorError::Cleanup)?;
             return Err(SupervisorError::Io(error));
         }
-        // /K deliberately keeps the job/queue waiting. AV1AN has its separate
-        // five-second tail. The actual tool status remains authoritative.
+        // /K deliberately keeps the job/queue waiting. The tool status remains authoritative.
         tokio::select! {biased;_=cancelled(cancel)=>{session.cancel.send_replace(true);session.joined().await.map_err(SupervisorError::Cleanup)?;return Err(SupervisorError::Cancelled);},joined=session.joined()=>{joined.map_err(SupervisorError::Cleanup)?;}}
     } else {
         session.cancel.send_replace(true);
@@ -447,9 +443,9 @@ fn helper(spool: &Path, state: &Path, mode: &str, title: &str) -> io::Result<i32
             && let Ok(bytes) = std::fs::read(state)
             && let Ok((code, _)) = serde_json::from_slice::<(i32, String)>(&bytes)
         {
-            completed = Some((code, std::time::Instant::now()));
+            completed = Some(code);
         }
-        if let Some((code, when)) = completed
+        if let Some(code) = completed
             && read == 0
         {
             for pending in &mut decoder {
@@ -463,7 +459,7 @@ fn helper(spool: &Path, state: &Path, mode: &str, title: &str) -> io::Result<i32
                     )?;
                     announced = true;
                 }
-            } else if mode != "av1an" || when.elapsed() >= Duration::from_secs(5) {
+            } else {
                 return Ok(code);
             }
         }
@@ -473,7 +469,11 @@ fn helper(spool: &Path, state: &Path, mode: &str, title: &str) -> io::Result<i32
 pub(super) fn helper_main() -> Option<i32> {
     let mut args = std::env::args_os();
     let _ = args.next();
-    if args.next().as_deref() != Some(OsStr::new(FLAG)) {
+    let flag = args.next()?;
+    if flag == av1an::FLAG {
+        return Some(av1an::helper(args).unwrap_or(1));
+    }
+    if flag != FLAG {
         return None;
     }
     let args = args.collect::<Vec<_>>();

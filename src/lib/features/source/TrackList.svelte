@@ -9,6 +9,7 @@
     tracks,
     mainFile,
     mode,
+    noDefaultSubtitles,
     onchange,
     onextract,
   }: {
@@ -16,7 +17,8 @@
     tracks: TrackSelection[];
     mainFile?: MediaFile;
     mode: FileListMode;
-    onchange: (tracks: TrackSelection[]) => void;
+    noDefaultSubtitles: boolean;
+    onchange: (tracks: TrackSelection[], noDefaultSubtitles?: boolean) => void;
     onextract: (track: TrackSelection) => Promise<void>;
   } = $props();
   let selected = $state('');
@@ -200,6 +202,7 @@
   }
   function updateChecked(next: TrackSelection[]) {
     for (const kind of ['audio', 'subtitle']) {
+      if (kind === 'subtitle' && noDefaultSubtitles) continue;
       const candidates = next.filter((row) => row.included && stream(row)?.kind === kind);
       if (candidates.length && !candidates.some((row) => row.defaultFlag === true)) {
         const first = key(candidates[0]);
@@ -260,6 +263,7 @@
       tracks.map((row) =>
         stream(row)?.kind === kind ? { ...row, defaultFlag: key(row) === value } : row,
       ),
+      kind === 'subtitle' ? value === '' : undefined,
     );
   }
 </script>

@@ -159,12 +159,13 @@
   ];
   let task = $state<Task | null>(null),
     dialog = $state<Dialog>(null),
-    pending = $state(false),
+    activeTask = $state<Task | null>(null),
     paused = $state(false),
     pausing = $state(false),
     analysisId = $state<string | null>(null),
     progress = $state<UtilityProgress | null>(null);
   let completedStatus = $state('');
+  const pending = $derived(activeTask !== null);
   let unsupportedBatchTask = $state<Task | null>(null);
   const batchReasons: Partial<Record<Task, string>> = {
     concat:
@@ -413,10 +414,13 @@
   const mainVideo = $derived(file?.streams.find((item) => item.kind === 'video'));
   const eligible = $derived(!!task && isDesktop() && !pending);
   $effect(() => {
+    const displayedTask = activeTask ?? task;
     const next = {
       run,
       canRun: eligible,
-      label: task ? `${fileMode === 'batch' ? 'Run Batch' : 'Run'}: ${labels[task]}` : 'Run',
+      label: displayedTask
+        ? `${fileMode === 'batch' ? 'Run Batch' : 'Run'}: ${labels[displayedTask]}`
+        : 'Run',
       active: pending,
       paused,
       progress: progress
@@ -841,36 +845,18 @@
       };
       return [{ kind: 'crfLadder', request }];
     }
-    if (task === 'color' && colorTarget) {
-      const donor = files.find((item) => item.path === colorSource),
-        target = files.find((item) => item.path === colorTarget);
-      if (!donor || !target) throw new Error('Choose the source and target video.');
-      return [
-        {
-          kind: 'colorMetadataTransfer',
-          request: {
-            inputPath: target.path,
-            inputVideoStreamIndex: fileVideo(target),
-            metadataSourcePath: donor.path,
-            metadataSourceVideoStreamIndex: fileVideo(donor),
-            outputPath: '',
-            copyColor,
-            copyHdr,
-            inPlace: true,
-          },
-        },
-      ];
-    }
     return [];
   }
   async function run() {
     if (!task || pending) return;
+    const runTask = task;
     if (!file) {
       onlog('No input file loaded. Please load one first (File List).', true);
       return;
     }
-    if (fileMode === 'batch' && ['metrics', 'ladder', 'concat', 'chart'].includes(task)) {
-      unsupportedBatchTask = task;
+    const batch = fileMode === 'batch';
+    if (batch && ['metrics', 'ladder', 'concat', 'chart'].includes(runTask)) {
+      unsupportedBatchTask = runTask;
       return;
     }
     const sourceSize = (bytes: string) => {
@@ -885,13 +871,12 @@
     let outputSummary = '';
     let batchInputBytes = 0n,
       batchOutputBytes = 0n;
-    pending = true;
+    activeTask = runTask;
     completedStatus = '';
     paused = false;
     progress = null;
     const active = new AbortController();
     abort = active;
-    const batch = fileMode === 'batch';
     const statusRunId = batchRunId('utility');
     let statuses: Record<string, BatchRowStatus> = batch
       ? Object.fromEntries(files.map((entry) => [entry.id, { glyph: '○', text: 'Queued' }]))
@@ -915,9 +900,9 @@
     }
     if (batch) onbatchstatus(statuses, statusRunId, true);
     try {
-      if (task === 'bitrates' || task === 'chart') {
+      if (runTask === 'bitrates' || runTask === 'chart') {
         const rows =
-          task === 'chart'
+          runTask === 'chart'
             ? [
                 {
                   sourceId: file.id,
@@ -929,7 +914,7 @@
                   forcedFlag: null,
                 },
               ]
-            : fileMode === 'batch'
+            : batch
               ? files.flatMap(selectedTracks)
               : tracks.filter((row) => row.included);
         if (!rows.length) throw new Error('Select tracks in the Track List first.');
@@ -946,7 +931,7 @@
           const size = Number(sourceBytes);
           return size > 0 ? ((Number(bytes) * 100) / size).toFixed(1) : '0.0';
         };
-        if (task === 'bitrates')
+        if (runTask === 'bitrates')
           onlog('Analyzing streams... This can take a few minutes on slower hard drives.');
         for (const row of rows) {
           const source = scopedFile(row);
@@ -956,9 +941,9 @@
             { inputPath: source.path, streamIndex: row.streamIndex, windowSeconds: 1 },
             active.signal,
             (id) => (analysisId = id),
-            task === 'chart',
+            runTask === 'chart',
           );
-          if (task === 'chart') {
+          if (runTask === 'chart') {
             if (!result.points.length)
               throw new Error(
                 'No frames could be read from this file, so there is no bitrate to chart. The log has ffprobe’s own output.',
@@ -1001,7 +986,7 @@
             mark(source.id, 'done');
           }
         }
-      } else if (task === 'metrics') {
+      } else if (runTask === 'metrics') {
         const reference = files.find((item) => item.path === metricsReference),
           encoded = files.find((item) => item.path === metricsEncoded);
         if (!reference || !encoded)
@@ -1028,13 +1013,12 @@
           const result = await analyzeQuality(request, active.signal, (id) => (analysisId = id));
           onlog(`${metric.toUpperCase()}: ${result.score?.toFixed(4) ?? '∞'}`);
         }
-      } else if (task === 'color' && (fileMode === 'batch' || !colorTarget)) {
-        const sources =
-          fileMode === 'batch' ? files : [files.find((item) => item.path === colorSource) ?? file];
+      } else if (runTask === 'color' && (batch || !colorTarget)) {
+        const sources = batch ? files : [files.find((item) => item.path === colorSource) ?? file];
         for (const source of sources) {
           mark(source.id, 'running');
           onlog(
-            fileMode === 'batch'
+            batch
               ? `Batch Processing Mode cannot transfer color data, so printing ${source.name}'s metadata only. Switch to Muxing Mode to transfer it.`
               : files.length < 2
                 ? `Only one file is loaded, so there is nothing to transfer to - printing ${source.name}'s metadata only.`
@@ -1056,52 +1040,69 @@
           mark(source.id, 'done');
         }
       } else {
-        if (task === 'deinterlace' && deinterlace === 'disabled') {
+        if (runTask === 'deinterlace' && deinterlace === 'disabled') {
           onlog('Deinterlacing is disabled.');
           return;
         }
-        if (task === 'color') {
+        let requests: UtilityRequest[];
+        if (runTask === 'color') {
           const donor = files.find((item) => item.path === colorSource);
           const target = files.find((item) => item.path === colorTarget);
           if (!donor || !target) throw new Error('Choose the source and target video.');
+          const request = {
+            inputPath: target.path,
+            inputVideoStreamIndex: fileVideo(target),
+            metadataSourcePath: donor.path,
+            metadataSourceVideoStreamIndex: fileVideo(donor),
+            outputPath: '',
+            copyColor,
+            copyHdr,
+            inPlace: true,
+          };
           const what =
-            copyColor && copyHdr
+            request.copyColor && request.copyHdr
               ? 'color space and HDR data'
-              : copyColor
+              : request.copyColor
                 ? 'color space'
-                : copyHdr
+                : request.copyHdr
                   ? 'HDR data'
                   : 'nothing';
           onlog(`Transferring ${what} from ${donor.name} to ${target.name}.`);
           const report = await readColorMetadata(
-            { inputPath: donor.path, videoStreamIndex: fileVideo(donor) },
+            {
+              inputPath: request.metadataSourcePath,
+              videoStreamIndex: request.metadataSourceVideoStreamIndex,
+            },
             active.signal,
             (id) => (analysisId = id),
           );
           onlog(report.summary);
-        }
-        let sources = fileMode === 'batch' && task !== 'concat' ? files : [file];
-        if (['cut', 'concat', 'grain', 'cadence', 'deinterlace', 'ladder'].includes(task)) {
-          const unsupported = (task === 'concat' ? files : sources).filter(
-            (entry) => entry.source?.kind === 'imageSequence',
-          );
-          if (unsupported.length && (task === 'concat' || fileMode !== 'batch'))
-            throw new Error('This utility does not support image sequence folders.');
-          for (const entry of unsupported) {
-            onlog(`${entry.name}: this utility does not support image sequence folders.`, true);
-            mark(entry.id, 'failed', 'This utility does not support image sequence folders.');
+          requests = [{ kind: 'colorMetadataTransfer', request }];
+        } else {
+          let sources = batch && runTask !== 'concat' ? files : [file];
+          if (['cut', 'concat', 'grain', 'cadence', 'deinterlace', 'ladder'].includes(runTask)) {
+            const unsupported = (runTask === 'concat' ? files : sources).filter(
+              (entry) => entry.source?.kind === 'imageSequence',
+            );
+            if (unsupported.length && (runTask === 'concat' || !batch))
+              throw new Error('This utility does not support image sequence folders.');
+            for (const entry of unsupported) {
+              onlog(`${entry.name}: this utility does not support image sequence folders.`, true);
+              mark(entry.id, 'failed', 'This utility does not support image sequence folders.');
+            }
+            sources = sources.filter((entry) => entry.source?.kind !== 'imageSequence');
+            if (!sources.length) return;
           }
-          sources = sources.filter((entry) => entry.source?.kind !== 'imageSequence');
-          if (!sources.length) return;
+          requests = sources.flatMap(outputRequests);
         }
-        let requests = sources.flatMap(outputRequests);
-        if (task === 'deinterlace') {
+        if (runTask === 'deinterlace') {
           const resolved: UtilityRequest[] = [];
+          const automatic = deinterlace === 'automatic';
           for (const item of requests) {
             if (item.kind !== 'deinterlaceExport') continue;
             const result = await resolveDeinterlace(
               item.request,
-              deinterlace === 'automatic',
+              automatic,
               active.signal,
               (id) => (analysisId = id),
             );
@@ -1114,7 +1115,7 @@
         }
         if (!requests.length)
           throw new Error(
-            task === 'ocr'
+            runTask === 'ocr'
               ? 'Select at least one bitmap subtitle track in the Track List.'
               : 'This utility has no valid input.',
           );
@@ -1145,15 +1146,15 @@
           // Report only completed native measurements on the source's routes.
           let bytes: string | undefined, outputPath: string | undefined;
           if (
-            ['cut', 'deinterlace', 'cadence', 'grain'].includes(task!) &&
+            ['cut', 'deinterlace', 'cadence', 'grain'].includes(runTask) &&
             result.kind === 'artifact'
           ) {
             bytes = result.result.sizeBytes;
             outputPath = result.result.outputPath;
-          } else if (task === 'grain' && result.kind === 'grainTable') {
+          } else if (runTask === 'grain' && result.kind === 'grainTable') {
             bytes = result.result.sizeBytes;
             outputPath = result.result.outputPath;
-          } else if (task === 'ladder' && result.kind === 'crfLadder') {
+          } else if (runTask === 'ladder' && result.kind === 'crfLadder') {
             bytes = result.result.samplesSizeBytes;
             outputPath = result.result.samplesDirectory;
           }
@@ -1279,7 +1280,7 @@
             ? 'Canceled.'
             : `Done${outputSummary ? ` - ${outputSummary}` : ''} - finished in ${elapsed}.`;
       }
-      pending = false;
+      activeTask = null;
       analysisId = null;
       paused = false;
       abort = undefined;

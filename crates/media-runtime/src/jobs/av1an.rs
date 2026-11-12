@@ -621,6 +621,13 @@ impl JobManager {
         // before Windows removes the exact now-empty launch directory below.
         drop(launch);
         drop(prepared_scenes);
+        // The process has exited, so seal its last complete receipts even when
+        // cancellation won. A crash before this point reuses only prior receipts.
+        // Keep the launch directory through this check: mkvmerge's options.json
+        // names its output there, including for an edited program.
+        let checkpoint = recovery
+            .checkpoint(!edited && result.as_ref().is_ok_and(|result| result.status.success()))
+            .await;
         if edited {
             if let Some(staged) = &staged_video
                 && staged.exists()
@@ -630,11 +637,6 @@ impl JobManager {
             }
             recovery.retire_launch(&launch_directory).await?;
         }
-        // The process has exited, so seal its last complete receipts even when
-        // cancellation won. A crash before this point reuses only prior receipts.
-        let checkpoint = recovery
-            .checkpoint(!edited && result.as_ref().is_ok_and(|result| result.status.success()))
-            .await;
         match checkpoint {
             Ok(summary) => {
                 let reader_cache = recovery.reader_cache_path().await?;

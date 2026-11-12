@@ -73,7 +73,7 @@ pwsh -NoProfile -File .\scripts\qualify-windows-console.ps1
 
 The script creates a fresh directory under
 `target\windows-console-qualification\<UTC timestamp>-<unique id>`. Expect
-`console-qualification.json` with **12 entries, all `passed: true`**, plus
+`console-qualification.json` with **13 entries, all `passed: true`**, plus
 `native-console-run.log`, `failed-console-diagnostics.txt` and the binary
 pipeline log. The JSON is emitted only after every assertion succeeds. A failed
 run retains its directory and command log for the Windows Codex session to fix
@@ -97,12 +97,13 @@ its automated cases close/cancel them. It covers:
 4. Stop canceling the finished `/K` wait.
 5. Closing an active console canceling its corresponding running tool.
 6. Actual process pause/resume/cancel with heartbeat evidence.
-7. Separate AV1AN visibility and its automatic five-second tail.
+7. A visible PowerShell 7 console with native terminal-backed AV1AN output and an automatic five-second tail.
 8. AV1AN hidden independently of the general stays-open setting.
 9. App-style shutdown joining the helper and tool scope.
 10. Exact 2,560,000-byte binary pipeline transfer, absent from console text.
 11. Stop during the separate AV1AN tail.
 12. Concurrent helpers canceled/joined at shutdown.
+13. A detached GUI-subsystem host attaching its relay to PowerShell 7.
 
 ## Desktop consumer and source policy
 
@@ -125,7 +126,14 @@ an internal chart-purpose marker; Read Bitrates accounting remains hidden.
 OCR retains the source's hidden behavior. Edited commands use their original
 route's profile without scanning user shell text. AV1AN's actual execution,
 including edited programs, uses its separate Windows preference and the
-`av1an` title; it does not inherit general `/K`.
+`av1an · PowerShell 7` title. It uses the separate AV1AN window preference.
+
+AV1AN uses a Windows pseudoconsole so its own CLI draws live progress bars for
+individual chunks. Jesses relays that terminal output to a real PowerShell 7
+window and captures diagnostics for the job log. The Windows Job Object still
+owns the encoder and its children. PowerShell 7 must be installed in the standard
+location or available as `pwsh.exe` on PATH. If the window cannot open, Jesses
+records the reason in the job log and encodes with hidden output capture.
 
 General Visible closes after actual tool completion. Visible/stays-open keeps
 the current job and queue waiting until that window closes, matching the fork's
@@ -160,7 +168,7 @@ large streaming output, process-tree drop/cancel, pause and timeout behavior.
 The combined source-image/QTGMC default-stack gate is recorded by its owning
 phase, separately from console compilation.
 
-The Windows-local session must run the twelve-case fixture and the actual
+The Windows-local session must run the thirteen-case fixture and the actual
 Windows desktop/provider workflows. Native window behavior, process freezing,
 console close events, long-path execution, five-second timing and Windows
 cleanup remain unqualified until those native receipts exist. The source

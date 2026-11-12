@@ -61,8 +61,9 @@ async function setup(page: Page, hold = false) {
               })),
             };
           }
-          if (command === 'begin_media_analysis') return `quality-${++callback}`;
-          if (command === 'cancel_media_analysis') return;
+          if (command === 'begin_media_analysis')
+            return payload.forImport ? 'import-reservation' : `quality-${++callback}`;
+          if (command === 'claim_media_import' || command === 'cancel_media_analysis') return;
           if (command === 'analyze_quality') {
             if (hold)
               await new Promise<void>((resolve) => {
@@ -169,8 +170,12 @@ test('Stop cancels a running metric and suppresses its late result', async ({ pa
   await expect.poll(async () => (await calls(page, 'analyze_quality')).length).toBe(1);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect
-    .poll(async () => (await calls(page, 'cancel_media_analysis')).length)
-    .toBeGreaterThan(0);
+    .poll(async () =>
+      (await calls(page, 'cancel_media_analysis')).some(
+        (call) => call.payload.id !== 'import-reservation',
+      ),
+    )
+    .toBe(true);
   await page.evaluate(() => (globalThis as any).__qualityMock.release?.());
   await expect(page.getByRole('button', { name: 'Run: Metrics calculation' })).toBeEnabled();
   await expect(page.getByRole('log', { name: 'Recent activity' })).not.toContainText(

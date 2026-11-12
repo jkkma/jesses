@@ -38,6 +38,7 @@ fn main() {
             "save_activity_log",
             "open_directory",
             "begin_media_analysis",
+            "claim_media_import",
             "cancel_media_analysis",
             "preview_frame",
             "snap_keyframe",

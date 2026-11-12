@@ -58,6 +58,7 @@
     "allow-save-activity-log",
     "allow-open-directory",
     "allow-begin-media-analysis",
+    "allow-claim-media-import",
     "allow-cancel-media-analysis",
     "allow-preview-frame",
     "allow-snap-keyframe",

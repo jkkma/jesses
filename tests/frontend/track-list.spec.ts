@@ -1,6 +1,32 @@
 import { expect, test } from '@playwright/test';
 import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
+test('explicitly disabling default subtitles survives track edits and reloads', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const subtitles = page.getByLabel('Default Subtitles');
+  await subtitles.selectOption('');
+  await page.getByRole('checkbox', { name: /Include .*Audio/ }).uncheck();
+  await expect(subtitles).toHaveValue('');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await expect(subtitles).toHaveValue('');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls
+          .find((call: any) => call.command === 'mock_start_encode')
+          ?.payload.request.settings.trackOverrides.find((track: any) => track.streamIndex === 2),
+      ),
+    )
+    .toMatchObject({ streamIndex: 2, default: false });
+});
+
 for (const height of [600, 720]) {
   test(`track action menus stay inside the workspace at ${height} px`, async ({ page }) => {
     await page.setViewportSize({ width: 1152, height });

@@ -21,6 +21,7 @@ use windows_sys::Win32::{
     },
     Security::SECURITY_ATTRIBUTES,
     System::{
+        Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON},
         JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -29,11 +30,12 @@ use windows_sys::Win32::{
         },
         Pipes::CreatePipe,
         Threading::{
-            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
             GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -48,6 +50,77 @@ pub(super) struct OwnedChild {
     stdin: Option<tokio::fs::File>,
     stdout: Option<tokio::fs::File>,
     stderr: Option<tokio::fs::File>,
+    terminal: Option<Pseudoconsole>,
+}
+
+struct Pseudoconsole {
+    handle: HPCON,
+    // Keep the session's input pipe alive even though Jesses sends no keys.
+    _input: OwnedHandle,
+}
+
+impl Pseudoconsole {
+    fn open(size: (i16, i16)) -> io::Result<(Self, OwnedHandle)> {
+        let (input_read, input_write) = pipe()?;
+        let (output_read, output_write) = pipe()?;
+        check(unsafe {
+            SetHandleInformation(input_write.as_raw_handle(), HANDLE_FLAG_INHERIT, 0)
+        })?;
+        check(unsafe {
+            SetHandleInformation(output_write.as_raw_handle(), HANDLE_FLAG_INHERIT, 0)
+        })?;
+        let mut handle = 0;
+        // SAFETY: both pipe ends and the output handle slot are valid. The
+        // console keeps its own references to the synchronous pipe ends.
+        let status = unsafe {
+            CreatePseudoConsole(
+                COORD {
+                    X: size.0,
+                    Y: size.1,
+                },
+                input_read.as_raw_handle(),
+                output_write.as_raw_handle(),
+                0,
+                &mut handle,
+            )
+        };
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "CreatePseudoConsole failed (HRESULT {status:#010x})."
+            )));
+        }
+        Ok((
+            Self {
+                handle,
+                _input: input_write,
+            },
+            output_read,
+        ))
+    }
+
+    fn take_handle(&mut self) -> HPCON {
+        std::mem::take(&mut self.handle)
+    }
+
+    async fn close(mut self) -> io::Result<()> {
+        let handle = self.take_handle();
+        // Windows before 24H2 can wait for a final output frame. Run on a
+        // different thread so the async reader can keep draining it.
+        tokio::task::spawn_blocking(move || unsafe { ClosePseudoConsole(handle) })
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
+impl Drop for Pseudoconsole {
+    fn drop(&mut self) {
+        let handle = self.take_handle();
+        if handle != 0 {
+            // A dropped supervisor has already terminated its job and dropped
+            // the pipe reader. Never block an async thread during this fallback.
+            std::thread::spawn(move || unsafe { ClosePseudoConsole(handle) });
+        }
+    }
 }
 
 pub(super) struct PauseTarget(OwnedHandle);
@@ -98,18 +171,42 @@ impl OwnedChild {
         spec: &CommandSpec,
         environment: Option<&super::ChildEnvironment>,
     ) -> io::Result<Self> {
-        Self::spawn_with_input(spec, false, None, environment)
+        Self::spawn_with_input(spec, false, None, environment, CREATE_NO_WINDOW)
     }
 
     pub(super) fn spawn_with_stdin(spec: &CommandSpec) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, None, None)
+        Self::spawn_with_input(spec, true, None, None, CREATE_NO_WINDOW)
     }
 
     pub(super) fn spawn_with_stdin_to_file(
         spec: &CommandSpec,
         output: std::fs::File,
     ) -> io::Result<Self> {
-        Self::spawn_with_input(spec, true, Some(output), None)
+        Self::spawn_with_input(spec, true, Some(output), None, CREATE_NO_WINDOW)
+    }
+
+    pub(super) fn spawn_presenter(
+        spec: &CommandSpec,
+        environment: &super::ChildEnvironment,
+    ) -> io::Result<Self> {
+        Self::spawn_with_input(spec, true, None, Some(environment), CREATE_NEW_CONSOLE)
+    }
+
+    pub(super) fn spawn_terminal(
+        spec: &CommandSpec,
+        environment: Option<&super::ChildEnvironment>,
+        size: (i16, i16),
+    ) -> io::Result<Self> {
+        let (terminal, output) = Pseudoconsole::open(size)?;
+        let (job, process) = launch(spec, environment, None, Some(&terminal), 0)?;
+        Ok(Self {
+            job,
+            process,
+            stdin: None,
+            stdout: None,
+            stderr: Some(tokio::fs::File::from_std(std::fs::File::from(output))),
+            terminal: Some(terminal),
+        })
     }
 
     fn spawn_with_input(
@@ -117,31 +214,8 @@ impl OwnedChild {
         pipe_stdin: bool,
         output: Option<std::fs::File>,
         changes: Option<&super::ChildEnvironment>,
+        flags: u32,
     ) -> io::Result<Self> {
-        if spec
-            .executable
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Shell scripts are not supported media executables.",
-            ));
-        }
-        let executable = wide(spec.executable.as_os_str())?;
-        let environment = changes.map(environment_with_changes).transpose()?;
-        let mut command_line = Vec::new();
-        quote(spec.executable.as_os_str(), &mut command_line)?;
-        for arg in &spec.args {
-            command_line.push(b' ' as u16);
-            quote(arg, &mut command_line)?;
-        }
-        command_line.push(0);
-        let cwd = spec
-            .cwd
-            .as_ref()
-            .map(|path| wide(path.as_os_str()))
-            .transpose()?;
         let (stdout_read, stdout_write) = if let Some(file) = output {
             // A seekable duplicate preserves the original ownership/share mode;
             // never reopen the pathname or make the parent's handle inheritable.
@@ -185,83 +259,17 @@ impl OwnedChild {
             )
         })?;
 
-        // SAFETY: null security attributes create a non-inheritable unnamed job.
-        let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // No breakaway flags: descendants remain in the owned job.
-        check(unsafe {
-            SetInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        })?;
-
-        let mut jobs = [job.as_raw_handle()];
-        let mut inherited = [
-            stdin_read.as_raw_handle(),
-            stdout_write.as_raw_handle(),
-            stderr_write.as_raw_handle(),
-        ];
-        let mut attributes = Attributes::new(2)?;
-        // SAFETY: both arrays and their handles remain alive through CreateProcessW
-        // and until Attributes is destroyed. Only the three stdio handles inherit.
-        check(unsafe {
-            UpdateProcThreadAttribute(
-                attributes.pointer(),
-                0,
-                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                jobs.as_mut_ptr().cast(),
-                size_of_val(&jobs),
-                null_mut(),
-                null(),
-            )
-        })?;
-        check(unsafe {
-            UpdateProcThreadAttribute(
-                attributes.pointer(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                inherited.as_mut_ptr().cast(),
-                size_of_val(&inherited),
-                null_mut(),
-                null(),
-            )
-        })?;
-
-        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
-        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = stdin_read.as_raw_handle();
-        startup.StartupInfo.hStdOutput = stdout_write.as_raw_handle();
-        startup.StartupInfo.hStdError = stderr_write.as_raw_handle();
-        startup.lpAttributeList = attributes.pointer();
-        let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
-        // JOB_LIST assigns the job before the initial thread can execute, avoiding
-        // both the child-spawn race and the suspended-child crash window.
-        // https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
-        check(unsafe {
-            CreateProcessW(
-                executable.as_ptr(),
-                command_line.as_mut_ptr(),
-                null(),
-                null(),
-                1,
-                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                environment
-                    .as_ref()
-                    .map_or(null(), |block| block.as_ptr().cast()),
-                cwd.as_ref().map_or(null(), |value| value.as_ptr()),
-                &startup.StartupInfo,
-                &mut info,
-            )
-        })?;
-        // SAFETY: successful CreateProcessW returned owned non-null handles.
-        let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
-        let _initial_thread = unsafe { OwnedHandle::from_raw_handle(info.hThread) };
-        drop(attributes);
+        let (job, process) = launch(
+            spec,
+            changes,
+            Some([
+                stdin_read.as_raw_handle(),
+                stdout_write.as_raw_handle(),
+                stderr_write.as_raw_handle(),
+            ]),
+            None,
+            flags,
+        )?;
         // Closing our write handles allows readers to see EOF after tree exit.
         drop(stdout_write);
         drop(stderr_write);
@@ -272,9 +280,140 @@ impl OwnedChild {
             stdin: stdin_write.map(|file| tokio::fs::File::from_std(std::fs::File::from(file))),
             stdout: stdout_read.map(|file| tokio::fs::File::from_std(std::fs::File::from(file))),
             stderr: Some(tokio::fs::File::from_std(std::fs::File::from(stderr_read))),
+            terminal: None,
         })
     }
+}
 
+fn launch(
+    spec: &CommandSpec,
+    changes: Option<&super::ChildEnvironment>,
+    inherited: Option<[HANDLE; 3]>,
+    terminal: Option<&Pseudoconsole>,
+    flags: u32,
+) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    if spec
+        .executable
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shell scripts are not supported media executables.",
+        ));
+    }
+    let executable = wide(spec.executable.as_os_str())?;
+    let environment = changes.map(environment_with_changes).transpose()?;
+    let mut command_line = Vec::new();
+    quote(spec.executable.as_os_str(), &mut command_line)?;
+    for arg in &spec.args {
+        command_line.push(b' ' as u16);
+        quote(arg, &mut command_line)?;
+    }
+    command_line.push(0);
+    let cwd = spec
+        .cwd
+        .as_ref()
+        .map(|path| wide(path.as_os_str()))
+        .transpose()?;
+
+    // SAFETY: null security attributes create a non-inheritable unnamed job.
+    let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // No breakaway flags: descendants remain in the owned job.
+    check(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    })?;
+
+    let mut jobs = [job.as_raw_handle()];
+    let mut inherited = inherited;
+    let mut attributes = Attributes::new(2)?;
+    // SAFETY: both arrays and their handles remain alive through CreateProcessW
+    // and until Attributes is destroyed. Only the three stdio handles inherit.
+    check(unsafe {
+        UpdateProcThreadAttribute(
+            attributes.pointer(),
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            jobs.as_mut_ptr().cast(),
+            size_of_val(&jobs),
+            null_mut(),
+            null(),
+        )
+    })?;
+    let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    if let Some(handles) = &mut inherited {
+        check(unsafe {
+            UpdateProcThreadAttribute(
+                attributes.pointer(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_mut_ptr().cast(),
+                size_of_val(handles),
+                null_mut(),
+                null(),
+            )
+        })?;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        [
+            startup.StartupInfo.hStdInput,
+            startup.StartupInfo.hStdOutput,
+            startup.StartupInfo.hStdError,
+        ] = *handles;
+    } else if let Some(terminal) = terminal {
+        // Explicit null standard handles prevent CreateProcessW from
+        // duplicating a redirected parent stream into the new console.
+        // ConPTY opens its own console handles for all three streams.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        // SAFETY: the HPCON stays alive through CreateProcessW. The
+        // attribute takes the handle value, rather than its address.
+        check(unsafe {
+            UpdateProcThreadAttribute(
+                attributes.pointer(),
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                terminal.handle as *mut _,
+                size_of::<HPCON>(),
+                null_mut(),
+                null(),
+            )
+        })?;
+    }
+    startup.lpAttributeList = attributes.pointer();
+    let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    // JOB_LIST assigns the job before the initial thread can execute, avoiding
+    // both the child-spawn race and the suspended-child crash window.
+    // https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+    check(unsafe {
+        CreateProcessW(
+            executable.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            i32::from(inherited.is_some()),
+            flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment
+                .as_ref()
+                .map_or(null(), |block| block.as_ptr().cast()),
+            cwd.as_ref().map_or(null(), |value| value.as_ptr()),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    })?;
+    // SAFETY: successful CreateProcessW returned owned non-null handles.
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
+    let _initial_thread = unsafe { OwnedHandle::from_raw_handle(info.hThread) };
+    Ok((job, process))
+}
+
+impl OwnedChild {
     pub(super) fn take_pipes(&mut self) -> (tokio::fs::File, tokio::fs::File) {
         (
             self.stdout.take().expect("piped stdout"),
@@ -345,6 +484,7 @@ impl OwnedChild {
             if let Some(status) = self.try_wait()? {
                 self.terminate_tree()?;
                 self.wait_empty().await?;
+                self.close_terminal().await?;
                 return Ok(status);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -353,7 +493,15 @@ impl OwnedChild {
 
     pub(super) async fn terminate_and_wait(&mut self) -> io::Result<()> {
         self.terminate_tree()?;
-        self.wait_empty().await
+        self.wait_empty().await?;
+        self.close_terminal().await
+    }
+
+    async fn close_terminal(&mut self) -> io::Result<()> {
+        if let Some(terminal) = self.terminal.take() {
+            terminal.close().await?;
+        }
+        Ok(())
     }
 }
 

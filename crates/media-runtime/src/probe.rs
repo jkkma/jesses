@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     discovery::find_executable,
-    process::{ProcessError, run_tool},
+    process::{ProcessError, run_tool_cancellable},
 };
 
 #[derive(Debug, Deserialize)]
@@ -386,7 +386,19 @@ fn probe_arguments(path: &Path) -> Vec<OsString> {
 /// Inspect one existing local regular file. No encoding, output paths, generic
 /// command execution, or remote input protocols are exposed to the frontend.
 pub async fn probe_media(path: String) -> Result<MediaFile, AppError> {
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    probe_media_cancellable(path, cancel).await
+}
+
+pub async fn probe_media_cancellable(
+    path: String,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<MediaFile, AppError> {
     let fail = |code: &str, message: String| AppError::new(code, message, Some(path.clone()));
+    let cancelled = || fail("ANALYSIS_CANCELLED", "The inspection was canceled.".into());
+    if *cancel.borrow() {
+        return Err(cancelled());
+    }
     if invalid_input(&path) {
         return Err(fail(
             "INVALID_INPUT",
@@ -436,17 +448,20 @@ pub async fn probe_media(path: String) -> Result<MediaFile, AppError> {
                     .into(),
             )
         })?;
-    let output = run_tool(
+    let output = run_tool_cancellable(
         &executable,
         &probe_arguments(&canonical),
         Duration::from_secs(30),
         2 * 1024 * 1024,
+        None,
+        cancel.clone(),
     )
     .await
     .map_err(|error| {
         let code = match &error {
             ProcessError::Timeout => "PROBE_TIMEOUT",
             ProcessError::OutputLimit => "PROBE_OUTPUT_LIMIT",
+            ProcessError::Cancelled => "ANALYSIS_CANCELLED",
             ProcessError::Io(_) => "TOOL_FAILED",
         };
         fail(code, error.to_string())
@@ -475,6 +490,9 @@ pub async fn probe_media(path: String) -> Result<MediaFile, AppError> {
     media.modified_at_ms = metadata.modified().ok().map(unix_milliseconds);
     crate::jobs::sequence::decorate(&mut media)?;
     source_guard.verify()?;
+    if *cancel.borrow() {
+        return Err(cancelled());
+    }
     Ok(media)
 }
 

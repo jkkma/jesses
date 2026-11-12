@@ -238,22 +238,31 @@ pub async fn run_with_environment(
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
-    console::scope(
-        console::logged_profile(&[spec]),
-        &[spec],
-        cancel,
-        |cancel| {
-            run_with_environment_inner(
-                spec,
-                cancel,
-                events,
-                log_path,
-                time_limit,
-                environment,
-                pause,
-            )
-        },
-    )
+    let profile = console::logged_profile(&[spec]);
+    #[cfg(windows)]
+    if console::av1an_terminal_enabled(profile) {
+        return console::run_av1an_terminal(
+            spec,
+            cancel,
+            events,
+            log_path,
+            time_limit,
+            environment,
+            pause,
+        )
+        .await;
+    }
+    console::scope(profile, &[spec], cancel, |cancel| {
+        run_with_environment_inner(
+            spec,
+            cancel,
+            events,
+            log_path,
+            time_limit,
+            environment,
+            pause,
+        )
+    })
     .await
 }
 #[allow(clippy::too_many_arguments)]
@@ -270,17 +279,42 @@ async fn run_with_environment_inner(
         return Err(SupervisorError::Cancelled);
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
-    let mut child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
+    let child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
+    run_logged_child(child, cancel, events, &log, time_limit, pause, None).await
+}
+
+async fn run_logged_child(
+    mut child: platform::OwnedChild,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log: &Mutex<RotatingLog>,
+    time_limit: Duration,
+    pause: Option<&PauseControl>,
+    terminal: Option<&mut tokio::fs::File>,
+) -> Result<ProcessResult, SupervisorError> {
     let pause = pause.cloned().or_else(pause::scoped_pause);
     let attached = pause
         .as_ref()
         .map(|control| control.attach(&child))
         .transpose()?;
-    let (stdout, stderr) = child.take_pipes();
+    let (stdout, stderr) = child.take_output_pipes();
     let execution = async {
         let (_, _, status) = tokio::try_join!(
-            drain(stdout, false, &events, &log),
-            drain(stderr, true, &events, &log),
+            async {
+                if let Some(stdout) = stdout {
+                    drain(stdout, false, &events, log).await?;
+                }
+                Ok(())
+            },
+            drain_stage_every(
+                stderr,
+                true,
+                None,
+                &events,
+                log,
+                REDRAW_LOG_INTERVAL,
+                terminal
+            ),
             async {
                 child
                     .wait_and_terminate_descendants()
@@ -914,7 +948,16 @@ async fn drain_stage(
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
 ) -> Result<(), SupervisorError> {
-    drain_stage_every(stream, stderr, stage, events, log, REDRAW_LOG_INTERVAL).await
+    drain_stage_every(
+        stream,
+        stderr,
+        stage,
+        events,
+        log,
+        REDRAW_LOG_INTERVAL,
+        None,
+    )
+    .await
 }
 
 async fn drain_stage_every(
@@ -924,6 +967,7 @@ async fn drain_stage_every(
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
     interval: Duration,
+    mut terminal_output: Option<&mut tokio::fs::File>,
 ) -> Result<(), SupervisorError> {
     let output = StageOutput {
         stderr,
@@ -965,8 +1009,25 @@ async fn drain_stage_every(
             },
             &buffer[..count],
         );
-        for &byte in &buffer[..count] {
-            let Some(byte) = terminal.push(byte) else {
+        if let Some(terminal) = terminal_output.as_mut() {
+            terminal
+                .write_all(&buffer[..count])
+                .await
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        SupervisorError::Cancelled
+                    } else {
+                        SupervisorError::Io(error)
+                    }
+                })?;
+        }
+        for &raw in &buffer[..count] {
+            let byte = if terminal_output.is_some() {
+                terminal.push_console(raw)
+            } else {
+                terminal.push(raw)
+            };
+            let Some(byte) = byte else {
                 continue;
             };
             if byte == b'\n' {
@@ -992,9 +1053,15 @@ async fn drain_stage_every(
                 redraws.held = Some(record);
             }
             if byte == b'\r' {
+                let cursor_redraw = raw != b'\r';
+                if cursor_redraw {
+                    pending.truncate(pending.trim_ascii_end().len());
+                }
                 if !pending.is_empty() {
-                    output.event(&pending);
                     let logged = redraws.due();
+                    if !cursor_redraw || logged {
+                        output.event(&pending);
+                    }
                     if logged {
                         redraws.release(Some(&pending), &output).await?;
                         output.log(&pending).await?;
