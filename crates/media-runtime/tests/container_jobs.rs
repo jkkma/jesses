@@ -280,6 +280,129 @@ async fn multi_source_mp4_keeps_edits_and_incompatible_webm_fails_before_output(
 }
 
 #[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone x264"]
+async fn mp4_preserves_translated_and_commentary_tracks_through_remux_and_encode() {
+    let directory = Fixture::new();
+    let base = fixture(&directory.0, false).await;
+    let source = directory.0.join("translated.mkv");
+    let mut cmd = args(&["-v", "error", "-nostdin", "-i"]);
+    cmd.push(base.into_os_string());
+    cmd.extend(args(&[
+        "-map",
+        "0",
+        "-map",
+        "0:s:0",
+        "-map",
+        "0:s:0",
+        "-c",
+        "copy",
+        // Use a zero-origin 25 fps clock exactly representable in Matroska;
+        // a stream-copy MP4 retains Matroska's millisecond packet timestamps.
+        "-c:v",
+        "libx264",
+        "-vf",
+        "fps=25,setpts=PTS-STARTPTS",
+        "-bf",
+        "0",
+        "-disposition:a:0",
+        "default+dub+comment",
+        "-disposition:s:0",
+        "default",
+        "-disposition:s:1",
+        "dub",
+        "-disposition:s:2",
+        "comment",
+        "-metadata:s:s:1",
+        "language=spa",
+        "-metadata:s:s:2",
+        "language=fra",
+    ]));
+    cmd.push(source.as_os_str().to_owned());
+    tool("ffmpeg", cmd).await;
+    let original = Sha256::digest(std::fs::read(&source).unwrap());
+    let manager = JobManager::new(directory.0.join("logs"));
+    let remuxed = directory.0.join("translated.mp4");
+    let job = manager
+        .start_remux(RemuxRequest {
+            input_path: source.to_string_lossy().into_owned(),
+            output_path: remuxed.to_string_lossy().into_owned(),
+            stream_indices: vec![0, 1, 2, 3, 4],
+        })
+        .await
+        .unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+
+    let encoded = directory.0.join("encoded.mp4");
+    let job = manager
+        .start_encode(media_runtime::EncodeRequest {
+            source: RemuxRequest {
+                input_path: remuxed.to_string_lossy().into_owned(),
+                output_path: encoded.to_string_lossy().into_owned(),
+                stream_indices: vec![0, 1, 2, 3, 4],
+            },
+            settings: media_core::EncodeSettings {
+                encoder: media_core::VideoEncoder::X264,
+                preset: 0,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                    full_output_verification: true,
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let job = finish(&manager, &job.id).await;
+    assert_eq!(
+        job.state,
+        JobState::Succeeded,
+        "{:?} {:?}",
+        job.error,
+        job.logs
+    );
+    manager.shutdown().await;
+
+    for output in [&remuxed, &encoded] {
+        let mut cmd = args(&[
+            "-v",
+            "error",
+            "-show_streams",
+            "-count_frames",
+            "-of",
+            "json",
+            "-i",
+        ]);
+        cmd.push(output.as_os_str().to_owned());
+        let probe: serde_json::Value = serde_json::from_slice(&tool("ffprobe", cmd).await).unwrap();
+        let streams = probe["streams"].as_array().unwrap();
+        assert_eq!(streams[0]["nb_read_frames"], "50");
+        for flag in ["default", "dub", "comment"] {
+            assert_eq!(streams[1]["disposition"][flag], 1);
+        }
+        for (index, flag, language) in [
+            (2, "default", "eng"),
+            (3, "dub", "spa"),
+            (4, "comment", "fra"),
+        ] {
+            assert_eq!(streams[index]["codec_name"], "mov_text");
+            assert_eq!(streams[index]["disposition"][flag], 1);
+            assert_eq!(streams[index]["tags"]["language"], language);
+        }
+        assert_eq!(streams[3]["disposition"]["default"], 0);
+        assert_eq!(streams[4]["disposition"]["default"], 0);
+    }
+    assert_eq!(Sha256::digest(std::fs::read(&source).unwrap()), original);
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg with libx264/AAC and FFprobe"]
 async fn explicit_false_default_never_silently_becomes_mp4_or_mov_default() {
     let directory = Fixture::new();

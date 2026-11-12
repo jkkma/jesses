@@ -348,22 +348,26 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn native_cmd_preserves_argv_binary_pipes_and_checks_every_pipeline_stage() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-artifacts/source-command-edit")
             .join(format!(
-                "windows-{}-{}-日本語-%%PATH%%-!",
+                "windows-{}-{}",
                 std::process::id(),
                 NEXT_ID.fetch_add(1, Ordering::Relaxed)
             ));
+        let root = build_root.join("日本語-%%PATH%%-!");
         std::fs::create_dir_all(&root).unwrap();
-        let source = root.join("argv.rs");
+        // MinGW's linker cannot create non-ASCII output paths on every host.
+        // Build in the plain parent, then exercise the real Unicode path.
+        let source = build_root.join("argv.rs");
+        let built_executable = build_root.join("argv.exe");
         let executable = root.join("argv helper.exe");
         std::fs::write(&source, r#"use std::io::{Read,Write};fn main(){let mut args=std::env::args().skip(1);let mode=args.next().unwrap();let path=std::path::PathBuf::from(args.next().unwrap());let mut text=String::new();for arg in args{for unit in arg.encode_utf16(){use std::fmt::Write;write!(&mut text,"{unit:04x}").unwrap();}text.push('\n');}std::fs::write(&path,text).unwrap();if mode=="producer"||mode=="fail"{std::io::stdout().write_all(b"raw\0binary\xff\n").unwrap();if mode=="fail"{std::process::exit(7);}}else{let mut data=Vec::new();std::io::stdin().read_to_end(&mut data).unwrap();std::fs::write(path.with_extension("pipe"),data).unwrap();}}"#).unwrap();
         let built = std::process::Command::new("rustc")
             .args(["--edition=2024", "--crate-name", "jesses_command_argv"])
             .arg(&source)
             .arg("-o")
-            .arg(&executable)
+            .arg(&built_executable)
             .output()
             .unwrap();
         assert!(
@@ -371,6 +375,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&built.stderr)
         );
+        std::fs::rename(&built_executable, &executable).unwrap();
         let expected = [
             "",
             "space path",
@@ -461,6 +466,6 @@ mod tests {
             assert_eq!(recovered.exists(), handled);
         }
         // Leave failures intact for a native runner's collected artifact log.
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&build_root).unwrap();
     }
 }

@@ -22,8 +22,14 @@ and timing is checked. Invisible trailing spaces before line breaks may be remov
 Unrepresentable drawings, changed cues and timing fail publication. MP4 text input
 can be explicitly converted to SubRip, ASS or WebVTT in standalone Quick Convert.
 
-Every output starts with the existing fully validated Matroska stage. A different
-container uses a second owned sibling; source fingerprints remain guarded through
+MP4 preserves translated (`dub`) and commentary (`comment`) track dispositions.
+Jobs retaining MP4 text subtitles use MP4 staging when either flag is present,
+including H.264/HEVC jobs, so an intermediate MOV cannot drop the flags. MOV and
+M4A still reject these flags because their FFmpeg mux modes omit the required
+track-kind boxes. Other unsupported dispositions remain rejected.
+
+Staging normally uses Matroska; retained MP4 text uses MP4 or MOV, and timed data
+uses MOV. A different final container uses a second owned sibling; source fingerprints remain guarded through
 final publication. Output validation checks exact stream order, codec/media
 properties, track language/title, dispositions, chapters and duration, plus every
 copied media packet's SHA-256, size, order and timing. MP4/MOV titles are validated
@@ -51,11 +57,11 @@ lock cannot publish either intermediate.
 
 On Windows with FFmpeg/FFprobe 9.0.1 and standalone x264:
 
-- `cargo test -p media-runtime --lib jobs::container --locked`: 2 checks passed,
+- `cargo test -p media-runtime --lib jobs::container --locked`: 11 checks passed,
   covering codec/metadata/disposition/empty-track rejection and strict chapter
   auxiliary classification/title/default normalization.
 - `cargo test -p media-runtime --test container_jobs --locked -- --ignored
---nocapture`: 4 actual-tool gates passed. H.264/AAC/subtitles to MP4/MOV and
+--nocapture`: 6 actual-tool gates passed. H.264/AAC/subtitles to MP4/MOV and
   VP9/Opus/subtitles to WebM preserve reordered streams, titles/languages, chapters,
   full decoded frame count, source SHA-256/mtime and cleanup. Multi-source edits
   survive MP4; incompatible H.264/AAC WebM fails without output. Quick Convert
@@ -69,6 +75,16 @@ On Windows with FFmpeg/FFprobe 9.0.1 and standalone x264:
   accessible name; no native UI result is inferred from the browser checks.
 
 ## Original-media evidence
+
+The 1.2.3 regression gate checks MP4 acceptance of `dub`/`comment` on audio and
+subtitle tracks, continued MOV/M4A rejection, and native remux followed by a
+thoroughly verified H.264 encode of an MP4 containing original-language,
+translated and commentary subtitles. It checks every flag, language and decoded
+frame count. A separate bounded run using the reported source's saved SVT-AV1
+settings produced 48 frames of 1920×1080 10-bit AV1, two Opus audio tracks and 25
+MP4-text subtitles. All 24 translated-subtitle flags survived; independent video
+and audio decoding completed without errors. This is a two-second qualification,
+not a full-movie encode. Source media and personal paths remain outside Git.
 
 A read-only 1280×720, 34,047-frame episode was qualified through its complete
 source scan, then frames 1200–1680 were encoded as H.264/AAC with seven MP4-text

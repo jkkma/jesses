@@ -391,10 +391,17 @@ fn preflight_with_staging(
                 }
             }
             for (flag, value) in &stream.disposition {
-                if *value != 0 && !matches!(flag.as_str(), "default" | "forced") {
+                // FFmpeg's MP4 kind boxes preserve these DASH roles. The MOV
+                // and M4A mux modes omit those boxes, so keep rejecting them
+                // there rather than silently dropping the requested flags.
+                let supported = matches!(flag.as_str(), "default" | "forced")
+                    || (container == ContainerFormat::Mp4
+                        && matches!(flag.as_str(), "dub" | "comment"));
+                if *value != 0 && !supported {
                     return Err(invalid(format!(
-                        "Stream {} disposition '{flag}' cannot be preserved by this MP4/MOV workflow. Choose Matroska.",
-                        stream.index
+                        "Stream {} disposition '{flag}' cannot be preserved by this {} workflow. Choose Matroska.",
+                        stream.index,
+                        container.extension().to_uppercase(),
                     )));
                 }
             }
@@ -721,7 +728,7 @@ pub(super) fn normalize(
 }
 
 /// Keep ordinary work in MKV; tx3g needs ISO BMFF and timed data needs MOV.
-/// MOV retains PCM; AV1/VP9 pictures instead require the MP4 muxer.
+/// MOV retains PCM; AV1/VP9 pictures and DASH track roles require the MP4 muxer.
 pub(super) fn staging_format(
     selected: &[&Stream],
     settings: Option<&EncodeSettings>,
@@ -749,6 +756,12 @@ pub(super) fn staging_format(
             || (mode == SubtitleMode::Copy && stream.codec_name.as_deref() == Some("mov_text"))
     }) {
         let needs_mp4 = selected.iter().any(|stream| {
+            if ["dub", "comment"]
+                .iter()
+                .any(|flag| stream.disposition.get(*flag).copied().unwrap_or(0) != 0)
+            {
+                return true;
+            }
             if stream.codec_type.as_deref() != Some("video") {
                 return false;
             }
@@ -1515,6 +1528,41 @@ mod tests {
         assert!(final_decode_args(path, &document, Some(0)).is_none());
         assert!(final_decode_args(path, &document, None).is_some());
     }
+    #[test]
+    fn mp4_accepts_dub_and_comment_but_mov_and_m4a_still_reject_them() {
+        for flag in ["dub", "comment"] {
+            for kind in ["audio", "subtitle"] {
+                let doc: Document = serde_json::from_value(serde_json::json!({
+                    "streams": [{
+                        "index": 4, "codec_type": kind,
+                        "codec_name": if kind == "audio" { "aac" } else { "subrip" },
+                        "nb_read_packets": "2", "disposition": {flag: 1}
+                    }]
+                }))
+                .unwrap();
+                let selected = doc.streams.iter().collect::<Vec<_>>();
+                preflight(Path::new("output.mp4"), &doc, &selected, None)
+                    .unwrap_or_else(|error| panic!("{kind} {flag}: {error:?}"));
+                for extension in ["mov", "m4a"] {
+                    if kind == "subtitle" && extension == "m4a" {
+                        continue;
+                    }
+                    let error = preflight(
+                        Path::new(&format!("output.{extension}")),
+                        &doc,
+                        &selected,
+                        None,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        error.message.contains(&format!("disposition '{flag}'")),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn container_preflight_rejects_unsupported_codecs_tags_empty_tracks_and_dispositions() {
         let mut doc = document();

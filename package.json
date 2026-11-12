@@ -1,7 +1,7 @@
 {
   "name": "jesses",
   "private": true,
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Desktop media encoding, muxing, and analysis. Created by jkkma.",
   "author": "jkkma",
   "license": "GPL-3.0-only",
