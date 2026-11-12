@@ -315,6 +315,7 @@ def scoop_manifest(archive_path: Path, url: str, destination: Path) -> None:
         "license": "GPL-3.0-only",
         "architecture": {"64bit": {"url": url, "hash": digest(archive_path)}},
         "bin": "jesses.exe",
+        "shortcuts": [["jesses.exe", "Jesses", "", "jesses.exe"]],
         "persist": "jesses-data",
         "notes": [
             "Requires the Microsoft Edge WebView2 runtime already available on the machine.",

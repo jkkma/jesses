@@ -151,8 +151,9 @@ release URL after choosing the release asset location:
 python scripts/package-desktop.py scoop --archive target/unsigned-windows-package/jesses_0.1.0_x86_64-pc-windows-msvc_release_portable.zip --url https://github.com/jkkma/jesses/releases/download/v0.1.0/jesses_0.1.0_x86_64-pc-windows-msvc_release_portable.zip --destination target/jesses.json
 ```
 
-This command records the ZIP's SHA-256 and version, exposes `jesses.exe`, and sets
-`persist` to `jesses-data`. The example URL is not a published-release claim.
+This command records the ZIP's SHA-256 and version, exposes `jesses.exe`, creates
+a `Jesses` Start menu shortcut using the executable's icon, and sets `persist` to
+`jesses-data`. The example URL is not a published-release claim.
 Local acceptance can use a loopback HTTP URL instead. Do not persist individual
 preference/history files: atomic replacement would break Scoop's file hard links.
 Ordinary `scoop uninstall jesses` retains persisted data; Scoop's explicit purge
