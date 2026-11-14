@@ -39,8 +39,8 @@ and permitted PATH fallbacks. Provider-specific rules also apply. See
 [packaging and tool discovery](docs/packaging.md),
 [SVT provider setup](docs/svt-forks.md), and
 [utility dependencies](docs/media-utilities.md#dependencies). The source-style
-SVT-AV1 choice resolves the qualified SVT-AV1-HDR provider; 5fish and mainline
-identities in older jobs are not separate choices in that interface.
+SVT-AV1 choice resolves SVT-AV1-HDR-PMod on Windows and SVT-AV1-HDR on Linux.
+Older jobs retain their saved encoder identifiers.
 
 `pnpm dev` starts a browser preview at `http://127.0.0.1:1420`. It does not
 provide the desktop's local media access or native tools.

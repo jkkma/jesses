@@ -33,7 +33,7 @@ pub(in crate::jobs) fn standalone_x265_arguments(
 }
 use super::*;
 pub use command_plan::preview_encode_plan;
-use media_core::VideoEncoder;
+use media_core::{EncoderProgress, VideoEncoder};
 
 // Construct large async state in a short-lived helper frame. Box::pin at the
 // callsite can retain its unboxed construction temporary in the caller's debug
@@ -1205,7 +1205,7 @@ impl JobManager {
             }
             match settings.encoder {
                 VideoEncoder::SvtAv1FiveFish => append_log(snapshot, format!("SVT-AV1 5fish: line-art bias {}, texture bias {}.", settings.lineart_psy_bias, settings.texture_psy_bias)),
-                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("SVT-AV1-HDR: {} tune.", settings.parameters.iter().find(|parameter| parameter.name == "tune").map_or_else(|| match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)".to_string(), media_core::HdrTune::FilmGrain => "film grain retention (5)".to_string() }, |parameter| format!("explicit override ({})", parameter.value)))),
+                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("{}: {} tune.", settings.encoder.name(), settings.parameters.iter().find(|parameter| parameter.name == "tune").map_or_else(|| match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)".to_string(), media_core::HdrTune::FilmGrain => "film grain retention (5)".to_string() }, |parameter| format!("explicit override ({})", parameter.value)))),
                 _ => {},
             }
             if plan.is_hdr10() {
@@ -1615,6 +1615,8 @@ impl JobManager {
             let mut encoded_path = intermediate.path.clone();
             for pass in 1..=if two_pass { 2 } else { 1 } {
                 let pass_output = if two_pass && pass == 1 { first_pass.as_ref().expect("review first pass") } else { intermediate };
+                // The held script may replace the producer or change its cadence.
+                // If accepted unchanged, the typed pipeline below adds its exact limit.
                 let mut args = consumer_arguments(&plan, settings);
                 if let Some(resources) = &standalone_hdr { resources.apply(&mut args); }
                 if let Some(table) = &standalone_grain_table {
@@ -1945,7 +1947,7 @@ impl JobManager {
                     executable: encoder.clone(),
                     // Both native encoders write into the already-owned file handle
                     // through stdout, preserving its identity guard and Unicode path.
-                    args: consumer_arguments(&plan, settings),
+                    args: standalone_consumer_arguments(&plan, settings, frame_count),
                     cwd: None,
                 };
                 if let Some(resources) = &standalone_hdr {
@@ -2056,6 +2058,7 @@ impl JobManager {
                     };
                     self.change(id, |snapshot| {
                     snapshot.progress_seconds = Some(0.0);
+                    snapshot.encoder_progress = None;
                     snapshot.log_path = Some(pass_log.to_string_lossy().into_owned());
                     if let Some(rate) = &rate {
                         append_log(snapshot, format!("Video bitrate {} kb/s; pass {pass}/{} starts a fresh source decoder and encoder. Pass log: {}", rate.kbps, if two_pass { 2 } else { 1 }, pass_log.display()));
@@ -2120,6 +2123,8 @@ impl JobManager {
                         .await
                     };
                     let _ = event_task.await;
+                    self.change(id, |snapshot| snapshot.encoder_progress = None)
+                        .await;
                     let result = result.map_err(|e| process_error(e, &source.path))?;
                     if !result.producer_status.success() || !result.consumer_status.success() {
                         return Err(files::error(
@@ -3184,8 +3189,13 @@ impl JobManager {
                                     .map_or(progress, |duration| progress.min(duration)),
                             );
                         }
+                        let encoder_progress = svt_progress(&line);
                         if let (Some(value), Some(frame_seconds)) = (
-                            svt_frame_counter(&line).or_else(|| x264::frame_counter(&line)),
+                            encoder_progress
+                                .as_ref()
+                                .map(|stats| stats.frames)
+                                .or_else(|| svt_frame_counter(&line))
+                                .or_else(|| x264::frame_counter(&line)),
                             frame_seconds,
                         ) {
                             let progress = value as f64 * frame_seconds;
@@ -3194,6 +3204,9 @@ impl JobManager {
                                     .duration_seconds
                                     .map_or(progress, |duration| progress.min(duration)),
                             );
+                        }
+                        if let Some(stats) = encoder_progress {
+                            snapshot.encoder_progress = Some(stats);
                         }
                         append_log(snapshot, line);
                     })
@@ -3213,6 +3226,94 @@ fn svt_frame_counter(line: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+fn svt_progress(line: &str) -> Option<EncoderProgress> {
+    let record = line.strip_prefix("[consumer] ").unwrap_or(line);
+    let (count, metrics) = record.strip_prefix("Encoding:")?.split_once(" Frames @ ")?;
+    let (frames, total_frames) = match count.trim().split_once('/') {
+        Some((frames, total)) => (
+            frames.parse().ok()?,
+            total.parse::<u64>().ok().filter(|n| *n > 0),
+        ),
+        None => (count.trim().parse().ok()?, None),
+    };
+    let mut fields = metrics.split('|').map(str::trim);
+    let speed = fields.next()?;
+    let fps = if let Some(value) = speed.strip_suffix("fps") {
+        svt_number(value)
+    } else {
+        speed
+            .strip_suffix("fpm")
+            .and_then(svt_number)
+            .map(|value| value / 60.0)
+    };
+    let bitrate_kbps = fields
+        .next()
+        .and_then(|value| value.strip_suffix("kb/s"))
+        .and_then(svt_number);
+    let (size_bytes, estimated_size_bytes) = fields
+        .next()
+        .and_then(|value| value.strip_prefix("Size: "))
+        .map_or((None, None), |value| {
+            let (size, estimate) = svt_bracketed_detail(value);
+            (svt_size_bytes(size), estimate.and_then(svt_size_bytes))
+        });
+    let (elapsed_seconds, eta_seconds) = fields
+        .next()
+        .and_then(|value| value.strip_prefix("Time: "))
+        .map_or((None, None), |value| {
+            let (elapsed, eta) = svt_bracketed_detail(value);
+            (
+                svt_clock_seconds(elapsed),
+                eta.and_then(|value| value.strip_prefix('-'))
+                    .and_then(svt_clock_seconds),
+            )
+        });
+    Some(EncoderProgress {
+        frames,
+        total_frames,
+        percent: total_frames.map(|total| (frames as f64 / total as f64 * 100.0).min(100.0)),
+        fps,
+        bitrate_kbps,
+        size_bytes,
+        estimated_size_bytes,
+        elapsed_seconds,
+        eta_seconds,
+    })
+}
+
+fn svt_bracketed_detail(value: &str) -> (&str, Option<&str>) {
+    value
+        .split_once(" [")
+        .map_or((value, None), |(current, prediction)| {
+            (current, prediction.strip_suffix(']'))
+        })
+}
+
+fn svt_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn svt_size_bytes(value: &str) -> Option<u64> {
+    let bytes = svt_number(value.strip_suffix(" MB")?)? * 1_000_000.0;
+    (bytes < u64::MAX as f64).then(|| bytes.round() as u64)
+}
+
+fn svt_clock_seconds(value: &str) -> Option<u64> {
+    let (hours, rest) = value.split_once(':')?;
+    let (minutes, seconds) = rest.split_once(':')?;
+    let hours = hours.parse::<u64>().ok()?;
+    let minutes = minutes.parse::<u64>().ok()?;
+    let seconds = seconds.parse::<u64>().ok()?;
+    if minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    hours.checked_mul(3600)?.checked_add(minutes * 60 + seconds)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4082,6 +4183,32 @@ pub(in crate::jobs) fn consumer_arguments(plan: &Plan, settings: &EncodeSettings
     }
 }
 
+fn svt_progress_frame_limit(settings: &EncodeSettings, frames: usize) -> Option<usize> {
+    // --frames is also an encoder input limit. Typed standalone transforms have
+    // a deterministic frame plan; source filter graphs may change the count.
+    // SVT's progress format prints the total as a signed 32-bit number.
+    (settings.backend == media_core::EncodeBackend::Standalone
+        && matches!(
+            settings.encoder,
+            VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1Hdr
+        )
+        && !settings.source_filters
+        && (1..=i32::MAX as usize).contains(&frames))
+    .then_some(frames)
+}
+
+fn standalone_consumer_arguments(
+    plan: &Plan,
+    settings: &EncodeSettings,
+    frames: usize,
+) -> Vec<OsString> {
+    let mut args = consumer_arguments(plan, settings);
+    if let Some(count) = svt_progress_frame_limit(settings, frames) {
+        args.extend(["--frames".into(), count.to_string().into()]);
+    }
+    args
+}
+
 /// av1an's Y4M pipe uses generic 4:2:0 tokens that do not carry source chroma
 /// siting. Test the selected aomenc with exactly that token and the explicit
 /// left-position flag before creating a resumable encoding workspace.
@@ -4772,6 +4899,64 @@ mod tests {
         );
         assert_eq!(svt_frame_counter("Encoding frame 9 40 fps"), Some(9));
         assert_eq!(svt_frame_counter("Total Encoding Time: 300 ms"), None);
+    }
+
+    #[test]
+    fn reads_patman_progress_with_and_without_a_frame_total() {
+        let known = svt_progress(
+            "[consumer] Encoding:   12/50 Frames @ 30.00 fps | 1234.56 kb/s | Size: 12.34 MB [51.42 MB] | Time: 0:00:03 [-0:00:09]",
+        ).unwrap();
+        assert_eq!(known.frames, 12);
+        assert_eq!(known.total_frames, Some(50));
+        assert_eq!(known.percent, Some(24.0));
+        assert_eq!(known.fps, Some(30.0));
+        assert_eq!(known.bitrate_kbps, Some(1234.56));
+        assert_eq!(known.size_bytes, Some(12_340_000));
+        assert_eq!(known.estimated_size_bytes, Some(51_420_000));
+        assert_eq!(known.elapsed_seconds, Some(3));
+        assert_eq!(known.eta_seconds, Some(9));
+
+        let unknown = svt_progress(
+            "Encoding:    5 Frames @ 15.00 fpm | 53.64 kb/s | Size: 0.01 MB | Time: 1:00:03",
+        )
+        .unwrap();
+        assert_eq!(unknown.frames, 5);
+        assert_eq!(unknown.fps, Some(0.25));
+        assert_eq!(unknown.elapsed_seconds, Some(3603));
+        assert_eq!(unknown.total_frames, None);
+        assert_eq!(unknown.percent, None);
+        assert_eq!(unknown.eta_seconds, None);
+        assert_eq!(unknown.estimated_size_bytes, None);
+        assert!(svt_progress("Total Encoding Time: 300 ms").is_none());
+    }
+
+    #[test]
+    fn only_known_standalone_hdr_frames_set_the_encoder_input_limit() {
+        let known = |settings: &EncodeSettings| svt_progress_frame_limit(settings, 123);
+        let mut settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            ..Default::default()
+        };
+        let (_, plan) = producer_plan();
+        let typed = standalone_consumer_arguments(&plan, &settings, 123);
+        assert_eq!(argument_after(&typed, "--frames"), "123");
+        let editable = consumer_arguments(&plan, &settings);
+        assert!(!editable.iter().any(|arg| arg == "--frames"));
+        assert_eq!(known(&settings), Some(123));
+        assert_eq!(svt_progress_frame_limit(&settings, 0), None);
+        settings.source_filters = true;
+        assert_eq!(known(&settings), None);
+        assert!(
+            !standalone_consumer_arguments(&plan, &settings, 123)
+                .iter()
+                .any(|arg| arg == "--frames")
+        );
+        settings.source_filters = false;
+        settings.backend = media_core::EncodeBackend::Av1an;
+        assert_eq!(known(&settings), None);
+        settings.backend = media_core::EncodeBackend::Standalone;
+        settings.encoder = VideoEncoder::SvtAv1FiveFish;
+        assert_eq!(known(&settings), None);
     }
 
     fn tag_value<'a>(stream: &'a metadata::Stream, key: &str) -> Option<&'a str> {

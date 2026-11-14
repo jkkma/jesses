@@ -220,7 +220,7 @@ pub(super) async fn build(
             };
             let raw_aom_input =
                 aom_vpx::configure_producer_output(&mut producer.args, plan, settings);
-            let mut args = consumer_arguments(plan, settings);
+            let mut args = standalone_consumer_arguments(plan, settings, frames);
             if let Some(rate) = rate {
                 rate.arguments_for_settings(&mut args, settings, pass);
             }

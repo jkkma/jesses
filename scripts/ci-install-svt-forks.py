@@ -26,7 +26,7 @@ def main() -> None:
     root = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
     install = Path(tempfile.mkdtemp(prefix="jesses-svt-forks-", dir=root))
     for encoder in manifest["encoders"]:
-        asset = encoder["assets"]["linuxX86_64"]
+        asset = {**encoder, **encoder["assets"]["linuxX86_64"]}
         directory = install / encoder["id"]
         directory.mkdir()
         archive = directory / "release.tar.xz"
@@ -46,11 +46,11 @@ def main() -> None:
         executable.chmod(0o755)
         result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=10, check=True)
         version = result.stdout + result.stderr
-        if encoder["versionMarker"] not in version:
+        if asset["versionMarker"] not in version:
             raise RuntimeError(f"Unexpected executable identity: {version}")
         for license_name in encoder["licenses"]:
-            (directory / license_name).write_bytes(download(encoder["licenseBaseUrl"] + license_name))
-        (directory / "provenance.json").write_text(json.dumps(encoder, indent=2))
+            (directory / license_name).write_bytes(download(asset["licenseBaseUrl"] + license_name))
+        (directory / "provenance.json").write_text(json.dumps(asset, indent=2))
         with Path(os.environ["GITHUB_ENV"]).open("a") as environment:
             environment.write(f"{encoder['environmentVariable']}={executable}\n")
         print(f"Verified {encoder['id']}: {version.strip()}")

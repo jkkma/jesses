@@ -277,6 +277,11 @@
   let selectedEncoder = $state<VideoEncoder>('svtAv1');
   // The two SVT builds listed in the codec menu share AV1 ranges and a 10-bit default.
   const listedSvt = (value: string) => value === 'svtAv1' || value === 'svtAv1Hdr';
+  const hdrEncoderName = $derived(
+    tools.some((tool) => tool.id === 'svt-av1-hdr' && tool.version?.includes('[Mod by Patman]'))
+      ? 'SVT-AV1-HDR-PMod'
+      : 'SVT-AV1-HDR',
+  );
   const tenBitDefault = (value: string) =>
     listedSvt(value) || value === 'aomAv1' || value === 'vpxStandalone';
   // Editable historical drafts receive a visible CPU default; stored jobs are
@@ -433,12 +438,16 @@
     request: CommandEditRequest,
     signal: AbortSignal,
     shouldEdit: () => boolean = () => true,
+    onjob?: (job: JobSnapshot) => void,
   ): Promise<CommandEditResult | null> {
     let id: string | undefined, trackedImageId: string | undefined;
     try {
       const review = await prepareCommandEdit(request, signal);
       id = review.id;
-      if (review.job) onreviewjob?.(review.job);
+      if (review.job) {
+        onjob?.(review.job);
+        onreviewjob?.(review.job);
+      }
       if (signal.aborted) return null;
       if (request.kind === 'image') {
         trackedImageId = review.id;
@@ -462,7 +471,10 @@
       if (!args || signal.aborted) return null;
       const result = await confirmCommandEdit({ id: review.id, arguments: args }, signal);
       id = undefined;
-      if (result.kind === 'encode') onreviewjob?.(result.job);
+      if (result.kind === 'encode') {
+        onjob?.(result.job);
+        onreviewjob?.(result.job);
+      }
       return result;
     } finally {
       if (trackedImageId && imageReviewId === trackedImageId) {
@@ -784,8 +796,27 @@
   let imageAbort: AbortController | undefined,
     imageProgress = $state(0),
     imageProgressDescription = $state(''),
-    batchCurrentJobId = $state<string | null>(null);
-  const batchCurrentJob = $derived(jobs.find((job) => job.id === batchCurrentJobId));
+    batchEncodeRun = $state(false),
+    batchCurrentJobId = $state<string | null>(null),
+    batchPendingSource = $state<{
+      inputPath: string;
+      outputPath: string;
+      previousJobs: ReadonlySet<string>;
+    }>();
+  const batchCurrentJob = $derived.by(() => {
+    if (batchCurrentJobId) return jobs.find((job) => job.id === batchCurrentJobId);
+    const pending = batchPendingSource;
+    if (!pending) return;
+    // The native job is published while the command is still being prepared.
+    return jobs.find(
+      (job) =>
+        !pending.previousJobs.has(job.id) &&
+        !!job.encodeSettings &&
+        !terminalJob(job.state) &&
+        job.request.inputPath === pending.inputPath &&
+        job.request.outputPath === pending.outputPath,
+    );
+  });
   const isImage = $derived(['gif', 'png', 'jpg'].includes(videoChoice));
   let metadataSource = $state('');
   let chapterSource = $state('');
@@ -1086,7 +1117,7 @@
       extension: outputContainer === 'matroska' ? 'mkv' : outputContainer,
     };
     const progress = imageProgress,
-      progressDescription = imageMode || mode === 'batch' ? imageProgressDescription : undefined,
+      progressDescription = batchEncodeRun || imageMode ? imageProgressDescription : undefined,
       paused = liveBatchJob ? liveBatchJob.state === 'paused' : imageIsPaused;
     const pause =
       liveBatchJob && ['preparing', 'running', 'paused', 'finalizing'].includes(liveBatchJob.state)
@@ -1106,6 +1137,7 @@
       active: inFlight,
       progress,
       progressDescription,
+      progressJobId: inFlight && batchEncodeRun ? (liveBatchJob?.id ?? null) : undefined,
       paused,
       pause,
       stop: () => {
@@ -2904,7 +2936,6 @@
             text: 'Skipped',
             note: 'The batch was stopped before this file ran.',
           });
-        imageProgressDescription = 'Batch stopped.';
       }
       throw cause;
     });
@@ -2987,14 +3018,19 @@
             : {}),
         },
       };
-      imageProgress = index / batchState.files.length;
       imageProgressDescription = `File ${index + 1}/${batchState.files.length} (${entry.name})`;
       mark(entry.id, { glyph: '▶', text: 'Running…' });
       try {
+        batchPendingSource = {
+          inputPath: prepared.source.inputPath,
+          outputPath: prepared.source.outputPath,
+          previousJobs: new Set(jobs.map((job) => job.id)),
+        };
         const reviewed = await reviewAndRun(
           { kind: 'encode', request: prepared },
           controller.signal,
           () => reviewThisFile(options),
+          (job) => (batchCurrentJobId = job.id),
         );
         if (!reviewed) {
           if (controller.signal.aborted) throw new DOMException('Canceled', 'AbortError');
@@ -3008,7 +3044,6 @@
         if (reviewed.kind !== 'encode')
           throw new Error('The command returned an unexpected image result.');
         const job = reviewed.job;
-        batchCurrentJobId = job.id;
         const finished = await waitForJobTerminal(job.id, controller.signal);
         if (finished.state === 'succeeded') mark(entry.id, { glyph: '✔', text: 'Done' });
         else if (finished.state === 'canceled' || finished.state === 'stopped')
@@ -3028,6 +3063,7 @@
           onlog?.(`${entry.name}: ${message}`);
         }
       } finally {
+        batchPendingSource = undefined;
         batchCurrentJobId = null;
       }
     }
@@ -3231,6 +3267,7 @@
     );
     const controller = new AbortController();
     imageAbort = controller;
+    batchEncodeRun = false;
     submitting = true;
     error = null;
     imageProgress = 0;
@@ -3294,9 +3331,11 @@
       controller = new AbortController(),
       statusId = batchRunId('image');
     imageAbort = controller;
+    batchEncodeRun = false;
     submitting = true;
     error = null;
     imageProgress = 0;
+    imageProgressDescription = fileMode === 'batch' ? 'Preparing batch…' : 'Preparing image output';
     const settings = structuredClone(
       $state.snapshot({
         framing: selectedFraming(activeFraming),
@@ -3654,6 +3693,9 @@
     };
     const controller = new AbortController();
     imageAbort = controller;
+    batchEncodeRun = runMode === 'batch';
+    imageProgress = 0;
+    imageProgressDescription = batchEncodeRun ? 'Preparing batch…' : '';
     submitting = true;
     error = null;
     const generation = draftGeneration;
@@ -3720,6 +3762,10 @@
           throw new Error('The command returned an unexpected image result.');
       }
     } catch (cause) {
+      if (runMode === 'batch')
+        imageProgressDescription = controller.signal.aborted
+          ? 'Batch stopped.'
+          : 'Batch did not finish - the log has the details.';
       if (!controller.signal.aborted && isCurrentDraft(generation, identity))
         error = errorMessage(cause);
     } finally {
@@ -3781,14 +3827,14 @@
                 >H.265 / HEVC (x265)</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="svtAv1"
                 >AV1 (SVT-AV1)</option
-              ><option value="svtAv1Hdr">AV1 (SVT-AV1-HDR)</option><option value="aomAv1"
+              ><option value="svtAv1Hdr">AV1 ({hdrEncoderName})</option><option value="aomAv1"
                 >AV1 (AOM)</option
               ><option value="gif">GIF [Animated GIF]</option><option value="png"
                 >PNG [Image Sequence]</option
               ><option value="jpg">JPEG [Image Sequence]</option>{:else}<option value="aomAv1"
                 >AV1 (AOM)</option
               ><option value="svtAv1">AV1 (SVT-AV1)</option><option value="svtAv1Hdr"
-                >AV1 (SVT-AV1-HDR)</option
+                >AV1 ({hdrEncoderName})</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="x265Standalone"
                 >H.265 / HEVC (x265)</option
               ><option value="x264">H.264 / AVC (x264)</option>{/if}
@@ -4787,7 +4833,7 @@
     width: min(100%, 14ch);
   }
   .video-columns .form > select[id$='-codec'] {
-    width: min(100%, 24ch);
+    width: min(100%, 29ch);
   }
   .video-columns .form > select[id$='-container'] {
     width: min(100%, 12ch);

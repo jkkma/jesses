@@ -51,6 +51,41 @@ test('encoding shows percent, position, speed and time left', () => {
   );
 });
 
+test('encoder telemetry supplies the bar and rate when it has an exact frame total', () => {
+  const snapshot = job({
+    progressSeconds: 30,
+    durationSeconds: 300,
+    encoderProgress: {
+      frames: 12,
+      totalFrames: 50,
+      percent: 24,
+      fps: 30,
+      bitrateKbps: 1234.56,
+      sizeBytes: 12340000,
+      estimatedSizeBytes: 51420000,
+      elapsedSeconds: 3,
+      etaSeconds: 9,
+    },
+  });
+  const measured = liveJobProgress(snapshot, { kind: 'waiting' });
+  expect(measured).toMatchObject({ value: 12, max: 50 });
+  expect(measured.text).toContain('Encoding 24% · 12/50 frames · 30.00 fps');
+  expect(measured.text).toContain('0:03 elapsed · 0:09 left');
+  expect(measured.text).toContain('1,234.56 kb/s');
+  expect(measured.text).toContain('12.34 MB');
+  expect(measured.text).toContain('51.42 MB');
+  const paused = liveJobProgress({ ...snapshot, state: 'paused' }, { kind: 'waiting' });
+  expect(paused).toMatchObject({ value: 12, max: 50 });
+  expect(paused.text).toContain('Paused at 24%');
+  expect(paused.text).toContain('12/50 frames');
+  expect(paused.text).not.toMatch(/fps|left/);
+  const finishing = liveJobProgress(
+    { ...snapshot, state: 'finalizing', progressSeconds: 0, logs: ['Verifying output.'] },
+    null,
+  );
+  expect(finishing).toMatchObject({ text: 'Finishing encode: Verifying output.', value: null });
+});
+
 test('final checks without a frame count stay indeterminate, with them they measure', () => {
   const logs = [
     "Verifying the completed output's exact frame count and timing, then checking copied tracks and metadata.",

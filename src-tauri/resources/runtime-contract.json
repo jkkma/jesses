@@ -66,8 +66,8 @@
       "id": "svt-av1-hdr",
       "executable": "SvtAv1EncApp-HDR",
       "versionArgument": "--version",
-      "upstream": "https://github.com/juliobbv-p/svt-av1-hdr",
-      "usage": "Default AV1 encoder; may also use the explicitly configured or managed fork installation."
+      "upstream": "https://github.com/Patman86/SVT-AV1-Mods-by-Patman",
+      "usage": "Default AV1 encoder. Windows packages include SVT-AV1-HDR-PMod and Linux packages include the qualified SVT-AV1-HDR build."
     },
     {
       "id": "x264",

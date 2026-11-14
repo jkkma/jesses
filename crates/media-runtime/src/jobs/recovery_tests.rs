@@ -248,6 +248,7 @@ async fn history_capacity_never_prunes_recoverable_work() {
                     standalone_recovery: standalone.then(|| fixture.standalone_recovery()),
                     input_size_bytes: None,
                     output_size_bytes: None,
+                    encoder_progress: None,
                     progress_seconds: None,
                     duration_seconds: None,
                     logs: vec![],

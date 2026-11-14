@@ -1,6 +1,147 @@
 import { expect, test } from '@playwright/test';
 import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
 
+test('the batch footer tracks the current file through preparation, encoding and final checks', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.addInitScript(() => {
+    (globalThis as any).__toolVersions = {
+      'svt-av1-hdr': 'SVT-AV1-HDR v4.1.0+77+85 [Mod by Patman]',
+    };
+  });
+  await installSourceEncodeFixture(page);
+  const first = {
+    ...source,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+    ),
+  };
+  const second = { ...first, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const host = globalThis as any;
+      host.__pickerPaths = inputs.map((item) => item.path);
+      host.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      host.__holdPrepareReply = new Promise((resolve) => (host.__releasePrepareReply = resolve));
+      host.__holdTerminal = true;
+    },
+    [first, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const codec = page.getByRole('region', { name: 'Quick Convert' }).getByLabel('Codec', {
+    exact: true,
+  });
+  await expect(codec.locator('option[value="svtAv1Hdr"]')).toHaveText('AV1 (SVT-AV1-HDR-PMod)');
+  await codec.selectOption('svtAv1Hdr');
+  const run = page.getByRole('button', { name: 'Run Batch: Encode', exact: true });
+  await run.click();
+  const status = page.getByLabel('Current action');
+  const bar = page.getByLabel('Task progress');
+  await expect.poll(() => page.evaluate(() => (globalThis as any).__testJobs.length)).toBe(1);
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    const [current] = host.__testJobs;
+    current.logs = ['Fingerprinting the current source.'];
+    host.__testJobs.unshift({
+      ...current,
+      id: 'unrelated',
+      request: { ...current.request, outputPath: '/media/other.mkv' },
+      state: 'running',
+      progressSeconds: 10,
+      logs: ['An unrelated encode.'],
+    });
+    host.__emitJobs();
+  });
+  await expect(status).toContainText('File 1/2 (input.mkv)');
+  await expect(status).toContainText('Fingerprinting the current source.');
+  await expect(bar).not.toHaveAttribute('value');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdPrepareReply = null;
+    host.__releasePrepareReply();
+  });
+  await expect(status).toContainText('Encoding 0%');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    const current = host.__testJobs.find((job: any) => job.id !== 'unrelated');
+    current.progressSeconds = 3;
+    current.encoderProgress = {
+      frames: 12,
+      totalFrames: 50,
+      percent: 24,
+      fps: 6.5,
+      bitrateKbps: null,
+      sizeBytes: null,
+      estimatedSizeBytes: null,
+      elapsedSeconds: 3,
+      etaSeconds: 6,
+    };
+    host.__emitJobs();
+  });
+  await expect(status).toContainText('Encoding 24% · 12/50 frames · 6.50 fps');
+  await expect(status).toContainText('0:03 elapsed · 0:06 left');
+  await expect(bar).toHaveAttribute('value', '12');
+  await expect(bar).toHaveAttribute('max', '50');
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await expect(status).toContainText('Paused at 24%');
+  await expect(status).not.toContainText('left');
+  await expect(bar).toHaveAttribute('value', '12');
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  await expect(status).toContainText('6.50 fps');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    const current = host.__testJobs.find((job: any) => job.id !== 'unrelated');
+    Object.assign(current, {
+      state: 'finalizing',
+      progressSeconds: null,
+      logs: ['Verifying the completed output.'],
+    });
+    host.__emitJobs();
+  });
+  await expect(status).toContainText('Verifying the completed output.');
+  await expect(status).not.toContainText('fps');
+  await expect(bar).not.toHaveAttribute('value');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs[1].state = 'succeeded';
+    host.__emitJobs();
+  });
+  await expect(status).toContainText('File 2/2 (second.mkv)');
+  await expect(status).toContainText('Encoding 0%');
+  await expect(status).not.toContainText('12/50 frames');
+  await expect(bar).toHaveAttribute('value', '0');
+});
+
+test('starting another encode batch clears the previous stopped status during preflight', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), {
+    ...source,
+    streams: [{ ...source.streams[0], fieldOrder: 'progressive' }, ...source.streams.slice(1)],
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run Batch: Encode', exact: true });
+  const status = page.getByLabel('Current action');
+  await page.evaluate(() => ((globalThis as any).__holdTerminal = true));
+  await run.click();
+  await expect(status).toContainText('File 1/1 (input.mkv)');
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await expect(status).toContainText('Batch stopped');
+  await expect(run).toBeEnabled();
+  await page.evaluate(() => {
+    (globalThis as any).__holdBatchPreview = new Promise(() => {});
+  });
+  await run.click();
+  await expect(status).toContainText('Preparing batch');
+  await expect(page.getByLabel('Task progress')).not.toHaveAttribute('value');
+});
+
 for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
   test(`${workflow} batch excludes attached cover images from video encoding`, async ({ page }) => {
     await installSourceEncodeFixture(page);

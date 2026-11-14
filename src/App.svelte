@@ -265,15 +265,22 @@
   const runBlockedReason = $derived(
     !runningAction && action && !action.canRun ? action.blockedReason : undefined,
   );
-  // Image and batch runs describe their own progress. A single encode stays
-  // "active" through its whole preparation (the command is prepared, then
-  // confirmed) without a description, so the live job's status speaks for it.
+  // Image and utility actions report their own progress. Encode batches provide
+  // a file label while their current job supplies the per-file progress.
   const actionProgress = $derived(
-    displayAction?.active && displayAction.progressDescription ? displayAction : undefined,
+    displayAction?.active &&
+      displayAction.progressJobId === undefined &&
+      displayAction.progressDescription
+      ? displayAction
+      : undefined,
+  );
+  const batchFileText = $derived(
+    runningAction?.progressJobId !== undefined ? runningAction.progressDescription : undefined,
   );
   const currentActionText = $derived.by(() => {
     if (actionProgress) return actionProgress.progressDescription!;
     if (liveProgress) return liveProgress.text;
+    if (batchFileText) return batchFileText;
     if (displayAction?.active)
       return `Running: ${displayAction.label.replace(/^Run(?: Batch)?:\s*/, '')}...`;
     if (lastActionStatus) return lastActionStatus;
@@ -558,8 +565,12 @@
       jobs.filter((job) => job.state === 'queued').at(-1) ??
       jobs[0],
   );
-  // Rate and time left come only from progress observed while this window is open.
-  const liveJob = $derived(currentJob && !terminalJob(currentJob.state) ? currentJob : undefined);
+  const liveJob = $derived.by(() => {
+    const id = runningAction?.progressJobId;
+    const job = id === undefined ? currentJob : jobs.find((entry) => entry.id === id);
+    return job && !terminalJob(job.state) ? job : undefined;
+  });
+  // Estimate a rate from progress seen in this window when the encoder lacks telemetry.
   const progressEstimator = new ProgressEstimator();
   let progressEstimate = $state<ProgressEstimate | null>(null);
   $effect(() => {
@@ -581,6 +592,17 @@
     return () => clearInterval(timer);
   });
   const liveProgress = $derived(liveJob ? liveJobProgress(liveJob, progressEstimate) : null);
+  const statusProgress = $derived(
+    actionProgress
+      ? { max: 1, value: actionProgress.progress ?? 0 }
+      : (liveProgress ??
+          (runningAction
+            ? { max: 1, value: null }
+            : { max: currentJob?.durationSeconds || 1, value: currentJob?.progressSeconds || 0 })),
+  );
+  const currentActionTitle = $derived(
+    batchFileText && liveProgress ? `${batchFileText} · ${currentActionText}` : currentActionText,
+  );
 
   // Mirror each job's own log into the Log pane: phase, tool and warning lines
   // as they arrive, then the final error. Encoder progress lines are left to
@@ -1667,21 +1689,18 @@
   {/if}
   <footer class="status-bar">
     <div class="current-action">
-      <span aria-label="Current action" title={currentActionText}>{currentActionText}</span
-      >{#if actionProgress}<progress
+      <div aria-label="Current action" title={currentActionTitle}>
+        {#if batchFileText && liveProgress}<span>{batchFileText}</span>{/if}
+        <span>{currentActionText}</span>
+      </div>
+      {#if statusProgress.value === null}<progress
           aria-label="Task progress"
-          max={1}
-          value={actionProgress.progress ?? 0}
-          aria-valuetext={actionProgress.progressDescription}
-
-        ></progress>{:else if liveProgress ? liveProgress.value === null : displayAction?.active}<progress
-          aria-label="Task progress"
-          aria-valuetext={currentActionText}
+          aria-valuetext={currentActionTitle}
         ></progress>{:else}<progress
           aria-label="Task progress"
-          max={liveProgress?.max ?? (currentJob?.durationSeconds || 1)}
-          value={liveProgress?.value ?? (currentJob?.progressSeconds || 0)}
-          aria-valuetext={liveProgress?.text}
+          aria-valuetext={currentActionTitle}
+          max={statusProgress.max}
+          value={statusProgress.value}
         ></progress>{/if}
     </div>
     <label
@@ -1982,6 +2001,7 @@
     gap: 3px;
   }
   .current-action span {
+    display: block;
     min-height: 12px;
     font-size: 11px;
     line-height: 12px;

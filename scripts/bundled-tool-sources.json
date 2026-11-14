@@ -6,8 +6,14 @@
       "sha256": "172a6867239f2e7165829f338358e1a497d9867c2bf19728ebc678de91ee3b4f"
     },
     "svt-av1-hdr": {
-      "url": "https://codeload.github.com/juliobbv-p/SVT-AV1-HDR/tar.gz/00333404f455471aaa6ee2c927cac3c93efb76e3",
-      "sha256": "a655830e176859c582f9549b250088ef8bc2d8d6ffb0c818aabf415c200fb401"
+      "windowsX86_64": {
+        "url": "https://codeload.github.com/Patman86/SVT-AV1-Mods-by-Patman/tar.gz/e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe",
+        "sha256": "caed1f754738b6365e7ecdedc1524b8ece8f39eb77c2a9e124add43af4802e83"
+      },
+      "linuxX86_64": {
+        "url": "https://codeload.github.com/juliobbv-p/SVT-AV1-HDR/tar.gz/00333404f455471aaa6ee2c927cac3c93efb76e3",
+        "sha256": "a655830e176859c582f9549b250088ef8bc2d8d6ffb0c818aabf415c200fb401"
+      }
     }
   }
 }

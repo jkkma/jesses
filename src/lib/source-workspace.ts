@@ -20,6 +20,8 @@ export type WorkspaceAction = {
   paused?: boolean;
   progress?: number;
   progressDescription?: string;
+  /** The batch's current job, or null while the batch prepares its next job. */
+  progressJobId?: string | null;
   batchNaming?: { codec: string; quality: string; preset: string; extension: string };
   pause?: () => Promise<void>;
   stop?: () => void;

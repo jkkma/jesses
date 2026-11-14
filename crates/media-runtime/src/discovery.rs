@@ -16,6 +16,17 @@ struct ToolSpec {
     version_arg: &'static str,
 }
 
+const HDR_PROVIDER_NAME: &str = if cfg!(windows) {
+    "SVT-AV1-HDR-PMod"
+} else {
+    "SVT-AV1-HDR"
+};
+const HDR_MANAGED_DIRECTORY: &str = if cfg!(windows) {
+    "svt-av1-hdr-pmod"
+} else {
+    "svt-av1-hdr"
+};
+
 const TOOLS: [ToolSpec; 12] = [
     ToolSpec {
         id: "ffmpeg",
@@ -55,7 +66,7 @@ const TOOLS: [ToolSpec; 12] = [
     },
     ToolSpec {
         id: "svt-av1-hdr",
-        name: "SVT-AV1-HDR",
+        name: HDR_PROVIDER_NAME,
         executables: &["SvtAv1EncApp-HDR"],
         version_arg: "--version",
     },
@@ -110,13 +121,17 @@ fn tool_encoder(id: &str) -> Option<VideoEncoder> {
 
 fn fork_config(encoder: VideoEncoder) -> Option<(&'static str, &'static str, &'static str)> {
     match encoder {
-        VideoEncoder::SvtAv1 => Some(("JESSES_SVT_AV1", "svt-av1-hdr", "SvtAv1EncApp")),
+        VideoEncoder::SvtAv1 => Some(("JESSES_SVT_AV1", HDR_MANAGED_DIRECTORY, "SvtAv1EncApp")),
         VideoEncoder::SvtAv1FiveFish => Some((
             "JESSES_SVT_AV1_5FISH",
             "svt-av1-5fish",
             "SvtAv1EncApp-5fish",
         )),
-        VideoEncoder::SvtAv1Hdr => Some(("JESSES_SVT_AV1_HDR", "svt-av1-hdr", "SvtAv1EncApp-HDR")),
+        VideoEncoder::SvtAv1Hdr => Some((
+            "JESSES_SVT_AV1_HDR",
+            HDR_MANAGED_DIRECTORY,
+            "SvtAv1EncApp-HDR",
+        )),
         _ => None,
     }
 }
@@ -242,10 +257,15 @@ fn source_svt_marker() -> Result<&'static str, String> {
             let provider = manifest["sourceProvider"]
                 .as_str()
                 .ok_or("The source SVT provider pin is missing.")?;
+            let asset_key = if cfg!(windows) {
+                "windowsX86_64"
+            } else {
+                "linuxX86_64"
+            };
             manifest["encoders"]
                 .as_array()
                 .and_then(|values| values.iter().find(|value| value["id"] == provider))
-                .and_then(|value| value["versionMarker"].as_str())
+                .and_then(|value| value["assets"][asset_key]["versionMarker"].as_str())
                 .map(str::to_owned)
                 .ok_or_else(|| "The source SVT version pin is missing.".into())
         })
@@ -380,7 +400,9 @@ pub(crate) fn validate_video_encoder_version(
     let matches = match encoder {
         VideoEncoder::SvtAv1 => !known_fork || (hdr && !five_fish),
         VideoEncoder::SvtAv1FiveFish => five_fish && !hdr,
-        VideoEncoder::SvtAv1Hdr => hdr && !five_fish,
+        VideoEncoder::SvtAv1Hdr => {
+            hdr && !five_fish && (!cfg!(windows) || lower.contains("[mod by patman]"))
+        }
         VideoEncoder::X264 => lower.starts_with("x264 "),
         VideoEncoder::X265Standalone => lower.starts_with("x265 "),
         VideoEncoder::AomAv1 => lower.contains("aomenc") || lower.contains("aom codec"),
@@ -696,7 +718,7 @@ mod tests {
             ),
             (
                 VideoEncoder::SvtAv1Hdr,
-                "SVT-AV1-HDR v4.1.0-21-g00333404f (release)\nHDR Release: 2026-09-01",
+                "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A",
             ),
             (VideoEncoder::X264, "x264 0.165.3222M b35605a"),
         ];
@@ -731,6 +753,15 @@ mod tests {
         ] {
             assert!(!source_svt_identity_matches(identity).unwrap());
         }
+        let old_hdr = "SVT-AV1-HDR v4.1.0-21-g00333404f (release)";
+        assert_eq!(
+            source_svt_identity_matches(old_hdr).unwrap(),
+            !cfg!(windows)
+        );
+        assert_eq!(
+            validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, old_hdr).is_ok(),
+            !cfg!(windows)
+        );
         assert!(
             validate_video_encoder_version(VideoEncoder::SvtAv1, "SVT-AV1 Encoder Lib v4.2.0")
                 .is_ok()

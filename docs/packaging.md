@@ -15,9 +15,10 @@ Use `package-desktop.py collect --tool-resources` to assemble the new executable
 with those verified tools, then verify the new archive and generate its Scoop
 manifest. Retain the tool sources, licenses, and provenance alongside the binaries.
 
-The workflow includes the pinned SVT-AV1 5fish and SVT-AV1-HDR binaries, their
-matching complete source archives and license/patent notices. These upstream
-builds require an x86-64-v3 CPU. Each native packaging run checks their versions
+The workflow includes pinned SVT-AV1 5fish and the qualified HDR provider for the
+host, with matching source archives and license and patent notices. Windows uses
+SVT-AV1-HDR-PMod. The 5fish and Linux HDR builds require an x86-64-v3 CPU.
+Each native packaging run checks their versions
 before bundling them. Binary and source downloads have pinned SHA-256 hashes.
 
 Windows package builds also compile the official FFmpeg/FFprobe 9.0.1 source

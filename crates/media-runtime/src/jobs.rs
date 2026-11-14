@@ -153,6 +153,9 @@ struct Entry {
 
 impl Entry {
     fn set_active_phase(&mut self, phase: JobState) {
+        if phase != JobState::Running {
+            self.snapshot.encoder_progress = None;
+        }
         match self.snapshot.state {
             JobState::Paused => self.phase_before_pause = Some(phase),
             JobState::Canceling | JobState::Stopping => {}
@@ -798,6 +801,7 @@ impl JobManager {
                 standalone_recovery: None,
                 input_size_bytes: None,
                 output_size_bytes: None,
+                encoder_progress: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec!["Media job admitted with an atomic batch.".into()],
@@ -978,6 +982,7 @@ impl JobManager {
             standalone_recovery: None,
             input_size_bytes: None,
             output_size_bytes: None,
+            encoder_progress: None,
             progress_seconds: None,
             duration_seconds: None,
             logs: vec!["Media job queued.".into()],
@@ -1399,6 +1404,7 @@ impl JobManager {
         entry.snapshot.state = JobState::Queued;
         entry.snapshot.error = None;
         entry.snapshot.progress_seconds = None;
+        entry.snapshot.encoder_progress = None;
         entry.cancel = cancel;
         entry.task = None;
         append_log(&mut entry.snapshot, "Resume requested with the original saved settings; source, tools and completed phase artifacts will be verified before reuse.".into());
@@ -1716,6 +1722,7 @@ impl JobManager {
             }
             // A successful publication already transitioned under the cancel lock.
             if let Err(error) = result {
+                snapshot.encoder_progress = None;
                 snapshot.state = if error.code == "JOB_CANCELED" {
                     if snapshot.state == JobState::Stopping {
                         JobState::Stopped
@@ -2100,6 +2107,7 @@ impl JobManager {
         temporary.publish(output)?;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.snapshot.id == id) {
             entry.snapshot.state = JobState::Succeeded;
+            entry.snapshot.encoder_progress = None;
             entry.snapshot.output_size_bytes = output_size;
             entry.snapshot.progress_seconds = entry.snapshot.duration_seconds;
             append_log(
@@ -2909,6 +2917,7 @@ mod tests {
                     standalone_recovery: None,
                     input_size_bytes: None,
                     output_size_bytes: None,
+                    encoder_progress: None,
                     progress_seconds: Some(1.0),
                     duration_seconds: Some(5.0),
                     logs: vec!["Started with saved settings".into()],

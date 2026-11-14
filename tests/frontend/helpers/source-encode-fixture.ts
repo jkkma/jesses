@@ -106,7 +106,7 @@ export async function installSourceEncodeFixture(page: Page) {
             name: id,
             available: !state.__unavailableTools?.includes(id),
             path: `/bin/${id}`,
-            version: 'test',
+            version: state.__toolVersions?.[id] ?? 'test',
           }));
         if (command === 'list_jobs') return [];
         if (command === 'get_preferences' || command === 'remember_recent_media')
@@ -213,6 +213,7 @@ export async function installSourceEncodeFixture(page: Page) {
             state.__testJobs = [job, ...state.__testJobs];
             emitJobs();
           }
+          if (state.__holdPrepareReply) await state.__holdPrepareReply;
           return {
             id,
             executableLabel:

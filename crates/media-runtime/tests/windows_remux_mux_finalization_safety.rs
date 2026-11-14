@@ -152,6 +152,7 @@ fn history_snapshot(
         standalone_recovery: None,
         input_size_bytes: None,
         output_size_bytes: None,
+        encoder_progress: None,
         progress_seconds: Some(1.0),
         duration_seconds: Some(2.0),
         logs: vec!["Final container conversion started.".into()],

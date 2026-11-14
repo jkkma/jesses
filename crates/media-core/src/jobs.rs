@@ -610,6 +610,7 @@ impl VideoEncoder {
         match self {
             Self::SvtAv1 => "SVT-AV1",
             Self::SvtAv1FiveFish => "SVT-AV1 5fish",
+            Self::SvtAv1Hdr if cfg!(windows) => "SVT-AV1-HDR-PMod",
             Self::SvtAv1Hdr => "SVT-AV1-HDR",
             Self::X264 => "x264",
             Self::X265 => "x265",
@@ -720,6 +721,26 @@ pub struct StandaloneRecovery {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct EncoderProgress {
+    #[ts(type = "number")]
+    pub frames: u64,
+    #[ts(type = "number | null")]
+    pub total_frames: Option<u64>,
+    pub percent: Option<f64>,
+    pub fps: Option<f64>,
+    pub bitrate_kbps: Option<f64>,
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub estimated_size_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub elapsed_seconds: Option<u64>,
+    #[ts(type = "number | null")]
+    pub eta_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct JobSnapshot {
     pub id: String,
     pub state: JobState,
@@ -747,6 +768,9 @@ pub struct JobSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub output_size_bytes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub encoder_progress: Option<EncoderProgress>,
     pub progress_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub logs: Vec<String>,

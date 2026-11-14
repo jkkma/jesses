@@ -744,6 +744,8 @@ export type RecoveryPhase = "encoding" | "finalizing";
 
 export type Av1anRecovery = { workspace: string, phase: RecoveryPhase, completedFrames: number, totalFrames: number, };
 
+export type EncoderProgress = { frames: number, totalFrames: number | null, percent: number | null, fps: number | null, bitrateKbps: number | null, sizeBytes: number | null, estimatedSizeBytes: number | null, elapsedSeconds: number | null, etaSeconds: number | null, };
+
 export type JobSnapshot = { id: string, state: JobState, request: RemuxRequest,
 /**
  * Present only for multi-source remux. The ordinary request is a display
@@ -757,7 +759,7 @@ inputSizeBytes?: string | null,
 /**
  * Verified output file bytes captured only after successful publication.
  */
-outputSizeBytes?: string | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
+outputSizeBytes?: string | null, encoderProgress?: EncoderProgress | null, progressSeconds: number | null, durationSeconds: number | null, logs: Array<string>, error: AppError | null, logPath: string | null, };
 
 export type Av1anRecoveryAction = { "action": "deleteEncode", id: string, } | { "action": "deleteChunks", id: string, } | { "action": "resumeSaved", id: string, } | { "action": "resumeNew", id: string, settings: EncodeSettings, } | { "action": "clearAll", ids: Array<string>, };
 

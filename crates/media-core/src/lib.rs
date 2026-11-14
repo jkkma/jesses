@@ -88,10 +88,11 @@ pub use encoder_parameters::{
 pub use jobs::{
     AudioChannelLayoutPolicy, AudioChannels, AudioCodec, AudioGain, AudioTrackSettings,
     Av1anRecovery, BorderRatio, BorderSettings, CropSettings, EncodeBackend, EncodeRequest,
-    EncodeSettings, EncodeTrackOverride, EncodeTrackRef, ExternalAudioSettings, ExternalTrack,
-    HdrTune, JobSnapshot, JobState, OutputMetadata, RecoveryPhase, RemuxRequest, ResizeFill,
-    ResizeMode, ResizeSettings, StandaloneRecovery, StandaloneRecoveryPhase, VideoEncoder,
-    VideoFraming, VideoMode, VideoRateControl, VideoSeekStrategy, VideoTimeTrim, VideoTrim,
+    EncodeSettings, EncodeTrackOverride, EncodeTrackRef, EncoderProgress, ExternalAudioSettings,
+    ExternalTrack, HdrTune, JobSnapshot, JobState, OutputMetadata, RecoveryPhase, RemuxRequest,
+    ResizeFill, ResizeMode, ResizeSettings, StandaloneRecovery, StandaloneRecoveryPhase,
+    VideoEncoder, VideoFraming, VideoMode, VideoRateControl, VideoSeekStrategy, VideoTimeTrim,
+    VideoTrim,
 };
 pub use mux::{MuxRequest, MuxSource, MuxTrack};
 pub use subtitles::{SubtitleMode, SubtitleTrackSettings};
@@ -443,6 +444,7 @@ pub fn typescript_contracts() -> String {
         JobState::decl(&config),
         RecoveryPhase::decl(&config),
         Av1anRecovery::decl(&config),
+        EncoderProgress::decl(&config),
         JobSnapshot::decl(&config),
         Av1anRecoveryAction::decl(&config),
         Av1anRecoveryActionResult::decl(&config),

@@ -1,13 +1,19 @@
 # Source SVT provider and AV1AN target defaults
 
-The source UI has one SVT choice. New canonical `svtAv1` requests resolve the exact
-SVT-AV1-HDR provider selected by the fork's bundle recipe; they do not silently
-fall back to mainline. Authority: Nmkoder `.github/scripts/bundle-tools.sh:1059–1112`.
-The pin is `pgo-build-2026-09-01-0033340`, commit
-`00333404f455471aaa6ee2c927cac3c93efb76e3`, marker
-`SVT-AV1-HDR v4.1.0-21-g00333404f`. Archive, executable, source and notice hashes
-are recorded in `scripts/svt-forks.json`; Linux ELF SHA-256 is
-`06201522b00b6edabf6aa69fe7b84b1c358b4205ef9dacfa2ef5a00378cc0631`.
+The source UI has one SVT choice. New canonical `svtAv1` requests use the qualified
+HDR provider for the host. Windows uses [SVT-AV1-HDR-PMod 2026-07-20](https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/tag/2026-07-20)
+from commit `e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe`. Linux uses the
+[SVT-AV1-HDR 2026-09-01 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-09-01-0033340)
+from commit `00333404f455471aaa6ee2c927cac3c93efb76e3`. The Linux package retains
+its qualified HDR10+ and Dolby Vision integration. Version markers and binary
+hashes are in `scripts/svt-forks.json`, and source hashes are in
+`scripts/bundled-tool-sources.json`.
+
+Standalone SVT progress includes frames, speed, bitrate, encoded size and
+elapsed time as the encoder reports them. For a deterministic frame plan,
+the typed pipeline supplies the exact frame count so the encoder also reports
+remaining time and estimated size. Unbounded source filters and manually
+edited command programs retain end-of-stream behavior.
 
 Discovery checks the canonical override, HDR override, managed HDR installation,
 verified package HDR record, then distinct/canonical PATH names. A discovered

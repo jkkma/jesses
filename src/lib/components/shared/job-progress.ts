@@ -29,10 +29,14 @@ export function clock(seconds: number): string {
 
 export type LiveJobProgress = {
   text: string;
-  /** Media seconds done, or null while the phase has no measurable progress. */
+  /** Frames or media seconds done, or null while progress cannot be measured. */
   value: number | null;
   max: number;
 };
+
+function encoderSize(bytes: number): string {
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(2)} GB` : `${(bytes / 1e6).toFixed(2)} MB`;
+}
 
 /**
  * What the status bar shows for a live job. Preparation and final checks can
@@ -60,6 +64,35 @@ export function liveJobProgress(
   const step = latestStep(job.logs ?? []);
   const value = measurable ? progress : null;
   const max = duration ?? 1;
+  const encoder = job.encoderProgress;
+  if (encoder && (job.state === 'running' || job.state === 'paused')) {
+    const reportedPercent = encoder.percent ?? percent;
+    const paused = job.state === 'paused';
+    const label = paused ? 'Paused' : av1an ? 'Encoding (AV1AN)' : 'Encoding';
+    const remaining =
+      encoder.etaSeconds ?? (estimate?.kind === 'estimate' ? estimate.remainingSeconds : null);
+    const size = encoder.sizeBytes !== null ? encoderSize(encoder.sizeBytes) : null;
+    const projected =
+      encoder.estimatedSizeBytes !== null ? encoderSize(encoder.estimatedSizeBytes) : null;
+    const text = [
+      reportedPercent === null
+        ? label
+        : `${label}${paused ? ' at' : ''} ${Math.floor(reportedPercent)}%`,
+      `${encoder.frames}${encoder.totalFrames !== null ? `/${encoder.totalFrames}` : ''} frames`,
+      !paused && encoder.fps !== null ? `${encoder.fps.toFixed(2)} fps` : null,
+      encoder.elapsedSeconds !== null ? `${clock(encoder.elapsedSeconds)} elapsed` : null,
+      !paused && remaining !== null ? `${clock(remaining)} left` : null,
+      !paused && encoder.bitrateKbps !== null
+        ? `${encoder.bitrateKbps.toLocaleString('en-US', { maximumFractionDigits: 2 })} kb/s`
+        : null,
+      !paused && size ? `${size}${projected ? ` (${projected} estimated)` : ''}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    return encoder.totalFrames !== null && encoder.totalFrames > 0
+      ? { text, value: Math.min(encoder.frames, encoder.totalFrames), max: encoder.totalFrames }
+      : { text, value, max };
+  }
   switch (job.state) {
     case 'queued':
       return { text: `Queued: ${task}...`, value: null, max };

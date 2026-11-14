@@ -389,6 +389,25 @@ def download(url: str, expected: str, cache: Path) -> Path:
     return cached
 
 
+def extract_fork_executable(binary_archive: Path, asset: dict, executable: Path, identifier: str) -> None:
+    if asset.get("archiveFormat") == "7z":
+        tar = Path(os.environ["SystemRoot"]) / "System32/tar.exe"
+        entries = subprocess.check_output([str(tar), "-tf", str(binary_archive)], text=True, timeout=15).splitlines()
+        if sorted(entries) != sorted(asset["archiveEntries"]) or entries.count(asset["entry"]) != 1:
+            raise ValueError(f"Unexpected binary archive layout for {identifier}.")
+        # Stream the named member instead of allowing archive-controlled paths
+        # or links into the package tree. The result must match the executable pin.
+        with executable.open("xb") as output:
+            subprocess.run([str(tar), "-xOf", str(binary_archive), asset["entry"]], stdout=output, check=True, timeout=15)
+        return
+    with tarfile.open(binary_archive) as archive:
+        members = archive.getmembers()
+        if len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"] or members[0].size > MAX_DOWNLOAD:
+            raise ValueError(f"Unexpected binary archive layout for {identifier}.")
+        with archive.extractfile(members[0]) as original, executable.open("xb") as output:
+            shutil.copyfileobj(original, output)
+
+
 def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None, mkvmerge_build: Path | None = None, grav1synth_build: Path | None = None) -> Path:
     host = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "x86_64-unknown-linux-gnu" if sys.platform == "linux" else "unsupported"
     if target != host or platform.machine().lower() not in {"amd64", "x86_64"}:
@@ -415,17 +434,14 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
     for encoder in forks["encoders"]:
         identifier = encoder["id"]
         asset = encoder["assets"][asset_key]
-        source = sources["sources"][identifier]
+        identity = {**encoder, **asset}
+        source_entry = sources["sources"][identifier]
+        source = source_entry.get(asset_key, source_entry)
         directory = tools_root / identifier
         directory.mkdir()
         binary_archive = download(asset["url"], asset["sha256"], cache)
-        with tarfile.open(binary_archive) as archive:
-            members = archive.getmembers()
-            if len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"] or members[0].size > MAX_DOWNLOAD:
-                raise ValueError(f"Unexpected binary archive layout for {identifier}.")
-            with archive.extractfile(members[0]) as original, (directory / asset["entry"]).open("xb") as output:
-                shutil.copyfileobj(original, output)
         executable = directory / asset["entry"]
+        extract_fork_executable(binary_archive, asset, executable, identifier)
         executable.chmod(0o755)
         executable_hash = digest(executable)
         if "executableSha256" in asset and executable_hash != asset["executableSha256"]:
@@ -434,7 +450,7 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
         # runtime dependency fails this native stage instead of shipping blindly.
         version_result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=15, check=True)
         version = (version_result.stdout + version_result.stderr).strip()
-        if encoder["versionMarker"] not in version:
+        if identity["versionMarker"] not in version:
             raise ValueError(f"The staged executable identity differs for {identifier}: {version}")
         source_archive = download(source["url"], source["sha256"], cache)
         shutil.copy2(source_archive, directory / "source.tar.gz")
@@ -450,7 +466,7 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
                 licenses.append({"path": f"{identifier}/{license_name}", "sha256": digest(directory / license_name)})
         staged.append({"id": identifier, "path": f"{identifier}/{asset['entry']}", "sha256": executable_hash,
                        "version": version, "architecture": asset["architecture"], "archive": asset,
-                       "sourceRepository": encoder["repository"], "sourceCommit": encoder["commit"],
+                       "sourceRepository": identity["repository"], "sourceCommit": identity["commit"],
                        "source": {**source, "path": f"{identifier}/source.tar.gz"}, "licenses": licenses})
         print(f"Verified package tool: {identifier} ({executable_hash})")
     if ffmpeg_build is not None:

@@ -147,6 +147,7 @@ impl History {
         // Disk logs hold diagnostics; persisted history needs only a bounded
         // summary, even after 100 verbose jobs.
         for job in &mut jobs {
+            job.encoder_progress = None;
             job.logs = job
                 .logs
                 .iter()
@@ -236,6 +237,7 @@ mod tests {
                 standalone_recovery: None,
                 input_size_bytes: None,
                 output_size_bytes: None,
+                encoder_progress: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec![],
@@ -359,6 +361,7 @@ mod tests {
                 standalone_recovery: None,
                 input_size_bytes: None,
                 output_size_bytes: None,
+                encoder_progress: None,
                 progress_seconds: None,
                 duration_seconds: None,
                 logs: vec![],
