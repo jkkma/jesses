@@ -71,7 +71,8 @@ impl JobManager {
         );
         let execution = async {
             if (settings.source_filters
-                || settings.tone_map.is_some_and(|tone| tone.source_workflow))
+                || settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                || quick_header_planning(settings))
                 && settings.backend == media_core::EncodeBackend::Standalone
                 && !settings.source_nvenc_quality
             {
@@ -445,6 +446,8 @@ impl JobManager {
         } else {
             None
         };
+        let thorough = thorough_verification(settings);
+        let check_capabilities = thorough || settings.backend == media_core::EncodeBackend::Av1an;
         for (path, version_arg) in [
             (&ffmpeg, "-version"),
             (&ffprobe, "-version"),
@@ -457,6 +460,11 @@ impl JobManager {
                 },
             ),
         ] {
+            // The actual processes report tool failures. Only the encoder's
+            // identity is needed to distinguish the explicitly selected fork.
+            if !check_capabilities && path != &encoder {
+                continue;
+            }
             let version = supervisor::run_capture(
                 &CommandSpec {
                     executable: path.clone(),
@@ -505,7 +513,6 @@ impl JobManager {
         }
         // Thorough verification re-checks every result; without it, a job runs
         // what the encode needs and checks the finished file's counts.
-        let thorough = thorough_verification(settings);
         // Stream headers are enough to plan. The whole file is read for packet
         // counts only for thorough verification, when a selected subtitle is
         // bound for a container that rejects empty subtitle tracks, or when a
@@ -640,7 +647,7 @@ impl JobManager {
         } else {
             mkvmerge
         };
-        if settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10() {
+        if check_capabilities && settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10() {
             let tool = mkvmerge.as_ref().expect("HDR10 AOM requires mkvmerge");
             let result = supervisor::run_capture(
                 &CommandSpec {
@@ -675,13 +682,17 @@ impl JobManager {
             }
         }
         plan.check_temporal_tools(&ffmpeg, cancel).await?;
-        audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
-        if audio::converted(&mux_settings).any(|track| {
-            matches!(
-                track.codec,
-                media_core::AudioCodec::Aac | media_core::AudioCodec::Opus
-            )
-        }) {
+        if check_capabilities {
+            audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
+        }
+        if check_capabilities
+            && audio::converted(&mux_settings).any(|track| {
+                matches!(
+                    track.codec,
+                    media_core::AudioCodec::Aac | media_core::AudioCodec::Opus
+                )
+            })
+        {
             self.phase(
                 id,
                 JobState::Preparing,
@@ -731,7 +742,7 @@ impl JobManager {
                             .expect("validated audio selection"),
                     )
                 });
-            if track.codec != media_core::AudioCodec::Copy {
+            if check_capabilities && track.codec != media_core::AudioCodec::Copy {
                 self.phase(id, JobState::Preparing, "Checking selected audio settings, codec delay, and final padding with the installed tools.").await;
                 scratch.push(Temporary::create(
                     &output,
@@ -749,8 +760,14 @@ impl JobManager {
             }
             // External tracks keep their complete scan: their bounds set the
             // expected output duration below.
-            let until =
-                trim_audio_until.filter(|_| external.audio_source(track.stream_index).is_none());
+            let priming_only = !check_capabilities
+                && trim_audio_until.is_none()
+                && external.audio_source(track.stream_index).is_none()
+                && track.codec == media_core::AudioCodec::Aac
+                && aac_priming_container;
+            let until = trim_audio_until
+                .filter(|_| external.audio_source(track.stream_index).is_none())
+                .or_else(|| priming_only.then_some(1.0));
             // Without a trim, a source track's complete decode only checks its
             // timeline, unless it is AAC bound for MP4/MOV, whose priming gate
             // below reads the decoded start.
@@ -764,7 +781,9 @@ impl JobManager {
             self.phase(
                 id,
                 JobState::Preparing,
-                if until.is_some() {
+                if priming_only {
+                    "Checking the first second of audio for MP4/MOV AAC priming."
+                } else if until.is_some() {
                     "Decoding selected audio through the trim end to verify its sample timeline."
                 } else {
                     "Decoding selected audio to verify its complete sample timeline."
@@ -795,6 +814,7 @@ impl JobManager {
             super::av1an::validate_input(&document, &plan)?;
         }
         if !settings.encoder.is_svt()
+            && check_capabilities
             && (settings.backend != media_core::EncodeBackend::Av1an || thorough)
         {
             check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
@@ -824,6 +844,12 @@ impl JobManager {
             && !plan.requires_av1an_preprocess()
             && !plan.requires_qtgmc()
             && !plan.requires_source_queue_clock_proof();
+        // A saved workspace was signed with an exact source plan. Keep that
+        // plan when resuming, even if thorough verification was turned off.
+        let fast_standalone = quick_header_planning(settings)
+            && !self.state.lock().await.entries.iter().any(|entry| {
+                entry.snapshot.id == id && entry.snapshot.standalone_recovery.is_some()
+            });
         let frame_count = self
             .source_frames(
                 id,
@@ -836,7 +862,7 @@ impl JobManager {
                 preview.is_some(),
                 thorough,
                 check_discard,
-                fast_av1an,
+                fast_av1an || fast_standalone,
                 cancel,
             )
             .await?;
@@ -886,7 +912,7 @@ impl JobManager {
                 ));
             }).await;
         }
-        if settings.encoder.is_svt() {
+        if check_capabilities && settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
         if super::parameters::requires_serial_svt(settings) {
@@ -1229,7 +1255,7 @@ impl JobManager {
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if super::source_timing::pending() || !thorough {"Will encode"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
+            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if plan.source_frames_estimated {"Estimated"} else if super::source_timing::pending() || !thorough {"Will encode"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
             if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
             }
@@ -2242,6 +2268,21 @@ impl JobManager {
                 .await;
                 } else {
                     intermediate.flush_nonempty_async().await?;
+                    if plan.source_frames_estimated && !settings.source_filters {
+                        let clock = producer_clock(cancel, &output).await?;
+                        frame_count = usize::try_from(clock.frames).map_err(|_| {
+                            files::error(
+                                "ENCODE_VALIDATION_FAILED",
+                                "The encoder input frame count exceeds this platform.",
+                                &output,
+                            )
+                        })?;
+                        plan.source_frames_estimated = false;
+                        self.change(id, |snapshot| {
+                            snapshot.duration_seconds = Some(frame_count as f64 * plan.frame_seconds());
+                            append_log(snapshot, format!("Actual encoder input: {frame_count} frames counted during encoding."));
+                        }).await;
+                    }
                     // Source filters set the plan's size and frame count from
                     // the filtered producer, so their observation always runs.
                     if thorough || settings.source_filters {
@@ -2252,21 +2293,7 @@ impl JobManager {
                             &mut plan,
                             &mut frame_count,
                             if settings.source_filters {
-                                Some(
-                                    super::source_filters::current()
-                                        .expect("source filter observation scope")
-                                        .completed(cancel)
-                                        .await?
-                                        .into_iter()
-                                        .find(|clock| clock.stream_index == 0)
-                                        .ok_or_else(|| {
-                                            files::error(
-                                                "SOURCE_FILTER_OBSERVATION_INVALID",
-                                                "The filtered producer omitted video stream zero.",
-                                                &output,
-                                            )
-                                        })?,
-                                )
+                                Some(producer_clock(cancel, &output).await?)
                             } else {
                                 None
                             },
@@ -2793,7 +2820,7 @@ impl JobManager {
                     .await;
             }
         }
-        if plan.has_alpha() {
+        if (thorough || settings.backend == media_core::EncodeBackend::Av1an) && plan.has_alpha() {
             self.phase(
                 id,
                 JobState::Finalizing,
@@ -2831,7 +2858,10 @@ impl JobManager {
             self.change(id, |snapshot| append_log(snapshot, evidence))
                 .await;
         }
-        if settings.lossless && !plan.has_alpha() {
+        if (thorough || settings.backend == media_core::EncodeBackend::Av1an)
+            && settings.lossless
+            && !plan.has_alpha()
+        {
             self.phase(id, JobState::Finalizing, "Comparing every decoded lossless pixel against the processed encoder input before publication.").await;
             let prepared_path = qtgmc
                 .as_ref()
@@ -3019,7 +3049,9 @@ impl JobManager {
                 basic_video_check: plan.basic_source_video_check(),
                 expected_kinds: repack_kinds.as_deref(),
             }),
-            plan.has_alpha().then_some((
+            ((thorough || settings.backend == media_core::EncodeBackend::Av1an)
+                && plan.has_alpha())
+            .then_some((
                 &plan,
                 ffmpeg.as_path(),
                 video_position,
@@ -3104,7 +3136,8 @@ impl JobManager {
         .await;
     }
 
-    /// Plan the source frame count and cadence. When packet timestamps can
+    /// Ordinary jobs plan from headers and learn their exact count during the
+    /// encode. When exact boundaries are required, packet timestamps can
     /// stand in for decoded frames, plan from them and the first decoded frames
     /// and verify the decoded frames beside the encoder (see `source_timing`):
     /// every frame, or for a trim every frame through its end plus look-ahead.
@@ -3122,10 +3155,10 @@ impl JobManager {
         preview: bool,
         thorough: bool,
         check_discard: bool,
-        fast_av1an: bool,
+        fast_start: bool,
         cancel: &watch::Receiver<bool>,
     ) -> Result<usize, AppError> {
-        if fast_av1an
+        if fast_start
             && !check_discard
             && let Some((planned, count)) = super::source_timing::plan_from_headers(
                 ffprobe, input, plan, stream, duration, cancel,
@@ -3134,7 +3167,7 @@ impl JobManager {
         {
             *plan = planned;
             self.change(id, |snapshot| append_log(snapshot, format!(
-                "Planning approximately {count} frames from source headers; av1an will establish the exact count while building its queue."
+                "Planning approximately {count} frames from source headers; the actual encode will establish the exact count."
             ))).await;
             return Ok(count);
         }
@@ -3688,6 +3721,38 @@ pub(super) fn thorough_verification(settings: &media_core::EncodeSettings) -> bo
     settings
         .encoding_preferences
         .is_some_and(|preferences| preferences.full_output_verification)
+}
+
+/// These operations need exact frame boundaries before starting; ordinary
+/// Quick Convert only needs an estimate for progress until the producer exits.
+fn quick_header_planning(settings: &EncodeSettings) -> bool {
+    settings.backend == media_core::EncodeBackend::Standalone
+        && !thorough_verification(settings)
+        && !settings.source_nvenc_quality
+        && settings.trim.is_none()
+        && settings.hdr_metadata.is_none()
+        && settings.rate_control.is_none()
+        && settings.mov_timecode_track.is_none()
+        && settings.temporal.is_none()
+}
+
+async fn producer_clock(
+    cancel: &watch::Receiver<bool>,
+    output: &Path,
+) -> Result<super::source_filters::ProducerClock, AppError> {
+    super::source_filters::current()
+        .expect("encoder input observation scope")
+        .completed(cancel)
+        .await?
+        .into_iter()
+        .find(|clock| clock.stream_index == 0 && clock.frames > 0)
+        .ok_or_else(|| {
+            files::error(
+                "SOURCE_FILTER_OBSERVATION_INVALID",
+                "The encoder input contained no video frames.",
+                output,
+            )
+        })
 }
 
 /// Proves that stream `index` of `staging` decodes to the same frames as
@@ -4316,7 +4381,9 @@ fn standalone_consumer_arguments(
     frames: usize,
 ) -> Vec<OsString> {
     let mut args = consumer_arguments(plan, settings);
-    if let Some(count) = svt_progress_frame_limit(settings, frames) {
+    if !plan.source_frames_estimated
+        && let Some(count) = svt_progress_frame_limit(settings, frames)
+    {
         args.extend(["--frames".into(), count.to_string().into()]);
     }
     args
@@ -5070,6 +5137,23 @@ mod tests {
         settings.backend = media_core::EncodeBackend::Standalone;
         settings.encoder = VideoEncoder::SvtAv1FiveFish;
         assert_eq!(known(&settings), None);
+    }
+
+    #[test]
+    fn estimated_source_frames_never_limit_the_standalone_encoder() {
+        let (_, mut plan) = producer_plan();
+        plan.source_frames_estimated = true;
+        for encoder in [VideoEncoder::SvtAv1, VideoEncoder::SvtAv1Hdr] {
+            let settings = EncodeSettings {
+                encoder,
+                ..Default::default()
+            };
+            assert!(
+                !standalone_consumer_arguments(&plan, &settings, 7)
+                    .iter()
+                    .any(|arg| arg == "--frames")
+            );
+        }
     }
 
     fn tag_value<'a>(stream: &'a metadata::Stream, key: &str) -> Option<&'a str> {
@@ -6163,6 +6247,10 @@ mod tests {
                     "bt709",
                     "-chroma_sample_location",
                     "left",
+                    // Deliberately stale header: conversion must encode the
+                    // actual input, never stop at this advertised count.
+                    "-metadata:s:v:0",
+                    "NUMBER_OF_FRAMES=7",
                     "-ac",
                     "2",
                     "-c:a",
@@ -6227,6 +6315,72 @@ mod tests {
     const FAST_VERIFIED: &str = "Fast output verification: all";
     const OUTPUT_CHECKED: &str = "Output check:";
     const FINAL_CHECKED: &str = "Final container check:";
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe, SvtAv1EncApp and x264"]
+    async fn quick_convert_uses_headers_and_counts_the_actual_encode() {
+        for (encoder, preset, codec, extension) in [
+            (VideoEncoder::SvtAv1, 12, "av1", "mkv"),
+            (VideoEncoder::X264, 5, "h264", "mkv"),
+            (VideoEncoder::SvtAv1, 12, "av1", "mp4"),
+            (VideoEncoder::X264, 5, "h264", "mp4"),
+        ] {
+            let (_fixture, output, job, frames) =
+                encode_with_audio(encoder, preset, extension, "flac", false, |settings| {
+                    settings.copy_metadata = Some(false);
+                    settings.audio = vec![media_core::AudioTrackSettings {
+                        stream_index: 1,
+                        codec: media_core::AudioCodec::Aac,
+                        bitrate_kbps: 128,
+                        channels: media_core::AudioChannels::Stereo,
+                        gain: None,
+                        normalization: None,
+                    }];
+                })
+                .await;
+            assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("Planning approximately 7 frames")),
+                "{:#?}",
+                job.logs
+            );
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("Actual encoder input:")),
+                "{:#?}",
+                job.logs
+            );
+            assert!(
+                !job.logs
+                    .iter()
+                    .any(|line| line.contains("every packet timestamp")
+                        || line.contains("Decoding the complete source")),
+                "{:#?}",
+                job.logs
+            );
+            assert!(
+                !job.logs
+                    .iter()
+                    .any(|line| line.contains("Checking audio codec delay")
+                        || line.contains("Checking selected audio settings")),
+                "{:#?}",
+                job.logs
+            );
+            assert_ne!(frames, 7);
+            assert_eq!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("Checking the first second of audio")),
+                extension == "mp4",
+                "{:#?}",
+                job.logs
+            );
+            assert_encoded(&output, codec, frames).await;
+        }
+    }
 
     async fn assert_encoded(output: &Path, codec: &str, frames: usize) {
         let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
@@ -6858,8 +7012,10 @@ mod tests {
                 job.logs
             );
             assert!(
-                job.logs.iter().any(|line| line.starts_with("Planned ")
-                    && line.ends_with("constant-rate frames from packet timestamps.")),
+                job.logs
+                    .iter()
+                    .any(|line| line.starts_with("Planning approximately ")
+                        && line.contains("from source headers")),
                 "{:#?}",
                 job.logs
             );

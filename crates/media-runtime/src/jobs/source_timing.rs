@@ -1,5 +1,5 @@
-//! Source planning: normal AV1AN jobs use headers and a bounded first-frame
-//! inspection, then learn the exact count from the engine's queue. Workflows
+//! Source planning: ordinary encodes use headers and a bounded first-frame
+//! inspection, then learn the exact count from the producer or AV1AN queue. Workflows
 //! needing exact boundaries use packet timestamps; thorough verification also
 //! runs decoded-frame validation beside the encoder.
 //!
@@ -329,8 +329,8 @@ impl std::fmt::Display for Fallback {
     }
 }
 
-/// Plan normal AV1AN jobs from headers and a bounded first-frame inspection.
-/// The count is provisional until the engine writes its actual chunk queue.
+/// Plan ordinary encodes from headers and a bounded first-frame inspection.
+/// The count is provisional until the producer runs or AV1AN writes its queue.
 pub(in crate::jobs) async fn plan_from_headers(
     ffprobe: &Path,
     input: &Path,
