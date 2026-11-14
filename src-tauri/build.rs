@@ -67,6 +67,7 @@ fn main() {
             "stop_job",
             "resume_job",
             "list_jobs",
+            "open_encode_window",
             "subscribe_jobs",
         ]),
     ))

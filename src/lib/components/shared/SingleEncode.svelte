@@ -247,7 +247,7 @@
       statuses: Record<string, BatchRowStatus>,
       begin?: boolean,
     ) => void;
-    onreviewjob?: (job: JobSnapshot) => void;
+    onreviewjob?: (job: JobSnapshot, started?: boolean) => void;
     ontracklist?: () => void;
     isShiftHeld?: () => boolean;
   } = $props();
@@ -473,7 +473,7 @@
       id = undefined;
       if (result.kind === 'encode') {
         onjob?.(result.job);
-        onreviewjob?.(result.job);
+        onreviewjob?.(result.job, true);
       }
       return result;
     } finally {

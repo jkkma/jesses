@@ -7,13 +7,14 @@ use media_core::{
 use media_runtime::jobs::JobManager;
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
 use std::time::Duration;
 use tauri::{Emitter, Manager, State, ipc::Channel};
 
 mod analysis;
 mod completion;
+mod encode_window;
 mod paths;
 mod ui_actions;
 use ui_actions::{open_directory, save_activity_log};
@@ -484,7 +485,12 @@ async fn preview_encode_plan(
 
 struct Jobs {
     manager: Arc<JobManager>,
-    subscription: Arc<AtomicU64>,
+    subscriptions: encode_window::JobSubscriptions,
+}
+
+#[tauri::command]
+async fn open_encode_window(app: tauri::AppHandle) -> Result<(), AppError> {
+    encode_window::open(app).await
 }
 
 #[tauri::command]
@@ -687,14 +693,14 @@ async fn list_jobs(jobs: State<'_, Jobs>) -> Result<Vec<JobSnapshot>, AppError> 
 async fn subscribe_jobs(
     channel: Channel<Vec<JobSnapshot>>,
     jobs: State<'_, Jobs>,
+    window: tauri::WebviewWindow,
 ) -> Result<(), AppError> {
     jobs.manager.ready().await?;
     let manager = Arc::clone(&jobs.manager);
-    let generation = Arc::clone(&jobs.subscription);
-    let current = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let active = jobs.subscriptions.start(window.label());
     tauri::async_runtime::spawn(async move {
         let mut previous = None;
-        while generation.load(Ordering::SeqCst) == current {
+        while active.load(Ordering::SeqCst) {
             let snapshot = manager.list_jobs().await;
             if previous.as_ref() != Some(&snapshot) {
                 if channel.send(snapshot.clone()).is_err() {
@@ -852,6 +858,7 @@ fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
         list_av1an_recoveries,
         av1an_recovery_action,
         list_jobs,
+        open_encode_window,
         subscribe_jobs
     ];
     handler(invoke)
@@ -925,6 +932,7 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "list_av1an_recoveries"
         | "av1an_recovery_action"
         | "list_jobs"
+        | "open_encode_window"
         | "subscribe_jobs" => invoke_jobs(invoke),
         _ => false,
     }
@@ -992,7 +1000,7 @@ pub fn run() {
                     log_dir,
                     history_dir,
                 ))),
-                subscription: Arc::new(AtomicU64::new(0)),
+                subscriptions: encode_window::JobSubscriptions::default(),
             });
             let mut main_window =
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?;
@@ -1017,6 +1025,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("could not start jesses")
         .run(move |app, event| {
+            if let tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } = &event
+            {
+                app.state::<Jobs>().subscriptions.stop(label);
+                // The processing window never keeps a closed main application alive.
+                // app.exit still runs the graceful shutdown below.
+                if label == "main" {
+                    app.exit(0);
+                }
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if exiting.load(Ordering::SeqCst) == 2 {
                     return;

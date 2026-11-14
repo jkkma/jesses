@@ -672,6 +672,11 @@ export async function startEncode(request: EncodeRequest): Promise<JobSnapshot> 
   return invoke<JobSnapshot>('start_encode', { request });
 }
 
+export async function openEncodeWindow(): Promise<void> {
+  requireDesktop();
+  return invoke<void>('open_encode_window');
+}
+
 export async function enqueueEncode(request: EncodeRequest): Promise<JobSnapshot> {
   requireDesktop();
   return invoke<JobSnapshot>('enqueue_encode', { request });

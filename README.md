@@ -64,6 +64,12 @@ provide the desktop's local media access or native tools.
    Stop, and the activity log remain accessible across tabs. Batch mode runs
    eligible tasks in file order, with a naming template and per-file status.
 
+Quick Convert encoding opens a separate, resizable processing window with live,
+syntax-highlighted tool output, progress, and Pause/Resume, Stop and Abort
+controls. Closing this window leaves the job running; **Show encoding window**
+in the main log toolbar reopens it. Closing the main Jesses window cancels active
+and queued jobs.
+
 Quick Convert and AV1AN provide trim, crop, resize, borders, frame processing,
 color and tone-mapping controls, audio and subtitle options, and advanced encoder
 settings. Availability depends on the selected workflow, source, and installed

@@ -87,6 +87,7 @@
     "allow-stop-job",
     "allow-resume-job",
     "allow-list-jobs",
+    "allow-open-encode-window",
     "allow-subscribe-jobs"
   ]
 }

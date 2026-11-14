@@ -76,6 +76,7 @@
     startRemux,
     startMux,
     startEncode,
+    openEncodeWindow,
     enqueueEncode,
     enqueueEncodeBatch,
     cancelAllJobs,
@@ -509,6 +510,39 @@
   let logOpen = $state(false);
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
+  const openedEncodeJobs = new Set<string>();
+  const previousEncodeStates = new Map<string, JobSnapshot['state']>();
+  async function showEncodeWindow() {
+    try {
+      await openEncodeWindow();
+    } catch (error) {
+      addLog(
+        `Could not open the encoding window: ${errorMessage(error)}. The job is still available in jesses.`,
+        'error',
+      );
+    }
+  }
+  function showStartedEncode(job: JobSnapshot) {
+    if (job.encodeSettings?.backend !== 'standalone' || openedEncodeJobs.has(job.id)) return;
+    openedEncodeJobs.add(job.id);
+    void showEncodeWindow();
+  }
+  function observeEncodeWindows(snapshot: JobSnapshot[]) {
+    for (const job of snapshot) {
+      if (job.encodeSettings?.backend !== 'standalone') continue;
+      const previous = previousEncodeStates.get(job.id);
+      if (previous && terminalJob(previous) && !terminalJob(job.state))
+        openedEncodeJobs.delete(job.id);
+      previousEncodeStates.set(job.id, job.state);
+      // A command review also has a preparing job. Wait for confirmation, or
+      // for a queued job to start, rather than opening over the command editor.
+      if (
+        ['running', 'paused', 'finalizing'].includes(job.state) ||
+        (previous === 'queued' && job.state === 'preparing')
+      )
+        showStartedEncode(job);
+    }
+  }
   let batchJobIds = $state<Record<string, string>>({});
   let utilityBatchStatuses = $state<Record<string, import('$lib/source-workspace').BatchRowStatus>>(
     {},
@@ -654,6 +688,7 @@
         jobs = snapshot;
         jobsConnected = true;
         mirrorJobLogs(snapshot);
+        observeEncodeWindows(snapshot);
       });
       if (jobsDisposed) stop();
       else stopJobSubscription = stop;
@@ -745,10 +780,12 @@
     const job = await startEncode(request);
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
     addLog(`${encoderOptions(request.settings.encoder).name} encode job submitted.`);
+    showStartedEncode(job);
   }
-  function acceptReviewedJob(job: JobSnapshot) {
+  function acceptReviewedJob(job: JobSnapshot, started = false) {
     // Subscription updates may arrive before the command reply.
     if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
+    if (started) showStartedEncode(job);
   }
   async function queueEncode(request: EncodeRequest) {
     const job = await enqueueEncode(request);
@@ -1644,6 +1681,9 @@
     <div class="log-bar">
       <strong>LOG</strong>
       <div class="log-bar-right">
+        {#if desktop && jobs.some((job) => job.encodeSettings?.backend === 'standalone')}
+          <button type="button" onclick={showEncodeWindow}>Show encoding window</button>
+        {/if}
         <button type="button" onclick={copyActivityLog} disabled={!logs.length}>Copy</button><button
           type="button"
           onclick={exportActivityLog}

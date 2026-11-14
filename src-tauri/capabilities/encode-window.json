@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "encode-window",
+  "description": "Quick Convert processing window: observe and control existing jobs.",
+  "windows": ["quick-convert"],
+  "permissions": [
+    "allow-subscribe-jobs",
+    "allow-cancel-job",
+    "allow-stop-job",
+    "allow-resume-job",
+    "allow-set-job-paused",
+    "allow-open-directory"
+  ]
+}
