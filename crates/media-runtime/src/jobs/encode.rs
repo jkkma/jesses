@@ -794,7 +794,9 @@ impl JobManager {
             super::av1an::validate_encoder_path(&encoder, settings)?;
             super::av1an::validate_input(&document, &plan)?;
         }
-        if !settings.encoder.is_svt() {
+        if !settings.encoder.is_svt()
+            && (settings.backend != media_core::EncodeBackend::Av1an || thorough)
+        {
             check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
         let video = selected
@@ -812,6 +814,16 @@ impl JobManager {
                 .as_ref()
                 .and_then(|format| format.format_name.as_deref())
                 .is_some_and(|names| names.split(',').any(|name| name == "mov"));
+        let fast_av1an = settings.backend == media_core::EncodeBackend::Av1an
+            && !thorough
+            && settings.trim.is_none()
+            && settings.hdr_metadata.is_none()
+            && settings.rate_control.is_none()
+            && settings.mov_timecode_track.is_none()
+            && settings.temporal.is_none()
+            && !plan.requires_av1an_preprocess()
+            && !plan.requires_qtgmc()
+            && !plan.requires_source_queue_clock_proof();
         let frame_count = self
             .source_frames(
                 id,
@@ -824,6 +836,7 @@ impl JobManager {
                 preview.is_some(),
                 thorough,
                 check_discard,
+                fast_av1an,
                 cancel,
             )
             .await?;
@@ -1825,6 +1838,7 @@ impl JobManager {
                 if settings
                     .av1an_options
                     .is_some_and(|options| options.source_workflow)
+                    || plan.source_frames_estimated
                 {
                     frame_count = recovery.queue_frame_count().await?;
                 }
@@ -1900,6 +1914,21 @@ impl JobManager {
                         .await?;
                     if let Some(actual) = plan.source_queue_frame_count() {
                         frame_count = actual;
+                    } else if plan.source_frames_estimated {
+                        frame_count = recovery.queue_frame_count().await?;
+                    }
+                    if plan.source_frames_estimated {
+                        self.change(id, |snapshot| {
+                            snapshot.duration_seconds =
+                                Some(frame_count as f64 * plan.frame_seconds());
+                            append_log(
+                                snapshot,
+                                format!(
+                                    "AV1AN established the exact queue count: {frame_count} frames."
+                                ),
+                            );
+                        })
+                        .await;
                     }
                     if edited {
                         let actual = super::command_edit::verify_actual_output(
@@ -3093,8 +3122,22 @@ impl JobManager {
         preview: bool,
         thorough: bool,
         check_discard: bool,
+        fast_av1an: bool,
         cancel: &watch::Receiver<bool>,
     ) -> Result<usize, AppError> {
+        if fast_av1an
+            && !check_discard
+            && let Some((planned, count)) = super::source_timing::plan_from_headers(
+                ffprobe, input, plan, stream, duration, cancel,
+            )
+            .await?
+        {
+            *plan = planned;
+            self.change(id, |snapshot| append_log(snapshot, format!(
+                "Planning approximately {count} frames from source headers; av1an will establish the exact count while building its queue."
+            ))).await;
+            return Ok(count);
+        }
         let concurrent = super::source_timing::available();
         if preview || concurrent || check_discard {
             self.change(id, |snapshot| {

@@ -374,15 +374,17 @@ impl JobManager {
         } else {
             None
         };
-        options::capabilities(
-            &launch.executable,
-            ffmpeg,
-            &launch.environment,
-            &work,
-            settings,
-            cancel,
-        )
-        .await?;
+        if super::encode::thorough_verification(settings) {
+            options::capabilities(
+                &launch.executable,
+                ffmpeg,
+                &launch.environment,
+                &work,
+                settings,
+                cancel,
+            )
+            .await?;
+        }
         let _grain_table = grain::stage(&work, settings)?;
         let _hdr_resources = dynamic_hdr.stage_av1an(&work)?;
         let version = version_text
@@ -401,8 +403,12 @@ impl JobManager {
                 |sha256| recovery::version_with_vship(&version_text, sha256),
             );
         recovery.version(recovery_version).await?;
-        recovery.verify_segments(ffmpeg, input, cancel).await?;
-        let prepared_scenes = if recovery.resume_chunks || !scenes::supports_preload(&version_text)
+        if super::encode::thorough_verification(settings) {
+            recovery.verify_segments(ffmpeg, input, cancel).await?;
+        }
+        let prepared_scenes = if !super::encode::thorough_verification(settings)
+            || recovery.resume_chunks
+            || !scenes::supports_preload(&version_text)
         {
             None
         } else {
@@ -459,10 +465,12 @@ impl JobManager {
         let progress_path = work.join("chunks/done.json");
         let event_progress_path = progress_path.clone();
         let frame_seconds = plan.frame_seconds();
+        let estimated_frames = plan.source_frames_estimated;
         let observe_events = async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut previous = 0;
+            let mut progress_frames = frame_count;
             loop {
                 tokio::select! {
                     event = events.recv() => {
@@ -471,20 +479,24 @@ impl JobManager {
                     }
                     _ = interval.tick() => {
                         if let Ok(summary) = event_recovery.checkpoint(false).await {
+                            progress_frames = usize::try_from(summary.total_frames).unwrap_or(frame_count);
                             let reader_cache = event_recovery.reader_cache_path().await.ok().flatten();
                             observer.change(&event_id, move |snapshot| {
+                                if estimated_frames {
+                                    snapshot.duration_seconds = Some(summary.total_frames as f64 * frame_seconds);
+                                }
                                 snapshot.recovery = Some(summary);
                                 if let Some(path) = reader_cache {
                                     report_reader_cache(snapshot, &path);
                                 }
                             }).await;
                         }
-                        if let Some((frames, chunks)) = read_progress(&event_progress_path, frame_count).await
+                        if let Some((frames, chunks)) = read_progress(&event_progress_path, progress_frames).await
                             && frames > previous {
                                 previous = frames;
                                 observer.change(&event_id, |snapshot| {
                                     snapshot.progress_seconds = Some(frames as f64 * frame_seconds);
-                                    append_log(snapshot, format!("av1an: {chunks} chunks completed; {frames}/{frame_count} frames."));
+                                    append_log(snapshot, format!("av1an: {chunks} chunks completed; {frames}/{progress_frames} frames."));
                                 }).await;
                         }
                     }
@@ -698,6 +710,7 @@ impl JobManager {
             return Err(cleanup);
         }
         outcome?;
+        let frame_count = recovery.queue_frame_count().await?;
         if edited {
             return Ok(true);
         }

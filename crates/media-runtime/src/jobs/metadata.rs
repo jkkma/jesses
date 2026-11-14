@@ -35,6 +35,7 @@ pub(super) struct Stream {
     pub channel_layout: Option<String>,
     pub duration: Option<String>,
     pub nb_read_packets: Option<String>,
+    pub nb_frames: Option<String>,
     pub extradata_hash: Option<String>,
     pub pix_fmt: Option<String>,
     pub field_order: Option<String>,

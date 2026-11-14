@@ -367,6 +367,8 @@ fn source_trim_arguments(
 
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
+    /// Progress estimate only; the AV1AN queue supplies the final frame count.
+    pub(super) source_frames_estimated: bool,
     pub trim: Option<media_core::VideoTrim>,
     /// Verified common mux clock for source packet-granular trim.
     pub output_origin: f64,
@@ -1206,6 +1208,7 @@ impl Plan {
         .find_map(|value| sdr_color(value).ok())
         .unwrap_or(conventional_sdr);
         Ok(Self {
+            source_frames_estimated: false,
             output_origin: 0.0,
             source_origin: declared_origin,
             source_cut_ordinals: false,

@@ -496,6 +496,16 @@ pub(super) fn target_scene_count(bytes: &[u8], total: u64, maximum: u32) -> Resu
     Ok(scenes.split_scenes.len())
 }
 
+/// Read the engine's actual input count. `validate` still checks the complete
+/// scene coverage, queue commands and done receipts against this count.
+pub(super) fn scene_frames(bytes: &[u8]) -> Result<u64, String> {
+    let scenes: Scenes = parse(bytes, "scenes.json")?;
+    if scenes.frames == 0 || scenes.frames > u64::from(u32::MAX) {
+        return Err("Invalid AV1AN source frame count".into());
+    }
+    Ok(scenes.frames)
+}
+
 pub(super) fn validate(
     chunks_bytes: &[u8],
     scenes_bytes: &[u8],

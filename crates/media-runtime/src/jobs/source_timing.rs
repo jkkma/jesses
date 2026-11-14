@@ -1,7 +1,9 @@
-//! Source frame planning from packet timestamps, with the complete decoded-frame
-//! validation running beside the encoder instead of before it.
+//! Source planning: normal AV1AN jobs use headers and a bounded first-frame
+//! inspection, then learn the exact count from the engine's queue. Workflows
+//! needing exact boundaries use packet timestamps; thorough verification also
+//! runs decoded-frame validation beside the encoder.
 //!
-//! Every source frame must still pass the strict per-frame checks documented in
+//! With thorough verification, source frames pass the per-frame checks documented in
 //! `docs/vulkan-libplacebo-provider.md` and `docs/source-dolby-combinations.md`:
 //! constant-rate timestamps, progressive fields, dimensions and pixel format,
 //! color declarations, static HDR metadata and a valid Dolby Vision RPU. Those
@@ -327,9 +329,57 @@ impl std::fmt::Display for Fallback {
     }
 }
 
-/// Plan the frame count and cadence from packet times and the first decoded
-/// frames. A semantic rejection (for example variable timestamps) is an error
-/// exactly as the decoded scan would report it.
+/// Plan normal AV1AN jobs from headers and a bounded first-frame inspection.
+/// The count is provisional until the engine writes its actual chunk queue.
+pub(in crate::jobs) async fn plan_from_headers(
+    ffprobe: &Path,
+    input: &Path,
+    plan: &Plan,
+    stream: &metadata::Stream,
+    duration: Option<f64>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<(Plan, usize)>, AppError> {
+    let Some(count) = header_frame_count(stream, duration, (plan.fps_num, plan.fps_den)) else {
+        return Ok(None);
+    };
+    let first = match first_frame(ffprobe, input, plan, stream.index, cancel).await? {
+        Ok(first) => first,
+        Err(_) => return Ok(None),
+    };
+    let mut validation = Validation::new(plan.clone(), stream.clone(), false);
+    validation.push(&first);
+    let (mut planned, _) = validation.finish()?;
+    planned.source_frames_estimated = true;
+    Ok(Some((planned, count)))
+}
+
+fn header_frame_count(
+    stream: &metadata::Stream,
+    duration: Option<f64>,
+    rate: (u32, u32),
+) -> Option<usize> {
+    stream
+        .nb_frames
+        .as_deref()
+        .or_else(|| {
+            stream
+                .tags
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("NUMBER_OF_FRAMES"))
+                .map(|(_, value)| value.as_str())
+        })
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&count| count > 0 && count <= u32::MAX as usize)
+        .or_else(|| {
+            let seconds = metadata::track_duration(stream).or(duration)?;
+            let frames = (seconds * f64::from(rate.0) / f64::from(rate.1)).round();
+            (frames.is_finite() && frames >= 1.0 && frames <= f64::from(u32::MAX))
+                .then_some(frames as usize)
+        })
+}
+
+/// Full timing inspection for explicitly requested verification or operations
+/// that need exact source frame boundaries before encoding.
 pub(in crate::jobs) async fn plan_from_packets(
     ffprobe: &Path,
     input: &Path,
@@ -536,6 +586,26 @@ async fn first_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_counts_use_video_metadata_and_reject_unusable_estimates() {
+        let stream = |value| serde_json::from_value::<metadata::Stream>(value).unwrap();
+        let video = stream(serde_json::json!({"index":0,"duration":"2.002"}));
+        assert_eq!(
+            header_frame_count(&video, Some(30.0), (24000, 1001)),
+            Some(48)
+        );
+        let tagged = stream(serde_json::json!({"index":0,"tags":{"NUMBER_OF_FRAMES":"73"}}));
+        assert_eq!(header_frame_count(&tagged, Some(2.0), (24, 1)), Some(73));
+        let exact = stream(
+            serde_json::json!({"index":0,"nb_frames":"48","tags":{"NUMBER_OF_FRAMES":"73"}}),
+        );
+        assert_eq!(header_frame_count(&exact, Some(2.0), (24, 1)), Some(48));
+        let unknown = stream(serde_json::json!({"index":0,"nb_frames":"N/A"}));
+        for duration in [None, Some(f64::NAN), Some(-1.0), Some(f64::INFINITY)] {
+            assert_eq!(header_frame_count(&unknown, duration, (24, 1)), None);
+        }
+    }
 
     #[test]
     fn packets_give_presentation_order_and_refuse_what_decoding_would_change() {

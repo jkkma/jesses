@@ -172,6 +172,42 @@ fn digest(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, 
     })
 }
 
+fn source_stamp(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
+    if let Some(cancel) = cancel {
+        check_cancel(cancel)?;
+    }
+    let guard = Source::open(path)?;
+    let metadata = guard
+        .file()
+        .metadata()
+        .map_err(|e| error(path, e.to_string()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| error(path, e.to_string()))?;
+    let modified = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| error(path, e.to_string()))?;
+    let stamp = Stamp {
+        path: path.to_owned(),
+        identity: file_identity(guard.file()).map_err(|e| error(path, e.to_string()))?,
+        length: metadata.len(),
+        // Versioned separately from the legacy full-content SHA-256 receipt.
+        // Normal jobs use file identity, size and modification time, like a
+        // media application; explicit thorough verification keeps full hashes.
+        sha256: format!("metadata-v1:{}", modified.as_nanos()),
+    };
+    guard.verify()?;
+    Ok(stamp)
+}
+
+fn restamp(stamp: &Stamp, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
+    if stamp.sha256.starts_with("metadata-v1:") {
+        source_stamp(&stamp.path, cancel)
+    } else {
+        digest(&stamp.path, cancel)
+    }
+}
+
 fn copy_prepared(
     source: &Path,
     destination: &Path,
@@ -464,6 +500,8 @@ struct Manifest {
     fps_num: u32,
     fps_den: u32,
     total_frames: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    estimated_frames: bool,
     #[serde(default)]
     source_filter: Option<String>,
     phase: RecoveryPhase,
@@ -577,7 +615,7 @@ fn write_cut_slot(
     cancel: Option<&watch::Receiver<bool>>,
 ) -> Result<Stamp, AppError> {
     use std::io::{Seek, SeekFrom};
-    if identity(path)? != *owner || digest(&source.path, cancel)? != *source {
+    if identity(path)? != *owner || restamp(source, cancel)? != *source {
         return Err(error(
             path,
             "The immutable cut or owned decoder slot changed before its authorized write.",
@@ -638,7 +676,7 @@ fn verify_source_cut_original(
     cancel: Option<&watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     if let Some(original) = &manifest.source_cut_original
-        && digest(&original.path, cancel)? != *original
+        && restamp(original, cancel)? != *original
     {
         return Err(error(
             &original.path,
@@ -1158,12 +1196,12 @@ fn source_matches_attempt(
         Ok(prepared.is_none()
             && manifest.original_source.as_ref() == Some(original_source)
             && manifest.source.path == cut_slot(root, &original_source.path)
-            && digest(&manifest.source.path, cancel)? == manifest.source)
+            && restamp(&manifest.source, cancel)? == manifest.source)
     } else if let Some(prepared) = prepared {
         Ok(manifest.original_source.as_ref() == Some(original_source)
             && manifest.prepared_identity.as_deref() == Some(prepared.decoded_identity.as_str())
             && manifest.source.path == root.join("prepared.mkv")
-            && digest(&manifest.source.path, cancel)? == manifest.source)
+            && restamp(&manifest.source, cancel)? == manifest.source)
     } else {
         Ok(manifest.source == *original_source
             && manifest.original_source.is_none()
@@ -1317,9 +1355,15 @@ impl Workspace {
         };
         let script_text =
             std::str::from_utf8(&script_bytes).map_err(|e| error(&chunks, e.to_string()))?;
+        let scenes = bytes(&chunks.join("scenes.json"))?;
+        let total_frames = if self.manifest.estimated_frames && self.manifest.queue.is_none() {
+            super::recovery_receipts::scene_frames(&scenes).map_err(|e| error(&chunks, e))?
+        } else {
+            queue_frames(&self.manifest)
+        };
         super::recovery_receipts::validate(
             &bytes(&chunks.join("chunks.json"))?,
-            &bytes(&chunks.join("scenes.json"))?,
+            &scenes,
             &bytes(&chunks.join("done.json"))?,
             &super::recovery_receipts::Expected {
                 source: self
@@ -1339,7 +1383,7 @@ impl Workspace {
                     .queue_recipe
                     .as_ref()
                     .map_or(&self.manifest.pixel_format, |recipe| &recipe.pixel_format),
-                total_frames: queue_frames(&self.manifest),
+                total_frames,
                 fps_num: queue_rate(&self.manifest).0,
                 fps_den: queue_rate(&self.manifest).1,
                 source_fps_num: self
@@ -1384,6 +1428,10 @@ impl Workspace {
             Err(_) if !required => return Ok(()),
             Err(e) => return Err(e),
         };
+        if self.manifest.estimated_frames && self.manifest.queue.is_none() {
+            self.manifest.total_frames = receipts.total_frames;
+            self.manifest.estimated_frames = false;
+        }
         if receipts.total_frames != queue_frames(&self.manifest)
             || receipts.completed_frames > receipts.total_frames
             || receipts.queued_chunks == 0
@@ -1582,7 +1630,7 @@ impl Workspace {
             for stamp in recipe.tools.iter().chain(std::iter::once(
                 recipe.original_source.as_ref().unwrap_or(&recipe.source),
             )) {
-                if digest(&stamp.path, cancel)? != *stamp {
+                if restamp(stamp, cancel)? != *stamp {
                     return Err(error(
                         &stamp.path,
                         "An immutable source queue resource changed.",
@@ -1592,7 +1640,7 @@ impl Workspace {
         }
         if self.manifest.source_cut_slot
             && self.manifest.source_slot_write.is_none()
-            && digest(&self.manifest.source.path, cancel)? != self.manifest.source
+            && restamp(&self.manifest.source, cancel)? != self.manifest.source
         {
             return Err(error(
                 &self.manifest.source.path,
@@ -1920,6 +1968,8 @@ pub(in crate::jobs) struct CommandRecipe {
     fps_num: u32,
     fps_den: u32,
     total_frames: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    estimated_frames: bool,
     source_filter: Option<String>,
     edited_command: Option<media_core::EditedCommand>,
 }
@@ -1936,12 +1986,14 @@ fn target_artifact_count(root: &Path, manifest: &Manifest) -> Result<usize, AppE
     {
         return Ok(0);
     }
-    super::recovery_receipts::target_scene_count(
-        &bytes(&scenes)?,
-        queue_frames(manifest),
-        options.maximum_chunk_frames,
-    )
-    .map_err(|message| error(&scenes, message))
+    let contents = bytes(&scenes)?;
+    let frames = if manifest.estimated_frames && manifest.queue.is_none() {
+        super::recovery_receipts::scene_frames(&contents).map_err(|e| error(&scenes, e))?
+    } else {
+        queue_frames(manifest)
+    };
+    super::recovery_receipts::target_scene_count(&contents, frames, options.maximum_chunk_frames)
+        .map_err(|message| error(&scenes, message))
 }
 
 fn is_target_artifact(relative: &str, manifest: &Manifest, count: usize) -> bool {
@@ -2427,7 +2479,7 @@ impl OwnedRecovery {
         }
         if (workspace.manifest.prepared_identity.is_some() || workspace.manifest.source_cut_slot)
             && workspace.manifest.source_slot_write.is_none()
-            && digest(&workspace.manifest.source.path, None)? != workspace.manifest.source
+            && restamp(&workspace.manifest.source, None)? != workspace.manifest.source
         {
             return Err(error(&workspace.root, "The owned prepared source changed."));
         }
@@ -2438,7 +2490,7 @@ impl OwnedRecovery {
                 .original_source
                 .as_ref()
                 .unwrap_or(&workspace.manifest.source);
-            if digest(&original.path, None)? != *original {
+            if restamp(original, None)? != *original {
                 return Err(error(
                     &original.path,
                     "The original source changed; resume is unavailable.",
@@ -2447,7 +2499,7 @@ impl OwnedRecovery {
             if (workspace.manifest.prepared_identity.is_some()
                 || workspace.manifest.source_cut_slot)
                 && workspace.manifest.source_slot_write.is_none()
-                && digest(&workspace.manifest.source.path, None)? != workspace.manifest.source
+                && restamp(&workspace.manifest.source, None)? != workspace.manifest.source
             {
                 return Err(error(&workspace.root, "The prepared source changed."));
             }
@@ -2525,6 +2577,7 @@ impl OwnedRecovery {
             fps_num: manifest.fps_num,
             fps_den: manifest.fps_den,
             total_frames: manifest.total_frames,
+            estimated_frames: manifest.estimated_frames,
             source_filter: manifest.source_filter.clone(),
             edited_command: manifest.edited_command.clone(),
         }
@@ -2542,7 +2595,7 @@ impl OwnedRecovery {
                 ));
             }
             if current.source_slot_write.is_none()
-                && digest(&current.source.path, None)? != current.source
+                && restamp(&current.source, None)? != current.source
             {
                 return Err(error(
                     &current.source.path,
@@ -2559,7 +2612,7 @@ impl OwnedRecovery {
                     )
                 })?
                 .clone();
-            if digest(&current.source.path, None).ok().as_ref() != Some(&recipe.source) {
+            if restamp(&current.source, None).ok().as_ref() != Some(&recipe.source) {
                 let path = current.source.path.clone();
                 self.workspace.manifest.source_slot_write = Some(original.clone());
                 self.workspace.save()?;
@@ -2581,7 +2634,7 @@ impl OwnedRecovery {
         manifest.tools = recipe.tools;
         manifest.external_sources = recipe.external_sources;
         if manifest.prepared_identity.is_some()
-            && digest(&manifest.source.path, None).ok().as_ref() != Some(&manifest.source)
+            && restamp(&manifest.source, None).ok().as_ref() != Some(&manifest.source)
         {
             manifest.source = manifest.original_source.take().ok_or_else(|| {
                 error(
@@ -2601,6 +2654,7 @@ impl OwnedRecovery {
         manifest.fps_num = recipe.fps_num;
         manifest.fps_den = recipe.fps_den;
         manifest.total_frames = recipe.total_frames;
+        manifest.estimated_frames = recipe.estimated_frames;
         manifest.source_filter = recipe.source_filter;
         manifest.edited_command = recipe.edited_command;
         self.workspace.save()?;
@@ -3023,6 +3077,7 @@ impl Recovery {
             .map(|v| v.into_string().expect("encoder ASCII params"))
             .collect::<Vec<_>>();
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
+        let estimated_frames = plan.source_frames_estimated;
         let pixel_format = plan.output_pixel_format.to_owned();
         let presented_rate = plan
             .av1an_presented_rate
@@ -3036,7 +3091,15 @@ impl Recovery {
                     .flatten()
             };
         tokio::task::spawn_blocking(move || {
-            let original_source = digest(&source, Some(&cancel))?;
+            let previous = locator.as_ref().map(|locator| load(&id, &request, &settings, locator)).transpose()?;
+            let saved_source = previous.as_ref().map(|(_, manifest)| manifest.original_source.as_ref().unwrap_or(&manifest.source));
+            let original_source = if let Some(saved) = saved_source.filter(|saved| saved.path == source) {
+                restamp(saved, Some(&cancel))?
+            } else if super::super::encode::thorough_verification(&settings) || is_source_cut(&settings) {
+                digest(&source, Some(&cancel))?
+            } else {
+                source_stamp(&source, Some(&cancel))?
+            };
             let source_cut_original=if is_source_cut(&settings){Some(digest(Path::new(&request.input_path),Some(&cancel))?)}else{None};
             if let Some(original)=&source_cut_original{super::super::source_normalization::av1an_trim::verify_variant(&id,&request,&settings,&source,&original.sha256,original.length,&original_source.sha256,original_source.length)?;}
             let external_sources = external_source_stamps(&settings, Some(&cancel))?;
@@ -3066,7 +3129,7 @@ impl Recovery {
                     if manifest.source_cut_slot&&is_source_cut(&settings) {
                         if source_cut_original.as_ref().is_none_or(|original|manifest.source_cut_original.as_ref()!=Some(original)) {return Err(error(&root,"The original source changed before the authorized cut-slot replacement."));}
                         if manifest.original_source.as_ref()!=Some(&original_source) {
-                            if digest(&manifest.source.path,Some(&cancel))?!=manifest.source {return Err(error(&manifest.source.path,"The owned cut decoder slot changed before New Settings."));}
+                            if restamp(&manifest.source,Some(&cancel))?!=manifest.source {return Err(error(&manifest.source.path,"The owned cut decoder slot changed before New Settings."));}
                             manifest.source_slot_write=Some(original_source.clone());
                             atomic(&root.join("manifest.json"),&serde_json::to_vec(&manifest).map_err(|cause|error(&root,cause.to_string()))?)?;
                             manifest.source=write_cut_slot(&original_source,&manifest.source.path,&manifest.source.identity,Some(&cancel))?;
@@ -3076,7 +3139,7 @@ impl Recovery {
                     manifest.settings=settings.clone();manifest.previous_settings=None;
                     manifest.external_sources=external_sources.clone();manifest.tools=tool_stamps.clone();
                     manifest.params=params.clone();manifest.pixel_format=pixel_format.clone();
-                    manifest.fps_num=fps_num;manifest.fps_den=fps_den;manifest.total_frames=frame_count as u64;
+                    manifest.fps_num=fps_num;manifest.fps_den=fps_den;manifest.total_frames=queue_frames(&manifest);manifest.estimated_frames=false;
                     manifest.source_filter=source_filter.clone();manifest.restart_pending=false;
                     atomic(&root.join("manifest.json"),&serde_json::to_vec(&manifest).map_err(|cause|error(&root,cause.to_string()))?)?;
                 } else if manifest.restart_pending {
@@ -3110,14 +3173,14 @@ impl Recovery {
                     manifest.source = next_source; manifest.original_source = original; manifest.prepared_identity = decoded;
                     manifest.external_sources = external_sources.clone(); manifest.tools = tool_stamps.clone();
                     manifest.params = params.clone(); manifest.pixel_format = pixel_format.clone();
-                    manifest.fps_num = fps_num; manifest.fps_den = fps_den; manifest.total_frames = frame_count as u64;
+                    manifest.fps_num = fps_num; manifest.fps_den = fps_den; manifest.total_frames = frame_count as u64; manifest.estimated_frames = estimated_frames;
                     manifest.source_filter = source_filter.clone(); manifest.restart_pending = false;
                 }
                 verify_source_cut_original(&manifest,Some(&cancel))?;
                 let source_matches = if source_workflow(&settings)&&manifest.queue_recipe.is_some(){
                     if manifest.source_cut_slot&&is_source_cut(&settings)&&manifest.original_source.as_ref()!=Some(&original_source) {return Err(error(&root,"Saved Settings cannot adopt an arbitrary replacement cut."));}
-                    digest(&manifest.source.path,Some(&cancel))?==manifest.source
-                        &&manifest.original_source.as_ref().is_none_or(|source|digest(&source.path,Some(&cancel)).ok().as_ref()==Some(source))
+                    restamp(&manifest.source,Some(&cancel))?==manifest.source
+                        &&manifest.original_source.as_ref().is_none_or(|source|restamp(source,Some(&cancel)).ok().as_ref()==Some(source))
                 }else{source_matches_attempt(
                     &manifest,
                     &root,
@@ -3132,7 +3195,7 @@ impl Recovery {
                     || (manifest.edited_command.is_none() && manifest.pixel_format != pixel_format)
                     || manifest.fps_num != fps_num
                     || manifest.fps_den != fps_den
-                    || manifest.total_frames != frame_count as u64
+                    || (!estimated_frames && manifest.total_frames != frame_count as u64)
                     || (manifest.edited_command.is_none() && manifest.source_filter != source_filter)
                 {
                     return Err(error(
@@ -3190,6 +3253,7 @@ impl Recovery {
                     fps_num,
                     fps_den,
                     total_frames: frame_count as u64,
+                    estimated_frames,
                     source_filter,
                     phase: RecoveryPhase::Encoding,
                     av1an_version: None,
@@ -4169,6 +4233,7 @@ mod tests {
                 fps_num: 24,
                 fps_den: 1,
                 total_frames: 48,
+                estimated_frames: false,
                 source_filter: None,
                 phase: RecoveryPhase::Encoding,
                 av1an_version: None,
@@ -4205,6 +4270,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn normal_source_identity_skips_media_reads_and_detects_changes() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("large-source.mkv");
+        let file = File::create(&source).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        COUNT_SOURCE_HASHES.with(|counter| *counter.borrow_mut() = Some((source.clone(), 0)));
+        let before = source_stamp(&source, None).unwrap();
+        let reads = COUNT_SOURCE_HASHES.with(|counter| counter.borrow_mut().take().unwrap().1);
+        assert_eq!(reads, 0, "normal startup must not hash the entire video");
+        assert_eq!(source_stamp(&source, None).unwrap(), before);
+        let legacy = digest(&source, None).unwrap();
+        assert_eq!(restamp(&legacy, None).unwrap(), legacy);
+        let mut writer = OpenOptions::new().write(true).open(&source).unwrap();
+        writer.write_all(b"changed").unwrap();
+        writer
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1234)),
+            )
+            .unwrap();
+        drop(writer);
+        assert_ne!(source_stamp(&source, None).unwrap(), before);
+        assert_ne!(restamp(&legacy, None).unwrap(), legacy);
     }
 
     fn frozen_source_recipe(workspace: &Workspace, ignore_frame_mismatch: bool) -> QueueRecipe {
@@ -6266,7 +6358,7 @@ mod tests {
         let (mut workspace, intermediate) = fixture.workspace();
         let (_, cancel) = watch::channel(true);
         assert_eq!(
-            digest(&workspace.manifest.source.path, Some(&cancel))
+            restamp(&workspace.manifest.source, Some(&cancel))
                 .unwrap_err()
                 .code,
             "JOB_CANCELED"

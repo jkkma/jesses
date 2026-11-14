@@ -1280,7 +1280,27 @@ async fn av1an_filtered_non_vmaf_targets_score_the_verified_processed_source() {
 async fn source_queue_default_skips_decode_and_reference_join_while_thorough_keeps_them() {
     let fixture = Fixture::new();
     let input = fixture.0.join("source.mkv");
-    synthesize(&input, "160x120", 48).await;
+    let fixture_input = fixture.0.join("fixture.mkv");
+    synthesize(&fixture_input, "160x120", 48).await;
+    // A stale container count may guide initial progress, but must never
+    // truncate the encode or override the engine's actual 48-frame queue.
+    let tagged = output(
+        command("ffmpeg")
+            .await
+            .args(["-v", "error", "-nostdin", "-n", "-i"])
+            .arg(&fixture_input)
+            .args([
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-metadata:s:v:0",
+                "NUMBER_OF_FRAMES=73",
+            ])
+            .arg(&input),
+    )
+    .await;
+    assert!(tagged.status.success());
     let original = std::fs::read(&input).unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
 
@@ -1337,6 +1357,21 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
             "{name} published after {:.2}s",
             began.elapsed().as_secs_f64()
         );
+        if !thorough && !resample {
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("approximately 73 frames")),
+                "{job:#?}"
+            );
+            assert!(
+                !job.logs
+                    .iter()
+                    .any(|line| line.contains("every packet timestamp")),
+                "normal AV1AN startup must not scan the whole source: {:?}",
+                job.logs
+            );
+        }
         assert_eq!(
             job.logs
                 .iter()
