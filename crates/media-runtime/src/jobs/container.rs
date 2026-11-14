@@ -590,17 +590,8 @@ fn arguments(
             flags.push_str("+faststart");
         }
         args.extend(["-movflags".into(), flags.into()]);
-        if document.streams.iter().any(|stream| {
-            stream
-                .side_data_list
-                .iter()
-                .any(|value| value["side_data_type"] == "DOVI configuration record")
-        }) {
-            // FFmpeg requires this explicit mux mode to retain dvvC/dvcC.
-            // The imported AV1 path independently checks its exact fields.
-            args.extend(["-strict".into(), "unofficial".into()]);
-        }
     }
+    append_dolby_vision_mux_options(&mut args, Some(container), document);
     args.extend([
         "-f".into(),
         container.ffmpeg_format().into(),
@@ -608,6 +599,24 @@ fn arguments(
         output.as_os_str().to_owned(),
     ]);
     Ok(args)
+}
+
+pub(super) fn append_dolby_vision_mux_options(
+    args: &mut Vec<OsString>,
+    container: Option<ContainerFormat>,
+    document: &Document,
+) {
+    if matches!(
+        container,
+        Some(ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a)
+    ) && document
+        .streams
+        .iter()
+        .any(|stream| stream.dolby_vision_configuration().next().is_some())
+    {
+        // FFmpeg requires explicit mux compliance to retain dvvC/dvcC.
+        args.extend(["-strict".into(), "unofficial".into()]);
+    }
 }
 
 pub(super) fn normalize(

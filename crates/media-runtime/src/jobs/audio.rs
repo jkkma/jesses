@@ -211,6 +211,76 @@ pub(super) fn converted(settings: &EncodeSettings) -> impl Iterator<Item = &Audi
         .filter(|track| track.codec != AudioCodec::Copy)
 }
 
+fn needs_edited_eac3_copy_check(stream: &metadata::Stream, settings: &EncodeSettings) -> bool {
+    stream.codec_type.as_deref() == Some("audio")
+        && stream.codec_name.as_deref() == Some("eac3")
+        && !converted(settings).any(|track| track.stream_index == stream.index)
+}
+
+pub(super) async fn validate_edited_eac3_copy(
+    ffprobe: &Path,
+    input: &Path,
+    stream: &metadata::Stream,
+    settings: &EncodeSettings,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    if !needs_edited_eac3_copy_check(stream, settings) {
+        return Ok(());
+    }
+    let mut args = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-select_streams",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.push(stream.index.to_string().into());
+    args.extend(
+        [
+            "-read_intervals",
+            "%+#64",
+            "-show_entries",
+            "packet=flags",
+            "-of",
+            "csv=p=0",
+            "-i",
+        ]
+        .map(OsString::from),
+    );
+    args.push(input.as_os_str().to_owned());
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        16 * 1024,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| process_error(error, input))?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(files::error(
+            "TOOL_FAILED",
+            "FFprobe could not inspect the copied E-AC-3 track for MP4 edit-list preroll.",
+            input,
+        ));
+    }
+    if String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .any(|flags| flags.contains('D'))
+    {
+        return Err(invalid(format!(
+            "E-AC-3 stream {} has MP4 edit-list preroll that can make the copied track duration incorrect. Choose audio conversion, such as FLAC for Matroska.",
+            stream.index,
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     let mut indices = HashSet::new();
     for track in &settings.audio {
@@ -1475,6 +1545,28 @@ mod tests {
             {"index":1,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"44100","channels":2,"channel_layout":"stereo"},
             {"index":2,"codec_type":"audio","sample_rate":"48000","channels":6,"channel_layout":"5.1"}
         ]})).unwrap()
+    }
+
+    #[test]
+    fn edited_eac3_selection_includes_implicit_and_explicit_copy() {
+        let mut document = source();
+        document.streams[1].codec_name = Some("eac3".into());
+        let stream = &document.streams[1];
+        let mut settings = EncodeSettings::default();
+        assert!(needs_edited_eac3_copy_check(stream, &settings));
+        settings.audio.push(track(AudioCodec::Copy));
+        assert!(needs_edited_eac3_copy_check(stream, &settings));
+        settings.audio[0].codec = AudioCodec::Flac;
+        assert!(!needs_edited_eac3_copy_check(stream, &settings));
+        assert!(!needs_edited_eac3_copy_check(
+            &document.streams[0],
+            &settings
+        ));
+        document.streams[1].codec_name = Some("aac".into());
+        assert!(!needs_edited_eac3_copy_check(
+            &document.streams[1],
+            &EncodeSettings::default()
+        ));
     }
     #[test]
     fn converted_titles_name_the_written_codec_and_layout() {

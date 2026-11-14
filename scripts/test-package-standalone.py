@@ -3,6 +3,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,42 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("stager", Path(__file__).with_name("stage-bundled-tools.py"))
 stager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stager)
+
+
+@unittest.skipUnless(sys.platform == "win32", "uses Windows system tar.exe")
+class PatmanArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="jesses-patman-archive-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.tar = Path(os.environ["SystemRoot"]) / "System32/tar.exe"
+        self.output = self.root / "output"
+        self.output.mkdir()
+        self.members = {"LICENSE.md": b"license", "README.md": b"readme", "SvtAv1EncApp.exe": b"encoder"}
+        for name, contents in self.members.items():
+            (self.root / name).write_bytes(contents)
+        self.pin = {"entry": "SvtAv1EncApp.exe", "archiveFormat": "7z",
+                    "members": {name: len(contents) for name, contents in self.members.items()}}
+
+    def archive(self, *members):
+        archive = self.root / "test.7z"
+        subprocess.run([self.tar, "-a", "-cf", archive, *members], cwd=self.root, check=True)
+        cached = self.root / "cached-by-digest"
+        archive.rename(cached)
+        return cached
+
+    def test_extracts_only_the_pinned_executable(self):
+        archive = self.archive(*self.members)
+        extracted = stager.extract_fork_binary(archive, self.output, self.pin)
+        self.assertEqual(extracted.read_bytes(), b"encoder")
+        self.assertEqual(list(self.output.iterdir()), [extracted])
+
+    def test_rejects_mismatched_archive_layout(self):
+        (self.root / "injected.dll").write_bytes(b"extra")
+        archive = self.archive(*self.members, "injected.dll")
+        with self.assertRaisesRegex(ValueError, "Unexpected binary archive layout"):
+            stager.extract_fork_binary(archive, self.output, self.pin)
+        self.assertEqual(list(self.output.iterdir()), [])
 
 
 class SharedSourceTests(unittest.TestCase):

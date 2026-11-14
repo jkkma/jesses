@@ -802,6 +802,16 @@ impl JobManager {
             .find(|stream| stream.index == plan.video_index)
             .expect("validated video selection");
         let declared_rate = (plan.fps_num, plan.fps_den);
+        let check_discard = settings.backend == media_core::EncodeBackend::Av1an
+            && matches!(
+                settings.av1an_options.unwrap_or_default().chunk_method,
+                media_core::Av1anChunkMethod::Lsmash | media_core::Av1anChunkMethod::Select
+            )
+            && document
+                .format
+                .as_ref()
+                .and_then(|format| format.format_name.as_deref())
+                .is_some_and(|names| names.split(',').any(|name| name == "mov"));
         let frame_count = self
             .source_frames(
                 id,
@@ -813,9 +823,16 @@ impl JobManager {
                 settings.trim,
                 preview.is_some(),
                 thorough,
+                check_discard,
                 cancel,
             )
             .await?;
+        if plan.av1an_presented_rate.is_some() {
+            for stream in &selected {
+                audio::validate_edited_eac3_copy(&ffprobe, &source.path, stream, settings, cancel)
+                    .await?;
+            }
+        }
         let dynamic_hdr =
             super::dynamic_hdr::Resources::prepare(settings, frame_count, cancel).await?;
         external.validate_timecode_clock(plan.fps_num, plan.fps_den, frame_count)?;
@@ -1261,9 +1278,12 @@ impl JobManager {
         } else {
             None
         };
+        let presented = plan
+            .av1an_presented_rate
+            .filter(|_| qtgmc.is_none() && !plan.requires_av1an_preprocess());
         let av1an_prepared = if settings.backend == media_core::EncodeBackend::Av1an
             && qtgmc.is_none()
-            && plan.requires_av1an_preprocess()
+            && (plan.requires_av1an_preprocess() || plan.av1an_presented_rate.is_some())
         {
             if subtitle_assets.bitmap_input().is_some() {
                 return Err(AppError::new(
@@ -1275,25 +1295,41 @@ impl JobManager {
             self.phase(
                 id,
                 JobState::Preparing,
-                "Preparing one verified lossless processed source for av1an scene detection, chunk encoding, and quality references.",
+                if plan.av1an_presented_rate.is_some() {
+                    super::av1an_preprocess::PRESENTED_FRAMES_NOTE
+                } else {
+                    "Preparing one verified lossless processed source for av1an scene detection, chunk encoding, and quality references."
+                },
             )
             .await;
-            let prepared = super::av1an_preprocess::Prepared::build(
-                &source.path,
-                &output,
-                &attempt_id,
-                &plan,
-                &ffmpeg,
-                interval.map(|value| {
-                    (
-                        u32::try_from(value.source_start_frame).expect("validated frame bound"),
-                        u32::try_from(value.source_end_frame).expect("validated frame bound"),
-                    )
-                }),
-                subtitle_assets.text_filter(),
-                cancel,
-            )
-            .await?;
+            let prepared = if let Some(rate) = presented {
+                super::av1an_preprocess::Prepared::build_presented(
+                    &source.path,
+                    &output,
+                    &attempt_id,
+                    &plan,
+                    &ffmpeg,
+                    rate,
+                    cancel,
+                )?
+            } else {
+                super::av1an_preprocess::Prepared::build(
+                    &source.path,
+                    &output,
+                    &attempt_id,
+                    &plan,
+                    &ffmpeg,
+                    interval.map(|value| {
+                        (
+                            u32::try_from(value.source_start_frame).expect("validated frame bound"),
+                            u32::try_from(value.source_end_frame).expect("validated frame bound"),
+                        )
+                    }),
+                    subtitle_assets.text_filter(),
+                    cancel,
+                )
+                .await?
+            };
             let preparation_log = log_path.with_extension("av1an-preprocess.log");
             self.change(id, |snapshot| {
                 snapshot.log_path = Some(preparation_log.to_string_lossy().into_owned());
@@ -1311,14 +1347,29 @@ impl JobManager {
             let result = prepared.run(cancel.clone(), sender, &preparation_log).await;
             let _ = observer.await;
             result?;
-            if thorough {
+            if thorough && presented.is_none() {
                 prepared
                     .validate(&ffprobe, &plan, frame_count, cancel)
                     .await?;
             }
-            let identity = prepared
-                .decoded_identity(&ffmpeg, frame_count, cancel)
-                .await?;
+            let identity = if let Some(rate) = presented {
+                boxed(|| {
+                    super::av1an_preprocess::verify_presented(
+                        &source.path,
+                        &plan,
+                        &ffmpeg,
+                        rate,
+                        frame_count,
+                        &prepared,
+                        cancel,
+                    )
+                })
+                .await?
+            } else {
+                prepared
+                    .decoded_identity(&ffmpeg, frame_count, cancel)
+                    .await?
+            };
             source.verify()?;
             Some((prepared, identity))
         } else {
@@ -2757,9 +2808,13 @@ impl JobManager {
                 .as_ref()
                 .map(|prepared| prepared.video.path.as_path())
                 .or_else(|| {
-                    av1an_prepared
-                        .as_ref()
-                        .map(|(prepared, _)| prepared.video.path.as_path())
+                    if presented.is_none() {
+                        av1an_prepared
+                            .as_ref()
+                            .map(|(prepared, _)| prepared.video.path.as_path())
+                    } else {
+                        None
+                    }
                 });
             let reference = CommandSpec {
                 executable: ffmpeg.clone(),
@@ -3037,16 +3092,24 @@ impl JobManager {
         trim: Option<media_core::VideoTrim>,
         preview: bool,
         thorough: bool,
+        check_discard: bool,
         cancel: &watch::Receiver<bool>,
     ) -> Result<usize, AppError> {
         let concurrent = super::source_timing::available();
-        if preview || concurrent {
+        if preview || concurrent || check_discard {
             self.change(id, |snapshot| {
                 append_log(snapshot, "Planning source frames from every packet timestamp and the first decoded frames.".into())
             })
             .await;
-            match super::source_timing::plan_from_packets(ffprobe, input, plan, stream, cancel)
-                .await?
+            match super::source_timing::plan_from_packets(
+                ffprobe,
+                input,
+                plan,
+                stream,
+                check_discard,
+                cancel,
+            )
+            .await?
             {
                 Ok((planned, count)) => {
                     if concurrent && !preview && !thorough {
@@ -3114,6 +3177,13 @@ impl JobManager {
                         append_log(snapshot, format!("Packet timing cannot stand in for decoded frames ({reason}); decoding the complete source before encoding."))
                     })
                     .await;
+                    if check_discard && reason.discarded {
+                        let count = self
+                            .scan_frames(id, ffprobe, input, plan, stream, false, cancel)
+                            .await?;
+                        plan.av1an_presented_rate = Some((plan.fps_num, plan.fps_den));
+                        return Ok(count);
+                    }
                 }
             }
         }

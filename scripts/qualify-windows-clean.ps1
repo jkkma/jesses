@@ -777,6 +777,25 @@ try {
     $receipt.webView2 = $webView
     if (-not $webView.available) { throw "Microsoft Edge WebView2 Runtime is unavailable." }
 
+    $toolManifest = Get-Content -LiteralPath (Join-Path $packageRoot "resources\tools\manifest.json") -Raw | ConvertFrom-Json
+    $hdrTool = $toolManifest.tools | Where-Object { $_.id -eq "svt-av1-hdr" }
+    $prerequisite = if ($hdrTool -and $hdrTool.archive.PSObject.Properties["runtimePrerequisite"]) {
+        $hdrTool.archive.runtimePrerequisite
+    }
+    if ($prerequisite) {
+        $dll = Join-Path $env:SystemRoot "System32\VCRUNTIME140.dll"
+        $runtime = if ([System.IO.File]::Exists($dll)) { [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dll) }
+        $available = $runtime -and [version]::new($runtime.FileMajorPart, $runtime.FileMinorPart) -ge [version]$prerequisite.minimumVersion
+        $receipt.visualCppRuntime = [ordered]@{
+            available = $available
+            minimumVersion = $prerequisite.minimumVersion
+            fileVersion = $(if ($runtime) { $runtime.FileVersion })
+        }
+        if (-not $available) {
+            throw "Install Microsoft Visual C++ v14 Redistributable (x64) $($prerequisite.minimumVersion) or later from https://aka.ms/vc14/vc_redist.x64.exe."
+        }
+    }
+
     $profileRoot = Join-Path $evidencePath "isolated-profile"
     $cleanEnvironment = Get-CleanEnvironment $profileRoot
     if ([System.IO.Directory]::Exists((Join-Path $profileRoot "appdata-local\jesses\tools"))) {
@@ -890,6 +909,7 @@ try {
         "package-payloads-unchanged",
         "source-archive-unchanged"
     )
+    if ($prerequisite) { $receipt.checks += "visual-cpp-runtime-present" }
     $receipt.qualifiesFreshImage = ($Scope -eq "FreshImage")
     $receipt.status = "passed"
     $receipt.boundary = if ($Scope -eq "FreshImage") {

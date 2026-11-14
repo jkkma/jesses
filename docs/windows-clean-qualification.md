@@ -8,10 +8,12 @@ probe and packaged FFmpeg, x264, SVT-AV1 and mkvmerge binaries with a cleared en
 a system-only `PATH`, and a new profile. The media checks generate their own
 eight-frame source; no source media is read or changed.
 
-The receipt also requires a machine- or user-installed Microsoft Edge WebView2
-Runtime. The portable package does not contain or install WebView2. The native
-application is not launched by this runner, so GUI startup, browser rendering,
-accessibility, and interactive workflows require a separate native UI pass.
+Provision Microsoft Edge WebView2 and the x64 Microsoft Visual C++ v14
+Redistributable 14.51 or later on the qualification image. The runner records
+WebView2 and the Visual C++ DLL version required by the packaged Patman encoder.
+GUI startup, browser rendering, accessibility, and interactive workflows require
+a separate native UI pass.
+[Download the Visual C++ runtime from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).
 
 ## Evidence levels
 

@@ -148,8 +148,8 @@ fn section(
         extension,
     })
 }
-fn arguments(input: &Path, output: &Path, section: &Section) -> Vec<OsString> {
-    [
+fn arguments(input: &Path, output: &Path, section: &Section, document: &Document) -> Vec<OsString> {
+    let mut args = [
         "-hide_banner",
         "-nostdin",
         "-v",
@@ -181,10 +181,11 @@ fn arguments(input: &Path, output: &Path, section: &Section) -> Vec<OsString> {
         "-avoid_negative_ts".into(),
         "make_zero".into(),
         "-ignore_unknown".into(),
-        "-y".into(),
-        output.as_os_str().to_owned(),
     ])
-    .collect()
+    .collect();
+    container::append_dolby_vision_mux_options(&mut args, container::format(output).ok(), document);
+    args.extend(["-y".into(), output.as_os_str().to_owned()]);
+    args
 }
 
 fn copy_diagnostic(event: ProcessEvent) -> Option<String> {
@@ -340,6 +341,17 @@ impl CutWorkspace {
         fs::remove_dir(&self.root).map_err(|error| invalid(&self.root, error.to_string()))
     }
 }
+
+fn reject_bound_dolby_cut_refresh(recovery_root: &Path) -> Result<(), AppError> {
+    match recovery_root.symlink_metadata() {
+        Ok(_) => Err(invalid(
+            recovery_root,
+            "The saved source cut has different Dolby Vision configuration. Discard the saved AV1AN progress and start the job again to rebuild the cut.",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(invalid(recovery_root, error.to_string())),
+    }
+}
 pub(in crate::jobs) struct Prepared {
     pub original: Source,
     pub source_path: PathBuf,
@@ -399,17 +411,38 @@ impl Prepared {
                     "The verified source-copy intermediate changed.",
                 ));
             }
+            let obsolete = if document
+                .streams
+                .iter()
+                .any(|stream| stream.dolby_vision_configuration().next().is_some())
+            {
+                let actual = probe_headers(&ffprobe, &source_path, cancel, None).await?;
+                !packets::copied_dolby_vision_configuration_matches(
+                    &document,
+                    &actual,
+                    &source_path,
+                )?
+            } else {
+                false
+            };
+            source.verify()?;
             drop(source);
-            let (request, settings) = effective(request, settings, &complete.tracks)?;
-            manager.change(id,|snapshot|append_log(snapshot,"Reusing the verified source AV1AN copied input; complete original/cut hashes and frozen section were rechecked.".into())).await;
-            return Ok(Self {
-                original,
-                source_path,
-                request,
-                settings,
-                video_origin: complete.video_origin,
-                workspace,
-            });
+            if !obsolete {
+                let (request, settings) = effective(request, settings, &complete.tracks)?;
+                manager.change(id,|snapshot|append_log(snapshot,"Reusing the verified source AV1AN copied input; complete original/cut hashes and frozen section were rechecked.".into())).await;
+                return Ok(Self {
+                    original,
+                    source_path,
+                    request,
+                    settings,
+                    video_origin: complete.video_origin,
+                    workspace,
+                });
+            }
+            check_cancel(cancel)?;
+            reject_bound_dolby_cut_refresh(&av1an::recovery_root(id, request)?)?;
+            workspace.cleanup()?;
+            manager.change(id, |snapshot| append_log(snapshot, "Rebuilding the saved copied input to retain its Dolby Vision configuration.".into())).await;
         }
         manager.phase_with_fresh_progress(id,JobState::Preparing,"Stream-copying the source AV1AN section with the fork's original keyframe/preroll semantics.").await;
         let guard = rate_control::Stats::durable(&root, false)?;
@@ -451,7 +484,7 @@ impl Prepared {
             .files
             .insert("owner.json".into(), file_identity(&owner_file)?);
         let tool = stamp(&Source::open(&ffmpeg)?, cancel).await?;
-        let args = arguments(&original.path, &temporary.path, &section);
+        let args = arguments(&original.path, &temporary.path, &section, &document);
         let owner = CutOwner {
             version: 1,
             id: id.into(),
@@ -794,6 +827,53 @@ pub(in crate::jobs) fn discard_variants_except(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mp4_source_cut_preserves_dolby_vision_configuration() {
+        let mut document: Document = serde_json::from_value(serde_json::json!({
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "hevc",
+                "side_data_list": [{"side_data_type": "DOVI configuration record", "dv_profile": 8}]}]
+        }))
+        .unwrap();
+        let cut_arguments = |document: &Document, extension: &str| {
+            let section = Section {
+                start_ms: 500,
+                end_ms: 2500,
+                extension: extension.into(),
+            };
+            let input = PathBuf::from(format!("source.{extension}"));
+            let output = PathBuf::from(format!("cut.{extension}"));
+            let args = arguments(&input, &output, &section, document);
+            args.windows(2)
+                .any(|pair| pair == ["-strict", "unofficial"])
+        };
+        assert!(cut_arguments(&document, "mp4"));
+        assert!(!cut_arguments(&document, "mkv"));
+        document.streams[0].side_data_list.clear();
+        assert!(!cut_arguments(&document, "mp4"));
+    }
+
+    #[test]
+    fn obsolete_dolby_cut_refresh_preserves_bound_av1an_progress() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "jesses-source-cut-refresh-{}-{nonce}",
+            std::process::id(),
+        ));
+        reject_bound_dolby_cut_refresh(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        let rejected = reject_bound_dolby_cut_refresh(&root);
+        fs::remove_dir(&root).unwrap();
+        assert!(
+            rejected
+                .unwrap_err()
+                .message
+                .contains("Discard the saved AV1AN progress")
+        );
+    }
 
     #[test]
     fn copy_activity_keeps_diagnostics_from_both_streams() {

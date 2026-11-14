@@ -26,7 +26,7 @@ def main() -> None:
     root = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
     install = Path(tempfile.mkdtemp(prefix="jesses-svt-forks-", dir=root))
     for encoder in manifest["encoders"]:
-        asset = {**encoder, **encoder["assets"]["linuxX86_64"]}
+        asset = encoder["assets"]["linuxX86_64"]
         directory = install / encoder["id"]
         directory.mkdir()
         archive = directory / "release.tar.xz"
@@ -46,7 +46,7 @@ def main() -> None:
         executable.chmod(0o755)
         result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=10, check=True)
         version = result.stdout + result.stderr
-        if asset["versionMarker"] not in version:
+        if not version.strip().startswith(asset["versionMarker"] + " "):
             raise RuntimeError(f"Unexpected executable identity: {version}")
         for license_name in encoder["licenses"]:
             (directory / license_name).write_bytes(download(asset["licenseBaseUrl"] + license_name))

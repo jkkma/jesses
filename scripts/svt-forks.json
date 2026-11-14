@@ -1,19 +1,19 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "sourceProvider": "svt-av1-hdr",
   "encoders": [
     {
       "id": "svt-av1-5fish",
       "selector": "5fish",
       "environmentVariable": "JESSES_SVT_AV1_5FISH",
-      "repository": "https://github.com/5fish/SVT-AV1",
-      "release": "v2.3.260827",
-      "commit": "1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
-      "versionMarker": "SVT-AV1 [5fish] v2.3.260827",
-      "licenseBaseUrl": "https://raw.githubusercontent.com/5fish/SVT-AV1/1c4fb91a06b0b14aafefe11835dafd91d337a3a4/",
       "licenses": ["LICENSE.md", "LICENSE-BSD2.md", "PATENTS.md"],
       "assets": {
         "windowsX86_64": {
+          "repository": "https://github.com/5fish/SVT-AV1",
+          "release": "v2.3.260827",
+          "commit": "1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
+          "versionMarker": "SVT-AV1 [5fish] v2.3.260827",
+          "licenseBaseUrl": "https://raw.githubusercontent.com/5fish/SVT-AV1/1c4fb91a06b0b14aafefe11835dafd91d337a3a4/",
           "architecture": "x86-64-v3",
           "url": "https://github.com/5fish/SVT-AV1/releases/download/v2.3.260827/Windows_x86-64_x86-64-v3%2Bznver2.tar.xz",
           "sha256": "ce597db27fa02448f3004d5b77c0f662d201d88214d7b99deea7f05ae1b8ca15",
@@ -21,6 +21,11 @@
           "executableSha256": "77e507215d46357e341f1915ae386a00b1504dbd2a54eeab5c6564beee2c716c"
         },
         "linuxX86_64": {
+          "repository": "https://github.com/5fish/SVT-AV1",
+          "release": "v2.3.260827",
+          "commit": "1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
+          "versionMarker": "SVT-AV1 [5fish] v2.3.260827",
+          "licenseBaseUrl": "https://raw.githubusercontent.com/5fish/SVT-AV1/1c4fb91a06b0b14aafefe11835dafd91d337a3a4/",
           "architecture": "x86-64-v3",
           "url": "https://github.com/5fish/SVT-AV1/releases/download/v2.3.260827/Linux_x86-64_x86-64-v3%2Bznver2.tar.xz",
           "sha256": "d974729fb1c57cac13a2c6d516a547af21a56da6d3603e84483a70ca373c48da",
@@ -40,14 +45,20 @@
           "commit": "e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe",
           "versionMarker": "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman]",
           "licenseBaseUrl": "https://raw.githubusercontent.com/Patman86/SVT-AV1-Mods-by-Patman/e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe/",
-          "managedDirectory": "svt-av1-hdr-pmod",
+          "managedDirectory": "svt-av1-hdr-pmod-msvc",
           "architecture": "x86-64",
+          "url": "https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/download/2026-07-20/SVT-AV1-HDR-EncApp-v4.1.0%2B77%2B85-e4b6c4ff5-.Mod-by-Patman.-x64-msvc19.51.7z",
+          "sha256": "1e077581055e8a91bf9e993c76c650b2f1fb64a75a8d40227f23d02e5668ee1a",
           "archiveFormat": "7z",
-          "archiveEntries": ["LICENSE.md", "README.md", "SvtAv1EncApp.exe"],
-          "url": "https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/download/2026-07-20/SVT-AV1-HDR-EncApp-v4.1.0%2B77%2B85-e4b6c4ff5-.Mod-by-Patman.-x64-clang22.1.8.7z",
-          "sha256": "9fedebfe6f99fa4cc621981a913770b24bf6dade0eaa35459025bf9a883ae201",
+          "members": { "LICENSE.md": 1741, "README.md": 16210, "SvtAv1EncApp.exe": 6309376 },
           "entry": "SvtAv1EncApp.exe",
-          "executableSha256": "5a87e9a502dae7e77f08f94ca3d65b3d08d858f15216c686a9386fe86ef00ba9"
+          "executableSha256": "6ffb2c4cad43b85b3892f0c542648328cf0133741010a15855c8c968e1843d33",
+          "runtimePrerequisite": {
+            "name": "Microsoft Visual C++ v14 Redistributable (x64)",
+            "minimumVersion": "14.51",
+            "dll": "VCRUNTIME140.dll",
+            "url": "https://aka.ms/vc14/vc_redist.x64.exe"
+          }
         },
         "linuxX86_64": {
           "repository": "https://github.com/juliobbv-p/svt-av1-hdr",

@@ -14,6 +14,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 const TIME_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const PRESENTED_FRAMES_NOTE: &str = "The MP4 edit leaves video packets marked for discard. Preparing a temporary lossless FFV1 source containing the presented frames for AV1AN. This can require substantial temporary disk space.";
 fn error(path: &Path, detail: impl Into<String>) -> AppError {
     files::error("AV1AN_PREPARE_FAILED", detail, path)
 }
@@ -24,6 +25,44 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
+    pub fn build_presented(
+        source: &Path,
+        output: &Path,
+        id: &str,
+        plan: &Plan,
+        ffmpeg: &Path,
+        rate: (u32, u32),
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Self, AppError> {
+        check_cancel(cancel)?;
+        let video = files::Temporary::create(output, &format!("{id}-presented-source"))?;
+        let mut args = presented_args(source, plan, rate);
+        args.extend(
+            [
+                "-c:v",
+                "ffv1",
+                "-level",
+                "3",
+                "-g",
+                "1",
+                "-slicecrc",
+                "1",
+                "-f",
+                "matroska",
+                "pipe:1",
+            ]
+            .map(OsString::from),
+        );
+        Ok(Self {
+            video,
+            producer: CommandSpec {
+                executable: ffmpeg.to_owned(),
+                args,
+                cwd: None,
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         source: &Path,
@@ -186,6 +225,80 @@ impl Prepared {
     ) -> Result<String, AppError> {
         decoded_identity(ffmpeg, &self.video.path, 0, expected_frames, cancel).await
     }
+}
+
+fn presented_args(source: &Path, plan: &Plan, rate: (u32, u32)) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-xerror",
+        "-err_detect",
+        "explode",
+        "-noautorotate",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.extend([
+        source.as_os_str().to_owned(),
+        "-map".into(),
+        format!("0:{}", plan.video_index).into(),
+        "-vf".into(),
+        plan.av1an_presented_filter(rate).into(),
+        "-enc_time_base".into(),
+        format!("{}/{}", rate.1, rate.0).into(),
+    ]);
+    args.extend(
+        [
+            "-fps_mode",
+            "passthrough",
+            "-an",
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+        ]
+        .map(OsString::from),
+    );
+    args
+}
+
+/// Verify each presented pixel and its ordinal clock against the independently
+/// decoded original. Normalize the clock for this comparison only.
+pub(super) async fn verify_presented(
+    source: &Path,
+    plan: &Plan,
+    ffmpeg: &Path,
+    rate: (u32, u32),
+    expected_frames: usize,
+    prepared: &Prepared,
+    cancel: &watch::Receiver<bool>,
+) -> Result<String, AppError> {
+    let original = fingerprint(
+        ffmpeg,
+        source,
+        presented_args(source, plan, rate),
+        expected_frames,
+        cancel,
+    )
+    .await?;
+    let staged = prepared
+        .decoded_identity(ffmpeg, expected_frames, cancel)
+        .await?;
+    if original != staged {
+        return Err(error(
+            &prepared.video.path,
+            "Lossless preparation changed the presented pixels or frame clock.",
+        ));
+    }
+    Ok(staged)
 }
 
 fn primaries(value: u8) -> &'static str {
@@ -444,21 +557,21 @@ pub(super) async fn decoded_identity(
     args.push(input.as_os_str().to_owned());
     args.extend(["-map".into(), format!("0:{stream_index}").into()]);
     args.extend(
-        [
-            "-an",
-            "-sn",
-            "-dn",
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "framemd5",
-            "-hash",
-            "sha256",
-            "pipe:1",
-        ]
-        .into_iter()
-        .map(OsString::from),
+        ["-an", "-sn", "-dn", "-fps_mode", "passthrough"]
+            .into_iter()
+            .map(OsString::from),
     );
+    fingerprint(ffmpeg, input, args, expected_frames, cancel).await
+}
+
+async fn fingerprint(
+    ffmpeg: &Path,
+    input: &Path,
+    mut args: Vec<OsString>,
+    expected_frames: usize,
+    cancel: &watch::Receiver<bool>,
+) -> Result<String, AppError> {
+    args.extend(["-f", "framemd5", "-hash", "sha256", "pipe:1"].map(OsString::from));
     let result = supervisor::run_streaming_stdout(
         &CommandSpec {
             executable: ffmpeg.to_owned(),

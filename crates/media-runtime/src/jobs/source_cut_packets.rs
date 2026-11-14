@@ -195,6 +195,24 @@ fn map_streams<'a>(
     }
     Ok(mapping)
 }
+
+fn matches_dolby_vision_configuration(mapping: &[(&metadata::Stream, &metadata::Stream)]) -> bool {
+    mapping.iter().all(|(original, copied)| {
+        original
+            .dolby_vision_configuration()
+            .eq(copied.dolby_vision_configuration())
+    })
+}
+
+pub(super) fn copied_dolby_vision_configuration_matches(
+    original: &Document,
+    copied: &Document,
+    cut: &Path,
+) -> Result<bool, AppError> {
+    Ok(matches_dolby_vision_configuration(&map_streams(
+        original, copied, cut,
+    )?))
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn verify(
     ffmpeg: &Path,
@@ -209,6 +227,12 @@ pub(super) async fn verify(
     cancel: &watch::Receiver<bool>,
 ) -> Result<(Vec<TrackProof>, f64), AppError> {
     let mapping = map_streams(document, actual, cut)?;
+    if !matches_dolby_vision_configuration(&mapping) {
+        return Err(invalid(
+            cut,
+            "The copied stream's Dolby Vision configuration changed.",
+        ));
+    }
     let (original_video, cut_video) = mapping
         .iter()
         .find(|(original, _)| original.index == video_index)
@@ -384,6 +408,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn source_cut_cannot_drop_or_change_dolby_vision_configuration() {
+        let original = document(json!([{
+            "index": 0, "codec_type": "video", "codec_name": "hevc",
+            "side_data_list": [{"side_data_type": "DOVI configuration record", "dv_profile": 8}]
+        }]));
+        let cut = Path::new("cut.mp4");
+        assert!(copied_dolby_vision_configuration_matches(&original, &original, cut).unwrap());
+        let mut changed = original.clone();
+        changed.streams[0].side_data_list[0]["dv_profile"] = json!(5);
+        assert!(!copied_dolby_vision_configuration_matches(&original, &changed, cut).unwrap());
+        changed.streams[0].side_data_list.clear();
+        assert!(!copied_dolby_vision_configuration_matches(&original, &changed, cut).unwrap());
     }
 
     #[test]

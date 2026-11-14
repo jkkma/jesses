@@ -6,7 +6,8 @@ Install pinned official Windows SVT forks into Jesses' per-user tools directory.
 Verifies published archive digests, extracted executable digests, and version
 identities. Keeps licenses and download provenance. Existing matching installs
 are reused; different existing files are never overwritten. PATH is unchanged.
-The pinned 5fish asset requires x86-64-v3.
+The 5fish build requires x86-64-v3. The MSVC Patman HDR build requires the
+Microsoft Visual C++ v14 Redistributable (x64) 14.51 or later.
 #>
 [CmdletBinding()]
 param([ValidateSet('all', '5fish', 'hdr')][string]$Fork = 'all')
@@ -30,7 +31,17 @@ foreach ($encoder in $manifest.encoders | Where-Object { $Fork -eq 'all' -or $_.
         -not [System.Runtime.Intrinsics.X86.Avx2]::IsSupported -or
         -not [System.Runtime.Intrinsics.X86.Bmi2]::IsSupported -or
         -not [System.Runtime.Intrinsics.X86.Fma]::IsSupported)) {
-        throw "The pinned $($encoder.id) binary requires an x86-64-v3 CPU (including AVX2, BMI2, and FMA)."
+        throw 'The selected encoder requires an x86-64-v3 CPU (including AVX2, BMI2, and FMA).'
+    }
+    if ($asset.runtimePrerequisite) {
+        $runtime = $asset.runtimePrerequisite
+        $runtimeDll = Join-Path $env:SystemRoot ('System32\' + $runtime.dll)
+        $runtimeVersion = if (Test-Path -LiteralPath $runtimeDll -PathType Leaf) {
+            [System.Diagnostics.FileVersionInfo]::GetVersionInfo($runtimeDll)
+        }
+        if (-not $runtimeVersion -or [version]::new($runtimeVersion.FileMajorPart, $runtimeVersion.FileMinorPart) -lt [version]$runtime.minimumVersion) {
+            throw "Install $($runtime.name) $($runtime.minimumVersion) or later from $($runtime.url) and retry."
+        }
     }
     $managedDirectory = $asset.managedDirectory ?? $encoder.id
     $destination = [System.IO.Path]::GetFullPath((Join-Path $toolsDirectory $managedDirectory))
@@ -55,41 +66,74 @@ foreach ($encoder in $manifest.encoders | Where-Object { $Fork -eq 'all' -or $_.
         throw 'The staging destination leaves the managed tools directory.'
     }
     New-Item -ItemType Directory -Path $staging | Out-Null
-    $archive = Join-Path $staging ('release.' + ($asset.archiveFormat ?? 'tar.xz'))
+    $archiveName = if ($asset.archiveFormat -eq '7z') { 'release.7z' } else { 'release.tar.xz' }
+    $archive = Join-Path $staging $archiveName
     Invoke-WebRequest -Uri $asset.url -OutFile $archive
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $asset.sha256) {
         throw "Archive checksum mismatch; files retained for inspection at $staging"
     }
-    $entries = @(& $tar -tf $archive)
-    $expectedEntries = @($asset.archiveEntries ?? @($asset.entry))
-    if ($LASTEXITCODE -ne 0 -or $entries.Count -ne $expectedEntries.Count -or
-        (Compare-Object -ReferenceObject $expectedEntries -DifferenceObject $entries -CaseSensitive)) {
-        throw "Unexpected archive entries; files retained for inspection at $staging"
-    }
-    & $tar -xf $archive -C $staging $asset.entry
-    if ($LASTEXITCODE -ne 0) { throw "Archive extraction failed: $staging" }
     $stagedBinary = Join-Path $staging $asset.entry
+    if ($asset.archiveFormat -eq '7z') {
+        $entries = @(& $tar -tvf $archive)
+        $expected = $asset.members.PSObject.Properties
+        if ($LASTEXITCODE -ne 0 -or $entries.Count -ne @($expected).Count) {
+            throw "Unexpected archive entries; files retained for inspection at $staging"
+        }
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($line in $entries) {
+            $fields = $line -split '\s+', 9
+            $member = if ($fields.Count -eq 9) { $expected | Where-Object Name -CEQ $fields[8] }
+            if (-not $member -or -not $fields[0].StartsWith('-') -or
+                $fields[4] -cne [string]$member.Value -or -not $seen.Add($fields[8])) {
+                throw "Unexpected archive entries; files retained for inspection at $staging"
+            }
+        }
+        # PowerShell pipelines may convert native output to text. Stream the
+        # exact member as bytes and create a fresh file without archive paths.
+        $start = [System.Diagnostics.ProcessStartInfo]::new($tar)
+        foreach ($argument in @('-xOf', $archive, '--', $asset.entry)) { $start.ArgumentList.Add($argument) }
+        $start.UseShellExecute = $false
+        $start.RedirectStandardOutput = $true
+        $process = [System.Diagnostics.Process]::Start($start)
+        try {
+            $output = [System.IO.File]::Open($stagedBinary, [System.IO.FileMode]::CreateNew)
+            try { $process.StandardOutput.BaseStream.CopyTo($output) }
+            finally { $output.Dispose() }
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0 -or (Get-Item -LiteralPath $stagedBinary).Length -ne $asset.members.($asset.entry)) {
+                throw "Archive extraction failed: $staging"
+            }
+        }
+        finally { $process.Dispose() }
+    } else {
+        $entries = @(& $tar -tf $archive)
+        if ($LASTEXITCODE -ne 0 -or $entries.Count -ne 1 -or $entries[0] -cne $asset.entry) {
+            throw "Unexpected archive entries; files retained for inspection at $staging"
+        }
+        & $tar -xf $archive -C $staging $asset.entry
+        if ($LASTEXITCODE -ne 0) { throw "Archive extraction failed: $staging" }
+    }
     if ((Get-FileHash -LiteralPath $stagedBinary -Algorithm SHA256).Hash -ne $asset.executableSha256) {
         throw "Executable checksum mismatch: $staging"
     }
     $version = (& $stagedBinary --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $version.Contains(($asset.versionMarker ?? $encoder.versionMarker))) {
+    if ($LASTEXITCODE -ne 0 -or -not $version.StartsWith($asset.versionMarker + ' ', [StringComparison]::Ordinal)) {
         throw "Encoder identity check failed: $version"
     }
-    $licenseBaseUrl = $asset.licenseBaseUrl ?? $encoder.licenseBaseUrl
     foreach ($license in $encoder.licenses) {
-        Invoke-WebRequest -Uri ($licenseBaseUrl + $license) -OutFile (Join-Path $staging $license)
+        Invoke-WebRequest -Uri ($asset.licenseBaseUrl + $license) -OutFile (Join-Path $staging $license)
     }
     [ordered]@{
-        repository = $asset.repository ?? $encoder.repository
-        release = $asset.release ?? $encoder.release
-        commit = $asset.commit ?? $encoder.commit
+        repository = $asset.repository
+        release = $asset.release
+        commit = $asset.commit
         assetUrl = $asset.url
         architecture = $asset.architecture
         archiveSha256 = $asset.sha256
         executableSha256 = $asset.executableSha256
         version = $version
-        licenseBaseUrl = $licenseBaseUrl
+        licenseBaseUrl = $asset.licenseBaseUrl
+        runtimePrerequisite = $asset.runtimePrerequisite
         installedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $staging 'provenance.json') -Encoding utf8
     # Publish the complete directory with a no-overwrite rename. Keep the verified

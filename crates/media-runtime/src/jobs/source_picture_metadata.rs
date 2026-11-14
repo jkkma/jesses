@@ -6,10 +6,11 @@
 //! the whole video here would only repeat that work single-threaded.
 use super::*;
 
-/// Packets decoded for the declarations. References always precede their
-/// dependents in decode order, so a prefix decodes without missing pictures;
-/// a few packets also cover leading pictures that an edit list discards.
+/// Most inputs produce pictures within this decode prefix.
 const FIRST_PACKETS: u32 = 16;
+/// An MP4 edit list can hide the whole prefix after a stream-copy cut. Allow
+/// more preroll in that case, still bounding the work independently of length.
+const MAX_PACKETS: u32 = 1024;
 
 /// Side-data fields the color plan reads. Requesting all frame side data would
 /// also print every Dolby Vision RPU and HDR10+ payload.
@@ -50,7 +51,7 @@ pub(super) fn needs_enrichment(video: &super::metadata::Stream, tone_mapped: boo
             }))
 }
 
-fn enrich_args(input: &Path, index: u32) -> Vec<OsString> {
+fn enrich_args(input: &Path, index: u32, packets: u32) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -68,7 +69,7 @@ fn enrich_args(input: &Path, index: u32) -> Vec<OsString> {
         format!("-threads:{index}").into(),
         "0".into(),
         "-read_intervals".into(),
-        format!("%+#{FIRST_PACKETS}").into(),
+        format!("%+#{packets}").into(),
         "-show_frames".into(),
         "-show_entries".into(),
         format!(
@@ -90,6 +91,39 @@ pub(super) async fn enrich(
     index: u32,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
+    let video = document
+        .streams
+        .iter_mut()
+        .find(|s| s.index == index)
+        .ok_or_else(|| {
+            files::error(
+                "STREAM_SELECTION_INVALID",
+                "The chosen source picture is absent.",
+                input,
+            )
+        })?;
+    for packets in [FIRST_PACKETS, 256, MAX_PACKETS] {
+        if let Some(enriched) = probe_prefix(ffprobe, input, video.clone(), packets, cancel).await?
+        {
+            *video = enriched;
+            return Ok(());
+        }
+    }
+    Err(process_error(
+        SupervisorError::OutputParse(format!(
+            "The source did not decode a picture for color planning within {MAX_PACKETS} packets."
+        )),
+        input,
+    ))
+}
+
+async fn probe_prefix(
+    ffprobe: &Path,
+    input: &Path,
+    mut video: super::metadata::Stream,
+    packets: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<super::metadata::Stream>, AppError> {
     #[derive(serde::Deserialize)]
     struct Frame {
         color_primaries: Option<String>,
@@ -100,23 +134,10 @@ pub(super) async fn enrich(
         #[serde(default)]
         side_data_list: Vec<serde_json::Value>,
     }
-    let mut video = document
-        .streams
-        .iter()
-        .find(|s| s.index == index)
-        .cloned()
-        .ok_or_else(|| {
-            files::error(
-                "STREAM_SELECTION_INVALID",
-                "The chosen source picture is absent.",
-                input,
-            )
-        })?;
-    let args = enrich_args(input, index);
     let result = supervisor::run_streaming_stdout(
         &CommandSpec {
             executable: ffprobe.to_owned(),
-            args,
+            args: enrich_args(input, video.index, packets),
             cwd: None,
         },
         cancel.clone(),
@@ -127,7 +148,7 @@ pub(super) async fn enrich(
                 super::encode_plan::hdr::StaticMetadata::parse(&video.side_data_list)
                     .map_err(|e| e.message)?;
             let mut failure = None;
-            let mut count = 0_u64;
+            let mut saw_picture = false;
             super::encode::frame_scan::parse::<Frame>(reader, |frame| {
                 if failure.is_some() {
                     return;
@@ -172,7 +193,7 @@ pub(super) async fn enrich(
                             video.side_data_list.push(value);
                         }
                     }
-                    count += 1;
+                    saw_picture = true;
                     Ok(())
                 })();
                 if let Err(cause) = checked {
@@ -182,10 +203,7 @@ pub(super) async fn enrich(
             if let Some(failure) = failure {
                 return Err(failure);
             }
-            if count == 0 {
-                return Err("The source did not decode a picture for color planning.".into());
-            }
-            Ok(video)
+            Ok(saw_picture.then_some(video))
         },
     )
     .await
@@ -197,12 +215,7 @@ pub(super) async fn enrich(
             input,
         ));
     }
-    *document
-        .streams
-        .iter_mut()
-        .find(|s| s.index == index)
-        .expect("selected source metadata") = result.value;
-    Ok(())
+    Ok(result.value)
 }
 
 #[cfg(test)]
@@ -238,7 +251,7 @@ mod tests {
 
     #[test]
     fn declarations_come_from_a_threaded_bounded_prefix_without_rpu_payloads() {
-        let args = enrich_args(Path::new("movie.mp4"), 3)
+        let args = enrich_args(Path::new("movie.mp4"), 3, FIRST_PACKETS)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -253,5 +266,64 @@ mod tests {
         assert!(entries.contains("frame_side_data=side_data_type,red_x"));
         assert!(entries.ends_with("max_content,max_average"));
         assert_eq!(args.last().unwrap(), "movie.mp4");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFmpeg with libx264 and FFprobe"]
+    async fn enrich_reads_past_mp4_edit_list_preroll() {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir();
+        let hint = directory.join("unused.mp4");
+        let id = format!("picture-metadata-{}-{nonce}", std::process::id());
+        let original = Temporary::create_extension(&hint, &id, "mp4").unwrap();
+        let cut = Temporary::create_extension(&hint, &format!("{id}-cut"), "mp4").unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let ffmpeg = discover("ffmpeg", &cancel).await.unwrap();
+        let ffprobe = discover("ffprobe", &cancel).await.unwrap();
+        let ffmpeg_args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        #[rustfmt::skip]
+        let mut encode = ffmpeg_args(&[
+            "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=64x48:r=60:d=8",
+            "-c:v", "libx264", "-threads:v", "1", "-g", "480", "-sc_threshold", "0",
+            "-colorspace", "bt709",
+        ]);
+        encode.push(original.path.as_os_str().to_owned());
+        // This cut starts 360 frames into the GOP. The edit list discards the
+        // preceding pictures, but the MP4 still contains their coded references.
+        let mut remux = ffmpeg_args(&["-v", "error", "-nostdin", "-y", "-ss", "6", "-i"]);
+        remux.push(original.path.as_os_str().to_owned());
+        remux.extend(ffmpeg_args(&["-t", "1", "-c", "copy"]));
+        remux.push(cut.path.as_os_str().to_owned());
+        for args in [encode, remux] {
+            let result = supervisor::run_capture(
+                &CommandSpec {
+                    executable: ffmpeg.clone(),
+                    args,
+                    cwd: None,
+                },
+                cancel.clone(),
+                64 * 1024,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let mut document: Document = serde_json::from_value(serde_json::json!({
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}]
+        }))
+        .unwrap();
+        enrich(&ffprobe, &cut.path, &mut document, 0, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(document.streams[0].color_space.as_deref(), Some("bt709"));
     }
 }

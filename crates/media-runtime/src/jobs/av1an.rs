@@ -21,6 +21,7 @@ pub(super) use options::source_resamples;
 pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
+pub(super) use recovery::root_for as recovery_root;
 pub(super) use recovery::{
     CommandRecipe, OwnedRecovery, PreparedSource, Recovery, restore_interrupted_source_cut,
 };

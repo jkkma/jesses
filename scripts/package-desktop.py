@@ -319,6 +319,7 @@ def scoop_manifest(archive_path: Path, url: str, destination: Path) -> None:
         "persist": "jesses-data",
         "notes": [
             "Requires the Microsoft Edge WebView2 runtime already available on the machine.",
+            "Bundled Patman MSVC encoding requires the x64 Microsoft Visual C++ v14 Redistributable 14.51 or later (https://aka.ms/vc14/vc_redist.x64.exe).",
             "Preferences, history, recovery metadata and browser state are kept in jesses-data and persist across Scoop updates and ordinary uninstall.",
             "Keep source media and recovery workspace paths unchanged while a job is saved for resume.",
         ],

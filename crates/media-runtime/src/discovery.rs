@@ -22,7 +22,7 @@ const HDR_PROVIDER_NAME: &str = if cfg!(windows) {
     "SVT-AV1-HDR"
 };
 const HDR_MANAGED_DIRECTORY: &str = if cfg!(windows) {
-    "svt-av1-hdr-pmod"
+    "svt-av1-hdr-pmod-msvc"
 } else {
     "svt-av1-hdr"
 };
@@ -190,17 +190,21 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
                         .flatten()
                 })
                 .map(PathBuf::from);
-            resolve_fork_location(
+            resolve_encoder_fork_location(
+                encoder,
                 override_path.as_deref(),
                 || managed_encoder_path(encoder),
-                || match crate::bundled_tools::find(encoder_tool_id(encoder))? {
-                    Some(path) => Ok(Some(path)),
-                    None if encoder == VideoEncoder::SvtAv1 => find_executable_blocking(&[
-                        "SvtAv1EncApp-HDR".to_owned(),
-                        alias.to_owned(),
-                        "svtav1encapp".to_owned(),
-                    ]),
-                    None => find_executable_blocking(&[alias.to_owned()]),
+                || crate::bundled_tools::find(encoder_tool_id(encoder)),
+                || {
+                    if encoder == VideoEncoder::SvtAv1 {
+                        find_executable_blocking(&[
+                            "SvtAv1EncApp-HDR".to_owned(),
+                            alias.to_owned(),
+                            "svtav1encapp".to_owned(),
+                        ])
+                    } else {
+                        find_executable_blocking(&[alias.to_owned()])
+                    }
                 },
             )
             .map_err(|error| {
@@ -257,7 +261,7 @@ fn source_svt_marker() -> Result<&'static str, String> {
             let provider = manifest["sourceProvider"]
                 .as_str()
                 .ok_or("The source SVT provider pin is missing.")?;
-            let asset_key = if cfg!(windows) {
+            let asset = if cfg!(windows) {
                 "windowsX86_64"
             } else {
                 "linuxX86_64"
@@ -265,7 +269,7 @@ fn source_svt_marker() -> Result<&'static str, String> {
             manifest["encoders"]
                 .as_array()
                 .and_then(|values| values.iter().find(|value| value["id"] == provider))
-                .and_then(|value| value["assets"][asset_key]["versionMarker"].as_str())
+                .and_then(|value| value["assets"][asset]["versionMarker"].as_str())
                 .map(str::to_owned)
                 .ok_or_else(|| "The source SVT version pin is missing.".into())
         })
@@ -283,6 +287,9 @@ async fn validate_source_svt(path: &Path) -> Result<(), String> {
     )
     .await
     .map_err(|cause| cause.to_string())?;
+    if let Some(detail) = hdr_runtime_error(VideoEncoder::SvtAv1, output.status) {
+        return Err(detail.into());
+    }
     let identity = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -322,6 +329,45 @@ fn encoder_tool_id(encoder: VideoEncoder) -> &'static str {
         VideoEncoder::X265Standalone => "x265",
         VideoEncoder::VpxStandalone => "vpxenc",
     }
+}
+
+fn hdr_runtime_error(
+    encoder: VideoEncoder,
+    status: std::process::ExitStatus,
+) -> Option<&'static str> {
+    if cfg!(windows)
+        && matches!(encoder, VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1Hdr)
+        && matches!(
+            status.code().map(|code| code as u32),
+            Some(0xC0000135 | 0xC0000139)
+        )
+    {
+        return Some(
+            "The HDR encoder could not load its runtime. Install Microsoft Visual C++ v14 Redistributable (x64) 14.51 or later from https://aka.ms/vc14/vc_redist.x64.exe, then refresh Tools.",
+        );
+    }
+    None
+}
+
+fn resolve_encoder_fork_location(
+    encoder: VideoEncoder,
+    explicit: Option<&Path>,
+    managed: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    bundled: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    alias: impl FnOnce() -> Result<Option<PathBuf>, String>,
+) -> Result<Option<PathBuf>, String> {
+    if explicit.is_none() && cfg!(windows) && encoder_tool_id(encoder) == "svt-av1-hdr" {
+        // The verified Windows package owns the default when present,
+        // including any error. An explicit override remains authoritative.
+        if let Some(path) = bundled()? {
+            return Ok(Some(path));
+        }
+        return resolve_fork_location(None, managed, alias);
+    }
+    resolve_fork_location(explicit, managed, || match bundled()? {
+        Some(path) => Ok(Some(path)),
+        None => alias(),
+    })
 }
 
 fn resolve_fork_location(
@@ -673,7 +719,12 @@ async fn discover(spec: ToolSpec) -> ToolInfo {
                 .map(|line| line.trim().chars().take(200).collect());
         }
         Ok(output) => {
-            info.detail = Some(format!("Version check failed ({}).", output.status));
+            info.detail = Some(
+                encoder
+                    .and_then(|encoder| hdr_runtime_error(encoder, output.status))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Version check failed ({}).", output.status)),
+            );
         }
         Err(error) => {
             info.detail = Some(error.to_string());
@@ -743,8 +794,19 @@ mod tests {
 
     #[test]
     fn source_svt_identity_requires_qualified_hdr_and_retains_explicit_legacy_mainline() {
-        let qualified = format!("{} (release)", source_svt_marker().unwrap());
-        assert!(source_svt_identity_matches(&qualified).unwrap());
+        let patman =
+            "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A";
+        let upstream = "SVT-AV1-HDR v4.1.0-21-g00333404f (release)";
+        assert_eq!(source_svt_identity_matches(patman).unwrap(), cfg!(windows));
+        assert_eq!(
+            source_svt_identity_matches(upstream).unwrap(),
+            !cfg!(windows)
+        );
+        assert!(validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, patman).is_ok());
+        assert_eq!(
+            validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, upstream).is_ok(),
+            !cfg!(windows)
+        );
         for identity in [
             "SVT-AV1 Encoder Lib v4.2.0",
             "SVT-AV1-HDR v4.2.0",
@@ -753,15 +815,6 @@ mod tests {
         ] {
             assert!(!source_svt_identity_matches(identity).unwrap());
         }
-        let old_hdr = "SVT-AV1-HDR v4.1.0-21-g00333404f (release)";
-        assert_eq!(
-            source_svt_identity_matches(old_hdr).unwrap(),
-            !cfg!(windows)
-        );
-        assert_eq!(
-            validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, old_hdr).is_ok(),
-            !cfg!(windows)
-        );
         assert!(
             validate_video_encoder_version(VideoEncoder::SvtAv1, "SVT-AV1 Encoder Lib v4.2.0")
                 .is_ok()
@@ -798,6 +851,30 @@ mod tests {
             }
         }
         let no_fallback = || -> Result<Option<PathBuf>, String> { panic!("unexpected fallback") };
+        for encoder in [VideoEncoder::SvtAv1, VideoEncoder::SvtAv1Hdr] {
+            assert_eq!(
+                resolve_encoder_fork_location(
+                    encoder,
+                    Some(&explicit),
+                    no_fallback,
+                    no_fallback,
+                    no_fallback
+                )
+                .unwrap(),
+                Some(explicit.canonicalize().unwrap())
+            );
+            assert_eq!(
+                resolve_encoder_fork_location(
+                    encoder,
+                    None,
+                    || Ok(Some(managed.clone())),
+                    || Ok(None),
+                    no_fallback
+                )
+                .unwrap(),
+                Some(managed.canonicalize().unwrap())
+            );
+        }
         assert_eq!(
             resolve_fork_location(Some(&explicit), no_fallback, no_fallback).unwrap(),
             Some(explicit.canonicalize().unwrap())
@@ -828,6 +905,48 @@ mod tests {
             .unwrap(),
             Some(explicit)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hdr_loader_failure_identifies_the_msvc_runtime() {
+        use std::os::windows::process::ExitStatusExt;
+        for code in [0xC0000135, 0xC0000139] {
+            let status = std::process::ExitStatus::from_raw(code);
+            let detail = hdr_runtime_error(VideoEncoder::SvtAv1Hdr, status).unwrap();
+            assert!(detail.contains("14.51"));
+            assert!(detail.contains("https://aka.ms/vc14/vc_redist.x64.exe"));
+            assert!(hdr_runtime_error(VideoEncoder::SvtAv1FiveFish, status).is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hdr_bundle_precedes_managed_install_and_propagates_corruption() {
+        let managed = || -> Result<Option<PathBuf>, String> { panic!("unexpected managed lookup") };
+        let bundled_path = PathBuf::from("bundled/SvtAv1EncApp.exe");
+        for encoder in [VideoEncoder::SvtAv1, VideoEncoder::SvtAv1Hdr] {
+            assert_eq!(
+                resolve_encoder_fork_location(
+                    encoder,
+                    None,
+                    managed,
+                    || Ok(Some(bundled_path.clone())),
+                    || panic!("unexpected PATH search")
+                )
+                .unwrap(),
+                Some(bundled_path.clone())
+            );
+            let error = resolve_encoder_fork_location(
+                encoder,
+                None,
+                managed,
+                || Err("bundled checksum mismatch".into()),
+                || panic!("unexpected PATH search"),
+            )
+            .unwrap_err();
+            assert_eq!(error, "bundled checksum mismatch");
+        }
     }
 
     #[test]

@@ -701,7 +701,7 @@ fn owned_concat_output(root: &Path, output: &Path) -> Result<bool, AppError> {
     }
 }
 
-fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
+pub(in crate::jobs) fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
     if id.is_empty() || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
         return Err(error(
             Path::new(&request.output_path),
@@ -2793,12 +2793,14 @@ impl Recovery {
             .collect::<Vec<_>>();
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
         let pixel_format = plan.output_pixel_format.to_owned();
+        let presented_rate = plan
+            .av1an_presented_rate
+            .filter(|_| !plan.requires_av1an_preprocess() && !plan.requires_qtgmc());
         let source_filter =
             if prepared.is_some() && settings.source_filters && plan.requires_qtgmc() {
                 plan.source_filter_rows_only()
             } else {
-                prepared
-                    .is_none()
+                (prepared.is_none() || presented_rate.is_some())
                     .then(|| plan.av1an_decoder_filter())
                     .flatten()
             };
@@ -2990,7 +2992,9 @@ impl Recovery {
             let mut workspace = Workspace {
                 root: root.clone(),
                 manifest,
-                source_rate: if prepared.is_some() {
+                source_rate: if let Some(rate) = presented_rate {
+                    rate
+                } else if prepared.is_some() {
                     (fps_num, fps_den)
                 } else {
                     source_rate

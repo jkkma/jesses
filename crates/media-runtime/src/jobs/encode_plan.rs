@@ -378,6 +378,9 @@ pub(super) struct Plan {
     /// That reader consumes every decoded frame by ordinal, retaining copied
     /// GOP boundary gaps in the input clock rather than inventing frames.
     pub source_cut_ordinals: bool,
+    /// A container edit marked video packets for decode only. Stage the
+    /// presented ordinals at the validated source rate before chunk reading.
+    pub(super) av1an_presented_rate: Option<(u32, u32)>,
     source_dolby_clock: bool,
     pub(super) source_dolby_render: bool,
     source_av1an_base_clock: bool,
@@ -1206,6 +1209,7 @@ impl Plan {
             output_origin: 0.0,
             source_origin: declared_origin,
             source_cut_ordinals: false,
+            av1an_presented_rate: None,
             source_dolby_clock: declared_origin.abs() > tolerance
                 && preserves_dolby_source_clock(video, settings),
             source_dolby_render,
@@ -1743,6 +1747,11 @@ impl Plan {
         let mut reader = self.clone();
         reader.source_cut_transform = None;
         reader.decoder_filter()
+    }
+
+    pub(super) fn av1an_presented_filter(&self, rate: (u32, u32)) -> String {
+        let transform = self.source_cut_transform.unwrap_or_default();
+        format!("{transform}settb=expr={}/{},setpts=N", rate.1, rate.0)
     }
 
     pub fn decoder_filter(&self) -> Option<String> {

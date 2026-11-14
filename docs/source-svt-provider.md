@@ -1,7 +1,7 @@
 # Source SVT provider and AV1AN target defaults
 
 The source UI has one SVT choice. New canonical `svtAv1` requests use the qualified
-HDR provider for the host. Windows uses [SVT-AV1-HDR-PMod 2026-07-20](https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/tag/2026-07-20)
+HDR provider for the host. Windows uses the MSVC 19.51 build of [SVT-AV1-HDR-PMod 2026-07-20](https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/tag/2026-07-20)
 from commit `e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe`. Linux support is
 deferred. Its retained development recipe uses the
 [SVT-AV1-HDR 2026-09-01 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-09-01-0033340)
@@ -16,8 +16,10 @@ the typed pipeline supplies the exact frame count so the encoder also reports
 remaining time and estimated size. Unbounded source filters and manually
 edited command programs retain end-of-stream behavior.
 
-Discovery checks the canonical override, HDR override, managed HDR installation,
-verified package HDR record, then distinct/canonical PATH names. A discovered
+Discovery checks the canonical and HDR overrides first. Windows checks the verified
+package HDR record before the managed installation. The retained Linux route
+checks the managed installation before the package. Distinct and canonical PATH
+names are the last fallback. A discovered
 unqualified provider fails clearly. Explicit `JESSES_SVT_AV1` remains the existing
 legacy/custom-provider override and checks the provider's actual CLI capabilities.
 The internal `svtAv1Hdr` and `svtAv1FiveFish` identities remain compatible without

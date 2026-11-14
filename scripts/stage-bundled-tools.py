@@ -389,23 +389,35 @@ def download(url: str, expected: str, cache: Path) -> Path:
     return cached
 
 
-def extract_fork_executable(binary_archive: Path, asset: dict, executable: Path, identifier: str) -> None:
+def extract_fork_binary(archive_path: Path, directory: Path, asset: dict) -> Path:
+    executable = directory / asset["entry"]
     if asset.get("archiveFormat") == "7z":
+        # Windows' system bsdtar can read 7z. Only stream the exact executable
+        # member, so archive paths and metadata never reach the filesystem.
         tar = Path(os.environ["SystemRoot"]) / "System32/tar.exe"
-        entries = subprocess.check_output([str(tar), "-tf", str(binary_archive)], text=True, timeout=15).splitlines()
-        if sorted(entries) != sorted(asset["archiveEntries"]) or entries.count(asset["entry"]) != 1:
-            raise ValueError(f"Unexpected binary archive layout for {identifier}.")
-        # Stream the named member instead of allowing archive-controlled paths
-        # or links into the package tree. The result must match the executable pin.
+        listed = subprocess.check_output([tar, "-tvf", archive_path], text=True, timeout=30)
+        members = {}
+        for line in listed.splitlines():
+            fields = line.split(maxsplit=8)
+            if len(fields) != 9 or not fields[0].startswith("-") or fields[8] in members:
+                raise ValueError("Unexpected binary archive layout for the Windows SVT fork.")
+            members[fields[8]] = int(fields[4])
+        if members != asset["members"] or not 0 < members.get(asset["entry"], 0) <= MAX_DOWNLOAD:
+            raise ValueError("Unexpected binary archive layout for the Windows SVT fork.")
         with executable.open("xb") as output:
-            subprocess.run([str(tar), "-xOf", str(binary_archive), asset["entry"]], stdout=output, check=True, timeout=15)
-        return
-    with tarfile.open(binary_archive) as archive:
-        members = archive.getmembers()
-        if len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"] or members[0].size > MAX_DOWNLOAD:
-            raise ValueError(f"Unexpected binary archive layout for {identifier}.")
-        with archive.extractfile(members[0]) as original, executable.open("xb") as output:
-            shutil.copyfileobj(original, output)
+            subprocess.run([tar, "-xOf", archive_path, "--", asset["entry"]],
+                           stdout=output, check=True, timeout=30)
+        if executable.stat().st_size != members[asset["entry"]]:
+            raise ValueError("The Windows SVT fork member size differs from its archive listing.")
+    else:
+        with tarfile.open(archive_path) as archive:
+            members = archive.getmembers()
+            if (len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"]
+                    or members[0].size > MAX_DOWNLOAD):
+                raise ValueError(f"Unexpected binary archive layout for {asset['entry']}.")
+            with archive.extractfile(members[0]) as original, executable.open("xb") as output:
+                shutil.copyfileobj(original, output)
+    return executable
 
 
 def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None = None, x264_build: Path | None = None, svt_build: Path | None = None, av1an_build: Path | None = None, aom_build: Path | None = None, vpx_build: Path | None = None, x265_build: Path | None = None, mkvmerge_build: Path | None = None, grav1synth_build: Path | None = None) -> Path:
@@ -434,23 +446,24 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
     for encoder in forks["encoders"]:
         identifier = encoder["id"]
         asset = encoder["assets"][asset_key]
-        identity = {**encoder, **asset}
-        source_entry = sources["sources"][identifier]
-        source = source_entry.get(asset_key, source_entry)
+        source = sources["sources"][asset["commit"]]
         directory = tools_root / identifier
         directory.mkdir()
         binary_archive = download(asset["url"], asset["sha256"], cache)
-        executable = directory / asset["entry"]
-        extract_fork_executable(binary_archive, asset, executable, identifier)
+        executable = extract_fork_binary(binary_archive, directory, asset)
         executable.chmod(0o755)
         executable_hash = digest(executable)
         if "executableSha256" in asset and executable_hash != asset["executableSha256"]:
             raise ValueError(f"The extracted executable checksum differs for {identifier}.")
         # No PATH fallback or shell is involved. An unsupported CPU or missing
         # runtime dependency fails this native stage instead of shipping blindly.
-        version_result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=15, check=True)
+        version_result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=15)
+        prerequisite = asset.get("runtimePrerequisite")
+        if prerequisite and (version_result.returncode & 0xFFFFFFFF) in {0xC0000135, 0xC0000139}:
+            raise ValueError(f"Install {prerequisite['name']} {prerequisite['minimumVersion']} or later: {prerequisite['url']}")
+        version_result.check_returncode()
         version = (version_result.stdout + version_result.stderr).strip()
-        if identity["versionMarker"] not in version:
+        if not version.startswith(asset["versionMarker"] + " "):
             raise ValueError(f"The staged executable identity differs for {identifier}: {version}")
         source_archive = download(source["url"], source["sha256"], cache)
         shutil.copy2(source_archive, directory / "source.tar.gz")
@@ -466,7 +479,7 @@ def stage(destination: Path, target: str, cache: Path, ffmpeg_build: Path | None
                 licenses.append({"path": f"{identifier}/{license_name}", "sha256": digest(directory / license_name)})
         staged.append({"id": identifier, "path": f"{identifier}/{asset['entry']}", "sha256": executable_hash,
                        "version": version, "architecture": asset["architecture"], "archive": asset,
-                       "sourceRepository": identity["repository"], "sourceCommit": identity["commit"],
+                       "sourceRepository": asset["repository"], "sourceCommit": asset["commit"],
                        "source": {**source, "path": f"{identifier}/source.tar.gz"}, "licenses": licenses})
         print(f"Verified package tool: {identifier} ({executable_hash})")
     if ffmpeg_build is not None:

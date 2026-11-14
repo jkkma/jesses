@@ -340,6 +340,145 @@ async fn av1an_preserves_frame_rate_color_audio_and_immutable_request() {
 
 #[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, x264, VapourSynth and L-SMASH on PATH"]
+async fn av1an_lsmash_encodes_only_the_presented_mp4_edit_frames() {
+    let fixture = Fixture::new();
+    let full = fixture.0.join("full.mp4");
+    let input = fixture.0.join("edit.mp4");
+    for args in [
+        command("ffmpeg")
+            .await
+            .args([
+                "-v", "error", "-n", "-f", "lavfi", "-i",
+                "testsrc2=size=128x96:rate=24,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                "-frames:v", "120", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
+                "-g", "120", "-sc_threshold", "0", "-bf", "0",
+            ])
+            .arg(&full),
+        command("ffmpeg")
+            .await
+            .args(["-v", "error", "-n", "-ss", "1.5", "-i"])
+            .arg(&full)
+            .args(["-t", "2", "-map", "0:v:0", "-c", "copy"])
+            .arg(&input),
+    ] {
+        let result = output(args).await;
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    let source = probe(&input).await;
+    assert_eq!(source["streams"][0]["nb_frames"], "84");
+    assert_eq!(source["streams"][0]["nb_read_frames"], "48");
+    let original = std::fs::read(&input).unwrap();
+
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut request = request(&input, &fixture.0.join("encode.mkv"), 5);
+    request.source.stream_indices = vec![0];
+    request.settings.encoder = media_core::VideoEncoder::X264;
+    request.settings.crf = 0;
+    request.settings.av1an_options = Some(media_core::Av1anOptions {
+        source_workflow: true,
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+        ..Default::default()
+    });
+    request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 1,
+        mp4_faststart: false,
+        full_output_verification: true,
+    });
+    request.settings.source_filters = true;
+    request.settings.av1an_filters = vec!["hflip".into()];
+
+    async fn pixels(path: &Path, flip: bool) -> Vec<String> {
+        let mut command = command("ffmpeg").await;
+        command.args(["-v", "error", "-i"]).arg(path);
+        if flip {
+            command.args(["-vf", "hflip"]);
+        }
+        let result = output(command.args([
+            "-map",
+            "0:v:0",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "framemd5",
+            "-",
+        ]))
+        .await;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.rsplit(',').next().unwrap().trim().to_owned())
+            .collect()
+    }
+    let expected = pixels(&input, true).await;
+    assert_eq!(expected.len(), 48);
+    for (method, name) in [
+        (media_core::Av1anChunkMethod::default(), "lsmash"),
+        (media_core::Av1anChunkMethod::Select, "select"),
+    ] {
+        let destination = fixture.0.join(format!("{name}.mkv"));
+        request.source.output_path = destination.to_string_lossy().into_owned();
+        request
+            .settings
+            .av1an_options
+            .as_mut()
+            .unwrap()
+            .chunk_method = method;
+        let submitted = manager.start_encode(request.clone()).await.unwrap();
+        let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+        assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+        assert_eq!(finished.encode_settings.as_ref(), Some(&request.settings));
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        let encoded = probe(&destination).await;
+        assert_eq!(encoded["streams"][0]["nb_read_frames"], "48");
+        assert_eq!(encoded["streams"][0]["color_primaries"], "bt709");
+        assert_eq!(encoded["streams"][0]["color_transfer"], "bt709");
+        assert_eq!(encoded["streams"][0]["color_space"], "bt709");
+        let frames = output(
+            command("ffprobe")
+                .await
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "frame=best_effort_timestamp_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(&destination),
+        )
+        .await;
+        assert!(frames.status.success());
+        let frames: Value = serde_json::from_slice(&frames.stdout).unwrap();
+        let timestamps = frames["frames"].as_array().unwrap();
+        assert_eq!(timestamps.len(), 48);
+        for (index, frame) in timestamps.iter().enumerate() {
+            let seconds: f64 = frame["best_effort_timestamp_time"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (seconds - index as f64 / 24.0).abs() <= 0.001,
+                "{name} frame {index}: {seconds}"
+            );
+        }
+        assert_eq!(pixels(&destination, false).await, expected);
+    }
+    manager.shutdown().await;
+    assert_no_partial_output(&fixture.0);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, x264, VapourSynth and L-SMASH on PATH"]
 async fn av1an_x264_keeps_timing_color_audio_and_source() {
     let fixture = Fixture::new();
     let input = fixture.0.join("x264 source.mkv");

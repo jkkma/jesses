@@ -39,7 +39,9 @@ and permitted PATH fallbacks. Provider-specific rules also apply. See
 [packaging and tool discovery](docs/packaging.md),
 [SVT provider setup](docs/svt-forks.md), and
 [utility dependencies](docs/media-utilities.md#dependencies). The source-style
-SVT-AV1 choice resolves SVT-AV1-HDR-PMod on Windows.
+SVT-AV1 choice resolves Patman's MSVC HDR-PMod in the Windows bundle. The
+bundled encoder requires the x64 Microsoft Visual C++ v14 Redistributable
+14.51 or later. [Download it from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).
 Older jobs retain their saved encoder identifiers.
 
 `pnpm dev` starts a browser preview at `http://127.0.0.1:1420`. It does not

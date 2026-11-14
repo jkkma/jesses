@@ -138,7 +138,12 @@ pub(super) async fn build(
         let executable = discover("av1an", cancel).await?;
         let work = super::super::rate_control::Stats::create(output, &format!("{id}-plan-av1an"))?;
         let log = work.path.join("av1an.log");
-        let prepared = if qtgmc.is_none() && plan.requires_av1an_preprocess() {
+        let presented = plan
+            .av1an_presented_rate
+            .filter(|_| !plan.requires_av1an_preprocess());
+        let prepared = if qtgmc.is_none()
+            && (plan.requires_av1an_preprocess() || presented.is_some())
+        {
             if subtitles.bitmap_input().is_some() {
                 return Err(AppError::new(
                     "AV1AN_PREPROCESS_SUBTITLE_UNSUPPORTED",
@@ -146,17 +151,32 @@ pub(super) async fn build(
                     None,
                 ));
             }
-            let prepared = super::super::av1an_preprocess::Prepared::build(
-                &source.path,
-                output,
-                id,
-                plan,
-                ffmpeg,
-                source_interval,
-                subtitles.text_filter(),
-                cancel,
-            )
-            .await?;
+            let prepared = if let Some(rate) = presented {
+                preview
+                    .notes
+                    .push(super::super::av1an_preprocess::PRESENTED_FRAMES_NOTE.into());
+                super::super::av1an_preprocess::Prepared::build_presented(
+                    &source.path,
+                    output,
+                    id,
+                    plan,
+                    ffmpeg,
+                    rate,
+                    cancel,
+                )?
+            } else {
+                super::super::av1an_preprocess::Prepared::build(
+                    &source.path,
+                    output,
+                    id,
+                    plan,
+                    ffmpeg,
+                    source_interval,
+                    subtitles.text_filter(),
+                    cancel,
+                )
+                .await?
+            };
             preview.stages.push(stage(
                 "Av1an lossless processed source",
                 prepared.producer.clone(),
@@ -173,7 +193,7 @@ pub(super) async fn build(
         } else {
             source.path.clone()
         };
-        let source_filter = (!uses_prepared)
+        let source_filter = (!uses_prepared || (qtgmc.is_none() && presented.is_some()))
             .then(|| plan.av1an_decoder_filter())
             .flatten();
         let arguments = super::super::av1an::arguments(

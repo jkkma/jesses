@@ -60,6 +60,14 @@ pub(super) struct Stream {
     pub disposition: BTreeMap<String, u32>,
 }
 
+impl Stream {
+    pub(super) fn dolby_vision_configuration(&self) -> impl Iterator<Item = &serde_json::Value> {
+        self.side_data_list
+            .iter()
+            .filter(|value| value["side_data_type"] == "DOVI configuration record")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct Chapter {
     pub start_time: String,

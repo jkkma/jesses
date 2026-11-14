@@ -300,7 +300,32 @@ pub(in crate::jobs) async fn settle(cancel: &watch::Receiver<bool>) -> Result<()
 
 /// Why packets cannot stand in for decoded frames; the caller then decodes
 /// the complete source before encoding, as before.
-pub(in crate::jobs) type Fallback = String;
+#[derive(Debug)]
+pub(in crate::jobs) struct Fallback {
+    reason: String,
+    pub discarded: bool,
+}
+
+impl From<String> for Fallback {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            discarded: false,
+        }
+    }
+}
+
+impl From<&str> for Fallback {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for Fallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(formatter)
+    }
+}
 
 /// Plan the frame count and cadence from packet times and the first decoded
 /// frames. A semantic rejection (for example variable timestamps) is an error
@@ -310,22 +335,26 @@ pub(in crate::jobs) async fn plan_from_packets(
     input: &Path,
     plan: &Plan,
     stream: &metadata::Stream,
+    check_discard: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Result<(Plan, usize), Fallback>, AppError> {
     // Field-coded video can store each field as its own packet, so packets
     // would not count frames. Such sources keep the blocking decoded scan.
-    if plan.accepts_field_coded_source()
+    let may_be_field_coded = plan.accepts_field_coded_source()
         || matches!(
             stream.field_order.as_deref(),
             Some("tt" | "bb" | "tb" | "bt")
-        )
-    {
+        );
+    if may_be_field_coded && !check_discard {
         return Ok(Err("the source may be field-coded".into()));
     }
     let times = match packet_times(ffprobe, input, stream.index, cancel).await? {
         Ok(times) => times,
         Err(reason) => return Ok(Err(reason)),
     };
+    if may_be_field_coded {
+        return Ok(Err("the source may be field-coded".into()));
+    }
     let first = match first_frame(ffprobe, input, plan, stream.index, cancel).await? {
         Ok(first) => first,
         Err(reason) => return Ok(Err(reason)),
@@ -410,9 +439,13 @@ fn packet_args(input: &Path, index: u32) -> Vec<OsString> {
 fn parse_packets(reader: impl std::io::BufRead) -> Result<Vec<f64>, Fallback> {
     let mut times = Vec::new();
     let mut fallback = None;
+    let mut discarded = false;
     for (position, line) in reader.lines().enumerate() {
         let line = line.map_err(|cause| cause.to_string())?;
         let line = line.trim();
+        discarded |= line
+            .split_once(',')
+            .is_some_and(|(_, flags)| flags.contains('D'));
         if line.is_empty() || fallback.is_some() {
             continue;
         }
@@ -439,7 +472,7 @@ fn parse_packets(reader: impl std::io::BufRead) -> Result<Vec<f64>, Fallback> {
         }
     }
     if let Some(reason) = fallback {
-        return Err(reason);
+        return Err(Fallback { reason, discarded });
     }
     if times.is_empty() {
         return Err("the stream has no packets".into());
@@ -520,7 +553,8 @@ mod tests {
             ("0.000000\n", "unreadable"),
         ] {
             let error = parse_packets(listing.as_bytes()).unwrap_err();
-            assert!(error.contains(reason), "{listing:?}: {error}");
+            assert!(error.reason.contains(reason), "{listing:?}: {error}");
+            assert_eq!(error.discarded, listing.contains('D'));
         }
     }
 

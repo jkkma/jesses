@@ -14,7 +14,7 @@
   "platforms": {
     "x86_64-pc-windows-msvc": {
       "runtime": "Microsoft Edge WebView2 Runtime",
-      "portableRuntimeStrategy": "WebView2 must already be installed. The portable archive does not contain the runtime.",
+      "portableRuntimeStrategy": "WebView2 must already be installed. Bundled Patman MSVC encoding requires the Microsoft Visual C++ v14 Redistributable (x64) 14.51 or later. The portable archive contains neither runtime.",
       "distribution": "Portable ZIP installed and updated through Scoop; persist the complete jesses-data directory.",
       "artifacts": ["portableZip"]
     },
@@ -67,7 +67,7 @@
       "executable": "SvtAv1EncApp-HDR",
       "versionArgument": "--version",
       "upstream": "https://github.com/Patman86/SVT-AV1-Mods-by-Patman",
-      "usage": "Default AV1 encoder. Windows packages include SVT-AV1-HDR-PMod and Linux packages include the qualified SVT-AV1-HDR build."
+      "usage": "Default AV1 encoder. Windows packages include Patman's MSVC HDR-PMod. The retained Linux development recipe uses upstream SVT-AV1-HDR."
     },
     {
       "id": "x264",

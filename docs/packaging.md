@@ -16,10 +16,10 @@ Use `package-desktop.py collect --tool-resources` to assemble the new executable
 with those verified tools, then verify the new archive and generate its Scoop
 manifest. Retain the tool sources, licenses, and provenance alongside the binaries.
 
-The workflow includes pinned SVT-AV1 5fish and SVT-AV1-HDR-PMod, with matching
-source archives and license and patent notices. The 5fish build requires an
-x86-64-v3 CPU.
-Each native packaging run checks their versions
+The workflow includes pinned SVT-AV1 5fish and Patman's MSVC 19.51 HDR-PMod,
+with matching source archives and license and patent notices. The 5fish build
+requires an x86-64-v3 CPU. Patman's build requires the x64 Microsoft Visual C++
+v14 Redistributable 14.51 or later. Each native packaging run checks their versions
 before bundling them. Binary and source downloads have pinned SHA-256 hashes.
 
 Windows package builds also compile the official FFmpeg/FFprobe 9.0.1 source
@@ -40,7 +40,8 @@ subtitle rendering uses the operating system's DirectWrite font provider.
 
 The retained [Linux FFmpeg build](linux-ffmpeg-package.md) compiles the same media
 pair and static codec libraries from pinned sources, with the ordinary Linux
-C/C++ runtime supplied by the target system. Its pinned recipe is active in the restored Ubuntu 24.04 packaging lane.
+C/C++ runtime supplied by the target system. Its pinned recipe is retained for
+local development while hosted Linux packaging is deferred.
 Historical receipts below remain bounded to their recorded revisions; the final
 changed artifact still requires fresh native qualification.
 
@@ -103,11 +104,11 @@ Install the remaining tools described in
 
 Explicit `JESSES_<TOOL_ID>` executable overrides take priority, with hyphens in
 tool IDs replaced by underscores; for example `JESSES_FFMPEG` or
-`JESSES_SVT_AV1_HDR`. Forks retain their existing managed-install priority. Next,
-the runtime verifies any corresponding bundled executable's SHA-256, then uses
-the permitted PATH fallback for tools that are not bundled. A corrupt bundled
-entry fails explicitly. No PATH mutation or alternate encoder substitution is
-performed. The selected tool is validated again before each media job.
+`JESSES_SVT_AV1_HDR`. For HDR on Windows, the runtime checks the verified
+bundle before the managed installation. The other fork keeps its managed-install
+priority. The runtime verifies bundled executable SHA-256 hashes and uses the
+permitted PATH fallback after its configured locations. A corrupt bundle entry
+fails explicitly. The selected tool is validated again before each media job.
 
 The portable application requires an already installed WebView2 runtime. It does
 not install a runtime or register an uninstaller. Release qualification must cover
