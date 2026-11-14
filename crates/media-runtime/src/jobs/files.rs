@@ -110,6 +110,10 @@ impl Source {
         })
     }
 
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+
     pub fn verify(&self) -> Result<(), AppError> {
         if let Some(sequence) = &self.sequence {
             sequence.verify()?;

@@ -701,6 +701,38 @@ fn owned_concat_output(root: &Path, output: &Path) -> Result<bool, AppError> {
     }
 }
 
+fn verify_concat_options(
+    root: &Path,
+    path: &Path,
+    manifest: &Manifest,
+    stale: bool,
+) -> Result<(), AppError> {
+    let values: Vec<String> =
+        serde_json::from_slice(&bytes(path)?).map_err(|cause| error(path, cause.to_string()))?;
+    let owned = if let Some(output) = values.get(1).map(Path::new) {
+        if stale {
+            manifest.launch_artifacts.iter().any(|launch| {
+                let expected = launch.path.join("encoded.mkv");
+                output == expected || output == dunce::simplified(&expected)
+            }) && owned_concat_output(root, output)?
+        } else {
+            owned_concat_output(root, output)?
+        }
+    } else {
+        false
+    };
+    if values.first().map(String::as_str) != Some("-o")
+        || !owned
+        || values.last().map(String::as_str) != Some("]")
+    {
+        return Err(error(
+            path,
+            "The concatenation options do not name an owned output.",
+        ));
+    }
+    Ok(())
+}
+
 pub(in crate::jobs) fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
     if id.is_empty() || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
         return Err(error(
@@ -748,6 +780,12 @@ fn load(
     }
     validate_layout(&root, &manifest)?;
     for stamp in &manifest.concat_inputs {
+        // A resume retires the old options file before av1an can rewrite it
+        // with the new launch output. A crash between unlink and saving that
+        // retirement can leave a receipt for an absent options file.
+        if stamp.path == root.join("chunks/options.json") && !entry_exists(&stamp.path)? {
+            continue;
+        }
         if digest(&stamp.path, None)? != *stamp {
             return Err(error(
                 &stamp.path,
@@ -909,11 +947,18 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     } else {
         None
     };
+    let lsmash_cache =
+        manifest.queue.is_some() && options.chunk_method == media_core::Av1anChunkMethod::Lsmash;
     if manifest
         .reader_cache
         .as_ref()
         .zip(expected_reader_cache.as_ref())
         .is_some_and(|(stamp, expected)| stamp.path != *expected)
+        || (lsmash_cache
+            && manifest
+                .reader_cache
+                .as_ref()
+                .is_some_and(|stamp| stamp.path != root.join("chunks/split/cache.lwi")))
     {
         return Err(error(
             root,
@@ -935,8 +980,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     if manifest.queue.is_some() != manifest.scenes.is_some()
         || (manifest.queue.is_some() && super::options::plugin(options).is_some())
             != manifest.script.is_some()
-        || (manifest.queue.is_some() && expected_reader_cache.is_some())
-            != manifest.reader_cache.is_some()
+        || (!lsmash_cache && expected_reader_cache.is_some() != manifest.reader_cache.is_some())
         || (manifest.queue.is_none() && !manifest.segments.is_empty())
         || (manifest.queue.is_none() && !manifest.completed.is_empty())
         || (manifest.phase == RecoveryPhase::Finalizing) != manifest.final_video.is_some()
@@ -1001,6 +1045,13 @@ pub(super) fn launch_directory_guard(path: &Path) -> Result<File, AppError> {
         return Err(error(path, "The staged launch directory changed."));
     }
     Ok(guard)
+}
+
+pub(super) fn verify_launch_directory(path: &Path, guard: &File) -> Result<(), AppError> {
+    if identity(path)? != file_identity(guard).map_err(|cause| error(path, cause.to_string()))? {
+        return Err(error(path, "The launch artifact directory was replaced."));
+    }
+    Ok(())
 }
 
 fn lock_workspace(root: &Path) -> Result<(File, WorkspaceLock), AppError> {
@@ -1183,12 +1234,64 @@ impl Workspace {
         }
         Ok(())
     }
+    fn guard_owned_launch(&self, path: &Path) -> Result<File, AppError> {
+        self.verify_owner()?;
+        validate_launch_layout(&self.root, &self.manifest)?;
+        let launch = self
+            .manifest
+            .launch_artifacts
+            .iter()
+            .find(|launch| launch.path == path)
+            .ok_or_else(|| error(path, "The launch directory has no durable reservation."))?;
+        verified_launch_guard(launch)
+    }
     fn save(&self) -> Result<(), AppError> {
         self.verify_owner()?;
         atomic(
             &self.root.join("manifest.json"),
             &serde_json::to_vec(&self.manifest).map_err(|e| error(&self.root, e.to_string()))?,
         )
+    }
+    fn sweep_stale_launches(&mut self) -> Result<(), AppError> {
+        // Retire mkvmerge's generated control before another attempt can
+        // rewrite it. It is never read to reconstruct a queue or join media.
+        let options = self.root.join("chunks/options.json");
+        if entry_exists(&options)? {
+            let _chunks = launch_directory_guard(&self.root.join("chunks"))?;
+            let guard = open_launch_file(&options)?;
+            let stamp = digest(&options, None)?;
+            if let Some(saved) = self
+                .manifest
+                .concat_inputs
+                .iter()
+                .find(|saved| saved.path == options)
+            {
+                if stamp != *saved {
+                    return Err(error(&options, "The saved concatenation options changed."));
+                }
+            } else {
+                verify_concat_options(&self.root, &options, &self.manifest, true)?;
+            }
+            guard.verify()?;
+            drop(guard);
+            remove_tree(&options, &stamp.identity, None)?;
+        }
+        self.manifest
+            .concat_inputs
+            .retain(|stamp| stamp.path != options);
+        for launch in &self.manifest.launch_artifacts {
+            if entry_exists(&launch.path)? {
+                remove_tree_checked(
+                    &launch.path,
+                    &launch.identity,
+                    None,
+                    Some(RemovalAuthority::Launch(launch)),
+                    false,
+                )?;
+            }
+        }
+        self.manifest.launch_artifacts.clear();
+        Ok(())
     }
     fn summary(&self) -> Av1anRecovery {
         Av1anRecovery {
@@ -1326,28 +1429,26 @@ impl Workspace {
                 ),
             });
         }
-        self.manifest.concat_inputs.clear();
+        let mut concat_inputs = Vec::new();
         for relative in ["chunks/options.json", "chunks/concat"] {
             let path = self.root.join(relative);
             if path.exists() {
-                if relative.ends_with("options.json") {
-                    let values: Vec<String> = serde_json::from_slice(&bytes(&path)?)
-                        .map_err(|cause| error(&path, cause.to_string()))?;
-                    if values.first().map(String::as_str) != Some("-o")
-                        || !values.get(1).map_or(Ok(false), |value| {
-                            owned_concat_output(&self.root, Path::new(value))
-                        })?
-                        || values.last().map(String::as_str) != Some("]")
-                    {
+                let stamp = digest(&path, None)?;
+                if relative.ends_with("options.json")
+                    && !self.manifest.concat_inputs.contains(&stamp)
+                {
+                    verify_concat_options(&self.root, &path, &self.manifest, false)?;
+                    if digest(&path, None)? != stamp {
                         return Err(error(
                             &path,
-                            "The concatenation options do not name an owned output.",
+                            "The concatenation options changed during verification.",
                         ));
                     }
                 }
-                self.manifest.concat_inputs.push(digest(&path, None)?);
+                concat_inputs.push(stamp);
             }
         }
+        self.manifest.concat_inputs = concat_inputs;
         if let Some(path) = &receipts.script_path {
             let stamp = digest(path, None)?;
             if self
@@ -1367,48 +1468,14 @@ impl Workspace {
         }
         if let Some(reader) = receipts.reader_cache {
             let path = external_reader_cache_path(&self.root.join("chunks"), reader)?;
-            if let Some(saved) = &self.manifest.reader_cache {
-                #[cfg(windows)]
-                {
-                    let canonical =
-                        fs::canonicalize(&path).map_err(|e| error(&path, e.to_string()))?;
-                    let guard = self
-                        .chunks
-                        .iter()
-                        .find(|guard| guard.path == canonical)
-                        .ok_or_else(|| {
-                            error(&path, "The external source-reader cache guard is missing.")
-                        })?;
-                    guard.verify().map_err(|_| {
-                        error(&path, "The saved external source-reader cache changed.")
-                    })?;
-                    let metadata = fs::metadata(&path).map_err(|e| error(&path, e.to_string()))?;
-                    if identity(&path)? != saved.identity || metadata.len() != saved.length {
-                        return Err(error(
-                            &path,
-                            "The saved external source-reader cache changed.",
-                        ));
-                    }
-                }
-                #[cfg(not(windows))]
-                if digest(&path, None)?.ne(saved) {
-                    return Err(error(
-                        &path,
-                        "The saved external source-reader cache changed.",
-                    ));
-                }
-            } else {
-                // Seal only a complete, readable index. On Windows this guard
-                // prevents writes, deletion and replacement for the remainder
-                // of the attempt, so periodic checkpoints need only verify its
-                // identity and metadata. Unix retains full-digest verification.
-                let guard = Source::open(&path)?;
-                let stamp = digest(&path, None)?;
-                if stamp.length == 0 {
-                    return Err(error(&path, "The external source-reader cache is empty."));
-                }
-                self.manifest.reader_cache = Some(stamp);
-                self.chunks.push(guard);
+            self.checkpoint_reader_cache(&path, required)?;
+        } else if queue_options(&self.manifest).chunk_method == media_core::Av1anChunkMethod::Lsmash
+        {
+            let path = self.root.join("chunks/split/cache.lwi");
+            // Older manifests did not record this index. Seal it on the next
+            // checkpoint when available, and retain its proof for later resumes.
+            if self.manifest.reader_cache.is_some() || entry_exists(&path)? {
+                self.checkpoint_reader_cache(&path, required)?;
             }
         } else if self.manifest.reader_cache.is_some() {
             return Err(error(
@@ -1466,6 +1533,43 @@ impl Workspace {
                     file: stamp,
                 },
             );
+            self.chunks.push(guard);
+        }
+        Ok(())
+    }
+    fn checkpoint_reader_cache(&mut self, path: &Path, required: bool) -> Result<(), AppError> {
+        if let Some(saved) = &self.manifest.reader_cache {
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| error(path, e.to_string()))?;
+            let guard = self
+                .chunks
+                .iter()
+                .find(|guard| guard.path == canonical)
+                .ok_or_else(|| error(path, "The external source-reader cache guard is missing."))?;
+            if guard.verify().is_err()
+                || identity(path)? != saved.identity
+                || fs::metadata(path)
+                    .map_err(|cause| error(path, cause.to_string()))?
+                    .len()
+                    != saved.length
+                || (required && digest(path, None)? != *saved)
+            {
+                return Err(error(
+                    path,
+                    "The saved external source-reader cache changed.",
+                ));
+            }
+        } else {
+            // Seal through a guard which retains the identity, length and mtime
+            // for cheap verification on subsequent periodic checkpoints.
+            let guard = open_launch_file(path)?;
+            let stamp = digest(path, None)?;
+            guard.verify()?;
+            if stamp.length == 0 {
+                return Err(error(path, "The external source-reader cache is empty."));
+            }
+            self.manifest.reader_cache = Some(stamp);
             self.chunks.push(guard);
         }
         Ok(())
@@ -1959,42 +2063,165 @@ fn validate_launch_layout(root: &Path, manifest: &Manifest) -> Result<(), AppErr
     Ok(())
 }
 
-fn verify_launch_artifacts(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
-    validate_launch_layout(root, manifest)?;
-    for launch in &manifest.launch_artifacts {
-        match fs::symlink_metadata(&launch.path) {
-            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(cause) => return Err(error(&launch.path, cause.to_string())),
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(error(
-                    &launch.path,
-                    "The sealed launch directory changed type.",
-                ));
+fn entry_exists(path: &Path) -> Result<bool, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(cause) => Err(error(path, cause.to_string())),
+    }
+}
+
+fn verified_launch_guard(launch: &LaunchArtifact) -> Result<File, AppError> {
+    let guard = launch_directory_guard(&launch.path)?;
+    if file_identity(&guard).map_err(|e| error(&launch.path, e.to_string()))? != launch.identity {
+        return Err(error(
+            &launch.path,
+            "The sealed launch directory was replaced.",
+        ));
+    }
+    Ok(guard)
+}
+
+fn verify_single_link_file(path: &Path) -> Result<Identity, AppError> {
+    let expected = identity(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(error(path, "Expected a regular launch artifact file."));
+    }
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink()
+    };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let file = OpenOptions::new()
+            .access_mode(0x80)
+            .share_mode(1 | 2 | 4)
+            .custom_flags(0x00200000)
+            .open(path)
+            .map_err(|e| error(path, e.to_string()))?;
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: file is a live handle and a successful call initializes info.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(error(path, std::io::Error::last_os_error().to_string()));
+        }
+        if file_identity(&file).map_err(|e| error(path, e.to_string()))? != expected {
+            return Err(error(path, "The launch artifact was replaced."));
+        }
+        unsafe { info.assume_init() }.nNumberOfLinks
+    };
+    if links != 1 || identity(path)? != expected {
+        return Err(error(
+            path,
+            "Launch artifact files cannot have additional links or change identity.",
+        ));
+    }
+    Ok(expected)
+}
+
+pub(super) fn open_launch_file(path: &Path) -> Result<Source, AppError> {
+    let expected = verify_single_link_file(path)?;
+    let source = Source::open(path)?;
+    if file_identity(source.file()).map_err(|e| error(path, e.to_string()))? != expected
+        || identity(path)? != expected
+    {
+        return Err(error(path, "The launch artifact changed while opening it."));
+    }
+    Ok(source)
+}
+
+pub(super) fn verify_launch_file(source: &Source) -> Result<(), AppError> {
+    source.verify()?;
+    let current = verify_single_link_file(&source.path)?;
+    if file_identity(source.file()).map_err(|e| error(&source.path, e.to_string()))? != current {
+        return Err(error(&source.path, "The launch artifact was replaced."));
+    }
+    Ok(())
+}
+
+fn verify_launch_contents(launch: &LaunchArtifact) -> Result<(), AppError> {
+    let _guard = verified_launch_guard(launch)?;
+    for entry in fs::read_dir(&launch.path).map_err(|e| error(&launch.path, e.to_string()))? {
+        let path = entry
+            .map_err(|e| error(&launch.path, e.to_string()))?
+            .path();
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("scene-prepass") => verify_scene_scratch(&path)?,
+            Some("encoded.mkv") => {
+                verify_single_link_file(&path)?;
             }
-            Ok(_) => {}
-        }
-        let _guard = launch_directory_guard(&launch.path)?;
-        if identity(&launch.path)? != launch.identity {
-            return Err(error(
-                &launch.path,
-                "The sealed launch directory was replaced.",
-            ));
-        }
-        if let Some(image) = &launch.image {
-            match fs::symlink_metadata(&image.path) {
-                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cause) => return Err(error(&image.path, cause.to_string())),
-                Ok(_) if digest(&image.path, None)? != *image => {
-                    return Err(error(
-                        &image.path,
-                        "The sealed staged launch image changed.",
-                    ));
+            Some("av1an.exe") if launch.image.is_some() => {
+                verify_single_link_file(&path)?;
+                if Some(&digest(&path, None)?) != launch.image.as_ref() {
+                    return Err(error(&path, "The sealed staged launch image changed."));
                 }
-                Ok(_) => {}
+            }
+            _ => {
+                return Err(error(
+                    &path,
+                    "Foreign artifact in the owned launch directory.",
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn verify_scene_scratch(root: &Path) -> Result<(), AppError> {
+    fn visit(root: &Path, directory: &Path) -> Result<(), AppError> {
+        let _guard = launch_directory_guard(directory)?;
+        for entry in fs::read_dir(directory).map_err(|e| error(directory, e.to_string()))? {
+            let path = entry.map_err(|e| error(directory, e.to_string()))?.path();
+            let relative = path.strip_prefix(root).expect("scene scratch descendant");
+            let parts: Vec<_> = relative
+                .iter()
+                .map(|name| name.to_str().unwrap_or(""))
+                .collect();
+            let slice = |name: &str| {
+                name.strip_prefix("slice-").is_some_and(|index| {
+                    index.len() == 2 && index.parse::<u8>().is_ok_and(|index| index < 16)
+                })
+            };
+            let is_directory = match parts.as_slice() {
+                ["index"] => true,
+                [name] => slice(name),
+                [name, "logs" | "temp"] => slice(name),
+                [name, "temp", "encode" | "split"] => slice(name),
+                _ => false,
+            };
+            let is_file = match parts.as_slice() {
+                ["source-info.vpy" | "cache.lwi" | "scenes.json"] => true,
+                ["index", name] => name.ends_with(".lwi"),
+                [name, "input.vpy" | "scenes.json" | "av1an.log"] => slice(name),
+                [name, "temp", "done.json"] => slice(name),
+                [name, "logs", log] => {
+                    slice(name)
+                        && log.strip_prefix("av1an.log.").is_some_and(|date| {
+                            date.len() == 10
+                                && date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                        })
+                }
+                _ => false,
+            };
+            if is_directory {
+                visit(root, &path)?;
+            } else if is_file {
+                verify_single_link_file(&path)?;
+            } else {
+                return Err(error(
+                    &path,
+                    "Foreign artifact in the scene prepass directory.",
+                ));
+            }
+        }
+        Ok(())
+    }
+    visit(root, root)
 }
 
 fn remove_empty_launch(path: &Path, expected: &Identity) -> Result<(), AppError> {
@@ -2031,7 +2258,7 @@ fn remove_empty_launch(path: &Path, expected: &Identity) -> Result<(), AppError>
 }
 
 fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
-    verify_launch_artifacts(root, manifest)?;
+    validate_launch_layout(root, manifest)?;
     let count = manifest
         .queue
         .as_ref()
@@ -2068,15 +2295,14 @@ fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> 
                 .to_string_lossy()
                 .replace('\\', "/");
             let dirs = matches!(rel.as_str(), "chunks" | "chunks/encode" | "chunks/split");
-            let owned_launch = manifest
+            if let Some(launch) = manifest
                 .launch_artifacts
                 .iter()
-                .any(|launch| launch.path == path);
-            let launch_image = manifest
-                .launch_artifacts
-                .iter()
-                .filter_map(|launch| launch.image.as_ref())
-                .any(|image| image.path == path);
+                .find(|launch| launch.path == path)
+            {
+                verify_launch_contents(launch)?;
+                continue;
+            }
             let stamped = manifest
                 .segments
                 .iter()
@@ -2084,6 +2310,11 @@ fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> 
                 .chain(manifest.script.iter())
                 .chain(manifest.concat_inputs.iter())
                 .any(|s| s.path == path);
+            let stale_concat = !stamped && rel == "chunks/options.json" && metadata.is_file();
+            if stale_concat {
+                verify_single_link_file(&path)?;
+                verify_concat_options(root, &path, manifest, true)?;
+            }
             let segment_list = rel == "segments.ffconcat" && !manifest.segments.is_empty();
             if segment_list {
                 let guard = Source::open(&path)?;
@@ -2132,13 +2363,13 @@ fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> 
                 })
             });
             if metadata.is_dir() {
-                if !dirs && !owned_launch {
+                if !dirs {
                     return Err(error(&path, "Foreign directory in recovery workspace."));
                 }
                 visit(root, &path, manifest, count, target_count)?;
             } else if !metadata.is_file()
-                || !(launch_image
-                    || stamped
+                || !(stamped
+                    || stale_concat
                     || control
                     || video
                     || prepared
@@ -3009,6 +3240,7 @@ impl Recovery {
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
             verify_action_tree(&workspace.root, &workspace.manifest)?;
+            workspace.sweep_stale_launches()?;
             let resume_chunks=workspace.manifest.queue.is_some();
             let finalizing=workspace.manifest.phase==RecoveryPhase::Finalizing;
             if !finalizing {
@@ -3027,6 +3259,7 @@ impl Recovery {
                     // is saved. Their scene receipt is sealed for safe actions,
                     // then regenerated with the discarded incomplete attempt.
                     workspace.manifest.scenes = None;
+                    workspace.manifest.concat_inputs.clear();
                 }
                 intermediate.clone_file()?.set_len(0).map_err(|e|error(&intermediate.path,e.to_string()))?;
             }
@@ -3146,6 +3379,28 @@ impl Recovery {
                     .retain(|launch| launch.path != path);
                 Ok(())
             })
+        })
+        .await
+    }
+    pub(super) async fn open_staged_video(&self, launch: &Path) -> Result<Source, AppError> {
+        let launch = launch.to_owned();
+        self.with(move |w| {
+            let _directory = w.guard_owned_launch(&launch)?;
+            let path = launch.join("encoded.mkv");
+            open_launch_file(&path)
+        })
+        .await
+    }
+    pub(super) async fn remove_staged_video(&self, launch: &Path) -> Result<(), AppError> {
+        let launch = launch.to_owned();
+        self.with(move |w| {
+            let _directory = w.guard_owned_launch(&launch)?;
+            let path = launch.join("encoded.mkv");
+            if entry_exists(&path)? {
+                let expected = verify_single_link_file(&path)?;
+                remove_tree_checked(&path, &expected, None, None, true)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -3379,7 +3634,7 @@ fn remove_tree(
     expected: &Identity,
     existing_guard: Option<File>,
 ) -> Result<(), AppError> {
-    remove_tree_checked(root, expected, existing_guard, None)
+    remove_tree_checked(root, expected, existing_guard, None, false)
 }
 
 fn remove_workspace_tree(
@@ -3387,14 +3642,50 @@ fn remove_workspace_tree(
     manifest: &Manifest,
     guard: Option<File>,
 ) -> Result<(), AppError> {
-    remove_tree_checked(root, &manifest.directory, guard, Some(manifest))
+    remove_tree_checked(
+        root,
+        &manifest.directory,
+        guard,
+        Some(RemovalAuthority::Workspace(manifest)),
+        false,
+    )
+}
+
+enum RemovalAuthority<'a> {
+    Workspace(&'a Manifest),
+    Launch(&'a LaunchArtifact),
+    SceneScratch,
+}
+
+pub(super) struct SceneScratch {
+    identity: Identity,
+    guard: File,
+}
+
+impl SceneScratch {
+    pub(super) fn capture(path: &Path) -> Result<Self, AppError> {
+        let guard = launch_directory_guard(path)?;
+        let identity = file_identity(&guard).map_err(|cause| error(path, cause.to_string()))?;
+        Ok(Self { identity, guard })
+    }
+
+    pub(super) fn remove(self, path: &Path) -> Result<(), AppError> {
+        remove_tree_checked(
+            path,
+            &self.identity,
+            Some(self.guard),
+            Some(RemovalAuthority::SceneScratch),
+            true,
+        )
+    }
 }
 
 fn remove_tree_checked(
     root: &Path,
     expected: &Identity,
     existing_guard: Option<File>,
-    manifest: Option<&Manifest>,
+    authority: Option<RemovalAuthority<'_>>,
+    retry: bool,
 ) -> Result<(), AppError> {
     struct Entry {
         path: PathBuf,
@@ -3407,19 +3698,24 @@ fn remove_tree_checked(
         expected: &Identity,
         guard: Option<File>,
         entries: &mut Vec<Entry>,
-        manifest: Option<&Manifest>,
+        authority: Option<&RemovalAuthority<'_>>,
     ) -> Result<(), AppError> {
         let metadata = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
         let directory = metadata.is_dir();
         let guard = match guard {
             Some(guard) => Some(guard),
             None if directory => Some(directory_guard(path)?),
-            None if manifest.is_some_and(|manifest| {
-                manifest
+            None if authority.is_some_and(|authority| match authority {
+                RemovalAuthority::Workspace(manifest) => manifest
                     .launch_artifacts
                     .iter()
                     .filter_map(|launch| launch.image.as_ref())
-                    .any(|image| image.path == path)
+                    .any(|image| image.path == path),
+                RemovalAuthority::Launch(launch) => launch
+                    .image
+                    .as_ref()
+                    .is_some_and(|image| image.path == path),
+                RemovalAuthority::SceneScratch => false,
             }) =>
             {
                 let mut options = OpenOptions::new();
@@ -3445,7 +3741,7 @@ fn remove_tree_checked(
         if directory {
             for child in fs::read_dir(path).map_err(|e| error(path, e.to_string()))? {
                 let child = child.map_err(|e| error(path, e.to_string()))?.path();
-                collect(&child, &identity(&child)?, None, entries, manifest)?;
+                collect(&child, &identity(&child)?, None, entries, authority)?;
             }
         } else if !metadata.is_file() {
             return Err(error(path, "Unsupported recovery filesystem entry."));
@@ -3459,18 +3755,28 @@ fn remove_tree_checked(
         Ok(())
     }
     let mut entries = Vec::new();
-    collect(root, expected, existing_guard, &mut entries, manifest)?;
+    collect(
+        root,
+        expected,
+        existing_guard,
+        &mut entries,
+        authority.as_ref(),
+    )?;
     #[cfg(test)]
     REMOVE_ENUMERATED_HOOK.with(|hook| {
         if let Some(mutate) = hook.borrow_mut().take() {
             mutate();
         }
     });
-    if let Some(manifest) = manifest {
+    if let Some(authority) = authority {
         // Validate after enumeration, while recorded launch images and all
         // ancestor directories remain guarded. Never delete an extra entry
         // introduced between preflight and cleanup enumeration.
-        verify_action_tree(root, manifest)?;
+        match authority {
+            RemovalAuthority::Workspace(manifest) => verify_action_tree(root, manifest)?,
+            RemovalAuthority::Launch(launch) => verify_launch_contents(launch)?,
+            RemovalAuthority::SceneScratch => verify_scene_scratch(root)?,
+        }
     }
     let root_entry = entries.pop().expect("owned root entry");
     // Preserve the durable locator/receipts if deleting any owned child fails.
@@ -3485,6 +3791,13 @@ fn remove_tree_checked(
     }
     children.extend(receipts);
     children.push(root_entry);
+    // A replacement encountered anywhere during enumeration invalidates the
+    // entire deletion before any of the verified entries are removed.
+    for entry in &children {
+        if identity(&entry.path)? != entry.identity {
+            return Err(error(&entry.path, "Recovery entry changed during cleanup."));
+        }
+    }
     for entry in children {
         if identity(root)? != *expected || identity(&entry.path)? != entry.identity {
             return Err(error(&entry.path, "Recovery entry changed during cleanup."));
@@ -3497,13 +3810,29 @@ fn remove_tree_checked(
             if entry.directory {
                 drop(entry.guard.take());
             }
-            let _ = entry.directory;
             let id = &entry.identity.0;
-            files::windows_delete_owned(&entry.path, (id[0] as u32, id[1] as u32, id[2] as u32))
-                .map_err(|e| error(&entry.path, e.to_string()))?;
+            let mut attempts = 0;
+            loop {
+                match files::windows_delete_owned(
+                    &entry.path,
+                    (id[0] as u32, id[1] as u32, id[2] as u32),
+                ) {
+                    Ok(()) => break,
+                    Err(cause)
+                        if retry
+                            && attempts < 5
+                            && matches!(cause.raw_os_error(), Some(5 | 32 | 33 | 145)) =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(cause) => return Err(error(&entry.path, cause.to_string())),
+                }
+            }
         }
         #[cfg(not(windows))]
         {
+            let _ = retry;
             // Keep any supplied identity guard live through the unlink.
             if entry.directory {
                 fs::remove_dir(&entry.path)
@@ -5142,6 +5471,33 @@ mod tests {
     }
 
     #[test]
+    fn reader_cache_hashes_on_first_seal_required_checkpoint_and_resume() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = fixture.workspace();
+        let cache = workspace.root.join("cache.ffindex");
+        fs::write(&cache, b"reader index").unwrap();
+        COUNT_SOURCE_HASHES.with(|counter| *counter.borrow_mut() = Some((cache.clone(), 0)));
+        workspace.checkpoint_reader_cache(&cache, false).unwrap();
+        for _ in 0..5 {
+            workspace.checkpoint_reader_cache(&cache, false).unwrap();
+        }
+        COUNT_SOURCE_HASHES.with(|counter| assert_eq!(counter.borrow().as_ref().unwrap().1, 1));
+        workspace.checkpoint_reader_cache(&cache, true).unwrap();
+        workspace.verify_saved(None).unwrap();
+        COUNT_SOURCE_HASHES.with(|counter| assert_eq!(counter.borrow_mut().take().unwrap().1, 3));
+        #[cfg(unix)]
+        {
+            let modified = fs::metadata(&cache).unwrap().modified().unwrap();
+            fs::write(&cache, b"replaced idx").unwrap();
+            assert!(workspace.checkpoint_reader_cache(&cache, false).is_err());
+            File::open(&cache).unwrap().set_modified(modified).unwrap();
+            workspace.checkpoint_reader_cache(&cache, false).unwrap();
+            assert!(workspace.checkpoint_reader_cache(&cache, true).is_err());
+            assert!(workspace.verify_saved(None).is_err());
+        }
+    }
+
+    #[test]
     fn external_reader_cache_is_owned_and_fingerprinted_for_resume() {
         for method in [
             media_core::Av1anChunkMethod::Ffms2,
@@ -5362,6 +5718,183 @@ mod tests {
         assert!(!root.exists());
         assert_eq!(fs::read(request.input_path).unwrap(), b"source bytes");
         assert_eq!(fs::read(neighbor).unwrap(), b"preserve neighboring bytes");
+    }
+
+    #[tokio::test]
+    async fn stale_scene_and_staged_video_launch_artifacts_allow_resume_and_discard() {
+        for discard in [false, true] {
+            let fixture = Fixture::new();
+            let (mut workspace, intermediate) = fixture.workspace();
+            let launch = stage_receipted_launch(&mut workspace, &fixture);
+            let slice = launch.join("scene-prepass/slice-00");
+            fs::create_dir_all(slice.join("temp/split")).unwrap();
+            fs::write(slice.join("input.vpy"), b"abandoned slice").unwrap();
+            fs::write(slice.join("temp/done.json"), b"abandoned slice progress").unwrap();
+            fs::write(launch.join("encoded.mkv"), b"abandoned video").unwrap();
+            let chunks = workspace.root.join("chunks");
+            fs::create_dir(&chunks).unwrap();
+            fs::write(
+                chunks.join("options.json"),
+                serde_json::to_vec(&serde_json::json!([
+                    "-o",
+                    dunce::simplified(&launch).join("encoded.mkv"),
+                    "[",
+                    "00000.ivf",
+                    "]"
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+            let neighbor = fixture.0.join("neighbor.txt");
+            fs::write(&neighbor, b"neighbor bytes").unwrap();
+            let root = workspace.root.clone();
+            let request = workspace.manifest.request.clone();
+            let settings = workspace.manifest.settings.clone();
+            let locator = workspace.summary();
+            let tools = workspace
+                .manifest
+                .tools
+                .iter()
+                .map(|tool| tool.path.clone())
+                .collect();
+            let source = PathBuf::from(&request.input_path);
+            let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({
+                "format":{"start_time":"0"},
+                "streams":[{"index":0,"codec_type":"video","codec_name":"ffv1","width":128,"height":72,
+                    "pix_fmt":"yuv420p10le","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0",
+                    "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
+                    "color_transfer":"bt709","color_range":"tv"}]
+            })).unwrap();
+            let plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+            workspace.manifest.params = super::super::encoder::parameters(&plan, &settings)
+                .into_iter()
+                .map(|parameter| parameter.into_string().unwrap())
+                .collect();
+            workspace.manifest.source_filter = plan.av1an_decoder_filter();
+            workspace.save().unwrap();
+            drop(workspace);
+            drop(intermediate);
+
+            if discard {
+                Recovery::discard("owned-job", &request, &settings, &locator)
+                    .await
+                    .unwrap();
+                assert!(!root.exists());
+            } else {
+                let (_owner, cancel) = watch::channel(false);
+                let (recovery, _intermediate, _) = Recovery::prepare(
+                    "owned-job",
+                    &request,
+                    &settings,
+                    &source,
+                    None,
+                    tools,
+                    &plan,
+                    (24, 1),
+                    48,
+                    Some(locator),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+                recovery
+                    .with(|workspace| {
+                        assert!(workspace.manifest.launch_artifacts.is_empty());
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert!(root.exists());
+            }
+            assert!(!launch.exists());
+            assert_eq!(fs::read(source).unwrap(), b"source bytes");
+            assert_eq!(fs::read(neighbor).unwrap(), b"neighbor bytes");
+        }
+    }
+
+    #[test]
+    fn stale_launch_cleanup_refuses_unknown_scratch_and_linked_outputs() {
+        for mutation in ["unknown", "hardlink", "reparse", "wrong type"] {
+            let fixture = Fixture::new();
+            let (mut workspace, _intermediate) = fixture.workspace();
+            let launch = stage_receipted_launch(&mut workspace, &fixture);
+            let scene = launch.join("scene-prepass");
+            let source = &workspace.manifest.source.path;
+            let staged = launch.join("encoded.mkv");
+            match mutation {
+                "unknown" => {
+                    let slice = scene.join("slice-00");
+                    fs::create_dir_all(&slice).unwrap();
+                    fs::write(slice.join("foreign.txt"), b"foreign bytes").unwrap();
+                    fs::write(&staged, b"staged bytes").unwrap();
+                }
+                "hardlink" => fs::hard_link(source, &staged).unwrap(),
+                "reparse" => {
+                    let neighbor = fixture.0.join("neighbor");
+                    fs::create_dir(&neighbor).unwrap();
+                    fs::write(neighbor.join("source-info.vpy"), b"neighbor bytes").unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&neighbor, &scene).unwrap();
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        let result = std::process::Command::new("cmd.exe")
+                            .args(["/d", "/c", "mklink", "/J"])
+                            .arg(dunce::simplified(&scene))
+                            .arg(&neighbor)
+                            .creation_flags(0x08000000)
+                            .output()
+                            .unwrap();
+                        assert!(
+                            result.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                    }
+                }
+                "wrong type" => fs::create_dir(&staged).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_action_tree(&workspace.root, &workspace.manifest).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                remove_tree_checked(
+                    &launch,
+                    &workspace.manifest.launch_artifacts[0].identity,
+                    None,
+                    Some(RemovalAuthority::Launch(
+                        &workspace.manifest.launch_artifacts[0]
+                    )),
+                    false
+                )
+                .is_err(),
+                "{mutation}"
+            );
+            assert!(
+                remove_workspace_tree(&workspace.root, &workspace.manifest, None).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(
+                fs::read(launch.join("av1an.exe")).unwrap(),
+                b"verified selected engine"
+            );
+            assert_eq!(fs::read(source).unwrap(), b"source bytes");
+            if mutation == "unknown" {
+                assert_eq!(
+                    fs::read(scene.join("slice-00/foreign.txt")).unwrap(),
+                    b"foreign bytes"
+                );
+                assert_eq!(fs::read(&staged).unwrap(), b"staged bytes");
+            }
+            if mutation == "reparse" {
+                assert_eq!(
+                    fs::read(fixture.0.join("neighbor/source-info.vpy")).unwrap(),
+                    b"neighbor bytes"
+                );
+            }
+        }
     }
 
     #[test]

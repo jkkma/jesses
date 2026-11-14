@@ -26,6 +26,8 @@ mod platform;
 
 #[path = "supervisor/ansi.rs"]
 mod ansi;
+#[path = "supervisor/av1an_activity.rs"]
+mod av1an_activity;
 #[path = "supervisor/pause.rs"]
 mod pause;
 pub(crate) use pause::scoped_pause;
@@ -150,6 +152,8 @@ pub enum SupervisorError {
     Cancelled,
     #[error("The tool exceeded its time limit.")]
     Timeout,
+    #[error("The tool exceeded its inactivity limit without encoding progress or log updates.")]
+    InactivityTimeout,
     #[error("The tool produced more output than the capture limit allows.")]
     OutputLimit,
     #[error("The tool output could not be parsed: {0}")]
@@ -238,6 +242,64 @@ pub async fn run_with_environment(
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
+    run_with_deadline(
+        spec,
+        cancel,
+        events,
+        log_path,
+        RunDeadline::Runtime(time_limit),
+        environment,
+        pause,
+    )
+    .await
+}
+
+/// Run AV1AN with a pause-aware inactivity limit. Advancing frame counters or
+/// changes to either progress file restart the clock independently of UI events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_environment_until_inactive(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    inactivity_limit: Duration,
+    progress_paths: [&Path; 2],
+    environment: Option<&ChildEnvironment>,
+    pause: Option<&PauseControl>,
+) -> Result<ProcessResult, SupervisorError> {
+    run_with_deadline(
+        spec,
+        cancel,
+        events,
+        log_path,
+        RunDeadline::Inactivity {
+            limit: inactivity_limit,
+            progress_paths,
+        },
+        environment,
+        pause,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RunDeadline<'a> {
+    Runtime(Duration),
+    Inactivity {
+        limit: Duration,
+        progress_paths: [&'a Path; 2],
+    },
+}
+
+async fn run_with_deadline(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    events: mpsc::Sender<ProcessEvent>,
+    log_path: &Path,
+    deadline: RunDeadline<'_>,
+    environment: Option<&ChildEnvironment>,
+    pause: Option<&PauseControl>,
+) -> Result<ProcessResult, SupervisorError> {
     let profile = console::logged_profile(&[spec]);
     #[cfg(windows)]
     if console::av1an_terminal_enabled(profile) {
@@ -246,22 +308,14 @@ pub async fn run_with_environment(
             cancel,
             events,
             log_path,
-            time_limit,
+            deadline,
             environment,
             pause,
         )
         .await;
     }
     console::scope(profile, &[spec], cancel, |cancel| {
-        run_with_environment_inner(
-            spec,
-            cancel,
-            events,
-            log_path,
-            time_limit,
-            environment,
-            pause,
-        )
+        run_with_environment_inner(spec, cancel, events, log_path, deadline, environment, pause)
     })
     .await
 }
@@ -271,7 +325,7 @@ async fn run_with_environment_inner(
     cancel: watch::Receiver<bool>,
     events: mpsc::Sender<ProcessEvent>,
     log_path: &Path,
-    time_limit: Duration,
+    deadline: RunDeadline<'_>,
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
@@ -280,7 +334,7 @@ async fn run_with_environment_inner(
     }
     let log = Mutex::new(RotatingLog::open(log_path).await?);
     let child = platform::OwnedChild::spawn_with_environment(spec, environment)?;
-    run_logged_child(child, cancel, events, &log, time_limit, pause, None).await
+    run_logged_child(child, cancel, events, &log, deadline, pause, None).await
 }
 
 async fn run_logged_child(
@@ -288,21 +342,44 @@ async fn run_logged_child(
     cancel: watch::Receiver<bool>,
     events: mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
-    time_limit: Duration,
+    deadline: RunDeadline<'_>,
     pause: Option<&PauseControl>,
-    terminal: Option<&mut tokio::fs::File>,
+    terminal: Option<&mpsc::Sender<Vec<u8>>>,
 ) -> Result<ProcessResult, SupervisorError> {
     let pause = pause.cloned().or_else(pause::scoped_pause);
-    let attached = pause
+    let attached = match pause
         .as_ref()
         .map(|control| control.attach(&child))
-        .transpose()?;
+        .transpose()
+    {
+        Ok(attached) => attached,
+        Err(error) => {
+            child
+                .terminate_and_wait()
+                .await
+                .map_err(SupervisorError::Cleanup)?;
+            return Err(error.into());
+        }
+    };
     let (stdout, stderr) = child.take_output_pipes();
+    let activity = matches!(deadline, RunDeadline::Inactivity { .. }).then(|| watch::channel(()).0);
     let execution = async {
         let (_, _, status) = tokio::try_join!(
             async {
                 if let Some(stdout) = stdout {
-                    drain(stdout, false, &events, log).await?;
+                    drain_stage_every(
+                        stdout,
+                        false,
+                        None,
+                        &events,
+                        log,
+                        REDRAW_LOG_INTERVAL,
+                        DrainExtras {
+                            terminal: None,
+                            activity: activity.as_ref(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },
@@ -313,7 +390,10 @@ async fn run_logged_child(
                 &events,
                 log,
                 REDRAW_LOG_INTERVAL,
-                terminal
+                DrainExtras {
+                    terminal,
+                    activity: activity.as_ref()
+                },
             ),
             async {
                 child
@@ -327,7 +407,10 @@ async fn run_logged_child(
     let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(SupervisorError::Cancelled),
-        _ = async { if let Some(control)=pause.as_ref() { control.timeout(time_limit).await; } else { tokio::time::sleep(time_limit).await; } } => Err(SupervisorError::Timeout),
+        _ = logged_timeout(deadline, pause.as_ref(), activity.as_ref()) => Err(match deadline {
+            RunDeadline::Runtime(_) => SupervisorError::Timeout,
+            RunDeadline::Inactivity { .. } => SupervisorError::InactivityTimeout,
+        }),
         result = execution => result,
     };
     // Explicit cleanup also reaps the leader. The guard handles future abortion.
@@ -338,6 +421,72 @@ async fn run_logged_child(
     log.lock().await.flush().await?;
     drop(attached);
     result
+}
+
+async fn logged_timeout(
+    deadline: RunDeadline<'_>,
+    pause: Option<&PauseControl>,
+    activity: Option<&watch::Sender<()>>,
+) {
+    async fn active_timeout(limit: Duration, pause: Option<&PauseControl>) {
+        if let Some(control) = pause {
+            control.timeout(limit).await;
+        } else {
+            tokio::time::sleep(limit).await;
+        }
+    }
+
+    match deadline {
+        RunDeadline::Runtime(limit) => active_timeout(limit, pause).await,
+        RunDeadline::Inactivity {
+            limit,
+            progress_paths,
+        } => {
+            let activity = activity.expect("inactivity watchdog tracks progress");
+            let mut changes = activity.subscribe();
+            let deadline = async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = changes.changed() => {},
+                        _ = active_timeout(limit, pause) => break,
+                    }
+                }
+            };
+            tokio::select! {
+                _ = watch_progress_files(progress_paths, limit, activity) => {},
+                _ = deadline => {},
+            }
+        }
+    }
+}
+
+async fn watch_progress_files(paths: [&Path; 2], limit: Duration, activity: &watch::Sender<()>) {
+    async fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+        let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some((metadata.len(), metadata.modified().ok()?))
+    }
+
+    let (mut first, mut second) = tokio::join!(stamp(paths[0]), stamp(paths[1]));
+    let period = (limit / 4).clamp(Duration::from_millis(1), Duration::from_secs(5));
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        poll.tick().await;
+        let (next_first, next_second) = tokio::join!(stamp(paths[0]), stamp(paths[1]));
+        // Missing files or transient read errors are not progress. Remember
+        // the last successful observation so they cannot reset the watchdog.
+        let changed = (next_first.is_some() && next_first != first)
+            || (next_second.is_some() && next_second != second);
+        first = next_first.or(first);
+        second = next_second.or(second);
+        if changed {
+            activity.send_replace(());
+        }
+    }
 }
 
 /// Lossless, bounded capture for short machine-readable commands (e.g. FFprobe).
@@ -925,15 +1074,6 @@ async fn capture(
     }
 }
 
-async fn drain(
-    stream: impl AsyncRead + Unpin,
-    stderr: bool,
-    events: &mpsc::Sender<ProcessEvent>,
-    log: &Mutex<RotatingLog>,
-) -> Result<(), SupervisorError> {
-    drain_stage(stream, stderr, None, events, log).await
-}
-
 /// Progress meters (SVT-AV1, x264, FFmpeg stats) redraw one line with a bare
 /// carriage return several times a second. Every redraw still reaches the
 /// job's events, but the job log keeps at most one per interval plus the
@@ -955,9 +1095,15 @@ async fn drain_stage(
         events,
         log,
         REDRAW_LOG_INTERVAL,
-        None,
+        DrainExtras::default(),
     )
     .await
+}
+
+#[derive(Default)]
+struct DrainExtras<'a> {
+    terminal: Option<&'a mpsc::Sender<Vec<u8>>>,
+    activity: Option<&'a watch::Sender<()>>,
 }
 
 async fn drain_stage_every(
@@ -967,7 +1113,7 @@ async fn drain_stage_every(
     events: &mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
     interval: Duration,
-    mut terminal_output: Option<&mut tokio::fs::File>,
+    extras: DrainExtras<'_>,
 ) -> Result<(), SupervisorError> {
     let output = StageOutput {
         stderr,
@@ -980,12 +1126,20 @@ async fn drain_stage_every(
         logged: None,
         held: None,
     };
-    let mut buffer = [0; RECORD_BYTES];
+    let mut buffer = vec![0; RECORD_BYTES];
     let mut pending = Vec::with_capacity(RECORD_BYTES);
     // A record ended by '\r' is a redraw unless '\n' follows (a CRLF line).
     // Its event is sent at once; only the log waits for the next byte.
     let mut carriage: Option<(Vec<u8>, bool)> = None;
     let mut terminal = ansi::Filter::default();
+    let mut progress = av1an_activity::Progress::default();
+    let mut observe_progress = |record: &[u8]| {
+        if let Some(activity) = extras.activity
+            && progress.advances(record)
+        {
+            activity.send_replace(());
+        }
+    };
     loop {
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {
@@ -1001,6 +1155,11 @@ async fn drain_stage_every(
             }
             return Ok(());
         }
+        if let Some(terminal) = extras.terminal
+            && let Ok(slot) = terminal.try_reserve()
+        {
+            slot.send(buffer[..count].to_vec());
+        }
         console::emit(
             match stage {
                 Some("producer") => 2,
@@ -1009,20 +1168,8 @@ async fn drain_stage_every(
             },
             &buffer[..count],
         );
-        if let Some(terminal) = terminal_output.as_mut() {
-            terminal
-                .write_all(&buffer[..count])
-                .await
-                .map_err(|error| {
-                    if error.kind() == io::ErrorKind::BrokenPipe {
-                        SupervisorError::Cancelled
-                    } else {
-                        SupervisorError::Io(error)
-                    }
-                })?;
-        }
         for &raw in &buffer[..count] {
-            let byte = if terminal_output.is_some() {
+            let byte = if extras.terminal.is_some() {
                 terminal.push_console(raw)
             } else {
                 terminal.push(raw)
@@ -1038,6 +1185,7 @@ async fn drain_stage_every(
                     }
                     Some((_, true)) => {}
                     None if !pending.is_empty() => {
+                        observe_progress(&pending);
                         output.event(&pending);
                         redraws.release(Some(&pending), &output).await?;
                         output.log(&pending).await?;
@@ -1058,6 +1206,7 @@ async fn drain_stage_every(
                     pending.truncate(pending.trim_ascii_end().len());
                 }
                 if !pending.is_empty() {
+                    observe_progress(&pending);
                     let logged = redraws.due();
                     if !cursor_redraw || logged {
                         output.event(&pending);
@@ -1072,6 +1221,7 @@ async fn drain_stage_every(
             } else {
                 pending.push(byte);
                 if pending.len() == RECORD_BYTES {
+                    observe_progress(&pending);
                     output.event(&pending);
                     redraws.release(Some(&pending), &output).await?;
                     output.log(&pending).await?;

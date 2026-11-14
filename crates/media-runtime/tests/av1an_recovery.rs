@@ -376,7 +376,7 @@ async fn observe_packaged_process_tree(
         if let (Some(av1an), Some(svt)) = (named("av1an.exe"), named("SvtAv1EncApp.exe")) {
             for (process, expected) in [
                 (av1an, expected_hash("av1an")),
-                (svt, expected_hash("svt-av1")),
+                (svt, expected_hash("svt-av1-hdr")),
             ] {
                 let path = process
                     .process
@@ -439,6 +439,11 @@ async fn run_crash_child(root: &Path) {
     let destination = root.join("published.mkv");
     let mut encode = request(&input, &destination, VideoEncoder::SvtAv1);
     encode.settings.preset = 2;
+    encode.settings.av1an_options = Some(media_core::Av1anOptions {
+        scene_detection_slices: 2,
+        concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+        ..Default::default()
+    });
     let manager = JobManager::open(root.join("logs"), root.join("history")).await;
     manager.ready().await.unwrap();
     let submitted = manager.start_encode(encode).await.unwrap();
@@ -449,6 +454,13 @@ async fn run_crash_child(root: &Path) {
     })
     .await;
     assert!(!checkpoint.state.is_terminal(), "{checkpoint:#?}");
+    assert!(
+        checkpoint
+            .logs
+            .iter()
+            .any(|line| line.contains("Parallel scene prepass: 2 slices")),
+        "the crash must interrupt an encode using the prepass: {checkpoint:#?}"
+    );
     let workspace = PathBuf::from(&checkpoint.recovery.as_ref().unwrap().workspace);
     let attempts: Vec<_> = std::fs::read_dir(&workspace)
         .unwrap()
@@ -628,11 +640,36 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
         assert_eq!(directory.parent(), Some(workspace.as_path()));
         assert_eq!(image, directory.join("av1an.exe"));
         assert_eq!(launch["image"]["sha256"], baseline["tools"][3]["sha256"]);
+        assert!(!directory.join("scene-prepass").exists());
         assert_eq!(
             format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
             launch["image"]["sha256"].as_str().unwrap()
         );
     }
+    let scenes_path = workspace.join("chunks/scenes.json");
+    let scenes: Value = serde_json::from_slice(&std::fs::read(&scenes_path).unwrap()).unwrap();
+    assert!(
+        scenes["scenes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scene| scene["start_frame"] == CRASH_FRAMES / 2)
+    );
+    let cache = RetainedFile::read(workspace.join("chunks/split/cache.lwi"));
+    assert_eq!(
+        baseline["reader_cache"]["sha256"],
+        format!("{:x}", Sha256::digest(std::fs::read(&cache.path).unwrap()))
+    );
+    let stale_launch = PathBuf::from(launches[0]["path"].as_str().unwrap());
+    // Model the two older crash windows in the actual abruptly stopped launch.
+    let abandoned_scratch = stale_launch.join("scene-prepass");
+    std::fs::create_dir(&abandoned_scratch).unwrap();
+    std::fs::write(
+        abandoned_scratch.join("source-info.vpy"),
+        b"abandoned script",
+    )
+    .unwrap();
+    std::fs::write(stale_launch.join("encoded.mkv"), b"abandoned concat").unwrap();
     eprintln!(
         "sealed crash launch ownership: {}",
         baseline["launch_artifacts"]
@@ -661,6 +698,7 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
     for file in &retained {
         file.assert_unchanged();
     }
+    cache.assert_unchanged();
 
     std::fs::write(&manifest_path, &original_manifest).unwrap();
     manager.resume_job(id.clone()).await.unwrap();
@@ -676,6 +714,7 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
     assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
     assert!(finished.recovery.is_none());
     assert!(!workspace.exists());
+    assert!(!stale_launch.exists());
     assert!(
         !crashed_attempt.exists(),
         "the exact pre-crash owned mux attempt survived successful recovery"

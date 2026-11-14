@@ -402,7 +402,8 @@ impl JobManager {
             );
         recovery.version(recovery_version).await?;
         recovery.verify_segments(ffmpeg, input, cancel).await?;
-        let prepared_scenes = if recovery.resume_chunks {
+        let prepared_scenes = if recovery.resume_chunks || !scenes::supports_preload(&version_text)
+        {
             None
         } else {
             match scenes::prepare(
@@ -418,6 +419,7 @@ impl JobManager {
             .await
             {
                 Ok(prepared) => prepared,
+                Err(error) if error.code == "AV1AN_SCENE_CLEANUP_FAILED" => return Err(error),
                 Err(error) => {
                     check_cancel(cancel)?;
                     self.change(id, |snapshot| append_log(snapshot, format!("Parallel scene prepass was unavailable ({error}); av1an will detect scenes during encoding."))).await;
@@ -455,9 +457,11 @@ impl JobManager {
         let event_id = id.to_owned();
         let event_recovery = recovery.clone();
         let progress_path = work.join("chunks/done.json");
+        let event_progress_path = progress_path.clone();
         let frame_seconds = plan.frame_seconds();
-        let event_task = tokio::spawn(async move {
+        let observe_events = async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut previous = 0;
             loop {
                 tokio::select! {
@@ -475,7 +479,7 @@ impl JobManager {
                                 }
                             }).await;
                         }
-                        if let Some((frames, chunks)) = read_progress(&progress_path, frame_count).await
+                        if let Some((frames, chunks)) = read_progress(&event_progress_path, frame_count).await
                             && frames > previous {
                                 previous = frames;
                                 observer.change(&event_id, |snapshot| {
@@ -486,7 +490,7 @@ impl JobManager {
                     }
                 }
             }
-        });
+        };
         let pause = self
             .state
             .lock()
@@ -514,7 +518,13 @@ impl JobManager {
             source_filter.as_deref(),
         );
         if let Some(prepared) = &prepared_scenes {
-            args.extend(["--scenes".into(), prepared.path.as_os_str().to_owned()]);
+            // The packaged engine preserves the primed index in resume mode
+            // and starts a fresh queue when chunks.json and done.json are absent.
+            args.extend([
+                "--scenes".into(),
+                prepared.path.as_os_str().to_owned(),
+                "--resume".into(),
+            ]);
         }
         let native_command = CommandSpec {
             executable: launch.executable.clone(),
@@ -595,20 +605,33 @@ impl JobManager {
         let environment = shell
             .as_ref()
             .map_or(&launch.environment, |shell| &shell.environment);
+        if let Some(prepared) = &prepared_scenes {
+            prepared.verify()?;
+        }
+        let event_task = tokio::spawn(observe_events);
         let result = supervisor::with_console_profile(supervisor::ConsoleProfile::Av1an, || {
-            supervisor::run_with_environment(
+            supervisor::run_with_environment_until_inactive(
                 execution,
                 cancel.clone(),
                 sender,
                 log_path,
-                Duration::from_secs(24 * 60 * 60),
+                Duration::from_hours(6),
+                [&progress_path, &internal_log],
                 Some(environment),
                 Some(&pause),
             )
         })
         .await;
         let _ = event_task.await;
-        if result.as_ref().is_ok_and(|result| result.status.success()) {
+        drop(prepared_scenes);
+        if let Err(error @ SupervisorError::Cleanup(_)) = result {
+            // An unconfirmed process exit can still own the launch artifacts.
+            // Leave the durably registered attempt for recovery.
+            launch.retain_unsealed();
+            return Err(process_error(error, input));
+        }
+        let exited_successfully = result.as_ref().is_ok_and(|result| result.status.success());
+        if exited_successfully {
             self.phase_with_fresh_progress(
                 id,
                 JobState::Finalizing,
@@ -616,96 +639,68 @@ impl JobManager {
             )
             .await;
         }
-        recovery.seal_target_artifacts().await?;
-        let stage_cleanup = launch.cleanup();
-        // The image guard is released by cleanup; release the directory guard
-        // before Windows removes the exact now-empty launch directory below.
-        drop(launch);
-        drop(prepared_scenes);
-        // The process has exited, so seal its last complete receipts even when
-        // cancellation won. A crash before this point reuses only prior receipts.
-        // Keep the launch directory through this check: mkvmerge's options.json
-        // names its output there, including for an edited program.
-        let checkpoint = recovery
-            .checkpoint(!edited && result.as_ref().is_ok_and(|result| result.status.success()))
+        let outcome = async {
+            recovery.seal_target_artifacts().await?;
+            // Seal the last complete receipts even when cancellation won.
+            // The concat options still refer to the live launch directory.
+            let summary = recovery.checkpoint(!edited && exited_successfully).await?;
+            let reader_cache = recovery.reader_cache_path().await?;
+            self.change(id, move |snapshot| {
+                snapshot.recovery = Some(summary);
+                if let Some(path) = reader_cache {
+                    report_reader_cache(snapshot, &path);
+                }
+            })
             .await;
-        if edited {
-            if let Some(staged) = &staged_video
-                && staged.exists()
-            {
-                let mut owned = Temporary::durable(staged, true)?;
-                owned.cleanup()?;
+            let result = result.map_err(|error| process_error(error, input))?;
+            if !result.status.success() {
+                return Err(files::error(
+                    "AV1AN_FAILED",
+                    format!(
+                        "av1an failed ({}). See the job log for the failed chunk or missing dependency.",
+                        result.status
+                    ),
+                    input,
+                ));
             }
-            recovery.retire_launch(&launch_directory).await?;
-        }
-        match checkpoint {
-            Ok(summary) => {
-                let reader_cache = recovery.reader_cache_path().await?;
-                self.change(id, move |snapshot| {
-                    snapshot.recovery = Some(summary);
-                    if let Some(path) = reader_cache {
-                        report_reader_cache(snapshot, &path);
-                    }
-                })
-                .await
+            if let Some(shell) = &shell {
+                shell.verify()?;
+            } else if let Some(staged) = &staged_video {
+                check_cancel(cancel)?;
+                let guard = recovery.open_staged_video(&launch_directory).await?;
+                let destination = video.clone_file()?;
+                let cancel = cancel.clone();
+                tokio::task::spawn_blocking(move || copy_staged_video(guard, destination, &cancel))
+                    .await
+                    .map_err(|error| files::error("ENCODE_VALIDATION_FAILED", error.to_string(), staged))??;
             }
-            Err(error) => return Err(error),
+            Ok(())
         }
-        let result = result.map_err(|e| process_error(e, input))?;
-        if result.status.success()
-            && let Some(shell) = &shell
-        {
-            shell.verify()?;
+        .await;
+        let cleanup = async {
+            let staged_cleanup = if staged_video.is_some() {
+                recovery.remove_staged_video(&launch_directory).await
+            } else {
+                Ok(())
+            };
+            let image_cleanup = launch.cleanup();
+            // Windows requires the directory guard to be released before removal.
+            drop(launch);
+            staged_cleanup?;
+            image_cleanup?;
+            recovery.retire_launch(&launch_directory).await
         }
-        stage_cleanup?;
-        if !result.status.success() {
-            return Err(files::error(
-                "AV1AN_FAILED",
-                format!(
-                    "av1an failed ({}). See the job log for the failed chunk or missing dependency.",
-                    result.status
-                ),
-                input,
-            ));
+        .await;
+        if let Err(mut cleanup) = cleanup {
+            if let Err(error) = outcome {
+                cleanup.message = format!("{} {}", error.message, cleanup.message);
+            }
+            return Err(cleanup);
         }
+        outcome?;
         if edited {
             return Ok(true);
         }
-        if let Some(staged) = &staged_video {
-            let staged = staged.clone();
-            let mut destination = video.clone_file()?;
-            tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-                use std::io::{Seek, SeekFrom, Write};
-                let guard = Source::open(&staged)?;
-                let mut input = std::fs::File::open(&guard.path).map_err(|e| {
-                    files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
-                })?;
-                destination
-                    .set_len(0)
-                    .and_then(|_| destination.seek(SeekFrom::Start(0)).map(|_| ()))
-                    .map_err(|e| {
-                        files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
-                    })?;
-                std::io::copy(&mut input, &mut destination)
-                    .and_then(|_| destination.flush())
-                    .and_then(|_| destination.sync_all())
-                    .map_err(|e| {
-                        files::error("ENCODE_VALIDATION_FAILED", e.to_string(), &staged)
-                    })?;
-                guard.verify()?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| {
-                files::error(
-                    "ENCODE_VALIDATION_FAILED",
-                    e.to_string(),
-                    staged_video.as_ref().unwrap(),
-                )
-            })??;
-            let _ = tokio::fs::remove_file(staged_video.as_ref().unwrap()).await;
-        }
-        recovery.retire_launch(&launch_directory).await?;
         // Decoding the joined segments against the source only re-checks
         // av1an's result; the finished file's frame count is checked anyway.
         if super::encode::thorough_verification(settings) {
@@ -773,6 +768,59 @@ impl JobManager {
         }
         check_cancel(cancel)?;
         Ok(false)
+    }
+}
+
+fn copy_staged_video(
+    staged: Source,
+    mut destination: std::fs::File,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    use std::io::{Seek, SeekFrom};
+
+    let io_error = |error: std::io::Error| {
+        files::error("ENCODE_VALIDATION_FAILED", error.to_string(), &staged.path)
+    };
+    check_cancel(cancel)?;
+    destination.set_len(0).map_err(io_error)?;
+    destination.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let copied = copy_video_bytes(staged.file(), &mut destination, &staged.path, cancel)
+        .and_then(|()| destination.sync_all().map_err(io_error))
+        .and_then(|()| check_cancel(cancel))
+        .and_then(|()| staged.verify());
+    if let Err(mut error) = copied {
+        // No final-video receipt is sealed for this attempt. If truncation also
+        // fails, recovery will reset the destination before reusing the chunks.
+        if let Err(reset_error) = destination.set_len(0) {
+            error.message.push_str(&format!(
+                " Could not reset the partial AV1AN video: {reset_error}",
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn copy_video_bytes(
+    mut input: impl std::io::Read,
+    mut destination: impl std::io::Write,
+    staged: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    let io_error =
+        |error: std::io::Error| files::error("ENCODE_VALIDATION_FAILED", error.to_string(), staged);
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        check_cancel(cancel)?;
+        let count = match input.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(io_error)?,
+        };
+        check_cancel(cancel)?;
+        if count == 0 {
+            return Ok(());
+        }
+        destination.write_all(&buffer[..count]).map_err(io_error)?;
     }
 }
 
@@ -900,6 +948,40 @@ fn normalize_ivf(
 pub(super) mod tests {
     use super::*;
     use media_core::VideoEncoder;
+
+    #[test]
+    fn staged_video_copy_stops_after_cancellation() {
+        use std::io::{Cursor, Write};
+
+        struct CancelOnWrite(watch::Sender<bool>, Vec<u8>);
+
+        impl Write for CancelOnWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = self.1.write(bytes)?;
+                self.0.send_replace(true);
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (stop, cancel) = watch::channel(false);
+        let input = vec![0x42; 4 * 1024 * 1024];
+        let mut source = Cursor::new(&input);
+        let mut destination = CancelOnWrite(stop, Vec::new());
+        let error = copy_video_bytes(
+            &mut source,
+            &mut destination,
+            Path::new("encoded.mkv"),
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "JOB_CANCELED");
+        assert_eq!(source.position(), 1024 * 1024);
+        assert_eq!(destination.1, &input[..1024 * 1024]);
+    }
 
     thread_local! {
         pub(in crate::jobs) static CHUNK_PROOF_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

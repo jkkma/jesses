@@ -274,7 +274,10 @@ where
     let completed = match &result {
         Ok(outcome) => Some(outcome.console_exit()),
         Err(
-            SupervisorError::Cancelled | SupervisorError::Timeout | SupervisorError::Cleanup(_),
+            SupervisorError::Cancelled
+            | SupervisorError::Timeout
+            | SupervisorError::InactivityTimeout
+            | SupervisorError::Cleanup(_),
         ) => None,
         Err(error) => Some((1, format!("Supervisor error: {error}"))),
     };

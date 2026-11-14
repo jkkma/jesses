@@ -73,7 +73,7 @@ pwsh -NoProfile -File .\scripts\qualify-windows-console.ps1
 
 The script creates a fresh directory under
 `target\windows-console-qualification\<UTC timestamp>-<unique id>`. Expect
-`console-qualification.json` with **13 entries, all `passed: true`**, plus
+`console-qualification.json` with **15 entries, all `passed: true`**, plus
 `native-console-run.log`, `failed-console-diagnostics.txt` and the binary
 pipeline log. The JSON is emitted only after every assertion succeeds. A failed
 run retains its directory and command log for the Windows Codex session to fix

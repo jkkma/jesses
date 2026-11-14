@@ -314,6 +314,42 @@ fn fake_tool() {
             writer.join().unwrap();
             std::process::exit(0);
         }
+        "relay-flood" => {
+            let mut stderr = std::io::stderr().lock();
+            let payload = "x".repeat(1024);
+            for index in 0..512 {
+                writeln!(stderr, "{index:04} {payload}").unwrap();
+            }
+            stderr.flush().unwrap();
+            std::process::exit(0);
+        }
+        "watchdog-output" | "watchdog-stalled-output" | "watchdog-progress-file" => {
+            for frames in 1..=30 {
+                if mode != "watchdog-progress-file" {
+                    let mut stderr = std::io::stderr().lock();
+                    let position = if mode == "watchdog-output" { frames } else { 7 };
+                    // Vary the elapsed time, speed and ETA independently of
+                    // frame position. The real terminal also does this when idle.
+                    write!(stderr, "\x1b[1").unwrap();
+                    stderr.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                    write!(
+                        stderr,
+                        "m00:00:{frames:02}\x1b[0m [0/4 Chunks] ▐██░░▌ 5% {position}/"
+                    )
+                    .unwrap();
+                    stderr.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                    write!(stderr, "100 ({} fps, eta {frames}s)\r", 120 / frames).unwrap();
+                    stderr.flush().unwrap();
+                } else {
+                    let data = "x".repeat(frames);
+                    std::fs::write(path.join("done.json"), data).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
+        }
         "small" => {
             std::io::stdout()
                 .write_all(b"binary\0\xff\r\ncomplete")
@@ -621,6 +657,213 @@ async fn drains_binary_flood_with_blocked_event_consumer_and_rotates_logs() {
 }
 
 #[tokio::test]
+async fn unread_terminal_does_not_block_child_or_drop_logged_records() {
+    let viewer_fixture = Fixture::new("sleep");
+    let mut viewer = platform::OwnedChild::spawn_with_stdin(&viewer_fixture.spec()).unwrap();
+    let mut writer = viewer.take_stdin();
+    let child_fixture = Fixture::new("relay-flood");
+    let child = platform::OwnedChild::spawn_with_environment(&child_fixture.spec(), None).unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let (events, _blocked_consumer) = mpsc::channel(1);
+    let path = child_fixture.0.join("job.log");
+    let log = Mutex::new(RotatingLog::open(&path).await.unwrap());
+    let (terminal, mut reads) = mpsc::channel::<Vec<u8>>(16);
+    let relay = tokio::spawn(async move {
+        while let Some(bytes) = reads.recv().await {
+            writer.write_all(&bytes).await?;
+        }
+        writer.flush().await
+    });
+    let result = run_logged_child(
+        child,
+        cancel,
+        events,
+        &log,
+        RunDeadline::Runtime(Duration::from_secs(3)),
+        None,
+        Some(&terminal),
+    )
+    .await;
+    viewer.terminate_and_wait().await.unwrap();
+    assert_eq!(
+        relay.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(result.unwrap().status.success());
+    let records = std::fs::read_to_string(path).unwrap();
+    let payload = "x".repeat(1024);
+    assert_eq!(
+        records
+            .lines()
+            .filter(|line| line.ends_with(&payload))
+            .collect::<Vec<_>>(),
+        (0..512)
+            .map(|index| format!("[stderr] {index:04} {payload}"))
+            .collect::<Vec<_>>(),
+    );
+}
+
+const WATCHDOG_LIMIT: Duration = Duration::from_secs(1);
+
+fn start_watchdog(
+    fixture: &Fixture,
+    cancel: watch::Receiver<bool>,
+    pause: Option<PauseControl>,
+) -> tokio::task::JoinHandle<Result<ProcessResult, SupervisorError>> {
+    let spec = fixture.spec();
+    let work = fixture.0.clone();
+    tokio::spawn(async move {
+        let (events, _blocked_consumer) = mpsc::channel(1);
+        with_console_profile(ConsoleProfile::Hidden, || async {
+            run_with_environment_until_inactive(
+                &spec,
+                cancel,
+                events,
+                &work.join("job.log"),
+                WATCHDOG_LIMIT,
+                [&work.join("done.json"), &work.join("av1an.log")],
+                None,
+                pause.as_ref(),
+            )
+            .await
+        })
+        .await
+    })
+}
+
+#[tokio::test]
+async fn watchdog_allows_active_output_or_progress_files_past_the_limit() {
+    for mode in ["watchdog-output", "watchdog-progress-file"] {
+        let fixture = Fixture::new(mode);
+        let (_owner, cancel) = watch::channel(false);
+        let started = std::time::Instant::now();
+        let result = start_watchdog(&fixture, cancel, None).await.unwrap();
+        assert!(result.unwrap().status.success(), "watchdog fixture {mode}");
+        assert!(started.elapsed() > WATCHDOG_LIMIT);
+    }
+}
+
+#[tokio::test]
+async fn watchdog_times_out_despite_steady_redraws_without_frame_progress() {
+    let fixture = Fixture::new("watchdog-stalled-output");
+    let (_owner, cancel) = watch::channel(false);
+    let task = start_watchdog(&fixture, cancel, None);
+    let pid = fixture.pid(0).await;
+    let result = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
+    assert_dead(&[pid]).await;
+}
+
+#[tokio::test]
+async fn watchdog_parses_progress_across_split_ansi_and_conpty_redraws() {
+    use tokio::io::AsyncWriteExt;
+
+    let fixture = Fixture::new("watchdog-ansi");
+    let log = Mutex::new(RotatingLog::open(&fixture.0.join("job.log")).await.unwrap());
+    let (events, _blocked_consumer) = mpsc::channel(1);
+    let (terminal, _viewer) = mpsc::channel(1);
+    let (activity, mut updates) = watch::channel(());
+    // Capacity one forces each test write to survive across multiple reads.
+    let (mut source, stream) = tokio::io::duplex(1);
+    let input = async {
+        for (position, elapsed, advances) in [(7, 1, true), (7, 2, false), (8, 3, true)] {
+            let record = format!(
+                "\x1b[3;1H\x1b[1m00:00:{elapsed:02}\x1b[0m [1/4 Chunks] ▐██░░▌ 5% {position}/100 ({} fps, eta {elapsed}s)\x1b[2;1H",
+                120 / elapsed,
+            );
+            source.write_all(record.as_bytes()).await.unwrap();
+            if advances {
+                tokio::time::timeout(Duration::from_secs(1), updates.changed())
+                    .await
+                    .expect("advancing frame counter resets inactivity promptly")
+                    .unwrap();
+            } else {
+                // Send another completed cursor boundary so the end of the
+                // preceding write has definitely reached the record parser.
+                source.write_all(b"\x1b[3;1H").await.unwrap();
+                assert!(!updates.has_changed().unwrap());
+            }
+        }
+        drop(source);
+    };
+    let (_, result) = tokio::join!(
+        input,
+        drain_stage_every(
+            stream,
+            true,
+            None,
+            &events,
+            &log,
+            REDRAW_LOG_INTERVAL,
+            DrainExtras {
+                terminal: Some(&terminal),
+                activity: Some(&activity)
+            },
+        )
+    );
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn watchdog_ignores_stale_files_and_stops_silent_tree() {
+    let fixture = Fixture::new("tree");
+    std::fs::write(fixture.0.join("done.json"), "prior progress").unwrap();
+    std::fs::write(fixture.0.join("av1an.log"), "prior activity").unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let task = start_watchdog(&fixture, cancel, None);
+    let pids = [
+        fixture.pid(0).await,
+        fixture.pid(1).await,
+        fixture.pid(2).await,
+    ];
+    let result = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
+    assert_dead(&pids).await;
+}
+
+#[tokio::test]
+async fn watchdog_ignores_pauses_and_stops_if_silent_after_resume() {
+    let fixture = Fixture::new("sleep");
+    let (_owner, cancel) = watch::channel(false);
+    let pause = PauseControl::default();
+    let mut task = start_watchdog(&fixture, cancel, Some(pause.clone()));
+    let pid = fixture.pid(0).await;
+    pause.set_paused(true).unwrap();
+    let result = tokio::time::timeout(WATCHDOG_LIMIT + Duration::from_millis(250), &mut task).await;
+    assert!(result.is_err(), "idle clock ran during pause: {result:?}");
+    pause.set_paused(false).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
+    assert_dead(&[pid]).await;
+}
+
+#[tokio::test]
+async fn watchdog_still_accepts_cancellation_while_paused() {
+    let fixture = Fixture::new("sleep");
+    let (owner, cancel) = watch::channel(false);
+    let pause = PauseControl::default();
+    let task = start_watchdog(&fixture, cancel, Some(pause.clone()));
+    let pid = fixture.pid(0).await;
+    pause.set_paused(true).unwrap();
+    owner.send_replace(true);
+    let result = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::Cancelled)));
+    assert_dead(&[pid]).await;
+}
+
+#[tokio::test]
 async fn capture_preserves_binary_bytes_and_exit_codes() {
     let fixture = Fixture::new("small");
     let (_cancel, receiver) = watch::channel(false);
@@ -662,7 +905,7 @@ async fn records_cr_progress_and_flushes_partial_final_line() {
             .unwrap(),
     );
     let (sender, mut receiver) = mpsc::channel(10);
-    drain(&b"one\rtwo\r\nlast"[..], false, &sender, &log)
+    drain_stage(&b"one\rtwo\r\nlast"[..], false, None, &sender, &log)
         .await
         .unwrap();
     let mut records = Vec::new();
@@ -680,9 +923,17 @@ async fn staged_records(input: &[u8], interval: Duration) -> (Vec<String>, Vec<S
     let path = fixture.0.join("progress.log");
     let log = Mutex::new(RotatingLog::open(&path).await.unwrap());
     let (sender, mut receiver) = mpsc::channel(32);
-    drain_stage_every(input, true, Some("consumer"), &sender, &log, interval, None)
-        .await
-        .unwrap();
+    drain_stage_every(
+        input,
+        true,
+        Some("consumer"),
+        &sender,
+        &log,
+        interval,
+        DrainExtras::default(),
+    )
+    .await
+    .unwrap();
     log.lock().await.flush().await.unwrap();
     let mut events = Vec::new();
     while let Ok(ProcessEvent::Stderr(value)) = receiver.try_recv() {
@@ -734,8 +985,7 @@ async fn conpty_cursor_redraws_are_thinned_and_raw_terminal_output_is_preserved(
     .as_bytes();
     let fixture = Fixture::new("conpty-redraw");
     let log_path = fixture.0.join("progress.log");
-    let relay_path = fixture.0.join("terminal.bin");
-    let mut relay = tokio::fs::File::create(&relay_path).await.unwrap();
+    let (relay, mut reads) = mpsc::channel(1);
     let log = Mutex::new(RotatingLog::open(&log_path).await.unwrap());
     let (sender, _receiver) = mpsc::channel(16);
     drain_stage_every(
@@ -745,13 +995,15 @@ async fn conpty_cursor_redraws_are_thinned_and_raw_terminal_output_is_preserved(
         &sender,
         &log,
         Duration::from_secs(3600),
-        Some(&mut relay),
+        DrainExtras {
+            terminal: Some(&relay),
+            activity: None,
+        },
     )
     .await
     .unwrap();
     log.lock().await.flush().await.unwrap();
-    relay.flush().await.unwrap();
-    assert_eq!(std::fs::read(relay_path).unwrap(), input);
+    assert_eq!(reads.try_recv().unwrap(), input);
     let records = std::fs::read_to_string(log_path).unwrap();
     let lines = records.lines().collect::<Vec<_>>();
     assert_eq!(

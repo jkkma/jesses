@@ -3,12 +3,14 @@
 use super::*;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_PROCESSED_OUTPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleScreenBufferInfo, STD_HANDLE,
-    STD_INPUT_HANDLE, SetConsoleMode,
+    ATTACH_PARENT_PROCESS, AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_EXTENDED_FLAGS,
+    ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    GetConsoleMode, GetConsoleScreenBufferInfo, STD_HANDLE, STD_INPUT_HANDLE, SetConsoleMode,
 };
 
 pub(super) const FLAG: &str = "--jesses-av1an-terminal";
+const RELAY_READS: usize = 16;
+const VIEWER_GRACE: Duration = Duration::from_secs(8);
 const PRESENTER: &str = r#"
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -ne 7) { exit 2 }
@@ -23,18 +25,22 @@ exit $relay.ExitCode
 "#;
 
 struct Presenter {
-    input: Option<tokio::fs::File>,
+    terminal: mpsc::Sender<Vec<u8>>,
+    finished: watch::Sender<Option<ExitStatus>>,
     ready: tokio::fs::File,
     // Retain the redirected error reader until the viewer exits. Startup
     // failures still have a timeout even if a broken installation floods it.
     _stderr: tokio::fs::File,
     cancel: watch::Sender<bool>,
     done: watch::Receiver<Option<Result<(), String>>>,
+    relay_error: watch::Receiver<Option<(io::ErrorKind, String)>>,
 }
 
 impl Drop for Presenter {
     fn drop(&mut self) {
-        self.cancel.send_replace(true);
+        if self.finished.borrow().is_none() {
+            self.cancel.send_replace(true);
+        }
     }
 }
 
@@ -53,7 +59,12 @@ async fn powershell() -> Result<PathBuf, String> {
 }
 
 impl Presenter {
-    fn start(host: &Path, powershell: PathBuf, log: &Path) -> io::Result<Self> {
+    fn start(
+        host: &Path,
+        powershell: PathBuf,
+        log: &Path,
+        job_cancel: watch::Receiver<bool>,
+    ) -> io::Result<Self> {
         let mut registry = active()
             .lock()
             .map_err(|_| io::Error::other("Console registry was poisoned."))?;
@@ -90,19 +101,44 @@ impl Presenter {
             },
         )?;
         let (ready, stderr) = child.take_pipes();
-        let input = child.take_stdin();
+        let mut input = Some(child.take_stdin());
         let (cancel, canceled) = watch::channel(false);
+        let (terminal, mut reads) = mpsc::channel(RELAY_READS);
+        let (finished, finishing) = watch::channel(None);
         let (done_owner, done) = watch::channel(None);
+        let (relay_error_owner, relay_error) = watch::channel(None);
         let task = tokio::spawn(async move {
+            let mut deadline = finishing.clone();
+            let grace = async {
+                if deadline.wait_for(Option::is_some).await.is_ok() {
+                    tokio::time::sleep(VIEWER_GRACE).await;
+                }
+            };
             tokio::select! {
                 biased;
                 _ = cancelled(canceled) => {},
+                _ = cancelled(job_cancel) => {},
                 _ = child.wait_and_terminate_descendants() => {},
+                _ = grace => {},
+                result = relay_terminal(&mut input, &mut reads, finishing) => {
+                    relay_error_owner.send_replace(Some((result.kind(), result.to_string())));
+                }
             }
+            drop(reads);
             let result = child
                 .terminate_and_wait()
                 .await
                 .map_err(|error| error.to_string());
+            // tokio::fs uses blocking anonymous-pipe writes. Killing the
+            // viewer closes its read handles before we settle any such write.
+            if result.is_ok()
+                && let Some(mut input) = input
+            {
+                let _ = input.flush().await;
+            }
+            if let Err(error) = &result {
+                let _ = writeln!(io::stderr().lock(), "AV1AN console cleanup: {error}");
+            }
             done_owner.send_replace(Some(result));
         });
         registry.insert(
@@ -115,11 +151,13 @@ impl Presenter {
             },
         );
         Ok(Self {
-            input: Some(input),
+            terminal,
+            finished,
             ready,
             _stderr: stderr,
             cancel,
             done,
+            relay_error,
         })
     }
 
@@ -129,6 +167,9 @@ impl Presenter {
         tokio::io::BufReader::new((&mut self.ready).take(128))
             .read_line(&mut line)
             .await?;
+        if let Some(detail) = line.strip_prefix("ERROR ") {
+            return Err(io::Error::other(detail.trim_end().to_owned()));
+        }
         let mut values = line.split_whitespace();
         let size = || {
             io::Error::new(
@@ -170,8 +211,37 @@ impl Presenter {
 
     async fn stop(&mut self) -> Result<(), SupervisorError> {
         self.cancel.send_replace(true);
-        self.input.take();
         self.joined().await.map_err(SupervisorError::Cleanup)
+    }
+}
+
+async fn relay_terminal(
+    input: &mut Option<tokio::fs::File>,
+    reads: &mut mpsc::Receiver<Vec<u8>>,
+    finished: watch::Receiver<Option<ExitStatus>>,
+) -> io::Error {
+    let writer = input.as_mut().expect("PowerShell relay pipe");
+    let result = async {
+        while let Some(bytes) = reads.recv().await {
+            writer.write_all(&bytes).await?;
+        }
+        let status = *finished.borrow();
+        if let Some(status) = status {
+            writer
+                .write_all(format!("\r\nExit status: {status}\r\n").as_bytes())
+                .await?;
+        }
+        writer.flush().await
+    }
+    .await;
+    match result {
+        Err(error) => error,
+        Ok(()) => {
+            drop(input.take());
+            // EOF starts the viewer's review window. The registered owner
+            // continues waiting for its exit, cancellation, or grace limit.
+            std::future::pending().await
+        }
     }
 }
 
@@ -194,7 +264,7 @@ pub(in crate::supervisor) async fn run_av1an_terminal(
     cancel: watch::Receiver<bool>,
     events: mpsc::Sender<ProcessEvent>,
     log_path: &Path,
-    time_limit: Duration,
+    deadline: RunDeadline<'_>,
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
@@ -207,7 +277,7 @@ pub(in crate::supervisor) async fn run_av1an_terminal(
             cancel,
             events,
             log_path,
-            time_limit,
+            deadline,
             environment,
             pause,
         )
@@ -216,7 +286,7 @@ pub(in crate::supervisor) async fn run_av1an_terminal(
     let log = Mutex::new(RotatingLog::open(log_path).await?);
     let startup = async {
         let pwsh = powershell().await.map_err(io::Error::other)?;
-        Presenter::start(host, pwsh, log_path)
+        Presenter::start(host, pwsh, log_path, cancel.clone())
     };
     let presenter = tokio::select! {
         biased;
@@ -273,7 +343,7 @@ pub(in crate::supervisor) async fn run_av1an_terminal(
             match child {
                 Ok(child) => {
                     return run_with_presenter(
-                        child, presenter, cancel, events, &log, time_limit, pause,
+                        child, presenter, cancel, events, &log, deadline, pause,
                     )
                     .await;
                 }
@@ -286,16 +356,7 @@ pub(in crate::supervisor) async fn run_av1an_terminal(
     };
     notice(&log, &events, format!("AV1AN's PowerShell 7 console could not open: {failure} Encoding continues with the job log.")).await?;
     log.lock().await.flush().await?;
-    run_with_environment_inner(
-        spec,
-        cancel,
-        events,
-        log_path,
-        time_limit,
-        environment,
-        pause,
-    )
-    .await
+    run_with_environment_inner(spec, cancel, events, log_path, deadline, environment, pause).await
 }
 
 async fn run_with_presenter(
@@ -304,10 +365,9 @@ async fn run_with_presenter(
     cancel: watch::Receiver<bool>,
     events: mpsc::Sender<ProcessEvent>,
     log: &Mutex<RotatingLog>,
-    time_limit: Duration,
+    deadline: RunDeadline<'_>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
-    let mut input = presenter.input.take().expect("PowerShell relay pipe");
     let (owner, stop) = watch::channel(false);
     let result = {
         let running = run_logged_child(
@@ -315,38 +375,38 @@ async fn run_with_presenter(
             stop,
             events,
             log,
-            time_limit,
+            deadline,
             pause,
-            Some(&mut input),
+            Some(&presenter.terminal),
         );
         tokio::pin!(running);
         tokio::select! {
             biased;
-            _ = cancelled(cancel.clone()) => { owner.send_replace(true); running.await },
-            _ = presenter.joined() => { owner.send_replace(true); running.await },
+            _ = cancelled(cancel) => {
+                owner.send_replace(true);
+                running.await.and(Err(SupervisorError::Cancelled))
+            },
+            _ = presenter.terminal.closed() => {
+                owner.send_replace(true);
+                let result = running.await.and(Err(SupervisorError::Cancelled));
+                match presenter.relay_error.borrow().as_ref() {
+                    Some((kind, message))
+                        if *kind != io::ErrorKind::BrokenPipe
+                            && matches!(result, Err(SupervisorError::Cancelled)) =>
+                    {
+                        Err(io::Error::new(*kind, message.clone()).into())
+                    }
+                    _ => result,
+                }
+            },
             result = &mut running => result,
         }
     };
     if let Ok(output) = &result {
-        let message = format!("\r\nExit status: {}\r\n", output.status);
-        let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            input.write_all(message.as_bytes()).await?;
-            input.flush().await
-        })
-        .await;
-        drop(input);
-        tokio::select! {
-            biased;
-            _ = cancelled(cancel) => { presenter.stop().await?; return Err(SupervisorError::Cancelled); },
-            joined = tokio::time::timeout(Duration::from_secs(8), presenter.joined()) => {
-                match joined {
-                    Ok(result) => result.map_err(SupervisorError::Cleanup)?,
-                    Err(_) => presenter.stop().await?,
-                }
-            },
-        }
+        // Dropping the terminal sender closes the relay queue. The existing
+        // registry task owns the viewer and all post-exit relay work.
+        presenter.finished.send_replace(Some(output.status));
     } else {
-        drop(input);
         presenter.stop().await?;
     }
     result
@@ -395,6 +455,10 @@ pub(super) fn helper(mut args: impl Iterator<Item = OsString>) -> io::Result<i32
         }
     };
     let handle = console.as_raw_handle();
+    if let Err(error) = disable_quick_edit() {
+        writeln!(ready, "ERROR AV1AN console input: {error}")?;
+        return Err(error);
+    }
     let mut mode = 0;
     let mut geometry = CONSOLE_SCREEN_BUFFER_INFO::default();
     // SAFETY: the console handle and out parameters remain valid for these calls.
@@ -431,4 +495,30 @@ pub(super) fn helper(mut args: impl Iterator<Item = OsString>) -> io::Result<i32
     // Preserve the brief post-exit review window while the job is finalizing.
     std::thread::sleep(Duration::from_secs(5));
     Ok(0)
+}
+
+fn disable_quick_edit() -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Use OPEN_EXISTING on the console input buffer even when stdin is a pipe.
+    // Rust's default share flags also include DELETE, which console handles reject.
+    let input = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open("CONIN$")?;
+    let handle = input.as_raw_handle();
+    let mut mode = 0;
+    // SAFETY: handle and output parameter stay valid for the calls.
+    if unsafe {
+        GetConsoleMode(handle, &mut mode) == 0
+            || SetConsoleMode(
+                handle,
+                (mode | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE,
+            ) == 0
+    } {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

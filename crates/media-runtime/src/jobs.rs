@@ -215,7 +215,7 @@ fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
 fn process_error(error: SupervisorError, path: &Path) -> AppError {
     let code = match &error {
         SupervisorError::Cancelled => "JOB_CANCELED",
-        SupervisorError::Timeout => "JOB_TIMEOUT",
+        SupervisorError::Timeout | SupervisorError::InactivityTimeout => "JOB_TIMEOUT",
         SupervisorError::OutputLimit => "PROBE_OUTPUT_LIMIT",
         _ => "TOOL_FAILED",
     };

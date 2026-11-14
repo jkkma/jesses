@@ -988,6 +988,96 @@ async fn av1an_x264_stops_with_verified_chunks_and_resumes_original_request() {
     manager.shutdown().await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires packaged Windows AV1AN, FFmpeg, FFprobe, x264 and mkvmerge"]
+async fn mkvmerge_copy_failure_cleans_stage_and_resumes() {
+    use media_core::{CommandEditConfirmation, CommandEditRequest};
+
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let destination = fixture.0.join("output.mkv");
+    let neighbor = fixture.0.join("neighbor.mkv");
+    std::fs::write(&neighbor, b"neighbor file").unwrap();
+    synthesize(&input, "160x120", 48).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut encode = request(&input, &destination, 5);
+    encode.settings.encoder = media_core::VideoEncoder::X264;
+    encode.settings.av1an_options = Some(media_core::Av1anOptions {
+        chunk_method: media_core::Av1anChunkMethod::Select,
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 24,
+        ..Default::default()
+    });
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let review = manager
+        .prepare_command_edit(
+            CommandEditRequest::Encode {
+                request: Box::new(encode),
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    let job = review.job.unwrap();
+    let workspace = PathBuf::from(job.recovery.unwrap().workspace);
+    let durable_video = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(workspace.join("video.mkv"))
+        .unwrap();
+    // Windows denies writes through the job's separate file handle without
+    // affecting the supervised encoder, which writes only to encoded.mkv.
+    durable_video.try_lock().unwrap();
+    manager
+        .confirm_command_edit(
+            CommandEditConfirmation {
+                id: review.id,
+                arguments: review.arguments,
+            },
+            cancel,
+        )
+        .await
+        .unwrap();
+    let failed = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+    drop(durable_video);
+    assert_eq!(failed.state, JobState::Failed, "{failed:#?}");
+    assert_eq!(
+        failed.error.as_ref().unwrap().code,
+        "ENCODE_VALIDATION_FAILED",
+        "{failed:#?}"
+    );
+    assert_eq!(failed.recovery.as_ref().unwrap().completed_frames, 48);
+    assert!(!destination.exists());
+    for entry in std::fs::read_dir(&workspace).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("launch-") {
+            assert!(
+                std::fs::read_dir(entry.path()).unwrap().next().is_none(),
+                "The failed copy left staged output in {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    manager.resume_job(job.id.clone()).await.unwrap();
+    let finished = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    let inspected = probe(&destination).await;
+    assert!(
+        inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stream| { stream["codec_name"] == "h264" && stream["nb_read_frames"] == "48" })
+    );
+    assert!(!workspace.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"neighbor file");
+}
+
 #[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, x264, mkvmerge, VapourSynth and L-SMASH on PATH"]
 async fn av1an_x264_discard_removes_only_stopped_jobs_saved_workspace() {

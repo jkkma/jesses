@@ -89,8 +89,10 @@ tool, reopened and completed with full decode and source unchanged. Strict launc
 ownership records a directory reservation before preparation and seals exact
 image identity before execution; guarded cleanup rejects injection, replacement
 and reparses. The separate `N/launch-reservation-recovery-green.result.json`
-records 39/39 unit cases. Unsealed child-created concat or scene-prepass artifacts
-after a crash still fail closed; this does not claim every crash point recovers.
+records 39/39 unit cases. At that checkpoint, child-created concat and
+scene-prepass artifacts blocked recovery after a crash. The 1.2.6 recovery
+update validates and removes known stale artifacts from a recorded launch.
+Unknown entries, links and changed launch identities still block cleanup.
 Independent source review found no remaining actionable finding for its reviewed
 snapshot. The broader `N/workspace-tests-post-launch-ownership.result.json`
 records 479 passed, 0 failed, 328 ignored across 73 groups, before two new

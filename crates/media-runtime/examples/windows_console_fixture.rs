@@ -365,14 +365,40 @@ mod windows {
             "AV1AN needs terminal-backed stderr for individual chunk bars"
         );
         let start = Instant::now();
-        let output = task.await.unwrap().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("AV1AN's result should arrive while the console lingers")
+            .unwrap()
+            .unwrap();
         assert!(output.status.success());
-        assert!(start.elapsed() >= Duration::from_millis(4900));
-        assert!(start.elapsed() < Duration::from_secs(9));
+        let result_wait = start.elapsed();
+        assert!(result_wait < Duration::from_secs(2));
+        assert_eq!(snapshots()[0].0, title);
         let log = std::fs::read_to_string(log).unwrap();
         assert!(log.contains("PowerShell 7.") && log.contains(TEXT));
         no_orphans().await;
-        proof.push(serde_json::json!({"case":"separate AV1AN visible fixed5s tail","passed":true}));
+        proof.push(serde_json::json!({"case":"AV1AN finishes while its live console lingers","passed":true,"result_wait_ms":result_wait.as_millis()}));
+        let (_owner, cancel) = watch::channel(false);
+        let marker = root.join("av1an-close-active.ticks");
+        let task = tokio::spawn(run_av1an(
+            spec(&av1an, &marker, 10000, 0),
+            cancel,
+            root.join("av1an-close-active.log"),
+        ));
+        let (title, _) = visible().await;
+        wait_for(|| marker.exists()).await;
+        close(&title);
+        let result = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("closing the viewer should stop AV1AN")
+            .unwrap();
+        assert!(matches!(result, Err(SupervisorError::Cancelled)));
+        let bytes = std::fs::metadata(&marker).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(std::fs::metadata(&marker).unwrap().len(), bytes);
+        assert!(!marker.with_extension("finished").exists());
+        no_orphans().await;
+        proof.push(serde_json::json!({"case":"closing the live AV1AN console cancels its process","passed":true}));
         settings(ConsoleWindowMode::VisibleStayOpen, false);
         let (_owner, cancel) = watch::channel(false);
         let task = tokio::spawn(run_av1an(
@@ -446,23 +472,38 @@ mod windows {
         settings(ConsoleWindowMode::Hidden, true);
         let (owner, cancel) = watch::channel(false);
         let marker = root.join("av1an-tail-stop.ticks");
-        let task = tokio::spawn(run_av1an(
+        let result = run_av1an(
             spec(&av1an, &marker, 100, 0),
             cancel,
             root.join("av1an-tail-stop.log"),
-        ));
+        )
+        .await
+        .unwrap();
+        assert!(result.status.success());
         visible().await;
-        wait_for(|| marker.with_extension("finished").is_file()).await;
-        assert!(!task.is_finished());
         owner.send_replace(true);
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(SupervisorError::Cancelled)
-        ));
+        tokio::time::timeout(Duration::from_secs(2), no_orphans())
+            .await
+            .expect("Stop during finalization closes AV1AN's lingering viewer");
+        proof.push(serde_json::json!({"case":"Stop during AV1AN finalization closes lingering viewer","passed":true}));
+        let (_owner, cancel) = watch::channel(false);
+        let result = run_av1an(
+            spec(&av1an, &root.join("av1an-tail-shutdown.ticks"), 100, 0),
+            cancel,
+            root.join("av1an-tail-shutdown.log"),
+        )
+        .await
+        .unwrap();
+        assert!(result.status.success());
+        visible().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor::shutdown_console_presentations(),
+        )
+        .await
+        .expect("shutdown stops and joins AV1AN's lingering viewer");
         no_orphans().await;
-        proof.push(
-            serde_json::json!({"case":"Stop during AV1AN fixed tail closes helper","passed":true}),
-        );
+        proof.push(serde_json::json!({"case":"shutdown stops and joins AV1AN's lingering viewer","passed":true}));
         settings(ConsoleWindowMode::Visible, false);
         let (_owner_a, cancel_a) = watch::channel(false);
         let (_owner_b, cancel_b) = watch::channel(false);
