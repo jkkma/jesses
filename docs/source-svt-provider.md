@@ -2,10 +2,11 @@
 
 The source UI has one SVT choice. New canonical `svtAv1` requests use the qualified
 HDR provider for the host. Windows uses [SVT-AV1-HDR-PMod 2026-07-20](https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/tag/2026-07-20)
-from commit `e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe`. Linux uses the
+from commit `e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe`. Linux support is
+deferred. Its retained development recipe uses the
 [SVT-AV1-HDR 2026-09-01 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-09-01-0033340)
-from commit `00333404f455471aaa6ee2c927cac3c93efb76e3`. The Linux package retains
-its qualified HDR10+ and Dolby Vision integration. Version markers and binary
+from commit `00333404f455471aaa6ee2c927cac3c93efb76e3`, with HDR10+ and Dolby
+Vision integration. Version markers and binary
 hashes are in `scripts/svt-forks.json`, and source hashes are in
 `scripts/bundled-tool-sources.json`.
 
@@ -27,7 +28,7 @@ Manual static HDR, Dolby Vision RPU, HDR10+ JSON and managed grain-table resourc
 use the same guarded typed resource consumers as the compatible internal fork
 identities. Scalar arguments are checked against the resolved encoder's help;
 accepting the canonical identity does not authorize an unsupported mainline flag.
-Real Linux Quick/AV1AN gates verify every output frame, dynamic metadata resources,
+Historical Linux Quick/AV1AN gates verified every output frame, dynamic metadata resources,
 source-only `tx-bias`, `noise-adaptive-filtering`, `hbd-mds`, and the authored
 14-point grain table in AV1 bitstream headers.
 

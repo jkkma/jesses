@@ -1,8 +1,9 @@
 # SVT provider identities
 
 The source Quick Convert, AV1AN and batch UI exposes one SVT-AV1 choice. Canonical
-`svtAv1` resolves SVT-AV1-HDR-PMod on Windows and SVT-AV1-HDR on Linux. It
-supports the source's scalar and managed HDR/grain resource
+`svtAv1` resolves SVT-AV1-HDR-PMod on Windows. The Linux development recipe
+retains SVT-AV1-HDR while Linux support is deferred. Both providers support
+the source's scalar and managed HDR/grain resource
 rows without a visible build selector. Source CRF0 is literal zero and carries
 no invented lossless guarantee. See [source SVT qualification](source-svt-provider.md)
 for exact pins, commands, target defaults, recovery safeguards and platform limits.

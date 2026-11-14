@@ -1,10 +1,11 @@
 # Portable packages, Scoop and data locations
 
-The manual **Native desktop packages** workflow builds the Windows x64 portable
-ZIP used by Scoop and Linux x64 AppImage/DEB artifacts. The separate
-**macOS native checks and app archives** workflow builds native Apple Silicon and
-Intel development app archives; see [macOS packaging](macos.md). Workflows upload
-artifacts without publishing a release. Windows distribution does not use NSIS.
+The manual **Native Windows desktop package** workflow builds the Windows x64
+portable ZIP used by Scoop. Linux support and hosted packages are deferred.
+The separate **macOS native checks and app archives** workflow builds Apple
+Silicon and Intel development archives on manual dispatch. See [macOS packaging](macos.md).
+Workflows upload artifacts without publishing a release. Windows distribution
+does not use NSIS.
 
 For application-only patches, the manual **Windows release executable** workflow
 builds an MSVC release executable from the selected ref and records its source
@@ -15,9 +16,9 @@ Use `package-desktop.py collect --tool-resources` to assemble the new executable
 with those verified tools, then verify the new archive and generate its Scoop
 manifest. Retain the tool sources, licenses, and provenance alongside the binaries.
 
-The workflow includes pinned SVT-AV1 5fish and the qualified HDR provider for the
-host, with matching source archives and license and patent notices. Windows uses
-SVT-AV1-HDR-PMod. The 5fish and Linux HDR builds require an x86-64-v3 CPU.
+The workflow includes pinned SVT-AV1 5fish and SVT-AV1-HDR-PMod, with matching
+source archives and license and patent notices. The 5fish build requires an
+x86-64-v3 CPU.
 Each native packaging run checks their versions
 before bundling them. Binary and source downloads have pinned SHA-256 hashes.
 
@@ -66,10 +67,9 @@ automatic plugin directory. Jesses checks a real metric in an isolated process
 before enabling it for an image-metric job; a failed GPU probe keeps the CPU
 scorers selected. The runtime and its corresponding sources remain covered by
 the package manifest.
-Linux also has retained standalone x264/mainline SVT
-source recipes and native package checks, described in the Linux build
-document. Linux uses external av1an/VapourSynth where the private Windows
-frameserver bundle is unavailable; their actual capabilities are checked per job.
+The retained Linux development recipes include standalone x264 and mainline
+SVT. They use external av1an/VapourSynth where the private Windows frameserver
+bundle is unavailable, with capabilities checked per job.
 
 Windows x64 also includes `mkvmerge` for Matroska muxing, chunk timing and metadata
 transfer, with its pinned sources, dependency notices and verified delivery.
@@ -119,8 +119,8 @@ writable persisted data, and generated encode/decode cases. Its receipt distingu
 an existing restricted host from a freshly provisioned Windows image. Native GUI
 and Scoop lifecycle checks remain separate; see the bounded
 [Windows crash recovery qualification](../tests/fixtures/windows-crash-recovery-validation.md).
-The restored Linux and new macOS lanes require fresh native artifact and
-clean-environment qualification for their intended system libraries.
+Linux and macOS support are deferred. The build recipes and qualification
+records remain available for development.
 
 ## Storage
 
@@ -226,8 +226,8 @@ modify the upstream codec binary or source. Input pinning provides repeatable
 build inputs; byte-for-byte reproducibility across hosts remains a separate gate.
 
 The retained Linux recipes use `--target x86_64-unknown-linux-gnu --bundles
-appimage,deb` and the corresponding target directory. They are documented for
-the restored Linux packaging lane. Every packaging
+appimage,deb` and the corresponding target directory. These recipes are for
+local development while Linux support is deferred. Every packaging
 destination must be new: scripts do not overwrite existing artifacts. Windows
 collection only needs the built executable and verified tools; stale installer
 files in the build directory are ignored.

@@ -14,9 +14,9 @@ See [CPU encoder scope](docs/cpu-only-encoding.md).
 
 ## Getting started
 
-Jesses is a development project. Package workflows exist for Windows, Linux,
-and macOS, but their current artifacts and native behavior have not all been
-qualified. See [platform status](#platform-status) before relying on a package.
+Jesses releases currently target Windows x64. Linux and macOS support are
+deferred. See [platform status](#platform-status) for development and
+qualification details.
 To run the desktop app from a checkout, install:
 
 - Node.js 24 or newer and pnpm 11.19.0, as specified in `package.json`.
@@ -39,7 +39,7 @@ and permitted PATH fallbacks. Provider-specific rules also apply. See
 [packaging and tool discovery](docs/packaging.md),
 [SVT provider setup](docs/svt-forks.md), and
 [utility dependencies](docs/media-utilities.md#dependencies). The source-style
-SVT-AV1 choice resolves SVT-AV1-HDR-PMod on Windows and SVT-AV1-HDR on Linux.
+SVT-AV1 choice resolves SVT-AV1-HDR-PMod on Windows.
 Older jobs retain their saved encoder identifiers.
 
 `pnpm dev` starts a browser preview at `http://127.0.0.1:1420`. It does not
@@ -101,19 +101,14 @@ See [completion actions](docs/completion-actions.md).
 
 ## Platform status
 
-The latest bounded Linux validation included real-media/provider checks, a
-407-passing runtime library run with 32 opt-in tests ignored, and a 279-passing
-mocked-browser suite. These results have specific scope; they are not a full
-cross-platform acceptance claim. The [Linux validation record](docs/final-linux-validation.md)
-contains the checks and limits.
+Windows x64 runs the automated frontend and desktop checks and receives the
+portable ZIP and Scoop manifest. See the [Windows handoff](docs/windows-local-validation.md)
+and [packaging guide](docs/packaging.md) for native qualification scope.
 
-An MSVC target check established Windows compilation for the recorded revision,
-but native Windows desktop, console, media providers, HDR/Vulkan, recovery, and
-package execution still need qualification. Native macOS acceptance remains
-unrun. Package workflows upload development artifacts without publishing a
-release; clean-environment and platform-specific checks remain separate. See the
-[Windows handoff](docs/windows-local-validation.md),
-[macOS notes](docs/macos.md), and [packaging guide](docs/packaging.md).
+Linux support is deferred, including automated checks and hosted packages.
+The [Linux validation record](docs/final-linux-validation.md) documents the
+previous checks. macOS support is also deferred, with manual development
+builds described in the [macOS notes](docs/macos.md).
 
 ## Development
 
