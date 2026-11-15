@@ -38,9 +38,16 @@ test.beforeEach(async ({ page }) => {
           command === 'get_capabilities' &&
           localStorage.getItem('test-batch-capabilities') === 'yes'
         )
-          return ['ffmpeg', 'ffprobe', 'svt-av1', 'av1an', 'mkvmerge', 'x264', 'x265'].map(
-            (id) => ({ id, name: id, available: true, path: `/bin/${id}`, version: 'test' }),
-          );
+          return [
+            'ffmpeg',
+            'ffprobe',
+            'svt-av1',
+            'svt-av1-hdr',
+            'av1an',
+            'mkvmerge',
+            'x264',
+            'x265',
+          ].map((id) => ({ id, name: id, available: true, path: `/bin/${id}`, version: 'test' }));
         if (
           command === 'get_capabilities' ||
           command === 'list_jobs' ||
@@ -1588,7 +1595,7 @@ test('Quick Convert encodes the managed sequence while output remains beside its
     )
     .toMatchObject({
       inputPath: 'C:\\private\\sequence.mkv',
-      outputPath: 'C:\\media\\frames.01.mkv',
+      outputPath: 'C:\\media\\frames.01.mp4',
     });
 });
 
@@ -1650,7 +1657,7 @@ test('batch naming example uses the full dotted sequence folder name and an empt
   await expect(page.getByRole('option', { name: /frames\.01/ })).toBeVisible();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByLabel('Output Names').fill('{name}-{ext}');
-  await expect(page.getByText('e.g. frames.01 → frames.01-.mkv')).toBeVisible();
+  await expect(page.getByText('e.g. frames.01 → frames.01-.webm')).toBeVisible();
 });
 
 for (const reusedCache of [false, true]) {

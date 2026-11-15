@@ -26,7 +26,7 @@ test('encoding log highlights syntax and diagnostics while preserving literal to
   const lines = [
     'Command: ffmpeg -i "C:\\Videos\\sample <one>.mkv" -vf scale=1280:720 | x264 --crf 20 --preset slow',
     '[consumer] x264 [info]: profile High, level 4.0',
-    '[consumer] 120 frames: 60.00 fps, 3500.00 kb/s',
+    '[consumer] encoded 120 frames, 60.00 fps, 3500.00 kb/s',
     '[producer] Warning: timestamp adjusted.',
     '[consumer] x264 [error]: cannot open output.',
     'Verified output published. The source was preserved.',
@@ -41,10 +41,10 @@ test('encoding log highlights syntax and diagnostics while preserving literal to
   const log = page.getByRole('log', { name: 'Job log', exact: true });
   await expect(log.getByText('--crf', { exact: true })).toBeVisible();
   const baseColor = await log.evaluate((el) => getComputedStyle(el).color);
-  for (const tone of ['warning', 'error', 'success', 'progress']) {
+  for (const tone of ['warning', 'error', 'success']) {
     const line = log.locator(`[data-tone="${tone}"]`);
-    await expect(line).toHaveCount(1);
-    expect(await line.evaluate((el) => getComputedStyle(el).color)).not.toBe(baseColor);
+    await expect(line).toHaveCount(tone === 'success' ? 2 : 1);
+    expect(await line.first().evaluate((el) => getComputedStyle(el).color)).not.toBe(baseColor);
   }
   expect(await log.textContent()).toMatch(
     new RegExp(lines.map((line) => line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\n') + '$'),
@@ -59,6 +59,60 @@ test('encoding log highlights syntax and diagnostics while preserving literal to
   await expect(log.locator('[data-tone="warning"]')).toHaveCount(2);
   await page.setViewportSize({ width: 900, height: 700 });
   await page.screenshot({ path: testInfo.outputPath('highlighted-log.png') });
+});
+
+test('monitor shows Patman progress in the footer and keeps log messages', async ({ page }) => {
+  const warning = '[consumer] Svt[warn]: Encoding: 2400 Frames reports estimated size.';
+  const error = '[producer] Error: Encoding frame 5 has an invalid timestamp.';
+  const summary = '[consumer] Total Encoding Time: 42471 ms';
+  const muxSummary = '[producer] frame= 2589 fps=0.0 q=-1.0 Lsize=98210kB time=00:01:47.87';
+  const command = 'Command: SvtAv1EncApp --tune 0';
+  const progress = (frames: number) =>
+    `Encoding: ${frames}/70369 Frames @ 60.97 fps | 6204.94 kb/s | Size: 98.21 MB [2669.45 MB] | Time: 0:00:42 [-0:18:32]`;
+  await page.addInitScript(
+    (entry) => sessionStorage.setItem('test-initial-jobs', JSON.stringify([entry])),
+    {
+      ...job,
+      encodeSettings: { ...job.encodeSettings, encoder: 'svtAv1Hdr' },
+      logs: [
+        command,
+        ...Array.from({ length: 75 }, (_, i) => `[consumer] ${progress(2440 + i)}`),
+        warning,
+        ...Array.from({ length: 75 }, (_, i) => progress(2515 + i)),
+        error,
+        summary,
+        muxSummary,
+      ],
+      encoderProgress: {
+        frames: 2589,
+        totalFrames: 70369,
+        percent: (2589 / 70369) * 100,
+        fps: 60.97,
+        bitrateKbps: 6204.94,
+        sizeBytes: 98_210_000,
+        estimatedSizeBytes: 2_669_450_000,
+        elapsedSeconds: 42,
+        etaSeconds: 1112,
+      },
+    },
+  );
+  await installSourceEncodeFixture(page);
+  await page.goto('/?window=quick-convert');
+
+  const stats = page.getByLabel('Encoder statistics');
+  await expect(stats).toContainText('2589/70369 frames · 60.97 fps');
+  await expect(stats).toContainText('18:32 left');
+  await expect(page.getByRole('progressbar', { name: 'Encode progress' })).toHaveAttribute(
+    'value',
+    '2589',
+  );
+  const log = page.getByRole('log', { name: 'Job log', exact: true });
+  await expect(log).toContainText(command);
+  await expect(log).toContainText(warning);
+  await expect(log).toContainText(error);
+  await expect(log).toContainText(summary);
+  await expect(log).toContainText(muxSummary);
+  await expect(log).not.toContainText(' Frames @ ');
 });
 
 test('Quick Convert opens a monitor once when encoding begins, with manual reopening', async ({

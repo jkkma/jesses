@@ -340,6 +340,249 @@ async fn av1an_preserves_frame_rate_color_audio_and_immutable_request() {
 
 #[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, av1an, x264, VapourSynth and L-SMASH on PATH"]
+async fn av1an_aac_mp4_checks_the_audio_prefix_before_encoding() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("source.mkv");
+    let gapped = fixture.0.join("gapped.mkv");
+    let destination = fixture.0.join("encoded.mp4");
+    synthesize(&input, "128x96", 96).await;
+    let original = std::fs::read(&input).unwrap();
+    let gap = output(
+        command("ffmpeg")
+            .await
+            .args(["-v", "error", "-n", "-i"])
+            .arg(&input)
+            .args([
+                "-c:v",
+                "copy",
+                "-c:a",
+                "pcm_s16le",
+                "-af",
+                r"aselect=not(between(t\,2\,2.25))",
+            ])
+            .arg(&gapped),
+    )
+    .await;
+    assert!(
+        gap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gap.stderr)
+    );
+
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let aac_request = |source: &Path, destination: &Path, thorough| {
+        let mut request = request(source, destination, 5);
+        request.settings.encoder = media_core::VideoEncoder::X264;
+        request.settings.audio = vec![media_core::AudioTrackSettings {
+            stream_index: 1,
+            codec: media_core::AudioCodec::Aac,
+            bitrate_kbps: 96,
+            channels: media_core::AudioChannels::Preserve,
+            gain: None,
+            normalization: None,
+        }];
+        request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+            keyframe_interval_seconds: 10,
+            mp4_faststart: true,
+            full_output_verification: thorough,
+        });
+        request
+    };
+    let rejected = fixture.0.join("rejected.mp4");
+    let submitted = manager
+        .start_encode(aac_request(&gapped, &rejected, true))
+        .await
+        .unwrap();
+    let thorough = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(thorough.state, JobState::Failed, "{thorough:#?}");
+    assert_eq!(
+        thorough.error.as_ref().unwrap().code,
+        "AUDIO_TIMELINE_INVALID"
+    );
+    assert!(
+        thorough
+            .logs
+            .iter()
+            .any(|line| line.contains("complete sample timeline"))
+    );
+    assert!(!rejected.exists());
+
+    let submitted = manager
+        .start_encode(aac_request(&input, &destination, false))
+        .await
+        .unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert!(
+        finished
+            .logs
+            .iter()
+            .any(|line| line.contains("first second of audio")),
+        "{:#?}",
+        finished.logs
+    );
+    assert!(
+        !finished
+            .logs
+            .iter()
+            .any(|line| line.contains("complete sample timeline"))
+    );
+    assert!(
+        finished
+            .logs
+            .iter()
+            .any(|line| line == "Output check: readable video and 2 planned streams.")
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+
+    let encoded = probe(&destination).await;
+    let streams = encoded["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams[0]["codec_name"], "aac");
+    assert_eq!(streams[0]["tags"]["language"], "jpn");
+    assert_eq!(streams[1]["codec_name"], "h264");
+    assert_eq!(streams[1]["nb_read_frames"], "96");
+    let bounds = |data: &Value| {
+        let parse = |name: &str| data[name].as_str().unwrap().parse::<f64>().unwrap();
+        (parse("start_time"), parse("duration"))
+    };
+    let (audio_start, audio_duration) = bounds(&streams[0]);
+    let (_, video_duration) = bounds(&streams[1]);
+    assert!(audio_start.abs() < 0.002, "{streams:#?}");
+    assert!(
+        (audio_duration - video_duration).abs() < 0.024,
+        "{streams:#?}"
+    );
+
+    let frames = output(
+        command("ffprobe")
+            .await
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-read_intervals",
+                "%+#5",
+                "-of",
+                "json",
+            ])
+            .arg(&destination),
+    )
+    .await;
+    assert!(frames.status.success());
+    let frames: Value = serde_json::from_slice(&frames.stdout).unwrap();
+    let first_sample: f64 = frames["frames"][0]["best_effort_timestamp_time"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(first_sample.abs() < 0.002, "{frames:#?}");
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, SVT-AV1-HDR, mkvmerge, VapourSynth and L-SMASH"]
+async fn av1an_retimes_a_near_constant_av1_source_without_rendering_ffv1() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("av1-vfr.mp4");
+    let destination = fixture.0.join("encoded.webm");
+    let generated = output(
+        command("ffmpeg").await.args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=30:duration=4",
+            "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=4",
+            "-vf", r"settb=1/240,setpts=8*N+3*mod(N\,2),setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+            "-pix_fmt", "yuv420p", "-chroma_sample_location", "left",
+            "-c:v", "libaom-av1", "-cpu-used", "8", "-lag-in-frames", "0",
+            "-enc_time_base", "1/240", "-fps_mode", "passthrough", "-video_track_timescale", "24000",
+            "-c:a", "aac",
+        ]).arg(&input),
+    ).await;
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let source = probe(&input).await;
+    assert_eq!(source["streams"][0]["r_frame_rate"], "240/1", "{source:#?}");
+    assert_eq!(
+        source["streams"][0]["avg_frame_rate"], "3200/107",
+        "{source:#?}"
+    );
+    assert_eq!(source["streams"][0]["nb_read_frames"], "120");
+    let original = std::fs::read(&input).unwrap();
+
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let mut settings = request(&input, &destination, 4);
+    settings.source.stream_indices = vec![0, 1];
+    settings.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+    settings.settings.crf = 35;
+    settings.settings.hdr_tune = media_core::HdrTune::VisualQuality;
+    settings.settings.audio = vec![media_core::AudioTrackSettings {
+        stream_index: 1,
+        codec: media_core::AudioCodec::Opus,
+        bitrate_kbps: 128,
+        channels: media_core::AudioChannels::Stereo,
+        gain: None,
+        normalization: None,
+    }];
+    settings.settings.temporal = Some(media_core::TemporalSettings {
+        resize_filter: media_core::ResizeFilter::Bicubic,
+        ..Default::default()
+    });
+    settings.settings.av1an_options = Some(media_core::Av1anOptions {
+        source_workflow: true,
+        split_method: media_core::Av1anSplitMethod::FixedChunks,
+        concat_method: media_core::Av1anConcatMethod::Mkvmerge,
+        pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p10le),
+        ..Default::default()
+    });
+    let start = std::time::Instant::now();
+    let submitted = manager.start_encode(settings).await.unwrap();
+    let running = wait_for(&manager, &submitted.id, |job| {
+        job.state == JobState::Running
+    })
+    .await;
+    eprintln!("AV1AN start: {:.3} seconds", start.elapsed().as_secs_f64());
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    manager.shutdown().await;
+    assert_eq!(running.state, JobState::Running, "{running:#?}");
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert!(
+        finished
+            .logs
+            .iter()
+            .any(|line| line.contains("Prepared the compressed source clock for 120 AV1 frames")),
+        "{finished:#?}"
+    );
+    assert!(
+        !finished
+            .logs
+            .iter()
+            .any(|line| line.contains("Preparing a lossless canonical source"))
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+
+    let result = probe(&destination).await;
+    assert_eq!(result["streams"][0]["codec_name"], "av1");
+    assert_eq!(result["streams"][0]["pix_fmt"], "yuv420p10le");
+    assert_eq!(result["streams"][0]["nb_read_frames"], "120");
+    assert_eq!(result["streams"][1]["codec_name"], "opus");
+    let span = |document: &Value| {
+        document["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+    };
+    assert!((span(&result) - span(&source)).abs() < 0.034, "{result:#?}");
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe, av1an, x264, VapourSynth and L-SMASH on PATH"]
 async fn av1an_lsmash_encodes_only_the_presented_mp4_edit_frames() {
     let fixture = Fixture::new();
     let full = fixture.0.join("full.mp4");
@@ -1412,13 +1655,7 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
             assert!(
                 job.logs
                     .iter()
-                    .any(|line| line.starts_with("Final container check: 48 video frames"))
-            );
-            assert!(
-                !job.logs
-                    .iter()
-                    .any(|line| line.starts_with("Output check:")),
-                "the temporary staging file does not need its own frame count"
+                    .any(|line| line == "Output check: readable video and 2 planned streams.")
             );
         }
     }

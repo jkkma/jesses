@@ -167,33 +167,18 @@ test('a single encode in preparation shows the live job step, not a blank bar', 
     .getByLabel('Output Path', { exact: true })
     .fill('/media/held');
   await page.evaluate(() => {
-    (globalThis as any).__holdResolution = new Promise(() => {});
+    const host = globalThis as any;
+    host.__holdPrepareReply = new Promise((resolve) => (host.__releasePrepareReply = resolve));
   });
   await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
   const status = page.getByLabel('Current action');
   const bar = page.getByLabel('Task progress');
-  await expect(status).toHaveText('Running: Encode...');
+  await expect(status).toContainText('Preparing encode');
   await expect(bar).not.toHaveAttribute('value');
   await page.evaluate(() => {
     const host = globalThis as any;
-    host.__testJobs = [
-      {
-        id: 'prepared',
-        state: 'preparing',
-        request: {
-          inputPath: '/media/input.mkv',
-          outputPath: '/media/held.mkv',
-          streamIndices: [0],
-        },
-        encodeSettings: { backend: 'standalone' },
-        progressSeconds: null,
-        durationSeconds: null,
-        logs: ['Planning source frames from every packet timestamp and the first decoded frames.'],
-        error: null,
-        recovery: null,
-        logPath: null,
-      },
-      ...host.__testJobs,
+    host.__testJobs[0].logs = [
+      'Planning source frames from every packet timestamp and the first decoded frames.',
     ];
     host.__emitJobs();
   });
@@ -201,6 +186,7 @@ test('a single encode in preparation shows the live job step, not a blank bar', 
     'Preparing encode: Planning source frames from every packet timestamp and the first decoded frames.',
   );
   await expect(bar).not.toHaveAttribute('value');
+  await page.evaluate(() => (globalThis as any).__releasePrepareReply());
 });
 
 test('finalizing updates stay visible through pause and continue without encoding estimates', async ({

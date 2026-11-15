@@ -24,6 +24,7 @@ test('one source Burn In selector retains selected stream identity across workfl
   await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), media);
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*Second/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByRole('tab', { name: 'Subtitles' }).click();

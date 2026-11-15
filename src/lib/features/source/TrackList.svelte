@@ -1,6 +1,10 @@
 <script lang="ts">
   import type { MediaFile, MediaStream } from '$lib/ipc/generated';
-  import type { FileListMode, TrackSelection } from '$lib/source-workspace';
+  import {
+    firstTrackSelection,
+    type FileListMode,
+    type TrackSelection,
+  } from '$lib/source-workspace';
   import SourceThumbnail from './SourceThumbnail.svelte';
   import { preferences } from '$lib/preferences.svelte';
   import { formatBytes, formatDuration, formatFrameRate } from '$lib/components/shared/format';
@@ -212,6 +216,10 @@
     onchange(next);
   }
   function selectAll(option: string) {
+    if (option === 'first') {
+      updateChecked(firstTrackSelection(tracks, (row) => stream(row)?.kind));
+      return;
+    }
     const seen = new Set<string>();
     updateChecked(
       tracks.map((row) => {

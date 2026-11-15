@@ -1,0 +1,11 @@
+# Removing redundant encode preparation and finalization passes
+
+Default Quick Convert and AV1AN preparation runs the probes and transforms needed to feed the selected encoder and muxer. Synthetic codec fixtures belong to thorough verification. Keep encoder identity and early checks for settings that require specific tools. Default publication requires successful tool exits, a readable output, and the planned streams in its headers. Operations whose mux decisions depend on packet timing or subtitle cue presence still read that evidence. Thorough verification keeps its staging and final media checks.
+
+Read source timing, apply necessary corrections, and start the encoder from the prepared pipeline. Ordinary final validation checks output existence and readable media information. External reference-source research is retained with the local verification evidence.
+
+Default untrimmed conversions of a primary audio track to MP4/MOV AAC need the decoded start to detect a known priming issue. Limit that read to the first second, as Quick Convert already does. Keep the complete audio timeline for thorough verification and converted external audio. Keep the trim timeline and its existing look-ahead. The earliest allowed audio start, source identity checks, temporary ownership and publication rules apply throughout.
+
+When a source needs a constant-rate intermediate, prefer its valid average presentation rate and use the nominal rate as a fallback. FFprobe's nominal rate can describe the timestamp grid and multiply the number of encoded frames. AV1AN splits independent frame ranges and currently needs the normalized clock before splitting.
+
+An untrimmed, zero-origin recording with a single, unrotated SDR AV1 stream in MP4 or MOV can be remuxed when its ordered, clean sample timestamps are each less than one output frame from the constant-rate grid. Verify the copy emits the expected number of video samples. Use the lossless transform when the compressed clock cannot be prepared within those bounds. Limit ordinary source preparation to the required transform, bounded color inspection and stream headers, plus fingerprints when recovery is available. Thorough verification also checks decoded metadata, transformed pixels and copied payloads.

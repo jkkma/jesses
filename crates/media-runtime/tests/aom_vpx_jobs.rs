@@ -63,6 +63,11 @@ async fn aom_10bit_left_chroma_raw_input_preserves_four_lossless_frames() {
                 encoder: VideoEncoder::AomAv1,
                 preset: 8,
                 lossless: true,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                    full_output_verification: true,
+                }),
                 ..Default::default()
             },
         })

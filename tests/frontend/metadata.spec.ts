@@ -64,8 +64,11 @@ test('Track List describes source streams and metadata edits retain their indice
   await expect(tracks.getByRole('option', { name: /Subtitles \(PGS\).*Japanese/ })).toBeVisible();
   await expect(tracks.getByRole('option', { name: /vendor_subtitle/ })).toBeVisible();
   await expect(tracks.getByRole('option', { name: /captions-font.ttf/ })).toBeVisible();
+  await tracks.getByRole('checkbox', { name: /Include .*vendor_subtitle/ }).check();
+  await tracks.getByRole('checkbox', { name: /Include .*captions-font.ttf/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container', { exact: true }).selectOption('matroska');
   await quick.getByRole('tab', { name: 'Metadata' }).click();
   await quick.getByLabel('Title for track 2').fill('Director commentary');
   await quick.getByLabel('Language for track 2').fill('fra');

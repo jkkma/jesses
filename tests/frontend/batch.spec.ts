@@ -499,7 +499,7 @@ test('an entirely nonvideo batch runs without the selected video encoder or pict
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
-  await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1');
+  await quick.getByLabel('Codec', { exact: true }).selectOption('svtAv1');
   await quick.getByLabel('Crop').selectOption('automatic');
   await expect(page.getByRole('button', { name: 'Run Batch: Encode' })).toBeEnabled();
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
@@ -1247,8 +1247,8 @@ test('AV1AN batch carries source grain synthesis only for compatible encoders', 
       .map((c: any) => [c.payload.request.settings.encoder, c.payload.request.settings.filmGrain]),
   );
   expect(grain).toEqual([
-    ['svtAv1', 12],
-    ['svtAv1', 12],
+    ['svtAv1Hdr', 12],
+    ['svtAv1Hdr', 12],
     ['x264', 0],
     ['x264', 0],
   ]);

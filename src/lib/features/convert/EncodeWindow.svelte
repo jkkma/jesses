@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { canKeepProgress, canResumeJob, terminalJob } from '$lib/components/shared/job-state';
   import { errorMessage, fileName, formatBytes } from '$lib/components/shared/format';
-  import { liveJobProgress } from '$lib/components/shared/job-progress';
+  import { isEncoderProgressLine, liveJobProgress } from '$lib/components/shared/job-progress';
   import {
     ProgressEstimator,
     type ProgressEstimate,
@@ -67,7 +67,7 @@
           `Output: ${current.request.outputPath}`,
           current.encodeSettings ? encodeSummary(current.encodeSettings) : '',
           '',
-          ...current.logs,
+          ...current.logs.filter((line) => !isEncoderProgressLine(line)),
         ].join('\n')
       : 'Waiting for a Quick Convert job…',
   );

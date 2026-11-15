@@ -40,6 +40,11 @@ async fn lossless_ultrafast_preserves_pixels_when_the_video_start_header_is_abse
                 encoder: VideoEncoder::X264,
                 preset: 0,
                 lossless: true,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                    full_output_verification: true,
+                }),
                 ..Default::default()
             },
         })

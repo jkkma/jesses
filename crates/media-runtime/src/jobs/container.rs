@@ -31,11 +31,11 @@ pub(super) struct Cadence<'a> {
     /// Thorough verification: re-check every converted track and decode the
     /// encoded video of the final file again whenever its copy is not proven
     /// identical to the verified staging video. Off, the final file is checked
-    /// only by its streams and its video frame count.
+    /// by its stream headers before publication.
     pub full_verification: bool,
     pub basic_video_check: Option<super::output_counts::VideoCheck>,
-    /// Original stream plan when a default AV1AN count is deferred to the
-    /// rewritten container. The staging header cannot define expectations.
+    /// Original stream plan for a default encode. The staging header cannot
+    /// define expectations.
     pub expected_kinds: Option<&'a [&'a str]>,
 }
 
@@ -935,8 +935,8 @@ pub(super) async fn prepare<'a>(
     super::check_cancel(cancel)?;
     let ffmpeg = super::discover("ffmpeg", cancel).await?;
     let ffprobe = super::discover("ffprobe", cancel).await?;
-    // Only an encode passes a cadence. Without thorough verification its final
-    // file is checked like its staging file: by streams and video frame count.
+    // Only an encode passes a cadence. Default encodes check the final stream
+    // headers at publication, for both direct and repacked output.
     let full_verification = cadence.is_none_or(|clock| clock.full_verification);
     if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
         if receipt.format != container || format(&input.path)? != container || timecode.is_some() {
@@ -946,8 +946,7 @@ pub(super) async fn prepare<'a>(
         }
         receipt.verify(input, cancel).await?;
         if !full_verification {
-            // The sealed file is the staging file, whose counts the encode
-            // already checked.
+            // The sealed staging file will be checked at publication.
             super::check_cancel(cancel)?;
             return Ok(None);
         }
@@ -972,8 +971,7 @@ pub(super) async fn prepare<'a>(
         return Ok(None);
     }
     let mut document = if let Some(kinds) = cadence.and_then(|clock| clock.expected_kinds) {
-        // Count video once after rewriting the file. Before the rewrite only
-        // subtitle compatibility can require counts from the staging file.
+        // Subtitle compatibility can require cue counts from the staging file.
         let headers = if kinds.contains(&"subtitle") {
             super::probe(&ffprobe, &input.path, cancel, None).await?
         } else {
@@ -1045,28 +1043,7 @@ pub(super) async fn prepare<'a>(
         )));
     }
     artifact.flush_nonempty_async().await?;
-    if let Some(clock) = cadence.filter(|_| !full_verification) {
-        let mut kinds: Vec<&str> = clock.expected_kinds.map_or_else(
-            || {
-                document
-                    .streams
-                    .iter()
-                    .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
-                    .collect()
-            },
-            <[&str]>::to_vec,
-        );
-        kinds.extend(timecode.map(|_| "data"));
-        super::output_counts::verify(
-            &ffprobe,
-            &artifact.path,
-            &kinds,
-            clock.index as usize,
-            clock.frames,
-            clock.basic_video_check,
-            cancel,
-        )
-        .await?;
+    if !full_verification {
         input.flush_nonempty_async().await?;
         super::check_cancel(cancel)?;
         return Ok(Some(artifact));

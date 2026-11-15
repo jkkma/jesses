@@ -1987,38 +1987,53 @@ impl JobManager {
             .and_then(|entry| entry.snapshot.encode_settings.as_ref())
             .and_then(|settings| settings.encoding_preferences)
             .is_some_and(|preferences| preferences.mp4_faststart);
+        let timecode = external.and_then(external_tracks::ExternalTracks::timecode);
         let converted = encode::boxed(|| {
             container::prepare(
-                temporary,
-                output,
-                id,
-                cancel,
-                cadence,
-                external.and_then(external_tracks::ExternalTracks::timecode),
-                faststart,
-                scratch,
+                temporary, output, id, cancel, cadence, timecode, faststart, scratch,
             )
         })
         .await?;
-        if converted.is_some()
-            && let Some(clock) = cadence.filter(|clock| !clock.full_verification)
-        {
+        let repacked = converted.is_some();
+        let temporary = converted.unwrap_or(temporary);
+        if let Some(clock) = cadence.filter(|clock| !clock.full_verification) {
+            let ffprobe = discover("ffprobe", cancel).await?;
+            let mut kinds = clock
+                .expected_kinds
+                .expect("default encode stream plan")
+                .to_vec();
+            if repacked && timecode.is_some() {
+                kinds.push("data");
+            }
+            let declared = output_counts::verify(
+                &ffprobe,
+                &temporary.path,
+                &kinds,
+                clock.index as usize,
+                clock.frames,
+                clock.basic_video_check,
+                cancel,
+            )
+            .await?;
             self.change(id, |snapshot| {
                 append_log(
                     snapshot,
                     format!(
-                        "Final container check: {} video frames and every planned stream.",
-                        clock.frames
+                        "Output check: readable video and {} planned {}.",
+                        kinds.len(),
+                        if kinds.len() == 1 { "stream" } else { "streams" },
                     ),
-                )
+                );
+                if let Some(declared) = declared.filter(|count| *count != clock.frames) {
+                    append_log(snapshot, format!(
+                        "Warning: the container declares {declared} video frames; encoding prepared {}. Turn on Thorough verification to check the actual frames.",
+                        clock.frames,
+                    ));
+                }
             })
             .await;
         }
-        let converted_alpha = converted.is_some();
-        let temporary = converted.unwrap_or(temporary);
-        if converted_alpha
-            && let Some((plan, ffmpeg, video_position, frame_count, lossless)) = alpha
-        {
+        if repacked && let Some((plan, ffmpeg, video_position, frame_count, lossless)) = alpha {
             let ffprobe = discover("ffprobe", cancel).await?;
             let document = probe(&ffprobe, &temporary.path, cancel, None).await?;
             let video = document.streams.get(video_position).ok_or_else(|| {

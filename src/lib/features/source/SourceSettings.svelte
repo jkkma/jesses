@@ -168,7 +168,7 @@
   >
   <label
     class="check"
-    title="Off: Quick Convert starts from source headers when possible and counts frames during encoding. The finished output's frame and stream counts are checked. Trims, frame-specific metadata and resumed jobs can require extra preparation. An interrupted job restarts, except AV1AN can resume saved chunks. On: codec tests, source and tool fingerprints, and complete frame and track comparisons are also performed."
+    title="Off: The finished output is checked for readable video and the planned streams. Trims, frame-specific metadata and resumed jobs can require extra preparation. An interrupted job restarts, except AV1AN can resume saved chunks. On: codec tests, source and tool fingerprints, and complete frame and track comparisons are also performed."
     ><input
       type="checkbox"
       checked={saved.fullOutputVerification ?? false}

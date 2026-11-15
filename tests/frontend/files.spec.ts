@@ -56,6 +56,7 @@ test('copy conversion keeps colliding stream indices source-scoped and preserves
   await page.getByRole('option', { name: /commentary.mka/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
+  await tracks.getByRole('checkbox', { name: /Include .*External commentary/ }).check();
   await tracks
     .getByRole('listbox', { name: 'Tracks' })
     .getByRole('option', { name: /External commentary/ })

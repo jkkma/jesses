@@ -79,6 +79,7 @@ test('per-track audio settings retain separate source identities with colliding 
   await page.getByRole('option', { name: /input.mkv/ }).click();
   await page.getByRole('option', { name: /voice.mka/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*External voice/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByRole('tab', { name: 'Audio' }).click();
@@ -146,6 +147,7 @@ test('AV1AN preserves a selected external audio track and applies the source aud
   await page.getByRole('option', { name: /input.mkv/ }).click();
   await page.getByRole('option', { name: /voice.mka/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*External voice/ }).check();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
   await av.getByRole('tab', { name: 'Audio & Tracks' }).click();

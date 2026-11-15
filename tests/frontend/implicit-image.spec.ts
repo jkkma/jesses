@@ -26,6 +26,7 @@ test('implicit image request freezes all inputs, checked tracks and source nonvi
   await page.getByRole('option', { name: /voice.mka/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('checkbox', { name: /Include .*Video/ }).uncheck();
+  await page.getByRole('checkbox', { name: /Include .*External voice/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Codec', { exact: true }).selectOption('png');
@@ -258,8 +259,10 @@ test('implicit image preserves attachment metadata input and surfaces native fai
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('checkbox', { name: /Include .*Video/ }).uncheck();
+  await page.getByRole('checkbox', { name: /Include .*Attachment/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container', { exact: true }).selectOption('matroska');
   await quick.getByLabel('Codec', { exact: true }).selectOption('gif');
   await quick.getByRole('tab', { name: 'Audio' }).click();
   await quick.getByLabel('Codec', { exact: true }).selectOption('strip');

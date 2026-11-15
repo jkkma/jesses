@@ -153,7 +153,7 @@ export function encoderOptions(encoder: VideoEncoder) {
       name: 'SVT-AV1-HDR',
       tool: 'svt-av1-hdr',
       defaultPreset: 2,
-      defaultHdrTune: 'filmGrain' as HdrTune,
+      defaultHdrTune: 'visualQuality' as HdrTune,
       suffix: '_av1_hdr.mkv',
       av1anSuffix: '_av1an_hdr.mkv',
     };

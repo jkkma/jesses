@@ -69,6 +69,7 @@ test('selected tracks with colliding indices retain independent metadata, order 
   await tracks.getByRole('button', { name: 'Move track up' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container', { exact: true }).selectOption('matroska');
   await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
   await quick.getByRole('tab', { name: 'Audio' }).click();
   await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
@@ -184,6 +185,7 @@ test('copy maps multiple checked primary and external video tracks in source ord
   await page.getByRole('option', { name: /picture.mkv/ }).click();
   await page.getByRole('option', { name: /external.mkv/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*Alternate picture/ }).check();
   await page.getByRole('checkbox', { name: /Include .*External picture/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
@@ -356,6 +358,8 @@ test('MOV maps checked external data and drops an incompatible attachment before
   await page.getByRole('option', { name: /first.mkv/ }).click();
   await page.getByRole('option', { name: /data.mov/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('checkbox', { name: /Include .*Data/ }).check();
+  await page.getByRole('checkbox', { name: /Include .*Attachment/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Codec', { exact: true }).selectOption('copy');

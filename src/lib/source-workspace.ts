@@ -12,6 +12,20 @@ export type TrackSelection = {
   forcedFlag: boolean | null;
 };
 
+/** Apply the Track List's first video, audio and subtitle selection rule. */
+export function firstTrackSelection(
+  rows: TrackSelection[],
+  kindOf: (row: TrackSelection) => string | undefined,
+  seen = new Set<string>(),
+): TrackSelection[] {
+  return rows.map((row) => {
+    const kind = kindOf(row) ?? '';
+    const included = ['video', 'audio', 'subtitle'].includes(kind) && !seen.has(kind);
+    seen.add(kind);
+    return { ...row, included };
+  });
+}
+
 /** Active tabs register the source-style global Run action with the shell. */
 export type WorkspaceAction = {
   run: (options?: { editCommand?: boolean; isShiftHeld?: () => boolean }) => Promise<void>;
@@ -28,6 +42,8 @@ export type WorkspaceAction = {
   canRun: boolean;
   /** Why Run is unavailable, shown beside the Run button as an error. */
   blockedReason?: string;
+  /** Open the setting responsible for the visible blocker, when available. */
+  openBlockedSetting?: () => void;
   label: string;
 };
 

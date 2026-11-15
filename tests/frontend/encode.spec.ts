@@ -228,6 +228,10 @@ for (const [workflow, missing] of [
     await page.getByRole('button', { name: workflow, exact: true }).click();
     const region = page.getByRole('region', { name: workflow, exact: true });
     if (missing === 'x264') await region.getByLabel('Codec', { exact: true }).selectOption('x264');
+    if (missing === 'svt-av1')
+      await region
+        .getByLabel(workflow === 'AV1AN' ? 'Encoder' : 'Codec', { exact: true })
+        .selectOption('svtAv1');
     await expect(
       page.getByRole('button', {
         name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
@@ -415,3 +419,63 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
     await expect(region.getByText('Old preparation failed')).toHaveCount(0);
   });
 }
+
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} explains invalid quality and returns to the video settings`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    await region.getByLabel('Quality', { exact: true }).fill('999');
+    await region
+      .getByRole('tab', { name: workflow === 'AV1AN' ? 'Audio & Tracks' : 'Audio' })
+      .click();
+    const reason = page.getByRole('button', { name: /CRF/ });
+    await expect(reason).toBeVisible();
+    await reason.click();
+    await expect(region.getByRole('tab', { name: 'Video', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await region.getByLabel('Quality', { exact: true }).fill('20');
+    await expect(
+      page.getByRole('button', {
+        name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
+        exact: true,
+      }),
+    ).toBeEnabled();
+  });
+
+  test(`${workflow} explains an empty output path`, async ({ page }) => {
+    await installSourceEncodeFixture(page);
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    await region.getByLabel('Output Path', { exact: true }).fill('');
+    await expect(
+      page.getByText('Choose an output path to continue.', { exact: true }),
+    ).toBeVisible();
+    await region.getByLabel('Output Path', { exact: true }).fill('/media/output');
+    await expect(
+      page.getByRole('button', {
+        name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
+        exact: true,
+      }),
+    ).toBeEnabled();
+  });
+}
+
+test('a missing required encoder is named beside Run', async ({ page }) => {
+  await page.addInitScript(() => {
+    (globalThis as any).__unavailableTools = ['svt-av1-hdr'];
+  });
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  await expect(page.getByText(/Missing required tool.*svt-av1-hdr/i)).toBeVisible();
+});

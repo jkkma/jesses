@@ -198,8 +198,8 @@ export type ToolInfo = { id: string, name: string, available: boolean, path: str
 
 export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean,
 /**
- * Thorough verification. Off (default), an encode checks the finished
- * file's frame and stream counts. AV1AN can resume saved chunks and still
+ * Thorough verification. Off (default), an encode checks that the finished
+ * file has readable video and the planned streams. AV1AN can resume saved chunks and still
  * checks timing or retained chunks where needed. On, the source and tools
  * are fingerprinted for resume, every output frame is decoded and every
  * track is re-checked.

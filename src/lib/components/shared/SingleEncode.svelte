@@ -274,7 +274,7 @@
   });
   let videoIndex = $state<number | undefined>();
   let videoMode = $state<'encode' | 'copy' | 'drop'>('encode');
-  let selectedEncoder = $state<VideoEncoder>('svtAv1');
+  let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
   // The two SVT builds listed in the codec menu share AV1 ranges and a 10-bit default.
   const listedSvt = (value: string) => value === 'svtAv1' || value === 'svtAv1Hdr';
   const hdrEncoderName = $derived(
@@ -354,7 +354,7 @@
     untrack(() => backend) === 'av1an' ? [...initialAv1anPreferences.filters] : [],
   );
   let outputPixelFormat = $state<Av1anPixelFormat | undefined>('yuv420p10le');
-  let crf = $state<number | undefined>(30);
+  let crf = $state<number | undefined>(untrack(() => backend) === 'av1an' ? 35 : 20);
   let preset = $state(4);
   let lastPreferenceSaveProblem = '';
   function reportPreferenceSave(problem?: string) {
@@ -367,7 +367,7 @@
   let hdr10Fallback = $state(false);
   let lineartPsyBias = $state<number | undefined>(0);
   let texturePsyBias = $state<number | undefined>(0);
-  let hdrTune = $state<HdrTune>('filmGrain');
+  let hdrTune = $state<HdrTune>('visualQuality');
   let included = $state<number[]>([]);
   let externalTracks = $state<ExternalTrackChoice[]>([]);
   let trackOverrides = $state<EncodeTrackOverride[]>([]);
@@ -704,7 +704,7 @@
   let deinterlaceChoice = $state<'automatic' | 'disabled' | 'qtgmc' | 'bwdif' | 'yadif'>(
     untrack(() => backend) === 'av1an' ? 'automatic' : 'qtgmc',
   );
-  let deinterlaceDouble = $state(true);
+  let deinterlaceDouble = $state(false);
   let subtitleMode = $state<SubtitleTrackSettings['mode']>('copy');
   let burnIndex = $state('');
   const activeBurn = $derived(videoMode === 'encode' && backend === 'standalone' ? burnIndex : '');
@@ -789,13 +789,16 @@
     };
   }
 
-  let outputContainer = $state<ContainerFormat>('matroska');
-  let videoChoice = $state('svtAv1');
+  let outputContainer = $state<ContainerFormat>(
+    untrack(() => backend) === 'av1an' ? 'webm' : 'mp4',
+  );
+  let videoChoice = $state('svtAv1Hdr');
   let imageQuality = $state(128);
   let imagePixel = $state<import('$lib/ipc/generated').ImagePixelFormat>('rgb24');
   let imageAbort: AbortController | undefined,
     imageProgress = $state(0),
     imageProgressDescription = $state(''),
+    singlePreparing = $state(false),
     batchEncodeRun = $state(false),
     batchCurrentJobId = $state<string | null>(null),
     batchPendingSource = $state<{
@@ -1117,7 +1120,10 @@
       extension: outputContainer === 'matroska' ? 'mkv' : outputContainer,
     };
     const progress = imageProgress,
-      progressDescription = batchEncodeRun || imageMode ? imageProgressDescription : undefined,
+      progressDescription =
+        batchEncodeRun || imageMode || (singlePreparing && !liveBatchJob)
+          ? imageProgressDescription
+          : undefined,
       paused = liveBatchJob ? liveBatchJob.state === 'paused' : imageIsPaused;
     const pause =
       liveBatchJob && ['preparing', 'running', 'paused', 'finalizing'].includes(liveBatchJob.state)
@@ -1132,16 +1138,22 @@
       reset: resetSourceSettings,
       canRun: enabled,
       blockedReason: enabled ? undefined : (runBlockedReason ?? undefined),
+      openBlockedSetting:
+        !enabled && runBlockedReason === videoSettingsIssue && videoSettingsIssue
+          ? () => (settingsTab = 'video')
+          : undefined,
       batchNaming: naming,
       label: `${mode === 'batch' ? 'Run Batch' : 'Run'}: ${av1anMode ? 'AV1AN encode' : 'Encode'}`,
       active: inFlight,
       progress,
       progressDescription,
-      progressJobId: inFlight && batchEncodeRun ? (liveBatchJob?.id ?? null) : undefined,
+      progressJobId:
+        inFlight && (batchEncodeRun || singlePreparing) ? (liveBatchJob?.id ?? null) : undefined,
       paused,
       pause,
       stop: () => {
         if (imageReviewId) imagePausePending = true;
+        if (singlePreparing && !liveBatchJob) imageProgressDescription = 'Stopping preparation…';
         imageAbort?.abort();
       },
     };
@@ -1418,7 +1430,7 @@
     if (flags.deinterlace) {
       temporal = { ...temporal, deinterlace: 'off', qtgmcPreset: 'verySlow' };
       deinterlaceChoice = chunked ? 'automatic' : 'qtgmc';
-      deinterlaceDouble = true;
+      deinterlaceDouble = false;
     }
     if (flags.toneMap) toneMap = defaultToneMap();
     if (flags.customFilters) av1anFilters = [];
@@ -1524,8 +1536,8 @@
         ...base,
         crfMin: 0,
         crfMax: 63,
-        defaultCrf: chunked ? 35 : 30,
-        defaultPreset: encoder === 'svtAv1' ? 4 : base.defaultPreset,
+        defaultCrf: chunked ? 35 : encoder === 'svtAv1Hdr' ? 20 : 30,
+        defaultPreset: 4,
         presets: numbers(12),
       };
     if (encoder === 'aomAv1')
@@ -1894,16 +1906,6 @@
       ? 'This selected external track type cannot be included by the encoder.'
       : null;
   });
-  // Track-selection and container problems are decided on other tabs, so the
-  // shell repeats them beside Run instead of leaving a silently disabled button.
-  const runBlockedReason = $derived(
-    sourceTrackIssue ??
-      containerIssue ??
-      (encodingVideo ? subtitleIssue : null) ??
-      (chunked && fileMode === 'batch' && files.length > 0 && !av1anBatchSource
-        ? 'AV1AN requires at least one movie video stream in the batch.'
-        : null),
-  );
   const noVideoForRun = $derived(
     !chunked &&
       fileMode === 'mux' &&
@@ -1954,6 +1956,45 @@
               : batchVideo(stream),
           ),
         )),
+  );
+  const missingRunTools = $derived.by(() => {
+    const basicOnly = noVideoForRun || batchWithoutVideo || (!chunked && fileMode === 'batch');
+    const required =
+      basicOnly || !encodingVideo
+        ? ['ffmpeg', 'ffprobe']
+        : requiredEncoderTools(backend, encoder, av1an.concatMethod, true);
+    if (
+      !basicOnly &&
+      encodingVideo &&
+      encoder === 'aomAv1' &&
+      preservableHdr10(selectedVideo) &&
+      !toneMap.enabled
+    )
+      required.push('mkvmerge');
+    return [...new Set(required)].filter(
+      (id) => !tools.some((tool) => tool.id === id && tool.available),
+    );
+  });
+  // Track-selection and container problems are decided on other tabs, so the
+  // shell repeats them beside Run instead of leaving a silently disabled button.
+  const runBlockedReason = $derived(
+    (!desktop ? 'Open jesses in the desktop app to encode.' : null) ??
+      (!usableSource ? 'Choose an encoding source to continue.' : null) ??
+      (!connected ? 'Waiting for the job service to connect.' : null) ??
+      (suggestionPending ? 'Preparing the suggested output path…' : null) ??
+      (!destination.trim() ? 'Choose an output path to continue.' : null) ??
+      (!isImage && !noVideoForRun && !batchWithoutVideo && encodingVideo
+        ? videoSettingsIssue
+        : null) ??
+      (!isImage && missingRunTools.length
+        ? `Missing required tool${missingRunTools.length === 1 ? '' : 's'}: ${missingRunTools.join(', ')}.`
+        : null) ??
+      sourceTrackIssue ??
+      containerIssue ??
+      (encodingVideo ? subtitleIssue : null) ??
+      (chunked && fileMode === 'batch' && files.length > 0 && !av1anBatchSource
+        ? 'AV1AN requires at least one movie video stream in the batch.'
+        : null),
   );
   const canQueue = $derived(
     !disabled &&
@@ -3694,8 +3735,9 @@
     const controller = new AbortController();
     imageAbort = controller;
     batchEncodeRun = runMode === 'batch';
+    singlePreparing = runMode !== 'batch';
     imageProgress = 0;
-    imageProgressDescription = batchEncodeRun ? 'Preparing batch…' : '';
+    imageProgressDescription = batchEncodeRun ? 'Preparing batch…' : 'Resolving output path…';
     submitting = true;
     error = null;
     const generation = draftGeneration;
@@ -3717,6 +3759,7 @@
       }
       if (controller.signal.aborted) return;
       if (runMode !== 'batch' && runVideoIndex !== undefined) {
+        imageProgressDescription = 'Analyzing source…';
         const resolvedTemporal = await temporalForSource(
           runSource,
           runVideoIndex,
@@ -3733,7 +3776,9 @@
           },
         };
       }
+      if (controller.signal.aborted) return;
       if (runCropMode === 'automatic' && runMode !== 'batch') {
+        imageProgressDescription = 'Detecting crop…';
         const detection = await detectCrop(
           { inputPath: runSource.path, videoStreamIndex: runVideoIndex! },
           controller.signal,
@@ -3750,8 +3795,17 @@
       if (controller.signal.aborted) return;
       if (runMode === 'batch') await runBatch(request, options, controller);
       else {
-        const reviewed = await reviewAndRun({ kind: 'encode', request }, controller.signal, () =>
-          reviewSingleFile(options),
+        imageProgressDescription = 'Preparing command…';
+        batchPendingSource = {
+          inputPath: request.source.inputPath,
+          outputPath: request.source.outputPath,
+          previousJobs: new Set(jobs.map((job) => job.id)),
+        };
+        const reviewed = await reviewAndRun(
+          { kind: 'encode', request },
+          controller.signal,
+          () => reviewSingleFile(options),
+          (job) => (batchCurrentJobId = job.id),
         );
         if (!reviewed) {
           if (!controller.signal.aborted)
@@ -3773,6 +3827,8 @@
       // authoritative reply settles, even when its draft is no longer visible.
       if (imageAbort === controller) imageAbort = undefined;
       batchCurrentJobId = null;
+      batchPendingSource = undefined;
+      singlePreparing = false;
       submitting = false;
     }
   }
@@ -3949,6 +4005,31 @@
                 value={choice.value}>{choice.label}</option
               >{/each}</select
           >
+          {#if encoder === 'svtAv1Hdr' && encodingVideo && !isImage}
+            {@const override = parameters.find((item) => item.name === 'tune')?.value}
+            <label for={`${idPrefix}-tune`}>Tune</label><select
+              id={`${idPrefix}-tune`}
+              value={override === '0'
+                ? 'visualQuality'
+                : override === '5'
+                  ? 'filmGrain'
+                  : override !== undefined
+                    ? 'advanced'
+                    : hdrTune}
+              onchange={(event) => {
+                const value = event.currentTarget.value;
+                if (value === 'visualQuality' || value === 'filmGrain') {
+                  hdrTune = value;
+                  parameters = parameters.filter((item) => item.name !== 'tune');
+                }
+              }}
+              ><option value="visualQuality">VQ (Visual quality)</option><option value="filmGrain"
+                >Film grain</option
+              >{#if override !== undefined && override !== '0' && override !== '5'}<option
+                  value="advanced">Advanced tune ({override})</option
+                >{/if}</select
+            >
+          {/if}
         </div>
         <div class="form">
           <label for={`${idPrefix}-color`}>Color Format</label>{#if isImage}<select
@@ -4326,7 +4407,7 @@
       <div class="video-columns av1an-infrastructure">
         <div class="form">
           <label for="split">Split Method</label><select id="split" bind:value={av1an.splitMethod}
-            ><option value="fixedChunks">None</option><option value="sceneDetection"
+            ><option value="fixedChunks">Fixed chunks</option><option value="sceneDetection"
               >Scene Change Detection</option
             ></select
           >

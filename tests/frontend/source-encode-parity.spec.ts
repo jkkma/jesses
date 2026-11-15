@@ -17,8 +17,8 @@ test('source tabs, defaults and conditional options follow each encoding view', 
     'Metadata',
     'Advanced',
   ]);
-  await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1');
-  await expect(quick.getByLabel('Container')).toHaveValue('matroska');
+  await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1Hdr');
+  await expect(quick.getByLabel('Container')).toHaveValue('mp4');
   await expect(quick.getByLabel('Quality Mode')).toHaveValue('quality');
   await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
   await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('opus');
@@ -57,14 +57,14 @@ test('global Run emits typed default source settings and selected tracks', async
   const request = calls.find((call: any) => call.command === 'mock_start_encode')?.payload.request;
   expect(request.source).toMatchObject({
     inputPath: '/media/input.mkv',
-    outputPath: '/media/output.mkv',
+    outputPath: '/media/output.mp4',
     streamIndices: [0, 1, 2],
   });
   expect(request.settings).toMatchObject({
     backend: 'standalone',
-    encoder: 'svtAv1',
-    crf: 30,
-    svtCrfQuarterSteps: 120,
+    encoder: 'svtAv1Hdr',
+    crf: 20,
+    svtCrfQuarterSteps: 80,
     audio: [{ streamIndex: 1, codec: 'opus', bitrateKbps: 128, channels: 'stereo' }],
   });
 });
@@ -104,7 +104,7 @@ test('source output box is a stem; format switches and collisions resolve to the
 }) => {
   await page.evaluate(() => {
     (globalThis as any).__occupied = [
-      '/media/input.mkv',
+      '/media/input.mp4',
       '/media/chosen.mp4',
       '/media/chosen.gif',
       '/media/chosen',
@@ -344,7 +344,7 @@ test('an encode snapshots its output, format and settings before awaiting name r
             ?.payload.request,
       ),
     )
-    .toMatchObject({ source: { outputPath: '/media/original.mkv' }, settings: { crf: 30 } });
+    .toMatchObject({ source: { outputPath: '/media/original.mp4' }, settings: { crf: 20 } });
   await expect(q.getByLabel('Output Path', { exact: true })).toHaveValue('/media/newer');
 });
 
@@ -648,9 +648,9 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
   const preview = calls.find((c: any) => c.command === 'preview_encode_batch').payload.request;
   expect(preview).toMatchObject({
     outputDirectory: '',
-    outputContainer: 'matroska',
+    outputContainer: 'mp4',
     outputNameTemplate: '{name}_{codec}_{preset}',
-    sourceNaming: { codec: 'av1', quality: '30', preset: '4' },
+    sourceNaming: { codec: 'av1', quality: '20', preset: '4' },
   });
   expect(preview.inputs.map((input: any) => input.subtitles)).toEqual([
     [{ streamIndex: 2, mode: 'copy', burnIn: true }],
@@ -669,6 +669,7 @@ test('source YADIF selection resolves into typed deinterlace settings', async ({
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Deinterlace').selectOption('yadif');
+  await quick.getByRole('checkbox', { name: 'One frame per field' }).check();
   await quick.getByLabel('Output Path', { exact: true }).fill('/media/output');
   await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
   await expect
@@ -742,7 +743,7 @@ test('source codec menu runs the SVT-AV1-HDR build with 10-bit output', async ({
   expect(request.settings).toMatchObject({
     encoder: 'svtAv1Hdr',
     outputPixelFormat: 'yuv420p10le',
-    hdrTune: 'filmGrain',
+    hdrTune: 'visualQuality',
   });
 });
 
@@ -835,8 +836,8 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
     },
     {
       codec: 'svtAv1Hdr',
-      quality: '30',
-      preset: '2',
+      quality: '20',
+      preset: '4',
       presets: Array.from({ length: 13 }, (_, i) => String(i)),
       colors: ['YUV - 4:2:0 - 8 bit', 'YUV - 4:2:0 - 10 bit'],
     },
@@ -1332,6 +1333,7 @@ test('advanced help, overwrite confirmation and managed grain table precedence',
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await q.getByLabel('Codec', { exact: true }).selectOption('svtAv1');
   await q.getByLabel('Grain Synthesis').selectOption('encoder');
   await q.getByRole('tab', { name: 'Advanced' }).click();
   const row = q.getByLabel('rc value');
@@ -1568,7 +1570,7 @@ test('resume with new settings activates the saved source and snapshots current 
           )?.payload.request,
       ),
     )
-    .toMatchObject({ id: 'one', settings: { backend: 'av1an', encoder: 'svtAv1', crf: 27 } });
+    .toMatchObject({ id: 'one', settings: { backend: 'av1an', encoder: 'svtAv1Hdr', crf: 27 } });
   const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
   expect(
     calls.some((c: any) => c.command === 'probe_media' && c.payload.path === '/media/other.mkv'),

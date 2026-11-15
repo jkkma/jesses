@@ -68,7 +68,7 @@ test('copy conversion reports a preparation failure and permits correction and r
             ?.payload.request.source.outputPath,
       ),
     )
-    .toBe('/media/corrected.mkv');
+    .toBe('/media/corrected.mp4');
 });
 
 test('a webview reload follows the existing copy job through failure without reporting success', async ({
@@ -195,7 +195,7 @@ for (const kind of ['Audio', 'Subtitle'] as const) {
     await tracks.getByRole('checkbox', { name: new RegExp(`Include .*${kind}`) }).check();
     await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
     const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
-    await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1');
+    await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1Hdr');
     await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
     await expect
       .poll(() =>
@@ -223,7 +223,7 @@ for (const kind of ['Audio', 'Subtitle'] as const) {
         ),
       ),
     ).toBe(false);
-    await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1');
+    await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1Hdr');
   });
 }
 

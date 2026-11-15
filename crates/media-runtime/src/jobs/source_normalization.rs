@@ -6,6 +6,8 @@ use super::*;
 pub(super) mod aac;
 #[path = "source_av1an_trim.rs"]
 pub(super) mod av1an_trim;
+#[path = "source_retime.rs"]
+mod retime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -100,6 +102,48 @@ fn digest(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Stamp, AppE
         sha256: format!("{:x}", hash.finalize()),
     })
 }
+// Match AV1AN's ordinary recovery policy. Full-byte receipts remain valid
+// and are checked byte-for-byte when reopening older or thorough jobs.
+fn metadata_stamp(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Stamp, AppError> {
+    check_cancel(cancel)?;
+    source.verify()?;
+    let metadata = source
+        .file()
+        .metadata()
+        .map_err(|error| invalid(&source.path, error.to_string()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| invalid(&source.path, error.to_string()))?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| invalid(&source.path, error.to_string()))?;
+    let result = Stamp {
+        path: source.path.clone(),
+        identity: file_identity(source.file())?,
+        length: metadata.len(),
+        sha256: format!("metadata-v1:{}", modified.as_nanos()),
+    };
+    source.verify()?;
+    Ok(result)
+}
+
+impl Stamp {
+    fn includes_contents(&self) -> bool {
+        !self.sha256.starts_with("metadata-v1:")
+    }
+}
+
+async fn recovery_stamp(
+    source: &Source,
+    cancel: &watch::Receiver<bool>,
+    include_contents: bool,
+) -> Result<Stamp, AppError> {
+    if include_contents {
+        stamp(source, cancel).await
+    } else {
+        metadata_stamp(source, cancel)
+    }
+}
+
 async fn stamp(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Stamp, AppError> {
     source.verify()?;
     let path = source.path.clone();
@@ -285,23 +329,14 @@ fn recipe(
             None,
         ));
     }
-    let rate = video
-        .r_frame_rate
-        .as_deref()
-        .and_then(|value| value.split_once('/'))
-        .or_else(|| {
-            video
-                .avg_frame_rate
-                .as_deref()
-                .and_then(|value| value.split_once('/'))
-        })
-        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
-        .filter(|(n, d)| {
-            *n > 0
-                && *d > 0
-                && (*n as f64 / *d as f64) >= 0.001
-                && (*n as f64 / *d as f64) <= 1000.0
-        })
+    // A demuxer's nominal rate can describe the VFR timestamp grid. At that
+    // rate, normalizing a 60 fps recording with one short interval can create
+    // four times as many pictures. Prefer the presentation average.
+    let rate = [&video.avg_frame_rate, &video.r_frame_rate]
+        .into_iter()
+        .filter_map(|value| value.as_deref()?.split_once('/'))
+        .filter_map(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .find(|&(n, d)| d > 0 && (0.001..=1000.0).contains(&(f64::from(n) / f64::from(d))))
         .ok_or_else(|| {
             AppError::new(
                 "ENCODE_INPUT_UNSUPPORTED",
@@ -340,14 +375,18 @@ struct Owner {
     settings: EncodeSettings,
     directory: Identity,
     files: BTreeMap<String, Identity>,
-    original: Stamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original: Option<Stamp>,
     recipe: Recipe,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Complete {
-    source: Stamp,
-    decoded_sha256: String,
-    decoded_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<Stamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoded_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoded_bytes: Option<u64>,
 }
 struct Workspace {
     root: PathBuf,
@@ -595,42 +634,14 @@ pub(super) async fn inspect(
         ));
     }
     let ffprobe = discover("ffprobe", cancel).await?;
-    let result = supervisor::run_capture(
-        &CommandSpec {
-            executable: ffprobe,
-            args: [
-                "-v",
-                "error",
-                "-protocol_whitelist",
-                "file",
-                "-show_streams",
-                "-show_format",
-                "-print_format",
-                "json",
-                "-i",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .chain([source.path.as_os_str().to_owned()])
-            .collect(),
-            cwd: None,
-        },
-        cancel.clone(),
-        2 * 1024 * 1024,
-        Duration::from_secs(30),
+    let document = probe_headers(
+        &ffprobe,
+        &source.path,
+        cancel,
+        Some(&request.stream_indices),
     )
-    .await
-    .map_err(|e| process_error(e, &source.path))?;
-    if !result.status.success() {
-        return Err(invalid(
-            &source.path,
-            "The source could not be inspected before canonicalization.",
-        ));
-    }
-    let document: Document =
-        serde_json::from_slice(&result.stdout).map_err(|e| invalid(&source.path, e.to_string()))?;
+    .await?;
     document.selected(&request.stream_indices)?;
-    let _ = settings;
     source.verify()?;
     Ok((source, document))
 }
@@ -650,9 +661,20 @@ impl Cleanup {
         self.0.cleanup()
     }
     pub(super) fn verify_source(&self) -> Result<(), AppError> {
-        let original = Source::open(&self.0.owner.original.path)?;
+        let expected = self.0.owner.original.as_ref().ok_or_else(|| {
+            invalid(
+                &self.0.root,
+                "This canonical source does not have a recovery fingerprint.",
+            )
+        })?;
+        let original = Source::open(&expected.path)?;
         let (_owner, cancel) = watch::channel(false);
-        if digest(&original, &cancel)? != self.0.owner.original {
+        let actual = if expected.includes_contents() {
+            digest(&original, &cancel)?
+        } else {
+            metadata_stamp(&original, &cancel)?
+        };
+        if actual != *expected {
             return Err(invalid(
                 &original.path,
                 "The original source changed since canonical preparation.",
@@ -837,10 +859,11 @@ pub(super) fn available(path: &Path) -> Result<u64, AppError> {
 }
 fn disk_preflight(
     path: &Path,
-    source: &Stamp,
+    source_length: u64,
     document: &Document,
     settings: &EncodeSettings,
     recipe: &Recipe,
+    compressed: bool,
 ) -> Result<(), AppError> {
     let video = document
         .streams
@@ -855,17 +878,20 @@ fn disk_preflight(
     let frames = (duration * recipe.numerator as f64 / recipe.denominator as f64).ceil() as u64;
     // Conservative allocation bound: planar 16-bit 4:4:4 plus FFV1 overhead,
     // copied packets and a small mux/index reserve. No source is downsampled.
-    let required = pixels
-        .saturating_mul(8)
-        .saturating_mul(frames)
-        .saturating_add(source.length)
+    let video_bytes = if compressed {
+        0
+    } else {
+        pixels.saturating_mul(8).saturating_mul(frames)
+    };
+    let required = video_bytes
+        .saturating_add(source_length)
         .saturating_add(16 * 1024 * 1024);
     let free = available(path.parent().expect("workspace parent"))?;
     if required > free {
         return Err(invalid(
             path,
             format!(
-                "Lossless source normalization needs up to {} MiB of temporary space; {} MiB is available. Choose an output drive with more space.",
+                "Source normalization needs up to {} MiB of temporary space; {} MiB is available. Choose an output drive with more space.",
                 required.div_ceil(1024 * 1024),
                 free / (1024 * 1024)
             ),
@@ -889,6 +915,111 @@ fn input_arguments(input: &Path, recipe: &Recipe) -> Vec<OsString> {
         "-i".into(),
         input.as_os_str().to_owned(),
     ]
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_source(
+    ffmpeg: &Path,
+    input: &Path,
+    document: &Document,
+    index: u32,
+    recipe: &Recipe,
+    chapter_file: &Path,
+    compressed: bool,
+    temporary: &mut Temporary,
+    cancel: &watch::Receiver<bool>,
+) -> Result<supervisor::CapturedOutput, AppError> {
+    let mut args = input_arguments(input, recipe);
+    args.extend([
+        "-f".into(),
+        "ffmetadata".into(),
+        "-i".into(),
+        chapter_file.as_os_str().to_owned(),
+        "-map".into(),
+        "0".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "1".into(),
+        "-c".into(),
+        "copy".into(),
+    ]);
+    if compressed {
+        let clock = format!("{}/({}*TB)", recipe.denominator, recipe.numerator);
+        args.extend([
+            format!("-bsf:{index}").into(),
+            format!("av1_frame_split,setts=pts=N*{clock}:dts=N*{clock}:duration={clock}").into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            "-stats_period".into(),
+            "60".into(),
+        ]);
+    } else {
+        args.extend([
+            format!("-c:{index}").into(),
+            "ffv1".into(),
+            format!("-level:{index}").into(),
+            "3".into(),
+            format!("-g:{index}").into(),
+            "1".into(),
+            format!("-slicecrc:{index}").into(),
+            "1".into(),
+            format!("-filter:{index}").into(),
+            recipe.filter().into(),
+            format!("-fps_mode:{index}").into(),
+            "cfr".into(),
+        ]);
+    }
+    args.extend([
+        format!("-r:{index}").into(),
+        format!("{}/{}", recipe.numerator, recipe.denominator).into(),
+        format!("-metadata:s:{index}").into(),
+        "rotate=0".into(),
+    ]);
+    for stream in &document.streams {
+        for key in stream.tags.keys() {
+            if (stream.index == index && metadata::is_derived_stream_tag(key))
+                || (recipe.origin != 0.0 && key.to_ascii_lowercase().starts_with("duration"))
+            {
+                args.extend([
+                    format!("-metadata:s:{}", stream.index).into(),
+                    format!("{key}=").into(),
+                ]);
+            }
+        }
+        if aac::needed(document, stream) {
+            args.extend([
+                format!("-bsf:{}", stream.index).into(),
+                "aac_adtstoasc".into(),
+            ]);
+        }
+    }
+    // A seekable Matroska writer records the authored duration and index.
+    args.extend([
+        "-avoid_negative_ts".into(),
+        "disabled".into(),
+        "-f".into(),
+        "matroska".into(),
+        "-y".into(),
+        "-nostats".into(),
+        temporary.path.as_os_str().to_owned(),
+    ]);
+    temporary.close_for_path_writer()?;
+    let execution = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffmpeg.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        128 * 1024,
+        TIME,
+    )
+    .await;
+    let rebound = temporary.reopen_after_path_writer();
+    let result = execution.map_err(|error| process_error(error, input))?;
+    rebound?;
+    Ok(result)
 }
 async fn pixels(
     spec: CommandSpec,
@@ -931,8 +1062,35 @@ async fn static_hdr_metadata(
     input: &Path,
     index: u32,
     header: &[serde_json::Value],
+    thorough: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<encode_plan::hdr::StaticMetadata, AppError> {
+    let limits: &[Option<u32>] = if thorough {
+        &[None]
+    } else {
+        &[Some(16), Some(256), Some(1024)]
+    };
+    for &limit in limits {
+        if let Some(metadata) =
+            scan_static_hdr_metadata(ffprobe, input, index, header, limit, cancel).await?
+        {
+            return Ok(metadata);
+        }
+    }
+    Err(invalid(
+        input,
+        "Canonical source color inspection found no decoded frames.",
+    ))
+}
+
+async fn scan_static_hdr_metadata(
+    ffprobe: &Path,
+    input: &Path,
+    index: u32,
+    header: &[serde_json::Value],
+    packets: Option<u32>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<encode_plan::hdr::StaticMetadata>, AppError> {
     #[derive(Deserialize)]
     struct Frame {
         #[serde(default)]
@@ -941,7 +1099,28 @@ async fn static_hdr_metadata(
         interlaced_frame: u8,
     }
     let mut metadata = encode_plan::hdr::StaticMetadata::parse(header)?;
-    let result=supervisor::run_streaming_stdout(&CommandSpec {executable:ffprobe.to_owned(),args:["-v","error","-select_streams"].into_iter().map(OsString::from).chain([index.to_string().into(),"-show_frames".into(),"-show_entries".into(),"frame=interlaced_frame:frame_side_data".into(),"-of".into(),"json".into(),"-i".into(),input.as_os_str().to_owned()]).collect(),cwd:None},cancel.clone(),64*1024,TIME,move |reader| {
+    let mut args = vec![
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        index.to_string().into(),
+    ];
+    if let Some(packets) = packets {
+        args.extend(["-read_intervals".into(), format!("%+#{packets}").into()]);
+    }
+    args.extend(
+        [
+            "-show_frames",
+            "-show_entries",
+            "frame=interlaced_frame:frame_side_data",
+            "-of",
+            "json",
+            "-i",
+        ]
+        .map(OsString::from),
+    );
+    args.push(input.as_os_str().to_owned());
+    let result=supervisor::run_streaming_stdout(&CommandSpec {executable:ffprobe.to_owned(),args,cwd:None},cancel.clone(),64*1024,TIME,move |reader| {
         let mut first=true;let mut failure=None;
         super::encode::frame_scan::parse(reader,|frame:Frame| {
             if failure.is_some(){return}
@@ -954,7 +1133,7 @@ async fn static_hdr_metadata(
             })();if let Err(error)=checked{failure=Some(error)}
         })?;
         if let Some(error)=failure{return Err(error)}
-        if first{return Err("HDR canonicalization source has no decoded frames.".into())}Ok(metadata)
+        Ok((!first).then_some(metadata))
     }).await.map_err(|e|process_error(e,input))?;
     if !result.status.success() || !result.stderr.is_empty() {
         return Err(invalid(
@@ -975,6 +1154,7 @@ impl Prepared {
         request: &RemuxRequest,
         settings: &EncodeSettings,
         original: Source,
+        headers: &Document,
         force: bool,
         cancel: &watch::Receiver<bool>,
         log: &Path,
@@ -982,18 +1162,29 @@ impl Prepared {
         let root = root_for(id, request)?;
         if root.symlink_metadata().is_ok() {
             let workspace = Workspace::open(id, request, settings)?;
-            let expected = workspace.owner.original.clone();
-            let actual = stamp(&original, cancel).await?;
-            if actual != expected {
+            let expected = workspace.owner.original.as_ref().ok_or_else(|| {
+                invalid(
+                    &root,
+                    "This canonical source does not have a recovery fingerprint.",
+                )
+            })?;
+            let actual = recovery_stamp(&original, cancel, expected.includes_contents()).await?;
+            if actual != *expected {
                 return Err(invalid(
                     &original.path,
                     "The original source changed since canonical preparation. Saved encoder work cannot be reused.",
                 ));
             }
             let complete: Complete = read_json(&root.join("complete.json"))?;
+            let expected = complete.source.as_ref().ok_or_else(|| {
+                invalid(
+                    &root,
+                    "This canonical artifact does not have a recovery fingerprint.",
+                )
+            })?;
             let source_path = root.join("source.mkv");
-            if complete.source.path != source_path
-                || complete.source.identity != workspace.owner.files["source.mkv"]
+            if expected.path != source_path
+                || expected.identity != workspace.owner.files["source.mkv"]
             {
                 return Err(invalid(
                     &root,
@@ -1001,14 +1192,15 @@ impl Prepared {
                 ));
             }
             let canonical = Source::open(&source_path)?;
-            if stamp(&canonical, cancel).await? != complete.source {
+            if recovery_stamp(&canonical, cancel, expected.includes_contents()).await? != *expected
+            {
                 return Err(invalid(
                     &source_path,
                     "The canonical source changed since it was verified.",
                 ));
             }
             drop(canonical);
-            manager.change(id,|snapshot|append_log(snapshot,format!("Reusing the verified lossless canonical source (decoded SHA-256 {}). Original and derivative bytes were rechecked.",complete.decoded_sha256))).await;
+            manager.change(id,|snapshot|append_log(snapshot,"Reusing the verified canonical source. Original and derivative file fingerprints were rechecked.".into())).await;
             return Ok(Self {
                 original,
                 source_path,
@@ -1017,14 +1209,22 @@ impl Prepared {
         }
         let ffprobe = discover("ffprobe", cancel).await?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
-        let document = probe(
-            &ffprobe,
-            &original.path,
-            cancel,
-            Some(&request.stream_indices),
-        )
-        .await?;
-        let recipe = recipe(&document, settings, force)?.ok_or_else(|| {
+        let thorough = super::encode::thorough_verification(settings);
+        let counted = if thorough {
+            Some(
+                probe(
+                    &ffprobe,
+                    &original.path,
+                    cancel,
+                    Some(&request.stream_indices),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let document = counted.as_ref().unwrap_or(headers);
+        let recipe = recipe(document, settings, force)?.ok_or_else(|| {
             invalid(
                 &original.path,
                 "This source does not need canonicalization.",
@@ -1042,7 +1242,38 @@ impl Prepared {
                 "Canonical preparation requires contiguous media/attachment stream IDs. Data/timecode inputs need their explicit mux workflow.",
             ));
         }
-        let original_stamp = stamp(&original, cancel).await?;
+        let metadata_video = document
+            .streams
+            .iter()
+            .find(|stream| stream.index == settings.video_stream_index)
+            .expect("selected video");
+        let retime_frames = if recipe.rotation == 0
+            && recipe.origin == 0.0
+            && super::encode::header_planning_allowed(settings)
+        {
+            retime::frame_count(
+                &ffprobe,
+                &original.path,
+                document,
+                metadata_video,
+                f64::from(recipe.denominator) / f64::from(recipe.numerator),
+                cancel,
+            )
+            .await?
+        } else {
+            None
+        };
+        let recovery = thorough || settings.backend == media_core::EncodeBackend::Av1an;
+        let source_length = original
+            .file()
+            .metadata()
+            .map_err(|error| invalid(&original.path, error.to_string()))?
+            .len();
+        let original_stamp = if recovery {
+            Some(recovery_stamp(&original, cancel, thorough).await?)
+        } else {
+            None
+        };
         let hdr_video = document
             .streams
             .iter()
@@ -1053,23 +1284,14 @@ impl Prepared {
                     Some("smpte2084" | "arib-std-b67")
                 )
             });
-        // Inspect every original frame even when its header omits HDR tags:
-        // dynamic rendering data may appear only in decoded frame side data.
-        let metadata_video = document
-            .streams
-            .iter()
-            .find(|stream| stream.index == settings.video_stream_index)
-            .expect("selected video");
-        let original_hdr = static_hdr_metadata(
-            &ffprobe,
-            &original.path,
-            metadata_video.index,
-            &metadata_video.side_data_list,
-            cancel,
-        )
-        .await?;
-        disk_preflight(&root, &original_stamp, &document, settings, &recipe)?;
-        manager.phase(id,JobState::Preparing,&format!("Preparing a verified lossless canonical source: display rotation {}°, timestamp origin {:.6}s, CFR {}/{}. Variable input intervals retain duration through explicit frame duplication/drop.",recipe.rotation,recipe.origin,recipe.numerator,recipe.denominator)).await;
+        disk_preflight(
+            &root,
+            source_length,
+            document,
+            settings,
+            &recipe,
+            retime_frames.is_some(),
+        )?;
         let guard = rate_control::Stats::durable(&root, false)?;
         let directory = identity(&root)?;
         let mut creating = Creating {
@@ -1092,7 +1314,7 @@ impl Prepared {
             .files
             .insert("chapters.ffmeta".into(), file_identity(&chapter_file)?);
         chapter_file
-            .write_all(chapters(&document, recipe.origin).as_bytes())
+            .write_all(chapters(document, recipe.origin).as_bytes())
             .and_then(|_| chapter_file.sync_all())
             .map_err(|e| invalid(&root, e.to_string()))?;
         drop(chapter_file);
@@ -1136,43 +1358,64 @@ impl Prepared {
         };
         creating.active = false;
         let result=async {
-            let mut args=input_arguments(&original.path,&recipe);
-            args.extend(["-f".into(),"ffmetadata".into(),"-i".into(),root.join("chapters.ffmeta").as_os_str().to_owned(),"-map".into(),"0".into(),"-map_metadata".into(),"0".into(),"-map_chapters".into(),"1".into(),"-c".into(),"copy".into(),format!("-c:{}",settings.video_stream_index).into(),"ffv1".into(),format!("-level:{}",settings.video_stream_index).into(),"3".into(),format!("-g:{}",settings.video_stream_index).into(),"1".into(),format!("-slicecrc:{}",settings.video_stream_index).into(),"1".into(),format!("-filter:{}",settings.video_stream_index).into(),recipe.filter().into(),format!("-r:{}",settings.video_stream_index).into(),format!("{}/{}",recipe.numerator,recipe.denominator).into(),format!("-fps_mode:{}",settings.video_stream_index).into(),"cfr".into(),format!("-metadata:s:{}",settings.video_stream_index).into(),"rotate=0".into(),"-avoid_negative_ts".into(),"disabled".into(),"-f".into(),"matroska".into(),"pipe:1".into()]);
-            // Duration statistics refer to the old timestamp origin; retain
-            // descriptive metadata but clear those obsolete exact keys.
-            let output_at=args.iter().position(|value|value=="-avoid_negative_ts").expect("normalization output options");
-            let mut clear=Vec::<OsString>::new();
-            for stream in &document.streams {
-                for key in stream.tags.keys() {
-                    if (stream.index==settings.video_stream_index && metadata::is_derived_stream_tag(key)) || (recipe.origin!=0.0 && key.to_ascii_lowercase().starts_with("duration")) {
-                        clear.extend([format!("-metadata:s:{}",stream.index).into(),format!("{key}=").into()]);
-                    }
+            let chapter_file = root.join("chapters.ffmeta");
+            let mut compressed = None;
+            if let Some(frames) = retime_frames {
+                manager.phase(id, JobState::Preparing, &format!("Adjusting the timestamps of {frames} compressed AV1 frames to {}/{} fps.", recipe.numerator, recipe.denominator)).await;
+                let staged = stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, true, &mut temporary, cancel).await?;
+                if retime::completed(&staged, frames) {
+                    compressed = Some(staged);
+                } else {
+                    check_cancel(cancel)?;
+                    original.verify()?;
+                    disk_preflight(&root, source_length, document, settings, &recipe, false)?;
+                    manager.change(id, |snapshot| append_log(snapshot, "The compressed AV1 clock could not be normalized one frame at a time. Rendering the normalized video instead.".into())).await;
                 }
             }
-            for stream in document.streams.iter().filter(|stream|aac::needed(&document,stream)){clear.extend([format!("-bsf:{}",stream.index).into(),"aac_adtstoasc".into()]);}
-            args.splice(output_at..output_at,clear);
-            // A seekable Matroska writer records an exact duration/index. A
-            // pipe-only multi-track FFV1 file gives FFprobe bitrate estimates
-            // instead of an authored duration, which cannot authorize muxing.
-            *args.last_mut().expect("canonical output")=temporary.path.as_os_str().to_owned();
-            let output_at=args.len()-1;args.splice(output_at..output_at,["-y".into(),"-nostats".into()]);
-            temporary.close_for_path_writer()?;
-            let execution=supervisor::run_capture(&CommandSpec {executable:ffmpeg.clone(),args,cwd:None},cancel.clone(),128*1024,TIME).await;
-            let rebound=temporary.reopen_after_path_writer();
-            let prepared=execution.map_err(|e|process_error(e,&original.path))?;rebound?;
+            let retimed = compressed.is_some();
+            let original_hdr = if retimed {
+                None
+            } else {
+                // The transform cannot preserve arbitrary dynamic HDR. A
+                // declared HDR source needs complete eligibility evidence
+                // before rendering even when output verification is lean.
+                Some(static_hdr_metadata(&ffprobe, &original.path, metadata_video.index, &metadata_video.side_data_list, thorough || hdr_video.is_some(), cancel).await?)
+            };
+            let prepared = if let Some(prepared) = compressed {
+                prepared
+            } else {
+                manager.phase(id,JobState::Preparing,&format!("Preparing a lossless canonical source: display rotation {}°, timestamp origin {:.6}s, CFR {}/{}. Variable input intervals retain duration through explicit frame duplication/drop.",recipe.rotation,recipe.origin,recipe.numerator,recipe.denominator)).await;
+                stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, false, &mut temporary, cancel).await?
+            };
             let diagnostic=format!("Canonical source preparation:\n{}",String::from_utf8_lossy(&prepared.stderr));
             if let Some(parent)=log.parent() {tokio::fs::create_dir_all(parent).await.map_err(|e|invalid(log,e.to_string()))?;}
             tokio::fs::write(log,diagnostic.as_bytes()).await.map_err(|e|invalid(log,e.to_string()))?;
             if !prepared.status.success() {return Err(invalid(&original.path,format!("FFmpeg could not prepare the canonical source: {}",String::from_utf8_lossy(&prepared.stderr))));}
             temporary.flush_nonempty_async().await?;
-            let actual=probe(&ffprobe,&temporary.path,cancel,None).await?;
+            let actual = if thorough {
+                probe(&ffprobe, &temporary.path, cancel, None).await?
+            } else {
+                probe_headers(&ffprobe, &temporary.path, cancel, None).await?
+            };
+            let kinds = document.streams.iter().map(|stream| stream.codec_type.as_deref().unwrap_or_default()).collect::<Vec<_>>();
+            super::output_counts::check_streams(&actual, &kinds)?;
             let selected_video=actual.streams.iter().find(|stream|stream.index==settings.video_stream_index).ok_or_else(||invalid(&temporary.path,"The canonical video stream is absent."))?;
+            let (mut width, mut height) = (metadata_video.width, metadata_video.height);
+            if matches!(recipe.rotation, 90 | 270) {
+                std::mem::swap(&mut width, &mut height);
+            }
+            if selected_video.codec_name.as_deref() != Some(if retimed { "av1" } else { "ffv1" })
+                || (selected_video.width, selected_video.height) != (width, height)
             {
-                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,cancel).await?;
+                return Err(invalid(&temporary.path, "The canonical video header does not match the planned codec and display dimensions."));
+            }
+            if let Some(original_hdr) = original_hdr {
+                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,thorough,cancel).await?;
                 original_hdr.validate_present(&observed,false)?;observed.validate_present(&original_hdr,false)?;
                 if let Some(original_video)=hdr_video
                     && (selected_video.color_primaries!=original_video.color_primaries||selected_video.color_transfer!=original_video.color_transfer||selected_video.color_space!=original_video.color_space||selected_video.color_range!=original_video.color_range||selected_video.pix_fmt!=original_video.pix_fmt) {return Err(invalid(&temporary.path,"Lossless canonicalization changed HDR color interpretation or sample format."));}
             }
+            let decoded = if thorough {
             let format=selected_video.pix_fmt.as_deref().ok_or_else(||invalid(&temporary.path,"The canonical source pixel format is unknown."))?;
             let mut reference=input_arguments(&original.path,&recipe);reference.extend(["-map".into(),format!("0:{}",settings.video_stream_index).into(),"-vf".into(),recipe.filter().into()]);
             let mut candidate:Vec<OsString>=["-v","error","-nostdin","-noautorotate","-protocol_whitelist","file","-i"].into_iter().map(OsString::from).chain([temporary.path.as_os_str().to_owned()]).collect();candidate.extend(["-map".into(),format!("0:{}",settings.video_stream_index).into()]);
@@ -1181,7 +1424,7 @@ impl Prepared {
             let observed=pixels(CommandSpec {executable:ffmpeg.clone(),args:candidate,cwd:None},cancel,&temporary.path).await?;
             if expected.0==0 || expected!=observed {return Err(invalid(&temporary.path,"The lossless canonical source does not contain exactly the independently decoded transformed source pixels."));}
             let mut expected_document=document.clone();
-            if let Some(format)=&mut expected_document.format {format.start_time=Some("0".into());format.duration=normalized_end(&document,recipe.origin).map(|duration|duration.to_string());}
+            if let Some(format)=&mut expected_document.format {format.start_time=Some("0".into());format.duration=normalized_end(document,recipe.origin).map(|duration|duration.to_string());}
             expected_document.chapters.retain(|chapter|number(Some(&chapter.end_time)).is_some_and(|end|end>recipe.origin));
             for chapter in &mut expected_document.chapters {chapter.start_time=(number(Some(&chapter.start_time)).unwrap_or(0.0)-recipe.origin).max(0.0).to_string();chapter.end_time=(number(Some(&chapter.end_time)).unwrap_or(0.0)-recipe.origin).max(0.0).to_string();}
             let normalized_end=expected_document.duration().map(|duration|duration.to_string());
@@ -1194,18 +1437,30 @@ impl Prepared {
             }
             metadata::verify_encoded(&expected_document,&expected_document.streams.iter().collect::<Vec<_>>(),&actual,settings.video_stream_index,"ffv1",(selected_video.width.unwrap_or(0),selected_video.height.unwrap_or(0)),&[])?;
             for stream in document.streams.iter().filter(|stream|stream.index!=settings.video_stream_index && matches!(stream.codec_type.as_deref(),Some("video"|"audio"|"subtitle"))) {
-                if aac::needed(&document,stream){
+                if aac::needed(document,stream){
                     let actual_stream=actual.streams.iter().find(|actual|actual.index==stream.index).expect("canonical AAC stream");
                     let evidence=aac::verify(&ffmpeg,&ffprobe,&original.path,stream,&temporary.path,actual_stream,-recipe.origin,cancel).await?;
                     manager.change(id,|snapshot|append_log(snapshot,evidence)).await;
                 }else{mux::verify_shifted_packets(&ffprobe,&original.path,stream.index,&temporary.path,stream.index,-recipe.origin,cancel).await?;}
             }
+            Some(observed)
+            } else {
+                None
+            };
             original.verify()?;workspace.verify_layout()?;check_cancel(cancel)?;
             temporary.publish(&source_path)?;drop(temporary);
-            let canonical=Source::open(&source_path)?;let stamp=stamp(&canonical,cancel).await?;drop(canonical);
-            let complete=Complete {source:stamp,decoded_bytes:observed.0,decoded_sha256:observed.1};
+            let stamp = if recovery { Some(recovery_stamp(&Source::open(&source_path)?, cancel, thorough).await?) } else { None };
+            let (decoded_bytes, decoded_sha256) = decoded.map_or((None, None), |(bytes, sha256)| (Some(bytes), Some(sha256)));
+            let complete=Complete {source:stamp,decoded_bytes,decoded_sha256};
             complete_file.write_all(&serde_json::to_vec(&complete).map_err(|e|invalid(&root,e.to_string()))?).and_then(|_|complete_file.sync_all()).map_err(|e|invalid(&root,e.to_string()))?;
-            manager.change(id,|snapshot|append_log(snapshot,format!("Verified lossless canonical source: {} decoded bytes, SHA-256 {}. Original source bytes and copied track packet timing were checked.",complete.decoded_bytes,complete.decoded_sha256))).await;
+            let summary = if let Some(frames) = retime_frames.filter(|_| retimed) {
+                format!("Prepared the compressed source clock for {frames} AV1 frames without decoding or re-encoding them.")
+            } else if let (Some(bytes), Some(sha256)) = (complete.decoded_bytes, complete.decoded_sha256) {
+                format!("Verified lossless canonical source: {bytes} decoded bytes, SHA-256 {sha256}. Original source bytes and copied track packet timing were checked.")
+            } else {
+                "Verified lossless canonical source headers.".into()
+            };
+            manager.change(id,|snapshot|append_log(snapshot,summary)).await;
             Ok::<_,AppError>(())
         }.await;
         drop(complete_file);
@@ -1323,6 +1578,79 @@ pub(super) fn preview_document(
 #[cfg(test)]
 mod orientation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canonical_recovery_detects_changes_with_legacy_and_metadata_receipts() {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-canonical-stamp-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut file = create_file(&path).unwrap();
+        file.write_all(b"original").unwrap();
+        drop(file);
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let fixture = Fixture(path);
+        let (_owner, cancel) = watch::channel(false);
+        let source = Source::open(&fixture.0).unwrap();
+        let metadata = recovery_stamp(&source, &cancel, false).await.unwrap();
+        let legacy = digest(&source, &cancel).unwrap();
+        assert!(!metadata.includes_contents());
+        assert!(legacy.includes_contents());
+        for expected in [&metadata, &legacy] {
+            assert_eq!(
+                &recovery_stamp(&source, &cancel, expected.includes_contents())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        drop(source);
+
+        let mut file = OpenOptions::new().write(true).open(&fixture.0).unwrap();
+        file.write_all(b"modified").unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+        drop(file);
+        let source = Source::open(&fixture.0).unwrap();
+        for expected in [&metadata, &legacy] {
+            assert_ne!(
+                &recovery_stamp(&source, &cancel, expected.includes_contents())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_clock_prefers_the_average_to_the_vfr_timestamp_grid() {
+        for (average, base, expected) in [
+            ("30000/1001", "240/1", (30000, 1001)),
+            ("0/0", "24000/1001", (24000, 1001)),
+            ("240/1", "0/0", (240, 1)),
+        ] {
+            let document: Document = serde_json::from_value(serde_json::json!({
+                "streams": [{
+                    "index": 0, "codec_type": "video", "start_time": "0",
+                    "avg_frame_rate": average, "r_frame_rate": base,
+                }],
+            }))
+            .unwrap();
+            let normalized = recipe(&document, &EncodeSettings::default(), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!((normalized.numerator, normalized.denominator), expected);
+        }
+    }
+
     #[test]
     fn transport_stream_duration_is_a_span_and_audio_lead_survives_preview() {
         let mut document:Document=serde_json::from_value(serde_json::json!({"format":{"format_name":"mpegts","start_time":"1.431644","duration":"2.010023"},"streams":[{"index":0,"codec_type":"video","width":128,"height":96,"start_time":"1.441667","duration":"2.0","r_frame_rate":"24/1"},{"index":1,"codec_type":"audio","start_time":"1.431644","duration":"1.992"}]})).unwrap();

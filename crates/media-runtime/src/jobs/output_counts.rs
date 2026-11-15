@@ -1,5 +1,5 @@
-//! Check the default encode's finished file for the planned streams and video
-//! packet count, plus the applicable AV1AN video header fields.
+//! Check that the default encode's finished file has readable video and the
+//! planned stream headers without scanning its packets.
 use super::{
     files,
     metadata::{Document, Stream, track_duration},
@@ -81,31 +81,29 @@ pub(super) fn check_streams<'a>(
     Ok(streams)
 }
 
-fn check(
-    document: &Document,
+fn check<'a>(
+    document: &'a Document,
     kinds: &[&str],
     video_position: usize,
-    frames: usize,
-) -> Result<(), AppError> {
-    // The encoders write one packet (access unit, temporal unit or superframe)
-    // per frame. `video_position` is the encoded video's place among streams.
+) -> Result<&'a Stream, AppError> {
     let streams = check_streams(document, kinds)?;
-    let counted = streams
+    streams
         .get(video_position)
-        .and_then(|stream| stream.nb_read_packets.as_deref())
-        .and_then(|value| value.parse::<usize>().ok());
-    match counted {
-        Some(count) if count == frames => Ok(()),
-        Some(count) => Err(failed(format!(
-            "The finished file has {count} video frames; {frames} were planned."
-        ))),
-        None => Err(failed(format!(
-            "The finished file's video frames could not be counted; {frames} were planned."
-        ))),
-    }
+        .filter(|stream| {
+            stream.codec_type.as_deref() == Some("video")
+                && stream
+                    .codec_name
+                    .as_deref()
+                    .is_some_and(|codec| !matches!(codec, "" | "unknown"))
+                && stream.width.is_some_and(|width| width > 0)
+                && stream.height.is_some_and(|height| height > 0)
+        })
+        .ok_or_else(|| {
+            failed("The finished file has no readable header for the encoded video.".into())
+        })
 }
 
-/// Counts the finished file's packets in one demux pass and checks them.
+/// Returns any declared frame count for the log. It can be absent or inaccurate.
 pub(super) async fn verify(
     ffprobe: &Path,
     output: &Path,
@@ -114,13 +112,14 @@ pub(super) async fn verify(
     frames: usize,
     video_check: Option<VideoCheck>,
     cancel: &watch::Receiver<bool>,
-) -> Result<(), AppError> {
+) -> Result<Option<usize>, AppError> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
-        "-count_packets",
+        "-protocol_whitelist",
+        "file",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_read_packets:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_frames:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -137,15 +136,15 @@ pub(super) async fn verify(
         },
         cancel.clone(),
         1024 * 1024,
-        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(5 * 60),
     )
     .await
     .map_err(|cause| process_error(cause, output))?;
-    if !result.status.success() || (video_check.is_some() && !result.stderr.is_empty()) {
+    if !result.status.success() || !result.stderr.is_empty() {
         return Err(files::error(
             "OUTPUT_VALIDATION_FAILED",
             format!(
-                "FFprobe could not count the finished file's packets: {}",
+                "FFprobe could not read the finished file's headers: {}",
                 String::from_utf8_lossy(&result.stderr).trim()
             ),
             output,
@@ -154,14 +153,19 @@ pub(super) async fn verify(
     let document: Document = serde_json::from_slice(&result.stdout).map_err(|_| {
         files::error(
             "PROBE_INVALID_RESPONSE",
-            "FFprobe returned unreadable packet counts.",
+            "FFprobe returned unreadable output headers.",
             output,
         )
     })?;
-    check(&document, kinds, video_position, frames)
-        .and_then(|()| match video_check {
-            Some(check) => check.verify(&document.streams[video_position], frames),
-            None => Ok(()),
+    check(&document, kinds, video_position)
+        .and_then(|video| {
+            if let Some(check) = video_check {
+                check.verify(video, frames)?;
+            }
+            Ok(video
+                .nb_frames
+                .as_deref()
+                .and_then(|count| count.parse().ok()))
         })
         .map_err(|error| AppError {
             path: Some(output.to_string_lossy().into_owned()),
@@ -176,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
-    async fn basic_probe_rejects_a_missing_track_and_a_physically_truncated_container() {
+    async fn lean_probe_checks_readable_headers_and_planned_streams_without_exact_counts() {
         let (_sender, cancel) = watch::channel(false);
         let ffmpeg = super::super::discover("ffmpeg", &cancel).await.unwrap();
         let ffprobe = super::super::discover("ffprobe", &cancel).await.unwrap();
@@ -196,9 +200,9 @@ mod tests {
             }
         }
         let fixture = Fixture(root);
-        let valid = fixture.0.join("valid.mkv");
-        let no_audio = fixture.0.join("no-audio.mkv");
-        let truncated = fixture.0.join("truncated.mkv");
+        let valid = fixture.0.join("valid.mov");
+        let no_audio = fixture.0.join("no-audio.mov");
+        let corrupt = fixture.0.join("corrupt.mov");
         for (output, include_audio) in [(&valid, true), (&no_audio, false)] {
             let mut args: Vec<OsString> = [
                 "-v",
@@ -244,25 +248,25 @@ mod tests {
                 String::from_utf8_lossy(&result.stderr)
             );
         }
-        let bytes = std::fs::read(&valid).unwrap();
-        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::write(&corrupt, b"nonempty unreadable output").unwrap();
         let expectation = Some(VideoCheck {
             codec: "h264",
             dimensions: (64, 64),
             frame_seconds: Some(0.1),
         });
-        verify(
+        let declared = verify(
             &ffprobe,
             &valid,
             &["video", "audio"],
             0,
-            12,
+            13,
             expectation,
             &cancel,
         )
         .await
         .unwrap();
-        for output in [no_audio, truncated] {
+        assert_eq!(declared, Some(12));
+        for output in [no_audio, corrupt] {
             let failure = verify(
                 &ffprobe,
                 &output,
@@ -284,26 +288,16 @@ mod tests {
 
     fn picture_and_sound() -> Document {
         document(serde_json::json!([
-            {"index": 0, "codec_type": "video", "nb_read_packets": "48"},
-            {"index": 1, "codec_type": "audio", "nb_read_packets": "70"}
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 64, "height": 64},
+            {"index": 1, "codec_type": "audio"}
         ]))
     }
 
     #[test]
-    fn matching_counts_and_kinds_pass() {
-        assert!(check(&picture_and_sound(), &["video", "audio"], 0, 48).is_ok());
-    }
-
-    #[test]
-    fn a_missing_or_extra_frame_fails() {
-        for frames in [47, 49] {
-            let error = check(&picture_and_sound(), &["video", "audio"], 0, frames).unwrap_err();
-            assert_eq!(error.code, "OUTPUT_VALIDATION_FAILED");
-            assert!(
-                error.message.contains(&format!("{frames} were planned")),
-                "{error:?}"
-            );
-        }
+    fn matching_headers_pass_without_a_frame_count() {
+        let document = picture_and_sound();
+        let video = check(&document, &["video", "audio"], 0).unwrap();
+        assert!(video.nb_frames.is_none());
     }
 
     #[test]
@@ -313,7 +307,7 @@ mod tests {
             &["video", "audio", "subtitle"][..],
             &["audio", "video"][..],
         ] {
-            let error = check(&picture_and_sound(), kinds, 0, 48).unwrap_err();
+            let error = check(&picture_and_sound(), kinds, 0).unwrap_err();
             assert_eq!(error.code, "OUTPUT_VALIDATION_FAILED");
         }
     }
@@ -322,30 +316,29 @@ mod tests {
     fn an_mp4_chapter_track_is_not_a_planned_stream() {
         let mut value = serde_json::json!({
             "streams": [
-                {"index": 0, "codec_type": "video", "nb_read_packets": "48"},
-                {"index": 1, "codec_type": "audio", "nb_read_packets": "70"},
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 64, "height": 64},
+                {"index": 1, "codec_type": "audio"},
                 {"index": 2, "codec_type": "data", "codec_name": "bin_data",
                  "codec_tag_string": "text", "tags": {"handler_name": "SubtitleHandler"}}
             ],
             "chapters": [{"start_time": "0.000000", "end_time": "1.000000"}]
         });
         let with_chapters: Document = serde_json::from_value(value.clone()).unwrap();
-        assert!(check(&with_chapters, &["video", "audio"], 0, 48).is_ok());
+        assert!(check(&with_chapters, &["video", "audio"], 0).is_ok());
         // Without chapters the same track is an unplanned stream.
         value["chapters"] = serde_json::json!([]);
         let without_chapters: Document = serde_json::from_value(value).unwrap();
-        assert!(check(&without_chapters, &["video", "audio"], 0, 48).is_err());
+        assert!(check(&without_chapters, &["video", "audio"], 0).is_err());
     }
 
     #[test]
-    fn an_unreadable_video_count_fails() {
-        for count in [serde_json::Value::Null, serde_json::json!("N/A")] {
-            let mut video = serde_json::json!({"index": 0, "codec_type": "video"});
-            if !count.is_null() {
-                video["nb_read_packets"] = count;
-            }
-            let document = document(serde_json::json!([video]));
-            let error = check(&document, &["video"], 0, 48).unwrap_err();
+    fn an_unreadable_video_header_fails() {
+        for stream in [
+            serde_json::json!({"index": 0, "codec_type": "video", "width": 64, "height": 64}),
+            serde_json::json!({"index": 0, "codec_type": "video", "codec_name": "h264", "width": 0, "height": 64}),
+        ] {
+            let document = document(serde_json::json!([stream]));
+            let error = check(&document, &["video"], 0).unwrap_err();
             assert_eq!(error.code, "OUTPUT_VALIDATION_FAILED");
         }
     }

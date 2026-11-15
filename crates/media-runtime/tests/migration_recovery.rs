@@ -49,9 +49,22 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-async fn generate(path: &Path) {
+async fn generate(path: &Path, shift_origin: bool) {
     let (_owner, cancel) = watch::channel(false);
     let mut args:Vec<std::ffi::OsString>=["-v","error","-nostdin","-n","-f","lavfi","-i","testsrc2=size=640x360:rate=24:duration=4","-f","lavfi","-i","sine=duration=4:sample_rate=48000","-map","0:v","-map","1:a","-vf","setpts=PTS+if(gte(N\\,24)\\,0.25/TB\\,0),setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709","-fps_mode","vfr","-c:v","ffv1","-level","3","-c:a","pcm_s16le"].into_iter().map(Into::into).collect();
+    if shift_origin {
+        // Exercise canonical recovery regardless of whether the packet gap
+        // is initially hidden by equal Matroska header rates.
+        args.extend(
+            [
+                "-output_ts_offset",
+                "0.25",
+                "-avoid_negative_ts",
+                "disabled",
+            ]
+            .map(Into::into),
+        );
+    }
     args.push(path.as_os_str().to_owned());
     let output = supervisor::run_capture(
         &CommandSpec {
@@ -91,7 +104,7 @@ async fn finish(manager: &JobManager, id: &str) -> media_core::JobSnapshot {
 }
 async fn stopped_pass_one(fixture: &Fixture) -> (String, PathBuf, Vec<u8>) {
     let input = fixture.0.join("variable-source.mkv");
-    generate(&input).await;
+    generate(&input, false).await;
     let original = std::fs::read(&input).unwrap();
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     let job = manager
@@ -226,7 +239,7 @@ async fn normalized_standalone_pass_resume_rechecks_both_sources_and_rejects_for
         completed
             .logs
             .iter()
-            .any(|line| line.contains("Reusing the verified lossless canonical source"))
+            .any(|line| line.contains("Reusing the verified canonical source"))
     );
     assert!(
         completed
@@ -265,7 +278,7 @@ async fn normalized_recovery_discard_does_not_require_original_source_and_preser
 async fn cancellation_during_canonical_preparation_cleans_only_owned_workspace() {
     let fixture = Fixture::new();
     let input = fixture.0.join("variable-source.mkv");
-    generate(&input).await;
+    generate(&input, false).await;
     let original = std::fs::read(&input).unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
     let output = fixture.0.join("canceled.mkv");
@@ -330,7 +343,7 @@ async fn normalized_av1an_recovery_case(new_settings: bool) {
     };
     let fixture = Fixture::new();
     let input = fixture.0.join("variable-source.mkv");
-    generate(&input).await;
+    generate(&input, true).await;
     let original = std::fs::read(&input).unwrap();
     let output = fixture.0.join("av1an-output.mkv");
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
@@ -432,7 +445,7 @@ async fn normalized_av1an_recovery_case(new_settings: bool) {
         completed
             .logs
             .iter()
-            .any(|line| line.contains("Reusing the verified lossless canonical source"))
+            .any(|line| line.contains("Reusing the verified canonical source"))
     );
     manager.shutdown().await;
     drop(manager);

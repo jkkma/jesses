@@ -392,6 +392,11 @@ async fn opaque_16bit_gbr_source_encodes_to_verified_10bit_yuv_without_source_ch
                 output_pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p10le),
                 lossless: true,
                 preset: 0,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                    full_output_verification: true,
+                }),
                 ..Default::default()
             },
         })

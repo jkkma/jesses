@@ -22,6 +22,7 @@ test('copied mov_text into MKV is converted to SubRip instead of blocking Run', 
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container', { exact: true }).selectOption('matroska');
   await quick.getByLabel('Output Path', { exact: true }).fill('/media/movie-av1');
   await expect(quick.getByRole('alert').filter({ hasText: /MKV cannot store/ })).toHaveCount(0);
   await expect(page.locator('#run-blocked-reason')).toHaveCount(0);

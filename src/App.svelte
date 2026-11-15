@@ -38,7 +38,7 @@
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
   import SourceSettings from '$lib/features/source/SourceSettings.svelte';
   import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
-  import { batchRunId } from '$lib/source-workspace';
+  import { batchRunId, firstTrackSelection } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -51,7 +51,7 @@
   import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
-  import { liveJobProgress } from '$lib/components/shared/job-progress';
+  import { isEncoderProgressLine, liveJobProgress } from '$lib/components/shared/job-progress';
   import {
     ProgressEstimator,
     type ProgressEstimate,
@@ -309,19 +309,15 @@
     const existing = new Set(
       trackSelection.map((row) => JSON.stringify([row.sourceId, row.streamIndex])),
     );
-    // Cover art (attached pictures) is a still image, not a second picture
-    // track; it starts unchecked and never counts as the source's video.
-    let hasVideo = trackSelection.some((row) =>
+    const kindOf = (row: TrackSelection) =>
       files
         .find((file) => file.id === row.sourceId)
-        ?.streams.some(
-          (stream) =>
-            stream.index === row.streamIndex && stream.kind === 'video' && !stream.attachedPic,
-        ),
+        ?.streams.find((stream) => stream.index === row.streamIndex)?.kind;
+    const seen = new Set(
+      trackSelection.map(kindOf).filter((kind): kind is NonNullable<typeof kind> => !!kind),
     );
     const additions: TrackSelection[] = [];
     for (const file of chosen) {
-      const alreadyHadVideo = hasVideo;
       for (const stream of file.streams) {
         const key = JSON.stringify([file.id, stream.index]);
         if (existing.has(key)) continue;
@@ -329,20 +325,16 @@
         additions.push({
           sourceId: file.id,
           streamIndex: stream.index,
-          included:
-            stream.codec?.toLowerCase() !== 'unknown' &&
-            !stream.attachedPic &&
-            !(stream.kind === 'video' && alreadyHadVideo),
+          included: false,
           title: stream.title ?? '',
           language: stream.language ?? '',
           defaultFlag:
             stream.kind === 'subtitle' && noDefaultSubtitles ? false : (stream.isDefault ?? null),
           forcedFlag: null,
         });
-        if (stream.kind === 'video' && !stream.attachedPic) hasVideo = true;
       }
     }
-    let next = [...trackSelection, ...additions];
+    let next = [...trackSelection, ...firstTrackSelection(additions, kindOf, seen)];
     for (const kind of ['audio', 'subtitle']) {
       if (kind === 'subtitle' && noDefaultSubtitles) continue;
       const candidates = next.filter(
@@ -644,8 +636,6 @@
   // replayed.
   const jobLogCursors = new Map<string, { last: string | undefined; finished: boolean }>();
   let jobLogsPrimed = false;
-  const progressLine =
-    /^(?:\[(?:consumer|producer)\]\s*)?(?:Encoding:?\s+\d+(?:\/\d+)?\s+Frames|Encoding frame\s+\d+|frame=\s*\d+|Encoding\s*$)/;
   function mirrorJobLogs(snapshot: JobSnapshot[]) {
     for (const job of snapshot) {
       const lines = job.logs ?? [];
@@ -662,7 +652,7 @@
       const failed = finished && (job.state === 'failed' || job.state === 'interrupted');
       const message = failed ? job.error?.message : undefined;
       for (const line of lines.slice(seen + 1))
-        if (!progressLine.test(line) && line !== message)
+        if (!isEncoderProgressLine(line) && line !== message)
           addLog(line, /\b(?:error|failed)\b/i.test(line) ? 'error' : 'info');
       if (failed) {
         if (message) addLog(message, 'error');
@@ -1768,7 +1758,13 @@
         onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
         >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
       ><button type="button" onclick={stopQueue}>Stop</button>{/if}
-    {#if runBlockedReason}<span
+    {#if runBlockedReason && action?.openBlockedSetting}<button
+        type="button"
+        id="run-blocked-reason"
+        class="run-blocked"
+        title={runBlockedReason}
+        onclick={action.openBlockedSetting}>{runBlockedReason}</button
+      >{:else if runBlockedReason}<span
         id="run-blocked-reason"
         class="run-blocked"
         role="alert"

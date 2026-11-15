@@ -6,6 +6,14 @@ import type { ProgressEstimate } from './progress-estimate';
 const toolOutput = /^(?:\s|\[)/;
 const bookkeeping = /^(?:Tool|Owned temporary [^:]+|Mux log|[\w -]+ log): /;
 const pauseControl = /^(?:Paused|Continued) the media job process trees\./;
+const progressLine =
+  /^(?:Encoding:?\s+\d+(?:\/\d+)?\s+Frames\b|Encoding frame\s+\d+\b|Encoding$|frame=\s*\d+|\d+\s+frames:\s+\d+(?:\.\d+)?\s+fps\b|\[\d+(?:\.\d+)?%\]\s+\d+\/\d+\s+frames,)/;
+
+/** Older job snapshots can still contain tool status updates alongside diagnostics. */
+export function isEncoderProgressLine(line: string): boolean {
+  const record = line.trim().replace(/^\[(?:consumer|producer)\]\s*/, '');
+  return progressLine.test(record) && !record.includes(' Lsize=');
+}
 
 /** The newest step the job reported, such as "Fingerprinting the source...". */
 export function latestStep(logs: readonly string[]): string | null {

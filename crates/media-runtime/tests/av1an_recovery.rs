@@ -1542,7 +1542,7 @@ async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verificat
         finished
             .logs
             .iter()
-            .any(|line| line.starts_with("Output check: 720 video frames and 4 streams"))
+            .any(|line| line == "Output check: readable video and 4 planned streams.")
     );
     assert!(
         !finished
