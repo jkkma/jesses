@@ -1,4 +1,4 @@
-use media_core::{Av1anResourceEstimate, Av1anResourceRequest, VideoEncoder};
+use media_core::{Av1anResourceEstimate, Av1anResourceRequest, MAX_WORKERS, VideoEncoder};
 
 fn memory() -> (Option<u32>, Option<u32>) {
     #[cfg(windows)]
@@ -48,13 +48,15 @@ fn estimate(
         0.0
     };
     let per_worker_mib = (150.0 + output_mp * slope + source_mp * 51.0 + filters).ceil() as u32;
-    let workers = r.workers.clamp(1, 64);
+    let workers = r.workers.clamp(1, MAX_WORKERS);
     let estimated_memory_mib = per_worker_mib.saturating_mul(u32::from(workers));
     let usable = total
         .map(|t| t.saturating_sub(2048.max(t / 5)))
         .map(|budget| available.map_or(budget, |a| budget.min(a)));
-    let memory_workers = usable
-        .map(|m| ((f64::from(m) / (f64::from(per_worker_mib) * 1.25)).floor() as u32).clamp(1, 64));
+    let memory_workers = usable.map(|m| {
+        ((f64::from(m) / (f64::from(per_worker_mib) * 1.25)).floor() as u32)
+            .clamp(1, u32::from(MAX_WORKERS))
+    });
     let baseline_workers = (processors * 2).div_ceil(5).clamp(2, 32);
     let cpu_workers = baseline_workers;
     let cpu_workers = if r.encoder.is_svt() {

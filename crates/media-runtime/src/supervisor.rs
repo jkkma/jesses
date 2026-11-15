@@ -5,8 +5,9 @@
 //! detach from that group. Dropping the run future also terminates the tree.
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::atomic::{AtomicBool, Ordering},
@@ -262,7 +263,7 @@ pub async fn run_with_environment(
 }
 
 /// Run AV1AN with a pause-aware inactivity limit. Advancing frame counters or
-/// changes to either progress file restart the clock independently of UI events.
+/// changes to either progress file or growing chunk outputs restart the clock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_environment_until_inactive(
     spec: &CommandSpec,
@@ -271,6 +272,7 @@ pub(crate) async fn run_with_environment_until_inactive(
     log_path: &Path,
     inactivity_limit: Duration,
     progress_paths: [&Path; 2],
+    chunk_directory: &Path,
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
@@ -282,6 +284,7 @@ pub(crate) async fn run_with_environment_until_inactive(
         RunDeadline::Inactivity {
             limit: inactivity_limit,
             progress_paths,
+            chunk_directory,
         },
         environment,
         pause,
@@ -295,6 +298,7 @@ enum RunDeadline<'a> {
     Inactivity {
         limit: Duration,
         progress_paths: [&'a Path; 2],
+        chunk_directory: &'a Path,
     },
 }
 
@@ -448,6 +452,7 @@ async fn logged_timeout(
         RunDeadline::Inactivity {
             limit,
             progress_paths,
+            chunk_directory,
         } => {
             let activity = activity.expect("inactivity watchdog tracks progress");
             let mut changes = activity.subscribe();
@@ -462,6 +467,7 @@ async fn logged_timeout(
             };
             tokio::select! {
                 _ = watch_progress_files(progress_paths, limit, activity) => {},
+                _ = watch_chunk_growth(chunk_directory, limit, activity) => {},
                 _ = deadline => {},
             }
         }
@@ -492,6 +498,87 @@ async fn watch_progress_files(paths: [&Path; 2], limit: Duration, activity: &wat
         second = next_second.or(second);
         if changed {
             activity.send_replace(());
+        }
+    }
+}
+
+async fn chunk_output_sizes(directory: &Path) -> Vec<(OsString, u64)> {
+    fn ordinary(metadata: &fs::Metadata) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        }
+        #[cfg(not(windows))]
+        {
+            !metadata.file_type().is_symlink()
+        }
+    }
+
+    let directory = directory.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if !fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir() && ordinary(&m))
+            || !directory.parent().is_some_and(|parent| {
+                fs::symlink_metadata(parent).is_ok_and(|m| m.is_dir() && ordinary(&m))
+            })
+        {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let (index, _) = name.to_str()?.split_once('.')?;
+                if index.len() < 5 || !index.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                (metadata.is_file() && ordinary(&metadata)).then_some((name, metadata.len()))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn watch_chunk_growth(directory: &Path, limit: Duration, activity: &watch::Sender<()>) {
+    let mut updates = activity.subscribe();
+    let mut sizes: HashMap<_, _> = chunk_output_sizes(directory)
+        .await
+        .into_iter()
+        .map(|(name, bytes)| (name, (bytes, true)))
+        .collect();
+    let period = (limit / 4).clamp(Duration::from_millis(1), Duration::from_secs(60));
+    loop {
+        // Walk the output directory only after a quiet interval. Most jobs
+        // report frame or checkpoint progress more often than this.
+        tokio::select! {
+            biased;
+            _ = updates.changed() => continue,
+            _ = tokio::time::sleep(period) => {}
+        }
+        let mut grew = false;
+        for (name, bytes) in chunk_output_sizes(directory).await {
+            let (peak, existed_at_launch) = sizes.entry(name).or_default();
+            if bytes > *peak {
+                *peak = bytes;
+                *existed_at_launch = false;
+                grew = true;
+            } else if bytes < *peak && *existed_at_launch {
+                // A resumed encoder may truncate an old incomplete chunk.
+                // Rebase once, then count only new high-water marks so a
+                // repeatedly truncated or recreated file cannot mask a stall.
+                *peak = bytes;
+                *existed_at_launch = false;
+            }
+        }
+        if grew {
+            activity.send_replace(());
+            updates.borrow_and_update();
         }
     }
 }

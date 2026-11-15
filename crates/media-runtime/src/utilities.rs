@@ -2854,6 +2854,9 @@ pub fn read_av1an_grain_table(path: String) -> Result<String, AppError> {
     validate_grain_table(&bytes)
         .map_err(|e| error("GRAIN_TABLE_INVALID", e, Some(&source.path)))?;
     String::from_utf8(bytes)
+        // AOM consumes exactly one byte after the magic header. Normalize
+        // freshly imported text before it enters the immutable job settings.
+        .map(|table| table.replace("\r\n", "\n"))
         .map_err(|e| error("GRAIN_TABLE_INVALID", e.to_string(), Some(&source.path)))
 }
 
@@ -2906,7 +2909,11 @@ pub async fn make_av1an_grain_preset(
         "-f",
         "lavfi",
         "-i",
-        "color=black:s=64x64:r=24:d=15",
+        "color=black:s=64x64:r=24",
+        // A stock preset supplies one static model. Extract one frame so
+        // per-frame seed changes cannot turn it into a timed table.
+        "-frames:v",
+        "1",
         "-pix_fmt",
         "yuv420p",
         "-f",
@@ -2999,56 +3006,81 @@ pub async fn make_av1an_grain_preset(
     )
     .await?;
     let original = read_av1an_grain_table(table.to_string_lossy().into_owned())?;
-    let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
-    if let Some(last) = lines.iter_mut().rfind(|line| line.starts_with("E ")) {
-        let mut fields = last
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let end = fields[2]
-            .parse::<u64>()
-            .map_err(|_| error("GRAIN_TABLE_INVALID", "Invalid table coverage.", None))?;
-        fields[2] = end.max(864_000_000_000).to_string();
-        *last = fields.join(" ");
+    let timing = grain_table_timing(original.as_bytes())
+        .map_err(|e| error("GRAIN_TABLE_INVALID", e, None))?;
+    if timing.segments != 1 || timing.start != 0 {
+        return Err(error(
+            "GRAIN_TABLE_INVALID",
+            "The film-stock preset did not produce one grain model at the start of the reference.",
+            None,
+        ));
     }
+    let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
+    let segment = lines
+        .iter_mut()
+        .find(|line| line.split_ascii_whitespace().next() == Some("E"))
+        .expect("validated preset segment");
+    let mut fields = segment
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // AOM's native table parser reads this stamp as a signed 64-bit value.
+    fields[2] = i64::MAX.to_string();
+    *segment = fields.join(" ");
     let result = lines.join("\n") + "\n";
     validate_grain_table(result.as_bytes()).map_err(|e| error("GRAIN_TABLE_INVALID", e, None))?;
     Ok(result)
 }
 
 pub(crate) fn validate_grain_table(bytes: &[u8]) -> Result<u32, String> {
+    grain_table_timing(bytes).map(|timing| timing.segments)
+}
+
+pub(crate) struct GrainTableTiming {
+    pub segments: u32,
+    pub start: u64,
+    pub end: u64,
+}
+
+pub(crate) fn grain_table_timing(bytes: &[u8]) -> Result<GrainTableTiming, String> {
     if bytes.is_empty() || bytes.len() > 64 * 1024 * 1024 || bytes.contains(&0) {
         return Err("The grain table is empty, too large, or contains binary data.".into());
     }
     let text = std::str::from_utf8(bytes).map_err(|_| "The grain table is not UTF-8 text.")?;
     let mut count = 0_u32;
-    let mut previous_end = None;
-    for line in text.lines().map(str::trim) {
-        if !line.starts_with("E ") {
+    let (mut first_start, mut previous_end) = (None, None);
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        if fields.next() != Some("E") {
             continue;
         }
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 6 {
+        let fields = fields.collect::<Vec<_>>();
+        if fields.len() < 5 {
             return Err("A grain-table segment has too few fields.".into());
         }
-        let start = fields[1]
+        let start = fields[0]
             .parse::<u64>()
             .map_err(|_| "A grain-table segment has an invalid start timestamp.")?;
-        let end = fields[2]
+        let end = fields[1]
             .parse::<u64>()
             .map_err(|_| "A grain-table segment has an invalid end timestamp.")?;
         if end <= start || previous_end.is_some_and(|previous| start < previous) {
             return Err("Grain-table segments overlap or have invalid timing.".into());
         }
+        first_start.get_or_insert(start);
         previous_end = Some(end);
         count = count
             .checked_add(1)
             .ok_or("The grain table contains too many segments.")?;
     }
-    if count == 0 {
+    let (Some(start), Some(end)) = (first_start, previous_end) else {
         return Err("The file contains no AV1 film-grain table segments.".into());
-    }
-    Ok(count)
+    };
+    Ok(GrainTableTiming {
+        segments: count,
+        start,
+        end,
+    })
 }
 
 fn read_grain_table(path: &Path) -> Result<(Vec<u8>, u32), AppError> {
@@ -4731,17 +4763,11 @@ mod tests {
             .unwrap();
         assert!(table.starts_with("filmgrn1\n"));
         assert!(table.len() <= 262144);
-        assert!(validate_grain_table(table.as_bytes()).unwrap() > 0);
-        let end = table
-            .lines()
-            .rfind(|line| line.starts_with("E "))
-            .unwrap()
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert!(end >= 864_000_000_000);
+        let timing = grain_table_timing(table.as_bytes()).unwrap();
+        assert_eq!(
+            (timing.segments, timing.start, timing.end),
+            (1, 0, i64::MAX as u64)
+        );
         let (_sender, cancel) = watch::channel(true);
         assert!(
             make_av1an_grain_preset("16mm".into(), cancel)
@@ -4759,7 +4785,11 @@ mod tests {
             .unwrap();
         assert!(table.starts_with("filmgrn1\n"));
         assert!(table.len() <= 262144);
-        assert!(validate_grain_table(table.as_bytes()).unwrap() > 0);
+        let timing = grain_table_timing(table.as_bytes()).unwrap();
+        assert_eq!(
+            (timing.segments, timing.start, timing.end),
+            (1, 0, i64::MAX as u64)
+        );
     }
 
     #[test]

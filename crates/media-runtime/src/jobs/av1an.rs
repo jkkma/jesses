@@ -9,8 +9,8 @@ pub(super) use filters::validate as validate_filters;
 pub(super) use grain::stage_standalone as stage_standalone_grain_table;
 pub(super) use grain::validate as validate_grain;
 pub(super) use grain::{
-    TABLE_NAME as GRAIN_TABLE_NAME, aom_parameters as aom_grain_parameters,
-    parameters as grain_parameters,
+    TABLE_NAME as GRAIN_TABLE_NAME, TableCoverage as GrainTableCoverage,
+    aom_parameters as aom_grain_parameters, parameters as grain_parameters,
 };
 pub(super) mod encoder;
 mod metrics;
@@ -403,13 +403,13 @@ impl JobManager {
                 |sha256| recovery::version_with_vship(&version_text, sha256),
             );
         recovery.version(recovery_version).await?;
-        if super::encode::thorough_verification(settings) {
+        let thorough = super::encode::thorough_verification(settings);
+        if thorough {
             recovery.verify_segments(ffmpeg, input, cancel).await?;
         }
-        let prepared_scenes = if !super::encode::thorough_verification(settings)
-            || recovery.resume_chunks
-            || !scenes::supports_preload(&version_text)
-        {
+        let fresh_prepass_supported =
+            !recovery.resume_chunks && scenes::supports_preload(&version_text);
+        let prepared_scenes = if !thorough || !fresh_prepass_supported {
             None
         } else {
             match scenes::prepare(
@@ -454,6 +454,13 @@ impl JobManager {
             }
             if let Some(prepared) = &prepared_scenes {
                 append_log(snapshot, format!("Parallel scene prepass: {} slices produced {} scenes.", prepared.slices, prepared.scenes));
+            } else if !thorough
+                && fresh_prepass_supported
+                && configured.scene_detection_slices > 1
+                && configured.split_method == media_core::Av1anSplitMethod::SceneDetection
+                && configured.chunk_method == media_core::Av1anChunkMethod::Lsmash
+            {
+                append_log(snapshot, format!("Detection Slices is set to {}. The parallel scene prepass requires Thorough verification. AV1AN will detect scenes during encoding.", configured.scene_detection_slices));
             }
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
@@ -621,6 +628,7 @@ impl JobManager {
             prepared.verify()?;
         }
         let event_task = tokio::spawn(observe_events);
+        let chunk_directory = work.join("chunks/encode");
         let result = supervisor::with_console_profile(supervisor::ConsoleProfile::Av1an, || {
             supervisor::run_with_environment_until_inactive(
                 execution,
@@ -629,6 +637,7 @@ impl JobManager {
                 log_path,
                 Duration::from_hours(6),
                 [&progress_path, &internal_log],
+                &chunk_directory,
                 Some(environment),
                 Some(&pause),
             )

@@ -8,6 +8,7 @@
     isDesktop,
   } from '$lib/ipc/client';
   import { errorMessage } from './format';
+  import { grainTableSegments } from './av1an-options';
   let {
     value,
     encoder,
@@ -155,8 +156,8 @@
         >{/if}
     {/if}
     {#if table}<p>
-        {table.split('\n').filter((line) => line.startsWith('E ')).length} table segments stored with
-        this job. The original file is read only; recovery uses these saved table bytes.
+        {grainTableSegments(table).length} table segments stored with this job. The original file is read
+        only; recovery uses these saved table bytes.
       </p>
       <button
         type="button"

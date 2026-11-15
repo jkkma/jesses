@@ -89,10 +89,10 @@ pub use jobs::{
     AudioChannelLayoutPolicy, AudioChannels, AudioCodec, AudioGain, AudioTrackSettings,
     Av1anRecovery, BorderRatio, BorderSettings, CropSettings, EncodeBackend, EncodeRequest,
     EncodeSettings, EncodeTrackOverride, EncodeTrackRef, EncoderProgress, ExternalAudioSettings,
-    ExternalTrack, HdrTune, JobSnapshot, JobState, OutputMetadata, RecoveryPhase, RemuxRequest,
-    ResizeFill, ResizeMode, ResizeSettings, StandaloneRecovery, StandaloneRecoveryPhase,
-    VideoEncoder, VideoFraming, VideoMode, VideoRateControl, VideoSeekStrategy, VideoTimeTrim,
-    VideoTrim,
+    ExternalTrack, HdrTune, JobSnapshot, JobState, MAX_WORKERS, OutputMetadata, RecoveryPhase,
+    RemuxRequest, ResizeFill, ResizeMode, ResizeSettings, StandaloneRecovery,
+    StandaloneRecoveryPhase, VideoEncoder, VideoFraming, VideoMode, VideoRateControl,
+    VideoSeekStrategy, VideoTimeTrim, VideoTrim,
 };
 pub use mux::{MuxRequest, MuxSource, MuxTrack};
 pub use subtitles::{SubtitleMode, SubtitleTrackSettings};

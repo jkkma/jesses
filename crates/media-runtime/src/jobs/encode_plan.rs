@@ -399,6 +399,8 @@ pub(super) struct Plan {
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
     pub(super) allow_parallel_svt: bool,
+    /// Use the exact SVT recipe from pre-1.3.0 recovery workspaces.
+    pub(super) legacy_svt_parameters: bool,
     source_pixel_format: &'static str,
     source_is_vp9_alpha: bool,
     pub output_pixel_format: &'static str,
@@ -601,30 +603,37 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
                 && !settings.hdr10_fallback
         }
     };
-    if !valid || !(1..=32).contains(&settings.workers) {
+    if !(1..=media_core::MAX_WORKERS).contains(&settings.workers) {
+        return Err(AppError::new(
+            "ENCODE_SETTINGS_INVALID",
+            format!("Use 1–{} workers.", media_core::MAX_WORKERS),
+            None,
+        ));
+    }
+    if !valid {
         return Err(AppError::new(
             "ENCODE_SETTINGS_INVALID",
             match settings.encoder {
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-                    "Use SVT CRF 0–63 in the whole-number field or 0–70 in 0.25 steps, an advertised preset from -3–13, film grain synthesis from 0–50, and 1–32 workers."
+                    "Use SVT CRF 0–63 in the whole-number field or 0–70 in 0.25 steps, an advertised preset from -3–13, and film grain synthesis from 0–50."
                 }
                 VideoEncoder::X264 => {
-                    "x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "x264 requires CRF 0–51, preset 0–9, grain 0, and HDR10 fallback off."
                 }
                 VideoEncoder::X265 | VideoEncoder::X265Standalone => {
-                    "x265 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "x265 requires CRF 0–51, preset 0–9, grain 0, and HDR10 fallback off."
                 }
                 VideoEncoder::Vp9 => {
-                    "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "VP9 requires standalone mode, CRF 0–63, speed preset 0–5, grain 0, and HDR10 fallback off."
                 }
                 VideoEncoder::AomAv1 => {
-                    "AOM requires CRF 0–63, speed preset 0–8, film grain synthesis 0–50, HDR10 fallback off, and 1–32 workers."
+                    "AOM requires CRF 0–63, speed preset 0–8, film grain synthesis 0–50, and HDR10 fallback off."
                 }
                 VideoEncoder::VpxStandalone => {
-                    "VPX requires CRF 0–63, speed preset 0–8, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "VPX requires CRF 0–63, speed preset 0–8, grain 0, and HDR10 fallback off."
                 }
                 VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
-                    "NVENC requires standalone mode, quality 0–51, preset P1–P7, grain 0, HDR10 fallback off, and 1–32 workers."
+                    "NVENC requires standalone mode, quality 0–51, preset P1–P7, grain 0, and HDR10 fallback off."
                 }
             },
             None,
@@ -732,13 +741,13 @@ pub(super) fn validate_hdr_metadata_settings(settings: &EncodeSettings) -> Resul
             ));
         }
         if settings.backend == EncodeBackend::Av1an
-            && !settings.av1an_options.is_some_and(|options| {
-                options.split_method == media_core::Av1anSplitMethod::FixedChunks
-                    && options.maximum_chunk_frames == 0
-            })
+            && !settings
+                .av1an_options
+                .unwrap_or_default()
+                .guarantees_single_chunk()
         {
             return Err(unsupported(
-                "External per-frame HDR metadata requires standalone encoding or a single AV1AN chunk (fixed splitting, maximum chunk frames 0). Parallel chunks require metadata sliced to their source frame intervals.",
+                "External per-frame HDR metadata must be applied to the whole video at once. Use standalone encoding or explicit fixed AV1AN splitting with maximum chunk frames 0. Source AV1AN derives its own chunk length.",
             ));
         }
         for path in [
@@ -1211,6 +1220,7 @@ impl Plan {
         Ok(Self {
             source_frames_estimated: false,
             allow_parallel_svt: false,
+            legacy_svt_parameters: false,
             output_origin: 0.0,
             source_origin: declared_origin,
             source_cut_ordinals: false,
@@ -2874,6 +2884,75 @@ mod tests {
     }
 
     #[test]
+    fn workers_accept_64_and_report_the_actual_upper_bound() {
+        let mut settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::SvtAv1Hdr,
+            workers: 64,
+            ..Default::default()
+        };
+        validate_settings(&settings).unwrap();
+        settings.workers = 65;
+        let error = validate_settings(&settings).unwrap_err();
+        assert_eq!(error.code, "ENCODE_SETTINGS_INVALID");
+        assert!(error.message.contains("1–64"));
+    }
+
+    #[test]
+    fn external_per_frame_hdr_requires_an_effective_single_av1an_chunk() {
+        for dolby_vision in [true, false] {
+            let path = std::env::temp_dir().join(if dolby_vision { "rpu.bin" } else { "hdr.json" });
+            let path = path.to_string_lossy().into_owned();
+            let metadata = if dolby_vision {
+                media_core::HdrMetadataSettings {
+                    dolby_vision_rpu_path: Some(path),
+                    ..Default::default()
+                }
+            } else {
+                media_core::HdrMetadataSettings {
+                    hdr10_plus_json_path: Some(path),
+                    ..Default::default()
+                }
+            };
+            let fixed = media_core::Av1anOptions {
+                split_method: media_core::Av1anSplitMethod::FixedChunks,
+                maximum_chunk_frames: 0,
+                ..Default::default()
+            };
+            let mut settings = EncodeSettings {
+                backend: EncodeBackend::Av1an,
+                encoder: VideoEncoder::SvtAv1Hdr,
+                hdr_metadata: Some(metadata),
+                av1an_options: Some(fixed),
+                ..Default::default()
+            };
+            validate_hdr_metadata_settings(&settings).unwrap();
+            for options in [
+                media_core::Av1anOptions {
+                    source_workflow: true,
+                    ..fixed
+                },
+                media_core::Av1anOptions {
+                    split_method: media_core::Av1anSplitMethod::SceneDetection,
+                    ..fixed
+                },
+                media_core::Av1anOptions {
+                    maximum_chunk_frames: 120,
+                    ..fixed
+                },
+            ] {
+                settings.av1an_options = Some(options);
+                let error = validate_hdr_metadata_settings(&settings).unwrap_err();
+                assert_eq!(error.code, "ENCODE_INPUT_UNSUPPORTED");
+                assert!(error.message.contains("standalone encoding"));
+            }
+            settings.backend = EncodeBackend::Standalone;
+            settings.av1an_options = None;
+            validate_hdr_metadata_settings(&settings).unwrap();
+        }
+    }
+
+    #[test]
     fn authored_hdr_output_does_not_replace_source_validation_metadata() {
         use media_core::{
             HdrChromaticity, HdrContentLight, HdrMasteringDisplay, HdrMetadataSettings,
@@ -3510,7 +3589,7 @@ mod tests {
                 .is_err()
             );
         }
-        for workers in [0, 33, 255] {
+        for workers in [0, u8::MAX] {
             assert!(
                 validate_settings(&EncodeSettings {
                     workers,

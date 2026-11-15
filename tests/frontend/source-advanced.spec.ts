@@ -4,6 +4,7 @@ import {
   av1anError,
   defaultAv1an,
   selectedAv1an,
+  grainTableIssue,
 } from '../../src/lib/components/shared/av1an-options';
 import { supportsDynamicHdr } from '../../src/lib/components/shared/hdr-metadata-options';
 import { requiredEncoderTools } from '../../src/lib/components/shared/encoder-options';
@@ -97,4 +98,38 @@ test('source AV1AN honors valid FFmpeg concat choices and retains the HEVC corre
   expect(requiredEncoderTools('av1an', 'x264', 'ffmpeg', true)).not.toContain('mkvmerge');
   expect(requiredEncoderTools('av1an', 'vpxStandalone', 'ffmpeg', true)).not.toContain('mkvmerge');
   expect(requiredEncoderTools('av1an', 'x264', 'ffmpeg', false)).toContain('mkvmerge');
+});
+
+test('grain table restrictions follow the encoder and effective chunking', () => {
+  const constant = 'filmgrn1\nE 0 100 1 2 1\n';
+  const late = 'filmgrn1\nE 10 100 1 2 1\n';
+  const timed = 'filmgrn1\nE 0 50 1 2 1\nE 50 100 1 2 1\n';
+  const draft = defaultAv1an(false);
+  for (const backend of ['standalone', 'av1an'] as const) {
+    expect(grainTableIssue('svtAv1Hdr', backend, constant, draft, true)).toBeNull();
+    expect(grainTableIssue('svtAv1Hdr', backend, timed, draft, true)).toContain(
+      'one segment starting at zero',
+    );
+    expect(grainTableIssue('svtAv1', backend, late, draft, true)).toContain(
+      'one segment starting at zero',
+    );
+  }
+  expect(
+    grainTableIssue('aomAv1', 'standalone', constant.replaceAll('\n', '\r\n'), draft, false),
+  ).toBe(
+    'AOM requires LF line endings in grain tables. Re-select the file to reload it, or use an LF copy.',
+  );
+  const tabbed = 'filmgrn1\nE 0 50 1 2 1\nE\t50 100 1 2 1\n';
+  const nonAsciiPrefix = 'filmgrn1\nE 0 100 1 2 1\n\u00a0E 100 200 1 2 1\n';
+  expect(grainTableIssue('svtAv1Hdr', 'standalone', tabbed, draft, false)).toContain(
+    'one segment starting at zero',
+  );
+  expect(grainTableIssue('svtAv1Hdr', 'standalone', nonAsciiPrefix, draft, false)).toBeNull();
+  expect(grainTableIssue('aomAv1', 'standalone', timed, draft, false)).toBeNull();
+  expect(grainTableIssue('aomAv1', 'av1an', timed, draft, true)).toContain('standalone AOM');
+  expect(grainTableIssue('aomAv1', 'av1an', timed, draft, false)).toContain('standalone AOM');
+  draft.splitMethod = 'fixedChunks';
+  draft.maximumChunkFrames = 0;
+  expect(grainTableIssue('aomAv1', 'av1an', timed, draft, false)).toBeNull();
+  expect(grainTableIssue('aomAv1', 'av1an', timed, draft, true)).toContain('standalone AOM');
 });

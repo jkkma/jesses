@@ -3059,7 +3059,7 @@ impl Recovery {
         source: &Path,
         prepared: Option<PreparedSource>,
         tools: Vec<PathBuf>,
-        plan: &Plan,
+        plan: &mut Plan,
         source_rate: (u32, u32),
         frame_count: usize,
         locator: Option<Av1anRecovery>,
@@ -3072,10 +3072,18 @@ impl Recovery {
             source.to_owned(),
             cancel.clone(),
         );
-        let params = super::encoder::parameters(plan, &settings)
-            .into_iter()
-            .map(|v| v.into_string().expect("encoder ASCII params"))
-            .collect::<Vec<_>>();
+        let encoder_params = |plan: &Plan| {
+            super::encoder::parameters(plan, &settings)
+                .into_iter()
+                .map(|v| v.into_string().expect("encoder ASCII params"))
+                .collect::<Vec<_>>()
+        };
+        let params = encoder_params(plan);
+        let legacy_params = (locator.is_some() && settings.encoder.is_svt()).then(|| {
+            let mut legacy = plan.clone();
+            legacy.legacy_svt_parameters = true;
+            encoder_params(&legacy)
+        });
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
         let estimated_frames = plan.source_frames_estimated;
         let pixel_format = plan.output_pixel_format.to_owned();
@@ -3090,7 +3098,7 @@ impl Recovery {
                     .then(|| plan.av1an_decoder_filter())
                     .flatten()
             };
-        tokio::task::spawn_blocking(move || {
+        let (recovery, intermediate, input, legacy_svt_parameters) = tokio::task::spawn_blocking(move || {
             let previous = locator.as_ref().map(|locator| load(&id, &request, &settings, locator)).transpose()?;
             let saved_source = previous.as_ref().map(|(_, manifest)| manifest.original_source.as_ref().unwrap_or(&manifest.source));
             let original_source = if let Some(saved) = saved_source.filter(|saved| saved.path == source) {
@@ -3112,6 +3120,7 @@ impl Recovery {
                 .map(|tool| digest(&tool.path, Some(&cancel)))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut preparation_lock=None;
+            let mut legacy_svt_parameters = false;
             let (root, mut manifest, intermediate) = if let Some(locator) = locator {
                 let (root, mut manifest) = load(&id, &request, &settings, &locator)?;
                 if source_workflow(&settings)&&manifest.queue_recipe.is_some() {
@@ -3188,10 +3197,15 @@ impl Recovery {
                     prepared.as_ref(),
                     Some(&cancel),
                 )?};
+                // Do not reinterpret a receipt or arbitrary saved argv. Only
+                // the exact previous planner recipe may run in legacy mode.
+                legacy_svt_parameters = manifest.edited_command.is_none()
+                    && manifest.params != params
+                    && legacy_params.as_ref() == Some(&manifest.params);
                 if !source_matches
                     || manifest.external_sources != external_sources
                     || !tool_contents_match(&manifest.tools, &tool_stamps)
-                    || (manifest.edited_command.is_none() && manifest.params != params)
+                    || (manifest.edited_command.is_none() && manifest.params != params && !legacy_svt_parameters)
                     || (manifest.edited_command.is_none() && manifest.pixel_format != pixel_format)
                     || manifest.fps_num != fps_num
                     || manifest.fps_den != fps_den
@@ -3328,8 +3342,10 @@ impl Recovery {
                 intermediate.clone_file()?.set_len(0).map_err(|e|error(&intermediate.path,e.to_string()))?;
             }
             workspace.save()?;
-            Ok((Self {root,finalizing,resume_chunks,inner:Arc::new(StdMutex::new(workspace))},intermediate,input))
-        }).await.map_err(|e|AppError::new("RECOVERY_INVALID",e.to_string(),None))?
+            Ok((Self {root,finalizing,resume_chunks,inner:Arc::new(StdMutex::new(workspace))},intermediate,input,legacy_svt_parameters))
+        }).await.map_err(|e|AppError::new("RECOVERY_INVALID",e.to_string(),None))??;
+        plan.legacy_svt_parameters = legacy_svt_parameters;
+        Ok((recovery, intermediate, input))
     }
 
     async fn with<T: Send + 'static>(
@@ -5785,6 +5801,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_preserves_only_the_exact_saved_svt_keyframe_recipe() {
+        for recipe in ["current", "legacy", "tampered"] {
+            let fixture = Fixture::new();
+            let (mut workspace, intermediate) = fixture.workspace();
+            let request = workspace.manifest.request.clone();
+            let source = PathBuf::from(&request.input_path);
+            let mut settings = EncodeSettings {
+                encoder: media_core::VideoEncoder::SvtAv1Hdr,
+                encoding_preferences: Some(media_core::EncodingPreferences {
+                    keyframe_interval_seconds: 1,
+                    mp4_faststart: false,
+                    full_output_verification: false,
+                }),
+                av1an_options: Some(media_core::Av1anOptions {
+                    encoder_threads: Some(4),
+                    ..Default::default()
+                }),
+                parameters: ["hbd-mds", "enable-overlays"]
+                    .into_iter()
+                    .map(|name| media_core::EncoderParameter {
+                        name: name.into(),
+                        value: "1".into(),
+                    })
+                    .collect(),
+                ..workspace.manifest.settings.clone()
+            };
+            let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({
+                "format":{"start_time":"0"},
+                "streams":[{"index":0,"codec_type":"video","codec_name":"ffv1","width":128,"height":72,
+                    "pix_fmt":"yuv420p10le","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0",
+                    "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
+                    "color_transfer":"bt709","color_range":"tv"}]
+            })).unwrap();
+            let mut plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+            plan.allow_parallel_svt = true;
+            let mut saved_plan = plan.clone();
+            saved_plan.allow_parallel_svt = recipe == "current";
+            settings.parameters.push(media_core::EncoderParameter {
+                name: "keyint".into(),
+                value: "321".into(),
+            });
+            let mut params_settings = settings.clone();
+            params_settings.encoding_preferences = None;
+            if recipe == "tampered" {
+                params_settings.parameters.last_mut().unwrap().value = "322".into();
+            }
+            let mut params: Vec<String> =
+                super::super::encoder::parameters(&saved_plan, &params_settings)
+                    .into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect();
+            if recipe != "current" {
+                let grain = params
+                    .iter()
+                    .position(|param| param == "--film-grain")
+                    .unwrap();
+                params.splice(grain..grain, ["--keyint".into(), "24".into()]);
+            }
+            workspace.manifest.params = params.clone();
+            workspace.manifest.settings = settings.clone();
+            workspace.manifest.pixel_format = plan.output_pixel_format.into();
+            workspace.manifest.source_filter = plan.av1an_decoder_filter();
+            workspace.save().unwrap();
+            let locator = workspace.summary();
+            drop(workspace);
+            drop(intermediate);
+
+            let (_owner, cancel) = watch::channel(false);
+            let resumed = Recovery::prepare(
+                "owned-job",
+                &request,
+                &settings,
+                &source,
+                None,
+                vec![],
+                &mut plan,
+                (24, 1),
+                48,
+                Some(locator),
+                &cancel,
+            )
+            .await;
+            if recipe == "tampered" {
+                assert!(resumed.is_err());
+            } else {
+                let (recovery, intermediate, _) = resumed.unwrap();
+                let args = super::super::arguments(
+                    &source,
+                    &intermediate.path,
+                    &recovery.root,
+                    &recovery.root.join("av1an.log"),
+                    &plan,
+                    &settings,
+                    recovery.resume_chunks,
+                    recovery.source_filter().unwrap().as_deref(),
+                );
+                let expected_params = params.join(" ");
+                assert!(args.windows(2).any(|pair| {
+                    pair[0] == "--video-params" && pair[1] == expected_params.as_str()
+                }));
+                assert_eq!(recovery.inner.lock().unwrap().manifest.params, params);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn persisted_launch_receipt_allows_crash_cleanup_without_changing_source_or_neighbor() {
         let fixture = Fixture::new();
         let (mut workspace, intermediate) = fixture.workspace();
@@ -5857,7 +5979,7 @@ mod tests {
                     "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
                     "color_transfer":"bt709","color_range":"tv"}]
             })).unwrap();
-            let plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+            let mut plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
             workspace.manifest.params = super::super::encoder::parameters(&plan, &settings)
                 .into_iter()
                 .map(|parameter| parameter.into_string().unwrap())
@@ -5881,7 +6003,7 @@ mod tests {
                     &source,
                     None,
                     tools,
-                    &plan,
+                    &mut plan,
                     (24, 1),
                     48,
                     Some(locator),

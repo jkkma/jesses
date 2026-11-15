@@ -57,6 +57,14 @@ pinned engine passed a native Segment job; older engines receive an actionable
 compatibility error before encoding.
 
 SVT and AOM can use a validated inline film-grain table or numeric grain synthesis.
+SVT uses one grain model for the whole video, even in a standalone encode. AOM
+honors table timestamps in a whole-input encode, but each AV1AN chunk starts
+at zero. For SVT or parallel AOM, use one table segment starting at zero and
+covering the complete video. For timed AOM tables, use standalone encoding or
+explicit fixed AV1AN splitting with maximum chunk frames set to zero.
+When the frame count or rate isn't known until encoding, Jesses checks coverage
+against the reconciled video before publishing the output.
+The built-in film-stock presets generate one grain model for the full duration.
 The table is saved as part of the immutable request. AV1AN stages it in the owned
 workspace and checks it again on recovery; standalone encodes stage a guarded
 temporary table for the encoder's lifetime. Optional denoising before an SVT table

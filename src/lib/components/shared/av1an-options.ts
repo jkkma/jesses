@@ -4,6 +4,7 @@ import type {
   Av1anTargetMetric,
   Av1anTargetQuality,
   EncoderParameter,
+  EncodeBackend,
   VideoEncoder,
 } from '$lib/ipc/generated';
 import { readAv1anPreferences } from './av1an-preferences';
@@ -59,6 +60,36 @@ export function av1anGrainConflict(
   )
     return 'Use one grain source: a grain table, film-grain synthesis, or the advanced noise override.';
   return null;
+}
+// Match Rust's split_ascii_whitespace (tab, LF, form feed, CR, space).
+export function grainTableSegments(table: string): string[][] {
+  return table
+    .split('\n')
+    .map((line) => line.split(/[\t\f\r ]+/).filter(Boolean))
+    .filter((fields) => fields[0] === 'E');
+}
+/** Checks the table properties available in the form; native validation checks coverage. */
+export function grainTableIssue(
+  encoder: VideoEncoder,
+  backend: EncodeBackend,
+  table: string | null | undefined,
+  draft: Av1anDraft,
+  sourceWorkflow: boolean,
+): string | null {
+  if (!table) return null;
+  if (encoder === 'aomAv1' && table.startsWith('filmgrn1\r\n'))
+    return 'AOM requires LF line endings in grain tables. Re-select the file to reload it, or use an LF copy.';
+  const svt = encoder === 'svtAv1' || encoder === 'svtAv1FiveFish' || encoder === 'svtAv1Hdr';
+  const chunkedAom =
+    encoder === 'aomAv1' &&
+    backend === 'av1an' &&
+    (sourceWorkflow || draft.splitMethod !== 'fixedChunks' || draft.maximumChunkFrames !== 0);
+  if (!svt && !chunkedAom) return null;
+  const segments = grainTableSegments(table);
+  if (segments.length === 1 && /^\+?0+$/.test(segments[0][1] ?? '')) return null;
+  return svt
+    ? 'SVT-AV1 uses one film-grain model for the whole video. Use a grain table with one segment starting at zero and covering the whole video.'
+    : 'Parallel AV1AN chunks restart the AOM grain table. Use a table with one segment starting at zero and covering the whole video, or use standalone AOM for timed grain.';
 }
 const whole = (value: number, low: number, high: number) =>
   Number.isInteger(value) && value >= low && value <= high;

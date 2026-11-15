@@ -132,7 +132,7 @@ pub(super) fn parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString
     super::grain::parameters(&mut args, settings);
     super::super::dynamic_hdr::Resources::parameters(&mut args, settings);
     let selected_threads = settings.av1an_options.unwrap_or_default().encoder_threads;
-    let threads = if super::super::parameters::requires_serial_svt(settings) {
+    let threads = if super::super::encode::requires_serial_svt(plan, settings) {
         Some(1)
     } else {
         selected_threads
@@ -278,7 +278,7 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+        let mut plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
         let args = parameters(&plan, &settings);
         assert_eq!(args.iter().filter(|value| *value == "--lp").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["--lp", "1"]));
@@ -288,5 +288,9 @@ mod tests {
                     .any(|pair| pair[0] == name && pair[1] == "1")
             );
         }
+        plan.allow_parallel_svt = true;
+        let args = parameters(&plan, &settings);
+        assert_eq!(args.iter().filter(|value| *value == "--lp").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--lp", "4"]));
     }
 }

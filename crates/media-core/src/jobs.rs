@@ -636,6 +636,8 @@ pub enum HdrTune {
     FilmGrain,
 }
 
+pub const MAX_WORKERS: u8 = 64;
+
 pub(crate) fn default_workers() -> u8 {
     2
 }

@@ -2,6 +2,74 @@ use super::*;
 use std::io::{Read, Write};
 pub(in crate::jobs) const TABLE_NAME: &str = "jesses-grain.tbl";
 
+pub(in crate::jobs) struct TableCoverage(Option<u64>);
+
+impl TableCoverage {
+    pub(in crate::jobs) fn from_settings(settings: &EncodeSettings) -> Result<Self, AppError> {
+        inline_table(settings).map_or(Ok(Self(None)), |table| Self::parse(settings, table))
+    }
+
+    fn parse(settings: &EncodeSettings, table: &str) -> Result<Self, AppError> {
+        if settings.encoder == media_core::VideoEncoder::AomAv1 && table.starts_with("filmgrn1\r\n")
+        {
+            return Err(invalid(
+                "AOM requires LF line endings in grain tables. Re-select the file to reload it, or use an LF copy.",
+            ));
+        }
+        let timing = crate::utilities::grain_table_timing(table.as_bytes())
+            .map_err(|message| AppError::new("ENCODE_SETTINGS_INVALID", message, None))?;
+        let svt = settings.encoder.is_svt();
+        let parallel_chunks = settings.backend == media_core::EncodeBackend::Av1an
+            && !settings
+                .av1an_options
+                .unwrap_or_default()
+                .guarantees_single_chunk();
+        if !svt && !parallel_chunks {
+            return Ok(Self(None));
+        }
+        // SVT applies its first model throughout, even on a full source. AOM
+        // honors timing, but each independently encoded chunk restarts at zero.
+        if timing.segments != 1 || timing.start != 0 {
+            return Err(invalid(if svt {
+                "SVT-AV1 uses one film-grain model for the whole video. Use a grain table with one segment starting at zero and covering the whole video."
+            } else {
+                "Parallel AV1AN chunks restart the AOM grain table. Use a table with one segment starting at zero and covering the whole video, or use standalone AOM for timed grain."
+            }));
+        }
+        Ok(Self(Some(timing.end)))
+    }
+
+    pub(in crate::jobs) fn verify(&self, frames: usize, rate: (u32, u32)) -> Result<(), AppError> {
+        let Some(end) = self.0 else { return Ok(()) };
+        // Grain-table ticks are 100 ns. Match that precision without rounding
+        // a rational video duration up to a tick the format cannot represent.
+        let video_end = frames as u128 * 10_000_000 * u128::from(rate.1) / u128::from(rate.0);
+        if u128::from(end) < video_end {
+            return Err(AppError::new(
+                "ENCODE_SETTINGS_INVALID",
+                format!(
+                    "The grain table ends at {:.3} s but the video needs {:.3} s. Use a grain table with one segment covering the whole video.",
+                    end as f64 / 10_000_000.0,
+                    video_end as f64 / 10_000_000.0
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn inline_table(settings: &EncodeSettings) -> Option<&str> {
+    settings
+        .av1an_grain
+        .as_ref()
+        .and_then(|grain| grain.table.as_deref())
+}
+
+fn invalid(message: &str) -> AppError {
+    AppError::new("ENCODE_SETTINGS_INVALID", message, None)
+}
+
 /// Standalone encoders may open a grain table while denying write sharing on
 /// Windows. Keep a read-only identity guard during encoding and retain the
 /// reserved temporary's identity for safe cleanup afterward.
@@ -99,7 +167,6 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
     let Some(grain) = &settings.av1an_grain else {
         return Ok(());
     };
-    let invalid = |message| AppError::new("ENCODE_SETTINGS_INVALID", message, None);
     if !(settings.encoder.is_svt() || settings.encoder == media_core::VideoEncoder::AomAv1) {
         return Err(invalid("Film-grain tables require SVT-AV1 or AOM."));
     }
@@ -117,8 +184,7 @@ pub(in crate::jobs) fn validate(settings: &EncodeSettings) -> Result<(), AppErro
                 "Use a grain table of at most 256 KiB with encoder grain strength set to zero.",
             ));
         }
-        crate::utilities::validate_grain_table(table.as_bytes())
-            .map_err(|message| AppError::new("ENCODE_SETTINGS_INVALID", message, None))?;
+        TableCoverage::parse(settings, table)?;
     }
     Ok(())
 }
@@ -235,6 +301,99 @@ pub(in crate::jobs) fn parameters(args: &mut Vec<OsString>, settings: &EncodeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timed_grain_tables_require_a_whole_input_aom_encode() {
+        const TIMED: [&str; 2] = [
+            "filmgrn1\nE 0 20000000 1 2 1\nE\t20000000 40000000 1 3 1\n",
+            "filmgrn1\nE 10000000 20000000 1 2 1\n",
+        ];
+        let single_chunk = media_core::Av1anOptions {
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            maximum_chunk_frames: 0,
+            ..Default::default()
+        };
+        for encoder in [
+            media_core::VideoEncoder::SvtAv1,
+            media_core::VideoEncoder::SvtAv1FiveFish,
+            media_core::VideoEncoder::SvtAv1Hdr,
+            media_core::VideoEncoder::AomAv1,
+        ] {
+            for (backend, av1an_options, whole_input) in [
+                (media_core::EncodeBackend::Standalone, None, true),
+                (media_core::EncodeBackend::Av1an, Some(single_chunk), true),
+                (media_core::EncodeBackend::Av1an, None, false),
+                (
+                    media_core::EncodeBackend::Av1an,
+                    Some(media_core::Av1anOptions {
+                        source_workflow: true,
+                        ..single_chunk
+                    }),
+                    false,
+                ),
+            ] {
+                let mut settings = EncodeSettings {
+                    backend,
+                    encoder,
+                    av1an_options,
+                    ..Default::default()
+                };
+                for table in TIMED {
+                    settings.av1an_grain = Some(media_core::Av1anGrainSettings {
+                        table: Some(table.into()),
+                        denoise: false,
+                        denoise_strength: 4,
+                    });
+                    let result = validate(&settings);
+                    if !encoder.is_svt() && whole_input {
+                        assert!(result.is_ok(), "{encoder:?} {backend:?}: {result:?}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code, "ENCODE_SETTINGS_INVALID");
+                    }
+                }
+                settings.av1an_grain.as_mut().unwrap().table =
+                    Some("filmgrn1\nE 0 40000000 1 2 1\n".into());
+                assert!(validate(&settings).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_aom_inline_tables_with_crlf_magic() {
+        let settings = EncodeSettings {
+            encoder: media_core::VideoEncoder::AomAv1,
+            av1an_grain: Some(media_core::Av1anGrainSettings {
+                table: Some("filmgrn1\r\nE 0 40000000 1 2 1\r\n".into()),
+                denoise: false,
+                denoise_strength: 4,
+            }),
+            ..Default::default()
+        };
+        let error = validate(&settings).unwrap_err();
+        assert!(error.message.contains("LF") && error.message.contains("Re-select"));
+    }
+
+    #[test]
+    fn constant_grain_must_cover_the_reconciled_video_clock() {
+        let settings = EncodeSettings {
+            encoder: media_core::VideoEncoder::SvtAv1Hdr,
+            av1an_grain: Some(media_core::Av1anGrainSettings {
+                table: Some("filmgrn1\nE 0 40040000 1 2 1\n".into()),
+                denoise: false,
+                denoise_strength: 4,
+            }),
+            ..Default::default()
+        };
+        let coverage = TableCoverage::from_settings(&settings).unwrap();
+        coverage.verify(95, (24_000, 1001)).unwrap();
+        coverage.verify(96, (24_000, 1001)).unwrap();
+        let error = coverage.verify(97, (24_000, 1001)).unwrap_err();
+        assert_eq!(error.code, "ENCODE_SETTINGS_INVALID");
+        assert!(error.message.contains("the video needs"));
+        TableCoverage(Some(416_666)).verify(1, (24, 1)).unwrap();
+        assert!(TableCoverage(Some(416_665)).verify(1, (24, 1)).is_err());
+    }
+
     #[test]
     fn synthetic_noise_cannot_silently_displace_selected_grain() {
         let mut settings = EncodeSettings {
@@ -273,10 +432,18 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
+        let selected = root.join("selected.tbl");
+        let source_bytes = b"filmgrn1\r\nE 0 100 1 2 1\r\n";
+        std::fs::write(&selected, source_bytes).unwrap();
+        let table =
+            crate::utilities::read_av1an_grain_table(selected.to_string_lossy().into_owned())
+                .unwrap();
+        assert_eq!(table, "filmgrn1\nE 0 100 1 2 1\n");
+        assert_eq!(std::fs::read(&selected).unwrap(), source_bytes);
         let settings = EncodeSettings {
             backend: media_core::EncodeBackend::Av1an,
             av1an_grain: Some(media_core::Av1anGrainSettings {
-                table: Some("filmgrn1\nE 0 100 1 2 1\n".into()),
+                table: Some(table),
                 denoise: false,
                 denoise_strength: 4,
             }),
@@ -311,11 +478,15 @@ mod tests {
         }
         drop(guard);
         assert!(stage(&root, &settings).is_ok());
-        std::fs::write(&path, b"changed").unwrap();
+        // A different line ending is enough to break a saved staging binding;
+        // only fresh reads normalize, and a resume never rewrites saved bytes.
+        std::fs::write(&path, source_bytes).unwrap();
         assert_eq!(
             stage(&root, &settings).err().unwrap().code,
             "RECOVERY_VALIDATION_FAILED"
         );
+        assert_eq!(std::fs::read(&path).unwrap(), source_bytes);
+        std::fs::remove_file(selected).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

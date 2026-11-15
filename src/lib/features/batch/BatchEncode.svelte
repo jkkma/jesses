@@ -23,6 +23,7 @@
     selectedAv1an,
     av1anError,
     av1anGrainConflict,
+    grainTableIssue,
     type Av1anDraft,
   } from '$lib/components/shared/av1an-options';
   import TemporalOptions from '$lib/components/shared/TemporalOptions.svelte';
@@ -193,7 +194,7 @@
   let hdr10Fallback = $state(false);
   let lineartPsyBias = $state<number | undefined>(0);
   let texturePsyBias = $state<number | undefined>(0);
-  let hdrTune = $state<HdrTune>('filmGrain');
+  let hdrTune = $state<HdrTune>(encoderOptions('svtAv1Hdr').defaultHdrTune);
   let outputDirectory = $state('');
   let outputContainer = $state<ContainerFormat>('matroska');
   let outputNameTemplate = $state('{name}_{codec}');
@@ -379,6 +380,9 @@
         tools.some((tool) => tool.id === 'mkvmerge' && tool.available)),
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
+  const grainTableError = $derived(
+    encodingVideo ? grainTableIssue(encoder, backend, av1anGrain?.table, av1an, false) : null,
+  );
   const grainConflict = $derived(
     backend === 'av1an' && isSvtEncoder(encoder)
       ? av1anGrainConflict(parameters, filmGrain, av1anGrain)
@@ -491,6 +495,7 @@
     hdrMetadata &&
       (hdrMetadata.dolbyVisionRpuPath || hdrMetadata.hdr10PlusJsonPath) &&
       (av1anFilters.length > 0 ||
+        !!av1anGrain?.denoise ||
         (backend === 'av1an' &&
           (av1an.splitMethod !== 'fixedChunks' || av1an.maximumChunkFrames !== 0)) ||
         selectedFiles.some((file) => {
@@ -502,7 +507,7 @@
             draft.toneMap.enabled
           );
         }))
-      ? 'Dynamic HDR imports require untrimmed sources without picture or timing changes. For av1an, select fixed chunks and set maximum chunk frames to 0.'
+      ? 'Dynamic HDR imports require untrimmed sources without picture or timing changes, including denoising. For av1an, select fixed chunks and set maximum chunk frames to 0.'
       : null,
   );
   const canPreview = $derived(
@@ -510,6 +515,7 @@
       toolsReady &&
       validSettings &&
       !dynamicHdrIssue &&
+      !grainTableError &&
       (!encodingVideo ||
         !hdrMetadata ||
         (supportsHdrMetadata(encoder) &&
@@ -845,6 +851,9 @@
     </p>
   </details>
   {#if error}<div class="notice error-notice" role="alert"><p>{error}</p></div>{/if}
+  {#if grainTableError}<div class="notice error-notice" role="alert">
+      <p>{grainTableError}</p>
+    </div>{/if}
   {#if submissionNotice}<div class="notice" role="status"><p>{submissionNotice}</p></div>{/if}
   <div class="batch-grid">
     <section class="panel batch-sources" aria-label="Batch source selection">

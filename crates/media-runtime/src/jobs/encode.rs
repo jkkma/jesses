@@ -504,8 +504,8 @@ impl JobManager {
                     && settings.backend == media_core::EncodeBackend::Standalone
                     && settings.encoder.is_svt()
                     && svt_ivf::rewrites_count(&identity);
-                allow_parallel_svt = !thorough
-                    && super::parameters::allows_parallel_standalone_svt(settings, &identity);
+                allow_parallel_svt =
+                    !thorough && super::parameters::allows_parallel_svt(settings, &identity);
                 super::rate_control::validate_encoder_version(settings, &identity).map_err(
                     |message| files::error("ENCODER_CAPABILITY_UNSUPPORTED", message, path),
                 )?;
@@ -938,9 +938,6 @@ impl JobManager {
         // Recoverable jobs keep the lane count recorded by their command
         // signature and use the same lane count across both bitrate passes.
         plan.allow_parallel_svt = allow_parallel_svt && standalone_locator.is_none();
-        if requires_serial_svt(&plan, settings) {
-            self.change(id, |snapshot| append_log(snapshot, "SVT high-bit-depth mode decision plus overlays uses one processing lane (lp=1), within the selected worker limit, to avoid the observed SVT4.2 parallel short-clip crash. Both requested controls remain enabled.".into())).await;
-        }
         let interval = settings
             .trim
             .map(|trim| super::trim::Interval::build(trim, frame_count, plan.fps_num, plan.fps_den))
@@ -1004,6 +1001,12 @@ impl JobManager {
             plan.set_exact_duplicate_count(source_frame_count, report.unique_frames)?;
         }
         let transformed_frame_count = plan.activate_temporal(source_frame_count)?;
+        let grain_coverage = av1an::GrainTableCoverage::from_settings(settings)?;
+        // Lean jobs and free-form filters obtain the exact output clock from
+        // the normal producer/AV1AN reconciliation, without an extra decode.
+        if !plan.source_frames_estimated && !settings.source_filters {
+            grain_coverage.verify(transformed_frame_count, (plan.fps_num, plan.fps_den))?;
+        }
         let mut frame_count = if settings.backend == media_core::EncodeBackend::Av1an
             && (settings.source_filters
                 || settings
@@ -1503,7 +1506,7 @@ impl JobManager {
                 &source.path,
                 prepared_source,
                 tools,
-                &plan,
+                &mut plan,
                 declared_rate,
                 frame_count,
                 locator,
@@ -1521,7 +1524,7 @@ impl JobManager {
         } else {
             let locator = standalone_locator;
             let two_pass = rate.as_ref().is_some_and(|value| value.two_pass);
-            let mut arguments = consumer_arguments(&plan, settings);
+            let mut arguments = standalone_recovery_arguments(&plan, settings);
             if let Some(rate) = &rate {
                 rate.arguments_for_settings(&mut arguments, settings, if two_pass { 2 } else { 1 });
             }
@@ -1627,6 +1630,9 @@ impl JobManager {
                 video
             }
         };
+        if requires_serial_svt(&plan, settings) {
+            self.change(id, |snapshot| append_log(snapshot, "SVT high-bit-depth mode decision plus overlays uses one processing lane (lp=1), within the selected worker limit, to avoid the observed SVT 4.2 parallel short-clip crash. Both requested controls remain enabled.".into())).await;
+        }
         // A resumed final stage is a committed recovery checkpoint, not an
         // attempt owned by execute's unconditional cleanup. Keep its durable
         // owner local so another cancellation releases the handle while
@@ -3089,6 +3095,7 @@ impl JobManager {
         if let Some(staged) = standalone_hdr.take() {
             staged.finish()?;
         }
+        grain_coverage.verify(frame_count, (plan.fps_num, plan.fps_den))?;
         let expected_kinds = (!thorough).then(|| {
             output_selected
                 .iter()
@@ -4480,8 +4487,10 @@ fn svt_quality(settings: &EncodeSettings) -> (String, String) {
     (svt_crf, svt_preset)
 }
 
-fn requires_serial_svt(plan: &Plan, settings: &EncodeSettings) -> bool {
-    !plan.allow_parallel_svt && super::parameters::requires_serial_svt(settings)
+pub(super) fn requires_serial_svt(plan: &Plan, settings: &EncodeSettings) -> bool {
+    (!plan.allow_parallel_svt
+        || (plan.legacy_svt_parameters && settings.backend == media_core::EncodeBackend::Av1an))
+        && super::parameters::requires_serial_svt(settings)
 }
 
 pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
@@ -4523,7 +4532,13 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         args.extend(["--lossless".into(), "1".into()]);
     }
     args.extend(plan.hdr_arguments());
-    if let Some(frames) = super::encoding_preferences::keyframes(plan, settings) {
+    if (plan.legacy_svt_parameters
+        || !settings
+            .parameters
+            .iter()
+            .any(|value| value.name == "keyint"))
+        && let Some(frames) = super::encoding_preferences::keyframes(plan, settings)
+    {
         args.extend(["--keyint".into(), frames.to_string().into()]);
     }
     // Keep the coded source texture. Synthesis is an explicit setting and never
@@ -4590,6 +4605,23 @@ pub(in crate::jobs) fn consumer_arguments(plan: &Plan, settings: &EncodeSettings
             ffmpeg_video::arguments(plan, settings)
         }
     }
+}
+
+fn standalone_recovery_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+    if !settings.encoder.is_svt()
+        || settings.encoding_preferences.is_none()
+        || !settings
+            .parameters
+            .iter()
+            .any(|value| value.name == "keyint")
+    {
+        return consumer_arguments(plan, settings);
+    }
+    // Version-one standalone receipts retain their argument signature. SVT
+    // already used the final keyint value; actual invocation emits it once.
+    let mut legacy = plan.clone();
+    legacy.legacy_svt_parameters = true;
+    consumer_arguments(&legacy, settings)
 }
 
 fn svt_progress_frame_limit(settings: &EncodeSettings, frames: usize) -> Option<usize> {
@@ -5489,6 +5521,45 @@ mod tests {
             assert_eq!(argument_after(&args, "--crf"), expected);
             assert_eq!(argument_after(&args, "--preset"), "-1");
         }
+    }
+
+    #[test]
+    fn svt_keyframe_override_replaces_the_planned_interval() {
+        let (_, plan) = producer_plan();
+        let mut settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            encoding_preferences: Some(media_core::EncodingPreferences {
+                keyframe_interval_seconds: 1,
+                mp4_faststart: false,
+                full_output_verification: false,
+            }),
+            ..Default::default()
+        };
+        let args = encoder_parameters(&plan, &settings);
+        assert_eq!(args.iter().filter(|arg| *arg == "--keyint").count(), 1);
+        assert_eq!(
+            argument_after(&args, "--keyint"),
+            super::super::encoding_preferences::keyframes(&plan, &settings)
+                .unwrap()
+                .to_string()
+        );
+        settings.parameters.push(media_core::EncoderParameter {
+            name: "keyint".into(),
+            value: "321".into(),
+        });
+        let args = encoder_parameters(&plan, &settings);
+        assert_eq!(args.iter().filter(|arg| *arg == "--keyint").count(), 1);
+        assert_eq!(argument_after(&args, "--keyint"), "321");
+        let original_keyint = super::super::encoding_preferences::keyframes(&plan, &settings)
+            .unwrap()
+            .to_string();
+        let signature = standalone_recovery_arguments(&plan, &settings);
+        let saved_keyints: Vec<_> = signature
+            .windows(2)
+            .filter(|pair| pair[0] == "--keyint")
+            .map(|pair| pair[1].to_str().unwrap())
+            .collect();
+        assert_eq!(saved_keyints, [original_keyint.as_str(), "321"]);
     }
 
     #[test]

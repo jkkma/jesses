@@ -350,6 +350,29 @@ fn fake_tool() {
             }
             std::process::exit(0);
         }
+        "watchdog-chunk-output" | "watchdog-stalled-chunk" => {
+            let chunk = path.join("encode/00000.ivf");
+            for _ in 1..=30 {
+                if mode == "watchdog-chunk-output" {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&chunk)
+                        .unwrap()
+                        .write_all(&[0])
+                        .unwrap();
+                } else {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&chunk)
+                        .unwrap()
+                        .write_all(&[0; 16])
+                        .unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
+        }
         "small" => {
             std::io::stdout()
                 .write_all(b"binary\0\xff\r\ncomplete")
@@ -722,6 +745,7 @@ fn start_watchdog(
                 &work.join("job.log"),
                 WATCHDOG_LIMIT,
                 [&work.join("done.json"), &work.join("av1an.log")],
+                &work.join("encode"),
                 None,
                 pause.as_ref(),
             )
@@ -741,6 +765,30 @@ async fn watchdog_allows_active_output_or_progress_files_past_the_limit() {
         assert!(result.unwrap().status.success(), "watchdog fixture {mode}");
         assert!(started.elapsed() > WATCHDOG_LIMIT);
     }
+}
+
+#[tokio::test]
+async fn watchdog_allows_quiet_chunks_while_output_grows() {
+    let fixture = Fixture::new("watchdog-chunk-output");
+    std::fs::create_dir(fixture.0.join("encode")).unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let started = std::time::Instant::now();
+    let result = start_watchdog(&fixture, cancel, None).await.unwrap();
+    assert!(result.unwrap().status.success());
+    assert!(started.elapsed() > WATCHDOG_LIMIT);
+}
+
+#[tokio::test]
+async fn watchdog_stops_a_chunk_that_rewrites_the_same_size() {
+    let fixture = Fixture::new("watchdog-stalled-chunk");
+    std::fs::create_dir(fixture.0.join("encode")).unwrap();
+    std::fs::write(fixture.0.join("encode/00000.ivf"), [0; 16]).unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let task = start_watchdog(&fixture, cancel, None);
+    let pid = fixture.pid(0).await;
+    let result = task.await.unwrap();
+    assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
+    assert_dead(&[pid]).await;
 }
 
 #[tokio::test]

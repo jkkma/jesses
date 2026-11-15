@@ -140,3 +140,74 @@ test('source AV1AN CPU tone request freezes both source workflow authorities', a
     av1anOptions: { sourceWorkflow: true },
   });
 });
+
+test('AV1AN explains that dynamic HDR imports need Quick Convert', async ({ page }) => {
+  await open(page);
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await av.getByRole('tab', { name: 'HDR Metadata' }).click();
+  await av.getByLabel('dolby-vision-rpu value').fill('/media/rpu.bin');
+  await expect(av.getByRole('alert').filter({ hasText: 'Use Quick Convert' })).toBeVisible();
+  await expect(av.getByText(/maximum chunk frames/i)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Run: AV1AN encode', exact: true })).toBeDisabled();
+});
+
+test('Quick Convert continues to accept an untrimmed dynamic HDR import', async ({ page }) => {
+  const quick = await open(page);
+  await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+  await quick.getByRole('tab', { name: 'Advanced' }).click();
+  await quick.getByRole('tab', { name: 'HDR Metadata' }).click();
+  await quick.getByLabel('hdr10plus-json value').fill('/media/hdr10plus.json');
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(run).toBeEnabled();
+  await run.click();
+  const settings = (await calls(page, 'mock_start_encode'))[0].settings;
+  expect(settings.hdrMetadata.hdr10PlusJsonPath).toBe('/media/hdr10plus.json');
+  expect(settings.temporal).toBeUndefined();
+});
+
+test('Quick Convert rejects geometry or timing changes with dynamic HDR imports', async ({
+  page,
+}) => {
+  const quick = await open(page);
+  await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+  await quick.getByRole('tab', { name: 'Advanced' }).click();
+  await quick.getByRole('tab', { name: 'HDR Metadata' }).click();
+  await quick.getByLabel('dolby-vision-rpu value').fill('/media/rpu.bin');
+  await quick.getByRole('tab', { name: 'Video', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(run).toBeEnabled();
+  await quick.getByLabel('Resize', { exact: true }).selectOption('720p');
+  await expect(run).toBeDisabled();
+  await expect(
+    quick.getByRole('alert').filter({ hasText: 'without picture or timing changes' }),
+  ).toBeVisible();
+  await quick.getByLabel('Resize', { exact: true }).selectOption('none');
+  await expect(run).toBeEnabled();
+  await quick.getByLabel('Frame Rate', { exact: true }).fill('30');
+  await expect(run).toBeDisabled();
+  await expect(
+    quick.getByRole('alert').filter({ hasText: 'without picture or timing changes' }),
+  ).toBeVisible();
+});
+
+test('Quick Convert blocks denoising with dynamic HDR metadata', async ({ page }) => {
+  const quick = await open(page);
+  await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+  await quick.getByRole('tab', { name: 'Advanced' }).click();
+  await quick.getByRole('tab', { name: 'HDR Metadata' }).click();
+  await quick.getByLabel('dolby-vision-rpu value').fill('/media/rpu.bin');
+  await quick.getByRole('tab', { name: 'Video', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await quick.getByLabel('Grain Synthesis').selectOption('table');
+  await quick.getByPlaceholder('Path to a .tbl grain table').fill('/media/grain.tbl');
+  await quick.getByPlaceholder('Path to a .tbl grain table').blur();
+  await expect(quick.getByRole('checkbox', { name: 'Denoise', exact: true })).toBeChecked();
+  await expect(run).toBeDisabled();
+  await expect(
+    quick.getByRole('alert').filter({ hasText: 'without picture or timing changes' }),
+  ).toBeVisible();
+  await quick.getByRole('checkbox', { name: 'Denoise', exact: true }).uncheck();
+  await expect(run).toBeEnabled();
+});

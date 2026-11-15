@@ -41,7 +41,6 @@
   import { parameterError } from './encoder-parameters';
   import type { EncoderParameter } from '$lib/ipc/generated';
   import type { EncoderParameterCatalog } from '$lib/ipc/generated';
-  import Av1anOptionsControl from './Av1anOptions.svelte';
   import Av1anResources from './Av1anResources.svelte';
   import Av1anGrain from './Av1anGrain.svelte';
   import Av1anFilters from './Av1anFilters.svelte';
@@ -60,6 +59,7 @@
     selectedAv1an,
     av1anError,
     av1anGrainConflict,
+    grainTableIssue,
     type Av1anDraft,
   } from './av1an-options';
   import TemporalOptions from './TemporalOptions.svelte';
@@ -96,7 +96,6 @@
   import TrimOptions from './TrimOptions.svelte';
   import ToneMapOptions from './ToneMapOptions.svelte';
   import RateControlOptions from './RateControlOptions.svelte';
-  import HdrMetadataOptions from './HdrMetadataOptions.svelte';
   import {
     supportsHdrMetadata,
     supportsDynamicHdr,
@@ -1772,16 +1771,35 @@
         tools.some((tool) => tool.id === 'mkvmerge' && tool.available)),
   );
   const disabled = $derived(!desktop || !usableSource || submitting);
+  // The source workflow keeps a resampler preference even when no resize occurs.
+  // It does not change frames and must not block a dynamic HDR import.
+  const requestTemporal = $derived.by(() => {
+    const value = selectedTemporal(temporal);
+    const hasDynamicHdr = hdrMetadata?.dolbyVisionRpuPath || hdrMetadata?.hdr10PlusJsonPath;
+    return hasDynamicHdr &&
+      value &&
+      Object.keys(value).every((key) => key === 'resizeFilter') &&
+      framingSummary(selectedFraming(activeFraming)) === 'Source dimensions'
+      ? undefined
+      : value;
+  });
   const dynamicHdrIssue = $derived(
-    hdrMetadata &&
-      (hdrMetadata.dolbyVisionRpuPath || hdrMetadata.hdr10PlusJsonPath) &&
-      (trim.enabled ||
-        !!selectedTemporal(temporal) ||
-        framingSummary(selectedFraming(activeFraming)) !== 'Source dimensions' ||
-        toneMap.enabled ||
-        av1anFilters.length > 0 ||
-        (chunked && (av1an.splitMethod !== 'fixedChunks' || av1an.maximumChunkFrames !== 0)))
-      ? 'Dynamic HDR imports require an untrimmed source without picture or timing changes. For av1an, select fixed chunks and set maximum chunk frames to 0.'
+    hdrMetadata && (hdrMetadata.dolbyVisionRpuPath || hdrMetadata.hdr10PlusJsonPath)
+      ? chunked
+        ? 'Dynamic HDR imports need the whole video in one encode. Use Quick Convert for this source.'
+        : trim.enabled ||
+            !!requestTemporal ||
+            framingSummary(selectedFraming(activeFraming)) !== 'Source dimensions' ||
+            toneMap.enabled ||
+            !!av1anGrain?.denoise ||
+            av1anFilters.length > 0
+          ? 'Dynamic HDR imports require an untrimmed source without picture or timing changes, including denoising.'
+          : null
+      : null,
+  );
+  const grainTableError = $derived(
+    encodingVideo
+      ? grainTableIssue(encoder, backend, gridGrain?.table ?? av1anGrain?.table, av1an, true)
       : null,
   );
   const grainConflict = $derived(
@@ -2024,6 +2042,7 @@
           validSettings &&
           !dynamicHdrIssue &&
           !gridGrainIssue &&
+          !grainTableError &&
           !parsedHdr.error &&
           (!encodingVideo ||
             !hdrMetadata ||
@@ -2556,9 +2575,7 @@
                 .map((value) => ({ ...value })),
             }
           : {}),
-        ...(pictureEnabled && selectedTemporal(temporal)
-          ? { temporal: selectedTemporal(temporal) }
-          : {}),
+        ...(pictureEnabled && requestTemporal ? { temporal: requestTemporal } : {}),
         videoStreamIndex: videoIndex ?? 0,
         ...(!pictureEnabled ? { videoMode: effectiveVideoMode } : {}),
         ...(chunked
@@ -4451,8 +4468,17 @@
             type="number"
             min="1"
             max="16"
+            disabled={!sourcePreferences?.fullOutputVerification ||
+              av1an.splitMethod !== 'sceneDetection' ||
+              av1an.chunkMethod !== 'lsmash'}
+            aria-describedby="slices-help"
             bind:value={av1an.sceneDetectionSlices}
           />
+          <span></span><small id="slices-help"
+            >Parallel detection requires Thorough verification, scene detection, and L-SMASH. It may
+            also be skipped when resuming or if the AV1AN build or source frame count does not
+            support it.</small
+          >
         </div>
         <div class="form">
           <label for="workers">Workers</label><input
@@ -4547,7 +4573,11 @@
         >Clear Temp…</button
       >{/if}
   </div>
-  {#if error}<p role="alert">{error}</p>{/if}{#if sequenceIssue}<p role="alert">
+  {#if error}<p role="alert">{error}</p>{/if}{#if grainTableError}<p role="alert">
+      {grainTableError}
+    </p>{/if}{#if dynamicHdrIssue}<p role="alert">
+      {dynamicHdrIssue}
+    </p>{/if}{#if sequenceIssue}<p role="alert">
       AV1AN does not support image sequence folders.
     </p>{/if}{#if sourceTrackIssue}<p role="alert">
       {sourceTrackIssue}

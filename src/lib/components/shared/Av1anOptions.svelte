@@ -143,10 +143,15 @@
             min="1"
             max="16"
             step="1"
+            disabled
+            aria-describedby={`${idPrefix}-scene-slices-help`}
             value={draft.sceneDetectionSlices ?? 1}
             oninput={(event) => onchange({ ...draft, sceneDetectionSlices: number(event) })}
           />
-          <p>1–16 independent slices for scene detection; 1 scans the full source.</p>
+          <p id={`${idPrefix}-scene-slices-help`}>
+            Parallel detection requires Thorough verification, scene detection, and L-SMASH. This
+            batch workflow does not enable Thorough verification, so AV1AN detects scenes normally.
+          </p>
         </div>
       {/if}
       {#each frameFields as field}

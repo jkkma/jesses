@@ -194,6 +194,16 @@ impl Default for Av1anOptions {
     }
 }
 
+impl Av1anOptions {
+    /// The Source workflow derives a nonzero chunk length from the keyframe
+    /// preference, even when its draft happens to contain a zero maximum.
+    pub fn guarantees_single_chunk(self) -> bool {
+        !self.source_workflow
+            && self.split_method == Av1anSplitMethod::FixedChunks
+            && self.maximum_chunk_frames == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

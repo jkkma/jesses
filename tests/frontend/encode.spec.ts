@@ -479,3 +479,118 @@ test('a missing required encoder is named beside Run', async ({ page }) => {
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   await expect(page.getByText(/Missing required tool.*svt-av1-hdr/i)).toBeVisible();
 });
+
+test('AV1AN exposes scene slices only when the prepass prerequisites are selected', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  const slices = av.getByLabel('Detection Slices');
+  await expect(slices).toBeDisabled();
+  await expect(av.getByText(/Thorough verification.*L-SMASH/i)).toBeVisible();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Thorough verification (slower)' }).check();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByLabel('Split Method').selectOption('sceneDetection');
+  await av.getByLabel('Chunk Method').selectOption('lsmash');
+  await expect(slices).toBeEnabled();
+  await av.getByLabel('Chunk Method').selectOption('ffms2');
+  await expect(slices).toBeDisabled();
+  await av.getByLabel('Chunk Method').selectOption('lsmash');
+  await av.getByLabel('Split Method').selectOption('fixedChunks');
+  await expect(slices).toBeDisabled();
+});
+
+test('AV1AN accepts 64 workers and rejects 65', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  const workers = av.getByLabel('Workers', { exact: true });
+  await expect(workers).toHaveAttribute('max', '64');
+  await workers.fill('65');
+  await expect(page.getByRole('button', { name: 'Run: AV1AN encode', exact: true })).toBeDisabled();
+  await workers.fill('64');
+  await page.getByRole('button', { name: 'Run: AV1AN encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (call: any) => call.command === 'mock_start_encode',
+          )?.payload.request.settings.workers,
+      ),
+    )
+    .toBe(64);
+});
+
+test('SVT shows an inline error for a time-varying grain table', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate(
+    () => ((globalThis as any).__grainTable = 'filmgrn1\nE 0 50 1 2 1\nE 50 100 1 2 1\n'),
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Grain Synthesis').selectOption('table');
+  await quick.getByPlaceholder('Path to a .tbl grain table').fill('/media/grain.tbl');
+  await quick.getByPlaceholder('Path to a .tbl grain table').blur();
+  await expect(
+    quick.getByRole('alert').filter({ hasText: 'one segment starting at zero' }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeDisabled();
+});
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} applies the AOM timed-grain rule for its chunking`, async ({ page }) => {
+    await installSourceEncodeFixture(page);
+    await page.evaluate(
+      () => ((globalThis as any).__grainTable = 'filmgrn1\nE 0 50 1 2 1\nE 50 100 1 2 1\n'),
+    );
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    await region
+      .getByLabel(workflow === 'AV1AN' ? 'Encoder' : 'Codec', { exact: true })
+      .selectOption('aomAv1');
+    await region.getByLabel('Grain Synthesis').selectOption('table');
+    await region.getByPlaceholder('Path to a .tbl grain table').fill('/media/grain.tbl');
+    await region.getByPlaceholder('Path to a .tbl grain table').blur();
+    const warning = region.getByRole('alert').filter({ hasText: 'standalone AOM' });
+    const run = page.getByRole('button', {
+      name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
+      exact: true,
+    });
+    if (workflow === 'AV1AN') {
+      await expect(warning).toBeVisible();
+      await expect(run).toBeDisabled();
+    } else {
+      await expect(warning).toHaveCount(0);
+      await expect(run).toBeEnabled();
+    }
+  });
+}
+
+test('AOM reports an incompatible CRLF grain table', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate(() => ((globalThis as any).__grainTable = 'filmgrn1\r\nE 0 100 1 2 1\r\n'));
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Codec', { exact: true }).selectOption('aomAv1');
+  await quick.getByLabel('Grain Synthesis').selectOption('table');
+  await quick.getByPlaceholder('Path to a .tbl grain table').fill('/media/grain.tbl');
+  await quick.getByPlaceholder('Path to a .tbl grain table').blur();
+  await expect(
+    quick.getByRole('alert').filter({ hasText: 'AOM requires LF line endings' }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeDisabled();
+});
