@@ -350,7 +350,7 @@ impl Transform {
                 }
             ),
             ResolvedBackend::Cpu => format!(
-                "CPU zscale tone mapping with {:?} curve and {:.0}-nit peak{}{}{}.",
+                "CPU zscale tone mapping with {:?} curve and {:.0}-nit peak{}{}.{}",
                 self.cpu_algorithm(),
                 self.effective_peak_nits,
                 self.measured_peak_nits
@@ -500,8 +500,19 @@ impl Transform {
                     .map_or(headroom, |value| headroom.min(value))
                     .max(measured)
                     .clamp(100.0, 10_000.0);
-            } else if let Some(declared) = declared {
-                self.effective_peak_nits = declared.clamp(100.0, 10_000.0);
+            } else {
+                let fallback = if let Some(declared) = declared {
+                    self.effective_peak_nits = declared.clamp(100.0, 10_000.0);
+                    "Using the declared peak."
+                } else {
+                    "Using the configured peak."
+                };
+                let note = self.fallback_note.get_or_insert_with(String::new);
+                if !note.is_empty() {
+                    note.push(' ');
+                }
+                note.push_str("Peak sampling returned no measurements. ");
+                note.push_str(fallback);
             }
         }
         Ok(())

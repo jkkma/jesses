@@ -58,19 +58,20 @@
     >Preview command plan</button
   >
   {#if busy}<button type="button" onclick={cancel}>Cancel command preview</button>
-    <p role="status">Validating the complete source and preparing the actual encoder plan…</p>{/if}
+    <p role="status">Inspecting the source and preparing the encoder plan…</p>{/if}
   <details class="preview-help">
     <summary>About command preview</summary>
     <p class="small-muted">
-      Preview validates the whole source and may prepare temporary subtitles or measure target-size
-      audio. It creates no final output. Argument edits are restricted to the validated advanced
-      catalog.
+      Preview inspects the source to prepare the command and may prepare temporary subtitles or
+      measure target-size audio. The checks depend on the selected settings and source. It creates
+      no final output. Argument edits are restricted to the validated advanced catalog.
     </p>
   </details>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if plan}
     <p role="status">
-      Validated plan: {plan.outputFrameCount} frames at {plan.outputFrameRate} fps.
+      {#if plan.outputFrameCountEstimated}Estimated plan: about {plan.outputFrameCount} frames at {plan.outputFrameRate}
+        fps.{:else}Plan: {plan.outputFrameCount} frames at {plan.outputFrameRate} fps.{/if}
     </p>
     {#each plan.notes as note}<p class="small-muted">{note}</p>{/each}
     {#each plan.stages as stage, i}

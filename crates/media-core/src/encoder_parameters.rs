@@ -71,6 +71,7 @@ pub struct EncodeCommandPlan {
     pub request: EncodeRequest,
     pub source_fingerprint: String,
     pub output_frame_count: String,
+    pub output_frame_count_estimated: bool,
     pub output_frame_rate: String,
     pub stages: Vec<EncodeCommandStage>,
     pub notes: Vec<String>,

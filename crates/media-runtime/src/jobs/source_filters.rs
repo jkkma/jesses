@@ -21,14 +21,38 @@ tokio::task_local! { static CURRENT: Observation; }
 pub(in crate::jobs) struct ProducerClock {
     pub stream_index: u32,
     pub frames: u64,
-    /// Encoder-pre timebase. Raw Y4M child encoders use their explicit frame
-    /// clock rather than these upstream filter PTS values.
+    /// Timebase of the observed clock. Raw Y4M child encoders use their
+    /// explicit frame clock instead of these timestamps.
     pub time_base: (u32, u32),
     pub first_pts: i64,
     pub last_pts: i64,
     pub monotonic: bool,
     /// SHA256(previous digest || relative producer PTS i64 LE), zero seed.
     pub relative_pts_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Cadence {
+    pub frame_seconds: f64,
+    pub tolerance: f64,
+}
+
+impl Cadence {
+    fn check(self, clock: &ProducerClock) -> Result<(), AppError> {
+        let tick = f64::from(clock.time_base.0) / f64::from(clock.time_base.1);
+        let elapsed = (i128::from(clock.last_pts) - i128::from(clock.first_pts)) as f64 * tick;
+        let expected = (clock.frames - 1) as f64 * self.frame_seconds;
+        // Matroska's millisecond timestamps, for example, alternate 41 and
+        // 42 ms at 24000/1001 fps. Check the grid, with room for quantization.
+        if !clock.monotonic || (elapsed - expected).abs() > self.tolerance.max(tick) {
+            return Err(AppError::new(
+                "ENCODE_INPUT_UNSUPPORTED",
+                "Decoded frame timestamps are not constant-rate. The FFmpeg producer encountered variable cadence or a timestamp gap.",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -78,6 +102,14 @@ impl Observation {
         &self,
         indices: &[u32],
     ) -> Result<Vec<OsString>, AppError> {
+        self.arguments_for_clock(indices, false)
+    }
+
+    fn arguments_for_clock(
+        &self,
+        indices: &[u32],
+        source_clock: bool,
+    ) -> Result<Vec<OsString>, AppError> {
         let mut state = self.0.lock().unwrap_or_else(|cause| cause.into_inner());
         if let Some(error) = &state.error {
             return Err(error.clone());
@@ -101,11 +133,18 @@ impl Observation {
                 "JESSES_SOURCE_FILTER_{}_{invocation}_{index}",
                 std::process::id()
             );
+            // The default encoder clock rounds onto the nominal frame grid.
+            // Observe the original decoded frame's clock on an ordinary job.
+            let clock = if source_clock {
+                "{tbi} {ptsi}"
+            } else {
+                "{tb} {pts}"
+            };
             args.extend([
                 format!("-stats_enc_pre:{index}").into(),
                 temporary.path.as_os_str().to_owned(),
                 format!("-stats_enc_pre_fmt:{index}").into(),
-                format!("{tag} {{sidx}} {{tb}} {{pts}} {{n}}").into(),
+                format!("{tag} {{sidx}} {clock} {{n}}").into(),
             ]);
             files.push(StatsFile {
                 temporary,
@@ -116,8 +155,8 @@ impl Observation {
         state.invocations.push(Invocation { files });
         Ok(args)
     }
-    fn single_arguments(&self) -> Vec<OsString> {
-        match self.arguments_for_streams(&[0]) {
+    fn single_arguments(&self, source_clock: bool) -> Vec<OsString> {
+        match self.arguments_for_clock(&[0], source_clock) {
             Ok(args) => args,
             Err(error) => {
                 self.0
@@ -134,21 +173,39 @@ impl Observation {
         &self,
         cancel: &watch::Receiver<bool>,
     ) -> Result<Vec<ProducerClock>, AppError> {
+        self.completed_with_cadence(cancel, None).await
+    }
+
+    pub(super) async fn completed_with_cadence(
+        &self,
+        cancel: &watch::Receiver<bool>,
+        cadence: Option<Cadence>,
+    ) -> Result<Vec<ProducerClock>, AppError> {
         let state = self.0.clone();
         let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move||{
-            let mut state=state.lock().unwrap_or_else(|cause|cause.into_inner());
-            if let Some(error)=&state.error{return Err(error.clone());}
-            for invocation in state.invocations.iter_mut().rev(){
-                let mut active=false;
-                for file in &invocation.files{if file.temporary.clone_file()?.metadata().map_err(|cause|invalid(&cause.to_string()))?.len()>0{active=true;}}
-                if !active{continue;}
-                let mut clocks=Vec::with_capacity(invocation.files.len());
-                for file in &mut invocation.files{clocks.push(read_file(file,&cancel)?);}
+        tokio::task::spawn_blocking(move || {
+            let mut state = state.lock().unwrap_or_else(|cause| cause.into_inner());
+            if let Some(error) = &state.error {
+                return Err(error.clone());
+            }
+            for invocation in state.invocations.iter_mut().rev() {
+                let mut active = false;
+                for file in &invocation.files {
+                    let metadata = file.temporary.clone_file()?.metadata()
+                        .map_err(|cause| invalid(&cause.to_string()))?;
+                    active |= metadata.len() > 0;
+                }
+                if !active {
+                    continue;
+                }
+                let mut clocks = Vec::with_capacity(invocation.files.len());
+                for file in &mut invocation.files {
+                    clocks.push(read_file(file, &cancel, cadence)?);
+                }
                 return Ok(clocks);
             }
-            Err(invalid("The actual filtered producer did not supply frame observations. Its FFmpeg must support encoder-pre statistics."))
-        }).await.map_err(|cause|invalid(&cause.to_string()))?
+            Err(invalid("The FFmpeg producer did not supply frame observations. This encode requires support for encoder-pre statistics."))
+        }).await.map_err(|cause| invalid(&cause.to_string()))?
     }
 }
 fn invalid(message: &str) -> AppError {
@@ -157,6 +214,7 @@ fn invalid(message: &str) -> AppError {
 fn read_file(
     file: &mut StatsFile,
     cancel: &watch::Receiver<bool>,
+    cadence: Option<Cadence>,
 ) -> Result<ProducerClock, AppError> {
     let mut input = file.temporary.clone_file()?;
     input
@@ -196,7 +254,10 @@ fn read_file(
                 "A private producer observation has the wrong invocation identity.",
             ));
         }
-        record(values, &mut clocks).map_err(|cause| invalid(&cause))?;
+        let clock = record(values, &mut clocks).map_err(|cause| invalid(&cause))?;
+        if let Some(cadence) = cadence {
+            cadence.check(clock)?;
+        }
     }
     file.temporary.clone_file()?;
     if clocks.len() != 1 || !clocks.contains_key(&file.index) {
@@ -206,7 +267,10 @@ fn read_file(
     }
     Ok(clocks.remove(&file.index).unwrap())
 }
-fn record(values: &str, clocks: &mut BTreeMap<u32, ProducerClock>) -> Result<(), String> {
+fn record<'a>(
+    values: &str,
+    clocks: &'a mut BTreeMap<u32, ProducerClock>,
+) -> Result<&'a ProducerClock, String> {
     let mut parts = values.split_whitespace();
     let stream = parts
         .next()
@@ -264,13 +328,15 @@ fn record(values: &str, clocks: &mut BTreeMap<u32, ProducerClock>) -> Result<(),
         .frames
         .checked_add(1)
         .ok_or("Producer frame count overflow")?;
-    Ok(())
+    Ok(clock)
 }
 pub(in crate::jobs) fn current() -> Option<Observation> {
     CURRENT.try_with(Clone::clone).ok()
 }
-pub(in crate::jobs) fn arguments() -> Vec<OsString> {
-    current().map_or_else(Vec::new, |observation| observation.single_arguments())
+pub(in crate::jobs) fn arguments(source_clock: bool) -> Vec<OsString> {
+    current().map_or_else(Vec::new, |observation| {
+        observation.single_arguments(source_clock)
+    })
 }
 pub(in crate::jobs) async fn with_observer<T>(
     observation: Observation,
@@ -391,10 +457,9 @@ mod tests {
         let effects = root.join("effects.txt");
         let log = root.join("process.log");
         let observation = Observation::new(&root.join("output.mkv"));
-        let graph = format!(
-            "[in]scale=80:48,metadata=mode=add:key=jesses:value=once,metadata=mode=print:file='{}'[out]",
-            effects.display()
-        );
+        // Use the owned fixture directory as cwd so the filtergraph does not
+        // need to escape an absolute Windows drive prefix or backslashes.
+        let graph = "[in]scale=80:48,metadata=mode=add:key=jesses:value=once,metadata=mode=print:file=effects.txt[out]";
         let mut args = [
             "-v",
             "warning",
@@ -403,7 +468,7 @@ mod tests {
             "-i",
             "testsrc2=size=128x96:rate=4:duration=1",
             "-vf",
-            &graph,
+            graph,
         ]
         .into_iter()
         .map(OsString::from)
@@ -418,7 +483,7 @@ mod tests {
                     .unwrap_or_else(|| "ffmpeg".into())
                     .into(),
                 args,
-                cwd: None,
+                cwd: Some(root.clone()),
             },
             cancel.clone(),
             events,

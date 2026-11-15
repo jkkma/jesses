@@ -70,11 +70,10 @@ impl JobManager {
             None,
         );
         let execution = async {
-            if (settings.source_filters
-                || settings.tone_map.is_some_and(|tone| tone.source_workflow)
-                || quick_header_planning(settings))
-                && settings.backend == media_core::EncodeBackend::Standalone
-                && !settings.source_nvenc_quality
+            if can_observe_standalone_producer(settings)
+                && (settings.source_filters
+                    || settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                    || header_planning_allowed(settings))
             {
                 super::source_filters::with_observer(
                     super::source_filters::Observation::new(Path::new(&request.output_path)),
@@ -255,11 +254,12 @@ impl JobManager {
                             || error.message.contains("timelines that start at zero")) =>
                 {
                     required = true;
+                    self.change(id, |snapshot| append_log(snapshot, error.message.clone()))
+                        .await;
                 }
                 _ => return result,
             }
-            // A rejected source clock has not entered the encoder. Remove its
-            // owned capability-probe assets before the normalized retry.
+            // Remove the rejected attempt's owned assets before the normalized retry.
             for temporary in scratch.iter_mut() {
                 temporary.cleanup()?;
             }
@@ -681,10 +681,8 @@ impl JobManager {
                 ));
             }
         }
+        audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
         plan.check_temporal_tools(&ffmpeg, cancel).await?;
-        if check_capabilities {
-            audio::check_encoders(&ffmpeg, &mux_settings, cancel).await?;
-        }
         if check_capabilities
             && audio::converted(&mux_settings).any(|track| {
                 matches!(
@@ -835,12 +833,7 @@ impl JobManager {
                 .and_then(|format| format.format_name.as_deref())
                 .is_some_and(|names| names.split(',').any(|name| name == "mov"));
         let fast_av1an = settings.backend == media_core::EncodeBackend::Av1an
-            && !thorough
-            && settings.trim.is_none()
-            && settings.hdr_metadata.is_none()
-            && settings.rate_control.is_none()
-            && settings.mov_timecode_track.is_none()
-            && settings.temporal.is_none()
+            && header_planning_allowed(settings)
             && !plan.requires_av1an_preprocess()
             && !plan.requires_qtgmc()
             && !plan.requires_source_queue_clock_proof();
@@ -875,9 +868,13 @@ impl JobManager {
         let dynamic_hdr =
             super::dynamic_hdr::Resources::prepare(settings, frame_count, cancel).await?;
         external.validate_timecode_clock(plan.fps_num, plan.fps_den, frame_count)?;
-        // Container duration may include a longer audio or subtitle track.
-        // Peak sampling belongs to the selected, fully scanned source video.
         let source_video_duration = frame_count as f64 * plan.frame_seconds();
+        let peak_sample_duration = tone_map_sample_duration(
+            plan.source_frames_estimated,
+            source_video_duration,
+            video,
+            document.duration(),
+        );
         if source_origin.is_some()
             && let Some(video) = output_document
                 .streams
@@ -896,7 +893,7 @@ impl JobManager {
         let deferred_vulkan =
             self.command_review(id).await.is_some() && plan.requires_vulkan_tone_map();
         if !deferred_vulkan {
-            plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
+            plan.resolve_tone_map(&ffmpeg, &source.path, peak_sample_duration, cancel)
                 .await?;
         }
         if !deferred_vulkan && let Some(description) = plan.tone_map_description() {
@@ -1797,7 +1794,7 @@ impl JobManager {
             }
         }
         if deferred_vulkan {
-            plan.resolve_tone_map(&ffmpeg, &source.path, Some(source_video_duration), cancel)
+            plan.resolve_tone_map(&ffmpeg, &source.path, peak_sample_duration, cancel)
                 .await?;
             if let Some(description) = plan.tone_map_description() {
                 self.change(id, |snapshot| append_log(snapshot, description))
@@ -1944,6 +1941,20 @@ impl JobManager {
                         frame_count = recovery.queue_frame_count().await?;
                     }
                     if plan.source_frames_estimated {
+                        if !edited && !plan.has_source_filters() {
+                            boxed(|| {
+                                self.verify_av1an_source_duration(
+                                    id,
+                                    &ffprobe,
+                                    &source.path,
+                                    video,
+                                    &plan,
+                                    frame_count,
+                                    cancel,
+                                )
+                            })
+                            .await?;
+                        }
                         self.change(id, |snapshot| {
                             snapshot.duration_seconds =
                                 Some(frame_count as f64 * plan.frame_seconds());
@@ -1994,6 +2005,20 @@ impl JobManager {
                         "Checking the saved AV1AN intermediate before finalizing output.",
                     )
                     .await;
+                    if plan.source_frames_estimated && !plan.has_source_filters() {
+                        boxed(|| {
+                            self.verify_av1an_source_duration(
+                                id,
+                                &ffprobe,
+                                &source.path,
+                                video,
+                                &plan,
+                                frame_count,
+                                cancel,
+                            )
+                        })
+                        .await?;
+                    }
                     if settings
                         .av1an_options
                         .is_some_and(|options| options.source_workflow)
@@ -2176,7 +2201,12 @@ impl JobManager {
                         intermediate
                     };
                     let (sender, events) = mpsc::channel(256);
-                    let event_task = self.observe_encode(id, events, Some(plan.frame_seconds()));
+                    let event_task = self.observe_encode_with_estimate(
+                        id,
+                        events,
+                        Some(plan.frame_seconds()),
+                        plan.source_frames_estimated,
+                    );
                     let result = if !dynamic_hdr.is_empty() {
                         // These fork builds print metadata-loading messages to
                         // stdout. A separate identity-guarded path writer keeps
@@ -2231,7 +2261,27 @@ impl JobManager {
                     let _ = event_task.await;
                     self.change(id, |snapshot| snapshot.encoder_progress = None)
                         .await;
-                    let result = result.map_err(|e| process_error(e, &source.path))?;
+                    let result = match result {
+                        Err(error) => {
+                            if error.is_pipeline_stage_failure()
+                                && producer.args.iter().any(|arg| arg == "-stats_enc_pre:0")
+                                && let Ok(log) = tokio::fs::read(&pass_log).await
+                                && let Some(capability) = unsupported_producer_clock_option(
+                                    &String::from_utf8_lossy(&log),
+                                )
+                            {
+                                return Err(files::error(
+                                    "SOURCE_FILTER_TOOL_UNSUPPORTED",
+                                    format!(
+                                        "This FFmpeg build does not support {capability}, which this encode needs to verify the input frame clock."
+                                    ),
+                                    &ffmpeg,
+                                ));
+                            }
+                            return Err(process_error(error, &source.path));
+                        }
+                        Ok(result) => result,
+                    };
                     if !result.producer_status.success() || !result.consumer_status.success() {
                         return Err(files::error(
                             "ENCODE_FAILED",
@@ -2269,7 +2319,11 @@ impl JobManager {
                 } else {
                     intermediate.flush_nonempty_async().await?;
                     if plan.source_frames_estimated && !settings.source_filters {
-                        let clock = producer_clock(cancel, &output).await?;
+                        let cadence = super::source_filters::Cadence {
+                            frame_seconds: plan.frame_seconds(),
+                            tolerance: plan.tolerance,
+                        };
+                        let clock = producer_clock(cancel, &output, Some(cadence)).await?;
                         frame_count = usize::try_from(clock.frames).map_err(|_| {
                             files::error(
                                 "ENCODE_VALIDATION_FAILED",
@@ -2293,7 +2347,7 @@ impl JobManager {
                             &mut plan,
                             &mut frame_count,
                             if settings.source_filters {
-                                Some(producer_clock(cancel, &output).await?)
+                                Some(producer_clock(cancel, &output, None).await?)
                             } else {
                                 None
                             },
@@ -3136,6 +3190,60 @@ impl JobManager {
         .await;
     }
 
+    /// AV1AN's queue has frame ranges, without source presentation timestamps.
+    /// Investigate a duration discrepancy only when the video itself declares
+    /// a duration. A longer audio or subtitle stream is normal.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_av1an_source_duration(
+        &self,
+        id: &str,
+        ffprobe: &Path,
+        input: &Path,
+        video: &metadata::Stream,
+        plan: &Plan,
+        queue_frames: usize,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        let frame_seconds = plan.frame_seconds();
+        let queue_duration = queue_frames as f64 * frame_seconds;
+        if !metadata::track_duration(video).is_some_and(|duration| {
+            duration > 0.0
+                && (duration - queue_duration).abs() > frame_seconds / 2.0 + plan.tolerance
+        }) {
+            return Ok(());
+        }
+        self.change(id, |snapshot| append_log(snapshot,
+            "The AV1AN queue count disagrees with the selected video's declared duration. Checking the source packet timeline before publication.".into(),
+        )).await;
+        let invalid_clock = |reason| {
+            files::error(
+                "AV1AN_SOURCE_CLOCK_INVALID",
+                format!(
+                    "The AV1AN queue could not be reconciled with the source video clock: {reason}"
+                ),
+                input,
+            )
+        };
+        match super::source_timing::plan_from_packets(ffprobe, input, plan, video, false, cancel)
+            .await
+        {
+            Ok(Ok((checked, count)))
+                if count == queue_frames
+                    && (checked.fps_num, checked.fps_den) == (plan.fps_num, plan.fps_den) =>
+            {
+                Ok(())
+            }
+            Ok(Ok(_)) => Err(invalid_clock(
+                "the packet count or frame rate differs from the encoded queue".into(),
+            )),
+            Ok(Err(reason)) => Err(invalid_clock(reason.to_string())),
+            Err(error) if error.code == "ENCODE_INPUT_UNSUPPORTED" => {
+                Err(invalid_clock(error.message))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Ordinary jobs plan from headers and learn their exact count during the
     /// encode. When exact boundaries are required, packet timestamps can
     /// stand in for decoded frames, plan from them and the first decoded frames
@@ -3316,8 +3424,18 @@ impl JobManager {
     pub(super) fn observe_encode(
         &self,
         id: &str,
+        events: mpsc::Receiver<ProcessEvent>,
+        frame_seconds: Option<f64>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.observe_encode_with_estimate(id, events, frame_seconds, false)
+    }
+
+    fn observe_encode_with_estimate(
+        &self,
+        id: &str,
         mut events: mpsc::Receiver<ProcessEvent>,
         frame_seconds: Option<f64>,
+        estimated: bool,
     ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         let id = id.to_owned();
@@ -3329,11 +3447,7 @@ impl JobManager {
                 manager
                     .change(&id, |snapshot| {
                         if let Some(progress) = progress_seconds(&line) {
-                            snapshot.progress_seconds = Some(
-                                snapshot
-                                    .duration_seconds
-                                    .map_or(progress, |duration| progress.min(duration)),
-                            );
+                            update_encode_progress(snapshot, progress, estimated);
                         }
                         let encoder_progress = svt_progress(&line);
                         if let (Some(value), Some(frame_seconds)) = (
@@ -3344,11 +3458,10 @@ impl JobManager {
                                 .or_else(|| x264::frame_counter(&line)),
                             frame_seconds,
                         ) {
-                            let progress = value as f64 * frame_seconds;
-                            snapshot.progress_seconds = Some(
-                                snapshot
-                                    .duration_seconds
-                                    .map_or(progress, |duration| progress.min(duration)),
+                            update_encode_progress(
+                                snapshot,
+                                value as f64 * frame_seconds,
+                                estimated,
                             );
                         }
                         if let Some(stats) = encoder_progress {
@@ -3360,6 +3473,21 @@ impl JobManager {
             }
         })
     }
+}
+
+fn update_encode_progress(snapshot: &mut JobSnapshot, progress: f64, estimated: bool) {
+    if estimated
+        && snapshot
+            .duration_seconds
+            .is_some_and(|duration| progress > duration)
+    {
+        snapshot.duration_seconds = Some(progress);
+    }
+    snapshot.progress_seconds = Some(
+        snapshot
+            .duration_seconds
+            .map_or(progress, |duration| progress.min(duration)),
+    );
 }
 
 fn svt_frame_counter(line: &str) -> Option<u64> {
@@ -3723,12 +3851,9 @@ pub(super) fn thorough_verification(settings: &media_core::EncodeSettings) -> bo
         .is_some_and(|preferences| preferences.full_output_verification)
 }
 
-/// These operations need exact frame boundaries before starting; ordinary
-/// Quick Convert only needs an estimate for progress until the producer exits.
-fn quick_header_planning(settings: &EncodeSettings) -> bool {
-    settings.backend == media_core::EncodeBackend::Standalone
-        && !thorough_verification(settings)
-        && !settings.source_nvenc_quality
+/// Jobs with these operations need exact frame boundaries before starting.
+fn header_planning_allowed(settings: &EncodeSettings) -> bool {
+    !thorough_verification(settings)
         && settings.trim.is_none()
         && settings.hdr_metadata.is_none()
         && settings.rate_control.is_none()
@@ -3736,13 +3861,64 @@ fn quick_header_planning(settings: &EncodeSettings) -> bool {
         && settings.temporal.is_none()
 }
 
+fn quick_header_planning(settings: &EncodeSettings) -> bool {
+    can_observe_standalone_producer(settings) && header_planning_allowed(settings)
+}
+
+fn can_observe_standalone_producer(settings: &EncodeSettings) -> bool {
+    settings.video_mode == media_core::VideoMode::Encode
+        && settings.backend == media_core::EncodeBackend::Standalone
+        && !settings.source_nvenc_quality
+}
+
+fn unsupported_producer_clock_option(log: &str) -> Option<&'static str> {
+    for line in log
+        .lines()
+        .filter_map(|line| line.strip_prefix("[stderr] [producer] "))
+    {
+        let line = line.to_ascii_lowercase();
+        if (line.contains("stats_enc_pre")
+            && (line.contains("unrecognized option") || line.contains("not found")))
+            || (line.contains("invalid format directive")
+                && (line.ends_with("tbi") || line.ends_with("ptsi")))
+        {
+            return Some("encoder-pre statistics (-stats_enc_pre)");
+        }
+    }
+    None
+}
+
+fn tone_map_sample_duration(
+    estimated: bool,
+    counted_duration: f64,
+    video: &metadata::Stream,
+    container_duration: Option<f64>,
+) -> Option<f64> {
+    if estimated {
+        // Prefer the selected stream. Container duration may include a
+        // longer audio or subtitle track, and a stale count can skew seeks.
+        metadata::track_duration(video)
+            .filter(|duration| *duration > 0.0)
+            .or(container_duration)
+    } else {
+        Some(counted_duration)
+    }
+}
+
 async fn producer_clock(
     cancel: &watch::Receiver<bool>,
     output: &Path,
+    cadence: Option<super::source_filters::Cadence>,
 ) -> Result<super::source_filters::ProducerClock, AppError> {
     super::source_filters::current()
-        .expect("encoder input observation scope")
-        .completed(cancel)
+        .ok_or_else(|| {
+            files::error(
+                "SOURCE_FILTER_OBSERVATION_INVALID",
+                "No producer observation was set up for this encode.",
+                output,
+            )
+        })?
+        .completed_with_cadence(cancel, cadence)
         .await?
         .into_iter()
         .find(|clock| clock.stream_index == 0 && clock.frames > 0)
@@ -3998,7 +4174,9 @@ pub(super) fn decoder_args_preprocessed(input: &Path, plan: &Plan) -> Vec<OsStri
         "-color_range".into(),
         if plan.full_range { "pc" } else { "tv" }.into(),
     ]);
-    args.extend(super::source_filters::arguments());
+    if plan.has_source_filters() {
+        args.extend(super::source_filters::arguments(false));
+    }
     if plan.has_source_filters()
         && let Some(position) = args.iter().position(|argument| argument == "-fps_mode")
     {
@@ -4223,7 +4401,9 @@ fn decoder_args_with_subtitles(
         .map(OsString::from),
     );
     args.extend(plan.source_output_trim());
-    args.extend(super::source_filters::arguments());
+    if plan.source_frames_estimated || plan.has_source_filters() {
+        args.extend(super::source_filters::arguments(!plan.has_source_filters()));
+    }
     if plan.has_source_filters()
         && let Some(position) = args.iter().position(|argument| argument == "-fps_mode")
     {
@@ -6200,6 +6380,27 @@ mod tests {
         full_output_verification: bool,
         customize: fn(&mut EncodeSettings),
     ) -> (Fixture, PathBuf, JobSnapshot, usize) {
+        encode_with_audio_filter(
+            encoder,
+            preset,
+            extension,
+            audio_codec,
+            full_output_verification,
+            customize,
+            "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        )
+        .await
+    }
+
+    async fn encode_with_audio_filter(
+        encoder: VideoEncoder,
+        preset: u8,
+        extension: &str,
+        audio_codec: &str,
+        full_output_verification: bool,
+        customize: fn(&mut EncodeSettings),
+        filter: &str,
+    ) -> (Fixture, PathBuf, JobSnapshot, usize) {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -6232,7 +6433,11 @@ mod tests {
                     "-t",
                     "1",
                     "-vf",
-                    "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                    filter,
+                    "-fps_mode",
+                    "passthrough",
+                    "-enc_time_base",
+                    "filter",
                     "-c:v",
                     "ffv1",
                     "-pix_fmt",
@@ -6317,6 +6522,199 @@ mod tests {
     const FINAL_CHECKED: &str = "Final container check:";
 
     #[tokio::test]
+    async fn producer_clock_without_an_observer_returns_an_error() {
+        let (_owner, cancel) = watch::channel(false);
+        let error = producer_clock(&cancel, Path::new("output.mkv"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "SOURCE_FILTER_OBSERVATION_INVALID");
+    }
+
+    #[test]
+    fn progress_extends_only_an_estimated_duration() {
+        let mut snapshot: JobSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "encode", "state": "running",
+            "request": {"inputPath": "source.mkv", "outputPath": "output.mkv", "streamIndices": [0]},
+            "logs": [], "durationSeconds": 1.0,
+        })).unwrap();
+        update_encode_progress(&mut snapshot, 1.25, false);
+        assert_eq!(
+            (snapshot.progress_seconds, snapshot.duration_seconds),
+            (Some(1.0), Some(1.0))
+        );
+        update_encode_progress(&mut snapshot, 1.25, true);
+        assert_eq!(
+            (snapshot.progress_seconds, snapshot.duration_seconds),
+            (Some(1.25), Some(1.25))
+        );
+    }
+
+    #[test]
+    fn tone_map_uses_the_selected_video_duration_for_an_estimated_plan() {
+        let video: metadata::Stream = serde_json::from_value(serde_json::json!({
+            "index": 0, "duration": "120", "tags": {"NUMBER_OF_FRAMES": "7"},
+        }))
+        .unwrap();
+        assert_eq!(
+            tone_map_sample_duration(true, 0.3, &video, Some(140.0)),
+            Some(120.0)
+        );
+        assert_eq!(
+            tone_map_sample_duration(false, 0.3, &video, Some(140.0)),
+            Some(0.3)
+        );
+    }
+
+    #[test]
+    fn exact_source_boundary_requirements_disallow_header_planning_for_both_backends() {
+        let changes: [fn(&mut EncodeSettings); 6] = [
+            |settings| {
+                settings.trim = Some(media_core::VideoTrim {
+                    start_frame: 0,
+                    end_frame_exclusive: 10,
+                    time: None,
+                })
+            },
+            |settings| settings.hdr_metadata = Some(Default::default()),
+            |settings| {
+                settings.rate_control = Some(media_core::VideoRateControl::Bitrate {
+                    bitrate_kbps: 500,
+                    two_pass: false,
+                })
+            },
+            |settings| {
+                settings.mov_timecode_track = Some(media_core::EncodeTrackRef {
+                    input_path: None,
+                    stream_index: 2,
+                })
+            },
+            |settings| settings.temporal = Some(Default::default()),
+            |settings| {
+                settings.encoding_preferences = Some(media_core::EncodingPreferences {
+                    full_output_verification: true,
+                    keyframe_interval_seconds: 10,
+                    mp4_faststart: true,
+                })
+            },
+        ];
+        for backend in [
+            media_core::EncodeBackend::Standalone,
+            media_core::EncodeBackend::Av1an,
+        ] {
+            let baseline = EncodeSettings {
+                backend,
+                ..Default::default()
+            };
+            assert!(header_planning_allowed(&baseline));
+            for change in changes {
+                let mut settings = baseline.clone();
+                change(&mut settings);
+                assert!(!header_planning_allowed(&settings));
+            }
+        }
+    }
+
+    #[test]
+    fn producer_clock_diagnostics_do_not_classify_unrelated_errors() {
+        let rejection = "Unrecognized option 'stats_enc_pre:0'.";
+        assert_eq!(
+            unsupported_producer_clock_option(&format!("[stderr] [producer] {rejection}")),
+            Some("encoder-pre statistics (-stats_enc_pre)")
+        );
+        assert_eq!(
+            unsupported_producer_clock_option(&format!("[stderr] [consumer] {rejection}")),
+            None
+        );
+        assert_eq!(
+            unsupported_producer_clock_option("[stderr] [producer] An unrelated decode error"),
+            None
+        );
+        assert!(
+            unsupported_producer_clock_option("[stderr] [producer] Invalid format directive: tbi")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg, FFprobe and x264"]
+    async fn quick_convert_rejects_interior_timing_changes_despite_constant_rate_headers() {
+        // A sub-frame timestamp shift starts halfway through and ends on the
+        // same frame grid. The nominal rates, count and end time all agree.
+        let (fixture, output, job, _) = encode_with_audio_filter(
+            VideoEncoder::X264,
+            5,
+            "mkv",
+            "flac",
+            false,
+            |_| {},
+            r"settb=1/1000,setpts=PTS+if(between(N\,12\,18)\,10\,0),setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        )
+        .await;
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        let input = fixture.0.join("source.mkv");
+        let document = probe(&ffprobe, &input, &cancel, None).await.unwrap();
+        let video = &document.streams[0];
+        assert_eq!(video.r_frame_rate.as_deref(), Some("24000/1001"));
+        assert_eq!(video.r_frame_rate, video.avg_frame_rate);
+        assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+        assert!(
+            job.logs
+                .iter()
+                .any(|line| line.contains("The FFmpeg producer encountered variable cadence")),
+            "{job:#?}"
+        );
+        assert!(
+            job.logs
+                .iter()
+                .any(|line| line.contains("Verified lossless canonical source")),
+            "{job:#?}"
+        );
+        assert!(output.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the qualified AV1AN, FFmpeg, FFprobe and x264 tools"]
+    async fn av1an_rejects_a_queue_clock_shorter_than_the_gapped_source() {
+        let (fixture, output, job, frames) = encode_with_audio_filter(
+            VideoEncoder::X264,
+            5,
+            "mkv",
+            "flac",
+            false,
+            |settings| {
+                settings.backend = media_core::EncodeBackend::Av1an;
+                settings.av1an_options = Some(media_core::Av1anOptions {
+                    chunk_method: media_core::Av1anChunkMethod::Select,
+                    ..Default::default()
+                });
+            },
+            r"setpts=PTS+gte(N\,12),setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        )
+        .await;
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_owner, cancel) = watch::channel(false);
+        let input = fixture.0.join("source.mkv");
+        let document = probe(&ffprobe, &input, &cancel, None).await.unwrap();
+        let video = &document.streams[0];
+        assert_eq!(video.r_frame_rate, video.avg_frame_rate);
+        assert_eq!(frames, 23);
+        assert_eq!(job.state, JobState::Failed, "{job:#?}");
+        assert_eq!(
+            job.error.as_ref().unwrap().code,
+            "AV1AN_SOURCE_CLOCK_INVALID",
+            "{job:#?}"
+        );
+        assert!(
+            job.logs
+                .iter()
+                .any(|line| line.contains("Checking the source packet timeline")),
+            "{job:#?}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
     #[ignore = "requires real FFmpeg, FFprobe, SvtAv1EncApp and x264"]
     async fn quick_convert_uses_headers_and_counts_the_actual_encode() {
         for (encoder, preset, codec, extension) in [
@@ -6342,7 +6740,7 @@ mod tests {
             assert!(
                 job.logs
                     .iter()
-                    .any(|line| line.contains("Planning approximately 7 frames")),
+                    .any(|line| line.contains(&format!("Planning approximately {frames} frames"))),
                 "{:#?}",
                 job.logs
             );
@@ -6380,6 +6778,56 @@ mod tests {
             );
             assert_encoded(&output, codec, frames).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFprobe and x264, with a native FFmpeg test override that lists no audio encoders"]
+    async fn quick_convert_reports_a_missing_audio_encoder_before_video_encoding() {
+        let (_fixture, output, job, _) =
+            encode_with_audio(VideoEncoder::X264, 5, "mkv", "flac", false, |settings| {
+                settings.audio = vec![media_core::AudioTrackSettings {
+                    stream_index: 1,
+                    codec: media_core::AudioCodec::Opus,
+                    bitrate_kbps: 128,
+                    channels: media_core::AudioChannels::Stereo,
+                    gain: None,
+                    normalization: None,
+                }]
+            })
+            .await;
+        assert_eq!(job.state, JobState::Failed, "{job:#?}");
+        assert_eq!(
+            job.error.as_ref().unwrap().code,
+            "AUDIO_ENCODER_MISSING",
+            "{job:#?}"
+        );
+        assert!(job.error.as_ref().unwrap().message.contains("libopus"));
+        assert!(
+            !job.logs.iter().any(|line| line.contains("Encoding H.264")),
+            "{job:#?}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real FFprobe and x264, with a native FFmpeg test override that rejects -stats_enc_pre"]
+    async fn quick_convert_reports_unsupported_producer_clock_options() {
+        let (_fixture, output, job, _) =
+            encode_with_audio(VideoEncoder::X264, 5, "mkv", "flac", false, |_| {}).await;
+        assert_eq!(job.state, JobState::Failed, "{job:#?}");
+        assert_eq!(
+            job.error.as_ref().unwrap().code,
+            "SOURCE_FILTER_TOOL_UNSUPPORTED",
+            "{job:#?}"
+        );
+        assert!(
+            job.error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("-stats_enc_pre")
+        );
+        assert!(!output.exists());
     }
 
     async fn assert_encoded(output: &Path, codec: &str, frames: usize) {

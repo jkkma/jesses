@@ -489,6 +489,17 @@ export async function installSourceEncodeFixture(page: Page) {
             }),
           };
         }
+        if (command === 'preview_encode_plan') {
+          return {
+            request: payload.request,
+            sourceFingerprint: 'test',
+            outputFrameCount: '288',
+            outputFrameRate: '24/1',
+            outputFrameCountEstimated: state.__commandPlanEstimated ?? true,
+            stages: [],
+            notes: [],
+          };
+        }
         if (command === 'enqueue_encode_batch') return [];
         if (command === 'resolve_output_path') {
           const request = payload.request;

@@ -620,7 +620,7 @@ export type EncoderParameterCatalog = { encoder: VideoEncoder, backend: EncodeBa
 
 export type EncodeCommandStage = { label: string, executable: string, arguments: Array<string>, workingDirectory: string | null, notes: Array<string>, };
 
-export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
+export type EncodeCommandPlan = { request: EncodeRequest, sourceFingerprint: string, outputFrameCount: string, outputFrameCountEstimated: boolean, outputFrameRate: string, stages: Array<EncodeCommandStage>, notes: Array<string>, };
 
 export type CommandEditRequest = { "kind": "encode", request: EncodeRequest, } | { "kind": "image", request: ImageRequest, } | { "kind": "resumeSaved", id: string, } | { "kind": "resumeNew", id: string, settings: EncodeSettings, };
 

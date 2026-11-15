@@ -2,7 +2,7 @@
 
 > **Execution policy:** One bounded task, implemented and reviewed directly under AGENTS.md.
 
-**Goal:** Open a separate processing window when Quick Convert starts encoding, following the behavior requested by the user and StaxRip's ProcessingForm.
+**Goal:** Open a separate processing window when Quick Convert starts encoding, following the user's request and a reference encoder's processing window.
 
 **Architecture:** Use a dedicated Svelte processing view and one reusable Tauri window. Reuse the existing progress estimator, job state helpers and native control commands. Keep job execution in the existing native manager. Give each window an independent job subscription. Open after command confirmation or when queued work starts; offer manual reopening. Closing the monitor only closes the monitor; closing the main app still shuts jobs down safely.
 
@@ -12,7 +12,7 @@
 
 **Approach:** A native app window can reuse authoritative job data and controls. An external console would require process changes and would not provide the existing controls; a modal would not provide the separate window requested.
 
-**User refinements:** Make the window responsive and closer to StaxRip's processing layout, while keeping Jesses' colors. The final view gives most space to a scrollable monospace log, with compact progress and controls below. It uses the existing paper-and-ink color variables and resizes down to 360 logical pixels. Log following pauses when the user scrolls back.
+**User refinements:** Make the window responsive and follow the reference processing layout while keeping Jesses' colors. The final view gives most space to a scrollable monospace log, with compact progress and controls below. It uses the existing paper-and-ink color variables and resizes down to 360 logical pixels. Log following pauses when the user scrolls back.
 
 **Review focus:** Concurrent subscriptions; canceled command review; queued/short jobs; window-open failure must not fail or repeat an encode; closing/reopening the monitor; main-app shutdown with the monitor still open.
 

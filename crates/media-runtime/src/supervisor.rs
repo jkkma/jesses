@@ -171,6 +171,13 @@ pub enum SupervisorError {
     Io(#[from] io::Error),
 }
 
+impl SupervisorError {
+    pub(crate) fn is_pipeline_stage_failure(&self) -> bool {
+        matches!(self, Self::StageFailed { .. } | Self::EarlyConsumerExit)
+            || matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::BrokenPipe)
+    }
+}
+
 async fn cancelled(mut cancel: watch::Receiver<bool>) {
     loop {
         if *cancel.borrow_and_update() {
@@ -932,20 +939,21 @@ async fn run_pipeline_execute(
     };
     tokio::pin!(consumer_output);
     let mut consumer_output_done = false;
+    let diagnostics = async {
+        tokio::try_join!(
+            drain_stage(producer_stderr, true, Some("producer"), &events, &log),
+            drain_stage(consumer_stderr, true, Some("consumer"), &events, &log),
+        )?;
+        Ok::<_, SupervisorError>(())
+    };
+    tokio::pin!(diagnostics);
+    let mut diagnostics_done = false;
     let execution = async {
         let producer_wait = producer.wait_and_terminate_descendants();
         let consumer_wait = consumer.wait_and_terminate_descendants();
         let transfer = transfer_binary(producer_stdout, consumer_stdin, &delivered);
-        let diagnostics = async {
-            tokio::try_join!(
-                drain_stage(producer_stderr, true, Some("producer"), &events, &log),
-                drain_stage(consumer_stderr, true, Some("consumer"), &events, &log),
-            )?;
-            Ok::<_, SupervisorError>(())
-        };
-        tokio::pin!(producer_wait, consumer_wait, transfer, diagnostics);
+        tokio::pin!(producer_wait, consumer_wait, transfer);
         let (mut producer_status, mut consumer_status, mut bytes_transferred) = (None, None, None);
-        let mut diagnostics_done = false;
         loop {
             tokio::select! {
                 biased;
@@ -968,8 +976,8 @@ async fn run_pipeline_execute(
                     bytes_transferred = Some(result?);
                 }
                 result = &mut diagnostics, if !diagnostics_done => {
-                    result?;
                     diagnostics_done = true;
+                    result?;
                 }
                 result = &mut consumer_output, if !consumer_output_done => {
                     consumer_output_done = true;
@@ -1009,6 +1017,15 @@ async fn run_pipeline_execute(
         tokio::join!(producer.terminate_and_wait(), consumer.terminate_and_wait(),);
     producer_cleanup.map_err(SupervisorError::Cleanup)?;
     consumer_cleanup.map_err(SupervisorError::Cleanup)?;
+    if !diagnostics_done
+        && result
+            .as_ref()
+            .is_err_and(|error| error.is_pipeline_stage_failure())
+    {
+        // A failed stage can exit before its stderr was polled. Read its
+        // remaining diagnostics after both process trees have closed the pipes.
+        let _ = tokio::time::timeout(Duration::from_secs(1), diagnostics).await;
+    }
     let output_result = if consumer_output_done {
         Ok(())
     } else {

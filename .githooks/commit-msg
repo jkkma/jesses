@@ -1,0 +1,2 @@
+#!/bin/sh
+exec sh scripts/check-repository-names.sh --message "$1"

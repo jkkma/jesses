@@ -339,6 +339,9 @@ pub(in crate::jobs) async fn plan_from_headers(
     duration: Option<f64>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Option<(Plan, usize)>, AppError> {
+    if !headers_declare_constant_rate(stream) {
+        return Ok(None);
+    }
     let Some(count) = header_frame_count(stream, duration, (plan.fps_num, plan.fps_den)) else {
         return Ok(None);
     };
@@ -353,29 +356,54 @@ pub(in crate::jobs) async fn plan_from_headers(
     Ok(Some((planned, count)))
 }
 
+// Equal rates are enough to try the fast path. Some containers reuse their
+// default frame duration for both rates even when individual timestamps vary.
+fn headers_declare_constant_rate(stream: &metadata::Stream) -> bool {
+    let rational = |value: Option<&str>| {
+        let (num, den) = value?.split_once('/')?;
+        let (num, den) = (num.parse::<u32>().ok()?, den.parse::<u32>().ok()?);
+        (num > 0 && den > 0).then_some((u64::from(num), u64::from(den)))
+    };
+    matches!(
+        (rational(stream.avg_frame_rate.as_deref()), rational(stream.r_frame_rate.as_deref())),
+        (Some((an, ad)), Some((rn, rd))) if an * rd == rn * ad
+    )
+}
+
 fn header_frame_count(
     stream: &metadata::Stream,
     duration: Option<f64>,
     rate: (u32, u32),
 ) -> Option<usize> {
+    let parse_count = |value: &str| {
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|&count| count > 0 && count <= u32::MAX as usize)
+    };
+    let from_duration = metadata::track_duration(stream)
+        .or(duration)
+        .and_then(|seconds| {
+            let frames = (seconds * f64::from(rate.0) / f64::from(rate.1)).round();
+            (frames.is_finite() && frames >= 1.0 && frames <= f64::from(u32::MAX))
+                .then_some(frames as usize)
+        });
     stream
         .nb_frames
         .as_deref()
+        .and_then(parse_count)
         .or_else(|| {
             stream
                 .tags
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case("NUMBER_OF_FRAMES"))
-                .map(|(_, value)| value.as_str())
+                .and_then(|(_, value)| parse_count(value))
+                .filter(|&count| {
+                    from_duration
+                        .is_none_or(|expected| count.abs_diff(expected) <= (expected / 50).max(2))
+                })
         })
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&count| count > 0 && count <= u32::MAX as usize)
-        .or_else(|| {
-            let seconds = metadata::track_duration(stream).or(duration)?;
-            let frames = (seconds * f64::from(rate.0) / f64::from(rate.1)).round();
-            (frames.is_finite() && frames >= 1.0 && frames <= f64::from(u32::MAX))
-                .then_some(frames as usize)
-        })
+        .or(from_duration)
 }
 
 /// Full timing inspection for explicitly requested verification or operations
@@ -596,7 +624,8 @@ mod tests {
             Some(48)
         );
         let tagged = stream(serde_json::json!({"index":0,"tags":{"NUMBER_OF_FRAMES":"73"}}));
-        assert_eq!(header_frame_count(&tagged, Some(2.0), (24, 1)), Some(73));
+        assert_eq!(header_frame_count(&tagged, Some(2.0), (24, 1)), Some(48));
+        assert_eq!(header_frame_count(&tagged, Some(3.0), (24, 1)), Some(73));
         let exact = stream(
             serde_json::json!({"index":0,"nb_frames":"48","tags":{"NUMBER_OF_FRAMES":"73"}}),
         );
@@ -604,6 +633,24 @@ mod tests {
         let unknown = stream(serde_json::json!({"index":0,"nb_frames":"N/A"}));
         for duration in [None, Some(f64::NAN), Some(-1.0), Some(f64::INFINITY)] {
             assert_eq!(header_frame_count(&unknown, duration, (24, 1)), None);
+        }
+    }
+
+    #[test]
+    fn constant_rate_headers_require_two_equal_positive_rationals() {
+        for (base, average, expected) in [
+            (Some("24/1"), Some("48/2"), true),
+            (Some("24/1"), Some("24000/1001"), false),
+            (Some("0/1"), Some("0/1"), false),
+            (Some("24/0"), Some("24/0"), false),
+            (None, Some("24/1"), false),
+            (Some("24/1"), None, false),
+        ] {
+            let video: metadata::Stream = serde_json::from_value(serde_json::json!({
+                "index": 0, "r_frame_rate": base, "avg_frame_rate": average,
+            }))
+            .unwrap();
+            assert_eq!(headers_declare_constant_rate(&video), expected);
         }
     }
 

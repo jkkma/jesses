@@ -25,6 +25,7 @@ pub async fn preview_encode_plan(
         request: request.clone(),
         source_fingerprint: String::new(),
         output_frame_count: String::new(),
+        output_frame_count_estimated: false,
         output_frame_rate: String::new(),
         stages: Vec::new(),
         notes: Vec::new(),
@@ -74,7 +75,7 @@ pub(super) async fn build(
     source: &Source,
     output: &Path,
     ffmpeg: &Path,
-    ffprobe: &Path,
+    _ffprobe: &Path,
     encoder: &Path,
     plan: &Plan,
     settings: &EncodeSettings,
@@ -106,19 +107,25 @@ pub(super) async fn build(
     };
     preview.source_fingerprint = crate::analysis::fingerprint(source)?;
     preview.output_frame_count = frames.to_string();
+    preview.output_frame_count_estimated = plan.source_frames_estimated;
     preview.output_frame_rate = format!("{}/{}", plan.fps_num, plan.fps_den);
     preview.notes=vec![
-        "The complete source and selected converted-audio timelines were validated. Any requested subtitle assets and target-size measurements were prepared using the normal execution path.".into(),
-        "Arguments are separate native argv values; the application never evaluates them through a shell. This preview's temporary files are removed before it returns. Execution creates fresh owned paths and repeats validation.".into(),
-        "Validation probes and font/subtitle preparation are additional supervised steps. After encoding, every output frame, audio timeline, selected track and metadata is checked before atomic no-overwrite publication.".into(),
+        if plan.source_frames_estimated {
+            "Stream headers and the first decoded frame were inspected. The frame count is an estimate; the exact count is established during encoding.".into()
+        } else {
+            "Source timing and an initial decoded frame were inspected; some sources require a complete decoded-frame scan. A counted plan does not mean every decoded frame was inspected in this preview.".into()
+        },
+        "Requested subtitle assets and target-size measurements are prepared using the normal execution path. Arguments are separate native argv values; the application never evaluates them through a shell. This preview's temporary files are removed before it returns. Execution creates fresh owned paths and repeats preparation.".into(),
+        "Validation probes and font/subtitle preparation are additional supervised steps. Output checks run before atomic no-overwrite publication.".into(),
     ];
-    if settings.lossless {
+    if settings.lossless
+        && (thorough_verification(settings) || settings.backend == media_core::EncodeBackend::Av1an)
+    {
         preview.notes.push("Before publication, execution compares the complete decoded pixel stream with the processed encoder input. A mismatch fails the job even when the encoder reports lossless coding; try another preset or encoder.".into());
     }
     if !external.is_empty() {
         preview.notes.push("Additional audio, subtitles and attachments come from their displayed input files. Selected audio conversions preserve the shifted decoded sample timeline; copied tracks preserve packet contents and their requested timing offsets. The primary source owns video processing; container metadata and chapters use their selected donors. Every additional source is verified before publication and bound to recovery.".into());
     }
-    preview.stages.push(stage("Source frame validation",CommandSpec{executable:ffprobe.to_owned(),args:frame_scan_args(&source.path,plan.video_index,std::thread::available_parallelism().map_or(1,usize::from).min(8)),cwd:None},vec!["Already completed for this preview, including source cadence and per-frame color/field validation.".into()]));
     if let Some(qtgmc) = qtgmc {
         preview.stages.push(stage(
             "QTGMC frameserver",

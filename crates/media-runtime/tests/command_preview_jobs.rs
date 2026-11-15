@@ -10,6 +10,103 @@ use std::{
 };
 
 #[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone SVT-AV1"]
+async fn default_preview_reports_header_estimate_without_claiming_complete_validation() {
+    if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+        media_runtime::configure_bundled_tools(resources.into()).unwrap();
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "jesses-preview-estimate-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let input = directory.join("source.mkv");
+    let output = directory.join("output.mkv");
+    let tools = media_runtime::get_capabilities().await;
+    let ffmpeg = tools
+        .iter()
+        .find(|tool| tool.id == "ffmpeg")
+        .unwrap()
+        .path
+        .as_ref()
+        .unwrap();
+    let fixture = std::process::Command::new(ffmpeg).args([
+        "-v", "error", "-n", "-f", "lavfi", "-i", "testsrc2=s=192x112:r=24:d=2", "-vf",
+        "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "-c:v", "ffv1", "-chroma_sample_location", "left", "-level", "3",
+    ]).arg(&input).output().unwrap();
+    assert!(
+        fixture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fixture.stderr)
+    );
+    let request = EncodeRequest {
+        source: RemuxRequest {
+            input_path: input.to_string_lossy().into_owned(),
+            output_path: output.to_string_lossy().into_owned(),
+            stream_indices: vec![0],
+        },
+        settings: EncodeSettings::default(),
+    };
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let preview = media_runtime::preview_encode_plan(request.clone(), cancel.clone())
+        .await
+        .unwrap();
+    let json = serde_json::to_value(&preview).unwrap();
+    assert_eq!(json["outputFrameCountEstimated"], true);
+    assert!(
+        preview
+            .notes
+            .iter()
+            .any(|note| note.contains("first decoded frame"))
+    );
+    assert!(
+        !preview
+            .notes
+            .iter()
+            .any(|note| note.contains("complete source") && note.contains("validated"))
+    );
+    assert!(
+        !preview
+            .stages
+            .iter()
+            .any(|stage| stage.label == "Source frame validation")
+    );
+    assert!(!output.exists());
+    let mut lossless = request;
+    lossless.settings.lossless = true;
+    let quick_lossless = media_runtime::preview_encode_plan(lossless.clone(), cancel.clone())
+        .await
+        .unwrap();
+    assert!(
+        !quick_lossless
+            .notes
+            .iter()
+            .any(|note| note.contains("compares the complete decoded pixel stream"))
+    );
+    lossless.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+        keyframe_interval_seconds: 10,
+        mp4_faststart: false,
+        full_output_verification: true,
+    });
+    let thorough_lossless = media_runtime::preview_encode_plan(lossless, cancel)
+        .await
+        .unwrap();
+    assert!(
+        thorough_lossless
+            .notes
+            .iter()
+            .any(|note| note.contains("compares the complete decoded pixel stream"))
+    );
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, standalone SVT-AV1 and av1an"]
 async fn processed_av1an_preview_uses_one_prepared_source_and_original_mux() {
     if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
@@ -83,6 +180,10 @@ async fn processed_av1an_preview_uses_one_prepared_source_and_original_mux() {
         .unwrap();
     assert_eq!(preview.output_frame_count, "12");
     assert_eq!(preview.output_frame_rate, "12/1");
+    assert_eq!(
+        serde_json::to_value(&preview).unwrap()["outputFrameCountEstimated"],
+        false
+    );
     let preparation = preview
         .stages
         .iter()
