@@ -2362,12 +2362,19 @@ fn verify_staged_encoder_input(
                 .find(|stamp| crate::batch::path_key(&stamp.path) == key)
         };
         let saved = requested.map(Path::new).and_then(|source| {
-            saved_stamp(source).or_else(|| {
-                // An alias may locate an already recorded file. Its live
-                // bytes never provide the expected fingerprint.
-                let resolved = source.canonicalize().ok()?;
-                let recorded = saved_stamp(&resolved)?;
-                (identity(&resolved).ok().as_ref() == Some(&recorded.identity)).then_some(recorded)
+            saved_stamp(source).or_else(|| match source.canonicalize() {
+                Ok(resolved) => {
+                    let recorded = saved_stamp(&resolved)?;
+                    (identity(&resolved).ok().as_ref() == Some(&recorded.identity)).then_some(recorded)
+                }
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound
+                    && matches!(entry_exists(source), Ok(false)) => {
+                    // A missing leaf can still have an aliased parent. Keep
+                    // the literal filename and use only its saved fingerprint.
+                    let parent = source.parent()?.canonicalize().ok()?;
+                    saved_stamp(&parent.join(source.file_name()?))
+                }
+                Err(_) => None,
             })
         }).ok_or_else(|| error(path, "The staged HDR resource has no matching saved source fingerprint. Restore the original HDR source path before retrying."))?;
         let length = guard
@@ -5011,6 +5018,9 @@ mod tests {
         let original_rpu = fixture.0.join("source.rpu");
         let original_json = fixture.0.join("source.json");
         let alternate_spelling = fixture.0.join("alias/../source.rpu");
+        // An aliased TEMP ancestor on Windows can leave the same mismatch
+        // between raw request spelling and the recorded canonical path.
+        let alternate_json = fixture.0.join("alias/../source.json");
         fs::create_dir(fixture.0.join("alias")).unwrap();
         let staged_rpu = root.join(super::super::super::dynamic_hdr::DOVI_NAME);
         let staged_json = root.join(super::super::super::dynamic_hdr::HDR10_NAME);
@@ -5018,7 +5028,7 @@ mod tests {
         fs::write(&original_json, b"original-hdr").unwrap();
         workspace.manifest.settings.hdr_metadata = Some(media_core::HdrMetadataSettings {
             dolby_vision_rpu_path: Some(alternate_spelling.to_string_lossy().into_owned()),
-            hdr10_plus_json_path: Some(original_json.to_string_lossy().into_owned()),
+            hdr10_plus_json_path: Some(alternate_json.to_string_lossy().into_owned()),
             ..Default::default()
         });
         fs::copy(&original_rpu, &staged_rpu).unwrap();
@@ -5037,17 +5047,26 @@ mod tests {
         assert!(root.join("manifest.json").exists());
 
         fs::write(&staged_rpu, b"original-rpu").unwrap();
+        let moved_json = fixture.0.join("moved-source.json");
+        fs::rename(&original_json, &moved_json).unwrap();
+        fs::write(&original_json, b"original-hdr").unwrap();
+        assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+        fs::remove_file(&original_json).unwrap();
+        fs::write(&staged_json, b"modified-hdr").unwrap();
+        assert!(remove_workspace_tree(&root, &workspace.manifest, None).is_err());
+        assert_eq!(fs::read(&staged_json).unwrap(), b"modified-hdr");
+        fs::write(&staged_json, b"original-hdr").unwrap();
         let request = workspace.manifest.request.clone();
         let settings = workspace.manifest.settings.clone();
         let locator = workspace.summary();
         drop(workspace);
         drop(intermediate);
-        fs::remove_file(&original_json).unwrap();
         Recovery::discard("owned-job", &request, &settings, &locator)
             .await
             .unwrap();
         assert!(!root.exists());
         assert_eq!(fs::read(original_rpu).unwrap(), b"modified-rpu");
+        assert_eq!(fs::read(moved_json).unwrap(), b"original-hdr");
     }
 
     #[test]
