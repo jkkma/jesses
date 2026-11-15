@@ -15,6 +15,8 @@ use serde_json::Value;
 
 struct Fixture(PathBuf);
 
+const GRAIN_TABLE: &str = "filmgrn1\nE 0 9223372036854775807 1 10956 1\n\tp 0 6 0 8 1 1 0 0 0 0 0 0\n\tsY 14  0 5 20 4 39 4 59 4 78 4 98 4 118 4 137 4 157 4 177 4 196 4 216 5 235 5 255 5\n\tsCb 0\n\tsCr 0\n\tcY\n\tcCb 0\n\tcCr 0\n";
+
 impl Fixture {
     fn new() -> Self {
         if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
@@ -1061,7 +1063,6 @@ async fn aom_standalone_and_av1an_preserve_hdr10_static_metadata() {
 #[ignore = "requires standalone aomenc and SVT-AV1, FFmpeg, FFprobe and JESSES_GRAV1SYNTH"]
 async fn standalone_aom_and_svt_use_requested_grain_sources() {
     use media_core::{Av1anGrainSettings, VideoEncoder};
-    const TABLE: &str = "filmgrn1\nE 0 18446744073709551615 1 10956 1\n\tp 0 6 0 8 1 1 0 0 0 0 0 0\n\tsY 14  0 5 20 4 39 4 59 4 78 4 98 4 118 4 137 4 157 4 177 4 196 4 216 5 235 5 255 5\n\tsCb 0\n\tsCr 0\n\tcY\n\tcCb 0\n\tcCr 0\n";
     let fixture = Fixture::new();
     let input = fixture.0.join("grain source.mkv");
     synthesize(&input, "128x96", 16).await;
@@ -1069,8 +1070,8 @@ async fn standalone_aom_and_svt_use_requested_grain_sources() {
     let manager = JobManager::new(fixture.0.join("logs"));
     for (name, encoder, strength, table) in [
         ("aom-numeric", VideoEncoder::AomAv1, 8, None),
-        ("aom-table", VideoEncoder::AomAv1, 0, Some(TABLE)),
-        ("svt-table", VideoEncoder::SvtAv1, 0, Some(TABLE)),
+        ("aom-table", VideoEncoder::AomAv1, 0, Some(GRAIN_TABLE)),
+        ("svt-table", VideoEncoder::SvtAv1, 0, Some(GRAIN_TABLE)),
     ] {
         let output = fixture.0.join(format!("{name}.mkv"));
         let mut selected = request(
@@ -1229,6 +1230,91 @@ async fn av1an_x264_stops_with_verified_chunks_and_resumes_original_request() {
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert_no_partial_output(&fixture.0);
     manager.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires packaged Windows AV1AN, Patman SVT-AV1-HDR, FFmpeg, FFprobe and grav1synth"]
+async fn av1an_with_staged_grain_resumes_after_job_manager_reopens() {
+    use media_core::{Av1anGrainSettings, Av1anOptions, Av1anSplitMethod, VideoEncoder};
+
+    let fixture = Fixture::new();
+    let input = fixture.0.join("grain resume source.mkv");
+    let output = fixture.0.join("grain resume output.mkv");
+    let logs = fixture.0.join("logs");
+    let history = fixture.0.join("history");
+    synthesize(&input, "960x540", 480).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::open(logs.clone(), history.clone()).await;
+    let mut selected = request(&input, &output, 4);
+    selected.settings.encoder = VideoEncoder::SvtAv1Hdr;
+    selected.settings.av1an_options = Some(Av1anOptions {
+        split_method: Av1anSplitMethod::FixedChunks,
+        maximum_chunk_frames: 48,
+        encoder_threads: Some(2),
+        ..Default::default()
+    });
+    selected.settings.av1an_grain = Some(Av1anGrainSettings {
+        table: Some(GRAIN_TABLE.into()),
+        denoise: false,
+        denoise_strength: 4,
+    });
+    let submitted = manager.start_encode(selected.clone()).await.unwrap();
+    let partial = wait_for(&manager, &submitted.id, |job| {
+        job.recovery
+            .as_ref()
+            .is_some_and(|saved| saved.completed_frames >= 48)
+    })
+    .await;
+    assert_eq!(partial.state, JobState::Running, "{partial:#?}");
+    manager.stop_job(submitted.id.clone()).await.unwrap();
+    let stopped = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(stopped.state, JobState::Stopped, "{stopped:#?}");
+    let saved = stopped
+        .recovery
+        .as_ref()
+        .expect("verified recovery locator");
+    assert!((48..480).contains(&saved.completed_frames));
+    let work = PathBuf::from(&saved.workspace);
+    assert_eq!(
+        std::fs::read(work.join("jesses-grain.tbl")).unwrap(),
+        GRAIN_TABLE.as_bytes()
+    );
+    assert!(!output.exists());
+    manager.shutdown().await;
+    drop(manager);
+
+    let manager = JobManager::open(logs, history).await;
+    manager.resume_job(submitted.id.clone()).await.unwrap();
+    let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
+    assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
+    assert_eq!(finished.encode_settings.as_ref(), Some(&selected.settings));
+    manager.shutdown().await;
+    assert!(!work.exists(), "completed workspace should be retired");
+    let info = probe(&output).await;
+    assert_eq!(info["streams"][1]["nb_read_frames"], "480");
+    let extracted = fixture.0.join("recovered-grain.tbl");
+    let receipt = self::output(
+        command("grav1synth")
+            .await
+            .args(["inspect"])
+            .arg(&output)
+            .args(["--output"])
+            .arg(&extracted),
+    )
+    .await;
+    assert!(
+        receipt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&receipt.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&extracted)
+            .unwrap()
+            .contains("\nE 0 ")
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
 }
 
 #[cfg(windows)]

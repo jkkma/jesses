@@ -2309,6 +2309,101 @@ fn remove_empty_launch(path: &Path, expected: &Identity) -> Result<(), AppError>
     Ok(())
 }
 
+const STAGED_ENCODER_INPUTS: [&str; 3] = [
+    super::grain::TABLE_NAME,
+    super::super::dynamic_hdr::DOVI_NAME,
+    super::super::dynamic_hdr::HDR10_NAME,
+];
+
+fn verify_staged_encoder_input(
+    path: &Path,
+    name: &str,
+    manifest: &Manifest,
+) -> Result<Identity, AppError> {
+    let guard = open_launch_file(path)?;
+    if name == super::grain::TABLE_NAME {
+        let table = manifest
+            .settings
+            .av1an_grain
+            .as_ref()
+            .and_then(|grain| grain.table.as_deref())
+            .ok_or_else(|| error(path, "The saved job does not own a staged grain table."))?;
+        let mut contents = Vec::new();
+        guard
+            .file()
+            .take(table.len() as u64 + 1)
+            .read_to_end(&mut contents)
+            .map_err(|cause| error(path, cause.to_string()))?;
+        if contents != table.as_bytes() {
+            return Err(error(
+                path,
+                "The staged grain table differs from the saved request.",
+            ));
+        }
+    } else {
+        let requested = manifest
+            .settings
+            .hdr_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                if name == super::super::dynamic_hdr::DOVI_NAME {
+                    metadata.dolby_vision_rpu_path.as_deref()
+                } else {
+                    metadata.hdr10_plus_json_path.as_deref()
+                }
+            });
+        // Compare with the fingerprint recorded before the first launch. The
+        // selected file may be missing or changed, especially during Discard.
+        let saved_stamp = |source: &Path| {
+            let key = crate::batch::path_key(source);
+            manifest
+                .external_sources
+                .iter()
+                .find(|stamp| crate::batch::path_key(&stamp.path) == key)
+        };
+        let saved = requested.map(Path::new).and_then(|source| {
+            saved_stamp(source).or_else(|| {
+                // An alias may locate an already recorded file. Its live
+                // bytes never provide the expected fingerprint.
+                let resolved = source.canonicalize().ok()?;
+                let recorded = saved_stamp(&resolved)?;
+                (identity(&resolved).ok().as_ref() == Some(&recorded.identity)).then_some(recorded)
+            })
+        }).ok_or_else(|| error(path, "The staged HDR resource has no matching saved source fingerprint. Restore the original HDR source path before retrying."))?;
+        let length = guard
+            .file()
+            .metadata()
+            .map_err(|cause| error(path, cause.to_string()))?
+            .len();
+        if length != saved.length || digest(path, None)?.sha256 != saved.sha256 {
+            return Err(error(
+                path,
+                "The staged HDR resource differs from the original saved fingerprint.",
+            ));
+        }
+    }
+    verify_launch_file(&guard)?;
+    file_identity(guard.file()).map_err(|cause| error(path, cause.to_string()))
+}
+
+fn retire_staged_encoder_inputs(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
+    for name in STAGED_ENCODER_INPUTS {
+        let path = root.join(name);
+        if entry_exists(&path)? {
+            let guard = removal_read_guard(&path)?;
+            let expected = verify_staged_encoder_input(&path, name, manifest)?;
+            if file_identity(&guard).map_err(|cause| error(&path, cause.to_string()))? != expected {
+                return Err(error(
+                    &path,
+                    "The staged encoder input changed during cleanup.",
+                ));
+            }
+            remove_tree(&path, &expected, Some(guard))?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
     validate_launch_layout(root, manifest)?;
     let count = manifest
@@ -2346,6 +2441,10 @@ fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> 
                 .map_err(|e| error(&path, e.to_string()))?
                 .to_string_lossy()
                 .replace('\\', "/");
+            if STAGED_ENCODER_INPUTS.contains(&rel.as_str()) {
+                verify_staged_encoder_input(&path, &rel, manifest)?;
+                continue;
+            }
             let dirs = matches!(rel.as_str(), "chunks" | "chunks/encode" | "chunks/split");
             if let Some(launch) = manifest
                 .launch_artifacts
@@ -2725,6 +2824,7 @@ impl OwnedRecovery {
                     "Source New Settings requires its sealed original queue and decoded completed-chunk contracts.",
                 ));
             }
+            retire_staged_encoder_inputs(&w.root, &w.manifest)?;
             w.manifest.source_cut_committed_recipe = Some(Box::new(committed));
             w.manifest.source_cut_rebind_pending = Some(settings_digest(settings)?);
             if w.manifest.previous_settings.is_none() {
@@ -2749,6 +2849,7 @@ impl OwnedRecovery {
                     != settings.video_stream_index);
         self.reset_chunks()?;
         let w = &mut self.workspace;
+        retire_staged_encoder_inputs(&w.root, &w.manifest)?;
         if source_cut_transaction {
             w.manifest.source_cut_committed_recipe = Some(Box::new(committed));
         }
@@ -3731,6 +3832,21 @@ fn remove_workspace_tree(
     )
 }
 
+fn removal_read_guard(path: &Path) -> Result<File, AppError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny writes through validation and exact-handle deletion. Allow
+        // the DELETE handle while the identity check rejects replacements.
+        options.share_mode(1 | 4).custom_flags(0x00200000);
+    }
+    options
+        .open(path)
+        .map_err(|cause| error(path, cause.to_string()))
+}
+
 enum RemovalAuthority<'a> {
     Workspace(&'a Manifest),
     Launch(&'a LaunchArtifact),
@@ -3774,6 +3890,7 @@ fn remove_tree_checked(
         guard: Option<File>,
     }
     fn collect(
+        root: &Path,
         path: &Path,
         expected: &Identity,
         guard: Option<File>,
@@ -3786,11 +3903,18 @@ fn remove_tree_checked(
             Some(guard) => Some(guard),
             None if directory => Some(directory_guard(path)?),
             None if authority.is_some_and(|authority| match authority {
-                RemovalAuthority::Workspace(manifest) => manifest
-                    .launch_artifacts
-                    .iter()
-                    .filter_map(|launch| launch.image.as_ref())
-                    .any(|image| image.path == path),
+                RemovalAuthority::Workspace(manifest) => {
+                    (path.parent() == Some(root)
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| STAGED_ENCODER_INPUTS.contains(&name)))
+                        || manifest
+                            .launch_artifacts
+                            .iter()
+                            .filter_map(|launch| launch.image.as_ref())
+                            .any(|image| image.path == path)
+                }
                 RemovalAuthority::Launch(launch) => launch
                     .image
                     .as_ref()
@@ -3798,17 +3922,7 @@ fn remove_tree_checked(
                 RemovalAuthority::SceneScratch => false,
             }) =>
             {
-                let mut options = OpenOptions::new();
-                options.read(true);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    // Deny writes through validation and exact-handle deletion.
-                    // FILE_SHARE_DELETE permits our DELETE handle while an ID
-                    // check still rejects any replacement of this pathname.
-                    options.share_mode(1 | 4).custom_flags(0x00200000);
-                }
-                Some(options.open(path).map_err(|e| error(path, e.to_string()))?)
+                Some(removal_read_guard(path)?)
             }
             None => None,
         };
@@ -3821,7 +3935,7 @@ fn remove_tree_checked(
         if directory {
             for child in fs::read_dir(path).map_err(|e| error(path, e.to_string()))? {
                 let child = child.map_err(|e| error(path, e.to_string()))?.path();
-                collect(&child, &identity(&child)?, None, entries, authority)?;
+                collect(root, &child, &identity(&child)?, None, entries, authority)?;
             }
         } else if !metadata.is_file() {
             return Err(error(path, "Unsupported recovery filesystem entry."));
@@ -3836,6 +3950,7 @@ fn remove_tree_checked(
     }
     let mut entries = Vec::new();
     collect(
+        root,
         root,
         expected,
         existing_guard,
@@ -4841,6 +4956,120 @@ mod tests {
         fs::write(&foreign, b"foreign").unwrap();
         assert!(owned.discard().is_err());
         assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+    }
+
+    #[tokio::test]
+    async fn recovery_admits_only_the_bound_staged_grain_table() {
+        const TABLE: &str = "filmgrn1\nE 0 40000000 1 2 1\n";
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let path = root.join(super::super::grain::TABLE_NAME);
+        let neighbor = fixture.0.join("outside.tbl");
+        fs::write(&neighbor, TABLE).unwrap();
+        fs::write(&path, TABLE).unwrap();
+        assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+
+        workspace.manifest.settings.av1an_grain = Some(media_core::Av1anGrainSettings {
+            table: Some(TABLE.into()),
+            denoise: false,
+            denoise_strength: 4,
+        });
+        workspace.save().unwrap();
+        verify_action_tree(&root, &workspace.manifest).unwrap();
+
+        fs::write(&path, TABLE.replace("1 2 1", "1 3 1")).unwrap();
+        assert!(remove_workspace_tree(&root, &workspace.manifest, None).is_err());
+        assert!(root.join("manifest.json").exists());
+        assert_ne!(fs::read(&path).unwrap(), TABLE.as_bytes());
+
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&neighbor, &path).unwrap();
+        assert!(remove_workspace_tree(&root, &workspace.manifest, None).is_err());
+        assert_eq!(fs::read(&neighbor).unwrap(), TABLE.as_bytes());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, TABLE).unwrap();
+
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let locator = workspace.summary();
+        drop(workspace);
+        drop(intermediate);
+        fs::remove_file(&request.input_path).unwrap();
+        Recovery::discard("owned-job", &request, &settings, &locator)
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(neighbor).unwrap(), TABLE.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn staged_hdr_copies_require_their_matching_saved_source_fingerprints() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let original_rpu = fixture.0.join("source.rpu");
+        let original_json = fixture.0.join("source.json");
+        let alternate_spelling = fixture.0.join("alias/../source.rpu");
+        fs::create_dir(fixture.0.join("alias")).unwrap();
+        let staged_rpu = root.join(super::super::super::dynamic_hdr::DOVI_NAME);
+        let staged_json = root.join(super::super::super::dynamic_hdr::HDR10_NAME);
+        fs::write(&original_rpu, b"original-rpu").unwrap();
+        fs::write(&original_json, b"original-hdr").unwrap();
+        workspace.manifest.settings.hdr_metadata = Some(media_core::HdrMetadataSettings {
+            dolby_vision_rpu_path: Some(alternate_spelling.to_string_lossy().into_owned()),
+            hdr10_plus_json_path: Some(original_json.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        fs::copy(&original_rpu, &staged_rpu).unwrap();
+        fs::copy(&original_json, &staged_json).unwrap();
+        assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+
+        workspace.manifest.external_sources =
+            external_source_stamps(&workspace.manifest.settings, None).unwrap();
+        workspace.save().unwrap();
+        verify_action_tree(&root, &workspace.manifest).unwrap();
+        fs::copy(&original_json, &staged_rpu).unwrap();
+        assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+        fs::write(&original_rpu, b"modified-rpu").unwrap();
+        fs::copy(&original_rpu, &staged_rpu).unwrap();
+        assert!(remove_workspace_tree(&root, &workspace.manifest, None).is_err());
+        assert!(root.join("manifest.json").exists());
+
+        fs::write(&staged_rpu, b"original-rpu").unwrap();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let locator = workspace.summary();
+        drop(workspace);
+        drop(intermediate);
+        fs::remove_file(&original_json).unwrap();
+        Recovery::discard("owned-job", &request, &settings, &locator)
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(original_rpu).unwrap(), b"modified-rpu");
+    }
+
+    #[test]
+    fn new_settings_retires_the_staged_encoder_input_before_rebinding() {
+        let fixture = Fixture::new();
+        let (mut workspace, _intermediate) = fixture.workspace();
+        let table = "filmgrn1\nE 0 40000000 1 2 1\n";
+        let path = workspace.root.join(super::super::grain::TABLE_NAME);
+        workspace.manifest.settings.av1an_grain = Some(media_core::Av1anGrainSettings {
+            table: Some(table.into()),
+            denoise: false,
+            denoise_strength: 4,
+        });
+        workspace.save().unwrap();
+        fs::write(&path, table).unwrap();
+        let mut next = workspace.manifest.settings.clone();
+        next.av1an_grain.as_mut().unwrap().table = Some(table.replace("1 2 1", "1 3 1"));
+        let mut owned = OwnedRecovery { workspace };
+        owned.new_settings(&next).unwrap();
+        assert!(!path.exists());
+        verify_action_tree(&owned.workspace.root, &owned.workspace.manifest).unwrap();
+        assert_eq!(owned.workspace.manifest.settings, next);
     }
 
     #[tokio::test]

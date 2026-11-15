@@ -18,7 +18,13 @@ async fn tool_path(id: &str) -> PathBuf {
     static TOOLS: tokio::sync::OnceCell<Vec<media_runtime::ToolInfo>> =
         tokio::sync::OnceCell::const_new();
     let tool = TOOLS
-        .get_or_init(|| Box::pin(media_runtime::get_capabilities()))
+        .get_or_init(|| {
+            if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+                media_runtime::configure_bundled_tools(PathBuf::from(resources))
+                    .expect("the package gate uses one absolute verified resource root");
+            }
+            Box::pin(media_runtime::get_capabilities())
+        })
         .await
         .iter()
         .find(|tool| tool.id == id)
