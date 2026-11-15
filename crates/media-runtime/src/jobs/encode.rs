@@ -8,6 +8,8 @@ mod command_plan;
 mod ffmpeg_video;
 #[path = "frame_scan.rs"]
 pub(super) mod frame_scan;
+#[path = "svt_ivf.rs"]
+mod svt_ivf;
 #[path = "x264.rs"]
 mod x264;
 
@@ -452,6 +454,8 @@ impl JobManager {
             None
         };
         let thorough = thorough_verification(settings);
+        let mut verify_svt_ivf = false;
+        let mut allow_parallel_svt = false;
         for (path, version_arg) in [
             (&ffmpeg, "-version"),
             (&ffprobe, "-version"),
@@ -496,6 +500,12 @@ impl JobManager {
                 );
                 crate::discovery::validate_video_encoder_version(settings.encoder, &identity)
                     .map_err(|message| files::error("ENCODER_BUILD_MISMATCH", message, path))?;
+                verify_svt_ivf = !thorough
+                    && settings.backend == media_core::EncodeBackend::Standalone
+                    && settings.encoder.is_svt()
+                    && svt_ivf::rewrites_count(&identity);
+                allow_parallel_svt = !thorough
+                    && super::parameters::allows_parallel_standalone_svt(settings, &identity);
                 super::rate_control::validate_encoder_version(settings, &identity).map_err(
                     |message| files::error("ENCODER_CAPABILITY_UNSUPPORTED", message, path),
                 )?;
@@ -913,7 +923,22 @@ impl JobManager {
         if thorough && settings.encoder.is_svt() {
             check_encoder_capabilities(&encoder, &output, &plan, settings, cancel).await?;
         }
-        if super::parameters::requires_serial_svt(settings) {
+        let standalone_locator =
+            if settings.backend == media_core::EncodeBackend::Standalone && preview.is_none() {
+                self.state
+                    .lock()
+                    .await
+                    .entries
+                    .iter()
+                    .find(|entry| entry.snapshot.id == id)
+                    .and_then(|entry| entry.snapshot.standalone_recovery.clone())
+            } else {
+                None
+            };
+        // Recoverable jobs keep the lane count recorded by their command
+        // signature and use the same lane count across both bitrate passes.
+        plan.allow_parallel_svt = allow_parallel_svt && standalone_locator.is_none();
+        if requires_serial_svt(&plan, settings) {
             self.change(id, |snapshot| append_log(snapshot, "SVT high-bit-depth mode decision plus overlays uses one processing lane (lp=1), within the selected worker limit, to avoid the observed SVT4.2 parallel short-clip crash. Both requested controls remain enabled.".into())).await;
         }
         let interval = settings
@@ -1181,22 +1206,14 @@ impl JobManager {
             && settings.backend == media_core::EncodeBackend::Standalone
             && plan.requires_qtgmc();
         let source_qtgmc_checkpoint_ready = source_qtgmc
-            && self
-                .state
-                .lock()
-                .await
-                .entries
-                .iter()
-                .find(|entry| entry.snapshot.id == id)
-                .and_then(|entry| entry.snapshot.standalone_recovery.as_ref())
-                .is_some_and(|recovery| {
-                    matches!(
-                        recovery.phase,
-                        media_core::StandaloneRecoveryPhase::VideoComplete
-                            | media_core::StandaloneRecoveryPhase::TimingWrapComplete
-                            | media_core::StandaloneRecoveryPhase::Finalizing
-                    )
-                });
+            && standalone_locator.as_ref().is_some_and(|recovery| {
+                matches!(
+                    recovery.phase,
+                    media_core::StandaloneRecoveryPhase::VideoComplete
+                        | media_core::StandaloneRecoveryPhase::TimingWrapComplete
+                        | media_core::StandaloneRecoveryPhase::Finalizing
+                )
+            });
         let defer_source_qtgmc = source_qtgmc
             && !source_qtgmc_checkpoint_ready
             && self.command_review(id).await.is_some();
@@ -1253,7 +1270,30 @@ impl JobManager {
         self.change(id,|snapshot| {
             snapshot.duration_seconds = Some(frame_count as f64*plan.frame_seconds());
             snapshot.progress_seconds = None;
-            append_log(snapshot,format!("{} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {}, preset {}.",if plan.source_frames_estimated {"Estimated"} else if super::source_timing::pending() || !thorough {"Will encode"} else {"Validated"},plan.fps_num,plan.fps_den,plan.output_bit_depth(),plan.output_codec(),rate.as_ref().map_or_else(|| format!("CRF {}", settings.crf), |rate| format!("target {} kb/s", rate.kbps)),settings.preset));
+            let (crf, preset) = if settings.encoder.is_svt() {
+                svt_quality(settings)
+            } else {
+                (settings.crf.to_string(), settings.preset.to_string())
+            };
+            let quality = match &rate {
+                Some(rate) => format!("target {} kb/s", rate.kbps),
+                None if settings.encoder.is_svt() && settings.lossless => String::from("lossless"),
+                None => format!("CRF {crf}"),
+            };
+            let count_status = if plan.source_frames_estimated {
+                "Estimated"
+            } else if super::source_timing::pending() || !thorough {
+                "Will encode"
+            } else {
+                "Validated"
+            };
+            append_log(
+                snapshot,
+                format!(
+                    "{count_status} {frame_count} progressive CFR frames at {}/{} fps; {}-bit {}, {quality}, preset {preset}.",
+                    plan.fps_num, plan.fps_den, plan.output_bit_depth(), plan.output_codec(),
+                ),
+            );
             if settings.encoder.is_svt() {
                 append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
             }
@@ -1479,14 +1519,7 @@ impl JobManager {
             recovery = Some(workspace);
             Some(intermediate)
         } else {
-            let locator = self
-                .state
-                .lock()
-                .await
-                .entries
-                .iter()
-                .find(|entry| entry.snapshot.id == id)
-                .and_then(|entry| entry.snapshot.standalone_recovery.clone());
+            let locator = standalone_locator;
             let two_pass = rate.as_ref().is_some_and(|value| value.two_pass);
             let mut arguments = consumer_arguments(&plan, settings);
             if let Some(rate) = &rate {
@@ -2102,8 +2135,12 @@ impl JobManager {
                 }
                 let raw_aom_input =
                     aom_vpx::configure_producer_output(&mut producer.args, &plan, settings);
+                let svt_phase;
                 self.phase(id, JobState::Running, match settings.encoder {
-                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => "Encoding 10-bit AV1 with the standalone SVT encoder; selected audio settings will be applied afterward.",
+                VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+                    svt_phase = format!("Encoding {}-bit AV1 with the standalone SVT encoder; selected audio settings will be applied afterward.", plan.output_bit_depth());
+                    &svt_phase
+                }
                 VideoEncoder::X264 => "Encoding H.264 with standalone x264 at the source bit depth; selected audio settings will be applied afterward.",
                 VideoEncoder::X265 => "Encoding HEVC with FFmpeg libx265 at the source bit depth; selected audio settings will be applied afterward.",
                 VideoEncoder::Vp9 => "Encoding VP9 with FFmpeg libvpx at the source bit depth; selected audio settings will be applied afterward.",
@@ -2356,6 +2393,9 @@ impl JobManager {
                             cancel,
                         )
                         .await?;
+                    }
+                    if verify_svt_ivf {
+                        svt_ivf::verify(intermediate, frame_count).await?;
                     }
                     if let Some(recovery) = standalone_recovery.as_mut() {
                         if source_qtgmc && let Some(prepared) = &qtgmc {
@@ -4423,7 +4463,7 @@ fn decoder_args_with_subtitles(
     args
 }
 
-pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+fn svt_quality(settings: &EncodeSettings) -> (String, String) {
     let svt_crf = settings
         .svt_crf_quarter_steps
         .map(|quarters| {
@@ -4437,6 +4477,15 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
     let svt_preset = settings
         .svt_preset
         .map_or_else(|| settings.preset.to_string(), |value| value.to_string());
+    (svt_crf, svt_preset)
+}
+
+fn requires_serial_svt(plan: &Plan, settings: &EncodeSettings) -> bool {
+    !plan.allow_parallel_svt && super::parameters::requires_serial_svt(settings)
+}
+
+pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
+    let (svt_crf, svt_preset) = svt_quality(settings);
     let values = [
         "--input-depth".into(),
         plan.output_bit_depth().to_string(),
@@ -4507,7 +4556,7 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
         _ => {}
     }
     args.extend(super::parameters::arguments(settings));
-    if super::parameters::requires_serial_svt(settings) {
+    if requires_serial_svt(plan, settings) {
         args.extend(["--lp".into(), "1".into()]);
     }
     args
@@ -4529,6 +4578,8 @@ fn encoder_args(output: &Path, plan: &Plan, settings: &EncodeSettings) -> Vec<Os
 pub(in crate::jobs) fn consumer_arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString> {
     match settings.encoder {
         VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
+            // SVT rewrites the IVF header at EOF. Redirect stdout to a
+            // seekable file so the rewrite cannot append a second header.
             encoder_args(Path::new("stdout"), plan, settings)
         }
         VideoEncoder::X264 => x264::arguments(plan, settings),
@@ -5421,6 +5472,48 @@ mod tests {
                     .any(|arg| arg == "--frames")
             );
         }
+    }
+
+    #[test]
+    fn svt_encoder_arguments_preserve_fractional_crf_and_signed_presets() {
+        let (_, plan) = producer_plan();
+        let mut settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            svt_preset: Some(-1),
+            ..Default::default()
+        };
+        for (quarters, expected) in [(None, "0"), (Some(81), "20.25"), (Some(80), "20")] {
+            settings.crf = 0;
+            settings.svt_crf_quarter_steps = quarters;
+            let args = encoder_parameters(&plan, &settings);
+            assert_eq!(argument_after(&args, "--crf"), expected);
+            assert_eq!(argument_after(&args, "--preset"), "-1");
+        }
+    }
+
+    #[test]
+    fn qualified_standalone_plan_omits_the_serial_svt_lane_override() {
+        let (_, mut plan) = producer_plan();
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            parameters: ["hbd-mds", "enable-overlays"]
+                .into_iter()
+                .map(|name| media_core::EncoderParameter {
+                    name: name.into(),
+                    value: "1".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            argument_after(&consumer_arguments(&plan, &settings), "--lp"),
+            "1"
+        );
+        plan.allow_parallel_svt = true;
+        let args = consumer_arguments(&plan, &settings);
+        assert!(!args.iter().any(|arg| arg == "--lp"));
+        assert_eq!(argument_after(&args, "--hbd-mds"), "1");
+        assert_eq!(argument_after(&args, "--enable-overlays"), "1");
     }
 
     fn tag_value<'a>(stream: &'a metadata::Stream, key: &str) -> Option<&'a str> {
@@ -6759,7 +6852,7 @@ mod tests {
         assert!(
             job.logs
                 .iter()
-                .any(|line| line.contains("The FFmpeg producer encountered variable cadence")),
+                .any(|line| line == "Preparing a compatible source clock."),
             "{job:#?}"
         );
         assert!(
@@ -6876,6 +6969,185 @@ mod tests {
             );
             assert_encoded(&output, codec, frames).await;
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires packaged FFmpeg, FFprobe and SVT-AV1-HDR"]
+    async fn quick_convert_reports_actual_svt_quality_and_depth() {
+        type Customize = fn(&mut EncodeSettings);
+        let cases: [(Customize, &str, &str, &str); 3] = [
+            (
+                |settings| {
+                    settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p);
+                    settings.svt_crf_quarter_steps = Some(81);
+                    settings.svt_preset = Some(-1);
+                },
+                "8",
+                "yuv420p",
+                "CRF 20.25, preset -1.",
+            ),
+            (
+                |settings| settings.lossless = true,
+                "10",
+                "yuv420p10le",
+                "lossless, preset 9.",
+            ),
+            (
+                |settings| {
+                    settings.rate_control = Some(media_core::VideoRateControl::Bitrate {
+                        bitrate_kbps: 300,
+                        two_pass: false,
+                    });
+                },
+                "10",
+                "yuv420p10le",
+                "target 300 kb/s, preset 9.",
+            ),
+        ];
+        for (customize, depth, pixel_format, quality) in cases {
+            let (_fixture, output, job, frames) =
+                encode_with_audio(VideoEncoder::SvtAv1Hdr, 9, "mkv", "flac", false, customize)
+                    .await;
+            assert_eq!(job.state, JobState::Succeeded, "{job:#?}");
+            assert!(
+                job.logs.iter().any(|line| line.contains(quality)),
+                "{job:#?}"
+            );
+            assert!(
+                job.logs.iter().any(|line| line.starts_with(&format!(
+                    "Encoding {depth}-bit AV1 with the standalone SVT encoder"
+                ))),
+                "{job:#?}"
+            );
+            let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+            let (_owner, cancel) = watch::channel(false);
+            let document = probe_headers(&ffprobe, &output, &cancel, Some(&[0]))
+                .await
+                .unwrap();
+            assert_eq!(document.streams[0].pix_fmt.as_deref(), Some(pixel_format));
+            assert_eq!(decoded_frames(&ffprobe, &output).await, frames);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires packaged FFmpeg and all three Windows SVT builds"]
+    async fn standalone_svt_seekable_output_reports_short_encodes() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!("jesses-svt-ivf-{nonce}")));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let output = fixture.0.join("short.mkv");
+        let log = fixture.0.join("short.log");
+        let ffmpeg = find_executable(&["ffmpeg"]).await.unwrap().unwrap();
+        let producer = CommandSpec {
+            executable: ffmpeg,
+            args: [
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=128x96:r=24",
+                "-frames:v",
+                "12",
+                "-strict",
+                "-1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "yuv4mpegpipe",
+                "pipe:1",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            cwd: None,
+        };
+        let (_, plan) = producer_plan();
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::SvtAv1FiveFish,
+            VideoEncoder::SvtAv1Hdr,
+        ] {
+            let executable = crate::discovery::find_video_encoder(encoder)
+                .await
+                .unwrap()
+                .unwrap();
+            let settings = EncodeSettings {
+                encoder,
+                preset: 9,
+                ..Default::default()
+            };
+            let mut args = consumer_arguments(&plan, &settings);
+            args.extend(["--frames".into(), "20".into()]);
+            let consumer = CommandSpec {
+                executable,
+                args,
+                cwd: None,
+            };
+            let video = Temporary::create_ivf(&output, "seekable").unwrap();
+            let (_owner, cancel) = watch::channel(false);
+            let (sender, mut events) = mpsc::channel(32);
+            let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+            let result = supervisor::run_pipeline_to_file(
+                &producer,
+                &consumer,
+                cancel,
+                sender,
+                &log,
+                Duration::from_secs(30),
+                video.clone_file().unwrap(),
+            )
+            .await
+            .unwrap();
+            drain.await.unwrap();
+            assert!(
+                result.producer_status.success() && result.consumer_status.success(),
+                "{encoder:?}"
+            );
+            svt_ivf::verify(&video, 12).await.unwrap();
+            let error = svt_ivf::verify(&video, 20).await.unwrap_err();
+            assert_eq!(error.code, "ENCODE_VALIDATION_FAILED");
+            assert!(
+                error
+                    .message
+                    .contains("wrote 12 frames, but 20 were expected")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires packaged FFprobe and SVT-AV1-HDR, and an FFmpeg override limiting the Y4M producer to 12 frames"]
+    async fn quick_convert_does_not_publish_a_short_svt_encode() {
+        let (_fixture, output, job, frames) = encode_with_audio(
+            VideoEncoder::SvtAv1Hdr,
+            9,
+            "mkv",
+            "flac",
+            false,
+            |settings| {
+                settings.rate_control = Some(media_core::VideoRateControl::Bitrate {
+                    bitrate_kbps: 300,
+                    two_pass: false,
+                });
+            },
+        )
+        .await;
+        assert!(frames > 12);
+        assert_eq!(job.state, JobState::Failed, "{job:#?}");
+        let error = job.error.as_ref().unwrap();
+        assert_eq!(error.code, "ENCODE_VALIDATION_FAILED", "{job:#?}");
+        assert!(
+            error
+                .message
+                .contains(&format!("wrote 12 frames, but {frames} were expected"))
+        );
+        assert!(!output.exists());
     }
 
     #[tokio::test]

@@ -158,7 +158,7 @@
   "svtAv1": [
     {
       "name": "Anime / Cel Animation",
-      "description": "Modern digital anime and cel-style 2D: clean line art, big flat colour fields, and gradients that band easily. Keeps the lines sharp, deblocks more accurately, and spends extra bits on the dark scenes that band worst.",
+      "description": "Modern digital anime and cel-style 2D: clean line art, big flat colour fields, and gradients that band easily. Keeps the lines sharp, deblocks more accurately, and spends extra bits on the dark scenes that band worst. With some SVT builds or AV1AN, this preset may limit each encoder to one processing lane and slow encoding.",
       "parameters": [
         {
           "name": "tune",
@@ -196,7 +196,7 @@
     },
     {
       "name": "Game Capture / Gameplay",
-      "description": "Raw gameplay capture at 60fps or faster, at whatever size it is being encoded to - a 4K capture scaled down to 1080p or 720p included: sustained fast motion, hard-edged HUD text, and synthetic skies, fog and volumetrics that band badly. Keeps the screen content tools from misfiring on a HUD and taking a whole chunk with them.",
+      "description": "Raw gameplay capture at 60fps or faster, at whatever size it is being encoded to - a 4K capture scaled down to 1080p or 720p included: sustained fast motion, hard-edged HUD text, and synthetic skies, fog and volumetrics that band badly. Keeps the screen content tools from misfiring on a HUD and taking a whole chunk with them. With some SVT builds or AV1AN, this preset may limit each encoder to one processing lane and slow encoding.",
       "parameters": [
         {
           "name": "tune",

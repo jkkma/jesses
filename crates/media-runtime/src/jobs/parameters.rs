@@ -287,6 +287,23 @@ pub(in crate::jobs) fn requires_serial_svt(settings: &EncodeSettings) -> bool {
         })
 }
 
+pub(in crate::jobs) const WINDOWS_PATMAN_RELEASE: &str =
+    "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)";
+
+pub(in crate::jobs) fn allows_parallel_standalone_svt(
+    settings: &EncodeSettings,
+    identity: &str,
+) -> bool {
+    // This build completed the same paired-option clip that crashes SVT 4.2
+    // at default parallelism, as well as longer clips. Keep the AV1AN cap.
+    cfg!(windows)
+        && settings.backend == EncodeBackend::Standalone
+        && settings.encoder == VideoEncoder::SvtAv1Hdr
+        && identity
+            .lines()
+            .any(|line| line.trim() == WINDOWS_PATMAN_RELEASE)
+}
+
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     validate_values(settings.encoder, settings.backend, &settings.parameters)?;
     if settings.encoder.is_svt()
@@ -1235,6 +1252,31 @@ mod tests {
         validate(&settings).unwrap();
         settings.parameters.pop();
         assert!(!requires_serial_svt(&settings));
+    }
+
+    #[test]
+    fn only_qualified_windows_patman_build_allows_standalone_parallel_svt_pair() {
+        let mut settings = setting(VideoEncoder::SvtAv1Hdr, "hbd-mds", "1");
+        settings.backend = EncodeBackend::Standalone;
+        let identity = format!("\n{WINDOWS_PATMAN_RELEASE}\nHDR Release: N/A\n");
+        assert_eq!(
+            allows_parallel_standalone_svt(&settings, &identity),
+            cfg!(windows)
+        );
+        for unqualified in [
+            "",
+            "SVT-AV1 v4.2.0 (release)",
+            "SVT-AV1 [5fish] v2.3.260827 (release)",
+            "SVT-AV1-HDR v4.1.0-21-g00333404f (release)",
+            "SVT-AV1-HDR v4.1.0+77+86-e4b6c4ff5 [Mod by Patman] (release)",
+        ] {
+            assert!(!allows_parallel_standalone_svt(&settings, unqualified));
+        }
+        settings.backend = EncodeBackend::Av1an;
+        assert!(!allows_parallel_standalone_svt(&settings, &identity));
+        settings.backend = EncodeBackend::Standalone;
+        settings.encoder = VideoEncoder::SvtAv1;
+        assert!(!allows_parallel_standalone_svt(&settings, &identity));
     }
 
     #[tokio::test]

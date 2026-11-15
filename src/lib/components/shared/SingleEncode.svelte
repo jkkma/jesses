@@ -3996,15 +3996,31 @@
               step={1}
               bind:value={crf}
               disabled={!encodingVideo}
+              aria-describedby={isSvtEncoder(encoder) && crf === 0 && encodingVideo
+                ? `${idPrefix}-svt-zero-hint`
+                : undefined}
             />{/if}
+          {#if encodingVideo && !isImage && isSvtEncoder(encoder) && crf === 0 && rate.mode === 'quality' && (!chunked || !av1an.targetEnabled)}
+            <p class="field-hint" id={`${idPrefix}-svt-zero-hint`}>
+              The documented SVT CRF range starts at 1; 0 is not lossless.
+            </p>
+          {/if}
           <label for={`${idPrefix}-preset`}>Preset / Effort</label><select
             id={`${idPrefix}-preset`}
             bind:value={preset}
             disabled={!encodingVideo || isImage}
+            aria-describedby={encodingVideo && !isImage && isSvtEncoder(encoder) && preset >= 10
+              ? `${idPrefix}-svt-preset-hint`
+              : undefined}
             >{#each isImage || !encodingVideo ? [] : options.presets as choice}<option
                 value={choice.value}>{choice.label}</option
               >{/each}</select
           >
+          {#if encodingVideo && !isImage && isSvtEncoder(encoder) && preset >= 10}
+            <p class="field-hint" id={`${idPrefix}-svt-preset-hint`}>
+              Preset 10 and above is intended for automated tooling; visual artifacts may occur.
+            </p>
+          {/if}
           {#if encoder === 'svtAv1Hdr' && encodingVideo && !isImage}
             {@const override = parameters.find((item) => item.name === 'tune')?.value}
             <label for={`${idPrefix}-tune`}>Tune</label><select
@@ -4900,6 +4916,11 @@
     gap: 5px 8px;
     font-size: 13px;
     min-width: 0;
+  }
+  .field-hint {
+    grid-column: 2;
+    margin: 0;
+    color: var(--muted-foreground);
   }
   .video-columns .form > select {
     width: min(100%, 22ch);

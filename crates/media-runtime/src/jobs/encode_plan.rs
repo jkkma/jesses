@@ -398,6 +398,7 @@ pub(super) struct Plan {
     source_filters: bool,
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
+    pub(super) allow_parallel_svt: bool,
     source_pixel_format: &'static str,
     source_is_vp9_alpha: bool,
     pub output_pixel_format: &'static str,
@@ -605,7 +606,7 @@ pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppErro
             "ENCODE_SETTINGS_INVALID",
             match settings.encoder {
                 VideoEncoder::SvtAv1 | VideoEncoder::SvtAv1FiveFish | VideoEncoder::SvtAv1Hdr => {
-                    "Use SVT CRF 1–70 in 0.25 steps, an advertised preset from -3–13, film grain synthesis from 0–50, and 1–32 workers."
+                    "Use SVT CRF 0–63 in the whole-number field or 0–70 in 0.25 steps, an advertised preset from -3–13, film grain synthesis from 0–50, and 1–32 workers."
                 }
                 VideoEncoder::X264 => {
                     "x264 requires CRF 0–51, preset 0–9, grain 0, HDR10 fallback off, and 1–32 workers."
@@ -1209,6 +1210,7 @@ impl Plan {
         .unwrap_or(conventional_sdr);
         Ok(Self {
             source_frames_estimated: false,
+            allow_parallel_svt: false,
             output_origin: 0.0,
             source_origin: declared_origin,
             source_cut_ordinals: false,
@@ -3516,6 +3518,29 @@ mod tests {
                 })
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn svt_quality_range_includes_zero_and_sub_one_values() {
+        for encoder in [
+            VideoEncoder::SvtAv1,
+            VideoEncoder::SvtAv1FiveFish,
+            VideoEncoder::SvtAv1Hdr,
+        ] {
+            let mut settings = EncodeSettings {
+                encoder,
+                crf: 0,
+                ..Default::default()
+            };
+            for quarters in [None, Some(1), Some(2), Some(3), Some(280)] {
+                settings.svt_crf_quarter_steps = quarters;
+                validate_settings(&settings).unwrap();
+            }
+            settings.svt_crf_quarter_steps = Some(281);
+            let error = validate_settings(&settings).unwrap_err();
+            assert!(error.message.contains("CRF 0–63"));
+            assert!(error.message.contains("0–70 in 0.25 steps"));
         }
     }
 
