@@ -549,6 +549,38 @@ impl Temporary {
         })
     }
 
+    /// Publication is a hard link beside the destination. Prove that the
+    /// destination's volume supports one before any media work starts, so an
+    /// unsupported volume fails at once and not after the encode.
+    pub fn check_publishable(output: &Path, id: &str) -> Result<(), AppError> {
+        let mut probe = Self::create_extension(output, &format!("{id}-publish-probe"), "tmp")?;
+        let alias = probe.path.with_extension("alias");
+        let linked = fs::hard_link(&probe.path, &alias);
+        #[cfg(unix)]
+        let identity = probe.identity;
+        #[cfg(windows)]
+        let identity = probe.windows_identity;
+        // Release the reservation first: removing the second name conflicts
+        // with an open handle that does not share delete access.
+        probe.cleanup()?;
+        if linked.is_ok() {
+            remove_owned_alias(&alias, identity).map_err(|e| {
+                error(
+                    "OUTPUT_CLEANUP_FAILED",
+                    format!("The publication probe could not be removed safely: {e}"),
+                    &alias,
+                )
+            })?;
+        }
+        linked.map_err(|e| {
+            error(
+                "OUTPUT_FINALIZE_UNSUPPORTED",
+                format!("Finished files cannot be published in this folder: {e}. The output filesystem must support hard links; choose a folder on another drive."),
+                output,
+            )
+        })
+    }
+
     pub fn cleanup(&mut self) -> Result<(), AppError> {
         self.verify_identity()?;
         self.file.take();
@@ -621,6 +653,25 @@ pub(super) fn windows_delete_owned(path: &Path, expected: (u32, u32, u32)) -> st
         return Err(std::io::Error::last_os_error());
     }
     Ok(()) // Closing this exact handle removes only this verified directory link.
+}
+
+/// Removes a second name of an owned temporary while it still names that file.
+#[cfg(windows)]
+fn remove_owned_alias(path: &Path, identity: (u32, u32, u32)) -> std::io::Result<()> {
+    windows_delete_owned(path, identity)
+}
+
+/// Removes a second name of an owned temporary while it still names that file.
+#[cfg(unix)]
+fn remove_owned_alias(path: &Path, identity: (u64, u64)) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if (metadata.dev(), metadata.ino()) != identity {
+        return Err(std::io::Error::other(
+            "The probe pathname now names a different file; it was preserved.",
+        ));
+    }
+    fs::remove_file(path)
 }
 
 impl Drop for Temporary {
@@ -739,6 +790,29 @@ mod tests {
         temp.publish(&output).unwrap();
         temp.cleanup().unwrap();
         assert_eq!(fs::read(&output).unwrap(), b"verified media");
+    }
+
+    #[test]
+    fn publication_probe_passes_and_leaves_the_destination_folder_unchanged() {
+        let dir = Fixture::new();
+        let output = dir.0.join("destination.mkv");
+        Temporary::check_publishable(&output, "probe").unwrap();
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn publication_probe_reports_a_failed_link_and_removes_only_its_own_file() {
+        let dir = Fixture::new();
+        let output = dir.0.join("destination.mkv");
+        // An unrelated file on the probe's second name makes the link fail, as
+        // it does on a volume without hard links.
+        let alias = dir.0.join(".jesses-blocked-publish-probe.partial.alias");
+        fs::write(&alias, b"unrelated").unwrap();
+        let error = Temporary::check_publishable(&output, "blocked").unwrap_err();
+        assert_eq!(error.code, "OUTPUT_FINALIZE_UNSUPPORTED");
+        assert!(error.message.contains("hard links"));
+        assert_eq!(fs::read(&alias).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
     }
 
     #[cfg(windows)]

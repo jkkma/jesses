@@ -1630,7 +1630,34 @@ impl JobManager {
         let request = snapshot.request;
         let mut temporary = None;
         let mut scratch = Vec::new();
-        let result = if let Some(mapping) = snapshot.mux_request {
+        // Publication needs a hard link beside the destination. A volume that
+        // cannot make one must fail here, not after the encode.
+        let publishable = {
+            let output = PathBuf::from(snapshot.mux_request.as_ref().map_or_else(
+                || request.output_path.clone(),
+                |mapping| mapping.output_path.clone(),
+            ));
+            let probe_id = id.clone();
+            tokio::task::spawn_blocking(move || {
+                // The job's own destination checks report a missing folder.
+                if output.file_name().is_some() && output.parent().is_some_and(Path::is_dir) {
+                    Temporary::check_publishable(&output, &probe_id)
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap_or_else(|cause| {
+                Err(AppError::new(
+                    "OUTPUT_CREATE_FAILED",
+                    cause.to_string(),
+                    None,
+                ))
+            })
+        };
+        let result = if let Err(error) = publishable {
+            Err(error)
+        } else if let Some(mapping) = snapshot.mux_request {
             self.mux(
                 &id,
                 &mapping,
