@@ -519,6 +519,22 @@ impl JobManager {
             })
             .await;
         }
+        if !thorough
+            && settings.backend == media_core::EncodeBackend::Standalone
+            && settings.encoder.is_svt()
+            && !verify_svt_ivf
+        {
+            // The check turns itself off for a build outside the qualified
+            // list, for example after an encoder update. Say so.
+            self.change(id, |snapshot| {
+                append_log(
+                    snapshot,
+                    "The encoded frame count is not compared for this SVT build: its IVF header count has not been qualified."
+                        .into(),
+                )
+            })
+            .await;
+        }
         // Thorough verification re-checks every result; without it, a job runs
         // what the encode needs and checks the finished file's counts.
         // Stream headers are enough to plan. The whole file is read for packet
@@ -2389,7 +2405,6 @@ impl JobManager {
                                 None
                             },
                             thorough,
-                            thorough,
                             cancel,
                         )
                         .await?;
@@ -4044,8 +4059,7 @@ async fn validate_video_checkpoint(
     plan: &mut Plan,
     expected_frames: &mut usize,
     producer: Option<super::source_filters::ProducerClock>,
-    decode: bool,
-    count: bool,
+    thorough: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let document = if plan.encoder == VideoEncoder::X265Standalone {
@@ -4090,7 +4104,7 @@ async fn validate_video_checkpoint(
                 &checkpoint.path,
             )
         })?
-    } else if count {
+    } else if thorough {
         probe(ffprobe, &checkpoint.path, cancel, Some(&[0])).await?
     } else {
         probe_headers(ffprobe, &checkpoint.path, cancel, Some(&[0])).await?
@@ -4112,18 +4126,13 @@ async fn validate_video_checkpoint(
             )
         })?;
     }
-    if !count {
+    // A default run does not read the checkpoint again: its frame count comes
+    // from the producer and, for qualified SVT builds, from the IVF header.
+    if !thorough {
         return Ok(());
     }
     plan.validate_elementary_checkpoint(source, encoded)?;
-    // Full verification decodes every frame. Fast verification counts packets:
-    // these encoders write exactly one packet (access unit, temporal unit, or
-    // superframe) per frame.
-    let (count, entry) = if decode {
-        ("-count_frames", "stream=nb_read_frames")
-    } else {
-        ("-count_packets", "stream=nb_read_packets")
-    };
+    // Thorough verification decodes every frame.
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -4131,9 +4140,9 @@ async fn validate_video_checkpoint(
         "explode",
         "-select_streams",
         "0",
-        count,
+        "-count_frames",
         "-show_entries",
-        entry,
+        "stream=nb_read_frames",
         "-of",
         "default=nokey=1:noprint_wrappers=1",
         "-i",
@@ -4161,15 +4170,9 @@ async fn validate_video_checkpoint(
     if !result.status.success() || !result.stderr.is_empty() || frames != Some(*expected_frames) {
         return Err(files::error(
             "ENCODE_VALIDATION_FAILED",
-            if decode {
-                format!(
-                    "The complete video checkpoint did not decode to the planned {expected_frames} frames."
-                )
-            } else {
-                format!(
-                    "The complete video checkpoint does not contain the planned {expected_frames} frames."
-                )
-            },
+            format!(
+                "The complete video checkpoint did not decode to the planned {expected_frames} frames."
+            ),
             &checkpoint.path,
         ));
     }
