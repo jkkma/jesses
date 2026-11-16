@@ -437,6 +437,25 @@ pub(super) fn unsupported(message: &str) -> AppError {
     AppError::new("ENCODE_INPUT_UNSUPPORTED", message, None)
 }
 
+// Source clocks that canonical source preparation repairs. The encode retries
+// through that preparation when it sees one of these rejections, so the places
+// that raise them and the retry share these constants.
+pub(super) const NOT_ZERO_BASED_TIMELINE: &str = "Encoding requires video timelines that start at zero. Timestamp offset handling requires canonical source preparation.";
+pub(super) const NOT_CONSTANT_RATE_FRAMES: &str = "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.";
+pub(super) const NOT_CONSTANT_RATE_PRODUCER: &str = "Decoded frame timestamps are not constant-rate. The FFmpeg producer encountered variable cadence or a timestamp gap.";
+
+/// Whether canonical source preparation can repair this rejected source clock.
+pub(super) fn repairable_source_clock(error: &AppError) -> bool {
+    error.code == "ENCODE_INPUT_UNSUPPORTED"
+        && [
+            NOT_ZERO_BASED_TIMELINE,
+            NOT_CONSTANT_RATE_FRAMES,
+            NOT_CONSTANT_RATE_PRODUCER,
+        ]
+        .iter()
+        .any(|message| error.message.contains(message))
+}
+
 pub(super) fn validate_settings(settings: &EncodeSettings) -> Result<(), AppError> {
     super::encoding_preferences::validate(settings)?;
     if settings.video_mode == media_core::VideoMode::Encode {
@@ -1195,9 +1214,7 @@ impl Plan {
             && !preserves_dolby_source_clock(video, settings)
             && !source_av1an_base_clock(video, settings)
         {
-            return Err(unsupported(
-                "Encoding requires video timelines that start at zero. Timestamp offset handling requires canonical source preparation.",
-            ));
+            return Err(unsupported(NOT_ZERO_BASED_TIMELINE));
         }
         let conventional_sdr = if rgb_source
             || video.height.is_some_and(|height| height > 576)
@@ -2368,9 +2385,7 @@ impl Plan {
             .abs()
                 > tolerance
             {
-                return Err(unsupported(
-                    "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
-                ));
+                return Err(unsupported(NOT_CONSTANT_RATE_FRAMES));
             }
             let (width, height) = self.frame_dimensions(encoded);
             self.validate_fields(frame, encoded)?;
@@ -2736,6 +2751,26 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_repairable_source_clock_rejection_reaches_the_retry() {
+        for message in [
+            NOT_ZERO_BASED_TIMELINE,
+            NOT_CONSTANT_RATE_FRAMES,
+            NOT_CONSTANT_RATE_PRODUCER,
+        ] {
+            assert!(repairable_source_clock(&unsupported(message)), "{message}");
+            // A caller may add context around the original message.
+            let wrapped = unsupported(&format!("Source check: {message} Cleanup: none."));
+            assert!(repairable_source_clock(&wrapped), "{message}");
+            // The same words under another code are a different failure.
+            let other = AppError::new("DECODE_VALIDATION_FAILED", message, None);
+            assert!(!repairable_source_clock(&other), "{message}");
+        }
+        assert!(!repairable_source_clock(&unsupported(
+            "Only progressive video can be encoded."
+        )));
+    }
 
     #[test]
     fn retained_dolby_origin_keeps_strict_cfr_and_does_not_enable_trim_or_ordinal_clocks() {

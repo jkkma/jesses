@@ -191,9 +191,7 @@ impl Cadence {
             .abs()
                 > self.tolerance
         {
-            return Err(unsupported(
-                "Decoded frame timestamps are not constant-rate starting at zero. VFR and timestamp gaps require a later workflow.",
-            ));
+            return Err(unsupported(NOT_CONSTANT_RATE_FRAMES));
         }
         if self.timing_only && self.count > 0 {
             return Ok(());

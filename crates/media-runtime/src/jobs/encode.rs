@@ -248,13 +248,7 @@ impl JobManager {
             })
             .await;
             match &result {
-                Err(error)
-                    if error.code == "ENCODE_INPUT_UNSUPPORTED"
-                        && (error
-                            .message
-                            .contains("Decoded frame timestamps are not constant-rate")
-                            || error.message.contains("timelines that start at zero")) =>
-                {
+                Err(error) if super::encode_plan::repairable_source_clock(error) => {
                     required = true;
                     self.phase(
                         id,

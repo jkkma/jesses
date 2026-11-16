@@ -45,10 +45,8 @@ impl Cadence {
         // Matroska's millisecond timestamps, for example, alternate 41 and
         // 42 ms at 24000/1001 fps. Check the grid, with room for quantization.
         if !clock.monotonic || (elapsed - expected).abs() > self.tolerance.max(tick) {
-            return Err(AppError::new(
-                "ENCODE_INPUT_UNSUPPORTED",
-                "Decoded frame timestamps are not constant-rate. The FFmpeg producer encountered variable cadence or a timestamp gap.",
-                None,
+            return Err(super::encode_plan::unsupported(
+                super::encode_plan::NOT_CONSTANT_RATE_PRODUCER,
             ));
         }
         Ok(())
