@@ -948,6 +948,11 @@ impl JobManager {
         // Recoverable jobs keep the lane count recorded by their command
         // signature and use the same lane count across both bitrate passes.
         plan.allow_parallel_svt = allow_parallel_svt && standalone_locator.is_none();
+        // The same holds for the other encoders' thread counts: only a job
+        // without a recovery workspace sizes them to this machine.
+        plan.machine_threads = !thorough
+            && settings.backend == media_core::EncodeBackend::Standalone
+            && standalone_locator.is_none();
         let interval = settings
             .trim
             .map(|trim| super::trim::Interval::build(trim, frame_count, plan.fps_num, plan.fps_den))

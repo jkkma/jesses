@@ -399,6 +399,9 @@ pub(super) struct Plan {
     temporal: Option<temporal::Transform>,
     pub encoder: VideoEncoder,
     pub(super) allow_parallel_svt: bool,
+    /// Size standalone x265, VP9, AOM and VPX threading to this machine. Jobs
+    /// with a recovery workspace keep the arguments their signature recorded.
+    pub(super) machine_threads: bool,
     /// Use the exact SVT recipe from pre-1.3.0 recovery workspaces.
     pub(super) legacy_svt_parameters: bool,
     source_pixel_format: &'static str,
@@ -1237,6 +1240,7 @@ impl Plan {
         Ok(Self {
             source_frames_estimated: false,
             allow_parallel_svt: false,
+            machine_threads: false,
             legacy_svt_parameters: false,
             output_origin: 0.0,
             source_origin: declared_origin,
@@ -1401,6 +1405,16 @@ impl Plan {
     }
     pub fn has_source_filters(&self) -> bool {
         self.source_filters
+    }
+    /// The thread count for a standalone x265, VP9, AOM or VPX run sized to
+    /// this machine, or `None` to keep the fixed threading arguments.
+    pub(super) fn machine_encoder_threads(&self) -> Option<usize> {
+        // libaom and libvpx accept at most 64 threads.
+        self.machine_threads.then(|| {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(64)
+        })
     }
     pub fn source_chunk_rate(&self) -> (u32, u32) {
         self.source_chunk_rate

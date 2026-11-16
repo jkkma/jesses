@@ -61,6 +61,10 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
         format!("--fps={}/{}", plan.fps_num, plan.fps_den).into(),
         "--disable-warning-prompt".into(),
     ];
+    // Row multithreading spreads rows over the threads the encoder is given.
+    if let Some(threads) = plan.machine_encoder_threads() {
+        args.push(format!("--threads={threads}").into());
+    }
     if let Some(frames) = super::super::encoding_preferences::keyframes(plan, settings) {
         args.push(format!("--kf-max-dist={frames}").into());
     }
@@ -256,6 +260,32 @@ mod tests {
         );
         let vpx = format!("{common} --codec=<arg> --color-space=<arg>");
         assert!(validate_help(&vpx, VideoEncoder::VpxStandalone, 8, false, "yuv420p").is_ok());
+    }
+
+    #[test]
+    fn machine_sized_runs_pass_a_thread_count_and_recorded_arguments_stay_fixed() {
+        let threads = |args: &[OsString]| {
+            args.iter()
+                .filter_map(|argument| {
+                    argument
+                        .to_str()?
+                        .strip_prefix("--threads=")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        for encoder in [VideoEncoder::AomAv1, VideoEncoder::VpxStandalone] {
+            let (mut plan, settings) = plan(8, encoder);
+            assert!(
+                threads(&arguments(&plan, &settings)).is_empty(),
+                "{encoder:?}"
+            );
+            plan.machine_threads = true;
+            let counts = threads(&arguments(&plan, &settings));
+            assert_eq!(counts.len(), 1, "{encoder:?}");
+            assert!((1..=64).contains(&counts[0]), "{encoder:?}");
+        }
     }
 
     #[test]

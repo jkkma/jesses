@@ -133,7 +133,14 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                 // All options are fixed scalars; no input path reaches this parser.
                 "-x265-params".into(),
                 format!(
-                    "pools=4:frame-threads=2:log-level=warning{}{}{}",
+                    "{}log-level=warning{}{}{}",
+                    // x265 sizes its own pools to the machine. The fixed pool
+                    // is what a recovery signature recorded.
+                    if plan.machine_encoder_threads().is_some() {
+                        ""
+                    } else {
+                        "pools=4:frame-threads=2:"
+                    },
                     if settings.lossless { ":lossless=1" } else { "" },
                     super::super::parameters::x265_suffix(settings),
                     plan.ffmpeg_x265_hdr_suffix()
@@ -157,7 +164,10 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                 "-row-mt".into(),
                 "1".into(),
                 "-threads".into(),
-                "4".into(),
+                plan.machine_encoder_threads()
+                    .unwrap_or(4)
+                    .to_string()
+                    .into(),
                 "-profile:v".into(),
                 match (
                     plan.output_pixel_format.starts_with("yuv444"),
@@ -250,6 +260,53 @@ pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan(encoder: VideoEncoder) -> (Plan, EncodeSettings) {
+        let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"0"},
+            "streams":[{"index":0,"codec_type":"video","codec_name":"ffv1","width":128,"height":72,
+                "pix_fmt":"yuv420p","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0",
+                "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
+                "color_transfer":"bt709","color_range":"tv"}]
+        }))
+        .unwrap();
+        let settings = EncodeSettings {
+            encoder,
+            video_stream_index: 0,
+            preset: 4,
+            ..Default::default()
+        };
+        (
+            Plan::build(&document, &[&document.streams[0]], &settings).unwrap(),
+            settings,
+        )
+    }
+
+    #[test]
+    fn machine_sized_runs_drop_the_fixed_thread_limits_and_recorded_arguments_keep_them() {
+        let after = |args: &[OsString], flag: &str| {
+            let at = args.iter().position(|argument| argument == flag).unwrap();
+            args[at + 1].to_string_lossy().into_owned()
+        };
+        let (mut x265, settings) = plan(VideoEncoder::X265);
+        assert!(
+            after(&arguments(&x265, &settings), "-x265-params")
+                .starts_with("pools=4:frame-threads=2:log-level=warning")
+        );
+        x265.machine_threads = true;
+        assert!(
+            after(&arguments(&x265, &settings), "-x265-params").starts_with("log-level=warning")
+        );
+
+        let (mut vp9, settings) = plan(VideoEncoder::Vp9);
+        assert_eq!(after(&arguments(&vp9, &settings), "-threads"), "4");
+        vp9.machine_threads = true;
+        let threads: usize = after(&arguments(&vp9, &settings), "-threads")
+            .parse()
+            .unwrap();
+        assert!((1..=64).contains(&threads));
+    }
+
     #[test]
     fn missing_cpu_library_or_selected_depth_is_rejected() {
         assert!(
