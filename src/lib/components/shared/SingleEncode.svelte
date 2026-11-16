@@ -2888,8 +2888,9 @@
           (stream) => stream.kind === 'video' && chosen.includes(stream.index),
         );
         const noPicture = !chunked && !vid;
+        const picture = !noPicture && batchState.encodingVideo;
         const burn =
-          !noPicture && batchState.burnOrdinal >= 0
+          picture && batchState.burnOrdinal >= 0
             ? entry.streams.filter((stream) => stream.kind === 'subtitle')[batchState.burnOrdinal]
             : undefined;
         const burnRetained = !!burn && chosen.includes(burn.index);
@@ -2913,20 +2914,25 @@
               : {}),
           }));
         let detected: Awaited<ReturnType<typeof detectCrop>> | null = null,
-          resolvedTemporal = noPicture ? undefined : settings.temporal;
+          resolvedTemporal = picture ? settings.temporal : undefined;
         try {
-          if (vid && batchState.cropMode === 'manual' && !cropFits(batchState.framing, vid))
+          if (
+            picture &&
+            vid &&
+            batchState.cropMode === 'manual' &&
+            !cropFits(batchState.framing, vid)
+          )
             throw new Error('Crop leaves less than two pixels.');
           detected =
-            batchState.cropMode === 'automatic' && vid
+            picture && batchState.cropMode === 'automatic' && vid
               ? await detectCrop(
                   { inputPath: entry.path, videoStreamIndex: vid.index },
                   controller.signal,
                 )
               : null;
-          if (vid && batchState.cropMode === 'automatic' && !detected?.crop)
+          if (picture && vid && batchState.cropMode === 'automatic' && !detected?.crop)
             throw new Error('Automatic crop detection did not find a crop.');
-          if (vid)
+          if (picture && vid)
             resolvedTemporal = await temporalForSource(
               entry,
               vid.index,
@@ -2974,7 +2980,7 @@
                   .filter((track) => track.mode !== 'copy' || track.burnIn),
               }
             : {}),
-          framing: noPicture
+          framing: !picture
             ? selectedFraming(defaultFramingDraft())
             : detected?.crop
               ? { ...settings.framing, crop: detected.crop }
@@ -2983,7 +2989,7 @@
                 : settings.framing,
           ...(resolvedTemporal ? { temporal: resolvedTemporal } : {}),
           ...(settings.trim ? { trim: settings.trim } : {}),
-          ...(!noPicture && settings.toneMap ? { toneMap: settings.toneMap } : {}),
+          ...(picture && settings.toneMap ? { toneMap: settings.toneMap } : {}),
         };
       }),
     ).catch((cause) => {
@@ -3737,8 +3743,9 @@
       );
     let request = structuredClone($state.snapshot(built));
     const runSource = structuredClone($state.snapshot(file));
-    const runVideoIndex = request.settings.videoMode === 'drop' ? undefined : videoIndex,
-      runCropMode = request.settings.videoMode === 'drop' ? 'disabled' : cropMode,
+    const runPicture = (request.settings.videoMode ?? 'encode') === 'encode';
+    const runVideoIndex = runPicture ? videoIndex : undefined,
+      runCropMode = runPicture ? cropMode : 'disabled',
       runMode = fileMode;
     const runTarget = outputTarget(),
       runStem = destination,

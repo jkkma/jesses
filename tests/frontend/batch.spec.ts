@@ -1079,6 +1079,51 @@ test('Quick batch freezes source HDR metadata grid in both per-file requests', a
   ]);
 });
 
+test('Quick batch copy sends no deinterlace or crop settings for interlaced sources', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  // The fixture's video stream is interlaced, and both controls stay at
+  // values that apply only when the video is encoded.
+  const second = { ...source, id: 'second', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    (inputs) => {
+      const h = globalThis as any;
+      h.__pickerPaths = inputs.map((item) => item.path);
+      h.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+    },
+    [source, second],
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Crop', { exact: true }).selectOption('automatic');
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const sent = calls
+    .filter((c: any) => c.command === 'mock_start_encode')
+    .map((c: any) => c.payload.request.settings);
+  for (const settings of sent) {
+    expect(settings.videoMode).toBe('copy');
+    expect(settings.temporal).toBeUndefined();
+    expect(settings.framing.crop).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+  }
+  expect(
+    calls.filter((c: any) => ['detect_crop', 'resolve_deinterlace'].includes(c.command)),
+  ).toHaveLength(0);
+});
+
 test('AV1AN batch freezes the chosen target metric and source defaults for both files', async ({
   page,
 }) => {

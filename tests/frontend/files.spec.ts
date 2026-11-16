@@ -82,6 +82,15 @@ test('copy conversion keeps colliding stream indices source-scoped and preserves
       (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode').payload
         .request,
   );
+  expect(request.settings.videoMode).toBe('copy');
+  expect(request.settings.temporal).toBeUndefined();
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'resolve_deinterlace')
+          .length,
+    ),
+  ).toBe(0);
   expect(request.source).toMatchObject({ inputPath: '/media/input.mkv', streamIndices: [0, 1, 2] });
   expect(request.settings.externalTracks).toContainEqual(
     expect.objectContaining({ inputPath: '/other/commentary.mka', streamIndex: 1 }),
@@ -96,4 +105,32 @@ test('copy conversion keeps colliding stream indices source-scoped and preserves
   expect(externalPosition).toBeGreaterThanOrEqual(0);
   expect(subtitlePosition).toBeGreaterThanOrEqual(0);
   expect(externalPosition).toBeLessThan(subtitlePosition);
+});
+
+test('copy ignores an automatic crop selected before changing codecs', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Crop').selectOption('automatic');
+  await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
+  await expect(quick.getByLabel('Crop')).toBeDisabled();
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+      ),
+    )
+    .toBe(true);
+  const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
+  const settings = calls.find((c: any) => c.command === 'mock_start_encode').payload.request
+    .settings;
+  expect(settings.videoMode).toBe('copy');
+  expect(settings.temporal).toBeUndefined();
+  expect(settings.framing.crop).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+  expect(
+    calls.filter((c: any) => ['detect_crop', 'resolve_deinterlace'].includes(c.command)),
+  ).toHaveLength(0);
 });

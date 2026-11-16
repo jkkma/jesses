@@ -186,6 +186,38 @@ export async function installSourceEncodeFixture(page: Page) {
               request.kind === 'resumeSaved' || request.kind === 'resumeNew'
                 ? state.__recoveries.find((entry: any) => entry.job.id === request.id)
                 : undefined;
+          if (request.kind === 'encode') {
+            const settings = request.request.settings;
+            if (settings.videoMode === 'copy' || settings.videoMode === 'drop') {
+              const framing = settings.framing ?? {};
+              const nonzeroEdges = (edges: any) =>
+                ['top', 'right', 'bottom', 'left'].some((edge) => (edges?.[edge] ?? 0) !== 0);
+              if (
+                settings.constantQuantizer != null ||
+                settings.hdrMetadata != null ||
+                nonzeroEdges(framing.crop) ||
+                nonzeroEdges(framing.borders) ||
+                framing.resizeWidth != null ||
+                framing.resize != null ||
+                framing.borderRatio != null ||
+                settings.temporal != null ||
+                settings.toneMap != null ||
+                settings.parameters?.length ||
+                settings.av1anFilters?.length ||
+                settings.av1anGrain != null ||
+                settings.outputPixelFormat != null ||
+                settings.av1anOptions != null ||
+                settings.movTimecodeTrack != null ||
+                settings.externalTracks?.some(
+                  (track: any) => track.subtitleBurnIn || track.subtitleMode === 'burnIn',
+                ) ||
+                settings.subtitles?.some((track: any) => track.mode === 'burnIn' || track.burnIn)
+              )
+                throw new Error(
+                  'Copy-video and audio-only conversion require picture controls and subtitle burn-in to be disabled. Choose video encoding to apply picture changes.',
+                );
+            }
+          }
           if (
             (request.kind === 'resumeSaved' || request.kind === 'resumeNew') &&
             state.__recoveryFailure
@@ -474,6 +506,36 @@ export async function installSourceEncodeFixture(page: Page) {
                   error: { code: 'TEST_FAILURE', message: 'Preparation failed for this input' },
                   request: null,
                 };
+              const settings = { ...payload.request, ...input };
+              // Like the backend, an input with its own copy or drop mode
+              // ignores the batch's picture settings.
+              if (input.videoMode && input.videoMode !== 'encode') {
+                for (const key of [
+                  'constantQuantizer',
+                  'hdrMetadata',
+                  'temporal',
+                  'parameters',
+                  'av1anOptions',
+                  'outputPixelFormat',
+                  'av1anGrain',
+                  'av1anFilters',
+                  'rateControl',
+                  'toneMap',
+                ])
+                  delete settings[key];
+                if (settings.framing)
+                  settings.framing = {
+                    crop: { top: 0, right: 0, bottom: 0, left: 0 },
+                    resizeWidth: null,
+                    borders: { top: 0, right: 0, bottom: 0, left: 0 },
+                  };
+                if (settings.subtitles)
+                  settings.subtitles = settings.subtitles.map((track: any) => ({
+                    ...track,
+                    burnIn: false,
+                    mode: track.mode === 'burnIn' ? 'copy' : track.mode,
+                  }));
+              }
               return {
                 inputPath: input.inputPath,
                 outputPath: path,
@@ -484,7 +546,7 @@ export async function installSourceEncodeFixture(page: Page) {
                     outputPath: path,
                     streamIndices: input.streamIndices,
                   },
-                  settings: { ...payload.request, ...input },
+                  settings,
                 },
               };
             }),
