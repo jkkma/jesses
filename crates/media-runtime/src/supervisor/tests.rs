@@ -373,6 +373,40 @@ fn fake_tool() {
             }
             std::process::exit(0);
         }
+        "watchdog-restarted-chunk" | "watchdog-recreated-chunk" => {
+            let chunk = path.join("encode/00000.ivf");
+            let append = |bytes: usize| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&chunk)
+                    .unwrap()
+                    .write_all(&vec![0; bytes])
+                    .unwrap();
+            };
+            let restart = || drop(std::fs::File::create(&chunk).unwrap());
+            // A first attempt writes most of a chunk before its encoder fails.
+            for _ in 0..12 {
+                append(100);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if mode == "watchdog-restarted-chunk" {
+                // The retry starts from an empty file and encodes normally,
+                // staying below the first attempt's size past the limit.
+                restart();
+                for _ in 0..30 {
+                    append(1);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                std::process::exit(0);
+            }
+            // A file that keeps being recreated at one size is not progress.
+            loop {
+                restart();
+                append(4);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         "small" => {
             std::io::stdout()
                 .write_all(b"binary\0\xff\r\ncomplete")
@@ -746,6 +780,7 @@ fn start_watchdog(
                 WATCHDOG_LIMIT,
                 [&work.join("done.json"), &work.join("av1an.log")],
                 &work.join("encode"),
+                1,
                 None,
                 pause.as_ref(),
             )
@@ -787,6 +822,34 @@ async fn watchdog_stops_a_chunk_that_rewrites_the_same_size() {
     let task = start_watchdog(&fixture, cancel, None);
     let pid = fixture.pid(0).await;
     let result = task.await.unwrap();
+    assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
+    assert_dead(&[pid]).await;
+}
+
+#[tokio::test]
+async fn watchdog_follows_a_chunk_that_its_encoder_starts_again() {
+    let fixture = Fixture::new("watchdog-restarted-chunk");
+    std::fs::create_dir(fixture.0.join("encode")).unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let started = std::time::Instant::now();
+    let result = start_watchdog(&fixture, cancel, None).await.unwrap();
+    // The retried file stays smaller than the failed attempt for longer than
+    // the limit; only its own growth can have kept the job alive.
+    assert!(result.unwrap().status.success());
+    assert!(started.elapsed() > WATCHDOG_LIMIT);
+}
+
+#[tokio::test]
+async fn watchdog_stops_a_chunk_that_keeps_being_recreated() {
+    let fixture = Fixture::new("watchdog-recreated-chunk");
+    std::fs::create_dir(fixture.0.join("encode")).unwrap();
+    let (_owner, cancel) = watch::channel(false);
+    let task = start_watchdog(&fixture, cancel, None);
+    let pid = fixture.pid(0).await;
+    let result = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(result, Err(SupervisorError::InactivityTimeout)));
     assert_dead(&[pid]).await;
 }

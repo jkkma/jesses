@@ -41,9 +41,7 @@ impl TableCoverage {
 
     pub(in crate::jobs) fn verify(&self, frames: usize, rate: (u32, u32)) -> Result<(), AppError> {
         let Some(end) = self.0 else { return Ok(()) };
-        // Grain-table ticks are 100 ns. Match that precision without rounding
-        // a rational video duration up to a tick the format cannot represent.
-        let video_end = frames as u128 * 10_000_000 * u128::from(rate.1) / u128::from(rate.0);
+        let video_end = video_end(frames, rate);
         if u128::from(end) < video_end {
             return Err(AppError::new(
                 "ENCODE_SETTINGS_INVALID",
@@ -57,6 +55,39 @@ impl TableCoverage {
         }
         Ok(())
     }
+
+    /// Default jobs plan from headers, so the frame count is provisional until
+    /// the encode has run. Stop a table that is short by a clear margin before
+    /// that encode is spent; `verify` still decides once the count is exact.
+    pub(in crate::jobs) fn verify_estimate(
+        &self,
+        frames: usize,
+        rate: (u32, u32),
+    ) -> Result<(), AppError> {
+        let Some(end) = self.0 else { return Ok(()) };
+        let video_end = video_end(frames, rate);
+        // Header counts are accepted within the same 2 % elsewhere; never
+        // refuse a table over a difference smaller than that or one second.
+        let margin = (video_end / 50).max(10_000_000);
+        if u128::from(end) + margin < video_end {
+            return Err(AppError::new(
+                "ENCODE_SETTINGS_INVALID",
+                format!(
+                    "The grain table ends at {:.3} s but the video needs about {:.3} s. Use a grain table with one segment covering the whole video. The video length was read from the file headers; if it is wrong, turn on Thorough verification to count the frames first.",
+                    end as f64 / 10_000_000.0,
+                    video_end as f64 / 10_000_000.0
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Grain-table ticks are 100 ns. Match that precision without rounding a
+// rational video duration up to a tick the format cannot represent.
+fn video_end(frames: usize, rate: (u32, u32)) -> u128 {
+    frames as u128 * 10_000_000 * u128::from(rate.1) / u128::from(rate.0)
 }
 
 fn inline_table(settings: &EncodeSettings) -> Option<&str> {
@@ -198,11 +229,10 @@ pub(super) fn stage(work: &Path, settings: &EncodeSettings) -> Result<Option<Sou
     let exists = path
         .try_exists()
         .map_err(|e| files::error("GRAIN_TABLE_UNREADABLE", e.to_string(), &path))?;
-    let file = Temporary::durable(&path, exists)?;
-    let mut writer = file.clone_file()?;
     if exists {
+        let file = Temporary::durable(&path, true)?;
         let mut bytes = Vec::new();
-        (&mut writer)
+        file.clone_file()?
             .take(262145)
             .read_to_end(&mut bytes)
             .map_err(|e| files::error("GRAIN_TABLE_UNREADABLE", e.to_string(), &path))?;
@@ -214,15 +244,15 @@ pub(super) fn stage(work: &Path, settings: &EncodeSettings) -> Result<Option<Sou
             ));
         }
     } else {
-        writer
-            .write_all(table.as_bytes())
-            .and_then(|_| writer.sync_all())
-            .map_err(|e| files::error("GRAIN_TABLE_WRITE_FAILED", e.to_string(), &path))?;
+        // Recovery compares this name with the saved table before any Resume
+        // or Discard, so a failed or interrupted write must never leave a
+        // partial table under it.
+        recovery::write_complete(&path, table.as_bytes(), &|path, cause| {
+            files::error("GRAIN_TABLE_WRITE_FAILED", cause, path)
+        })?;
     }
-    // Encoders can open tables with deny-write sharing on Windows. Release our writer
-    // before retaining a read-only identity guard for all encoder children.
-    drop(writer);
-    drop(file);
+    // Encoders can open tables with deny-write sharing on Windows. No writer
+    // remains open here; retain a read-only identity guard for all encoder children.
     let guard = Source::open(&path)?;
     let mut bytes = Vec::new();
     std::fs::File::open(&guard.path)
@@ -392,6 +422,52 @@ mod tests {
         assert!(error.message.contains("the video needs"));
         TableCoverage(Some(416_666)).verify(1, (24, 1)).unwrap();
         assert!(TableCoverage(Some(416_665)).verify(1, (24, 1)).is_err());
+    }
+
+    #[test]
+    fn a_header_estimate_only_refuses_a_clearly_short_grain_table() {
+        // 2,400 frames at 24 fps need 100 s; the margin is 2 %.
+        const NEEDED: u64 = 1_000_000_000;
+        let rate = (24, 1);
+        TableCoverage(Some(NEEDED))
+            .verify_estimate(2400, rate)
+            .unwrap();
+        TableCoverage(Some(NEEDED - 20_000_000))
+            .verify_estimate(2400, rate)
+            .unwrap();
+        let error = TableCoverage(Some(NEEDED - 20_000_001))
+            .verify_estimate(2400, rate)
+            .unwrap_err();
+        assert_eq!(error.code, "ENCODE_SETTINGS_INVALID");
+        assert!(error.message.contains("ends at 98.000 s"));
+        assert!(error.message.contains("the video needs about 100.000 s"));
+        assert!(error.message.contains("Thorough verification"));
+        // The exact check still refuses what the estimate lets through.
+        assert!(
+            TableCoverage(Some(NEEDED - 20_000_000))
+                .verify(2400, rate)
+                .is_err()
+        );
+        // Short clips keep a margin of one second.
+        TableCoverage(Some(1)).verify_estimate(24, rate).unwrap();
+        TableCoverage(Some(10_000_000))
+            .verify_estimate(48, rate)
+            .unwrap();
+        assert!(
+            TableCoverage(Some(10_000_000))
+                .verify_estimate(49, rate)
+                .is_err()
+        );
+        // Unbounded tables and the usual maximum stamps pass both checks.
+        TableCoverage(None).verify_estimate(2400, rate).unwrap();
+        for end in [i64::MAX as u64, u64::MAX] {
+            TableCoverage(Some(end))
+                .verify_estimate(u32::MAX as usize, rate)
+                .unwrap();
+            TableCoverage(Some(end))
+                .verify(u32::MAX as usize, rate)
+                .unwrap();
+        }
     }
 
     #[test]

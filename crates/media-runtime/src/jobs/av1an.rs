@@ -22,6 +22,7 @@ pub(super) use options::validate_settings;
 mod recovery;
 mod recovery_receipts;
 pub(super) use recovery::root_for as recovery_root;
+pub(super) use recovery::write_complete as write_complete_recovery_file;
 pub(super) use recovery::{
     CommandRecipe, OwnedRecovery, PreparedSource, Recovery, restore_interrupted_source_cut,
 };
@@ -629,6 +630,19 @@ impl JobManager {
         }
         let event_task = tokio::spawn(observe_events);
         let chunk_directory = work.join("chunks/encode");
+        // AV1AN starts a failed chunk again from an empty file. Tell the
+        // watchdog how often, so a retry of a long chunk still counts as work.
+        let chunk_restarts = command
+            .as_ref()
+            .filter(|_| edited)
+            .and_then(|command| {
+                super::command_edit::rebind::argument(&command.arguments, "av1an", "--max-tries")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|tries| tries.parse::<u32>().ok())
+            .unwrap_or_else(|| u32::from(settings.av1an_options.unwrap_or_default().max_tries))
+            .min(10);
         let result = supervisor::with_console_profile(supervisor::ConsoleProfile::Av1an, || {
             supervisor::run_with_environment_until_inactive(
                 execution,
@@ -638,6 +652,7 @@ impl JobManager {
                 Duration::from_hours(6),
                 [&progress_path, &internal_log],
                 &chunk_directory,
+                chunk_restarts,
                 Some(environment),
                 Some(&pause),
             )

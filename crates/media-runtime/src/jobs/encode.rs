@@ -1019,8 +1019,15 @@ impl JobManager {
         let grain_coverage = av1an::GrainTableCoverage::from_settings(settings)?;
         // Lean jobs and free-form filters obtain the exact output clock from
         // the normal producer/AV1AN reconciliation, without an extra decode.
-        if !plan.source_frames_estimated && !settings.source_filters {
-            grain_coverage.verify(transformed_frame_count, (plan.fps_num, plan.fps_den))?;
+        // The header count is still enough to stop a table that is clearly
+        // too short before the encode; the exact check runs once it is known.
+        if !settings.source_filters {
+            let rate = (plan.fps_num, plan.fps_den);
+            if plan.source_frames_estimated {
+                grain_coverage.verify_estimate(transformed_frame_count, rate)?;
+            } else {
+                grain_coverage.verify(transformed_frame_count, rate)?;
+            }
         }
         let mut frame_count = if settings.backend == media_core::EncodeBackend::Av1an
             && (settings.source_filters

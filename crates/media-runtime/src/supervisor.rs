@@ -264,6 +264,7 @@ pub async fn run_with_environment(
 
 /// Run AV1AN with a pause-aware inactivity limit. Advancing frame counters or
 /// changes to either progress file or growing chunk outputs restart the clock.
+/// `chunk_restarts` is how often AV1AN may start one chunk's output again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_environment_until_inactive(
     spec: &CommandSpec,
@@ -273,6 +274,7 @@ pub(crate) async fn run_with_environment_until_inactive(
     inactivity_limit: Duration,
     progress_paths: [&Path; 2],
     chunk_directory: &Path,
+    chunk_restarts: u32,
     environment: Option<&ChildEnvironment>,
     pause: Option<&PauseControl>,
 ) -> Result<ProcessResult, SupervisorError> {
@@ -285,6 +287,7 @@ pub(crate) async fn run_with_environment_until_inactive(
             limit: inactivity_limit,
             progress_paths,
             chunk_directory,
+            chunk_restarts,
         },
         environment,
         pause,
@@ -299,6 +302,7 @@ enum RunDeadline<'a> {
         limit: Duration,
         progress_paths: [&'a Path; 2],
         chunk_directory: &'a Path,
+        chunk_restarts: u32,
     },
 }
 
@@ -453,6 +457,7 @@ async fn logged_timeout(
             limit,
             progress_paths,
             chunk_directory,
+            chunk_restarts,
         } => {
             let activity = activity.expect("inactivity watchdog tracks progress");
             let mut changes = activity.subscribe();
@@ -467,7 +472,7 @@ async fn logged_timeout(
             };
             tokio::select! {
                 _ = watch_progress_files(progress_paths, limit, activity) => {},
-                _ = watch_chunk_growth(chunk_directory, limit, activity) => {},
+                _ = watch_chunk_growth(chunk_directory, chunk_restarts, limit, activity) => {},
                 _ = deadline => {},
             }
         }
@@ -545,12 +550,20 @@ async fn chunk_output_sizes(directory: &Path) -> Vec<(OsString, u64)> {
     .unwrap_or_default()
 }
 
-async fn watch_chunk_growth(directory: &Path, limit: Duration, activity: &watch::Sender<()>) {
+async fn watch_chunk_growth(
+    directory: &Path,
+    restarts: u32,
+    limit: Duration,
+    activity: &watch::Sender<()>,
+) {
     let mut updates = activity.subscribe();
+    // Each file carries its high-water mark and how often that mark may still
+    // be rebased. A file left by an earlier run gets one more rebase, because
+    // a resumed encoder may truncate it before its first retry.
     let mut sizes: HashMap<_, _> = chunk_output_sizes(directory)
         .await
         .into_iter()
-        .map(|(name, bytes)| (name, (bytes, true)))
+        .map(|(name, bytes)| (name, (bytes, restarts.saturating_add(1))))
         .collect();
     let period = (limit / 4).clamp(Duration::from_millis(1), Duration::from_secs(60));
     loop {
@@ -563,17 +576,19 @@ async fn watch_chunk_growth(directory: &Path, limit: Duration, activity: &watch:
         }
         let mut grew = false;
         for (name, bytes) in chunk_output_sizes(directory).await {
-            let (peak, existed_at_launch) = sizes.entry(name).or_default();
+            let (peak, rebases) = sizes.entry(name).or_insert((0, restarts));
             if bytes > *peak {
                 *peak = bytes;
-                *existed_at_launch = false;
                 grew = true;
-            } else if bytes < *peak && *existed_at_launch {
-                // A resumed encoder may truncate an old incomplete chunk.
-                // Rebase once, then count only new high-water marks so a
-                // repeatedly truncated or recreated file cannot mask a stall.
+            } else if bytes < *peak && *rebases > 0 {
+                // AV1AN starts a failed chunk again from an empty file, and a
+                // resumed encoder may truncate an old incomplete one. Follow
+                // the new file from its current size, or a long chunk would
+                // look idle until it passed its earlier size. The rebase
+                // itself is not progress and the count is bounded, so a file
+                // that keeps being truncated or recreated cannot mask a stall.
                 *peak = bytes;
-                *existed_at_launch = false;
+                *rebases -= 1;
             }
         }
         if grew {

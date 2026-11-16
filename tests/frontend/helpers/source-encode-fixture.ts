@@ -452,8 +452,9 @@ export async function installSourceEncodeFixture(page: Page) {
             ],
           };
         }
+        // The default table covers the fixture's 12-second source.
         if (command === 'read_av1an_grain_table')
-          return state.__grainTable ?? 'filmgrn1\nE 0 100 1 2 1\n';
+          return state.__grainTable ?? 'filmgrn1\nE 0 120000000 1 2 1\n';
         if (command === 'run_image_job') {
           if (state.__holdImage) await state.__holdImage;
           if (payload.request.inputPath === state.__imageFailurePath)

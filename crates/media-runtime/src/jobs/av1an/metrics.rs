@@ -339,38 +339,15 @@ pub(super) async fn select_bundled_vship(
     } else {
         "vspipe"
     });
-    let path = work.join(format!(
-        "metric-gpu-check-{}.vpy",
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true).write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        open.share_mode(1);
-    }
-    let file = open
-        .open(&path)
-        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &path))?;
-    let mut probe = Script {
-        path,
-        file: Some(file),
-    };
-    probe
-        .file
-        .as_mut()
-        .unwrap()
-        .write_all(
-            script_with_plugin(
-                metric,
-                Some(&plugin),
-                target.probe_width,
-                target.probe_height,
-            )
-            .as_bytes(),
-        )
-        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &probe.path))?;
+    let probe = Script::create(
+        "metric-gpu-check",
+        &script_with_plugin(
+            metric,
+            Some(&plugin),
+            target.probe_width,
+            target.probe_height,
+        ),
+    )?;
     let tested = supervisor::run_capture_with_environment(
         &CommandSpec {
             executable,
@@ -447,6 +424,42 @@ struct Script {
     path: PathBuf,
     file: Option<std::fs::File>,
 }
+impl Script {
+    /// Probe scripts are written outside the recovery workspace. Recovery
+    /// admits only names it knows, so a script left there by a kill or a failed
+    /// delete would refuse Resume and Discard and keep a finished job's chunks
+    /// beside its output. Nothing in a script depends on where it is stored.
+    fn create(label: &str, content: &str) -> Result<Self, AppError> {
+        let path = std::env::temp_dir().join(format!(
+            "jesses-{label}-{}-{}.vpy",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            open.share_mode(1); // The scorer can read; replacement/writes stay locked.
+        }
+        let file = open
+            .open(&path)
+            .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &path))?;
+        let mut script = Self {
+            path,
+            file: Some(file),
+        };
+        script
+            .file
+            .as_mut()
+            .expect("open probe script")
+            .write_all(content.as_bytes())
+            .map_err(|error| {
+                files::error("AV1AN_PREPARE_FAILED", error.to_string(), &script.path)
+            })?;
+        Ok(script)
+    }
+}
 impl Drop for Script {
     fn drop(&mut self) {
         drop(self.file.take());
@@ -480,31 +493,7 @@ async fn check_vapoursynth(
                 work,
             )
         })?;
-    let path = work.join(format!(
-        "metric-check-{}.vpy",
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true).write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        open.share_mode(1); // The scorer can read; replacement/writes stay locked.
-    }
-    let file = open
-        .open(&path)
-        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &path))?;
-    let content = script(metric);
-    let mut script = Script {
-        path,
-        file: Some(file),
-    };
-    script
-        .file
-        .as_mut()
-        .unwrap()
-        .write_all(content.as_bytes())
-        .map_err(|error| files::error("AV1AN_PREPARE_FAILED", error.to_string(), &script.path))?;
+    let script = Script::create("metric-check", &script(metric))?;
     let result = supervisor::run_capture_with_environment(
         &CommandSpec {
             executable: executable.clone(),
@@ -554,6 +543,45 @@ mod tests {
         let cpu = script(Av1anTargetMetric::Ssimulacra2);
         assert!(cpu.contains("BlankClip(width=192, height=128"));
         assert!(!cpu.contains("LoadPlugin"));
+    }
+
+    #[test]
+    fn probe_scripts_are_written_outside_the_workspace_and_removed() {
+        let script = Script::create("metric-check", "print('probe')\n").unwrap();
+        let path = script.path.clone();
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "print('probe')\n");
+        drop(script);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_scorer_check_leaves_nothing_in_the_recovery_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "jesses-metric-probe-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (tools, work) = (root.join("tools"), root.join("work"));
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        // An empty file is found as VSPipe and then fails to start.
+        std::fs::write(
+            tools.join(if cfg!(windows) {
+                "vspipe.exe"
+            } else {
+                "vspipe"
+            }),
+            b"",
+        )
+        .unwrap();
+        let environment = supervisor::ChildEnvironment::with_path(tools.as_os_str());
+        let (_owner, cancel) = watch::channel(false);
+        let checked =
+            check_vapoursynth(&environment, &work, Av1anTargetMetric::Ssimulacra2, &cancel).await;
+        assert!(checked.is_err());
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

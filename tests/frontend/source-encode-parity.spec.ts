@@ -1377,7 +1377,7 @@ test('advanced help, overwrite confirmation and managed grain table precedence',
   const settings = calls.find((c: any) => c.command === 'mock_start_encode').payload.request
     .settings;
   expect(settings.filmGrain).toBe(0);
-  expect(settings.av1anGrain.table).toBe('filmgrn1\nE 0 100 1 2 1\n');
+  expect(settings.av1anGrain.table).toBe('filmgrn1\nE 0 120000000 1 2 1\n');
   expect(settings.av1anGrain.table).not.toContain('/media/');
 });
 

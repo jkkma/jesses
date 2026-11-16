@@ -234,11 +234,11 @@ impl Resources {
             let exists = path
                 .try_exists()
                 .map_err(|e| invalid(&path, e.to_string()))?;
-            let staged = Temporary::durable(&path, exists)?;
-            let mut writer = staged.clone_file()?;
             if exists {
+                let staged = Temporary::durable(&path, true)?;
                 let mut bytes = Vec::new();
-                (&mut writer)
+                staged
+                    .clone_file()?
                     .take(LIMIT + 1)
                     .read_to_end(&mut bytes)
                     .map_err(|e| invalid(&path, e.to_string()))?;
@@ -249,13 +249,15 @@ impl Resources {
                     ));
                 }
             } else {
-                writer
-                    .write_all(&resource.bytes)
-                    .and_then(|_| writer.sync_all())
-                    .map_err(|e| invalid(&path, e.to_string()))?;
+                // Recovery compares this name with the saved source fingerprint
+                // before any Resume or Discard, so a failed or interrupted write
+                // must never leave a partial copy under it.
+                super::av1an::write_complete_recovery_file(
+                    &path,
+                    &resource.bytes,
+                    &|path, cause| invalid(path, cause),
+                )?;
             }
-            drop(writer);
-            drop(staged);
             guards.push(Source::open(&path)?);
         }
         Ok(guards)

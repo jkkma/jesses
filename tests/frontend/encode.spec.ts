@@ -547,6 +547,24 @@ test('SVT shows an inline error for a time-varying grain table', async ({ page }
   ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeDisabled();
 });
+test('SVT shows an inline error for a grain table that ends before the video', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  // One second of grain for the fixture's 12-second source.
+  await page.evaluate(() => ((globalThis as any).__grainTable = 'filmgrn1\nE 0 10000000 1 2 1\n'));
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Grain Synthesis').selectOption('table');
+  await quick.getByPlaceholder('Path to a .tbl grain table').fill('/media/grain.tbl');
+  await quick.getByPlaceholder('Path to a .tbl grain table').blur();
+  await expect(
+    quick
+      .getByRole('alert')
+      .filter({ hasText: 'ends at 1.000 s but the video needs about 12.000 s' }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run: Encode', exact: true })).toBeDisabled();
+});
 for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
   test(`${workflow} applies the AOM timed-grain rule for its chunking`, async ({ page }) => {
     await installSourceEncodeFixture(page);

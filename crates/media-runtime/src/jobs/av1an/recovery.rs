@@ -23,6 +23,7 @@ thread_local! {
     static CUT_SLOT_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static COUNT_SOURCE_HASHES: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
     static DIGEST_FIRST_READ_HOOK: std::cell::RefCell<Option<DigestReadHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn error(path: &Path, message: impl Into<String>) -> AppError {
@@ -294,35 +295,113 @@ fn atomic(path: &Path, data: &[u8]) -> Result<(), AppError> {
     if data.len() > LIMIT {
         return Err(error(path, "Recovery record exceeds its size limit."));
     }
-    let temp = path.with_extension(format!(
+    write_complete(path, data, &|path, cause| error(path, cause))
+}
+
+/// The name a workspace file is written under before it is renamed onto
+/// `path`. `interrupted_write` recognizes the same shape.
+fn pending_write_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
         "next-{}-{}",
         std::process::id(),
         WRITE_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    ))
+}
+
+/// Write beside `path` and rename into place, so `path` only ever holds
+/// complete bytes. A writer that dies before its rename leaves only a pending
+/// name, which `sweep_interrupted_writes` retires on the next owned action.
+pub(in crate::jobs) fn write_complete(
+    path: &Path,
+    data: &[u8],
+    fail: &dyn Fn(&Path, String) -> AppError,
+) -> Result<(), AppError> {
+    let temp = pending_write_path(path);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
-        .map_err(|e| error(&temp, e.to_string()))?;
-    let created = file_identity(&file).map_err(|e| error(&temp, e.to_string()))?;
+        .map_err(|e| fail(&temp, e.to_string()))?;
+    let created = file_identity(&file).map_err(|e| fail(&temp, e.to_string()))?;
     let result = (|| {
         file.write_all(data)
             .and_then(|()| file.sync_all())
-            .map_err(|e| error(&temp, e.to_string()))?;
+            .map_err(|e| fail(&temp, e.to_string()))?;
         drop(file);
-        fs::rename(&temp, path).map_err(|e| error(path, e.to_string()))?;
+        #[cfg(test)]
+        BEFORE_RENAME_HOOK.with(|hook| {
+            if let Some(interrupt) = hook.borrow_mut().take() {
+                interrupt();
+            }
+        });
+        fs::rename(&temp, path).map_err(|e| fail(path, e.to_string()))?;
         #[cfg(unix)]
         File::open(path.parent().expect("owned directory"))
             .and_then(|f| f.sync_all())
-            .map_err(|e| error(path, e.to_string()))?;
+            .map_err(|e| fail(path, e.to_string()))?;
         Ok(())
     })();
     if result.is_err() && identity(&temp).is_ok_and(|current| current == created) {
-        // A failed write must not strand our partial receipt as a foreign
+        // A failed write must not strand our partial file as a foreign
         // workspace artifact. Never adopt or remove another writer's file.
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Whether a workspace-relative name is one `write_complete` uses while it
+/// writes a file this module accepts: a receipt or a staged encoder input.
+fn interrupted_write(relative: &str) -> bool {
+    ["manifest.json", "chunks/done.json"]
+        .into_iter()
+        .chain(STAGED_ENCODER_INPUTS)
+        .any(|target| {
+            target
+                .rsplit_once('.')
+                .and_then(|(stem, _)| relative.strip_prefix(stem))
+                .and_then(|rest| rest.strip_prefix(".next-"))
+                .and_then(|rest| rest.split_once('-'))
+                .is_some_and(|(pid, id)| {
+                    !pid.is_empty()
+                        && !id.is_empty()
+                        && pid.bytes().chain(id.bytes()).all(|b| b.is_ascii_digit())
+                })
+        })
+}
+
+/// Remove what a writer left when it died between creating its pending file
+/// and renaming it. Call only while holding the workspace lock: no writer of
+/// this workspace is alive then, so every pending name is stale, and the file
+/// it would have replaced still holds its last committed bytes.
+fn sweep_interrupted_writes(root: &Path) -> Result<(), AppError> {
+    for directory in [root.to_owned(), root.join("chunks")] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            // The tree check reports a link or a file in a directory's place.
+            Ok(_) => continue,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(cause) => return Err(error(&directory, cause.to_string())),
+        }
+        let _guard = launch_directory_guard(&directory)?;
+        for entry in fs::read_dir(&directory).map_err(|e| error(&directory, e.to_string()))? {
+            let path = entry.map_err(|e| error(&directory, e.to_string()))?.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| error(&path, e.to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !interrupted_write(&relative) {
+                continue;
+            }
+            // Only a plain single-link file is ours to remove. A directory or
+            // a link under one of these names is left for the tree check, which
+            // refuses it without deleting anything.
+            if let Ok(expected) = verify_single_link_file(&path) {
+                remove_tree(&path, &expected, None)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1090,6 +1169,38 @@ pub(super) fn verify_launch_directory(path: &Path, guard: &File) -> Result<(), A
         return Err(error(path, "The launch artifact directory was replaced."));
     }
     Ok(())
+}
+
+/// Every completed chunk keeps an open read guard until cleanup, and a
+/// scene-split film has more chunks than the usual soft descriptor limit
+/// (1,024 on Linux, 256 for a macOS app). Raise the soft limit toward the hard
+/// limit before any guard is opened. A refusal is not an error here: a job
+/// that fits the current limit runs as before, and one that does not reports
+/// the real failure at its checkpoint.
+#[cfg(unix)]
+fn raise_descriptor_limit() {
+    // More guards than any real queue needs; children inherit the soft limit.
+    const WANTED: libc::rlim_t = 65_536;
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: limit is a correctly sized output buffer for this call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return;
+    }
+    // SAFETY: the successful call initialized the structure.
+    let mut limit = unsafe { limit.assume_init() };
+    // macOS refuses a soft limit above OPEN_MAX (10,240) even when the hard
+    // limit is reported as unlimited.
+    let open_max = if cfg!(target_os = "macos") {
+        10_240
+    } else {
+        libc::rlim_t::MAX
+    };
+    let ceiling = limit.rlim_max.min(open_max).min(WANTED);
+    if limit.rlim_cur < ceiling {
+        limit.rlim_cur = ceiling;
+        // SAFETY: limit holds a valid soft limit no greater than the hard limit.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
 }
 
 fn lock_workspace(root: &Path) -> Result<(File, WorkspaceLock), AppError> {
@@ -2566,6 +2677,7 @@ impl OwnedRecovery {
         if current != manifest {
             return Err(error(&root, "Recovery changed while acquiring ownership."));
         }
+        sweep_interrupted_writes(&root)?;
         verify_action_tree(&root, &manifest)?;
         let workspace = Workspace {
             root,
@@ -3145,6 +3257,7 @@ impl Recovery {
                     "The recovery directory changed before discard.",
                 ));
             }
+            sweep_interrupted_writes(&root)?;
             drop(lock);
             remove_workspace_tree(&root, &manifest, Some(directory))
         })
@@ -3173,6 +3286,8 @@ impl Recovery {
         locator: Option<Av1anRecovery>,
         cancel: &watch::Receiver<bool>,
     ) -> Result<(Self, Temporary, PathBuf), AppError> {
+        #[cfg(unix)]
+        raise_descriptor_limit();
         let (id, request, settings, source, cancel) = (
             id.to_owned(),
             request.clone(),
@@ -3229,6 +3344,7 @@ impl Recovery {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut preparation_lock=None;
             let mut legacy_svt_parameters = false;
+            let resuming = locator.is_some();
             let (root, mut manifest, intermediate) = if let Some(locator) = locator {
                 let (root, mut manifest) = load(&id, &request, &settings, &locator)?;
                 if source_workflow(&settings)&&manifest.queue_recipe.is_some() {
@@ -3425,6 +3541,9 @@ impl Recovery {
             };
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
+            if resuming {
+                sweep_interrupted_writes(&workspace.root)?;
+            }
             verify_action_tree(&workspace.root, &workspace.manifest)?;
             workspace.sweep_stale_launches()?;
             let resume_chunks=workspace.manifest.queue.is_some();
@@ -5008,6 +5127,310 @@ mod tests {
             .unwrap();
         assert!(!root.exists());
         assert_eq!(fs::read(neighbor).unwrap(), TABLE.as_bytes());
+    }
+
+    fn saved_snapshot(
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        locator: &Av1anRecovery,
+    ) -> media_core::JobSnapshot {
+        serde_json::from_value(serde_json::json!({"id":"owned-job","state":"stopped","request":request,"encodeSettings":settings,"recovery":locator,"progressSeconds":null,"durationSeconds":null,"logs":[],"error":null,"logPath":null})).unwrap()
+    }
+
+    #[test]
+    fn only_pending_names_of_admitted_files_count_as_interrupted_writes() {
+        for name in [
+            "manifest.next-1-1",
+            "manifest.next-4294967295-18446744073709551615",
+            "chunks/done.next-22-3",
+            "jesses-grain.next-1-2",
+            "jesses-dovi.next-1-2",
+            "jesses-hdr10plus.next-1-2",
+        ] {
+            assert!(interrupted_write(name), "{name}");
+        }
+        for name in [
+            "manifest.json",
+            "manifest.next-1",
+            "manifest.next--1",
+            "manifest.next-1-",
+            "manifest.next-1-2-3",
+            "manifest.next-1-2.json",
+            "manifest.next-a-1",
+            "manifest.prev-1-1",
+            "done.next-1-1",
+            "chunks/manifest.next-1-1",
+            "chunks/chunks.next-1-1",
+            "chunks/encode/done.next-1-1",
+            "video.next-1-1",
+            "metric-check-1.vpy",
+        ] {
+            assert!(!interrupted_write(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_receipt_and_staging_writes_allow_resume_and_discard() {
+        for action in ["resume", "discard", "owned discard"] {
+            let fixture = Fixture::new();
+            let (mut workspace, intermediate) = fixture.workspace();
+            let root = workspace.root.clone();
+            let chunks = root.join("chunks");
+            fs::create_dir(&chunks).unwrap();
+            let pending = [
+                root.join("manifest.next-7-1"),
+                chunks.join("done.next-7-2"),
+                root.join("jesses-grain.next-7-3"),
+                root.join("jesses-dovi.next-7-4"),
+                root.join("jesses-hdr10plus.next-7-5"),
+            ];
+            for path in &pending {
+                fs::write(path, b"partial").unwrap();
+            }
+            // The tree check itself still admits none of these names.
+            assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+            let request = workspace.manifest.request.clone();
+            let settings = workspace.manifest.settings.clone();
+            let locator = workspace.summary();
+            let source = PathBuf::from(&request.input_path);
+            let document: crate::jobs::metadata::Document = serde_json::from_value(serde_json::json!({
+                "format":{"start_time":"0"},
+                "streams":[{"index":0,"codec_type":"video","codec_name":"ffv1","width":128,"height":72,
+                    "pix_fmt":"yuv420p10le","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0",
+                    "chroma_location":"left","color_space":"bt709","color_primaries":"bt709",
+                    "color_transfer":"bt709","color_range":"tv"}]
+            })).unwrap();
+            let mut plan = Plan::build(&document, &[&document.streams[0]], &settings).unwrap();
+            workspace.manifest.params = super::super::encoder::parameters(&plan, &settings)
+                .into_iter()
+                .map(|parameter| parameter.into_string().unwrap())
+                .collect();
+            workspace.manifest.source_filter = plan.av1an_decoder_filter();
+            workspace.save().unwrap();
+            let committed = fs::read(root.join("manifest.json")).unwrap();
+            drop(workspace);
+            drop(intermediate);
+
+            match action {
+                "resume" => {
+                    let (_owner, cancel) = watch::channel(false);
+                    let (recovery, _intermediate, _) = Recovery::prepare(
+                        "owned-job",
+                        &request,
+                        &settings,
+                        &source,
+                        None,
+                        vec![],
+                        &mut plan,
+                        (24, 1),
+                        48,
+                        Some(locator),
+                        &cancel,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{action}: {}", error.message));
+                    assert!(root.join("manifest.json").exists());
+                    drop(recovery);
+                }
+                "discard" => {
+                    Recovery::discard("owned-job", &request, &settings, &locator)
+                        .await
+                        .unwrap();
+                    assert!(!root.exists());
+                }
+                _ => {
+                    assert_eq!(fs::read(root.join("manifest.json")).unwrap(), committed);
+                    OwnedRecovery::open(&saved_snapshot(&request, &settings, &locator), true)
+                        .unwrap()
+                        .discard()
+                        .unwrap();
+                    assert!(!root.exists());
+                }
+            }
+            for path in &pending {
+                assert!(!path.exists(), "{action}: {}", path.display());
+            }
+            assert_eq!(fs::read(source).unwrap(), b"source bytes");
+        }
+    }
+
+    #[test]
+    fn pending_names_that_are_not_plain_files_still_fail_closed() {
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let snapshot = saved_snapshot(
+            &workspace.manifest.request,
+            &workspace.manifest.settings,
+            &workspace.summary(),
+        );
+        drop(workspace);
+        drop(intermediate);
+
+        // A directory under a pending name is nothing this module wrote.
+        let directory = root.join("manifest.next-7-1");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("kept.txt"), b"kept").unwrap();
+        assert!(OwnedRecovery::open(&snapshot, true).is_err());
+        assert_eq!(fs::read(directory.join("kept.txt")).unwrap(), b"kept");
+        fs::remove_dir_all(&directory).unwrap();
+
+        // Nor is a second name of a file that lives outside the workspace.
+        let neighbor = fixture.0.join("neighbor.txt");
+        fs::write(&neighbor, b"neighbor bytes").unwrap();
+        let linked = root.join("jesses-grain.next-7-2");
+        fs::hard_link(&neighbor, &linked).unwrap();
+        assert!(OwnedRecovery::open(&snapshot, true).is_err());
+        assert!(linked.exists());
+        assert_eq!(fs::read(&neighbor).unwrap(), b"neighbor bytes");
+        fs::remove_file(&linked).unwrap();
+
+        OwnedRecovery::open(&snapshot, true)
+            .unwrap()
+            .discard()
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(neighbor).unwrap(), b"neighbor bytes");
+    }
+
+    #[test]
+    fn a_writer_killed_before_its_rename_leaves_a_usable_workspace() {
+        const CHILD: &str = "JESSES_INTERRUPTED_RECEIPT_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let manifest = PathBuf::from(root).join("manifest.json");
+            // End this process where a kill or power cut would: the new
+            // receipt is flushed but not yet renamed over the committed one.
+            BEFORE_RENAME_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| {
+                    std::process::exit(0);
+                }));
+            });
+            let _ = atomic(&manifest, b"uncommitted receipt");
+            unreachable!("the pending write must have ended this process");
+        }
+        let fixture = Fixture::new();
+        let (workspace, intermediate) = fixture.workspace();
+        let root = workspace.root.clone();
+        let request = workspace.manifest.request.clone();
+        let settings = workspace.manifest.settings.clone();
+        let locator = workspace.summary();
+        drop(workspace);
+        drop(intermediate);
+        let committed = fs::read(root.join("manifest.json")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jobs::av1an::recovery::tests::a_writer_killed_before_its_rename_leaves_a_usable_workspace", "--nocapture"])
+            .env(CHILD, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stranded: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("manifest.next-"))
+            })
+            .collect();
+        assert_eq!(stranded.len(), 1, "{stranded:?}");
+        assert_eq!(fs::read(&stranded[0]).unwrap(), b"uncommitted receipt");
+        assert_eq!(fs::read(root.join("manifest.json")).unwrap(), committed);
+        // On its own this leftover refuses every recovery action.
+        let (_, manifest) = load("owned-job", &request, &settings, &locator).unwrap();
+        assert!(verify_action_tree(&root, &manifest).is_err());
+
+        let owned =
+            OwnedRecovery::open(&saved_snapshot(&request, &settings, &locator), true).unwrap();
+        assert!(!stranded[0].exists());
+        assert_eq!(fs::read(root.join("manifest.json")).unwrap(), committed);
+        owned.discard().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn an_interrupted_staged_input_never_appears_under_its_final_name() {
+        const TABLE: &str = "filmgrn1\nE 0 40000000 1 2 1\n";
+        let fixture = Fixture::new();
+        let (mut workspace, _intermediate) = fixture.workspace();
+        workspace.manifest.settings.av1an_grain = Some(media_core::Av1anGrainSettings {
+            table: Some(TABLE.into()),
+            denoise: false,
+            denoise_strength: 4,
+        });
+        workspace.save().unwrap();
+        let root = workspace.root.clone();
+        let settings = workspace.manifest.settings.clone();
+        let table = root.join(super::super::grain::TABLE_NAME);
+
+        // Stop where a killed writer would: flushed, not yet renamed.
+        BEFORE_RENAME_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                panic!("interrupted before the rename");
+            }));
+        });
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::super::grain::stage(&root, &settings).map(drop)
+        }));
+        assert!(interrupted.is_err());
+        assert!(!table.exists());
+        assert!(verify_action_tree(&root, &workspace.manifest).is_err());
+        sweep_interrupted_writes(&root).unwrap();
+        verify_action_tree(&root, &workspace.manifest).unwrap();
+
+        // The next attempt stages the complete table under the final name.
+        let guard = super::super::grain::stage(&root, &settings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(&table).unwrap(), TABLE.as_bytes());
+        drop(guard);
+        verify_action_tree(&root, &workspace.manifest).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_limit_is_raised_before_chunk_guards_are_opened() {
+        const CHILD: &str = "JESSES_DESCRIPTOR_LIMIT_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            // Lower the soft limit in this subprocess only, as a desktop
+            // session would start it, and keep the hard limit.
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            let mut limit = unsafe { limit.assume_init() };
+            if limit.rlim_max < 512 {
+                return;
+            }
+            limit.rlim_cur = 64;
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            raise_descriptor_limit();
+            let root = PathBuf::from(root);
+            let guards: Vec<_> = (0..256)
+                .map(|index| {
+                    let path = root.join(format!("{index:05}.ivf"));
+                    fs::write(&path, b"chunk").unwrap();
+                    Source::open(&path).unwrap()
+                })
+                .collect();
+            assert_eq!(guards.len(), 256);
+            return;
+        }
+        let fixture = Fixture::new();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jobs::av1an::recovery::tests::descriptor_limit_is_raised_before_chunk_guards_are_opened", "--nocapture"])
+            .env(CHILD, &fixture.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]

@@ -68,13 +68,31 @@ export function grainTableSegments(table: string): string[][] {
     .map((line) => line.split(/[\t\f\r ]+/).filter(Boolean))
     .filter((fields) => fields[0] === 'E');
 }
-/** Checks the table properties available in the form; native validation checks coverage. */
+// Mirrors the native check made from header timing: a table is refused only
+// when it ends before the video by more than 2 % of its length and one second.
+function grainTableCoverageIssue(
+  end: string | undefined,
+  videoSeconds: number | null | undefined,
+): string | null {
+  // Native validation reports a malformed stamp.
+  if (!end || !/^\+?\d+$/.test(end)) return null;
+  if (videoSeconds == null || !Number.isFinite(videoSeconds) || videoSeconds <= 0) return null;
+  const endSeconds = Number(end) / 10_000_000;
+  if (endSeconds + Math.max(videoSeconds / 50, 1) >= videoSeconds) return null;
+  return `The grain table ends at ${endSeconds.toFixed(3)} s but the video needs about ${videoSeconds.toFixed(3)} s. Use a grain table with one segment covering the whole video. The video length was read from the file headers; if it is wrong, turn on Thorough verification to count the frames first.`;
+}
+/**
+ * Checks the table properties available in the form. Pass `videoSeconds`, the
+ * header length of the video, only when the output keeps the source clock and
+ * frames are not counted before encoding; native validation checks exact coverage.
+ */
 export function grainTableIssue(
   encoder: VideoEncoder,
   backend: EncodeBackend,
   table: string | null | undefined,
   draft: Av1anDraft,
   sourceWorkflow: boolean,
+  videoSeconds?: number | null,
 ): string | null {
   if (!table) return null;
   if (encoder === 'aomAv1' && table.startsWith('filmgrn1\r\n'))
@@ -86,7 +104,8 @@ export function grainTableIssue(
     (sourceWorkflow || draft.splitMethod !== 'fixedChunks' || draft.maximumChunkFrames !== 0);
   if (!svt && !chunkedAom) return null;
   const segments = grainTableSegments(table);
-  if (segments.length === 1 && /^\+?0+$/.test(segments[0][1] ?? '')) return null;
+  if (segments.length === 1 && /^\+?0+$/.test(segments[0][1] ?? ''))
+    return grainTableCoverageIssue(segments[0][2], videoSeconds);
   return svt
     ? 'SVT-AV1 uses one film-grain model for the whole video. Use a grain table with one segment starting at zero and covering the whole video.'
     : 'Parallel AV1AN chunks restart the AOM grain table. Use a table with one segment starting at zero and covering the whole video, or use standalone AOM for timed grain.';

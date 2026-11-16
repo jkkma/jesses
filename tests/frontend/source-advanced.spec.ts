@@ -133,3 +133,28 @@ test('grain table restrictions follow the encoder and effective chunking', () =>
   expect(grainTableIssue('aomAv1', 'av1an', timed, draft, false)).toBeNull();
   expect(grainTableIssue('aomAv1', 'av1an', timed, draft, true)).toContain('standalone AOM');
 });
+
+test('a grain table that clearly ends before the video is refused in the form', () => {
+  const draft = defaultAv1an(false);
+  const table = (end: string) => `filmgrn1\nE 0 ${end} 1 2 1\n`;
+  // 100 s of video: the margin is 2 %, so a table ending at 98 s is left to native validation.
+  expect(grainTableIssue('svtAv1Hdr', 'av1an', table('980000000'), draft, true, 100)).toBeNull();
+  const short = grainTableIssue('svtAv1Hdr', 'av1an', table('979999999'), draft, true, 100);
+  expect(short).toContain('ends at 98.000 s but the video needs about 100.000 s');
+  expect(short).toContain('Thorough verification');
+  // Short clips keep a margin of one second.
+  expect(grainTableIssue('svtAv1', 'standalone', table('10000000'), draft, true, 2)).toBeNull();
+  expect(grainTableIssue('svtAv1', 'standalone', table('10000000'), draft, true, 2.1)).toContain(
+    'needs about 2.100 s',
+  );
+  // Open-ended stamps and an unknown video length are never refused here.
+  for (const end of ['9223372036854775807', '18446744073709551615'])
+    expect(grainTableIssue('svtAv1Hdr', 'av1an', table(end), draft, true, 7200)).toBeNull();
+  for (const length of [undefined, null, 0, Number.NaN])
+    expect(grainTableIssue('svtAv1Hdr', 'av1an', table('10'), draft, true, length)).toBeNull();
+  // Standalone AOM honors timed tables, so it needs no coverage; chunked AOM does.
+  expect(grainTableIssue('aomAv1', 'standalone', table('10'), draft, false, 7200)).toBeNull();
+  expect(grainTableIssue('aomAv1', 'av1an', table('10'), draft, false, 7200)).toContain(
+    'needs about 7200.000 s',
+  );
+});

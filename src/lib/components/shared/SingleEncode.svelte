@@ -1797,9 +1797,28 @@
           : null
       : null,
   );
+  // The header length the native estimate uses, and only where it uses one:
+  // the output keeps the source clock, and Thorough verification, which
+  // counts frames before encoding, is off.
+  const grainVideoSeconds = $derived(
+    trim.enabled ||
+      temporal.deinterlace !== 'off' ||
+      temporal.changeRate ||
+      sourceFilterRows(av1anFilters).length > 0 ||
+      sourcePreferences?.fullOutputVerification
+      ? undefined
+      : (selectedVideo?.durationSeconds ?? file?.durationSeconds ?? undefined),
+  );
   const grainTableError = $derived(
     encodingVideo
-      ? grainTableIssue(encoder, backend, gridGrain?.table ?? av1anGrain?.table, av1an, true)
+      ? grainTableIssue(
+          encoder,
+          backend,
+          gridGrain?.table ?? av1anGrain?.table,
+          av1an,
+          true,
+          grainVideoSeconds,
+        )
       : null,
   );
   const grainConflict = $derived(
