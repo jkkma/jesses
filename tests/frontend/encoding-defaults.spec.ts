@@ -92,6 +92,60 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
   });
 }
 
+for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
+  test(`${workflow} leaves image subtitles out of its default container`, async ({ page }) => {
+    await installSourceEncodeFixture(page);
+    // A Blu-ray rip: the first (default-selected) subtitle is PGS.
+    const withPgs = {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'subtitle'
+          ? { ...stream, codec: 'hdmv_pgs_subtitle', title: 'PGS' }
+          : stream,
+      ),
+    };
+    await page.evaluate((entry) => (globalThis as any).__setSourceMedia(entry), withPgs);
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
+    await page.getByRole('button', { name: workflow, exact: true }).click();
+    const region = page.getByRole('region', { name: workflow, exact: true });
+    const tracksTab = region.getByRole('tab', {
+      name: workflow === 'AV1AN' ? 'Audio & Tracks' : 'Subtitles',
+      exact: true,
+    });
+    const note = `${workflow === 'AV1AN' ? 'WebM' : 'MP4'} cannot store image subtitles (PGS, VobSub), so one subtitle track is left out. Choose MKV to keep them.`;
+    await tracksTab.click();
+    await expect(region.getByLabel('Image subtitles')).toHaveText(note);
+    await region.getByLabel('Output Path', { exact: true }).fill('/media/pgs');
+    await page
+      .getByRole('button', {
+        name: workflow === 'AV1AN' ? 'Run: AV1AN encode' : 'Run: Encode',
+        exact: true,
+      })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (globalThis as any).__sourceCalls.some((c: any) => c.command === 'mock_start_encode'),
+        ),
+      )
+      .toBe(true);
+    const request = await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+          .payload.request,
+    );
+    // The PGS track (2) is left out instead of the job being refused.
+    expect(request.source.streamIndices).toEqual([0, 1]);
+    await expect(page.getByRole('log')).toContainText(note);
+    // MKV keeps image subtitles, so the note goes away.
+    await region.getByRole('tab', { name: 'Video', exact: true }).click();
+    await region.getByLabel('Container', { exact: true }).selectOption('matroska');
+    await tracksTab.click();
+    await expect(region.getByLabel('Image subtitles')).toHaveCount(0);
+  });
+}
+
 test('explicit AV1AN scene detection survives reload and a source change', async ({ page }) => {
   await installSourceEncodeFixture(page);
   await page.getByRole('button', { name: 'Add Files…' }).click();

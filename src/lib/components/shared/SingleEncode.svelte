@@ -1122,6 +1122,36 @@
       ? `${outputContainer === 'webm' ? 'WebM' : outputContainer.toUpperCase()} cannot store styled (ASS) subtitles, so ${flattenedStyled === 1 ? 'the ASS track becomes' : `${flattenedStyled} ASS tracks become`} ${outputContainer === 'webm' ? 'WebVTT' : 'MP4 text'}: styling, positions and fonts are lost. Choose MKV to keep them.`
       : '',
   );
+  /** Containers that hold text subtitles only (no PGS, VobSub or DVB images). */
+  const textSubtitleContainers: ContainerFormat[] = ['mp4', 'mov', 'webm'];
+  function imageSubtitleLeftOut(
+    stream: import('$lib/ipc/generated').MediaStream | undefined,
+    container: ContainerFormat,
+  ) {
+    return (
+      textSubtitleContainers.includes(container) &&
+      stream?.kind === 'subtitle' &&
+      !['ass', 'subrip', 'webvtt', 'mov_text'].includes(stream.codec ?? '')
+    );
+  }
+  function imageSubtitleNote(count: number, container: ContainerFormat) {
+    return count
+      ? `${container === 'webm' ? 'WebM' : container.toUpperCase()} cannot store image subtitles (PGS, VobSub), so ${count === 1 ? 'one subtitle track is' : `${count} subtitle tracks are`} left out. Choose MKV to keep them.`
+      : '';
+  }
+  /** Included image subtitles the chosen container leaves out; a burned track stays. */
+  const leftOutImageSubtitles = $derived.by(() => {
+    if (chunked ? !copySubs : stripSubs || subtitleMode !== 'copy') return 0;
+    return (file?.streams ?? []).filter(
+      (stream) =>
+        included.includes(stream.index) &&
+        imageSubtitleLeftOut(stream, outputContainer) &&
+        !(!chunked && file?.id === mainFile?.id && String(stream.index) === activeBurn),
+    ).length;
+  });
+  const leftOutImageSubtitlesNote = $derived(
+    imageSubtitleNote(leftOutImageSubtitles, outputContainer),
+  );
   const convertedMovText = $derived(
     subtitles.filter(
       (track) =>
@@ -2625,6 +2655,10 @@
           !(
             stream.kind === 'attachment' &&
             (outputContainer !== 'matroska' || (chunked && !copyAttachments))
+          ) &&
+          !(
+            imageSubtitleLeftOut(stream, outputContainer) &&
+            !(pictureEnabled && file.id === mainFile?.id && String(stream.index) === activeBurn)
           ),
       )
       .sort((a, b) => Number(a.kind === 'attachment') - Number(b.kind === 'attachment'));
@@ -2673,12 +2707,19 @@
         (fileMode !== 'mux' && row.sourceId !== file.id)
       )
         return false;
-      const kind = trackKind(
-        files
-          .find((source) => source.id === row.sourceId)
-          ?.streams.find((stream) => stream.index === row.streamIndex),
-      );
+      const rowStream = files
+        .find((source) => source.id === row.sourceId)
+        ?.streams.find((stream) => stream.index === row.streamIndex);
+      const kind = trackKind(rowStream);
       return (
+        !(
+          imageSubtitleLeftOut(rowStream, outputContainer) &&
+          !(
+            pictureEnabled &&
+            row.sourceId === mainFile?.id &&
+            String(row.streamIndex) === activeBurn
+          )
+        ) &&
         kind !== 'cover' &&
         !(kind === 'audio' && stripAudio) &&
         !(
@@ -3056,6 +3097,17 @@
               ),
           )
           .map((stream) => stream.index);
+        // Image subtitles stay out of MP4/MOV/WebM unless one is burned in below.
+        const leftOutImages = entry.streams.filter(
+          (stream) =>
+            chosen.includes(stream.index) &&
+            imageSubtitleLeftOut(stream, batchState.outputContainer),
+        );
+        for (const stream of leftOutImages) chosen.splice(chosen.indexOf(stream.index), 1);
+        if (leftOutImages.length)
+          onlog?.(
+            `${entry.name}: ${imageSubtitleNote(leftOutImages.length, batchState.outputContainer)}`,
+          );
         const vid = entry.streams.find(
           (stream) => stream.kind === 'video' && chosen.includes(stream.index),
         );
@@ -3922,6 +3974,7 @@
         outputContainer,
         (built.settings.videoMode ?? 'encode') === 'encode',
       );
+    if (fileMode !== 'batch' && leftOutImageSubtitlesNote) onlog?.(leftOutImageSubtitlesNote);
     let request = structuredClone($state.snapshot(built));
     const runSource = structuredClone($state.snapshot(file));
     const runPicture = (request.settings.videoMode ?? 'encode') === 'encode';
@@ -4541,6 +4594,11 @@
           </div>
           {#if flattenedStyledNote}<p class="geometry-readout subtitle-note">
               {flattenedStyledNote}
+            </p>{/if}{#if leftOutImageSubtitlesNote}<p
+              class="geometry-readout subtitle-note"
+              aria-label="Image subtitles"
+            >
+              {leftOutImageSubtitlesNote}
             </p>{/if}{:else}<label for="loudness">Loudness</label><select
             id="loudness"
             bind:value={loudness}
@@ -4578,6 +4636,11 @@
               : `${convertedMovText} MP4 text subtitles are converted to SubRip, because MKV cannot store MP4 text.`}
           </p>{/if}{#if flattenedStyledNote}<p class="geometry-readout subtitle-note">
             {flattenedStyledNote}
+          </p>{/if}{#if leftOutImageSubtitlesNote}<p
+            class="geometry-readout subtitle-note"
+            aria-label="Image subtitles"
+          >
+            {leftOutImageSubtitlesNote}
           </p>{/if}
       </div>
     {:else if settingsTab === 'metadata'}
