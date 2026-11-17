@@ -245,6 +245,10 @@ export function encodeSummary(settings: EncodeSettings): string {
   }
   const name = encoderOptions(settings.encoder).name;
   const pixelFormat = settings.outputPixelFormat ?? settings.av1anOptions?.pixelFormat;
-  const depth = pixelFormat && !pixelFormat.endsWith('10le') ? '8-bit' : '10-bit';
+  // High-bit-depth mode decision (hbd-mds 1 or 2) always encodes at 10 bits.
+  const highBitDepth = settings.parameters?.some(
+    (value) => value.name === 'hbd-mds' && ['1', '2'].includes(value.value),
+  );
+  const depth = pixelFormat && !pixelFormat.endsWith('10le') && !highBitDepth ? '8-bit' : '10-bit';
   return `${settings.backend === 'av1an' ? `av1an / ${name} · ${settings.workers ?? 2} parallel chunks` : `Standalone ${name}`} · ${depth} · ${settings.av1anOptions?.targetQuality ? 'Perceptual quality target' : rateSummary(settings.rateControl, settings.svtCrfQuarterSteps === undefined ? settings.crf : settings.svtCrfQuarterSteps / 4, settings.lossless, settings.constantQuantizer)} · Preset ${settings.svtPreset ?? settings.preset}${forkSettingsSummary(settings)} · Grain ${settings.filmGrain ?? 0} · HDR10 fallback ${settings.hdr10Fallback ? 'allowed' : 'off'} · ${framingSummary(settings.framing)} · ${audioSummary(settings.audio)}${trimSummary(settings.trim)}${subtitleSummary(settings.subtitles) ? ` · ${subtitleSummary(settings.subtitles)}` : ''}${toneMapSummary(settings.toneMap)}${temporalSummary(settings.temporal)}${av1anSummary(settings.av1anOptions)}${parameterSummary(settings.parameters)}`;
 }

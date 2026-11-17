@@ -1718,6 +1718,20 @@ impl JobManager {
         if requires_serial_svt(&plan, settings) {
             self.change(id, |snapshot| append_log(snapshot, "SVT high-bit-depth mode decision plus overlays uses one processing lane (lp=1), within the selected worker limit, to avoid the observed SVT 4.2 parallel short-clip crash. Both requested controls remain enabled.".into())).await;
         }
+        if plan.widens_eight_bit_source() {
+            let reason = if super::parameters::high_bit_depth_decision(settings) {
+                " so high-bit-depth mode decision runs on a 10-bit picture"
+            } else {
+                ""
+            };
+            self.change(id, |snapshot| {
+                append_log(
+                    snapshot,
+                    format!("The 8-bit source is converted to 10-bit before encoding{reason}."),
+                )
+            })
+            .await;
+        }
         // A resumed final stage is a committed recovery checkpoint, not an
         // attempt owned by execute's unconditional cleanup. Keep its durable
         // owner local so another cancellation releases the handle while

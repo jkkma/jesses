@@ -60,7 +60,9 @@ test('the encode tabs name their source and show the output extension', async ({
     await page.getByRole('button', { name: workflow, exact: true }).click();
     const region = page.getByRole('region', { name: workflow, exact: true });
     await expect(region.getByText('Source: input.mkv', { exact: true })).toBeVisible();
-    await expect(region.getByText('.mkv', { exact: true })).toBeVisible();
+    await expect(
+      region.getByText(workflow === 'AV1AN' ? '.webm' : '.mp4', { exact: true }),
+    ).toBeVisible();
   }
 });
 

@@ -1085,6 +1085,17 @@ impl Plan {
                     .av1an_options
                     .and_then(|options| options.pixel_format)
             })
+            .map(|format| {
+                // High-bit-depth mode decision needs a 10-bit picture. Raise an
+                // 8-bit choice to 10-bit; pixel_conversion widens an 8-bit source.
+                if format == media_core::Av1anPixelFormat::Yuv420p
+                    && super::parameters::high_bit_depth_decision(settings)
+                {
+                    media_core::Av1anPixelFormat::Yuv420p10le
+                } else {
+                    format
+                }
+            })
             .map(media_core::Av1anPixelFormat::ffmpeg);
         if alpha_source != (explicit_pixel_format == Some("yuva420p")) {
             return Err(unsupported(
@@ -2231,6 +2242,15 @@ impl Plan {
         } else {
             8
         }
+    }
+
+    /// An 8-bit source picture that pixel_conversion widens to 10 bits before
+    /// the encoder sees it. Tone mapping already renders at 10 bits.
+    pub fn widens_eight_bit_source(&self) -> bool {
+        self.output_bit_depth() == 10
+            && self.tone_map.is_none()
+            && source_pixel_format(Some(self.source_pixel_format), true)
+                .is_ok_and(|(_, depth)| depth == 8)
     }
 
     fn high_chroma_output(&self) -> bool {

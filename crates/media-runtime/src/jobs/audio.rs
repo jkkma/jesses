@@ -725,6 +725,10 @@ pub(super) fn append_arguments(
     if track.codec == AudioCodec::Aac {
         args.extend([format!("-profile:{position}").into(), "aac_low".into()]);
     }
+    // The bitrate is an average target: Opus spends more on complex passages.
+    if track.codec == AudioCodec::Opus {
+        args.extend([format!("-vbr:{position}").into(), "on".into()]);
+    }
     if matches!(
         track.channels,
         AudioChannels::Explicit {
@@ -1711,6 +1715,23 @@ mod tests {
         });
         settings.audio[0].codec = AudioCodec::Copy;
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn opus_encodes_with_variable_bitrate_and_others_do_not_get_the_flag() {
+        let document = source();
+        for codec in [AudioCodec::Opus, AudioCodec::Aac, AudioCodec::Vorbis] {
+            let mut args = Vec::new();
+            append_arguments(&mut args, 1, &track(codec), &document.streams[1]);
+            let vbr = args
+                .windows(2)
+                .any(|pair| pair[0] == "-vbr:1" && pair[1] == "on");
+            assert_eq!(vbr, codec == AudioCodec::Opus, "{codec:?}: {args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-b:1" && pair[1] == "128k")
+            );
+        }
     }
 
     #[test]

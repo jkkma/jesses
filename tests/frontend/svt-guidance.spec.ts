@@ -32,6 +32,13 @@ test('SVT job summaries reflect selected output depth and the historical default
   expect(
     encodeSummary({
       ...settings,
+      outputPixelFormat: 'yuv420p',
+      parameters: [{ name: 'hbd-mds', value: '1' }],
+    }),
+  ).toContain(' · 10-bit · ');
+  expect(
+    encodeSummary({
+      ...settings,
       backend: 'av1an',
       av1anOptions: { pixelFormat: 'yuv420p' } as EncodeSettings['av1anOptions'],
     }),

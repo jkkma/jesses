@@ -281,13 +281,15 @@
   const listedSvt = (value: string) => value === 'svtAv1' || value === 'svtAv1Hdr';
   const tenBitDefault = (value: string) =>
     listedSvt(value) || value === 'aomAv1' || value === 'vpxStandalone';
+  // SVT quality defaults differ by tab: Quick Convert CRF 20, AV1AN CRF 35.
+  const svtDefaultCrf = (route: EncodeBackend) => (route === 'av1an' ? 35 : 20);
   // Editable historical drafts receive a visible CPU default; stored jobs are
   // still admitted with their original settings and reject hardware encoding.
   $effect(() => {
     if (['h264Nvenc', 'hevcNvenc'].includes(selectedEncoder))
       untrack(() => {
         selectedEncoder = 'svtAv1';
-        crf = 30;
+        crf = svtDefaultCrf(backend);
         preset = 4;
         outputPixelFormat = 'yuv420p10le';
         rate = defaultRate();
@@ -351,7 +353,7 @@
     untrack(() => backend) === 'av1an' ? [...initialAv1anPreferences.filters] : [],
   );
   let outputPixelFormat = $state<Av1anPixelFormat | undefined>('yuv420p10le');
-  let crf = $state<number | undefined>(30);
+  let crf = $state<number | undefined>(svtDefaultCrf(untrack(() => backend)));
   let preset = $state(4);
   let lastPreferenceSaveProblem = '';
   function reportPreferenceSave(problem?: string) {
@@ -849,9 +851,11 @@
     };
   }
 
-  // Matroska holds every track kind a source may bring (styled subtitles,
-  // fonts, chapters, covers), so it is the default in both tabs.
-  let outputContainer = $state<ContainerFormat>('matroska');
+  // Quick Convert writes MP4 and AV1AN writes WebM by default. Tracks those
+  // containers cannot hold are reported; MKV keeps everything.
+  let outputContainer = $state<ContainerFormat>(
+    untrack(() => backend) === 'av1an' ? 'webm' : 'mp4',
+  );
   let videoChoice = $state('svtAv1Hdr');
   let imageQuality = $state(128);
   let imagePixel = $state<import('$lib/ipc/generated').ImagePixelFormat>('rgb24');
@@ -1604,14 +1608,14 @@
         ].includes(p.label),
       )
       .reverse();
-    // One default quality per encoder in both tabs, so switching between
-    // Quick Convert and AV1AN does not silently change the target quality.
+    // SVT defaults to CRF 20 in Quick Convert and CRF 35 in AV1AN; the other
+    // encoders keep one default quality in both tabs.
     if (listedSvt(encoder))
       return {
         ...base,
         crfMin: 0,
         crfMax: 63,
-        defaultCrf: 30,
+        defaultCrf: svtDefaultCrf(backend),
         defaultPreset: 4,
         presets: numbers(12),
       };
@@ -1780,6 +1784,36 @@
         : sourceBitDepth(selectedVideo)
           ? `${sourceBitDepth(selectedVideo)}-bit source`
           : 'Source bit depth',
+  );
+  // SVT high-bit-depth mode decision (hbd-mds 1 or 2) needs a 10-bit picture:
+  // the job encodes at 10 bits and widens an 8-bit source first.
+  const highBitDepthDecision = $derived(
+    isSvtEncoder(encoder) &&
+      parameters.some((value) => value.name === 'hbd-mds' && ['1', '2'].includes(value.value)),
+  );
+  const chosenPixelFormat = $derived(chunked ? av1an.pixelFormat : outputPixelFormat);
+  $effect(() => {
+    if (!highBitDepthDecision) return;
+    untrack(() => {
+      if (chosenPixelFormat !== 'yuv420p') return;
+      if (chunked) av1an = { ...av1an, pixelFormat: 'yuv420p10le' };
+      else outputPixelFormat = 'yuv420p10le';
+    });
+  });
+  const tenBitNote = $derived.by(() => {
+    if (!encodingVideo || !highBitDepthDecision) return '';
+    const raised = chosenPixelFormat === 'yuv420p';
+    const widened = !toneMap.enabled && sourceBitDepth(selectedVideo) === 8;
+    if (!raised && !widened) return '';
+    return `High-bit-depth mode decision runs at 10 bits: ${raised ? 'this encode uses 10-bit 4:2:0' : 'the 8-bit source is converted to 10-bit first'}.`;
+  });
+  const colorFormatHint = $derived(
+    encodingVideo &&
+      !toneMap.enabled &&
+      sourceBitDepth(selectedVideo) === 8 &&
+      (chosenPixelFormat?.includes('10') || highBitDepthDecision)
+      ? 'The 8-bit source is converted to 10-bit before encoding.'
+      : undefined,
   );
   const selectedVideoSupported = $derived(
     fileMode === 'batch'
@@ -4248,10 +4282,13 @@
                 else outputPixelFormat = value;
               }}
               disabled={!encodingVideo}
+              title={colorFormatHint}
               >{#each encodingVideo ? sourceColors : [] as format}<option value={format.value}
                   >{format.label}</option
                 >{/each}</select
-            >
+            >{#if tenBitNote}<p class="geometry-readout subtitle-note" aria-label="Bit depth">
+                {tenBitNote}
+              </p>{/if}
           {/if}
           <label for={`${idPrefix}-fps`}>Frame Rate</label><input
             id={`${idPrefix}-fps`}
@@ -4433,7 +4470,8 @@
           }}
           ><option value="copy">Copy Audio Without Re-Encoding</option><option value="strip"
             >Disable (Strip Audio)</option
-          ><option value="aac">AAC (Advanced Audio Coding)</option><option value="opus">Opus</option
+          ><option value="aac">AAC (Advanced Audio Coding)</option><option value="opus"
+            >Opus (VBR)</option
           ><option value="vorbis">Vorbis</option><option value="eac3"
             >E-AC-3 (Dolby Digital Plus)</option
           ><option value="mp3">MP3</option><option value="flac"

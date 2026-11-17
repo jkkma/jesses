@@ -295,6 +295,17 @@ pub(in crate::jobs) fn requires_serial_svt(settings: &EncodeSettings) -> bool {
         })
 }
 
+/// SVT high-bit-depth mode decision (1 = full 10-bit, 2 = hybrid) only runs on
+/// a 10-bit picture, so these jobs always encode at 10 bits: an 8-bit 4:2:0
+/// choice is raised to 10-bit and an 8-bit source is widened before encoding.
+pub(in crate::jobs) fn high_bit_depth_decision(settings: &EncodeSettings) -> bool {
+    settings.encoder.is_svt()
+        && settings
+            .parameters
+            .iter()
+            .any(|value| value.name == "hbd-mds" && matches!(value.value.as_str(), "1" | "2"))
+}
+
 pub(in crate::jobs) const WINDOWS_HDR_RELEASE: &str = "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)";
 
 pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: &str) -> bool {
@@ -309,24 +320,6 @@ pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: 
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     validate_values(settings.encoder, settings.backend, &settings.parameters)?;
-    if settings.encoder.is_svt()
-        && settings
-            .parameters
-            .iter()
-            .any(|value| value.name == "hbd-mds" && value.value == "1")
-        && settings
-            .output_pixel_format
-            .or_else(|| {
-                settings
-                    .av1an_options
-                    .and_then(|options| options.pixel_format)
-            })
-            .is_some_and(|format| !format.ffmpeg().contains("10"))
-    {
-        return Err(error(
-            "SVT hbd-mds=1 requires 10-bit output. Choose a 10-bit output format or remove that content-preset override before queueing.",
-        ));
-    }
     if let Some(quantizer) = settings.constant_quantizer
         && (quantizer > 51
             || !matches!(
@@ -1255,19 +1248,34 @@ mod tests {
     }
 
     #[test]
-    fn svt_high_bit_depth_preset_constraint_is_rejected_before_queueing() {
+    fn svt_high_bit_depth_decision_is_accepted_with_any_output_depth() {
         let mut settings = setting(VideoEncoder::SvtAv1, "hbd-mds", "1");
         settings.parameters.push(media_core::EncoderParameter {
             name: "enable-overlays".into(),
             value: "1".into(),
         });
         assert!(requires_serial_svt(&settings));
+        assert!(high_bit_depth_decision(&settings));
+        // An 8-bit choice is raised to 10-bit by the plan instead of refused.
         settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p);
-        assert!(validate(&settings).unwrap_err().message.contains("10-bit"));
+        validate(&settings).unwrap();
         settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p10le);
         validate(&settings).unwrap();
         settings.parameters.pop();
         assert!(!requires_serial_svt(&settings));
+        for (encoder, value, expected) in [
+            (VideoEncoder::SvtAv1Hdr, "2", true),
+            (VideoEncoder::SvtAv1Hdr, "0", false),
+            (VideoEncoder::AomAv1, "1", false),
+        ] {
+            settings.encoder = encoder;
+            settings.parameters[0].value = value.into();
+            assert_eq!(
+                high_bit_depth_decision(&settings),
+                expected,
+                "{encoder:?} {value}"
+            );
+        }
     }
 
     #[test]

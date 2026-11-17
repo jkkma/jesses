@@ -643,7 +643,7 @@ pub(super) fn svt() -> Vec<Spec> {
             0,
             2,
             quant,
-            "Choose high-bit-depth mode-decision depth. Modes 1 and 2 have no effect with 8-bit output.",
+            "Choose high-bit-depth mode-decision depth. Modes 1 and 2 encode at 10 bits; an 8-bit source is converted to 10-bit first.",
             "1",
         ),
         number(

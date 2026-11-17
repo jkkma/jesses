@@ -65,7 +65,7 @@
         onchange={(event) => changeFormat({ codec: event.currentTarget.value as AudioCodec })}
       >
         <option value="copy">Copy source</option>
-        <option value="opus">Opus</option>
+        <option value="opus">Opus (VBR)</option>
         <option value="aac">AAC</option>
         <option value="flac">FLAC (24-bit)</option>
         <option value="mp3">MP3</option>
@@ -125,7 +125,7 @@
   </div>
   <p class="audio-help">
     {converting
-      ? `${settings.codec === 'flac' ? 'Encodes 24-bit integer PCM without a bitrate target. Floating-point and higher-depth sources are converted to 24-bit.' : `${settings.codec === 'mp3' ? 'Choose a standard bitrate.' : `32–${bitrateMax} kb/s target.`} ${settings.codec === 'opus' ? 'Opus uses 48 kHz.' : 'Retains the source sample rate.'}`} Track title, language, and default status are retained.`
+      ? `${settings.codec === 'flac' ? 'Encodes 24-bit integer PCM without a bitrate target. Floating-point and higher-depth sources are converted to 24-bit.' : `${settings.codec === 'mp3' ? 'Choose a standard bitrate.' : `32–${bitrateMax} kb/s${settings.codec === 'opus' ? ' VBR' : ''} target.`} ${settings.codec === 'opus' ? 'Opus uses 48 kHz.' : 'Retains the source sample rate.'}`} Track title, language, and default status are retained.`
       : 'Keeps the original audio without quality loss.'}
   </p>
   {#if converting && (settings.channels === 'surround51' || settings.channels === 'surround71')}

@@ -81,8 +81,9 @@ promise of memory use.
 
 Selecting an advanced synthetic-noise override together with film-grain
 synthesis or a table reports a conflict, since SVT otherwise silently chooses
-one grain mode. High-bit-depth mode-decision controls identify their lack of
-effect on 8-bit output.
+one grain mode. High-bit-depth mode decision (`hbd-mds` 1 or 2) needs a 10-bit
+picture, so those jobs always encode at 10 bits: an 8-bit source is converted
+to 10-bit before encoding, and an 8-bit output format is raised to 10-bit.
 
 Film-stock presets include the supported stock modifiers. Audio codec,
 bitrate, and channel choices are remembered for new sources; measured gain and

@@ -18,7 +18,7 @@ test('source tabs, defaults and conditional options follow each encoding view', 
     'Advanced',
   ]);
   await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1Hdr');
-  await expect(quick.getByLabel('Container')).toHaveValue('matroska');
+  await expect(quick.getByLabel('Container')).toHaveValue('mp4');
   await expect(quick.getByLabel('Quality Mode')).toHaveValue('quality');
   await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
   await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('opus');
@@ -57,14 +57,14 @@ test('global Run emits typed default source settings and selected tracks', async
   const request = calls.find((call: any) => call.command === 'mock_start_encode')?.payload.request;
   expect(request.source).toMatchObject({
     inputPath: '/media/input.mkv',
-    outputPath: '/media/output.mkv',
+    outputPath: '/media/output.mp4',
     streamIndices: [0, 1, 2],
   });
   expect(request.settings).toMatchObject({
     backend: 'standalone',
     encoder: 'svtAv1Hdr',
-    crf: 30,
-    svtCrfQuarterSteps: 120,
+    crf: 20,
+    svtCrfQuarterSteps: 80,
     audio: [{ streamIndex: 1, codec: 'opus', bitrateKbps: 128, channels: 'preserve' }],
   });
 });
@@ -104,8 +104,8 @@ test('source output box is a stem; format switches and collisions resolve to the
 }) => {
   await page.evaluate(() => {
     (globalThis as any).__occupied = [
-      '/media/input.mkv',
-      '/media/chosen.mp4',
+      '/media/input.mp4',
+      '/media/chosen.mkv',
       '/media/chosen.gif',
       '/media/chosen',
     ];
@@ -116,7 +116,7 @@ test('source output box is a stem; format switches and collisions resolve to the
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await expect(q.getByLabel('Output Path', { exact: true })).toHaveValue('/media/input (1)');
   await q.getByLabel('Output Path', { exact: true }).fill('/media/chosen');
-  await q.getByLabel('Container').selectOption('mp4');
+  await q.getByLabel('Container').selectOption('matroska');
   await expect(q.getByLabel('Output Path', { exact: true })).toHaveValue('/media/chosen (1)');
   await q.getByLabel('Output Path', { exact: true }).fill('/media/chosen');
   await q.getByLabel('Codec', { exact: true }).selectOption('gif');
@@ -344,7 +344,7 @@ test('an encode snapshots its output, format and settings before awaiting name r
             ?.payload.request,
       ),
     )
-    .toMatchObject({ source: { outputPath: '/media/original.mkv' }, settings: { crf: 30 } });
+    .toMatchObject({ source: { outputPath: '/media/original.mp4' }, settings: { crf: 20 } });
   await expect(q.getByLabel('Output Path', { exact: true })).toHaveValue('/media/newer');
 });
 
@@ -622,7 +622,7 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
       const host = globalThis as any;
       host.__pickerPaths = [first.path, second.path];
       host.__mediaByPath = { [first.path]: first, [second.path]: second };
-      host.__batchOutputPaths = ['/media/first (1).mkv', '/other/second (1).mkv'];
+      host.__batchOutputPaths = ['/media/first (1).mp4', '/other/second (1).mp4'];
     },
     { first: source, second },
   );
@@ -648,9 +648,9 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
   const preview = calls.find((c: any) => c.command === 'preview_encode_batch').payload.request;
   expect(preview).toMatchObject({
     outputDirectory: '',
-    outputContainer: 'matroska',
+    outputContainer: 'mp4',
     outputNameTemplate: '{name}_{codec}_{preset}',
-    sourceNaming: { codec: 'av1', quality: '30', preset: '4' },
+    sourceNaming: { codec: 'av1', quality: '20', preset: '4' },
   });
   expect(preview.inputs.map((input: any) => input.subtitles)).toEqual([
     [{ streamIndex: 2, mode: 'copy', burnIn: true }],
@@ -660,7 +660,7 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
     calls
       .filter((c: any) => c.command === 'mock_start_encode')
       .map((c: any) => c.payload.request.source.outputPath),
-  ).toEqual(['/media/first (1).mkv', '/other/second (1).mkv']);
+  ).toEqual(['/media/first (1).mp4', '/other/second (1).mp4']);
 });
 
 test('source YADIF selection resolves into typed deinterlace settings', async ({ page }) => {
@@ -836,7 +836,7 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
     },
     {
       codec: 'svtAv1Hdr',
-      quality: '30',
+      quality: '20',
       preset: '4',
       presets: Array.from({ length: 13 }, (_, i) => String(i)),
       colors: ['YUV - 4:2:0 - 8 bit', 'YUV - 4:2:0 - 10 bit'],
@@ -874,7 +874,7 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
     'Copy Audio Without Re-Encoding',
     'Disable (Strip Audio)',
     'AAC (Advanced Audio Coding)',
-    'Opus',
+    'Opus (VBR)',
     'Vorbis',
     'E-AC-3 (Dolby Digital Plus)',
     'MP3',
@@ -1013,7 +1013,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
     },
     {
       encoder: 'svtAv1',
-      q: '30',
+      q: '35',
       max: '63',
       p: '4',
       poptions: Array.from({ length: 13 }, (_, i) => String(i)),

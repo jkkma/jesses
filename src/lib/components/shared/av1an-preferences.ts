@@ -194,7 +194,14 @@ export function defaultAv1anAudio(
 ): AudioTrackDraft[] {
   const saved = readAv1anPreferences(sourceFilters).audio;
   const tracks = defaultAudio(streams);
-  if (!saved) return tracks;
+  // Without a saved choice, AV1AN converts to Opus VBR 128 kb/s like Quick Convert.
+  if (!saved)
+    return tracks.map((track) => ({
+      ...track,
+      codec: 'opus',
+      bitrateKbps: 128,
+      channels: 'preserve',
+    }));
   return tracks.map((track) => {
     const stream = streams.find((candidate) => candidate.index === track.streamIndex);
     if (!stream) return track;
