@@ -15,6 +15,22 @@ fn memory() -> (Option<u32>, Option<u32>) {
     (None, None)
 }
 
+/// One scene detection process already keeps five to nine threads busy, so
+/// two or three parts fill a desktop CPU; more only cost memory. The form's
+/// own default uses the same rule.
+fn scene_slices(processors: u32) -> u8 {
+    if processors < 8 {
+        1
+    } else {
+        ((processors + 4) / 8).clamp(2, 8) as u8
+    }
+}
+
+/// Physical memory that is free right now, where the platform reports it.
+pub(crate) fn available_memory_mib() -> Option<u32> {
+    memory().1
+}
+
 pub fn estimate_av1an_resources(request: Av1anResourceRequest) -> Av1anResourceEstimate {
     let processors = std::thread::available_parallelism().map_or(1, |n| n.get().min(4096) as u32);
     let (total, available) = memory();
@@ -80,7 +96,7 @@ fn estimate(
         estimated_memory_mib,
         suggested_workers,
         suggested_threads,
-        suggested_scene_slices: (processors / 2).clamp(1, 8) as u8,
+        suggested_scene_slices: scene_slices(processors),
         warning,
     }
 }
@@ -138,5 +154,24 @@ mod tests {
         source.encoder = VideoEncoder::X264;
         let x264 = estimate(source, 16, Some(65536), Some(60000));
         assert_eq!((x264.suggested_workers, x264.suggested_threads), (7, 2));
+    }
+
+    #[test]
+    fn scene_slices_stay_few_because_each_detector_is_already_parallel() {
+        let expected = [
+            (1, 1),
+            (4, 1),
+            (7, 1),
+            (8, 2),
+            (12, 2),
+            (16, 2),
+            (20, 3),
+            (32, 4),
+            (64, 8),
+            (256, 8),
+        ];
+        for (processors, slices) in expected {
+            assert_eq!(scene_slices(processors), slices, "{processors} processors");
+        }
     }
 }

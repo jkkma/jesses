@@ -143,14 +143,15 @@
             min="1"
             max="16"
             step="1"
-            disabled
+            disabled={draft.chunkMethod !== 'lsmash'}
             aria-describedby={`${idPrefix}-scene-slices-help`}
             value={draft.sceneDetectionSlices ?? 1}
             oninput={(event) => onchange({ ...draft, sceneDetectionSlices: number(event) })}
           />
           <p id={`${idPrefix}-scene-slices-help`}>
-            Parallel detection requires Thorough verification, scene detection, and L-SMASH. This
-            batch workflow does not enable Thorough verification, so AV1AN detects scenes normally.
+            Detects scenes in this many parallel parts before encoding. Requires scene detection and
+            L-SMASH. Skipped when resuming, for short sources, or if the AV1AN build does not
+            support it.
           </p>
         </div>
       {/if}

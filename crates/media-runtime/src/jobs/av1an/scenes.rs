@@ -72,10 +72,60 @@ fn capture_error(error: supervisor::SupervisorError, path: &Path) -> AppError {
     }
 }
 
+/// The job's frame count when the prepass starts. A count read from the file
+/// headers only sizes the slices; the reader's own index then says where the
+/// video ends, exactly as it does when av1an detects scenes itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlannedFrames {
+    Counted(usize),
+    FromHeaders(usize),
+}
+
+impl PlannedFrames {
+    fn planned(self) -> usize {
+        match self {
+            Self::Counted(frames) | Self::FromHeaders(frames) => frames,
+        }
+    }
+
+    /// The frame count the slices tile, given what the reader indexed.
+    fn indexed(self, indexed: Option<usize>, slices: usize) -> Result<usize, String> {
+        match (self, indexed) {
+            (Self::Counted(expected), Some(frames)) if frames == expected => Ok(frames),
+            (Self::Counted(expected), _) => Err(format!(
+                "L-SMASH indexed {indexed:?} frames; the validated source has {expected}. Parallel scene detection was not used."
+            )),
+            // Keep the slice count chosen from the header estimate unless the
+            // real video is so much shorter that slicing it is pointless.
+            (Self::FromHeaders(_), Some(frames))
+                if frames >= slices * (MIN_FRAMES_PER_SLICE / 2) =>
+            {
+                Ok(frames)
+            }
+            (Self::FromHeaders(planned), _) => Err(format!(
+                "L-SMASH indexed {indexed:?} frames where the file headers suggested {planned}. Parallel scene detection was not used."
+            )),
+        }
+    }
+}
+
 fn slice_count(requested: u8, frames: usize) -> usize {
     usize::from(requested)
         .min(MAX_SLICES)
         .min(frames / MIN_FRAMES_PER_SLICE)
+}
+
+/// Every slice is its own av1an process decoding the source at full size.
+/// Measured with the pinned build: about 0.55 GiB a slice for 1080p and
+/// 1.7 GiB for 3832x1600. Keep all slices within half of the memory that is
+/// free right now, so a large source cannot push the machine into its page file.
+fn memory_slices(picture: (u32, u32), available_mib: Option<u32>) -> usize {
+    let Some(available) = available_mib else {
+        return MAX_SLICES;
+    };
+    let megapixels = f64::from(picture.0) * f64::from(picture.1) / 1_000_000.0;
+    let per_slice_mib = 128.0 + megapixels * 300.0;
+    ((f64::from(available) / 2.0 / per_slice_mib) as usize).min(MAX_SLICES)
 }
 
 fn bounds(frames: usize, slices: usize) -> Vec<usize> {
@@ -154,7 +204,8 @@ pub(super) async fn prepare(
     input: &Path,
     launch_directory: &Path,
     durable_chunks: &Path,
-    expected_frames: usize,
+    frames: PlannedFrames,
+    picture: (u32, u32),
     options: media_core::Av1anOptions,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Option<Prepared>, AppError> {
@@ -165,7 +216,10 @@ pub(super) async fn prepare(
     {
         return Ok(None);
     }
-    let slices = slice_count(options.scene_detection_slices, expected_frames);
+    let slices = slice_count(options.scene_detection_slices, frames.planned()).min(memory_slices(
+        picture,
+        crate::av1an_resources::available_memory_mib(),
+    ));
     if slices < 2 {
         return Ok(None);
     }
@@ -184,7 +238,7 @@ pub(super) async fn prepare(
         &work,
         &cache,
         reader,
-        expected_frames,
+        frames,
         options,
         slices,
         cancel,
@@ -230,7 +284,7 @@ async fn detect(
     work: &Path,
     cache: &Path,
     reader: PathBuf,
-    expected_frames: usize,
+    frames: PlannedFrames,
     options: media_core::Av1anOptions,
     slices: usize,
     cancel: &watch::Receiver<bool>,
@@ -281,18 +335,16 @@ async fn detect(
     )
     .await
     .map_err(|error| capture_error(error, input))?;
-    let indexed_frames =
-        parse_frame_count(&info.stdout).or_else(|| parse_frame_count(&info.stderr));
-    if !info.status.success() || indexed_frames != Some(expected_frames) {
-        return Err(failure(
-            input,
-            format!(
-                "L-SMASH indexed {indexed_frames:?} frames; the validated source has {expected_frames}. Parallel scene detection was not used."
-            ),
-        ));
-    }
+    let indexed_frames = info
+        .status
+        .success()
+        .then(|| parse_frame_count(&info.stdout).or_else(|| parse_frame_count(&info.stderr)))
+        .flatten();
+    let total = frames
+        .indexed(indexed_frames, slices)
+        .map_err(|detail| failure(input, detail))?;
 
-    let limits = bounds(expected_frames, slices);
+    let limits = bounds(total, slices);
     let mut commands = Vec::with_capacity(slices);
     for index in 0..slices {
         let slice_dir = work.join(format!("slice-{index:02}"));
@@ -629,6 +681,45 @@ mod tests {
     }
 
     #[test]
+    fn free_memory_bounds_the_slices_of_a_large_picture() {
+        // Unknown memory leaves the requested count alone.
+        assert_eq!(memory_slices((3840, 2160), None), MAX_SLICES);
+        // 12 GiB free: half of it holds two 4K slices but every 1080p slice.
+        assert_eq!(memory_slices((3840, 2160), Some(12 * 1024)), 2);
+        assert_eq!(memory_slices((1920, 1080), Some(12 * 1024)), 8);
+        assert_eq!(memory_slices((1920, 1080), Some(64 * 1024)), MAX_SLICES);
+        // Too little for even two slices: the caller skips the prepass.
+        assert!(memory_slices((3840, 2160), Some(8 * 1024)) < 2);
+    }
+
+    #[test]
+    fn a_counted_plan_must_match_the_index_and_a_header_estimate_follows_it() {
+        let counted = PlannedFrames::Counted(4_800);
+        assert_eq!(counted.indexed(Some(4_800), 4), Ok(4_800));
+        assert!(
+            counted
+                .indexed(Some(4_799), 4)
+                .unwrap_err()
+                .contains("validated source has 4800")
+        );
+        assert!(counted.indexed(None, 4).is_err());
+
+        // Header counts can be a few frames off; the reader's index decides.
+        let estimated = PlannedFrames::FromHeaders(4_800);
+        assert_eq!(estimated.planned(), 4_800);
+        assert_eq!(estimated.indexed(Some(4_793), 4), Ok(4_793));
+        assert_eq!(estimated.indexed(Some(4_900), 4), Ok(4_900));
+        assert_eq!(estimated.indexed(Some(2_400), 4), Ok(2_400));
+        assert!(
+            estimated
+                .indexed(Some(2_399), 4)
+                .unwrap_err()
+                .contains("file headers suggested 4800")
+        );
+        assert!(estimated.indexed(None, 4).is_err());
+    }
+
+    #[test]
     fn merges_validated_scene_documents_without_losing_metadata() {
         let documents = [
             json!({"frames": 1200, "engine_marker": "kept", "scenes": [
@@ -804,7 +895,8 @@ mod tests {
             &input,
             &launch,
             &chunks,
-            2400,
+            PlannedFrames::Counted(2400),
+            (128, 96),
             media_core::Av1anOptions {
                 scene_detection_slices: 2,
                 scene_downscale_height: Some(96),
@@ -842,7 +934,8 @@ mod tests {
             &input,
             &launch,
             &abort_chunks,
-            2400,
+            PlannedFrames::Counted(2400),
+            (128, 96),
             media_core::Av1anOptions {
                 scene_detection_slices: 2,
                 scene_downscale_height: Some(96),

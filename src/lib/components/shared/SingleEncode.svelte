@@ -4494,15 +4494,13 @@
             type="number"
             min="1"
             max="16"
-            disabled={!sourcePreferences?.fullOutputVerification ||
-              av1an.splitMethod !== 'sceneDetection' ||
-              av1an.chunkMethod !== 'lsmash'}
+            disabled={av1an.splitMethod !== 'sceneDetection' || av1an.chunkMethod !== 'lsmash'}
             aria-describedby="slices-help"
             bind:value={av1an.sceneDetectionSlices}
           />
           <span></span><small id="slices-help"
-            >Parallel detection requires Thorough verification, scene detection, and L-SMASH. It may
-            also be skipped when resuming or if the AV1AN build or source frame count does not
+            >Detects scenes in this many parallel parts before encoding. Requires scene detection
+            and L-SMASH. Skipped when resuming, for short sources, or if the AV1AN build does not
             support it.</small
           >
         </div>

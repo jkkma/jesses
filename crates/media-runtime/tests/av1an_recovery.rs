@@ -358,6 +358,22 @@ async fn observe_packaged_process_tree(
             .and_then(|tool| tool["sha256"].as_str())
             .unwrap()
     };
+    // The job runs whichever SVT build discovery selects: the HDR fork by
+    // default, mainline when JESSES_SVT_AV1 names it (as the package gate does).
+    // Either way it must be the packaged binary its manifest receipt describes.
+    let receipt_at = |path: &str| {
+        manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool["path"].as_str().is_some_and(|relative| {
+                    normalize(&format!("{resources}/resources/tools/{relative}")) == path
+                })
+            })
+            .and_then(|tool| tool["sha256"].as_str())
+            .unwrap_or_else(|| panic!("the live encoder is not a packaged tool: {path}"))
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let inventory = tokio::task::spawn_blocking(windows_process_inventory)
@@ -374,10 +390,7 @@ async fn observe_packaged_process_tree(
             })
         };
         if let (Some(av1an), Some(svt)) = (named("av1an.exe"), named("SvtAv1EncApp.exe")) {
-            for (process, expected) in [
-                (av1an, expected_hash("av1an")),
-                (svt, expected_hash("svt-av1-hdr")),
-            ] {
+            for (process, staged) in [(av1an, true), (svt, false)] {
                 let path = process
                     .process
                     .executable_path
@@ -388,6 +401,12 @@ async fn observe_packaged_process_tree(
                     path.starts_with(&workspace) || path.starts_with(&resources),
                     "the verified package tool escaped its resource and recovery roots: {path}"
                 );
+                // av1an runs from a staged copy in the workspace; the encoder in place.
+                let expected = if staged {
+                    expected_hash("av1an")
+                } else {
+                    receipt_at(&path)
+                };
                 assert_eq!(
                     format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
                     expected,

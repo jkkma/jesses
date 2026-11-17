@@ -58,7 +58,9 @@ const defaults = (): Av1anPreferences => {
       2,
       Math.min(16, Math.ceil(Math.max(2, Math.round(cores * 0.8)) / baseline)),
     ),
-    sceneDetectionSlices: Math.max(1, Math.min(8, Math.floor(cores / 2))),
+    // One detection process already keeps five to nine threads busy, so two
+    // or three parts fill a desktop CPU; more only cost memory.
+    sceneDetectionSlices: cores < 8 ? 1 : Math.max(2, Math.min(8, Math.floor((cores + 4) / 8))),
     workers: Math.max(1, baseline - 2),
     workerBaseline: baseline,
     filters: [],

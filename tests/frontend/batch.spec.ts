@@ -1684,10 +1684,8 @@ test('batch component queues the same default HDR tune before and after switchin
   ).toEqual(['visualQuality', 'visualQuality']);
   await batch.getByLabel('Encode backend').selectOption('av1an');
   await batch.getByText('Scenes and quality targeting', { exact: true }).click();
-  await expect(batch.getByLabel('Scene detection slices')).toBeDisabled();
-  await expect(
-    batch.getByText(/batch workflow does not enable Thorough verification/),
-  ).toBeVisible();
+  await expect(batch.getByLabel('Scene detection slices')).toBeEnabled();
+  await expect(batch.getByText(/Detects scenes in this many parallel parts/)).toBeVisible();
   await page.evaluate(() => {
     (globalThis as any).__pickerPaths = ['/media/grain.tbl'];
     (globalThis as any).__grainTable = 'filmgrn1\nE 0 50 1 2 1\nE\t50 100 1 2 1\n';

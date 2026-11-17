@@ -46,12 +46,15 @@ unqualified. Custom encoder paths and file-reading filter expressions are not
 accepted as advanced overrides. Scaling and pixel conversion use the verified
 FFmpeg preparation path.
 
-Normal jobs let av1an perform indexing and scene detection during its own launch.
-With Thorough verification enabled, scene detection can divide a sufficiently long L-SMASH source into 2–16
-parallel slices. Each slice needs at least 1,200 frames. Jesses validates and
-merges the scene lists into av1an's durable receipt path; shorter inputs and
-fixed-chunk splitting use ordinary in-run detection. A failed optional prepass
-is reported and falls back to ordinary detection. The Segment reader requires
+Scene detection can divide a sufficiently long L-SMASH source into 2–16
+parallel slices before encoding, on default jobs and with Thorough verification
+alike. Each slice needs at least 1,200 frames. A default job plans its length
+from the file headers, so the slices tile the frame count of the L-SMASH index
+that the prepass builds and av1an then reuses; a counted source must match that
+index exactly. Jesses validates and merges the scene lists into av1an's durable
+receipt path; shorter inputs, other readers, resumed jobs and fixed-chunk
+splitting let av1an index and detect scenes during its own launch. A failed
+optional prepass is reported and falls back to that. The Segment reader requires
 an installed av1an advertising the FFmpeg 9 compatibility fix. The rebuilt,
 pinned engine passed a native Segment job; older engines receive an actionable
 compatibility error before encoding.

@@ -410,7 +410,15 @@ impl JobManager {
         }
         let fresh_prepass_supported =
             !recovery.resume_chunks && scenes::supports_preload(&version_text);
-        let prepared_scenes = if !thorough || !fresh_prepass_supported {
+        // The prepass replaces av1an's own single-process detection and builds
+        // the reader index av1an would build anyway, so it also runs on default
+        // jobs. Those plan from headers; the reader's index gives the count.
+        let planned_frames = if plan.source_frames_estimated {
+            scenes::PlannedFrames::FromHeaders(frame_count)
+        } else {
+            scenes::PlannedFrames::Counted(frame_count)
+        };
+        let prepared_scenes = if !fresh_prepass_supported {
             None
         } else {
             match scenes::prepare(
@@ -419,7 +427,8 @@ impl JobManager {
                 input,
                 &launch_directory,
                 &work.join("chunks"),
-                frame_count,
+                planned_frames,
+                plan.frame_dimensions(false),
                 configured,
                 cancel,
             )
@@ -455,13 +464,6 @@ impl JobManager {
             }
             if let Some(prepared) = &prepared_scenes {
                 append_log(snapshot, format!("Parallel scene prepass: {} slices produced {} scenes.", prepared.slices, prepared.scenes));
-            } else if !thorough
-                && fresh_prepass_supported
-                && configured.scene_detection_slices > 1
-                && configured.split_method == media_core::Av1anSplitMethod::SceneDetection
-                && configured.chunk_method == media_core::Av1anChunkMethod::Lsmash
-            {
-                append_log(snapshot, format!("Detection Slices is set to {}. The parallel scene prepass requires Thorough verification. AV1AN will detect scenes during encoding.", configured.scene_detection_slices));
             }
             append_log(snapshot, format!("av1an detail log: {}", internal_log.display()));
             snapshot.log_path = Some(log_path.to_string_lossy().into_owned());
