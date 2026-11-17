@@ -256,6 +256,24 @@ fn rotation(video: &metadata::Stream) -> Result<i32, AppError> {
     }
     Ok(quarter as i32 % 360)
 }
+/// The right-angle rotation Quick Convert applies while it encodes, when this
+/// source can skip the canonical copy (0 for a later start alone). Reflected
+/// or otherwise unusual display matrices keep the canonical copy.
+pub(super) fn direct_rotation(video: &metadata::Stream, settings: &EncodeSettings) -> Option<i32> {
+    if !super::encode_plan::direct_source_clock(video, settings) {
+        return None;
+    }
+    let rotation = rotation(video).ok()?;
+    let (_, transform) =
+        crate::analysis::display_transform_parts(&video.side_data_list, &video.tags).ok()?;
+    let expected = match rotation {
+        90 => "transpose=cclock,",
+        180 => "hflip,vflip,",
+        270 => "transpose=clock,",
+        _ => "",
+    };
+    (transform == expected).then_some(rotation)
+}
 fn recipe(
     document: &Document,
     settings: &EncodeSettings,
@@ -278,6 +296,11 @@ fn recipe(
     let rotation = rotation(video)?;
     let origin = number(video.start_time.as_deref()).unwrap_or(0.0);
     if !force && rotation == 0 && origin.abs() <= 0.001 {
+        return Ok(None);
+    }
+    if !force && direct_rotation(video, settings).is_some() {
+        // The encode rotates in its decoder and restores the origin at the
+        // mux. A variable clock is still caught and retried with `force`.
         return Ok(None);
     }
     if rotation == 0 && super::encode_plan::source_av1an_base_clock(video, settings) {
@@ -857,6 +880,52 @@ pub(super) fn available(path: &Path) -> Result<u64, AppError> {
         Ok(bytes)
     }
 }
+/// Uncompressed size of one pixel in half bytes, from the pixel format name.
+/// An unknown format is sized as 16-bit 4:4:4 with alpha (8 bytes).
+fn raw_half_bytes_per_pixel(pix_fmt: Option<&str>) -> u64 {
+    const UNKNOWN: u64 = 16;
+    let Some(name) = pix_fmt.map(str::to_ascii_lowercase) else {
+        return UNKNOWN;
+    };
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
+    let contains = |parts: &[&str]| parts.iter().any(|part| name.contains(part));
+    // Samples per pixel, in halves.
+    let samples = if contains(&["420", "411", "410"]) || starts(&["nv12", "nv21", "p010", "p016"]) {
+        3
+    } else if contains(&["422", "440"])
+        || starts(&["nv16", "p210", "p216", "y210", "y212", "yuyv", "uyvy"])
+    {
+        4
+    } else if contains(&["444"])
+        || starts(&[
+            "gbr", "rgb", "bgr", "0rgb", "0bgr", "argb", "abgr", "x2rgb", "x2bgr", "nv24", "p410",
+            "p416",
+        ])
+    {
+        6
+    } else if starts(&["gray", "ya"]) {
+        2
+    } else {
+        return UNKNOWN;
+    };
+    let alpha = starts(&["yuva", "rgba", "bgra", "argb", "abgr", "gbrap", "ya"]);
+    let samples = samples + if alpha { 2 } else { 0 };
+    let wide = contains(&[
+        "p9", "p10", "p12", "p14", "p16", "48", "64", "x2rgb10", "x2bgr10",
+    ]) || starts(&[
+        "p010", "p016", "p210", "p216", "p410", "p416", "y210", "y212",
+    ]) || name
+        .strip_prefix("gray")
+        .or_else(|| name.strip_prefix("ya"))
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|bits| bits.parse::<u32>().ok())
+        .is_some_and(|bits| bits > 8);
+    samples * if wide { 2 } else { 1 }
+}
 fn disk_preflight(
     path: &Path,
     source_length: u64,
@@ -876,12 +945,18 @@ fn disk_preflight(
     let pixels =
         u64::from(video.width.unwrap_or(0)).saturating_mul(u64::from(video.height.unwrap_or(0)));
     let frames = (duration * recipe.numerator as f64 / recipe.denominator as f64).ceil() as u64;
-    // Conservative allocation bound: planar 16-bit 4:4:4 plus FFV1 overhead,
-    // copied packets and a small mux/index reserve. No source is downsampled.
+    // Allocation bound: the source's uncompressed frames plus a quarter for
+    // FFV1 on noise, a small per-frame reserve, the copied packets and a
+    // mux/index reserve. No source is downsampled.
     let video_bytes = if compressed {
         0
     } else {
-        pixels.saturating_mul(8).saturating_mul(frames)
+        pixels
+            .saturating_mul(raw_half_bytes_per_pixel(video.pix_fmt.as_deref()))
+            .saturating_mul(5)
+            .div_ceil(8)
+            .saturating_add(4096)
+            .saturating_mul(frames)
     };
     let required = video_bytes
         .saturating_add(source_length)
@@ -1528,25 +1603,10 @@ impl Prepared {
         oriented_settings(settings, self.workspace.owner.recipe.rotation)
     }
 }
-/// Batch admission previews the same geometry/clock without writing derivatives.
-/// The execution path still proves every original/derived frame and packet.
-pub(super) fn preview_document(
-    document: &mut Document,
-    settings: &EncodeSettings,
-) -> Result<EncodeSettings, AppError> {
-    let proposed = recipe(document, settings, false)?;
-    let Some(recipe) = proposed else {
-        return Ok(settings.clone());
-    };
-    let duration = normalized_end(document, recipe.origin);
-    let video = document
-        .streams
-        .iter_mut()
-        .find(|stream| stream.index == settings.video_stream_index)
-        .expect("selected video");
-    video.start_time = Some("0".into());
-    video.packet_start_time = Some(0.0);
-    if matches!(recipe.rotation, 90 | 270) {
+/// The stream as displayed: a quarter turn swaps its axes and sample aspect
+/// ratio, and the display transform is no longer pending.
+fn display_oriented(video: &mut metadata::Stream, rotation: i32) {
+    if matches!(rotation, 90 | 270) {
         std::mem::swap(&mut video.width, &mut video.height);
         if let Some((n, d)) = video
             .sample_aspect_ratio
@@ -1566,6 +1626,38 @@ pub(super) fn preview_document(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|kind| kind == "Display Matrix")
     });
+}
+/// Batch admission previews the same geometry/clock without writing derivatives.
+/// The execution path still proves every original/derived frame and packet.
+pub(super) fn preview_document(
+    document: &mut Document,
+    settings: &EncodeSettings,
+) -> Result<EncodeSettings, AppError> {
+    let proposed = recipe(document, settings, false)?;
+    let Some(recipe) = proposed else {
+        // A directly encoded rotation is previewed in display orientation;
+        // its origin stays, as the encode restores it.
+        let video = document
+            .streams
+            .iter_mut()
+            .find(|stream| stream.index == settings.video_stream_index);
+        if let Some(video) = video
+            && let Some(rotation) = direct_rotation(video, settings).filter(|value| *value != 0)
+        {
+            display_oriented(video, rotation);
+            return Ok(oriented_settings(settings, rotation));
+        }
+        return Ok(settings.clone());
+    };
+    let duration = normalized_end(document, recipe.origin);
+    let video = document
+        .streams
+        .iter_mut()
+        .find(|stream| stream.index == settings.video_stream_index)
+        .expect("selected video");
+    video.start_time = Some("0".into());
+    video.packet_start_time = Some(0.0);
+    display_oriented(video, recipe.rotation);
     video.avg_frame_rate = Some(format!("{}/{}", recipe.numerator, recipe.denominator));
     video.r_frame_rate = video.avg_frame_rate.clone();
     if let Some(format) = &mut document.format {
@@ -1653,11 +1745,146 @@ mod orientation_tests {
 
     #[test]
     fn transport_stream_duration_is_a_span_and_audio_lead_survives_preview() {
-        let mut document:Document=serde_json::from_value(serde_json::json!({"format":{"format_name":"mpegts","start_time":"1.431644","duration":"2.010023"},"streams":[{"index":0,"codec_type":"video","width":128,"height":96,"start_time":"1.441667","duration":"2.0","r_frame_rate":"24/1"},{"index":1,"codec_type":"audio","start_time":"1.431644","duration":"1.992"}]})).unwrap();
-        assert!((normalized_end(&document, 1.441667).unwrap() - 2.0).abs() < 1e-6);
-        preview_document(&mut document, &EncodeSettings::default()).unwrap();
+        let source:Document=serde_json::from_value(serde_json::json!({"format":{"format_name":"mpegts","start_time":"1.431644","duration":"2.010023"},"streams":[{"index":0,"codec_type":"video","width":128,"height":96,"start_time":"1.441667","duration":"2.0","r_frame_rate":"24/1"},{"index":1,"codec_type":"audio","start_time":"1.431644","duration":"1.992"}]})).unwrap();
+        assert!((normalized_end(&source, 1.441667).unwrap() - 2.0).abs() < 1e-6);
+        // AV1AN still rebases through a canonical source.
+        let mut document = source.clone();
+        let av1an = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            ..Default::default()
+        };
+        preview_document(&mut document, &av1an).unwrap();
         assert!((document.duration().unwrap() - 2.0).abs() < 1e-6);
         assert_eq!(document.streams[0].start_time.as_deref(), Some("0"));
+        // Quick Convert keeps the origin and restores it at the mux.
+        let mut document = source.clone();
+        preview_document(&mut document, &EncodeSettings::default()).unwrap();
+        assert_eq!(document.streams[0].start_time.as_deref(), Some("1.441667"));
+        assert!((document.duration().unwrap() - 2.010023).abs() < 1e-6);
+        assert!(!needs(&source, &EncodeSettings::default(), false).unwrap());
+        assert!(needs(&source, &av1an, false).unwrap());
+    }
+
+    fn rotated(side_data: serde_json::Value) -> Document {
+        serde_json::from_value(serde_json::json!({"streams":[{
+            "index":0,"codec_type":"video","width":128,"height":96,"start_time":"0",
+            "sample_aspect_ratio":"4:3","r_frame_rate":"24/1","side_data_list":side_data
+        }]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn quick_convert_rotates_right_angle_turns_itself_and_keeps_the_canonical_copy_otherwise() {
+        let quick = EncodeSettings::default();
+        let turn = |rotation: i32, matrix: &str| {
+            rotated(serde_json::json!([{
+                "side_data_type":"Display Matrix","displaymatrix":matrix,"rotation":rotation
+            }]))
+        };
+        // FFprobe's matrices for a quarter turn and a half turn.
+        let quarter = turn(
+            90,
+            "\n00000000: 0 -65536 0\n00000001: 65536 0 0\n00000002: 0 0 1073741824\n",
+        );
+        let half = turn(
+            180,
+            "\n00000000: -65536 0 0\n00000001: 0 -65536 0\n00000002: 0 0 1073741824\n",
+        );
+        // A mirrored quarter turn keeps the canonical copy.
+        let mirrored = turn(
+            90,
+            "\n00000000: 0 65536 0\n00000001: 65536 0 0\n00000002: 0 0 1073741824\n",
+        );
+        assert_eq!(direct_rotation(&mirrored.streams[0], &quick), None);
+        assert!(needs(&mirrored, &quick, false).unwrap());
+        for (document, expected) in [(&quarter, 90), (&half, 180)] {
+            let video = &document.streams[0];
+            assert_eq!(direct_rotation(video, &quick), Some(expected));
+            assert!(!needs(document, &quick, false).unwrap());
+            // Reshaping, re-timing or AV1AN keeps the canonical copy.
+            for other in [
+                EncodeSettings {
+                    backend: media_core::EncodeBackend::Av1an,
+                    ..Default::default()
+                },
+                EncodeSettings {
+                    trim: Some(
+                        serde_json::from_value(
+                            serde_json::json!({"startFrame":0,"endFrameExclusive":4}),
+                        )
+                        .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(direct_rotation(video, &other), None);
+                assert!(needs(document, &other, false).unwrap());
+            }
+        }
+        // A rotate tag alone, as older demuxers reported it.
+        let tagged: Document = serde_json::from_value(serde_json::json!({"streams":[{
+            "index":0,"codec_type":"video","width":128,"height":96,"start_time":"0",
+            "sample_aspect_ratio":"4:3","r_frame_rate":"24/1","tags":{"rotate":"270"}
+        }]}))
+        .unwrap();
+        assert_eq!(direct_rotation(&tagged.streams[0], &quick), Some(270));
+        // The batch preview shows the turned raster and turns the crop with it.
+        let mut preview = tagged.clone();
+        let settings = EncodeSettings {
+            framing: media_core::VideoFraming {
+                crop: media_core::CropSettings {
+                    top: 8,
+                    right: 16,
+                    bottom: 24,
+                    left: 32,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let oriented = preview_document(&mut preview, &settings).unwrap();
+        let video = &preview.streams[0];
+        assert_eq!((video.width, video.height), (Some(96), Some(128)));
+        assert_eq!(video.sample_aspect_ratio.as_deref(), Some("3:4"));
+        assert!(video.tags.is_empty());
+        assert_eq!(video.start_time.as_deref(), Some("0"));
+        let c = oriented.framing.crop;
+        assert_eq!([c.top, c.right, c.bottom, c.left], [32, 8, 16, 24]);
+        // Dynamic HDR metadata keeps the canonical route's refusal.
+        let dynamic = rotated(serde_json::json!([
+            {"side_data_type":"Display Matrix","rotation":90},
+            {"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}
+        ]));
+        assert_eq!(direct_rotation(&dynamic.streams[0], &quick), None);
+    }
+
+    #[test]
+    fn the_space_check_sizes_frames_from_their_pixel_format() {
+        for (format, bytes_x2) in [
+            ("yuv420p", 3),
+            ("yuvj420p", 3),
+            ("nv12", 3),
+            ("yuv420p10le", 6),
+            ("p010le", 6),
+            ("yuv422p", 4),
+            ("yuv422p10le", 8),
+            ("yuv444p", 6),
+            ("yuv444p12le", 12),
+            ("yuva420p", 5),
+            ("gray", 2),
+            ("gray10le", 4),
+            ("ya8", 4),
+            ("rgb24", 6),
+            ("rgba", 8),
+            ("rgb48le", 12),
+            ("rgba64le", 16),
+            ("gbrp10le", 12),
+            ("gbrap", 8),
+            ("something-new", 16),
+        ] {
+            assert_eq!(raw_half_bytes_per_pixel(Some(format)), bytes_x2, "{format}");
+        }
+        assert_eq!(raw_half_bytes_per_pixel(None), 16);
     }
     #[test]
     fn coded_crop_edges_rotate_before_display_geometry_and_preserve_authority() {

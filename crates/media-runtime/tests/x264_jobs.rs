@@ -534,6 +534,7 @@ async fn x264_batch_preview_queue_and_history_retain_the_selected_encoder() {
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![3, 2, 1, 4],
         video_stream_index: 1,
+        cover_stream_index: None,
     };
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
@@ -669,6 +670,7 @@ async fn x264_rejects_hdr_before_creating_output_in_preview_and_execution() {
                 input_path: request.source.input_path.clone(),
                 stream_indices: request.source.stream_indices.clone(),
                 video_stream_index: 1,
+                cover_stream_index: None,
             }],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             output_name_template: None,

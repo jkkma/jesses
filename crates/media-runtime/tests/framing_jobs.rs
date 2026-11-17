@@ -699,6 +699,7 @@ async fn framing_batch_keeps_per_file_geometry_and_saved_history() {
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![3, 2, 1, 4],
         video_stream_index: 1,
+        cover_stream_index: None,
         audio: Vec::new(),
         framing: bordered_framing(),
     };

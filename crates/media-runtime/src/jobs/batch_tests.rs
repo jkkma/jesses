@@ -485,6 +485,7 @@ fn batch_header_preflight_rejects_unsupported_encoding_before_queueing() {
         input_path: "source.mkv".into(),
         stream_indices: vec![2],
         video_stream_index: 2,
+        cover_stream_index: None,
     };
     let document = serde_json::json!({
         "streams": [{
@@ -566,6 +567,7 @@ fn batch_header_preflight_rejects_alternate_video_only_for_av1an() {
             input_path: "multi-video.mkv".into(),
             stream_indices: vec![index, 0],
             video_stream_index: index,
+            cover_stream_index: None,
         };
         validate_encode_preview(&bytes, &input, &EncodeSettings::default()).unwrap();
         let result = validate_encode_preview(&bytes, &input, &av1an);
@@ -592,6 +594,7 @@ fn batch_header_preflight_honors_explicit_hdr10_fallback_for_both_backends() {
         input_path: "hdr-base.mkv".into(),
         stream_indices: vec![2],
         video_stream_index: 2,
+        cover_stream_index: None,
     };
     // Mastering metadata may be carried by the first decoded frame. Header
     // preview must preserve consent and defer that full scan to execution.
@@ -722,6 +725,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
         input_path: input.to_string_lossy().into_owned(),
         stream_indices: vec![0],
         video_stream_index: 0,
+        cover_stream_index: None,
     };
     let preview = manager
         .preview_encode_batch(BatchEncodeRequest {
@@ -845,6 +849,7 @@ async fn preview_and_atomic_batch_preserve_selections_and_execute_fifo() {
                 input_path: input.to_string_lossy().into_owned(),
                 stream_indices: vec![0],
                 video_stream_index: 0,
+                cover_stream_index: None,
             }],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             output_name_template: None,

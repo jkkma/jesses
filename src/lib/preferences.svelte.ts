@@ -6,6 +6,8 @@ export const preferences = $state<{
   value: UserPreferences;
   loaded: boolean;
   error: string | null;
+  /** How a damaged or newer preferences file was handled at startup. */
+  notice: string | null;
 }>({
   value: {
     general: { defaultOutputDirectory: '', recursiveImport: false },
@@ -14,6 +16,7 @@ export const preferences = $state<{
   },
   loaded: false,
   error: null,
+  notice: null,
 });
 let mutationTail = Promise.resolve();
 function serializeMutation<T>(action: () => Promise<T>): Promise<T> {
@@ -32,7 +35,9 @@ function receive(value: UserPreferences) {
 }
 export async function loadPreferences() {
   try {
-    receive(await getPreferences());
+    const value = await getPreferences();
+    preferences.notice = value.notice ?? null;
+    receive(value);
   } catch (error) {
     preferences.error = errorMessage(error);
   }

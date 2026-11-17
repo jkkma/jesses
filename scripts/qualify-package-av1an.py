@@ -107,7 +107,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="jesses-portable-av1an-gate-") as temporary:
         env = support.isolated_environment()
         env.update(LOCALAPPDATA=temporary, APPDATA=temporary, PATH=str(support.system32()), JESSES_TEST_TOOL_RESOURCES=str(resources))
-        for identifier, relative in {"FFMPEG": "ffmpeg/ffmpeg.exe", "FFPROBE": "ffmpeg/ffprobe.exe", "X264": "x264/x264.exe", "SVT_AV1": "svt-av1/SvtAv1EncApp.exe", "SVT_AV1_5FISH": "svt-av1-5fish/SvtAv1EncApp.exe", "SVT_AV1_HDR": "svt-av1-hdr/SvtAv1EncApp.exe"}.items():
+        for identifier, relative in {"FFMPEG": "ffmpeg/ffmpeg.exe", "FFPROBE": "ffmpeg/ffprobe.exe", "X264": "x264/x264.exe", "SVT_AV1": "svt-av1/SvtAv1EncApp.exe", "SVT_AV1_5FISH": "svt-av1-5fish/SvtAv1EncApp.exe", "SVT_AV1_HDR": "svt-av1-hdr/SvtAv1EncApp.exe", "GRAV1SYNTH": "grav1synth/grav1synth.exe"}.items():
             env["JESSES_" + identifier] = str(tools / relative)
         # These settings must be replaced/removed only for the bundled child.
         # A path-only launcher would try to load the nonexistent frameserver.

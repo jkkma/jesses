@@ -270,6 +270,60 @@ async fn history_capacity_never_prunes_recoverable_work() {
 }
 
 #[tokio::test]
+async fn pruning_a_finished_job_removes_its_log_files() {
+    let fixture = Fixture::new();
+    let logs = fixture.0.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let manager = JobManager::new(logs.clone());
+    let request = fixture.request();
+    {
+        let mut state = manager.state.lock().await;
+        for index in 0..MAX_HISTORY {
+            let (cancel, _) = watch::channel(true);
+            state.entries.push(Entry {
+                command_review: None,
+                pause: Default::default(),
+                phase_before_pause: None,
+                snapshot: JobSnapshot {
+                    id: format!("1-1-{index}"),
+                    state: JobState::Succeeded,
+                    request: request.source.clone(),
+                    mux_request: None,
+                    encode_settings: Some(request.settings.clone()),
+                    edited_command: None,
+                    recovery: None,
+                    standalone_recovery: None,
+                    input_size_bytes: None,
+                    output_size_bytes: None,
+                    encoder_progress: None,
+                    progress_seconds: None,
+                    duration_seconds: None,
+                    logs: vec![],
+                    error: None,
+                    log_path: None,
+                },
+                cancel,
+                task: None,
+            });
+        }
+    }
+    for name in ["1-1-0.log", "1-1-0.log.1", "1-1-0.mux.log", "1-1-1.log"] {
+        std::fs::write(logs.join(name), b"log").unwrap();
+    }
+    let slot = manager.execution.lock().await;
+    manager.enqueue_encode(request).await.unwrap();
+    let jobs = manager.list_jobs().await;
+    assert_eq!(jobs.len(), MAX_HISTORY);
+    assert!(jobs.iter().all(|job| job.id != "1-1-0"));
+    assert!(!logs.join("1-1-0.log").exists());
+    assert!(!logs.join("1-1-0.log.1").exists());
+    assert!(!logs.join("1-1-0.mux.log").exists());
+    assert!(logs.join("1-1-1.log").exists());
+    drop(slot);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn stop_is_not_available_for_remux() {
     let fixture = Fixture::new();
     let manager = JobManager::new(fixture.0.join("logs"));

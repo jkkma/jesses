@@ -99,6 +99,7 @@
 <section class="panel preferences-panel" aria-label="General preferences">
   <div class="section-heading"><span class="eyebrow">General preferences</span></div>
   <div class="preferences-body">
+    {#if preferences.notice}<p role="status">{preferences.notice}</p>{/if}
     {#if preferences.error}<p role="alert">{preferences.error}</p>
       <Button variant="outline" onclick={() => loadPreferences()} disabled={busy}
         >Retry preferences</Button

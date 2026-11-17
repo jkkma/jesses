@@ -900,6 +900,7 @@ pub(crate) async fn preview(
             framing: input.framing,
             audio: input.audio.clone(),
             video_stream_index: input.video_stream_index,
+            cover_stream_index: input.cover_stream_index,
             crf: request.crf,
             preset: request.preset,
             lossless: request.lossless,
@@ -1197,6 +1198,7 @@ mod tests {
                     input_path: input_path.clone(),
                     stream_indices: vec![3],
                     video_stream_index: 3,
+                    cover_stream_index: None,
                 }],
                 output_directory: path
                     .parent()
@@ -1634,6 +1636,7 @@ mod tests {
                 input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
                 stream_indices: vec![0],
                 video_stream_index: 0,
+                cover_stream_index: None,
             }],
             output_directory: fixture.0.to_string_lossy().into_owned(),
             output_name_template: None,
@@ -1793,6 +1796,7 @@ mod tests {
                         input_path: fixture.0.join("missing.mkv").to_string_lossy().into_owned(),
                         stream_indices: vec![0],
                         video_stream_index: 0,
+                        cover_stream_index: None,
                     },
                     BatchEncodeInput {
                         video_mode: None,
@@ -1809,6 +1813,7 @@ mod tests {
                             .into_owned(),
                         stream_indices: vec![0, 0],
                         video_stream_index: 0,
+                        cover_stream_index: None,
                     },
                 ],
                 output_directory: fixture.0.to_string_lossy().into_owned(),

@@ -788,6 +788,150 @@ async fn accepts_untagged_sdr_anamorphic_small_and_high_rate_sources_with_verifi
     manager.shutdown().await;
 }
 
+async fn run_tool(id: &str, args: Vec<std::ffi::OsString>) -> Vec<u8> {
+    let (_owner, cancel) = watch::channel(false);
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: tool_path(id).await,
+            args,
+            cwd: None,
+        },
+        cancel,
+        4 * 1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{id}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result.stdout
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg/FFprobe and standalone x264 on PATH"]
+async fn embedded_cover_art_is_kept_in_mkv_and_mp4_and_reported_for_mov() {
+    use media_core::VideoEncoder;
+    let fixture = Fixture::new();
+    let base = fixture.0.join("base.mkv");
+    generate(&base).await;
+    let cover = fixture.0.join("cover.jpg");
+    run_tool(
+        "ffmpeg",
+        [
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:size=64x64",
+            "-frames:v",
+            "1",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .chain([cover.as_os_str().to_owned()])
+        .collect(),
+    )
+    .await;
+    let source = fixture.0.join("source.mp4");
+    let mut args: Vec<std::ffi::OsString> = vec!["-v".into(), "error".into(), "-i".into()];
+    args.extend([
+        base.as_os_str().to_owned(),
+        "-i".into(),
+        cover.as_os_str().to_owned(),
+    ]);
+    args.extend(
+        [
+            "-map",
+            "0:v",
+            "-map",
+            "0:a",
+            "-map",
+            "1",
+            "-c:v:0",
+            "mpeg4",
+            "-g",
+            "12",
+            "-bf",
+            "0",
+            "-fps_mode:v:0",
+            "cfr",
+            "-r:v:0",
+            "24",
+            "-c:a",
+            "alac",
+            "-c:v:1",
+            "copy",
+            "-disposition:v:1",
+            "attached_pic",
+        ]
+        .map(Into::into),
+    );
+    args.push(source.as_os_str().to_owned());
+    run_tool("ffmpeg", args).await;
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (name, kept) in [("out.mkv", true), ("out.mp4", true), ("out.mov", false)] {
+        let output = fixture.0.join(name);
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: source.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0, 1],
+                },
+                settings: EncodeSettings {
+                    encoder: VideoEncoder::X264,
+                    preset: 0,
+                    lossless: true,
+                    cover_stream_index: Some(2),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let job = finish(&manager, &job.id).await;
+        assert_eq!(job.state, JobState::Succeeded, "{name}: {job:#?}");
+        let probe: serde_json::Value = serde_json::from_slice(
+            &run_tool(
+                "ffprobe",
+                vec![
+                    "-v".into(),
+                    "error".into(),
+                    "-show_entries".into(),
+                    "stream=codec_type,codec_name:stream_disposition=attached_pic".into(),
+                    "-of".into(),
+                    "json".into(),
+                    output.as_os_str().to_owned(),
+                ],
+            )
+            .await,
+        )
+        .unwrap();
+        let streams = probe["streams"].as_array().unwrap();
+        let covers: Vec<_> = streams
+            .iter()
+            .filter(|stream| stream["disposition"]["attached_pic"] == 1)
+            .collect();
+        if kept {
+            assert_eq!(covers.len(), 1, "{name}: {probe:#}");
+            assert_eq!(covers[0]["codec_name"], "mjpeg", "{name}: {probe:#}");
+            assert_eq!(streams[0]["codec_name"], "h264", "{name}: {probe:#}");
+        } else {
+            assert!(covers.is_empty(), "{name}: {probe:#}");
+            assert!(
+                job.logs
+                    .iter()
+                    .any(|line| line.contains("Cover art was left out")),
+                "{name}: {job:#?}"
+            );
+        }
+    }
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "requires FFmpeg/FFprobe and standalone x264 on PATH"]
 async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_variable_timestamps()
@@ -839,8 +983,19 @@ async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_v
                         base.as_os_str().to_owned(),
                         "-map".into(),
                         "0".into(),
+                        // Re-encode at an exact 24 fps: copying the Matroska
+                        // fixture's millisecond clock declares 48000/1999 fps,
+                        // which is not constant-rate.
                         "-c:v".into(),
-                        "copy".into(),
+                        "mpeg4".into(),
+                        "-g".into(),
+                        "12".into(),
+                        "-bf".into(),
+                        "0".into(),
+                        "-fps_mode".into(),
+                        "cfr".into(),
+                        "-r".into(),
+                        "24".into(),
                         "-c:a".into(),
                         "alac".into(),
                         unrotated.as_os_str().to_owned(),
@@ -1005,11 +1160,14 @@ async fn canonical_sources_preserve_audio_while_normalizing_shift_rotation_and_v
             (media.duration_seconds.unwrap() - if name == "vfr" { 2.25 } else { 2.0 }).abs() < 0.05,
             "{name}: {media:#?}"
         );
-        assert!(
+        // Quick Convert rotates and rebases a constant-rate source while it
+        // encodes. Only the variable-rate source needs a canonical copy.
+        assert_eq!(
             job.logs
                 .iter()
                 .any(|line| line.contains("Verified lossless canonical source")),
-            "{job:#?}"
+            name == "vfr",
+            "{name}: {job:#?}"
         );
         assert_eq!(std::fs::read(&input).unwrap(), original);
         assert!(!std::fs::read_dir(&fixture.0).unwrap().any(|entry| {

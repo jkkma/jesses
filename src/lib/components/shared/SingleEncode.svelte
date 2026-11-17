@@ -30,7 +30,7 @@
     inspectUtilityCapabilities,
     chooseUtilityFile,
   } from '$lib/ipc/client';
-  import { batchRunId } from '$lib/source-workspace';
+  import { batchRunId, trackKind } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -1916,18 +1916,23 @@
     const selected = tracks.filter((row) => row.included);
     const videos = selected.filter(
       (row) =>
-        files
-          .find((f) => f.id === row.sourceId)
-          ?.streams.find((stream) => stream.index === row.streamIndex)?.kind === 'video',
+        trackKind(
+          files
+            .find((f) => f.id === row.sourceId)
+            ?.streams.find((stream) => stream.index === row.streamIndex),
+        ) === 'video',
     );
     if (videos.length > 1 && !sourceMultipleVideos && videoMode !== 'drop')
       return 'This encoder supports one selected video track per encode.';
     const unsupported = selected.find((row) => {
-      const kind = files
-        .find((f) => f.id === row.sourceId)
-        ?.streams.find((stream) => stream.index === row.streamIndex)?.kind;
+      const kind = trackKind(
+        files
+          .find((f) => f.id === row.sourceId)
+          ?.streams.find((stream) => stream.index === row.streamIndex),
+      );
       return (
         row.sourceId !== file.id &&
+        kind !== 'cover' &&
         !(kind === 'data' && outputContainer !== 'mov') &&
         !(kind === 'video' && !chunked && videoMode === 'drop') &&
         ![
@@ -1952,7 +1957,9 @@
           row.included &&
           files
             .find((source) => source.id === row.sourceId)
-            ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === 'video'),
+            ?.streams.some(
+              (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
+            ),
       ),
   );
   function sourceKnownStream(stream: import('$lib/ipc/generated').MediaStream) {
@@ -1966,10 +1973,22 @@
   function batchVideo(stream: import('$lib/ipc/generated').MediaStream) {
     return stream.kind === 'video' && !stream.attachedPic && sourceKnownStream(stream);
   }
+  /** Containers whose encodes keep embedded cover art. */
+  const coverContainers: ContainerFormat[] = ['matroska', 'mp4'];
   function logDroppedStreams(
     streams: import('$lib/ipc/generated').MediaStream[],
     container: ContainerFormat,
+    encoding: boolean,
   ) {
+    if (streams.some((stream) => trackKind(stream) === 'cover'))
+      if (!encoding)
+        onlog?.(
+          'Cover image left out: only video encodes keep cover art, not copy or audio-only jobs.',
+        );
+      else if (!coverContainers.includes(container))
+        onlog?.(
+          `Cover image left out: ${(container === 'matroska' ? 'mkv' : container).toUpperCase()} cannot store cover art. Choose MKV or MP4 to keep it.`,
+        );
     for (const kind of ['data', 'attachment'] as const) {
       const count = streams.filter(
         (stream) =>
@@ -2186,7 +2205,7 @@
           row.sourceId === source?.id &&
           row.included &&
           source?.streams.some(
-            (stream) => stream.index === row.streamIndex && stream.kind === 'video',
+            (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
           ),
       )?.streamIndex ??
       (
@@ -2503,13 +2522,26 @@
                   row.sourceId === file.id &&
                   row.included &&
                   file.streams.some(
-                    (stream) => stream.index === row.streamIndex && stream.kind === 'video',
+                    (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
                   ),
               )
               .map((row) => row.streamIndex)
           : [videoIndex]),
       ...copies.map((stream) => stream.index),
     ];
+    // A kept cover travels beside the selected streams. Encodes into MKV or MP4
+    // keep it; a cover unchecked in the Track List is left out.
+    const sourceCover = file.streams.find((stream) => trackKind(stream) === 'cover');
+    const coverRow =
+      sourceCover &&
+      tracks.find((row) => row.sourceId === file.id && row.streamIndex === sourceCover.index);
+    const coverStreamIndex =
+      sourceCover &&
+      pictureEnabled &&
+      (coverRow ? coverRow.included : true) &&
+      coverContainers.includes(outputContainer)
+        ? sourceCover.index
+        : undefined;
     const selectedPrimary = new Set(selectedIndices);
     const selectedOverrides = trackOverrides
       .filter((entry) => selectedPrimary.has(entry.streamIndex))
@@ -2525,10 +2557,13 @@
         (fileMode !== 'mux' && row.sourceId !== file.id)
       )
         return false;
-      const kind = files
-        .find((source) => source.id === row.sourceId)
-        ?.streams.find((stream) => stream.index === row.streamIndex)?.kind;
+      const kind = trackKind(
+        files
+          .find((source) => source.id === row.sourceId)
+          ?.streams.find((stream) => stream.index === row.streamIndex),
+      );
       return (
+        kind !== 'cover' &&
         !(kind === 'audio' && stripAudio) &&
         !(
           kind === 'subtitle' &&
@@ -2596,6 +2631,7 @@
           : {}),
         ...(pictureEnabled && requestTemporal ? { temporal: requestTemporal } : {}),
         videoStreamIndex: videoIndex ?? 0,
+        ...(coverStreamIndex !== undefined ? { coverStreamIndex } : {}),
         ...(!pictureEnabled ? { videoMode: effectiveVideoMode } : {}),
         ...(chunked
           ? {
@@ -2876,7 +2912,8 @@
         // The source reloads each file's tracks for batch, checking every known
         // stream independently of the selection made in the mux track list.
         const checked = entry.streams.filter(sourceKnownStream);
-        if (!chunked) logDroppedStreams(checked, batchState.outputContainer);
+        if (!chunked)
+          logDroppedStreams(checked, batchState.outputContainer, batchState.encodingVideo);
         if (!checked.length)
           inputErrors[entry.id] =
             'No tracks are selected. Please select at least one track to use.';
@@ -2969,10 +3006,14 @@
           if (controller.signal.aborted) throw cause;
           inputErrors[entry.id] = errorMessage(cause);
         }
+        const cover = entry.streams.find((stream) => trackKind(stream) === 'cover');
         return {
           inputPath: entry.path,
           ...(noPicture ? { videoMode: 'drop' as const } : {}),
           videoStreamIndex: vid?.index ?? 0,
+          ...(picture && cover && coverContainers.includes(batchState.outputContainer)
+            ? { coverStreamIndex: cover.index }
+            : {}),
           streamIndices: chosen,
           audio: selectedAudio(sourceAudio, chosen),
           ...(!chunked || batchState.encodingVideo
@@ -3024,6 +3065,7 @@
     });
     const {
       videoStreamIndex: _video,
+      coverStreamIndex: _cover,
       audio: _audio,
       framing: _framing,
       trim: _trim,
@@ -3759,6 +3801,7 @@
             return stream ? [stream] : [];
           }),
         outputContainer,
+        (built.settings.videoMode ?? 'encode') === 'encode',
       );
     let request = structuredClone($state.snapshot(built));
     const runSource = structuredClone($state.snapshot(file));

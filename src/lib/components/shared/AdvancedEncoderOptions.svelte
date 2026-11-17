@@ -1,12 +1,20 @@
 <script lang="ts">
-  import { getEncoderParameters } from '$lib/ipc/client';
+  import {
+    getEncoderParameters,
+    getParameterPresets,
+    isDesktop,
+    removeParameterPreset,
+    saveParameterPreset,
+  } from '$lib/ipc/client';
   import { contentPresets, applicableContentPreset } from './content-presets';
+  import { errorMessage } from './format';
   import sourceHelp from '$lib/encoder-source-help.json';
   import SourceDialog from './SourceDialog.svelte';
   import type {
     EncodeBackend,
     EncoderParameter,
     EncoderParameterCatalog,
+    EncoderParameterPreset,
     VideoEncoder,
   } from '$lib/ipc/generated';
   let {
@@ -34,11 +42,69 @@
     onraw?: (value: Record<string, string>) => void;
     onresource?: (name: string, path: string) => void;
   } = $props();
+  /** A preset waiting for confirmation; null parameters clear the grid. */
+  type PendingPreset = { name: string; parameters: EncoderParameter[] | null };
   let catalog = $state<EncoderParameterCatalog | null>(null),
     category = $state(''),
     error = $state(''),
     help = $state<string | null>(null),
-    pendingPreset = $state<string | null>(null);
+    pendingPreset = $state<PendingPreset | null>(null);
+  // Named presets the user saved, kept in preferences per encoder and route.
+  let saved = $state<EncoderParameterPreset[]>([]),
+    savedChoice = $state(''),
+    saveOpen = $state(false),
+    saveName = $state(''),
+    saveError = $state(''),
+    savingPreset = $state(false);
+  const savedHere = $derived(
+    saved.filter((preset) => preset.encoder === encoder && preset.backend === backend),
+  );
+  const chosenSaved = $derived(savedHere.find((preset) => preset.name === savedChoice));
+  $effect(() => {
+    if (!isDesktop()) return;
+    let alive = true;
+    void getParameterPresets()
+      .then((list) => {
+        if (alive) saved = list ?? [];
+      })
+      .catch((cause) => {
+        if (alive) error = `Saved presets are unavailable: ${errorMessage(cause)}`;
+      });
+    return () => {
+      alive = false;
+    };
+  });
+  async function savePreset() {
+    const name = saveName.trim();
+    if (!name || savingPreset) return;
+    savingPreset = true;
+    saveError = '';
+    try {
+      saved =
+        (await saveParameterPreset({
+          name,
+          encoder,
+          backend,
+          parameters: value.map((item) => ({ name: item.name, value: item.value })),
+        })) ?? [];
+      savedChoice = name;
+      saveOpen = false;
+    } catch (cause) {
+      saveError = errorMessage(cause);
+    } finally {
+      savingPreset = false;
+    }
+  }
+  async function deletePreset() {
+    const preset = chosenSaved;
+    if (!preset) return;
+    try {
+      saved = (await removeParameterPreset({ name: preset.name, encoder, backend })) ?? [];
+      savedChoice = '';
+    } catch (cause) {
+      error = errorMessage(cause);
+    }
+  }
   type HelpRow = { summary: string; details: string; examples: string };
   const sourceRows = $derived(
     (sourceHelp as Record<string, Record<string, HelpRow>>)[encoder] ?? {},
@@ -83,11 +149,11 @@
         .map(([name, value]) => ({ name, value })),
     ];
   }
-  function covers(preset: (typeof presets)[number], filled: EncoderParameter[]) {
+  function covers(parameters: EncoderParameter[], filled: EncoderParameter[]) {
     return (
       filled.length > 0 &&
       filled.every((item) =>
-        preset.parameters.some(
+        parameters.some(
           (p) =>
             p.name === item.name &&
             p.value.replaceAll(',', ':') === item.value.replaceAll(',', ':'),
@@ -95,25 +161,29 @@
       )
     );
   }
-  function applyPreset(name: string, confirmed = false) {
+  /** Applies a built-in or saved preset, or clears the grid when `parameters` is null. */
+  function applyParameters(name: string, parameters: EncoderParameter[] | null, confirmed = false) {
     if (!catalog) return;
-    const preset = presets.find((p) => p.name === name),
-      filled = currentFilled();
-    if (!preset && !filled.length) return;
-    if (preset && filled.length === preset.parameters.length && covers(preset, filled)) return;
-    if (!confirmed && filled.length && !presets.some((p) => covers(p, filled))) {
-      pendingPreset = name;
+    const filled = currentFilled();
+    if (!parameters && !filled.length) return;
+    if (parameters && filled.length === parameters.length && covers(parameters, filled)) return;
+    const known = [...presets, ...savedHere].map((preset) => preset.parameters);
+    if (!confirmed && filled.length && !known.some((list) => covers(list, filled))) {
+      pendingPreset = { name, parameters };
       return;
     }
     onraw?.({});
-    if (!preset) {
+    if (!parameters) {
       onchange([]);
       error = '';
       return;
     }
-    const result = applicableContentPreset(preset.parameters, catalog, encoder);
+    const result = applicableContentPreset(parameters, catalog, encoder);
     onchange(result.accepted);
     error = result.skipped.length ? `Unavailable arguments: ${result.skipped.join(', ')}.` : '';
+  }
+  function applyPreset(name: string) {
+    applyParameters(name, presets.find((p) => p.name === name)?.parameters ?? null);
   }
   $effect(() => {
     const currentEncoder = encoder,
@@ -153,6 +223,27 @@
         title={preset.description}
         onclick={() => applyPreset(preset.name)}>{preset.name}</button
       >{/each}<button {disabled} onclick={() => applyPreset('')}>Clear</button>
+  </div>{/if}
+{#if isDesktop()}<div class="preset-row" role="group" aria-label="Saved presets">
+    <span>My presets</span><select
+      aria-label="Saved preset"
+      bind:value={savedChoice}
+      disabled={disabled || !savedHere.length}
+      ><option value="">{savedHere.length ? 'Choose a saved preset' : 'None saved yet'}</option
+      >{#each savedHere as preset}<option value={preset.name}>{preset.name}</option>{/each}</select
+    ><button
+      disabled={!catalog || disabled || !chosenSaved}
+      onclick={() => chosenSaved && applyParameters(chosenSaved.name, chosenSaved.parameters)}
+      >Apply</button
+    ><button
+      disabled={disabled || !value.length}
+      title="Save the arguments set in this grid under a name"
+      onclick={() => {
+        saveName = chosenSaved?.name ?? '';
+        saveError = '';
+        saveOpen = true;
+      }}>Save as…</button
+    ><button disabled={disabled || !chosenSaved} onclick={() => void deletePreset()}>Delete</button>
   </div>{/if}
 <div role="tablist" aria-label="Encoder argument categories" class="categories">
   {#each groups as group}<button
@@ -235,17 +326,43 @@
       .join(', ')}
   </p>
   <p>
-    {pendingPreset
-      ? `Applying '${pendingPreset}' replaces them all. Continue?`
+    {pendingPreset?.parameters
+      ? `Applying '${pendingPreset.name}' replaces them all. Continue?`
       : 'Clearing empties them all. Continue?'}
   </p>
   <div class="help-actions">
     <button onclick={() => (pendingPreset = null)}>No</button><button
       onclick={() => {
-        const choice = pendingPreset ?? '';
+        const choice = pendingPreset;
         pendingPreset = null;
-        applyPreset(choice, true);
+        if (choice) applyParameters(choice.name, choice.parameters, true);
       }}>Yes</button
+    >
+  </div></SourceDialog
+>
+<SourceDialog title="Save preset" open={saveOpen} onclose={() => (saveOpen = false)} width={440}
+  ><label class="save-name"
+    >Preset name<input
+      data-dialog-initial-focus
+      maxlength="64"
+      bind:value={saveName}
+      onkeydown={(event) => {
+        if (event.key === 'Enter') void savePreset();
+      }}
+    /></label
+  >
+  <p>
+    Saves the {value.length} argument{value.length === 1 ? '' : 's'} set in this grid for this encoder
+    and route. HDR and grain file fields are not saved.
+  </p>
+  {#if savedHere.some((preset) => preset.name === saveName.trim())}<p>
+      This replaces the saved preset with the same name.
+    </p>{/if}
+  {#if saveError}<p role="alert">{saveError}</p>{/if}
+  <div class="help-actions">
+    <button onclick={() => (saveOpen = false)}>Cancel</button><button
+      disabled={!saveName.trim() || savingPreset}
+      onclick={() => void savePreset()}>Save</button
     >
   </div></SourceDialog
 >
@@ -258,6 +375,17 @@
     flex-wrap: wrap;
     margin: 6px 0;
     font-size: 12px;
+  }
+  .preset-row select {
+    color: inherit;
+    background: var(--background);
+    border: 1px solid var(--border);
+    padding: 4px;
+    min-width: 180px;
+  }
+  .save-name {
+    display: grid;
+    gap: 4px;
   }
   .categories {
     display: flex;

@@ -56,19 +56,19 @@ impl VideoCheck {
 }
 
 /// `kinds` lists the planned streams' codec types in output order.
-/// An MP4/MOV file's trailing chapter track is not a planned stream.
+/// An MP4/MOV file's chapter track is not a planned stream.
 pub(super) fn check_streams<'a>(
     document: &'a Document,
     kinds: &[&str],
-) -> Result<&'a [Stream], AppError> {
-    let streams = match document.streams.split_last() {
-        Some((last, planned))
-            if !document.chapters.is_empty() && super::container::is_chapter_track(last) =>
-        {
-            planned
-        }
-        _ => &document.streams[..],
-    };
+) -> Result<Vec<&'a Stream>, AppError> {
+    let chapter_track = super::container::chapter_track_position(document);
+    let streams: Vec<&Stream> = document
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| Some(*position) != chapter_track)
+        .map(|(_, stream)| stream)
+        .collect();
     let actual: Vec<&str> = streams
         .iter()
         .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
@@ -89,6 +89,7 @@ fn check<'a>(
     let streams = check_streams(document, kinds)?;
     streams
         .get(video_position)
+        .copied()
         .filter(|stream| {
             stream.codec_type.as_deref() == Some("video")
                 && stream
@@ -119,7 +120,7 @@ pub(super) async fn verify(
         "-protocol_whitelist",
         "file",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_frames:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_frames:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -329,6 +330,24 @@ mod tests {
         value["chapters"] = serde_json::json!([]);
         let without_chapters: Document = serde_json::from_value(value).unwrap();
         assert!(check(&without_chapters, &["video", "audio"], 0).is_err());
+    }
+
+    #[test]
+    fn an_mp4_cover_follows_the_chapter_track() {
+        let value = serde_json::json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 64, "height": 64},
+                {"index": 1, "codec_type": "audio"},
+                {"index": 2, "codec_type": "data", "codec_name": "bin_data",
+                 "codec_tag_string": "text", "tags": {"handler_name": "SubtitleHandler"}},
+                {"index": 3, "codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}}
+            ],
+            "chapters": [{"start_time": "0.000000", "end_time": "1.000000"}]
+        });
+        let document: Document = serde_json::from_value(value).unwrap();
+        assert!(check(&document, &["video", "audio", "video"], 0).is_ok());
+        assert!(check(&document, &["video", "audio"], 0).is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod codec_config;
 pub(crate) mod command_edit;
 mod container;
 mod conversion;
+mod cover_art;
 mod encode;
 mod source_copy;
 mod source_copy_packets;
@@ -90,6 +91,7 @@ mod history;
 pub(crate) mod images;
 pub use images::run_image_job;
 mod dynamic_hdr;
+mod log_retention;
 mod lossless;
 mod metadata;
 mod mux;
@@ -434,7 +436,18 @@ impl JobManager {
                     });
                 }
                 let _ = manager.persist(&mut state).await;
+                let known: HashSet<String> = state
+                    .entries
+                    .iter()
+                    .map(|entry| entry.snapshot.id.clone())
+                    .collect();
+                let log_dir = manager.log_dir.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    log_retention::remove_orphans(&log_dir, &known, SystemTime::now())
+                })
+                .await;
             }
+            // Without a readable history no log can be shown to be orphaned.
             Err(error) => manager.state.lock().await.storage_error = Some(error),
         }
         manager
@@ -524,6 +537,7 @@ impl JobManager {
                 .unwrap_or(request.video_mode)
         };
         let mut validation = EncodeSettings {
+            cover_stream_index: None,
             encoding_preferences: request.encoding_preferences,
             constant_quantizer: request.constant_quantizer,
             source_nvenc_quality: request.source_nvenc_quality,
@@ -688,6 +702,7 @@ impl JobManager {
                     input_path: request.source.input_path.clone(),
                     stream_indices: request.source.stream_indices.clone(),
                     video_stream_index: request.settings.video_stream_index,
+                    cover_stream_index: request.settings.cover_stream_index,
                 },
                 &request.settings,
                 epoch,
@@ -847,12 +862,17 @@ impl JobManager {
             self.queue_changed.notify_waiters();
             return Err(error);
         }
+        let pruned_ids: HashSet<String> = prune
+            .iter()
+            .map(|&index| state.entries[index].snapshot.id.clone())
+            .collect();
         let mut index = 0;
         state.entries.retain(|_| {
             let retain = !prune.contains(&index);
             index += 1;
             retain
         });
+        log_retention::remove(&self.log_dir, &pruned_ids);
         let snapshots = staged
             .iter()
             .map(|(entry, _, _)| entry.snapshot.clone())
@@ -942,6 +962,7 @@ impl JobManager {
                 Some(request.output_path),
             ));
         }
+        let mut pruned_ids = HashSet::new();
         while state.entries.len() >= MAX_HISTORY {
             let index = state
                 .entries
@@ -959,7 +980,7 @@ impl JobManager {
                         None,
                     )
                 })?;
-            state.entries.remove(index);
+            pruned_ids.insert(state.entries.remove(index).snapshot.id);
         }
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1007,6 +1028,8 @@ impl JobManager {
             state.entries.pop();
             return Err(error);
         }
+        // Only once the pruned entries have left the saved history.
+        log_retention::remove(&self.log_dir, &pruned_ids);
         let task = tokio::spawn(async move {
             worker.run_queued(task_id, receiver, log_path).await;
         });
@@ -1537,7 +1560,20 @@ impl JobManager {
                 .filter_map(|e| {
                     if !e.snapshot.state.is_terminal() {
                         e.cancel.send_replace(true);
-                        if e.snapshot.state != JobState::Stopping {
+                        // A started encode ends as Stopped, so its card says
+                        // whether verified progress was kept for Resume.
+                        // Queued work and copy jobs are canceled.
+                        let started_encode = e.snapshot.encode_settings.is_some()
+                            && !matches!(e.snapshot.state, JobState::Queued | JobState::Canceling);
+                        if started_encode {
+                            if e.snapshot.state != JobState::Stopping {
+                                append_log(
+                                    &mut e.snapshot,
+                                    "The application is closing; stopping this encode.".into(),
+                                );
+                            }
+                            e.snapshot.state = JobState::Stopping;
+                        } else if e.snapshot.state != JobState::Stopping {
                             e.snapshot.state = JobState::Canceling;
                         }
                     }

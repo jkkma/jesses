@@ -71,10 +71,22 @@ export async function installSourceEncodeFixture(page: Page) {
     state.isTauri = true;
     const emitJobs = () => state.__jobChannel?.onmessage(structuredClone(state.__testJobs));
     state.__emitJobs = emitJobs;
+    // Native events: listeners registered through plugin:event|listen.
+    const callbacks = new Map<number, (event: unknown) => unknown>();
+    const listeners: { event: string; handler: number }[] = [];
+    state.__emitEvent = async (event: string, payload: unknown = {}) => {
+      for (const listener of listeners.filter((entry) => entry.event === event))
+        await callbacks.get(listener.handler)?.({ event, id: 0, payload });
+    };
+    state.__launchPaths = [];
     state.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-      transformCallback: () => ++callback,
-      unregisterCallback: () => {},
+      transformCallback: (fn?: (event: unknown) => unknown) => {
+        const id = ++callback;
+        if (fn) callbacks.set(id, fn);
+        return id;
+      },
+      unregisterCallback: (id: number) => callbacks.delete(id),
       invoke: async (command: string, payload: any = {}) => {
         calls.push({ command, payload });
         if (command === 'open_encode_window') {
@@ -123,6 +135,23 @@ export async function installSourceEncodeFixture(page: Page) {
           };
           return structuredClone(state.__preferences);
         }
+        if (command === 'get_parameter_presets')
+          return structuredClone(state.__parameterPresets ?? []);
+        if (command === 'save_parameter_preset' || command === 'remove_parameter_preset') {
+          const key = payload.request;
+          state.__parameterPresets = [
+            ...(state.__parameterPresets ?? []).filter(
+              (preset: any) =>
+                !(
+                  preset.name === key.name &&
+                  preset.encoder === key.encoder &&
+                  preset.backend === key.backend
+                ),
+            ),
+            ...(command === 'save_parameter_preset' ? [key] : []),
+          ];
+          return structuredClone(state.__parameterPresets);
+        }
         if (command === 'list_av1an_recoveries') return structuredClone(state.__recoveries);
         if (command === 'av1an_recovery_action') {
           const req = payload.request;
@@ -163,7 +192,19 @@ export async function installSourceEncodeFixture(page: Page) {
             secondsRemaining: null,
             error: null,
           };
+        if (command === 'plugin:event|listen')
+          listeners.push({ event: payload.event, handler: payload.handler });
         if (command.startsWith('plugin:event|')) return ++callback;
+        if (command === 'take_launch_paths') {
+          // Init scripts run in no defined order; read the seeded paths late.
+          const paths = [
+            ...JSON.parse(sessionStorage.getItem('test-launch-paths') ?? '[]'),
+            ...state.__launchPaths,
+          ];
+          sessionStorage.removeItem('test-launch-paths');
+          state.__launchPaths = [];
+          return paths;
+        }
         if (command === 'start_encode')
           return {
             id: 'job',
@@ -607,6 +648,8 @@ export async function installSourceEncodeFixture(page: Page) {
             stem = `${original.replace(/\s*\(\d+\)$/, '')} (${++n})`;
           return { outputStem: stem, outputPath: output(stem), isDirectory: !ext, numbered: n > 0 };
         }
+        if (command === 'recent_path_is_folder') return false;
+        if (command === 'prepare_close') return;
         throw new Error(`Unexpected command ${command}`);
       },
     };

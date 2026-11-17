@@ -27,7 +27,201 @@ struct Record {
 }
 pub struct PreferencesStore {
     path: PathBuf,
-    current: Mutex<Result<UserPreferences, AppError>>,
+    current: Mutex<UserPreferences>,
+    /// Set when the file on disk must not be replaced this session.
+    read_only: Option<AppError>,
+    /// Reported with every read so the app can explain a recovery.
+    notice: Option<String>,
+}
+
+/// What opening found. A damaged file never leaves the app without usable
+/// preferences: it is set aside or salvaged, and a file this version cannot
+/// safely replace is left untouched while the session uses defaults.
+struct Opened {
+    preferences: UserPreferences,
+    read_only: Option<AppError>,
+    notice: Option<String>,
+}
+
+impl Opened {
+    fn clean(preferences: UserPreferences) -> Self {
+        Self {
+            preferences,
+            read_only: None,
+            notice: None,
+        }
+    }
+    fn read_only(preferences: UserPreferences, message: String) -> Self {
+        Self {
+            preferences,
+            read_only: Some(AppError::new(
+                "PREFERENCES_READ_ONLY",
+                message.clone(),
+                None,
+            )),
+            notice: Some(message),
+        }
+    }
+}
+
+/// A free `preferences.json.bad-<seconds>[-n]` name next to the file.
+fn aside_path(path: &Path) -> PathBuf {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let base = format!("preferences.json.bad-{seconds}");
+    let directory = path.parent().unwrap_or(Path::new("."));
+    (0..)
+        .map(|n| {
+            directory.join(if n == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            })
+        })
+        .find(|candidate| fs::symlink_metadata(candidate).is_err())
+        .expect("an unused name")
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Renames an unreadable file out of the way and starts from defaults.
+fn set_aside(path: &Path, reason: &str) -> Opened {
+    let target = aside_path(path);
+    match fs::rename(path, &target) {
+        Ok(()) => Opened {
+            preferences: UserPreferences::default(),
+            read_only: None,
+            notice: Some(format!(
+                "Saved preferences could not be read ({reason}). The file was renamed to {} and default preferences are in use.",
+                file_name(&target)
+            )),
+        },
+        Err(cause) => Opened::read_only(
+            UserPreferences::default(),
+            format!(
+                "Saved preferences could not be read ({reason}) and could not be set aside ({cause}). Default preferences are in use and changes will not be saved this session."
+            ),
+        ),
+    }
+}
+
+fn open_file(path: &Path) -> Opened {
+    match fs::metadata(path) {
+        Ok(_) => {}
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            return Opened::clean(UserPreferences::default());
+        }
+        Err(cause) => {
+            return Opened::read_only(
+                UserPreferences::default(),
+                format!(
+                    "Saved preferences could not be checked ({cause}). Default preferences are in use and the file is left unchanged this session."
+                ),
+            );
+        }
+    }
+    let bytes = match read_limited(path) {
+        Ok(bytes) => bytes,
+        Err(Limited::TooLarge) => return set_aside(path, "the file exceeds 256 KiB"),
+        Err(Limited::Io(cause)) => {
+            return Opened::read_only(
+                UserPreferences::default(),
+                format!(
+                    "Saved preferences could not be read ({cause}). Default preferences are in use and the file is left unchanged this session."
+                ),
+            );
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(cause) => return set_aside(path, &format!("it is not valid JSON: {cause}")),
+    };
+    match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1) => {}
+        Some(version) if version > 1 => {
+            return Opened::read_only(
+                UserPreferences::default(),
+                format!(
+                    "Saved preferences were written by a newer version of Jesses (format {version}). The file was left unchanged; default preferences are in use and changes will not be saved until Jesses is updated."
+                ),
+            );
+        }
+        _ => return set_aside(path, "it has no supported format version"),
+    }
+    let record: Record = match serde_json::from_value(value) {
+        Ok(record) => record,
+        Err(cause) => return set_aside(path, &cause.to_string()),
+    };
+    let mut preferences = record.preferences;
+    preferences.notice = None;
+    let mut dropped = Vec::new();
+    if validate_general(&preferences.general).is_err() {
+        preferences.general = GeneralPreferences::default();
+        dropped.push("the general preferences were reset to their defaults".to_owned());
+    }
+    let presets = std::mem::take(&mut preferences.parameter_presets);
+    let saved = presets.len();
+    for preset in presets {
+        let duplicate = preferences
+            .parameter_presets
+            .iter()
+            .any(|other| same_preset(other, &preset.name, preset.encoder, preset.backend));
+        if !duplicate
+            && preferences.parameter_presets.len() < 30
+            && validate_presets(std::slice::from_ref(&preset)).is_ok()
+        {
+            preferences.parameter_presets.push(preset);
+        }
+    }
+    if preferences.parameter_presets.len() != saved {
+        dropped.push(format!(
+            "{} saved parameter preset(s) that this version cannot use were removed",
+            saved - preferences.parameter_presets.len()
+        ));
+    }
+    let recents = std::mem::take(&mut preferences.recent_paths);
+    let usable: Vec<String> = recents
+        .iter()
+        .filter(|path| valid_path(path))
+        .take(500)
+        .cloned()
+        .collect();
+    if usable.len() != recents.len() {
+        dropped.push(format!(
+            "{} invalid recent path(s) were removed",
+            recents.len() - usable.len()
+        ));
+    }
+    preferences.recent_paths = normalize(usable).unwrap_or_default();
+    if dropped.is_empty() {
+        return Opened::clean(preferences);
+    }
+    // Keep the original bytes before the next save replaces them.
+    let backup = aside_path(path);
+    match fs::write(&backup, &bytes) {
+        Ok(()) => Opened {
+            preferences,
+            read_only: None,
+            notice: Some(format!(
+                "Some saved preferences could not be used: {}. A copy of the original file was saved as {}.",
+                dropped.join("; "),
+                file_name(&backup)
+            )),
+        },
+        Err(cause) => Opened::read_only(
+            preferences,
+            format!(
+                "Some saved preferences could not be used: {}. A copy could not be saved ({cause}), so the file is left unchanged and changes will not be saved this session.",
+                dropped.join("; ")
+            ),
+        ),
+    }
 }
 fn error(detail: impl std::fmt::Display) -> AppError {
     AppError::new(
@@ -95,17 +289,27 @@ fn normalize(paths: Vec<String>) -> Result<Vec<String>, AppError> {
     }
     Ok(out)
 }
-fn read_bounded(path: &Path) -> Result<Vec<u8>, AppError> {
+enum Limited {
+    TooLarge,
+    Io(std::io::Error),
+}
+fn read_limited(path: &Path) -> Result<Vec<u8>, Limited> {
     let mut bytes = Vec::new();
     File::open(path)
-        .map_err(error)?
+        .map_err(Limited::Io)?
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(error)?;
+        .map_err(Limited::Io)?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(error("the file exceeds 256 KiB"));
+        return Err(Limited::TooLarge);
     }
     Ok(bytes)
+}
+fn read_bounded(path: &Path) -> Result<Vec<u8>, AppError> {
+    read_limited(path).map_err(|cause| match cause {
+        Limited::TooLarge => error("the file exceeds 256 KiB"),
+        Limited::Io(cause) => error(cause),
+    })
 }
 fn same_preset(
     value: &EncoderParameterPreset,
@@ -142,34 +346,19 @@ fn validate_presets(values: &[EncoderParameterPreset]) -> Result<(), AppError> {
 impl PreferencesStore {
     pub fn open(directory: PathBuf) -> Self {
         let path = directory.join("preferences.json");
-        let current = (|| {
-            if let Err(e) = fs::metadata(&path) {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return Ok(UserPreferences::default());
-                }
-                return Err(error(e));
-            }
-            let mut record: Record =
-                serde_json::from_slice(&read_bounded(&path)?).map_err(error)?;
-            if record.version != 1 {
-                return Err(error("unsupported preference version"));
-            }
-            validate_general(&record.preferences.general)?;
-            validate_presets(&record.preferences.parameter_presets)?;
-            record.preferences.recent_paths = normalize(record.preferences.recent_paths)?;
-            Ok(record.preferences)
-        })();
-        if let Ok(preferences) = &current {
-            crate::supervisor::configure_console_preferences(&preferences.general);
-        }
+        let opened = open_file(&path);
+        crate::supervisor::configure_console_preferences(&opened.preferences.general);
         Self {
             path,
-            current: Mutex::new(current),
+            current: Mutex::new(opened.preferences),
+            read_only: opened.read_only,
+            notice: opened.notice,
         }
     }
     pub fn get(&self) -> Result<UserPreferences, AppError> {
-        let preferences = self.current.lock().map_err(error)?.clone()?;
+        let mut preferences = self.current.lock().map_err(error)?.clone();
         crate::supervisor::configure_console_preferences(&preferences.general);
+        preferences.notice = self.notice.clone();
         Ok(preferences)
     }
     fn change(
@@ -177,9 +366,12 @@ impl PreferencesStore {
         edit: impl FnOnce(&mut UserPreferences) -> Result<(), AppError>,
     ) -> Result<UserPreferences, AppError> {
         let mut current = self.current.lock().map_err(error)?;
-        let mut next = current.clone()?;
+        if let Some(read_only) = &self.read_only {
+            return Err(read_only.clone());
+        }
+        let mut next = current.clone();
         edit(&mut next)?;
-        if current.as_ref().is_ok_and(|value| value == &next) {
+        if *current == next {
             return Ok(next);
         }
         next.revision = next
@@ -220,7 +412,7 @@ impl PreferencesStore {
             return Err(error(e));
         }
         crate::supervisor::configure_console_preferences(&next.general);
-        *current = Ok(next.clone());
+        *current = next.clone();
         Ok(next)
     }
     pub fn save(&self, request: SavePreferencesRequest) -> Result<UserPreferences, AppError> {
@@ -444,15 +636,39 @@ mod tests {
         fs::remove_file(dir.join("preferences.json")).unwrap();
         fs::remove_dir(dir).unwrap();
     }
+    fn aside_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| file_name(path).starts_with("preferences.json.bad-"))
+            .collect()
+    }
     #[test]
-    fn corrupt_unknown_and_failed_writes_preserve_previous_bytes() {
+    fn corrupt_files_are_set_aside_and_failed_writes_preserve_previous_bytes() {
         let dir = fixture();
         let path = dir.join("preferences.json");
         fs::write(&path, b"{broken").unwrap();
         let store = PreferencesStore::open(dir.clone());
-        assert!(store.get().is_err());
-        assert!(store.remember(vec![dir.display().to_string()]).is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        let opened = store.get().unwrap();
+        assert!(
+            opened
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("renamed to preferences.json.bad-")
+        );
+        assert_eq!(opened.general, GeneralPreferences::default());
+        let aside = aside_files(&dir);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read(&aside[0]).unwrap(), b"{broken");
+        assert!(!path.exists());
+        let saved = store.remember(vec![dir.display().to_string()]).unwrap();
+        assert!(saved.notice.is_none());
+        let reopened = PreferencesStore::open(dir.clone()).get().unwrap();
+        assert_eq!(reopened.recent_paths, vec![dir.display().to_string()]);
+        assert!(reopened.notice.is_none());
+        assert!(!fs::read_to_string(&path).unwrap().contains("notice"));
+        fs::remove_file(&aside[0]).unwrap();
         fs::remove_file(&path).unwrap();
         let store = PreferencesStore::open(dir.clone());
         fs::create_dir(&path).unwrap();
@@ -624,26 +840,54 @@ mod tests {
         assert!(store.save_parameter_preset(invalid.clone()).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         let mut bad: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        bad["preferences"]["parameterPresets"] = serde_json::json!([invalid]);
+        bad["preferences"]["parameterPresets"] = serde_json::json!([invalid, preset("Valid")]);
+        bad["preferences"]["recentPaths"] = serde_json::json!(["relative.mkv"]);
         let corrupt = serde_json::to_vec(&bad).unwrap();
         fs::write(&path, &corrupt).unwrap();
+        // The usable parts survive; the original bytes are kept beside it.
         let reopened = PreferencesStore::open(dir.clone());
-        assert!(reopened.parameter_presets().is_err());
-        assert!(
-            reopened
-                .save_parameter_preset(preset("Replacement"))
-                .is_err()
-        );
-        assert!(
-            reopened
-                .remove_parameter_preset(EncoderParameterPresetKey {
-                    name: "Invalid".into(),
-                    encoder: media_core::VideoEncoder::X264,
-                    backend: media_core::EncodeBackend::Standalone
-                })
-                .is_err()
-        );
+        let value = reopened.get().unwrap();
+        assert_eq!(value.parameter_presets, vec![preset("Valid")]);
+        assert!(value.recent_paths.is_empty());
+        let notice = value.notice.unwrap();
+        assert!(notice.contains("1 saved parameter preset(s)"), "{notice}");
+        assert!(notice.contains("1 invalid recent path(s)"), "{notice}");
+        let aside = aside_files(&dir);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read(&aside[0]).unwrap(), corrupt);
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+        reopened
+            .save_parameter_preset(preset("Replacement"))
+            .unwrap();
+        let saved = PreferencesStore::open(dir.clone()).get().unwrap();
+        assert_eq!(
+            saved.parameter_presets,
+            vec![preset("Valid"), preset("Replacement")]
+        );
+        assert!(saved.notice.is_none());
+        fs::remove_file(&aside[0]).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn newer_files_are_left_untouched_and_saving_is_refused() {
+        let dir = fixture();
+        let path = dir.join("preferences.json");
+        let newer = br#"{"version":2,"preferences":{"future":true}}"#;
+        fs::write(&path, newer).unwrap();
+        let store = PreferencesStore::open(dir.clone());
+        let opened = store.get().unwrap();
+        assert!(opened.notice.as_deref().unwrap().contains("format 2"));
+        assert_eq!(opened.general, GeneralPreferences::default());
+        assert_eq!(
+            store
+                .remember(vec![dir.display().to_string()])
+                .unwrap_err()
+                .code,
+            "PREFERENCES_READ_ONLY"
+        );
+        assert!(store.save_parameter_preset(preset("Any")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), newer);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_file(path).unwrap();
         fs::remove_dir(dir).unwrap();

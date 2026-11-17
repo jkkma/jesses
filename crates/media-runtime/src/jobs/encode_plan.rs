@@ -63,6 +63,50 @@ pub(super) fn source_av1an_base_clock(video: &Stream, settings: &EncodeSettings)
         && tone_map::compatible_dolby_base(video)
 }
 
+/// Quick Convert encodes a source with a right-angle display rotation or a
+/// later start directly: the decoder applies the rotation, the encoded video
+/// starts at zero, and the mux moves the source's copied tracks back by the
+/// same origin, as a canonical copy would. A variable-rate source still fails
+/// the constant-rate checks and is retried through a canonical copy. Jobs that
+/// reshape or re-time the picture, or verify every frame, keep using that copy.
+pub(super) fn direct_source_clock(video: &Stream, settings: &EncodeSettings) -> bool {
+    let burns_subtitles = settings
+        .subtitles
+        .iter()
+        .any(|track| track.mode == media_core::SubtitleMode::BurnIn || track.burn_in)
+        || settings.external_tracks.iter().any(|track| {
+            track.subtitle_burn_in || track.subtitle_mode == Some(media_core::SubtitleMode::BurnIn)
+        });
+    settings.backend == EncodeBackend::Standalone
+        && settings.video_mode == media_core::VideoMode::Encode
+        && !settings
+            .encoding_preferences
+            .is_some_and(|preferences| preferences.full_output_verification)
+        && settings.trim.is_none()
+        && !settings.source_trim
+        && !settings.source_filters
+        && settings.tone_map.is_none()
+        && settings.external_tracks.is_empty()
+        && !burns_subtitles
+        && settings.temporal.is_none_or(|value| {
+            value.deinterlace.is_none() && value.qtgmc.is_none() && value.cadence_repair.is_none()
+        })
+        && !settings.hdr_metadata.as_ref().is_some_and(|metadata| {
+            metadata.dolby_vision_rpu_path.is_some() || metadata.hdr10_plus_json_path.is_some()
+        })
+        && !video.side_data_list.iter().any(|value| {
+            value
+                .get("side_data_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    kind.contains("DOVI")
+                        || kind.contains("Dolby")
+                        || kind.contains("Dynamic")
+                        || kind.contains("HDR10+")
+                })
+        })
+}
+
 pub(super) struct ImageFilterPlan {
     pub filter: Option<String>,
     pub prefix: String,
@@ -384,6 +428,9 @@ pub(super) struct Plan {
     /// presented ordinals at the validated source rate before chunk reading.
     pub(super) av1an_presented_rate: Option<(u32, u32)>,
     source_dolby_clock: bool,
+    /// A directly encoded Quick Convert source starts after zero. Its video
+    /// is encoded from zero and the mux moves the copied tracks back to match.
+    rebases_source_origin: bool,
     pub(super) source_dolby_render: bool,
     source_av1an_base_clock: bool,
     source_rotation: i32,
@@ -1213,9 +1260,11 @@ impl Plan {
         let declared_origin = seconds(video.start_time.as_deref())
             .filter(|value| value.is_finite())
             .unwrap_or(0.0);
+        let direct_clock = direct_source_clock(video, settings);
         if !seconds(video.start_time.as_deref()).is_some_and(|value| value.abs() <= tolerance)
             && !preserves_dolby_source_clock(video, settings)
             && !source_av1an_base_clock(video, settings)
+            && !direct_clock
         {
             return Err(unsupported(NOT_ZERO_BASED_TIMELINE));
         }
@@ -1248,6 +1297,7 @@ impl Plan {
             av1an_presented_rate: None,
             source_dolby_clock: declared_origin.abs() > tolerance
                 && preserves_dolby_source_clock(video, settings),
+            rebases_source_origin: declared_origin.abs() > tolerance && direct_clock,
             source_dolby_render,
             source_rotation,
             source_coded_size,
@@ -1402,6 +1452,11 @@ impl Plan {
     }
     pub fn restores_source_dolby_clock(&self) -> bool {
         self.source_dolby_clock && !self.source_dolby_render && self.trim.is_none()
+    }
+    /// The origin the mux removes from the source's copied tracks, when the
+    /// source was encoded directly instead of through a canonical copy.
+    pub fn rebased_source_origin(&self) -> Option<f64> {
+        self.rebases_source_origin.then_some(self.source_origin)
     }
     pub fn has_source_filters(&self) -> bool {
         self.source_filters
@@ -4753,16 +4808,40 @@ mod tests {
             let mut source = serde_json::to_value(serde_json::from_str::<serde_json::Value>(r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}],"format":{"start_time":"0"}}"#).unwrap()).unwrap();
             source["streams"][0][field] = value.into();
             let source: Document = serde_json::from_value(source).unwrap();
+            // A later start is encoded directly only by Quick Convert.
+            let settings = if field == "start_time" {
+                EncodeSettings {
+                    backend: EncodeBackend::Av1an,
+                    ..EncodeSettings::default()
+                }
+            } else {
+                EncodeSettings::default()
+            };
             assert!(
-                Plan::build(
-                    &source,
-                    &source.selected(&[0]).unwrap(),
-                    &EncodeSettings::default()
-                )
-                .is_err(),
+                Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err(),
                 "{field}"
             );
         }
+        // Quick Convert keeps the origin and the mux rebases the copied tracks.
+        let mut later: serde_json::Value = serde_json::from_str(r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"24/1","time_base":"1/1000","start_time":"1.4","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}],"format":{"start_time":"1.4"}}"#).unwrap();
+        let source: Document = serde_json::from_value(later.clone()).unwrap();
+        let plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.rebased_source_origin(), Some(1.4));
+        assert!(!plan.restores_source_dolby_clock());
+        later["streams"][0]["start_time"] = "0".into();
+        let source: Document = serde_json::from_value(later).unwrap();
+        let plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.rebased_source_origin(), None);
         assert!(
             validate_settings(&EncodeSettings {
                 crf: 64,

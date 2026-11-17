@@ -1,5 +1,6 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { open, save, type OpenDialogOptions } from '@tauri-apps/plugin-dialog';
 import type {
@@ -8,8 +9,6 @@ import type {
   Av1anRecoveryAction,
   Av1anRecoveryActionResult,
   Av1anResourceEstimate,
-  ImageRequest,
-  ImageResult,
   OutputPathRequest,
   OutputPathResolution,
   UtilityRequest,
@@ -21,8 +20,6 @@ import type {
   CompletionOptions,
   CompletionStatus,
   SavedJobInspection,
-  AnalysisReport,
-  AnalysisExportFormat,
   AutoCropRequest,
   AutoCropResult,
   BitrateRequest,
@@ -52,8 +49,6 @@ import type {
   FramePreviewResult,
   JobSnapshot,
   MediaFile,
-  MuxRequest,
-  RemuxRequest,
   ToolInfo,
   UserPreferences,
   SavePreferencesRequest,
@@ -75,9 +70,6 @@ export function makeAv1anGrainPreset(preset: string, signal?: AbortSignal): Prom
   return analyzeSource('make_av1an_grain_preset', preset, signal);
 }
 
-export function runImageJob(request: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
-  return analyzeSource('run_image_job', request, signal);
-}
 export function resolveOutputPath(request: OutputPathRequest): Promise<OutputPathResolution> {
   requireDesktop();
   return invoke<OutputPathResolution>('resolve_output_path', { request });
@@ -149,18 +141,6 @@ export async function setMediaAnalysisPaused(id: string, paused: boolean): Promi
 }
 export function inspectUtilityCapabilities(signal?: AbortSignal): Promise<UtilityCapabilities> {
   return analyzeSource('inspect_utility_capabilities', {}, signal);
-}
-export async function chooseImages(): Promise<string[]> {
-  requireDesktop();
-  const result = await openRemembered({
-    multiple: true,
-    directory: false,
-    title: 'Choose images in sequence',
-    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp'] }],
-  });
-  const paths = result === null ? [] : Array.isArray(result) ? result : [result];
-  rememberDirectory(paths[0], false);
-  return paths;
 }
 export async function chooseUtilityDestination(
   defaultPath: string,
@@ -268,20 +248,6 @@ export async function inspectSavedJob(
 export async function exportSavedJob(path: string, request: EncodeRequest): Promise<string> {
   requireDesktop();
   return invoke('export_saved_job', { path, request });
-}
-
-export async function exportAnalysis(
-  report: AnalysisReport,
-  format: AnalysisExportFormat,
-): Promise<string | null> {
-  requireDesktop();
-  const outputPath = await save({
-    title: 'Export analysis',
-    defaultPath: `${report.kind}-analysis.${format}`,
-    filters: [{ name: format === 'csv' ? 'CSV data' : 'SVG chart', extensions: [format] }],
-  });
-  if (outputPath === null) return null;
-  return invoke<string>('export_analysis', { request: { outputPath, format, report } });
 }
 
 export async function getParameterPresets(): Promise<EncoderParameterPreset[]> {
@@ -637,27 +603,6 @@ export async function getCapabilities(): Promise<ToolInfo[]> {
   return invoke<ToolInfo[]>('get_capabilities');
 }
 
-export async function chooseRemuxDestination(defaultPath: string): Promise<string | null> {
-  requireDesktop();
-  return save({
-    title: 'Save remuxed media',
-    defaultPath,
-    filters: [
-      { name: 'Media containers', extensions: ['mkv', 'mp4', 'mov', 'webm', 'm4a', 'ogg'] },
-    ],
-  });
-}
-
-export async function startRemux(request: RemuxRequest): Promise<JobSnapshot> {
-  requireDesktop();
-  return invoke<JobSnapshot>('start_remux', { request });
-}
-
-export async function startMux(request: MuxRequest): Promise<JobSnapshot> {
-  requireDesktop();
-  return invoke<JobSnapshot>('start_mux', { request });
-}
-
 export async function chooseEncodeDestination(defaultPath: string): Promise<string | null> {
   requireDesktop();
   return save({
@@ -712,11 +657,6 @@ export async function av1anRecoveryAction(
 ): Promise<Av1anRecoveryActionResult> {
   requireDesktop();
   return invoke<Av1anRecoveryActionResult>('av1an_recovery_action', { request });
-}
-
-export async function discardAv1anRecovery(id: string): Promise<JobSnapshot> {
-  requireDesktop();
-  return invoke<JobSnapshot>('discard_av1an_recovery', { id });
 }
 
 const jobListeners = new Set<(jobs: JobSnapshot[]) => void>();
@@ -801,5 +741,61 @@ export async function subscribeDrop(handler: (paths: string[]) => void): Promise
   if (!isDesktop()) return () => {};
   return getCurrentWebview().onDragDropEvent((event) => {
     if (event.payload.type === 'drop') handler(event.payload.paths);
+  });
+}
+
+/** Media paths passed at launch or by a later launch; each is returned once. */
+export async function takeLaunchPaths(): Promise<string[]> {
+  if (!isDesktop()) return [];
+  return invoke<string[]>('take_launch_paths');
+}
+
+/** Called when a later launch hands over paths to take. */
+export async function subscribeLaunchPaths(handler: () => void): Promise<() => void> {
+  if (!isDesktop()) return () => {};
+  return listen('launch-paths', handler);
+}
+
+/**
+ * Intercepts every close of the main window: the title-bar button, Alt+F4 and
+ * the taskbar. The handler must call `preventDefault` and close the window
+ * itself with `prepareClose` and `destroyMainWindow`.
+ */
+export async function subscribeCloseRequested(
+  handler: (event: { preventDefault(): void }) => void,
+): Promise<() => void> {
+  if (!isDesktop()) return () => {};
+  return getCurrentWindow().onCloseRequested(handler);
+}
+
+/** Stops every job and analysis; resolves once they have ended. */
+export async function prepareClose(): Promise<void> {
+  requireDesktop();
+  await invoke('prepare_close');
+}
+
+export async function destroyMainWindow(): Promise<void> {
+  requireDesktop();
+  await getCurrentWindow().destroy();
+}
+
+export type TaskbarProgress =
+  { state: 'none' | 'indeterminate' } | { state: 'normal' | 'paused' | 'error'; percent: number };
+
+const taskbarStatus = {
+  none: ProgressBarStatus.None,
+  indeterminate: ProgressBarStatus.Indeterminate,
+  normal: ProgressBarStatus.Normal,
+  paused: ProgressBarStatus.Paused,
+  error: ProgressBarStatus.Error,
+} as const;
+
+/** Mirrors job progress on the Windows taskbar button. */
+export async function setTaskbarProgress(progress: TaskbarProgress): Promise<void> {
+  if (!isDesktop()) return;
+  await getCurrentWindow().setProgressBar({
+    status: taskbarStatus[progress.state],
+    progress:
+      'percent' in progress ? Math.max(0, Math.min(100, Math.round(progress.percent))) : undefined,
   });
 }

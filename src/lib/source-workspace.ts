@@ -12,7 +12,17 @@ export type TrackSelection = {
   forcedFlag: boolean | null;
 };
 
-/** Apply the Track List's first video, audio and subtitle selection rule. */
+/**
+ * The Track List's selection kind. Cover art is its own kind, so a cover listed
+ * before the movie is never picked as the video. Encodes keep a checked cover.
+ */
+export function trackKind(
+  stream: { kind: string; attachedPic?: boolean } | undefined,
+): string | undefined {
+  return stream?.kind === 'video' && stream.attachedPic ? 'cover' : stream?.kind;
+}
+
+/** Apply the Track List's first video, audio, subtitle and cover selection rule. */
 export function firstTrackSelection(
   rows: TrackSelection[],
   kindOf: (row: TrackSelection) => string | undefined,
@@ -20,7 +30,7 @@ export function firstTrackSelection(
 ): TrackSelection[] {
   return rows.map((row) => {
     const kind = kindOf(row) ?? '';
-    const included = ['video', 'audio', 'subtitle'].includes(kind) && !seen.has(kind);
+    const included = ['video', 'audio', 'subtitle', 'cover'].includes(kind) && !seen.has(kind);
     seen.add(kind);
     return { ...row, included };
   });

@@ -171,6 +171,21 @@ pub(super) fn is_chapter_track(stream: &Stream) -> bool {
         && tag(stream, "handler_name") == Some("SubtitleHandler")
 }
 
+/// An MP4/MOV chapter track follows the planned tracks. Readers list an MP4
+/// cover after it, so it can also be second to last.
+pub(super) fn chapter_track_position(document: &Document) -> Option<usize> {
+    if document.chapters.is_empty() {
+        return None;
+    }
+    match document.streams.as_slice() {
+        [.., chapter, cover] if is_chapter_track(chapter) && super::cover_art::is_cover(cover) => {
+            Some(document.streams.len() - 2)
+        }
+        [.., chapter] if is_chapter_track(chapter) => Some(document.streams.len() - 1),
+        _ => None,
+    }
+}
+
 fn tag<'a>(stream: &'a Stream, key: &str) -> Option<&'a str> {
     stream
         .tags
@@ -281,6 +296,13 @@ fn preflight_with_staging(
         if subtitle.is_some_and(|track| track.mode == SubtitleMode::BurnIn) {
             continue;
         }
+        // A JPEG or PNG cover becomes the MP4 cover or a Matroska attachment.
+        if super::cover_art::is_cover(stream)
+            && super::cover_art::supported(container)
+            && matches!(stream.codec_name.as_deref(), Some("mjpeg" | "png"))
+        {
+            continue;
+        }
         if container == ContainerFormat::Ogg
             && stream
                 .disposition
@@ -376,7 +398,12 @@ fn preflight_with_staging(
                     stream.index
                 )));
             }
-            for key in stream.tags.keys() {
+            for (key, value) in &stream.tags {
+                // A canonical source marks its upright picture with rotate=0;
+                // there is nothing to preserve.
+                if key.eq_ignore_ascii_case("rotate") && value.trim() == "0" {
+                    continue;
+                }
                 if !metadata::is_derived_stream_tag(key)
                     && !(container == ContainerFormat::Mov && key.eq_ignore_ascii_case("timecode"))
                     && !matches!(
@@ -585,11 +612,22 @@ fn arguments(
         container,
         ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
     ) {
-        let mut flags = iso_flags(&document.streams.iter().collect::<Vec<_>>());
-        if faststart && container == ContainerFormat::Mp4 {
-            flags.push_str("+faststart");
+        let mut flags: Vec<String> = iso_flags(&document.streams.iter().collect::<Vec<_>>())
+            .split('+')
+            .map(str::to_owned)
+            .collect();
+        if container == ContainerFormat::Mp4
+            && document.streams.iter().any(super::cover_art::is_cover)
+        {
+            // FFmpeg writes an MP4 cover only with iTunes-style metadata.
+            flags.retain(|flag| flag != "use_metadata_tags");
         }
-        args.extend(["-movflags".into(), flags.into()]);
+        if faststart && container == ContainerFormat::Mp4 {
+            flags.push("faststart".into());
+        }
+        if !flags.is_empty() {
+            args.extend(["-movflags".into(), flags.join("+").into()]);
+        }
     }
     append_dolby_vision_mux_options(&mut args, Some(container), document);
     args.extend([
@@ -682,16 +720,31 @@ pub(super) fn normalize(
         }
     }
     if iso && !expected.chapters.is_empty() {
-        let auxiliary = actual
-            .streams
-            .last()
-            .filter(|stream| is_chapter_track(stream));
+        let auxiliary = chapter_track_position(actual);
         if actual.streams.len() != expected.streams.len() + 1 || auxiliary.is_none() {
             return Err(invalid(
                 "MP4/MOV chapter track structure could not be verified.",
             ));
         }
-        actual.streams.pop();
+        actual
+            .streams
+            .remove(auxiliary.expect("checked chapter track"));
+    }
+    if iso {
+        // MP4 keeps a cover's picture, not its Matroska file name, type or
+        // start time.
+        for stream in expected
+            .streams
+            .iter_mut()
+            .chain(actual.streams.iter_mut())
+            .filter(|stream| super::cover_art::is_cover(stream))
+        {
+            stream.tags.retain(|key, _| {
+                !matches!(key.to_ascii_lowercase().as_str(), "filename" | "mimetype")
+            });
+            stream.start_time = None;
+            stream.packet_start_time = None;
+        }
     }
     let mut first = HashSet::new();
     let kinds_with_default: HashSet<_> = expected
@@ -982,8 +1035,8 @@ pub(super) async fn prepare<'a>(
     } else {
         super::probe(&ffprobe, &input.path, cancel, None).await?
     };
-    if !document.chapters.is_empty() && document.streams.last().is_some_and(is_chapter_track) {
-        document.streams.pop();
+    if let Some(position) = chapter_track_position(&document) {
+        document.streams.remove(position);
     }
     for stream in document
         .streams

@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         framing: Default::default(),
         audio: Vec::new(),
         video_stream_index: video.index,
+        cover_stream_index: None,
         encoder,
         crf: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(
             if encoder == VideoEncoder::X264 {

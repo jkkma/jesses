@@ -217,7 +217,12 @@ export type ConsoleWindowMode = "hidden" | "visible" | "visibleStayOpen";
 
 export type ResetOnNewFilePreferences = { trim: boolean, frameRate: boolean, resize: boolean, crop: boolean, borders: boolean, deinterlace: boolean, toneMap: boolean, customFilters: boolean, };
 
-export type UserPreferences = { general: GeneralPreferences, recentPaths: Array<string>, revision: number, parameterPresets?: Array<EncoderParameterPreset>, };
+export type UserPreferences = { general: GeneralPreferences, recentPaths: Array<string>, revision: number, parameterPresets?: Array<EncoderParameterPreset>,
+/**
+ * How this session's preferences were recovered from a damaged or newer
+ * file. Reported by reads only and never written to disk.
+ */
+notice?: string, };
 
 export type EncoderParameterPreset = { name: string, encoder: VideoEncoder, backend: EncodeBackend, parameters: Array<EncoderParameter>, };
 
@@ -701,6 +706,12 @@ framing: VideoFraming,
  */
 audio: Array<AudioTrackSettings>, backend: EncodeBackend, encoder: VideoEncoder, workers: number, videoStreamIndex: number,
 /**
+ * An embedded cover picture (`attached_pic`) to keep. It is not one of the
+ * selected streams: Matroska stores it as an attachment and MP4 as its
+ * cover. Other containers leave it out with a log line.
+ */
+coverStreamIndex?: number,
+/**
  * NVENC constant-QP mode. Omission preserves the historical CRF/CQ mode.
  */
 constantQuantizer?: number,
@@ -783,7 +794,11 @@ export type BatchEncodeInput = {
 /**
  * Quick's per-file mapped video presence; omitted keeps the batch mode.
  */
-videoMode?: VideoMode, temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number, };
+videoMode?: VideoMode, temporal?: TemporalSettings, toneMap?: ToneMapSettings, trim?: VideoTrim, subtitles?: Array<SubtitleTrackSettings>, framing: VideoFraming, audio: Array<AudioTrackSettings>, inputPath: string, streamIndices: Array<number>, videoStreamIndex: number,
+/**
+ * This file's embedded cover picture to keep (see `EncodeSettings`).
+ */
+coverStreamIndex?: number, };
 
 export type BatchNamingValues = { codec: string, quality: string, preset: string, };
 

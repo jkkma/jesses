@@ -2,7 +2,7 @@ use media_core::{
     AppError, AutoCropRequest, AutoCropResult, BatchEncodePreview, BatchEncodeRequest,
     BitrateRequest, BitrateResult, EncodeRequest, FolderScanRequest, FolderScanResult,
     FramePreviewRequest, FramePreviewResult, JobSnapshot, LoudnessRequest, LoudnessResult,
-    MediaFile, RemuxRequest, ToolInfo,
+    MediaFile, ToolInfo,
 };
 use media_runtime::jobs::JobManager;
 use std::sync::{
@@ -158,16 +158,6 @@ async fn export_saved_job(
         .await
         .map_err(|e| AppError::new("SAVED_JOB_WRITE_FAILED", e.to_string(), None))?
 }
-
-#[tauri::command]
-async fn run_image_job(
-    id: String,
-    request: media_core::ImageRequest,
-    tasks: State<'_, analysis::AnalysisTasks>,
-) -> Result<media_core::ImageResult, AppError> {
-    let running = tasks.run(&id)?;
-    media_runtime::jobs::run_image_job(request, running.cancel.clone()).await
-}
 #[tauri::command]
 async fn resolve_output_path(
     request: media_core::OutputPathRequest,
@@ -265,17 +255,6 @@ fn cancel_finish_action(
 ) -> media_core::CompletionStatus {
     monitor.cancel();
     monitor.status()
-}
-
-#[tauri::command]
-async fn export_analysis(
-    request: media_core::AnalysisExportRequest,
-    monitor: State<'_, completion::CompletionMonitor>,
-) -> Result<String, AppError> {
-    let _admission = monitor.admit_work().await?;
-    tauri::async_runtime::spawn_blocking(move || media_runtime::jobs::export_analysis(request))
-        .await
-        .map_err(|e| AppError::new("ANALYSIS_EXPORT_FAILED", e.to_string(), None))?
 }
 
 type Preferences = Arc<media_runtime::preferences::PreferencesStore>;
@@ -523,16 +502,6 @@ async fn analyze_bitrate(
 }
 
 #[tauri::command]
-async fn start_remux(
-    request: RemuxRequest,
-    jobs: State<'_, Jobs>,
-    monitor: State<'_, completion::CompletionMonitor>,
-) -> Result<JobSnapshot, AppError> {
-    let _admission = monitor.admit_work().await?;
-    jobs.manager.start_remux(request).await
-}
-
-#[tauri::command]
 async fn set_job_paused(
     id: String,
     paused: bool,
@@ -549,16 +518,6 @@ async fn measure_loudness(
 ) -> Result<LoudnessResult, AppError> {
     let running = tasks.run(&id)?;
     media_runtime::measure_loudness(request, running.cancel.clone()).await
-}
-
-#[tauri::command]
-async fn start_mux(
-    request: media_core::MuxRequest,
-    jobs: State<'_, Jobs>,
-    monitor: State<'_, completion::CompletionMonitor>,
-) -> Result<JobSnapshot, AppError> {
-    let _admission = monitor.admit_work().await?;
-    jobs.manager.start_mux(request).await
 }
 
 #[tauri::command]
@@ -675,12 +634,57 @@ async fn av1an_recovery_action(
     jobs.manager.av1an_recovery_action(request).await
 }
 
+/// Ends every job and analysis while the main window is still visible, so a
+/// slow cleanup shows as "Closing…" instead of a process without a window.
+/// The window is destroyed afterwards; the exit handler's own shutdown then
+/// has nothing left to wait for.
 #[tauri::command]
-async fn discard_av1an_recovery(
-    id: String,
+async fn prepare_close(
     jobs: State<'_, Jobs>,
-) -> Result<JobSnapshot, AppError> {
-    jobs.manager.discard_av1an_recovery(id).await
+    analyses: State<'_, analysis::AnalysisTasks>,
+) -> Result<(), AppError> {
+    tokio::join!(jobs.manager.shutdown(), analyses.shutdown());
+    Ok(())
+}
+
+/// Media paths the operating system handed to the app: Open with, Send To, a
+/// file dropped on the shortcut, or a later launch. The frontend takes them
+/// once it is ready; a later launch also emits `launch-paths`.
+#[derive(Default)]
+struct LaunchPaths(std::sync::Mutex<Vec<String>>);
+
+impl LaunchPaths {
+    fn push(&self, paths: Vec<String>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(paths);
+    }
+}
+
+/// Existing file or folder arguments after the executable, made absolute
+/// against the launch directory. Switches are ignored.
+fn launch_paths(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    cwd: Option<&std::path::Path>,
+) -> Vec<String> {
+    args.into_iter()
+        .skip(1)
+        .filter(|arg| !arg.to_string_lossy().starts_with('-'))
+        .map(std::path::PathBuf::from)
+        .filter_map(|path| match (path.is_absolute(), cwd) {
+            (true, _) => Some(path),
+            (false, Some(cwd)) => Some(cwd.join(path)),
+            (false, None) => None,
+        })
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[tauri::command]
+fn take_launch_paths(paths: State<'_, LaunchPaths>) -> Vec<String> {
+    std::mem::take(&mut *paths.0.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 #[tauri::command]
@@ -780,7 +784,6 @@ fn invoke_utilities(invoke: tauri::ipc::Invoke) -> bool {
         inspect_utility_capabilities,
         inspect_saved_job,
         export_saved_job,
-        run_image_job,
         extract_attachment,
         resolve_deinterlace
     ];
@@ -793,7 +796,7 @@ fn invoke_settings(invoke: tauri::ipc::Invoke) -> bool {
         set_completion_options,
         get_completion_status,
         cancel_finish_action,
-        export_analysis,
+        take_launch_paths,
         get_preferences,
         get_parameter_presets,
         save_parameter_preset,
@@ -843,8 +846,6 @@ fn invoke_analysis(invoke: tauri::ipc::Invoke) -> bool {
 #[inline(never)]
 fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
     let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
-        start_remux,
-        start_mux,
         start_encode,
         enqueue_encode,
         scan_media_folder,
@@ -854,12 +855,12 @@ fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
         cancel_job,
         stop_job,
         resume_job,
-        discard_av1an_recovery,
         list_av1an_recoveries,
         av1an_recovery_action,
         list_jobs,
         open_encode_window,
-        subscribe_jobs
+        subscribe_jobs,
+        prepare_close
     ];
     handler(invoke)
 }
@@ -875,13 +876,12 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "inspect_utility_capabilities"
         | "inspect_saved_job"
         | "export_saved_job"
-        | "run_image_job"
         | "extract_attachment" => invoke_utilities(invoke),
         "resolve_deinterlace" => invoke_utilities(invoke),
         "set_completion_options"
         | "get_completion_status"
         | "cancel_finish_action"
-        | "export_analysis"
+        | "take_launch_paths"
         | "get_preferences"
         | "get_parameter_presets"
         | "save_parameter_preset"
@@ -917,9 +917,7 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "import_image_sequence"
         | "release_image_sequence"
         | "get_capabilities" => invoke_analysis(invoke),
-        "start_remux"
-        | "start_mux"
-        | "start_encode"
+        "start_encode"
         | "enqueue_encode"
         | "scan_media_folder"
         | "preview_encode_batch"
@@ -928,12 +926,12 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "cancel_job"
         | "stop_job"
         | "resume_job"
-        | "discard_av1an_recovery"
         | "list_av1an_recoveries"
         | "av1an_recovery_action"
         | "list_jobs"
         | "open_encode_window"
-        | "subscribe_jobs" => invoke_jobs(invoke),
+        | "subscribe_jobs"
+        | "prepare_close" => invoke_jobs(invoke),
         _ => false,
     }
 }
@@ -941,9 +939,18 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
 pub fn run() {
     let exiting = Arc::new(AtomicU8::new(0));
     tauri::Builder::default()
+        .manage(LaunchPaths::default())
         // This must run before setup opens the persisted history and WebView.
         // Scoop launches and version directories all share the same app ID.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let paths = launch_paths(
+                args.into_iter().map(std::ffi::OsString::from),
+                Some(std::path::Path::new(&cwd)),
+            );
+            if !paths.is_empty() {
+                app.state::<LaunchPaths>().push(paths);
+                let _ = app.emit("launch-paths", ());
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
@@ -984,6 +991,10 @@ pub fn run() {
                 },
             )?;
             paths.prepare()?;
+            app.state::<LaunchPaths>().push(launch_paths(
+                std::env::args_os(),
+                std::env::current_dir().ok().as_deref(),
+            ));
             media_runtime::configure_bundled_tools(paths.resource_dir.clone())
                 .map_err(std::io::Error::other)?;
             let log_dir = paths.job_log_dir();
@@ -1059,4 +1070,38 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod launch_path_tests {
+    use super::launch_paths;
+    use std::ffi::OsString;
+
+    #[test]
+    fn launch_arguments_keep_existing_paths_and_skip_the_executable_and_switches() {
+        let dir = std::env::temp_dir().join(format!("jesses-launch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::write(dir.join("clip.mkv"), b"").unwrap();
+        let absolute = dir.join("clip.mkv");
+        let args = [
+            OsString::from(dir.join("clip.mkv")),
+            OsString::from("--flag"),
+            OsString::from(&absolute),
+            OsString::from("folder"),
+            OsString::from("missing.mkv"),
+        ];
+        assert_eq!(
+            launch_paths(args.clone(), Some(&dir)),
+            [
+                absolute.to_string_lossy().into_owned(),
+                dir.join("folder").to_string_lossy().into_owned()
+            ]
+        );
+        // Without a launch directory relative arguments cannot be placed.
+        assert_eq!(
+            launch_paths(args, None),
+            [absolute.to_string_lossy().into_owned()]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

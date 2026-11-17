@@ -2,6 +2,7 @@
   import type { MediaFile, MediaStream } from '$lib/ipc/generated';
   import {
     firstTrackSelection,
+    trackKind,
     type FileListMode,
     type TrackSelection,
   } from '$lib/source-workspace';
@@ -171,9 +172,11 @@
     const kind =
       item?.kind === 'subtitle'
         ? 'Subtitles'
-        : item?.kind
-          ? item.kind[0].toUpperCase() + item.kind.slice(1)
-          : 'Track';
+        : trackKind(item) === 'cover'
+          ? 'Cover'
+          : item?.kind
+            ? item.kind[0].toUpperCase() + item.kind.slice(1)
+            : 'Track';
     const parts = [`(${codecName(item?.codec)})`];
     if (item?.kind === 'video') {
       if (row.language && row.language.toLowerCase() !== 'und')
@@ -217,7 +220,7 @@
   }
   function selectAll(option: string) {
     if (option === 'first') {
-      updateChecked(firstTrackSelection(tracks, (row) => stream(row)?.kind));
+      updateChecked(firstTrackSelection(tracks, (row) => trackKind(stream(row))));
       return;
     }
     const seen = new Set<string>();

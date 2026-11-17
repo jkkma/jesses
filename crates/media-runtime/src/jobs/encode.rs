@@ -229,11 +229,30 @@ impl JobManager {
             .await?;
         }
         if !existing && !required {
+            // A rotated or later-starting source that Quick Convert encodes
+            // directly: crop values are given in coded orientation, so they turn
+            // with the picture, as they do for a canonical copy.
+            let direct = document
+                .streams
+                .iter()
+                .find(|stream| stream.index == settings.video_stream_index)
+                .and_then(|video| {
+                    let rotation = super::source_normalization::direct_rotation(video, settings)?;
+                    let origin = video
+                        .start_time
+                        .as_deref()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    (rotation != 0 || origin.abs() > 0.001).then_some(rotation)
+                });
+            let oriented = direct
+                .filter(|rotation| *rotation != 0)
+                .map(|rotation| super::source_normalization::oriented_settings(settings, rotation));
             let result = boxed(|| {
                 self.encode_video_mode(
                     id,
                     request,
-                    settings,
+                    oriented.as_ref().unwrap_or(settings),
                     cancel,
                     log_path,
                     temporary,
@@ -241,14 +260,25 @@ impl JobManager {
                     preview.as_deref_mut(),
                     None,
                     None,
-                    None,
+                    oriented.is_some().then_some(settings),
                     None,
                     None,
                 )
             })
             .await;
             match &result {
-                Err(error) if super::encode_plan::repairable_source_clock(error) => {
+                Err(error)
+                    if super::encode_plan::repairable_source_clock(error)
+                        || (direct.is_some() && error.code == "ENCODE_INPUT_UNSUPPORTED") =>
+                {
+                    if direct.is_some() {
+                        let message = format!(
+                            "Encoding the rotated or later-starting source directly was refused ({}). Preparing a lossless canonical source instead.",
+                            error.message
+                        );
+                        self.change(id, |snapshot| append_log(snapshot, message))
+                            .await;
+                    }
                     required = true;
                     self.phase(
                         id,
@@ -622,6 +652,29 @@ impl JobManager {
             &preflight_selected,
             Some(&mux_settings),
         )?;
+        // The cover's one packet is copied out before any encoding, so a cover
+        // that cannot be kept is reported now instead of failing a finished job.
+        let cover_art = match super::cover_art::CoverArt::prepare(
+            &ffmpeg,
+            original_guard.map_or(source.path.as_path(), |original| original.path.as_path()),
+            &output,
+            container::source_iso_format(&output, &preflight_selected, &mux_settings).is_none()
+                && container::staging_format(&preflight_selected, Some(&mux_settings))
+                    == media_core::ContainerFormat::Matroska,
+            &attempt_id,
+            settings,
+            cancel,
+        )
+        .await
+        {
+            Ok(cover) => cover,
+            Err(error) if error.code == "COVER_ART_LEFT_OUT" => {
+                self.change(id, |snapshot| append_log(snapshot, error.message.clone()))
+                    .await;
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let mut planning_document = document.clone();
         if source_origin.is_some()
             && let Some(video) = planning_document
@@ -632,7 +685,16 @@ impl JobManager {
             video.start_time = Some("0".into());
             video.packet_start_time = Some(0.0);
         }
-        let mut plan = if source_origin.is_some() {
+        // A rotated source Quick Convert encodes directly is planned in display
+        // orientation; the decoder applies its transform to the coded frames.
+        let direct_rotation = normalized_source.is_none()
+            && planning_document
+                .streams
+                .iter()
+                .find(|stream| stream.index == settings.video_stream_index)
+                .and_then(|video| super::source_normalization::direct_rotation(video, settings))
+                .is_some_and(|rotation| rotation != 0);
+        let mut plan = if source_origin.is_some() || direct_rotation {
             Plan::build_source_cut(
                 &planning_document,
                 &planning_document.selected(&request.stream_indices)?,
@@ -1168,6 +1230,7 @@ impl JobManager {
             normalization.apply_mux(&mut args, &budget_selected)?;
             subtitle_assets.apply_mux(&mut args, &budget_selected);
             keep_last_codec_options(&mut args);
+            append_attachments(&mut args, &budget_selected, cover_art.as_ref(), None);
             tokio::fs::create_dir_all(self.log_dir.as_ref())
                 .await
                 .map_err(|e| {
@@ -1809,7 +1872,7 @@ impl JobManager {
             let mut mux = mux_args(&source.path, &encoded_path, &temp.path, &output_selected, &plan, settings, &external);
             if let Some(trim) = &prepared_trim { trim.apply_mux(&mut mux, &output_selected, &audio_filters)?; }
             normalization.apply_mux(&mut mux, &output_selected)?; subtitle_assets.apply_mux(&mut mux, &output_selected); keep_last_codec_options(&mut mux);
-            if let Some(attachment) = &attachment { attachment.apply(&mut mux, output_selected.iter().filter(|stream| stream.codec_type.as_deref() == Some("attachment")).count()); }
+            append_attachments(&mut mux, &output_selected, cover_art.as_ref(), attachment.as_ref());
             commands.push(super::command_edit::format_command(&CommandSpec { executable: ffmpeg.clone(), args: mux, cwd: None }));
             let program = commands.join(" &&\n");
             if let Some(review) = self.review_command(id, "ffmpeg", &program, &output, cancel).await?
@@ -1957,17 +2020,12 @@ impl JobManager {
                         normalization.apply_mux(&mut args, &output_selected)?;
                         subtitle_assets.apply_mux(&mut args, &output_selected);
                         keep_last_codec_options(&mut args);
-                        if let Some(attachment) = &review_attachment {
-                            attachment.apply(
-                                &mut args,
-                                output_selected
-                                    .iter()
-                                    .filter(|stream| {
-                                        stream.codec_type.as_deref() == Some("attachment")
-                                    })
-                                    .count(),
-                            );
-                        }
+                        append_attachments(
+                            &mut args,
+                            &output_selected,
+                            cover_art.as_ref(),
+                            review_attachment.as_ref(),
+                        );
                         Some(CommandSpec {
                             executable: ffmpeg.clone(),
                             args,
@@ -2624,15 +2682,12 @@ impl JobManager {
             normalization.apply_mux(&mut mux_arguments, &output_selected)?;
             subtitle_assets.apply_mux(&mut mux_arguments, &output_selected);
             keep_last_codec_options(&mut mux_arguments);
-            if let Some(attachment) = &settings_attachment {
-                attachment.apply(
-                    &mut mux_arguments,
-                    output_selected
-                        .iter()
-                        .filter(|stream| stream.codec_type.as_deref() == Some("attachment"))
-                        .count(),
-                );
-            }
+            append_attachments(
+                &mut mux_arguments,
+                &output_selected,
+                cover_art.as_ref(),
+                settings_attachment.as_ref(),
+            );
             let (sender, events) = mpsc::channel(256);
             let observer = self.observe_encode(id, events, None);
             let result = supervisor::run(
@@ -2683,6 +2738,9 @@ impl JobManager {
                 let mut artifact = probe(&ffprobe, &temp.path, cancel, None).await?;
                 if let Some(attachment) = &settings_attachment {
                     attachment.verify_and_remove(&mut artifact)?;
+                }
+                if let Some(cover) = &cover_art {
+                    cover.verify_and_remove(&mut artifact)?;
                 }
                 let verified_trim = if let Some(prepared) = &prepared_trim {
                     let (expected, origin) = prepared
@@ -3121,6 +3179,8 @@ impl JobManager {
             output_selected
                 .iter()
                 .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
+                // Readers list a cover attachment as an attached picture.
+                .chain(cover_art.as_ref().map(|_| "video"))
                 .chain(
                     settings
                         .av1an_options
@@ -5006,6 +5066,27 @@ async fn check_encoder_capabilities(
     Ok(())
 }
 
+/// Appends the kept cover and the settings attachment after the selected
+/// attachments of a mux command, in that order.
+fn append_attachments(
+    args: &mut Vec<OsString>,
+    selected: &[&metadata::Stream],
+    cover: Option<&super::cover_art::CoverArt>,
+    settings: Option<&super::encode_settings::SettingsAttachment>,
+) {
+    let mut count = selected
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("attachment"))
+        .count();
+    if let Some(cover) = cover {
+        cover.apply(args, count);
+        count += 1;
+    }
+    if let Some(settings) = settings {
+        settings.apply(args, count);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mux_args(
     input: &Path,
@@ -5031,6 +5112,15 @@ fn mux_args(
     .into_iter()
     .map(OsString::from)
     .collect();
+    if let Some(origin) = plan.rebased_source_origin() {
+        // The encoded video starts at zero; move the source's tracks back by
+        // its origin, as a canonical copy would have.
+        let position = args.len() - 1;
+        args.splice(
+            position..position,
+            ["-itsoffset".into(), format!("{:.9}", -origin).into()],
+        );
+    }
     args.push(input.as_os_str().to_owned());
     // A copied track can precede the selected video too (for example MP2
     // encoder delay in MPEG-TS). Preserve its negative canonical origin just

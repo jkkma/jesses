@@ -33,12 +33,11 @@
   } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import WindowControls from '$lib/components/WindowControls.svelte';
-  import FileInspector from '$lib/features/files/FileInspector.svelte';
   import SourceFileList from '$lib/features/source/FileList.svelte';
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
   import SourceSettings from '$lib/features/source/SourceSettings.svelte';
   import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
-  import { batchRunId, firstTrackSelection } from '$lib/source-workspace';
+  import { batchRunId, firstTrackSelection, trackKind } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -47,8 +46,6 @@
   } from '$lib/source-workspace';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
   import Av1an from '$lib/features/av1an/Av1an.svelte';
-  import BatchEncode from '$lib/features/batch/BatchEncode.svelte';
-  import Remux from '$lib/features/remux/Remux.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
   import { isEncoderProgressLine, liveJobProgress } from '$lib/components/shared/job-progress';
@@ -73,17 +70,18 @@
     probeMedia,
     subscribeDrop,
     subscribeJobs,
-    startRemux,
-    startMux,
+    subscribeLaunchPaths,
+    takeLaunchPaths,
+    subscribeCloseRequested,
+    prepareClose,
+    destroyMainWindow,
+    setTaskbarProgress,
+    type TaskbarProgress,
     startEncode,
     openEncodeWindow,
     enqueueEncode,
     enqueueEncodeBatch,
     cancelAllJobs,
-    cancelJob,
-    stopJob as stopAndKeepProgress,
-    resumeJob,
-    discardAv1anRecovery,
     setJobPaused,
     recentPathIsFolder,
     getStorageLocations,
@@ -99,8 +97,6 @@
     CompletionStatus,
     EncodeRequest,
     JobSnapshot,
-    RemuxRequest,
-    MuxRequest,
     MediaFile,
     ToolInfo,
   } from '$lib/ipc/generated';
@@ -112,7 +108,7 @@
     formatDuration,
   } from '$lib/components/shared/format';
 
-  type View = 'files' | 'tracks' | 'convert' | 'av1an' | 'batch' | 'remux' | 'tools' | 'utilities';
+  type View = 'files' | 'tracks' | 'convert' | 'av1an' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
   type ImportEntry = { path: string; detectFolder: boolean };
   type ImportSession = {
@@ -310,9 +306,11 @@
       trackSelection.map((row) => JSON.stringify([row.sourceId, row.streamIndex])),
     );
     const kindOf = (row: TrackSelection) =>
-      files
-        .find((file) => file.id === row.sourceId)
-        ?.streams.find((stream) => stream.index === row.streamIndex)?.kind;
+      trackKind(
+        files
+          .find((file) => file.id === row.sourceId)
+          ?.streams.find((stream) => stream.index === row.streamIndex),
+      );
     const seen = new Set(
       trackSelection.map(kindOf).filter((kind): kind is NonNullable<typeof kind> => !!kind),
     );
@@ -630,6 +628,52 @@
     batchFileText && liveProgress ? `${batchFileText} · ${currentActionText}` : currentActionText,
   );
 
+  // The taskbar button mirrors the in-app progress bar while work is live,
+  // and turns red after a failure until the next job starts.
+  const taskbarProgress = $derived.by((): TaskbarProgress => {
+    if (liveJob || runningAction) {
+      const { max, value } = statusProgress;
+      const percent = value === null || !(max > 0) ? null : (100 * value) / max;
+      if (liveJob?.state === 'paused') return { state: 'paused', percent: percent ?? 0 };
+      return percent === null ? { state: 'indeterminate' } : { state: 'normal', percent };
+    }
+    if (currentJob?.state === 'failed' || currentJob?.state === 'interrupted')
+      return { state: 'error', percent: 100 };
+    return { state: 'none' };
+  });
+  let shownTaskbarProgress = '';
+  $effect(() => {
+    if (!desktop) return;
+    const next = taskbarProgress;
+    const key = 'percent' in next ? `${next.state}:${Math.round(next.percent)}` : next.state;
+    if (key === shownTaskbarProgress) return;
+    shownTaskbarProgress = key;
+    void setTaskbarProgress(next).catch(() => {
+      /* Taskbar progress is optional. */
+    });
+  });
+
+  // Closing the window (title bar, Alt+F4 or the taskbar) asks first when jobs
+  // would be stopped, then keeps the window up until they have ended.
+  const activeJobCount = $derived(jobs.filter((job) => !terminalJob(job.state)).length);
+  let closePrompt = $state(false);
+  let closing = $state(false);
+  async function finishClose() {
+    closePrompt = false;
+    closing = true;
+    try {
+      await prepareClose();
+    } catch (error) {
+      addLog(`Jobs did not stop cleanly before closing: ${errorMessage(error)}`, 'error');
+    }
+    try {
+      await destroyMainWindow();
+    } catch (error) {
+      closing = false;
+      addLog(`Could not close the window: ${errorMessage(error)}`, 'error');
+    }
+  }
+
   // Mirror each job's own log into the Log pane: phase, tool and warning lines
   // as they arrive, then the final error. Encoder progress lines are left to
   // the progress bar, and jobs already present when the pane connects are not
@@ -690,47 +734,6 @@
     }
   }
 
-  async function submitRemux(request: RemuxRequest) {
-    const job = await startRemux(request);
-    // A channel snapshot may arrive before the command reply. Never regress it.
-    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog('Remux job submitted.');
-  }
-
-  async function submitMux(request: MuxRequest) {
-    const job = await startMux(request);
-    // A channel snapshot may arrive before the command reply. Never regress it.
-    if (!jobs.some((entry) => entry.id === job.id)) jobs = [job, ...jobs];
-    addLog('Multi-source remux job submitted.');
-  }
-
-  async function stopJob(id: string) {
-    const job = await cancelJob(id);
-    jobs = jobs.map((entry) => (entry.id === id && !terminalJob(entry.state) ? job : entry));
-  }
-  async function keepJobProgress(id: string) {
-    const before = jobs.find((entry) => entry.id === id);
-    const snapshot = await stopAndKeepProgress(id);
-    // The command can reply after its channel has already advanced the job.
-    jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
-    addLog('Requested a stop with progress kept.');
-  }
-  async function resumeSavedJob(id: string) {
-    const before = jobs.find((entry) => entry.id === id);
-    const snapshot = await resumeJob(id);
-    if (jobs.find((entry) => entry.id === id) === before) {
-      // New queued work is stored first and displayed in reverse queue order.
-      // A resumed job joins the tail behind jobs that were already waiting.
-      jobs = [snapshot, ...jobs.filter((entry) => entry.id !== id)];
-    }
-    addLog('Saved job submitted for resume.');
-  }
-  async function discardSavedAv1anProgress(id: string) {
-    const before = jobs.find((entry) => entry.id === id);
-    const snapshot = await discardAv1anRecovery(id);
-    jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
-    addLog('Saved AV1AN progress discarded.');
-  }
   async function pauseLiveJob(id: string, paused: boolean) {
     const before = jobs.find((entry) => entry.id === id);
     const snapshot = await setJobPaused(id, paused);
@@ -839,8 +842,8 @@
   const hasSample = $derived(files.some((file) => file.id === sampleId));
   const availableTools = $derived(tools.filter((tool) => tool.available).length);
   const sourceRequired = $derived(
-    ((view === 'convert' || view === 'av1an' || view === 'remux') && !selectedFile) ||
-      ((view === 'batch' || view === 'utilities') && files.length === 0),
+    ((view === 'convert' || view === 'av1an') && !selectedFile) ||
+      (view === 'utilities' && files.length === 0),
   );
 
   function addLog(message: string, level: LogEntry['level'] = 'info') {
@@ -1339,6 +1342,8 @@
     uiStateReady = true;
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    let stopLaunchPaths: (() => void) | undefined;
+    let stopCloseRequests: (() => void) | undefined;
     let stopWindowTracking: (() => void) | undefined;
     let completionTimer: ReturnType<typeof setInterval> | undefined;
     if (desktop) {
@@ -1366,7 +1371,9 @@
         .catch(() => {
           /* Window state is optional. */
         });
-      void loadPreferences();
+      void loadPreferences().then(() => {
+        if (!disposed && preferences.notice) addLog(preferences.notice, 'error');
+      });
       void refreshTools();
       void connectJobs();
       void subscribeDrop((paths) => {
@@ -1379,6 +1386,37 @@
         .catch((error) => {
           addLog(`File drop listener unavailable: ${errorMessage(error)}`, 'error');
         });
+      // Open with, Send To, files dropped on the shortcut, and later launches.
+      const importLaunchPaths = async () => {
+        try {
+          const paths = await takeLaunchPaths();
+          if (!disposed && paths.length) await importPaths(paths, true);
+        } catch (error) {
+          addLog(`Could not open the files passed at launch: ${errorMessage(error)}`, 'error');
+        }
+      };
+      void subscribeLaunchPaths(() => void importLaunchPaths())
+        .then((stop) => {
+          if (disposed) stop();
+          else stopLaunchPaths = stop;
+        })
+        .catch(() => {
+          /* Later launches still focus the window. */
+        });
+      void importLaunchPaths();
+      void subscribeCloseRequested((event) => {
+        event.preventDefault();
+        if (closing) return;
+        if (activeJobCount > 0) closePrompt = true;
+        else void finishClose();
+      })
+        .then((stop) => {
+          if (disposed) stop();
+          else stopCloseRequests = stop;
+        })
+        .catch((error) => {
+          addLog(`Close confirmation unavailable: ${errorMessage(error)}`, 'error');
+        });
     }
     return () => {
       disposed = true;
@@ -1388,6 +1426,8 @@
       importSession = null;
       void releaseImport(importTicket);
       unlisten?.();
+      stopLaunchPaths?.();
+      stopCloseRequests?.();
       stopWindowTracking?.();
       jobsDisposed = true;
       stopJobSubscription?.();
@@ -1563,6 +1603,7 @@
             workspaceActions.av1an?.reset?.();
           }}
         />
+        <SavedJobs {jobs} onqueue={queueEncode} />
       {/if}
       {#if (view === 'convert' || view === 'av1an') && jobsError}<p role="alert">
           {jobsError}
@@ -1827,6 +1868,24 @@
     <div class="import-actions"><button onclick={() => finishSequenceRate()}>OK</button></div>
   {/if}
 </SourceDialog>
+<SourceDialog
+  title="Close jesses?"
+  open={closePrompt && !closing}
+  onclose={() => (closePrompt = false)}
+  width={460}
+>
+  <p>
+    {activeJobCount === 1 ? '1 job is' : `${activeJobCount} jobs are`} running or queued. Closing stops
+    {activeJobCount === 1 ? 'it' : 'them'}; only encodes with saved progress can be resumed later.
+  </p>
+  <div class="import-actions">
+    <button data-dialog-initial-focus onclick={() => (closePrompt = false)}>Keep running</button
+    ><button onclick={() => void finishClose()}>Close anyway</button>
+  </div>
+</SourceDialog>
+{#if closing}
+  <div class="closing-overlay" role="status">Closing… waiting for jobs to stop.</div>
+{/if}
 
 <style>
   .import-choices {
@@ -1842,6 +1901,17 @@
     justify-content: end;
     gap: 8px;
     margin-top: 12px;
+  }
+  .closing-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    background: #282c25aa;
+    color: var(--background);
+    font-weight: 600;
+    letter-spacing: 0.04em;
   }
   .app-shell {
     height: 100vh;

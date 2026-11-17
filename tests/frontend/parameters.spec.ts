@@ -185,3 +185,49 @@ test('batch AV1AN freezes the source argument grid into each per-file request', 
   for (const request of requests)
     expect(request.settings.parameters).toEqual([{ name: 'tune', value: '4' }]);
 });
+
+test('named presets save, apply and delete per encoder and route', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Encoder', { exact: true }).selectOption('x264');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  const group = av.getByRole('group', { name: 'Saved presets' });
+  const saved = group.getByLabel('Saved preset', { exact: true });
+  await expect(saved).toBeDisabled();
+  await av.getByLabel('tune value').fill('4');
+  await group.getByRole('button', { name: 'Save as…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Save preset' });
+  await dialog.getByLabel('Preset name').fill('Anime');
+  await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(saved).toHaveValue('Anime');
+  expect(await page.evaluate(() => (globalThis as any).__parameterPresets)).toEqual([
+    {
+      name: 'Anime',
+      encoder: 'x264',
+      backend: 'av1an',
+      parameters: [{ name: 'tune', value: '4' }],
+    },
+  ]);
+
+  await av.getByLabel('tune value').fill('');
+  await group.getByRole('button', { name: 'Apply', exact: true }).click();
+  await expect(av.getByLabel('tune value')).toHaveValue('4');
+
+  // A preset belongs to its encoder: another encoder does not offer it.
+  await av.getByRole('tab', { name: 'Video', exact: true }).click();
+  await av.getByLabel('Encoder', { exact: true }).selectOption('aomAv1');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await expect(saved.getByRole('option', { name: 'Anime' })).toHaveCount(0);
+
+  await av.getByRole('tab', { name: 'Video', exact: true }).click();
+  await av.getByLabel('Encoder', { exact: true }).selectOption('x264');
+  await av.getByRole('tab', { name: 'Advanced' }).click();
+  await saved.selectOption('Anime');
+  await group.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(saved.getByRole('option', { name: 'Anime' })).toHaveCount(0);
+  expect(await page.evaluate(() => (globalThis as any).__parameterPresets)).toEqual([]);
+});

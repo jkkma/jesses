@@ -212,6 +212,12 @@ pub struct EncodeSettings {
     #[serde(default = "default_workers")]
     pub workers: u8,
     pub video_stream_index: u32,
+    /// An embedded cover picture (`attached_pic`) to keep. It is not one of the
+    /// selected streams: Matroska stores it as an attachment and MP4 as its
+    /// cover. Other containers leave it out with a log line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cover_stream_index: Option<u32>,
     /// NVENC constant-QP mode. Omission preserves the historical CRF/CQ mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -286,6 +292,7 @@ impl Default for EncodeSettings {
             encoder: VideoEncoder::default(),
             workers: default_workers(),
             video_stream_index: 0,
+            cover_stream_index: None,
             crf: 30,
             preset: 4,
             lossless: false,

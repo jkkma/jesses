@@ -103,6 +103,10 @@ pub struct BatchEncodeInput {
     pub input_path: String,
     pub stream_indices: Vec<u32>,
     pub video_stream_index: u32,
+    /// This file's embedded cover picture to keep (see `EncodeSettings`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cover_stream_index: Option<u32>,
 }
 
 /// Batch previews accept only encode fields; unrelated operation fields must

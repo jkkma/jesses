@@ -116,6 +116,11 @@ pub struct UserPreferences {
     pub revision: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameter_presets: Vec<crate::EncoderParameterPreset>,
+    /// How this session's preferences were recovered from a damaged or newer
+    /// file. Reported by reads only and never written to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
