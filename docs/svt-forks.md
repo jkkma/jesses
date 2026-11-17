@@ -1,8 +1,8 @@
 # SVT provider identities
 
 The source Quick Convert, AV1AN and batch UI exposes one SVT-AV1 choice. Canonical
-`svtAv1` resolves Patman's MSVC 19.51 HDR-PMod on Windows. The Linux development recipe
-retains SVT-AV1-HDR while Linux support is deferred. Both providers support
+`svtAv1` resolves upstream SVT-AV1-HDR 4.3.0. The Linux development recipe
+pins the same release while Linux support is deferred. The provider supports
 the source's scalar and managed HDR/grain resource
 rows without a visible build selector. Source CRF0 is literal zero and carries
 no invented lossless guarantee. See [source SVT qualification](source-svt-provider.md)
@@ -18,16 +18,15 @@ The Windows installer is `scripts/install-svt-forks.ps1`, with `-Fork 5fish` or
 notices/provenance in separate managed directories. It changes neither PATH nor
 an existing different installation. Exact versions and platform assets are in
 [scripts/svt-forks.json](../scripts/svt-forks.json). The pinned x86-64-v3 assets
-require an appropriate CPU. The Windows Patman build requires the x64 Microsoft
-Visual C++ v14 Redistributable 14.51 or later.
+require an appropriate CPU. The Windows HDR build requires the x64 Microsoft
+Visual C++ v14 Redistributable.
 [Download it from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).
 
 Managed roots are `%LOCALAPPDATA%/jesses/tools` on Windows,
 `$XDG_DATA_HOME/jesses/tools` (default `~/.local/share/jesses/tools`) on Linux,
-and `~/Library/Application Support/jesses/tools` on macOS. The Windows installer
-places PMod under `svt-av1-hdr-pmod-msvc`, alongside any earlier managed HDR
-installation. The Linux provider uses `svt-av1-hdr`. The 5fish provider uses
-`svt-av1-5fish`. Explicit HDR/FiveFish override variables
+and `~/Library/Application Support/jesses/tools` on macOS. The HDR provider
+uses `svt-av1-hdr` and the 5fish provider uses `svt-av1-5fish`. An earlier
+managed `svt-av1-hdr-pmod-msvc` directory is no longer read; remove it by hand. Explicit HDR/FiveFish override variables
 and distinct PATH aliases remain `JESSES_SVT_AV1_HDR`/`SvtAv1EncApp-HDR` and
 `JESSES_SVT_AV1_5FISH`/`SvtAv1EncApp-5fish`. On Windows the verified HDR bundle
 precedes managed and PATH locations. The canonical source path also verifies

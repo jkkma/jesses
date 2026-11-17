@@ -16,16 +16,8 @@ struct ToolSpec {
     version_arg: &'static str,
 }
 
-const HDR_PROVIDER_NAME: &str = if cfg!(windows) {
-    "SVT-AV1-HDR-PMod"
-} else {
-    "SVT-AV1-HDR"
-};
-const HDR_MANAGED_DIRECTORY: &str = if cfg!(windows) {
-    "svt-av1-hdr-pmod-msvc"
-} else {
-    "svt-av1-hdr"
-};
+const HDR_PROVIDER_NAME: &str = "SVT-AV1-HDR";
+const HDR_MANAGED_DIRECTORY: &str = "svt-av1-hdr";
 
 const TOOLS: [ToolSpec; 12] = [
     ToolSpec {
@@ -343,7 +335,7 @@ fn hdr_runtime_error(
         )
     {
         return Some(
-            "The HDR encoder could not load its runtime. Install Microsoft Visual C++ v14 Redistributable (x64) 14.51 or later from https://aka.ms/vc14/vc_redist.x64.exe, then refresh Tools.",
+            "The HDR encoder could not load its runtime. Install Microsoft Visual C++ v14 Redistributable (x64) from https://aka.ms/vc14/vc_redist.x64.exe, then refresh Tools.",
         );
     }
     None
@@ -446,9 +438,8 @@ pub(crate) fn validate_video_encoder_version(
     let matches = match encoder {
         VideoEncoder::SvtAv1 => !known_fork || (hdr && !five_fish),
         VideoEncoder::SvtAv1FiveFish => five_fish && !hdr,
-        VideoEncoder::SvtAv1Hdr => {
-            hdr && !five_fish && (!cfg!(windows) || lower.contains("[mod by patman]"))
-        }
+        // Patman's mod is no longer qualified: its tune numbering differs.
+        VideoEncoder::SvtAv1Hdr => hdr && !five_fish && !lower.contains("[mod by patman]"),
         VideoEncoder::X264 => lower.starts_with("x264 "),
         VideoEncoder::X265Standalone => lower.starts_with("x265 "),
         VideoEncoder::AomAv1 => lower.contains("aomenc") || lower.contains("aom codec"),
@@ -769,7 +760,7 @@ mod tests {
             ),
             (
                 VideoEncoder::SvtAv1Hdr,
-                "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A",
+                "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)\nHDR Release: N/A",
             ),
             (VideoEncoder::X264, "x264 0.165.3222M b35605a"),
         ];
@@ -794,22 +785,17 @@ mod tests {
 
     #[test]
     fn source_svt_identity_requires_qualified_hdr_and_retains_explicit_legacy_mainline() {
+        let qualified = "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)\nHDR Release: N/A";
         let patman =
             "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A";
-        let upstream = "SVT-AV1-HDR v4.1.0-21-g00333404f (release)";
-        assert_eq!(source_svt_identity_matches(patman).unwrap(), cfg!(windows));
-        assert_eq!(
-            source_svt_identity_matches(upstream).unwrap(),
-            !cfg!(windows)
-        );
-        assert!(validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, patman).is_ok());
-        assert_eq!(
-            validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, upstream).is_ok(),
-            !cfg!(windows)
-        );
+        assert!(source_svt_identity_matches(qualified).unwrap());
+        assert!(validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, qualified).is_ok());
+        assert!(!source_svt_identity_matches(patman).unwrap());
+        assert!(validate_video_encoder_version(VideoEncoder::SvtAv1Hdr, patman).is_err());
         for identity in [
             "SVT-AV1 Encoder Lib v4.2.0",
             "SVT-AV1-HDR v4.2.0",
+            "SVT-AV1-HDR v4.1.0-21-g00333404f (release)",
             "SVT-AV1 [5fish] v2.3.260827",
             &format!("{}bad", source_svt_marker().unwrap()),
         ] {
@@ -914,7 +900,7 @@ mod tests {
         for code in [0xC0000135, 0xC0000139] {
             let status = std::process::ExitStatus::from_raw(code);
             let detail = hdr_runtime_error(VideoEncoder::SvtAv1Hdr, status).unwrap();
-            assert!(detail.contains("14.51"));
+            assert!(detail.contains("Visual C++ v14 Redistributable (x64)"));
             assert!(detail.contains("https://aka.ms/vc14/vc_redist.x64.exe"));
             assert!(hdr_runtime_error(VideoEncoder::SvtAv1FiveFish, status).is_none());
         }

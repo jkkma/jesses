@@ -16,8 +16,8 @@ preserved in `licenses/dolby-vision-MIT.txt` and `licenses/hdr10plus-MIT.txt`.
 These exact Rust dependency versions are pinned in Cargo.toml and Cargo.lock;
 metadata imports require no separate runtime CLI.
 
-The packaged SVT-AV1 5fish and Patman MSVC HDR-PMod executables are separate
-upstream programs. The retained Linux recipe uses upstream SVT-AV1-HDR.
+The packaged SVT-AV1 5fish and SVT-AV1-HDR executables are separate
+upstream programs. The retained Linux recipe uses the same SVT-AV1-HDR release.
 Their BSD 3-Clause Clear, BSD 2-Clause and patent notices are
 included beside each executable under `resources/tools`, together with the
 complete source archive for the pinned upstream commit. The packaged

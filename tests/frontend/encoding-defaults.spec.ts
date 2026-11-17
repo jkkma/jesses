@@ -206,7 +206,7 @@ test('HDR Tune follows advanced override and the Video selector can replace it',
   const region = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await region.getByRole('tab', { name: 'Advanced' }).click();
   await region.getByRole('tab', { name: 'Quality & Tuning' }).click();
-  await region.getByLabel('tune value', { exact: true }).fill('5');
+  await region.getByLabel('tune value', { exact: true }).fill('6');
   await region.getByRole('tab', { name: 'Video', exact: true }).click();
   await expect(region.getByLabel('Tune', { exact: true })).toHaveValue('filmGrain');
   await region.getByLabel('Tune', { exact: true }).selectOption('visualQuality');

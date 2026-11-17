@@ -1387,7 +1387,7 @@ impl JobManager {
             }
             match settings.encoder {
                 VideoEncoder::SvtAv1FiveFish => append_log(snapshot, format!("SVT-AV1 5fish: line-art bias {}, texture bias {}.", settings.lineart_psy_bias, settings.texture_psy_bias)),
-                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("{}: {} tune.", settings.encoder.name(), settings.parameters.iter().find(|parameter| parameter.name == "tune").map_or_else(|| match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)".to_string(), media_core::HdrTune::FilmGrain => "film grain retention (5)".to_string() }, |parameter| format!("explicit override ({})", parameter.value)))),
+                VideoEncoder::SvtAv1Hdr => append_log(snapshot, format!("{}: {} tune.", settings.encoder.name(), settings.parameters.iter().find(|parameter| parameter.name == "tune").map_or_else(|| match settings.hdr_tune { media_core::HdrTune::VisualQuality => "visual quality (0)".to_string(), media_core::HdrTune::FilmGrain => "film grain retention (6)".to_string() }, |parameter| format!("explicit override ({})", parameter.value)))),
                 _ => {},
             }
             if plan.is_hdr10() {
@@ -4632,7 +4632,7 @@ pub(super) fn encoder_parameters(plan: &Plan, settings: &EncodeSettings) -> Vec<
                 "--tune".into(),
                 match settings.hdr_tune {
                     media_core::HdrTune::VisualQuality => "0",
-                    media_core::HdrTune::FilmGrain => "5",
+                    media_core::HdrTune::FilmGrain => "6",
                 }
                 .into(),
             ])
@@ -5447,7 +5447,7 @@ mod tests {
     async fn encode_observer_keeps_progress_in_statistics_and_preserves_the_log() {
         let manager = JobManager::new(PathBuf::new());
         let snapshot = serde_json::from_value(serde_json::json!({
-            "id": "patman-progress",
+            "id": "svt-progress",
             "state": "running",
             "request": {"inputPath":"source.mkv","outputPath":"output.mkv","streamIndices":[0]},
             "progressSeconds": 0.0,
@@ -5469,7 +5469,7 @@ mod tests {
                 task: None,
             });
         let (sender, events) = mpsc::channel(32);
-        let observer = manager.observe_encode("patman-progress", events, Some(1.0 / 24.0));
+        let observer = manager.observe_encode("svt-progress", events, Some(1.0 / 24.0));
         let warning = "[consumer] Svt[warn]: Encoding: 2400 Frames reports estimated size.";
         let error = "[producer] Error: Encoding frame 5 has an invalid timestamp.";
         let summary = "[consumer] Total Encoding Time: 42471 ms";
@@ -5531,7 +5531,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_patman_progress_with_and_without_a_frame_total() {
+    fn reads_svt_progress_with_and_without_a_frame_total() {
         let known = svt_progress(
             "[consumer] Encoding:   12/50 Frames @ 30.00 fps | 1234.56 kb/s | Size: 12.34 MB [51.42 MB] | Time: 0:00:03 [-0:00:09]",
         ).unwrap();

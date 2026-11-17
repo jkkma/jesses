@@ -1,14 +1,20 @@
 # Source SVT provider and AV1AN target defaults
 
 The source UI has one SVT choice. New canonical `svtAv1` requests use the qualified
-HDR provider for the host. Windows uses the MSVC 19.51 build of [SVT-AV1-HDR-PMod 2026-07-20](https://github.com/Patman86/SVT-AV1-Mods-by-Patman/releases/tag/2026-07-20)
-from commit `e4b6c4ff5a8c52a03a7cfee49ca89513c4d75cbe`. Linux support is
-deferred. Its retained development recipe uses the
-[SVT-AV1-HDR 2026-09-01 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-09-01-0033340)
-from commit `00333404f455471aaa6ee2c927cac3c93efb76e3`, with HDR10+ and Dolby
-Vision integration. Version markers and binary
-hashes are in `scripts/svt-forks.json`, and source hashes are in
+HDR provider for the host. Windows uses the x86-64-v3 asset of the upstream
+[SVT-AV1-HDR 2026-11-04 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-11-04-6d661b6),
+which is v4.3.0 at commit `6d661b6b510eb30b568d5ffcbb121176e553c454`, with
+HDR10+ and Dolby Vision integration. Linux support is deferred. Its retained
+development recipe pins the same release. Version markers and binary hashes are
+in `scripts/svt-forks.json`, and source hashes are in
 `scripts/bundled-tool-sources.json`.
+
+This release numbers film grain as tune 6, after VMAF at tune 5. The Tune
+selector sends `--tune 0` for visual quality and `--tune 6` for film grain.
+On Windows, this exact build passed the short-clip check with both
+`--hbd-mds 1` and `--enable-overlays 1` at default parallelism, including six
+concurrent processes. It also rewrote the IVF frame count on seekable output. The
+app therefore keeps default parallelism and its IVF count check for this build.
 
 Standalone SVT progress includes frames, speed, bitrate, encoded size and
 elapsed time as the encoder reports them. For a deterministic frame plan,

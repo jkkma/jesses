@@ -1,11 +1,11 @@
 """Standalone encoder staging must retain its verified shared source closure."""
 
 import importlib.util
+import io
 import json
 from pathlib import Path
-import os
-import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,37 +16,32 @@ stager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stager)
 
 
-@unittest.skipUnless(sys.platform == "win32", "uses Windows system tar.exe")
-class PatmanArchiveTests(unittest.TestCase):
+class ForkArchiveTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="jesses-patman-archive-test-")
+        temporary = tempfile.TemporaryDirectory(prefix="jesses-fork-archive-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.tar = Path(os.environ["SystemRoot"]) / "System32/tar.exe"
         self.output = self.root / "output"
         self.output.mkdir()
-        self.members = {"LICENSE.md": b"license", "README.md": b"readme", "SvtAv1EncApp.exe": b"encoder"}
-        for name, contents in self.members.items():
-            (self.root / name).write_bytes(contents)
-        self.pin = {"entry": "SvtAv1EncApp.exe", "archiveFormat": "7z",
-                    "members": {name: len(contents) for name, contents in self.members.items()}}
+        self.pin = {"entry": "SvtAv1EncApp.exe"}
 
-    def archive(self, *members):
-        archive = self.root / "test.7z"
-        subprocess.run([self.tar, "-a", "-cf", archive, *members], cwd=self.root, check=True)
-        cached = self.root / "cached-by-digest"
-        archive.rename(cached)
-        return cached
+    def archive(self, **members):
+        archive = self.root / "cached-by-digest"
+        with tarfile.open(archive, "w:xz") as bundle:
+            for name, contents in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(contents)
+                bundle.addfile(info, io.BytesIO(contents))
+        return archive
 
     def test_extracts_only_the_pinned_executable(self):
-        archive = self.archive(*self.members)
+        archive = self.archive(**{"SvtAv1EncApp.exe": b"encoder"})
         extracted = stager.extract_fork_binary(archive, self.output, self.pin)
         self.assertEqual(extracted.read_bytes(), b"encoder")
         self.assertEqual(list(self.output.iterdir()), [extracted])
 
     def test_rejects_mismatched_archive_layout(self):
-        (self.root / "injected.dll").write_bytes(b"extra")
-        archive = self.archive(*self.members, "injected.dll")
+        archive = self.archive(**{"SvtAv1EncApp.exe": b"encoder", "injected.dll": b"extra"})
         with self.assertRaisesRegex(ValueError, "Unexpected binary archive layout"):
             stager.extract_fork_binary(archive, self.output, self.pin)
         self.assertEqual(list(self.output.iterdir()), [])

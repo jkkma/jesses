@@ -276,11 +276,6 @@
   let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
   // The two SVT builds listed in the codec menu share AV1 ranges and a 10-bit default.
   const listedSvt = (value: string) => value === 'svtAv1' || value === 'svtAv1Hdr';
-  const hdrEncoderName = $derived(
-    tools.some((tool) => tool.id === 'svt-av1-hdr' && tool.version?.includes('[Mod by Patman]'))
-      ? 'SVT-AV1-HDR-PMod'
-      : 'SVT-AV1-HDR',
-  );
   const tenBitDefault = (value: string) =>
     listedSvt(value) || value === 'aomAv1' || value === 'vpxStandalone';
   // Editable historical drafts receive a visible CPU default; stored jobs are
@@ -3969,14 +3964,14 @@
                 >H.265 / HEVC (x265)</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="svtAv1"
                 >AV1 (SVT-AV1)</option
-              ><option value="svtAv1Hdr">AV1 ({hdrEncoderName})</option><option value="aomAv1"
+              ><option value="svtAv1Hdr">AV1 (SVT-AV1-HDR)</option><option value="aomAv1"
                 >AV1 (AOM)</option
               ><option value="gif">GIF [Animated GIF]</option><option value="png"
                 >PNG [Image Sequence]</option
               ><option value="jpg">JPEG [Image Sequence]</option>{:else}<option value="aomAv1"
                 >AV1 (AOM)</option
               ><option value="svtAv1">AV1 (SVT-AV1)</option><option value="svtAv1Hdr"
-                >AV1 ({hdrEncoderName})</option
+                >AV1 (SVT-AV1-HDR)</option
               ><option value="vpxStandalone">VP9 (VPX)</option><option value="x265Standalone"
                 >H.265 / HEVC (x265)</option
               ><option value="x264">H.264 / AVC (x264)</option>{/if}
@@ -4113,7 +4108,7 @@
               id={`${idPrefix}-tune`}
               value={override === '0'
                 ? 'visualQuality'
-                : override === '5'
+                : override === '6'
                   ? 'filmGrain'
                   : override !== undefined
                     ? 'advanced'
@@ -4127,7 +4122,7 @@
               }}
               ><option value="visualQuality">VQ (Visual quality)</option><option value="filmGrain"
                 >Film grain</option
-              >{#if override !== undefined && override !== '0' && override !== '5'}<option
+              >{#if override !== undefined && override !== '0' && override !== '6'}<option
                   value="advanced">Advanced tune ({override})</option
                 >{/if}</select
             >

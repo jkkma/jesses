@@ -9,8 +9,8 @@ a system-only `PATH`, and a new profile. The media checks generate their own
 eight-frame source; no source media is read or changed.
 
 Provision Microsoft Edge WebView2 and the x64 Microsoft Visual C++ v14
-Redistributable 14.51 or later on the qualification image. The runner records
-WebView2 and the Visual C++ DLL version required by the packaged Patman encoder.
+Redistributable on the qualification image. The runner records WebView2 and
+the Visual C++ DLL version required by the packaged SVT-AV1-HDR encoder.
 GUI startup, browser rendering, accessibility, and interactive workflows require
 a separate native UI pass.
 [Download the Visual C++ runtime from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).

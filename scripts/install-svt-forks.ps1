@@ -6,8 +6,8 @@ Install pinned official Windows SVT forks into Jesses' per-user tools directory.
 Verifies published archive digests, extracted executable digests, and version
 identities. Keeps licenses and download provenance. Existing matching installs
 are reused; different existing files are never overwritten. PATH is unchanged.
-The 5fish build requires x86-64-v3. The MSVC Patman HDR build requires the
-Microsoft Visual C++ v14 Redistributable (x64) 14.51 or later.
+Both builds require x86-64-v3. The HDR build also requires the Microsoft
+Visual C++ v14 Redistributable (x64).
 #>
 [CmdletBinding()]
 param([ValidateSet('all', '5fish', 'hdr')][string]$Fork = 'all')
@@ -66,53 +66,18 @@ foreach ($encoder in $manifest.encoders | Where-Object { $Fork -eq 'all' -or $_.
         throw 'The staging destination leaves the managed tools directory.'
     }
     New-Item -ItemType Directory -Path $staging | Out-Null
-    $archiveName = if ($asset.archiveFormat -eq '7z') { 'release.7z' } else { 'release.tar.xz' }
-    $archive = Join-Path $staging $archiveName
+    $archive = Join-Path $staging 'release.tar.xz'
     Invoke-WebRequest -Uri $asset.url -OutFile $archive
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $asset.sha256) {
         throw "Archive checksum mismatch; files retained for inspection at $staging"
     }
     $stagedBinary = Join-Path $staging $asset.entry
-    if ($asset.archiveFormat -eq '7z') {
-        $entries = @(& $tar -tvf $archive)
-        $expected = $asset.members.PSObject.Properties
-        if ($LASTEXITCODE -ne 0 -or $entries.Count -ne @($expected).Count) {
-            throw "Unexpected archive entries; files retained for inspection at $staging"
-        }
-        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($line in $entries) {
-            $fields = $line -split '\s+', 9
-            $member = if ($fields.Count -eq 9) { $expected | Where-Object Name -CEQ $fields[8] }
-            if (-not $member -or -not $fields[0].StartsWith('-') -or
-                $fields[4] -cne [string]$member.Value -or -not $seen.Add($fields[8])) {
-                throw "Unexpected archive entries; files retained for inspection at $staging"
-            }
-        }
-        # PowerShell pipelines may convert native output to text. Stream the
-        # exact member as bytes and create a fresh file without archive paths.
-        $start = [System.Diagnostics.ProcessStartInfo]::new($tar)
-        foreach ($argument in @('-xOf', $archive, '--', $asset.entry)) { $start.ArgumentList.Add($argument) }
-        $start.UseShellExecute = $false
-        $start.RedirectStandardOutput = $true
-        $process = [System.Diagnostics.Process]::Start($start)
-        try {
-            $output = [System.IO.File]::Open($stagedBinary, [System.IO.FileMode]::CreateNew)
-            try { $process.StandardOutput.BaseStream.CopyTo($output) }
-            finally { $output.Dispose() }
-            $process.WaitForExit()
-            if ($process.ExitCode -ne 0 -or (Get-Item -LiteralPath $stagedBinary).Length -ne $asset.members.($asset.entry)) {
-                throw "Archive extraction failed: $staging"
-            }
-        }
-        finally { $process.Dispose() }
-    } else {
-        $entries = @(& $tar -tf $archive)
-        if ($LASTEXITCODE -ne 0 -or $entries.Count -ne 1 -or $entries[0] -cne $asset.entry) {
-            throw "Unexpected archive entries; files retained for inspection at $staging"
-        }
-        & $tar -xf $archive -C $staging $asset.entry
-        if ($LASTEXITCODE -ne 0) { throw "Archive extraction failed: $staging" }
+    $entries = @(& $tar -tf $archive)
+    if ($LASTEXITCODE -ne 0 -or $entries.Count -ne 1 -or $entries[0] -cne $asset.entry) {
+        throw "Unexpected archive entries; files retained for inspection at $staging"
     }
+    & $tar -xf $archive -C $staging $asset.entry
+    if ($LASTEXITCODE -ne 0) { throw "Archive extraction failed: $staging" }
     if ((Get-FileHash -LiteralPath $stagedBinary -Algorithm SHA256).Hash -ne $asset.executableSha256) {
         throw "Executable checksum mismatch: $staging"
     }

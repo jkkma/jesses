@@ -7,7 +7,7 @@ test('the batch footer tracks the current file through preparation, encoding and
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.addInitScript(() => {
     (globalThis as any).__toolVersions = {
-      'svt-av1-hdr': 'SVT-AV1-HDR v4.1.0+77+85 [Mod by Patman]',
+      'svt-av1-hdr': 'SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)',
     };
   });
   await installSourceEncodeFixture(page);
@@ -34,7 +34,7 @@ test('the batch footer tracks the current file through preparation, encoding and
   const codec = page.getByRole('region', { name: 'Quick Convert' }).getByLabel('Codec', {
     exact: true,
   });
-  await expect(codec.locator('option[value="svtAv1Hdr"]')).toHaveText('AV1 (SVT-AV1-HDR-PMod)');
+  await expect(codec.locator('option[value="svtAv1Hdr"]')).toHaveText('AV1 (SVT-AV1-HDR)');
   await codec.selectOption('svtAv1Hdr');
   const run = page.getByRole('button', { name: 'Run Batch: Encode', exact: true });
   await run.click();

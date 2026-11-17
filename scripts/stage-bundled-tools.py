@@ -391,32 +391,13 @@ def download(url: str, expected: str, cache: Path) -> Path:
 
 def extract_fork_binary(archive_path: Path, directory: Path, asset: dict) -> Path:
     executable = directory / asset["entry"]
-    if asset.get("archiveFormat") == "7z":
-        # Windows' system bsdtar can read 7z. Only stream the exact executable
-        # member, so archive paths and metadata never reach the filesystem.
-        tar = Path(os.environ["SystemRoot"]) / "System32/tar.exe"
-        listed = subprocess.check_output([tar, "-tvf", archive_path], text=True, timeout=30)
-        members = {}
-        for line in listed.splitlines():
-            fields = line.split(maxsplit=8)
-            if len(fields) != 9 or not fields[0].startswith("-") or fields[8] in members:
-                raise ValueError("Unexpected binary archive layout for the Windows SVT fork.")
-            members[fields[8]] = int(fields[4])
-        if members != asset["members"] or not 0 < members.get(asset["entry"], 0) <= MAX_DOWNLOAD:
-            raise ValueError("Unexpected binary archive layout for the Windows SVT fork.")
-        with executable.open("xb") as output:
-            subprocess.run([tar, "-xOf", archive_path, "--", asset["entry"]],
-                           stdout=output, check=True, timeout=30)
-        if executable.stat().st_size != members[asset["entry"]]:
-            raise ValueError("The Windows SVT fork member size differs from its archive listing.")
-    else:
-        with tarfile.open(archive_path) as archive:
-            members = archive.getmembers()
-            if (len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"]
-                    or members[0].size > MAX_DOWNLOAD):
-                raise ValueError(f"Unexpected binary archive layout for {asset['entry']}.")
-            with archive.extractfile(members[0]) as original, executable.open("xb") as output:
-                shutil.copyfileobj(original, output)
+    with tarfile.open(archive_path) as archive:
+        members = archive.getmembers()
+        if (len(members) != 1 or not members[0].isfile() or members[0].name != asset["entry"]
+                or members[0].size > MAX_DOWNLOAD):
+            raise ValueError(f"Unexpected binary archive layout for {asset['entry']}.")
+        with archive.extractfile(members[0]) as original, executable.open("xb") as output:
+            shutil.copyfileobj(original, output)
     return executable
 
 

@@ -617,7 +617,6 @@ impl VideoEncoder {
         match self {
             Self::SvtAv1 => "SVT-AV1",
             Self::SvtAv1FiveFish => "SVT-AV1 5fish",
-            Self::SvtAv1Hdr if cfg!(windows) => "SVT-AV1-HDR-PMod",
             Self::SvtAv1Hdr => "SVT-AV1-HDR",
             Self::X264 => "x264",
             Self::X265 => "x265",

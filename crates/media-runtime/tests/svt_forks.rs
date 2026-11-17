@@ -285,7 +285,7 @@ async fn qualify(backend: EncodeBackend) {
             assert!(
                 observed_logs
                     .iter()
-                    .any(|line| line.contains("film grain retention (5)"))
+                    .any(|line| line.contains("film grain retention (6)"))
             );
         }
         expected.push((started.id, settings));

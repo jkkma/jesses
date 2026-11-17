@@ -61,7 +61,9 @@ test('encoding log highlights syntax and diagnostics while preserving literal to
   await page.screenshot({ path: testInfo.outputPath('highlighted-log.png') });
 });
 
-test('monitor shows Patman progress in the footer and keeps log messages', async ({ page }) => {
+test('monitor shows SVT-AV1-HDR progress in the footer and keeps log messages', async ({
+  page,
+}) => {
   const warning = '[consumer] Svt[warn]: Encoding: 2400 Frames reports estimated size.';
   const error = '[producer] Error: Encoding frame 5 has an invalid timestamp.';
   const summary = '[consumer] Total Encoding Time: 42471 ms';

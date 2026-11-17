@@ -141,7 +141,12 @@ function validNativeFallback(encoder: VideoEncoder, name: string, value: string)
         (!parts.includes('all') && !parts.includes('none')))
     );
   }
-  const range = x264 ? x264Ranges[name] : svtRanges[name];
+  // SVT-AV1-HDR 4.3.0 numbers film grain as tune 6, after VMAF.
+  const range: [number, number] | undefined = x264
+    ? x264Ranges[name]
+    : name === 'tune' && encoder === 'svtAv1Hdr'
+      ? [0, 6]
+      : svtRanges[name];
   if (name === 'deblock' || name === 'psy-rd') {
     const parts = value.split(':');
     const [min, max] = name === 'deblock' ? [-6, 6] : [0, 10];

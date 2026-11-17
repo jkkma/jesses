@@ -1234,7 +1234,7 @@ async fn av1an_x264_stops_with_verified_chunks_and_resumes_original_request() {
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "requires packaged Windows AV1AN, Patman SVT-AV1-HDR, FFmpeg, FFprobe and grav1synth"]
+#[ignore = "requires packaged Windows AV1AN, SVT-AV1-HDR, FFmpeg, FFprobe and grav1synth"]
 async fn av1an_with_staged_grain_resumes_after_job_manager_reopens() {
     use media_core::{Av1anGrainSettings, Av1anOptions, Av1anSplitMethod, VideoEncoder};
 

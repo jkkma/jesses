@@ -1,4 +1,4 @@
-use super::super::parameters::WINDOWS_PATMAN_RELEASE;
+use super::super::parameters::WINDOWS_HDR_RELEASE;
 use super::{AppError, Temporary, files};
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -17,7 +17,7 @@ pub(super) fn rewrites_count(identity: &str) -> bool {
                 line,
                 "SVT-AV1 v4.2.0 (release)"
                     | "SVT-AV1 [5fish] v2.3.260827 (release)"
-                    | WINDOWS_PATMAN_RELEASE
+                    | WINDOWS_HDR_RELEASE
             )
         })
 }
@@ -115,15 +115,14 @@ mod tests {
             cfg!(windows)
         );
         assert_eq!(
-            rewrites_count(
-                "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A"
-            ),
+            rewrites_count("SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)\nHDR Release: N/A"),
             cfg!(windows)
         );
         for unknown in [
             "SVT-AV1 v4.2.0 (debug)",
             "SVT-AV1 v4.2.1 (release)",
             "SVT-AV1-HDR v4.1.0-21-g00333404f (release)",
+            "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)",
         ] {
             assert!(!rewrites_count(unknown), "accepted {unknown}");
         }

@@ -93,9 +93,17 @@ fn specs(encoder: VideoEncoder) -> Vec<Spec> {
             spec.group = group;
             spec.description = description;
         }
+        if encoder == VideoEncoder::SvtAv1Hdr && spec.name == "tune" {
+            // The pinned SVT-AV1-HDR 4.3.0 build inserted VMAF as tune 5 and
+            // moved film grain to tune 6. The source catalog predates that.
+            spec.max = 6;
+            spec.description = HDR_TUNE_DESCRIPTION;
+        }
     }
     values
 }
+
+const HDR_TUNE_DESCRIPTION: &str = "0-6 (default 1) - What it optimises for; 0 visual quality, 1 PSNR, 2 SSIM, 3 image quality, 4 MS-SSIM, 5 VMAF, 6 film grain\n\nTune picks the quality model the encoder optimises its internal decisions against, which changes rate-distortion choices, filtering and where bits land rather than just which score gets reported. 0 is visual quality, 1 PSNR, 2 SSIM, 3 still-image quality, 4 MS-SSIM and SSIMULACRA2, 5 VMAF, and 6 is a film grain bundle that turns off temporal filtering, CDEF and restoration and enables the complex visual model, transform bias and a strong AC bias.\n\nTune 1 is the metric-safe default. Tune 0 gives a sharper, more detailed picture for lower scores and more artefacts. Tune 6 holds onto grain aggressively and costs bitrate and encoding time; it is aimed at moderate to heavy grain on a slow preset.\n\nThe Tune selector sets 0 or 6 for you; a value here overrides it.";
 
 /// Library controls used by the ladder share the source-checked scalar catalog
 /// with regular encoding. Resource paths, HDR metadata and grain are typed jobs.
@@ -287,8 +295,7 @@ pub(in crate::jobs) fn requires_serial_svt(settings: &EncodeSettings) -> bool {
         })
 }
 
-pub(in crate::jobs) const WINDOWS_PATMAN_RELEASE: &str =
-    "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)";
+pub(in crate::jobs) const WINDOWS_HDR_RELEASE: &str = "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)";
 
 pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: &str) -> bool {
     // This exact build passed the paired-option short-clip reproducer at
@@ -297,7 +304,7 @@ pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: 
         && settings.encoder == VideoEncoder::SvtAv1Hdr
         && identity
             .lines()
-            .any(|line| line.trim() == WINDOWS_PATMAN_RELEASE)
+            .any(|line| line.trim() == WINDOWS_HDR_RELEASE)
 }
 
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
@@ -1006,6 +1013,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_hdr_build_accepts_film_grain_tune_six() {
+        assert!(validate(&setting(VideoEncoder::SvtAv1Hdr, "tune", "6")).is_ok());
+        assert!(validate(&setting(VideoEncoder::SvtAv1Hdr, "tune", "7")).is_err());
+        assert!(validate(&setting(VideoEncoder::SvtAv1, "tune", "6")).is_err());
+        assert!(validate(&setting(VideoEncoder::SvtAv1FiveFish, "tune", "6")).is_err());
+        let hdr = specs(VideoEncoder::SvtAv1Hdr)
+            .into_iter()
+            .find(|spec| spec.name == "tune")
+            .unwrap();
+        assert!(hdr.description.contains("5 VMAF, 6 film grain"));
+    }
+
+    #[test]
     fn svt_signed_decimal_and_installed_help_gates_are_exact() {
         assert!(validate(&setting(VideoEncoder::SvtAv1Hdr, "sharpness", "-7")).is_ok());
         assert!(validate(&setting(VideoEncoder::SvtAv1Hdr, "ac-bias", "4.125")).is_ok());
@@ -1251,17 +1271,18 @@ mod tests {
     }
 
     #[test]
-    fn only_qualified_windows_patman_build_allows_parallel_svt_pair() {
+    fn only_qualified_windows_hdr_build_allows_parallel_svt_pair() {
         let mut settings = setting(VideoEncoder::SvtAv1Hdr, "hbd-mds", "1");
         settings.backend = EncodeBackend::Standalone;
-        let identity = format!("\n{WINDOWS_PATMAN_RELEASE}\nHDR Release: N/A\n");
+        let identity = format!("\n{WINDOWS_HDR_RELEASE}\nHDR Release: N/A\n");
         assert_eq!(allows_parallel_svt(&settings, &identity), cfg!(windows));
         for unqualified in [
             "",
             "SVT-AV1 v4.2.0 (release)",
             "SVT-AV1 [5fish] v2.3.260827 (release)",
             "SVT-AV1-HDR v4.1.0-21-g00333404f (release)",
-            "SVT-AV1-HDR v4.1.0+77+86-e4b6c4ff5 [Mod by Patman] (release)",
+            "SVT-AV1-HDR v4.3.0-g6d661b6b6 (release)",
+            "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)",
         ] {
             assert!(!allows_parallel_svt(&settings, unqualified));
         }

@@ -3930,7 +3930,7 @@ mod tests {
                             .any(|pair| pair == ["--film-grain-denoise", "0"])
                     );
                     if encoder == VideoEncoder::SvtAv1Hdr {
-                        assert!(args.windows(2).any(|pair| pair == ["--tune", "5"]));
+                        assert!(args.windows(2).any(|pair| pair == ["--tune", "6"]));
                         let mut overridden = settings.clone();
                         overridden.parameters.push(media_core::EncoderParameter {
                             name: "tune".into(),
