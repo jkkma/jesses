@@ -75,7 +75,10 @@ test('saved AV1AN resume survives reload and ignores the current editor draft', 
   await page.getByRole('button', { name: 'Resume', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
-  await expect(page.getByLabel('Current action')).toHaveText('Canceled.');
+  // Stop keeps an encode's progress; the fixture's stopped job has none saved.
+  await expect(page.getByLabel('Current action')).toHaveText(
+    /^\s*Stopped(?:\. Progress was kept; Resume continues it\.| before any progress was saved\.)$/,
+  );
   expect(
     await page.evaluate(() =>
       (globalThis as any).__sourceCalls

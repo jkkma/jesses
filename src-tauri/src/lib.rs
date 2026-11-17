@@ -1018,7 +1018,7 @@ pub fn run() {
             if let Some(data_directory) = webview_data_dir {
                 main_window = main_window.data_directory(data_directory);
             }
-            main_window
+            let main_window = main_window
                 .on_page_load(|window, payload| {
                     if payload.event() == tauri::webview::PageLoadEvent::Started {
                         window.state::<analysis::AnalysisTasks>().cancel_all();
@@ -1029,6 +1029,7 @@ pub fn run() {
                     }
                 })
                 .build()?;
+            encode_window::fit_to_work_area(&main_window);
             completion::start(app.handle().clone());
             Ok(())
         })

@@ -78,15 +78,24 @@
 </div>
 
 <style>
+  /* On short windows the cell can be lower than a 16:9 box. The picture then
+     shrinks inside its cell (letterboxed) instead of spilling over the
+     buttons below it. */
   .source-thumbnail {
     width: min(100%, 384px);
+    max-height: 100%;
+    min-height: 0;
+    overflow: hidden;
     display: grid;
+    grid-template-rows: minmax(0, max-content) auto;
     gap: 0.3rem;
     align-self: start;
     align-content: start;
   }
   .image {
     width: 100%;
+    min-height: 0;
+    max-height: 100%;
     aspect-ratio: 16 / 9;
     padding: 0;
     overflow: hidden;

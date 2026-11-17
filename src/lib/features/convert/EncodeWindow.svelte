@@ -1,8 +1,12 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { canKeepProgress, canResumeJob, terminalJob } from '$lib/components/shared/job-state';
-  import { errorMessage, fileName, formatBytes } from '$lib/components/shared/format';
-  import { isEncoderProgressLine, liveJobProgress } from '$lib/components/shared/job-progress';
+  import { displayPaths, errorMessage, fileName, formatBytes } from '$lib/components/shared/format';
+  import {
+    isEncoderProgressLine,
+    liveJobProgress,
+    withoutAttachmentProbeNoise,
+  } from '$lib/components/shared/job-progress';
   import {
     ProgressEstimator,
     type ProgressEstimate,
@@ -62,13 +66,17 @@
   const progress = $derived(current ? liveJobProgress(current, estimate) : null);
   const logText = $derived(
     current
-      ? [
-          `Source: ${current.request.inputPath}`,
-          `Output: ${current.request.outputPath}`,
-          current.encodeSettings ? encodeSummary(current.encodeSettings) : '',
-          '',
-          ...current.logs.filter((line) => !isEncoderProgressLine(line)),
-        ].join('\n')
+      ? displayPaths(
+          [
+            `Source: ${current.request.inputPath}`,
+            `Output: ${current.request.outputPath}`,
+            current.encodeSettings ? encodeSummary(current.encodeSettings) : '',
+            '',
+            ...withoutAttachmentProbeNoise(current.logs).filter(
+              (line) => !isEncoderProgressLine(line),
+            ),
+          ].join('\n'),
+        )
       : 'Waiting for a Quick Convert job…',
   );
   const highlightedLog = $derived(logText.split('\n').map(highlightLogLine));

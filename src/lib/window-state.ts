@@ -34,7 +34,7 @@ export async function restoreAndTrackWindow(): Promise<() => void> {
   if (saved) {
     try {
       const monitors = await availableMonitors();
-      const visible = monitors.some(
+      const monitor = monitors.find(
         ({ position, size }) =>
           Math.min(saved.x + saved.width, position.x + size.width) -
             Math.max(saved.x, position.x) >=
@@ -43,9 +43,21 @@ export async function restoreAndTrackWindow(): Promise<() => void> {
             Math.max(saved.y, position.y) >=
             80,
       );
-      if (visible) {
-        await window.setSize(new PhysicalSize(saved.width, saved.height));
-        await window.setPosition(new PhysicalPosition(saved.x, saved.y));
+      if (monitor) {
+        // A size saved on a larger display (or before a scaling change) must
+        // still fit this one, with the footer and Run button on screen.
+        const area = monitor.workArea ?? { position: monitor.position, size: monitor.size };
+        const width = Math.min(saved.width, area.size.width);
+        const height = Math.min(saved.height, area.size.height);
+        const clamp = (value: number, low: number, high: number) =>
+          Math.min(Math.max(value, low), Math.max(low, high));
+        await window.setSize(new PhysicalSize(width, height));
+        await window.setPosition(
+          new PhysicalPosition(
+            clamp(saved.x, area.position.x, area.position.x + area.size.width - width),
+            clamp(saved.y, area.position.y, area.position.y + area.size.height - height),
+          ),
+        );
       }
       if (saved.maximized) await window.maximize();
     } catch {

@@ -44,3 +44,16 @@ export function errorMessage(error: unknown): string {
 export function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
+
+/**
+ * A path as people write it. Windows canonical paths carry the verbatim
+ * prefix (\\?\C:\… or \\?\UNC\server\…), which is noise in labels and logs.
+ */
+export function displayPath(path: string): string {
+  return path.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\(?=[a-z]:\\)/i, '');
+}
+
+/** Replace every canonical (\\?\) path inside a message with its display form. */
+export function displayPaths(text: string): string {
+  return text.replace(/\\\\\?\\UNC\\/gi, '\\\\').replace(/\\\\\?\\(?=[a-z]:\\)/gi, '');
+}

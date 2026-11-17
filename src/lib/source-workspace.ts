@@ -36,6 +36,61 @@ export function firstTrackSelection(
   });
 }
 
+type StreamFacts = {
+  kind: string;
+  codec?: string | null;
+  attachmentMimeType?: string | null;
+  attachmentFilename?: string | null;
+};
+
+/** A font attached to a Matroska file, as styled (ASS/SSA) subtitles use. */
+export function isFontAttachment(stream: StreamFacts | undefined): boolean {
+  if (stream?.kind !== 'attachment') return false;
+  const mime = stream.attachmentMimeType?.toLowerCase() ?? '';
+  const name = stream.attachmentFilename?.toLowerCase() ?? '';
+  // FFmpeg names recognised font attachments by codec (ttf, otf); others only
+  // by MIME type or file name.
+  return (
+    ['ttf', 'otf'].includes(stream.codec?.toLowerCase() ?? '') ||
+    mime.startsWith('font/') ||
+    /(?:truetype|opentype|font-ttf|font-otf|x-font)/.test(mime) ||
+    /\.(?:ttf|otf|ttc|woff2?)$/.test(name)
+  );
+}
+
+export function isStyledSubtitle(stream: StreamFacts | undefined): boolean {
+  return stream?.kind === 'subtitle' && ['ass', 'ssa'].includes(stream.codec ?? '');
+}
+
+/**
+ * Styled subtitles render with the fonts packed beside them. Include a file's
+ * fonts when one of its ASS/SSA tracks becomes included, and leave them out
+ * again with the last one. Between those changes the user's own font choices
+ * stand.
+ */
+export function syncSubtitleFonts(
+  rows: TrackSelection[],
+  streamOf: (row: TrackSelection) => StreamFacts | undefined,
+  previous: TrackSelection[] = [],
+): TrackSelection[] {
+  const styled = (list: TrackSelection[], sourceId: string) =>
+    list.some(
+      (row) => row.sourceId === sourceId && row.included && isStyledSubtitle(streamOf(row)),
+    );
+  const changes = new Map<string, boolean>();
+  for (const sourceId of new Set(rows.map((row) => row.sourceId))) {
+    const now = styled(rows, sourceId);
+    const before = previous.length ? styled(previous, sourceId) : false;
+    if (now !== before) changes.set(sourceId, now);
+  }
+  if (!changes.size) return rows;
+  return rows.map((row) =>
+    changes.has(row.sourceId) && isFontAttachment(streamOf(row))
+      ? { ...row, included: changes.get(row.sourceId)! }
+      : row,
+  );
+}
+
 /** Active tabs register the source-style global Run action with the shell. */
 export type WorkspaceAction = {
   run: (options?: { editCommand?: boolean; isShiftHeld?: () => boolean }) => Promise<void>;

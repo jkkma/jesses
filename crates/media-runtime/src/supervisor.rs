@@ -149,7 +149,9 @@ impl std::fmt::Display for PipelineStage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
-    #[error("The job was cancelled.")]
+    // Both Stop (which keeps verified progress) and Abort end the tools this
+    // way, so the wording must not claim the work was thrown away.
+    #[error("The job's tools were stopped.")]
     Cancelled,
     #[error("The tool exceeded its time limit.")]
     Timeout,

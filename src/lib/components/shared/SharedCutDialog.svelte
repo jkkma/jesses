@@ -365,9 +365,13 @@
 </SourceDialog>
 
 <style>
+  /* A definite single cell lets the image's percentage size resolve, so a
+     16:9 or portrait frame is letterboxed whole instead of laid out at its
+     natural height and clipped. */
   .preview {
     height: 300px;
     display: grid;
+    grid-template: 100% / 100%;
     place-items: center;
     background: var(--muted);
     overflow: hidden;
@@ -375,6 +379,8 @@
   .preview img {
     width: 100%;
     height: 100%;
+    min-width: 0;
+    min-height: 0;
     object-fit: contain;
   }
   .slider {

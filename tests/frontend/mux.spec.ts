@@ -76,7 +76,7 @@ test('selected tracks with colliding indices retain independent metadata, order 
   await quick.getByRole('tab', { name: 'Metadata' }).click();
   await quick.getByLabel('Copy Metadata From').selectOption('/media/voice.mka');
   await quick.getByLabel('Copy Chapters From').selectOption('/media/picture.mkv');
-  const voice = quick.getByRole('row').filter({ hasText: 'voice.mka #0' });
+  const voice = quick.getByRole('row').filter({ hasText: 'Audio #01 (AAC) · voice.mka' });
   await voice.getByLabel('Title for track 0').fill("Dub's ${title} 日本語");
   await voice.getByLabel('Language for track 0').fill('spa');
   await quick.getByLabel('Output Path', { exact: true }).fill('/media/combined');
@@ -122,7 +122,10 @@ test('selected tracks with colliding indices retain independent metadata, order 
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await quick.getByRole('tab', { name: 'Metadata' }).click();
   await expect(
-    quick.getByRole('row').filter({ hasText: 'voice.mka #0' }).getByLabel('Title for track 0'),
+    quick
+      .getByRole('row')
+      .filter({ hasText: 'Audio #01 (AAC) · voice.mka' })
+      .getByLabel('Title for track 0'),
   ).toHaveValue("Dub's ${title} 日本語");
 });
 
@@ -359,7 +362,7 @@ test('MOV maps checked external data and drops an incompatible attachment before
   await page.getByRole('option', { name: /data.mov/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('checkbox', { name: /Include .*Data/ }).check();
-  await page.getByRole('checkbox', { name: /Include .*Attachment/ }).check();
+  await page.getByRole('checkbox', { name: /Include .*Font/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Codec', { exact: true }).selectOption('copy');
@@ -367,12 +370,12 @@ test('MOV maps checked external data and drops an incompatible attachment before
   await quick.getByRole('tab', { name: 'Metadata' }).click();
   await quick
     .getByRole('row')
-    .filter({ hasText: 'first.mkv #3' })
+    .filter({ hasText: 'Audio #04 (AAC) · first.mkv' })
     .getByLabel('Title for track 3')
     .fill('Main audio');
   await quick
     .getByRole('row')
-    .filter({ hasText: 'data.mov #0' })
+    .filter({ hasText: 'Data #01 · data.mov' })
     .getByLabel('Title for track 0')
     .fill('GPS');
   await page.getByRole('button', { name: 'Run: Encode' }).click();

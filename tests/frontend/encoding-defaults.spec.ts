@@ -12,15 +12,12 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
     await expect(
       region.getByLabel(workflow === 'AV1AN' ? 'Encoder' : 'Codec', { exact: true }),
     ).toHaveValue('svtAv1Hdr');
-    await expect(region.getByLabel('Container', { exact: true })).toHaveValue(
-      workflow === 'AV1AN' ? 'webm' : 'mp4',
-    );
+    // Both tabs share one default container and one default quality per encoder.
+    await expect(region.getByLabel('Container', { exact: true })).toHaveValue('matroska');
     await expect(region.getByLabel('Quality Mode', { exact: true })).toHaveValue(
       workflow === 'AV1AN' ? 'crf' : 'quality',
     );
-    await expect(region.getByLabel('Quality', { exact: true })).toHaveValue(
-      workflow === 'AV1AN' ? '35' : '20',
-    );
+    await expect(region.getByLabel('Quality', { exact: true })).toHaveValue('30');
     await expect(region.getByLabel('Preset / Effort', { exact: true })).toHaveValue('4');
     await expect(region.getByLabel('Tune', { exact: true })).toHaveValue('visualQuality');
     await expect(region.getByLabel('Color Format', { exact: true })).toHaveValue('yuv420p10le');
@@ -64,7 +61,7 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
     expect(request.settings).toMatchObject({
       encoder: 'svtAv1Hdr',
       hdrTune: 'visualQuality',
-      crf: workflow === 'AV1AN' ? 35 : 20,
+      crf: 30,
       preset: 4,
     });
     expect(

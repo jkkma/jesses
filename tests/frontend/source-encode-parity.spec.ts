@@ -18,12 +18,12 @@ test('source tabs, defaults and conditional options follow each encoding view', 
     'Advanced',
   ]);
   await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('svtAv1Hdr');
-  await expect(quick.getByLabel('Container')).toHaveValue('mp4');
+  await expect(quick.getByLabel('Container')).toHaveValue('matroska');
   await expect(quick.getByLabel('Quality Mode')).toHaveValue('quality');
   await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
   await expect(quick.getByLabel('Codec', { exact: true })).toHaveValue('opus');
   await expect(quick.getByLabel('Bitrate (Kbps)')).toHaveValue('128');
-  await expect(quick.getByLabel('Channels')).toHaveValue('stereo');
+  await expect(quick.getByLabel('Channels')).toHaveValue('preserve');
   await quick.getByLabel('Configuration').selectOption('perTrack');
   await expect(quick.getByLabel('Configuration')).toHaveValue('same');
   await expect(quick.getByRole('alert')).toContainText('requires a loaded audio track');
@@ -57,15 +57,15 @@ test('global Run emits typed default source settings and selected tracks', async
   const request = calls.find((call: any) => call.command === 'mock_start_encode')?.payload.request;
   expect(request.source).toMatchObject({
     inputPath: '/media/input.mkv',
-    outputPath: '/media/output.mp4',
+    outputPath: '/media/output.mkv',
     streamIndices: [0, 1, 2],
   });
   expect(request.settings).toMatchObject({
     backend: 'standalone',
     encoder: 'svtAv1Hdr',
-    crf: 20,
-    svtCrfQuarterSteps: 80,
-    audio: [{ streamIndex: 1, codec: 'opus', bitrateKbps: 128, channels: 'stereo' }],
+    crf: 30,
+    svtCrfQuarterSteps: 120,
+    audio: [{ streamIndex: 1, codec: 'opus', bitrateKbps: 128, channels: 'preserve' }],
   });
 });
 
@@ -104,7 +104,7 @@ test('source output box is a stem; format switches and collisions resolve to the
 }) => {
   await page.evaluate(() => {
     (globalThis as any).__occupied = [
-      '/media/input.mp4',
+      '/media/input.mkv',
       '/media/chosen.mp4',
       '/media/chosen.gif',
       '/media/chosen',
@@ -344,7 +344,7 @@ test('an encode snapshots its output, format and settings before awaiting name r
             ?.payload.request,
       ),
     )
-    .toMatchObject({ source: { outputPath: '/media/original.mp4' }, settings: { crf: 20 } });
+    .toMatchObject({ source: { outputPath: '/media/original.mkv' }, settings: { crf: 30 } });
   await expect(q.getByLabel('Output Path', { exact: true })).toHaveValue('/media/newer');
 });
 
@@ -648,9 +648,9 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
   const preview = calls.find((c: any) => c.command === 'preview_encode_batch').payload.request;
   expect(preview).toMatchObject({
     outputDirectory: '',
-    outputContainer: 'mp4',
+    outputContainer: 'matroska',
     outputNameTemplate: '{name}_{codec}_{preset}',
-    sourceNaming: { codec: 'av1', quality: '20', preset: '4' },
+    sourceNaming: { codec: 'av1', quality: '30', preset: '4' },
   });
   expect(preview.inputs.map((input: any) => input.subtitles)).toEqual([
     [{ streamIndex: 2, mode: 'copy', burnIn: true }],
@@ -836,7 +836,7 @@ test('source menus and codec-dependent options match the CPU-only user scope', a
     },
     {
       codec: 'svtAv1Hdr',
-      quality: '20',
+      quality: '30',
       preset: '4',
       presets: Array.from({ length: 13 }, (_, i) => String(i)),
       colors: ['YUV - 4:2:0 - 8 bit', 'YUV - 4:2:0 - 10 bit'],
@@ -1004,7 +1004,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
   const rows = [
     {
       encoder: 'aomAv1',
-      q: '20',
+      q: '30',
       max: '63',
       p: '6',
       poptions: Array.from({ length: 7 }, (_, i) => String(i)),
@@ -1013,7 +1013,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
     },
     {
       encoder: 'svtAv1',
-      q: '35',
+      q: '30',
       max: '63',
       p: '4',
       poptions: Array.from({ length: 13 }, (_, i) => String(i)),
@@ -1022,7 +1022,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
     },
     {
       encoder: 'vpxStandalone',
-      q: '20',
+      q: '30',
       max: '50',
       p: '3',
       poptions: Array.from({ length: 7 }, (_, i) => String(i)),
@@ -1031,7 +1031,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
     },
     {
       encoder: 'x265Standalone',
-      q: '20',
+      q: '22',
       max: '51',
       p: '5',
       poptions: ['veryslow', 'slower', 'slow', 'medium', 'fast', 'faster', 'veryfast', 'superfast'],
@@ -2405,7 +2405,7 @@ test('batch samples live Shift per file and continues after a canceled review', 
   await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Failed');
 });
 
-test('stopping a batch terminal wait cancels only its current job and skips later files', async ({
+test('stopping a batch terminal wait stops only its current job, keeping progress, and skips later files', async ({
   page,
 }) => {
   const second = { ...source, id: 'source-2', path: '/other/second.mkv', name: 'second.mkv' };
@@ -2455,11 +2455,16 @@ test('stopping a batch terminal wait cancels only its current job and skips late
       page.evaluate(() => {
         const calls = (globalThis as any).__sourceCalls;
         const id = calls.find((c: any) => c.command === 'confirm_command_edit')?.payload.request.id;
-        return (
+        const touched = new Set(
           calls
-            .filter((c: any) => c.command === 'cancel_job')
-            .map((c: any) => c.payload.id)
-            .join(',') === id
+            .filter((c: any) => c.command === 'stop_job' || c.command === 'cancel_job')
+            .map((c: any) => c.payload.id),
+        );
+        // Stop keeps the current file's progress (stop_job first); the queued
+        // unrelated job is not touched.
+        return (
+          calls.some((c: any) => c.command === 'stop_job' && c.payload.id === id) &&
+          [...touched].join(',') === id
         );
       }),
     )

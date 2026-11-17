@@ -212,6 +212,8 @@ test('reopening a loaded recent selects it without duplicate probing', async ({ 
   await page.goto('/');
   await openRecent(page, 'C:\\media\\sample.mkv');
   await openRecent(page, 'C:\\media\\second.mkv');
+  // With a file loaded, a recent file asks whether it replaces the list or joins it.
+  await page.getByRole('button', { name: 'Add to file list', exact: true }).click();
   await expect(page.getByRole('option', { name: /second.mkv/ })).toBeVisible();
   await openRecent(page, 'C:\\media\\sample.mkv');
   await expect(page.getByRole('option', { name: /sample.mkv/ })).toHaveAttribute(

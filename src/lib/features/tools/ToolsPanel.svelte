@@ -23,6 +23,7 @@
     checked,
     error,
     onrefresh,
+    preferences = true,
   }: {
     tools: ToolInfo[];
     desktop: boolean;
@@ -30,6 +31,8 @@
     checked: boolean;
     error: string | null;
     onrefresh: () => void;
+    /** Settings shows its own preferences above this panel. */
+    preferences?: boolean;
   } = $props();
   const available = $derived(tools.filter((tool) => tool.available).length);
   let locations = $state<[string, string][]>([]);
@@ -51,12 +54,12 @@
   });
 </script>
 
-<section class="tools-workspace" aria-label="Tools and settings">
+<section class="tools-workspace" aria-label="Installed tools">
   <div class="view-intro">
     <div>
-      <span class="eyebrow">Installed tools & app settings</span>
+      <span class="eyebrow">Installed tools</span>
       <h1>Tools & environment</h1>
-      <p>Check what jesses can use, then set defaults for future jobs.</p>
+      <p>Check which tools jesses found, and why one is missing.</p>
     </div>
     <Button variant="outline" onclick={onrefresh} disabled={!desktop || loading}
       ><RefreshCw size={14} class={loading ? 'spinning' : ''} aria-hidden="true" />Check again</Button
@@ -163,7 +166,7 @@
     </div>
   </section>
   {#if desktop}
-    <PreferencesPanel />
+    {#if preferences}<PreferencesPanel />{/if}
     <section class="panel scorer-panel">
       <div class="section-heading">
         <span class="heading-with-icon"

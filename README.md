@@ -63,12 +63,20 @@ provide the desktop's local media access or native tools.
 4. Press **Run** in the shared footer. Progress, Pause/Resume where supported,
    Stop, and the activity log remain accessible across tabs. Batch mode runs
    eligible tasks in file order, with a naming template and per-file status.
+   Stop keeps an encode's finished work so it can be resumed; discarding it is a
+   separate action (Abort in the encoding window, or Delete in AV1AN's
+   **Resume…** dialog).
 
 Quick Convert encoding opens a separate, resizable processing window with live,
 syntax-highlighted tool output, progress, and Pause/Resume, Stop and Abort
 controls. Closing this window leaves the job running; **Show encoding window**
-in the main log toolbar reopens it. Closing the main Jesses window cancels active
-and queued jobs.
+in the main log toolbar reopens it. Closing the main Jesses window while jobs are
+running or queued asks first; started encodes then stop with their progress kept,
+and queued jobs are canceled.
+
+New jobs default to MKV, keep each audio track's channels, and keep the fonts of
+styled (ASS) subtitles. **Settings** lists every tool Jesses found, with its
+version, location and the reason a missing one was not usable.
 
 Quick Convert and AV1AN provide trim, crop, resize, borders, frame processing,
 color and tone-mapping controls, audio and subtitle options, and advanced encoder

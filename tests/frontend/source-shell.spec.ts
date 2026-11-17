@@ -472,7 +472,7 @@ test('selected attachment extracts the correct source-scoped stream and opens it
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
   await expect(tracks.getByRole('button', { name: 'Extract', exact: true })).toHaveCount(0);
-  await tracks.getByRole('option', { name: /Attachment/ }).click();
+  await tracks.getByRole('option', { name: /Font \(TTF\)/ }).click();
   await tracks.getByRole('button', { name: 'Extract', exact: true }).click();
   await expect
     .poll(() =>
@@ -875,7 +875,7 @@ test('removing the loaded source promotes the first remaining file and loads its
   await page.getByRole('button', { name: 'Track List', exact: true }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
   await expect(tracks.getByRole('listbox', { name: 'Tracks' }).getByRole('option')).toHaveCount(4);
-  await expect(tracks.getByRole('option', { name: /Attachment.*Font/ })).toBeVisible();
+  await expect(tracks.getByRole('option', { name: /Font \(TTF\).*Font/ })).toBeVisible();
 });
 
 test('mode transition clears the assembled tracks and restores a single file on return to mux', async ({
@@ -973,18 +973,19 @@ test('Sample Encodes parses integer CRFs like the fork and falls back for invali
     .toEqual([20, 30, 63]);
 });
 
-test('default selectors use per-kind ordinals while requests retain source-scoped stream identities', async ({
+test('default selectors number tracks as the list does while requests retain source-scoped stream identities', async ({
   page,
 }) => {
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('option', { name: /A.mkv/ }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
+  // "#02" names the same track in the list and in the default menus.
   await expect(tracks.getByLabel('Default Audio').getByRole('option').first()).toHaveText(
-    '#01 - ENG',
+    '#02 - ENG',
   );
   await expect(tracks.getByLabel('Default Subtitles').getByRole('option').nth(1)).toHaveText(
-    '#01 - ENG (ASS)',
+    '#03 - ENG (ASS)',
   );
   await expect(tracks.getByLabel('Default Audio').getByRole('option').first()).toHaveAttribute(
     'value',
@@ -1595,7 +1596,7 @@ test('Quick Convert encodes the managed sequence while output remains beside its
     )
     .toMatchObject({
       inputPath: 'C:\\private\\sequence.mkv',
-      outputPath: 'C:\\media\\frames.01.mp4',
+      outputPath: 'C:\\media\\frames.01.mkv',
     });
 });
 
@@ -1657,7 +1658,7 @@ test('batch naming example uses the full dotted sequence folder name and an empt
   await expect(page.getByRole('option', { name: /frames\.01/ })).toBeVisible();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByLabel('Output Names').fill('{name}-{ext}');
-  await expect(page.getByText('e.g. frames.01 → frames.01-.webm')).toBeVisible();
+  await expect(page.getByText('e.g. frames.01 → frames.01-.mkv')).toBeVisible();
 });
 
 for (const reusedCache of [false, true]) {

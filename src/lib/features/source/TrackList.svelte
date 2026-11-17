@@ -2,6 +2,8 @@
   import type { MediaFile, MediaStream } from '$lib/ipc/generated';
   import {
     firstTrackSelection,
+    isFontAttachment,
+    syncSubtitleFonts,
     trackKind,
     type FileListMode,
     type TrackSelection,
@@ -79,7 +81,9 @@
     const source = files.find((file) => file.id === row.sourceId);
     const lines = [
       `Source File: ${source?.name ?? ''}`,
-      `Codec: ${item.codecLongName ?? item.codec ?? 'Unknown'} (${item.codec ?? 'unknown'})`,
+      item.kind === 'attachment'
+        ? `Type: ${isFontAttachment(item) ? `Font (${fontType(item)})` : 'File attachment'}`
+        : `Codec: ${item.codecLongName ?? item.codec ?? 'Unknown'} (${item.codec ?? 'unknown'})`,
     ];
     if (item.kind === 'video') {
       const [n, d] = (item.frameRate ?? '').split('/').map(Number);
@@ -123,6 +127,34 @@
     return lines.join('\n');
   }
   const blocked = $derived(mode === 'batch');
+  /** FFprobe names formats by demuxer ("mov,mp4,m4a,3gp,3g2,mj2"); show the file's own kind. */
+  function containerName(file: MediaFile) {
+    const format = file.format ?? '';
+    const extension = file.name.split('.').at(-1)?.toLowerCase() ?? '';
+    const byExtension: Record<string, string> = {
+      mkv: 'Matroska (MKV)',
+      mka: 'Matroska audio (MKA)',
+      webm: 'WebM',
+      mp4: 'MP4',
+      m4v: 'MP4',
+      m4a: 'MP4 audio (M4A)',
+      mov: 'QuickTime (MOV)',
+      '3gp': '3GP',
+      ts: 'MPEG transport stream',
+      m2ts: 'Blu-ray transport stream (M2TS)',
+      mts: 'AVCHD transport stream (MTS)',
+      avi: 'AVI',
+    };
+    if (format.includes(',') || byExtension[extension])
+      return byExtension[extension] ?? format.split(',')[0];
+    return format || 'Unknown';
+  }
+  function fontType(item: MediaStream) {
+    const name = item.attachmentFilename ?? '';
+    const extension = name.includes('.') ? name.split('.').at(-1)?.toUpperCase() : undefined;
+    if (extension && extension.length <= 5) return extension;
+    return ['ttf', 'otf'].includes(item.codec ?? '') ? item.codec!.toUpperCase() : 'font';
+  }
   function codecName(codec: string | null | undefined) {
     const value = codec ?? 'unknown',
       lower = value.toLowerCase();
@@ -137,6 +169,7 @@
       (
         {
           webvtt: 'WebVTT',
+          mov_text: 'MP4 Text',
           truehd: 'TrueHD',
           opus: 'Opus',
           pcm_bluray: 'Blu-ray PCM',
@@ -169,15 +202,20 @@
         }
       ).zeroIndexedStreams ?? false;
     const number = String(row.streamIndex + (zeroBased ? 0 : 1)).padStart(2, '0');
+    const font = isFontAttachment(item);
     const kind =
       item?.kind === 'subtitle'
         ? 'Subtitles'
         : trackKind(item) === 'cover'
           ? 'Cover'
-          : item?.kind
-            ? item.kind[0].toUpperCase() + item.kind.slice(1)
-            : 'Track';
-    const parts = [`(${codecName(item?.codec)})`];
+          : font
+            ? 'Font'
+            : item?.kind
+              ? item.kind[0].toUpperCase() + item.kind.slice(1)
+              : 'Track';
+    const parts = [
+      `(${font ? fontType(item!) : item?.kind === 'attachment' ? 'File' : codecName(item?.codec)})`,
+    ];
     if (item?.kind === 'video') {
       if (row.language && row.language.toLowerCase() !== 'und')
         parts.push(row.language.toUpperCase().slice(0, 7));
@@ -193,8 +231,9 @@
       parts.push(item.attachmentFilename.slice(0, 50));
     return `[#${number}]: ${kind} ${parts.join(' - ')}`;
   };
-  function defaultDisplay(row: TrackSelection, index: number, subtitle: boolean) {
-    const number = index + (preferences.value.general.zeroIndexedStreams ? 0 : 1);
+  // Numbered like the list above, so "#02" names the same track in both.
+  function defaultDisplay(row: TrackSelection, subtitle: boolean) {
+    const number = row.streamIndex + (preferences.value.general.zeroIndexedStreams ? 0 : 1);
     const parts = [
       `#${String(number).padStart(2, '0')}`,
       row.language.toUpperCase().slice(0, 6),
@@ -207,10 +246,15 @@
       tracks.map((item) => (key(item) === key(row) ? { ...item, included: !item.included } : item)),
     );
   }
-  function updateChecked(next: TrackSelection[]) {
+  // A Select… preset rewrites every row, so its fonts follow the new subtitle
+  // choice as on a fresh load; a single click only reacts to what changed.
+  function updateChecked(next: TrackSelection[], fresh = false) {
+    next = syncSubtitleFonts(next, stream, fresh ? [] : tracks);
     for (const kind of ['audio', 'subtitle']) {
       if (kind === 'subtitle' && noDefaultSubtitles) continue;
       const candidates = next.filter((row) => row.included && stream(row)?.kind === kind);
+      // Subtitles the source marked as not default stay off until chosen.
+      if (kind === 'subtitle' && candidates.every((row) => row.defaultFlag === false)) continue;
       if (candidates.length && !candidates.some((row) => row.defaultFlag === true)) {
         const first = key(candidates[0]);
         next = next.map((row) => (key(row) === first ? { ...row, defaultFlag: true } : row));
@@ -220,7 +264,10 @@
   }
   function selectAll(option: string) {
     if (option === 'first') {
-      updateChecked(firstTrackSelection(tracks, (row) => trackKind(stream(row))));
+      updateChecked(
+        firstTrackSelection(tracks, (row) => trackKind(stream(row))),
+        true,
+      );
       return;
     }
     const seen = new Set<string>();
@@ -244,6 +291,7 @@
         }
         return { ...row, included };
       }),
+      !['none', 'invert'].includes(option),
     );
   }
   function sortBy(option: string) {
@@ -280,10 +328,10 @@
 </script>
 
 <section class="track-list" aria-label="Track List">
-  {#if mainFile}<p class="format-info">
+  {#if mainFile}<p class="format-info" title={mainFile.title ?? undefined}>
       {mainFile.title && mainFile.title.trim().length > 2
-        ? `Title: ${mainFile.title.slice(0, 30)} - `
-        : ''}Format: {mainFile.format ?? 'Unknown'} - Duration: {formatDuration(
+        ? `Title: ${mainFile.title.length > 70 ? `${mainFile.title.slice(0, 69)}…` : mainFile.title} - `
+        : ''}Format: {containerName(mainFile)} - Duration: {formatDuration(
         mainFile.durationSeconds ?? 0,
       )}{mainFile.bitRate ? ` - Bitrate: ${(Number(mainFile.bitRate) / 1000).toFixed(0)} kbps` : ''} -
       Size: {formatBytes(mainFile.sizeBytes)}
@@ -378,8 +426,7 @@
             },
         )}
         onchange={(event) => setDefault('audio', event.currentTarget.value)}
-        >{#each audio as row, index}<option value={key(row)}
-            >{defaultDisplay(row, index, false)}</option
+        >{#each audio as row}<option value={key(row)}>{defaultDisplay(row, false)}</option
           >{/each}</select
       ></label
     ><label
@@ -389,8 +436,8 @@
           ? key(subtitles.find((row) => row.defaultFlag === true)!)
           : ''}
         onchange={(event) => setDefault('subtitle', event.currentTarget.value)}
-        ><option value="">None</option>{#each subtitles as row, index}<option value={key(row)}
-            >{defaultDisplay(row, index, true)}</option
+        ><option value="">None</option>{#each subtitles as row}<option value={key(row)}
+            >{defaultDisplay(row, true)}</option
           >{/each}</select
       ></label
     >
@@ -416,6 +463,9 @@
     margin: 0;
     color: var(--muted-foreground);
     font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .track-body {
     flex: 1 1 0;

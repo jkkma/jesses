@@ -73,6 +73,29 @@ export function audioCompatibilityError(
   return null;
 }
 
+/**
+ * "Keep original" for a codec that cannot carry the source's speaker layout as
+ * it is (Opus and 5.1(side), for example): keep the channel count and use
+ * FFmpeg's standard layout for it, so 5.1(side) becomes 5.1 instead of the job
+ * being refused. Every other choice is returned unchanged.
+ */
+export function resolvedChannels(
+  codec: AudioTrackDraft['codec'],
+  channels: AudioTrackDraft['channels'],
+  stream: MediaStream | undefined,
+): AudioTrackDraft['channels'] {
+  if (channels !== 'preserve' || !stream?.channels || !stream.channelLayout) return channels;
+  const unsupported =
+    codec === 'opus' || codec === 'vorbis'
+      ? ['4.0', 'quad(side)', '5.0(side)', '5.1(side)']
+      : codec === 'flac'
+        ? ['4.0', 'quad(side)']
+        : [];
+  return unsupported.includes(stream.channelLayout)
+    ? { explicit: { count: stream.channels, layout: 'ffmpegDefault' } }
+    : channels;
+}
+
 export function defaultAudio(streams: MediaStream[]): AudioTrackDraft[] {
   return streams
     .filter((stream) => stream.kind === 'audio')

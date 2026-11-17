@@ -219,15 +219,25 @@ impl Document {
 /// has no per-track creation time, so FFmpeg drops it there.
 pub(super) fn is_derived_stream_tag(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
+    // ENCODER_SETTINGS describes the encode that produced the stream, like
+    // ENCODER: a re-encode replaces it, and it is not user metadata.
     matches!(
         key.as_str(),
-        "encoder" | "duration" | "bps" | "number_of_frames" | "number_of_bytes" | "creation_time"
+        "encoder"
+            | "encoder_settings"
+            | "duration"
+            | "bps"
+            | "number_of_frames"
+            | "number_of_bytes"
+            | "creation_time"
     ) || key.starts_with("_statistics_")
-        || ["duration-", "encoder-"].iter().any(|prefix| {
-            key.strip_prefix(prefix).is_some_and(|suffix| {
-                suffix.len() == 3 && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
+        || ["duration-", "encoder-", "encoder_settings-"]
+            .iter()
+            .any(|prefix| {
+                key.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.len() == 3 && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
             })
-        })
         || key.starts_with("bps-")
         || key.starts_with("number_of_frames-")
         || key.starts_with("number_of_bytes-")
@@ -644,6 +654,23 @@ mod tests {
         let mut output = source.clone();
         output.format.as_mut().unwrap().duration = Some(output_duration.into());
         (source, output)
+    }
+
+    #[test]
+    fn encoder_provenance_tags_are_derived_but_user_tags_are_not() {
+        // A re-encode blanks derived tags, so the old encoder's settings never
+        // describe the new stream, and MP4 does not refuse them.
+        for key in ["ENCODER", "encoder_settings", "ENCODER_SETTINGS-eng", "BPS"] {
+            assert!(is_derived_stream_tag(key), "{key}");
+        }
+        for key in [
+            "title",
+            "comment",
+            "ENCODER_SETTINGS_NOTE",
+            "encoder_settings-x",
+        ] {
+            assert!(!is_derived_stream_tag(key), "{key}");
+        }
     }
 
     #[test]

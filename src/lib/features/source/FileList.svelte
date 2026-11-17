@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { MediaFile } from '$lib/ipc/generated';
   import type { FileListMode } from '$lib/source-workspace';
-  import { formatBytes } from '$lib/components/shared/format';
+  import { displayPath, fileName, formatBytes } from '$lib/components/shared/format';
   import SourceThumbnail from './SourceThumbnail.svelte';
   let {
     files,
@@ -91,7 +91,22 @@
       <span class="batch-example">{batchExample}</span>{/if}
   </div>
   <div class="files-body">
-    <div class="rows" role="listbox" aria-label="Files" aria-multiselectable="true">
+    <div
+      class="rows"
+      role="listbox"
+      aria-label="Files"
+      aria-multiselectable="true"
+      tabindex="-1"
+      onkeydown={(event) => {
+        if (event.key === 'Delete' && selectedIds.length && !importing) {
+          event.preventDefault();
+          onremove();
+        } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+          event.preventDefault();
+          onselect(files.map((file) => file.id));
+        }
+      }}
+    >
       {#each files as file (file.id)}<button
           type="button"
           role="option"
@@ -104,9 +119,13 @@
             onselect([file.id]);
             onload();
           }}
-          >{#if statuses[file.id]}<span aria-hidden="true">{statuses[file.id].glyph}</span
-            >{/if}<span>{file.name} ({formatBytes(file.sizeBytes)})</span
-          >{#if statuses[file.id]}<span class="batch-status">{statuses[file.id].text}</span
+          >{#if statuses[file.id]}<span class="batch-glyph" aria-hidden="true"
+              >{statuses[file.id].glyph}</span
+            >{/if}<span class="file-name">{file.name} ({formatBytes(file.sizeBytes)})</span
+          >{#if statuses[file.id]}<span class="batch-status"
+              >{statuses[file.id].text}{#if statuses[file.id].note}<span class="batch-note"
+                  >: {statuses[file.id].note}</span
+                >{/if}</span
             >{/if}</button
         >
       {:else}<div class="empty">
@@ -117,22 +136,31 @@
   </div>
   <div class="file-actions">
     <span class="file-count"
-      >{files.length}
-      {files.length === 1 ? 'file' : 'files'} loaded.{#if files.length > 1 && mode === 'mux'}
-        Double click any of them or use the Load Tracks button to load their tracks.{/if}</span
+      >{`${files.length} ${files.length === 1 ? 'file' : 'files'} loaded.${
+        files.length > 1 && mode === 'mux'
+          ? ' Double click any of them or use the Load Tracks button to load their tracks.'
+          : ''
+      }`}</span
     >
     <button type="button" onclick={onadd} disabled={!desktop || importing}>Add Files…</button
     ><button type="button" onclick={onfolder} disabled={!desktop || importing}>Add Folder…</button>
     <details>
       <summary class:disabled={!recentPaths.length}>Recent…</summary>
-      <div class="menu">
-        {#each recentPaths as path}<button
+      <div class="menu recent">
+        {#each recentPaths as path}{@const shown = displayPath(path)}<button
             type="button"
+            title={shown}
+            aria-label={shown}
             onclick={(event) => {
               onrecent(path);
               (event.currentTarget.closest('details') as HTMLDetailsElement).open = false;
-            }}>{path}</button
-          >{/each}
+            }}
+            ><span class="recent-name">{fileName(shown)}</span><span class="recent-folder"
+              >{shown
+                .slice(0, Math.max(0, shown.length - fileName(shown).length))
+                .replace(/[\\/]$/, '')}</span
+            ></button
+          >{:else}<span class="recent-empty">No recent files yet.</span>{/each}
       </div>
     </details>
     <button
@@ -170,6 +198,8 @@
 
 <style>
   .batch-example {
+    flex: 1 1 0;
+    min-width: 160px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -178,13 +208,25 @@
   }
   .batch-status {
     margin-left: auto;
+    max-width: 55%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--muted-foreground);
     font-size: 12px;
   }
+  .file-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The list shrinks before the buttons below it leave the panel on short
+     windows (Batch mode adds a naming row above it). */
   .file-list {
     height: 100%;
     display: grid;
-    grid-template-rows: auto minmax(300px, 1fr) auto;
+    grid-template-rows: auto minmax(120px, 1fr) auto;
     gap: 0.6rem;
   }
   .mode-line,
@@ -209,9 +251,10 @@
     max-width: 100%;
   }
   .files-body {
-    min-height: 300px;
+    min-height: 120px;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(200px, 384px);
+    grid-template-rows: minmax(0, 1fr);
     gap: 10px;
   }
   .rows {
@@ -221,7 +264,9 @@
     background: var(--background);
   }
   .rows > button {
-    display: block;
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
     text-align: left;
     width: 100%;
     border: 0;
@@ -295,6 +340,28 @@
   }
   .menu button:hover {
     background: var(--accent);
+  }
+  .menu.recent {
+    width: min(420px, 70vw);
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .menu.recent button {
+    display: grid;
+    gap: 1px;
+  }
+  .recent-name,
+  .recent-folder {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .recent-folder {
+    color: var(--muted-foreground);
+    font-size: 11px;
+  }
+  .recent-empty {
+    padding: 0.4rem 0.7rem;
+    color: var(--muted-foreground);
   }
   .help p {
     bottom: auto;

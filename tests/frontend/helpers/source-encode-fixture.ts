@@ -378,9 +378,16 @@ export async function installSourceEncodeFixture(page: Page) {
           emitJobs();
           return state.__testJobs.find((entry: any) => entry.id === payload.id);
         }
+        if (command === 'stop_job') {
+          state.__testJobs = state.__testJobs.map((entry: any) =>
+            entry.id === payload.id ? { ...entry, state: 'stopped' } : entry,
+          );
+          emitJobs();
+          return state.__testJobs.find((entry: any) => entry.id === payload.id);
+        }
         if (command === 'cancel_all_jobs') {
           state.__testJobs = state.__testJobs.map((entry: any) =>
-            ['succeeded', 'failed', 'canceled', 'interrupted'].includes(entry.state)
+            ['succeeded', 'failed', 'canceled', 'interrupted', 'stopped'].includes(entry.state)
               ? entry
               : { ...entry, state: 'canceled' },
           );
@@ -431,6 +438,7 @@ export async function installSourceEncodeFixture(page: Page) {
             });
           return {
             imageDataUrl:
+              state.__previewDataUrl ??
               'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
             width: 1,
             height: 1,

@@ -50,7 +50,7 @@ test('implicit image request freezes all inputs, checked tracks and source nonvi
   await quick.getByLabel('Language for output file').fill('  jpn  ');
   await quick.getByLabel('Copy Metadata From').selectOption('/other/voice.mka');
   await quick.getByLabel('Copy Chapters From').selectOption('/media/input.mkv');
-  const voice = quick.getByRole('row').filter({ hasText: 'voice.mka #1' });
+  const voice = quick.getByRole('row').filter({ hasText: /Audio #02 .*· voice\.mka/ });
   await voice.getByLabel('Title for track 1').fill('Dub');
   await voice.getByLabel('Language for track 1').fill('spa');
   await quick.getByLabel('Output Path', { exact: true }).fill('/media/images');
@@ -259,7 +259,7 @@ test('implicit image preserves attachment metadata input and surfaces native fai
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('checkbox', { name: /Include .*Video/ }).uncheck();
-  await page.getByRole('checkbox', { name: /Include .*Attachment/ }).check();
+  await page.getByRole('checkbox', { name: /Include .*Font/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Container', { exact: true }).selectOption('matroska');

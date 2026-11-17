@@ -29,8 +29,10 @@
     makeAv1anGrainPreset,
     inspectUtilityCapabilities,
     chooseUtilityFile,
+    previewFrame,
   } from '$lib/ipc/client';
-  import { batchRunId, trackKind } from '$lib/source-workspace';
+  import type { FramePreviewResult } from '$lib/ipc/generated';
+  import { batchRunId, isStyledSubtitle, trackKind } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -74,7 +76,7 @@
   import { ArrowRight, FolderOutput, Info, Play, RotateCcw } from '@lucide/svelte';
   import { Button } from '$lib/components/ui/button';
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
-  import { errorMessage, formatDuration } from '$lib/components/shared/format';
+  import { displayCodec, errorMessage, formatDuration } from '$lib/components/shared/format';
   import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
   import AudioOptions from './AudioOptions.svelte';
   import SubtitleOptions from './SubtitleOptions.svelte';
@@ -157,6 +159,7 @@
     validAudio,
     selectedAudio,
     audioSummary,
+    resolvedChannels,
     type AudioTrackDraft,
   } from './audio-options';
   import {
@@ -348,7 +351,7 @@
     untrack(() => backend) === 'av1an' ? [...initialAv1anPreferences.filters] : [],
   );
   let outputPixelFormat = $state<Av1anPixelFormat | undefined>('yuv420p10le');
-  let crf = $state<number | undefined>(untrack(() => backend) === 'av1an' ? 35 : 20);
+  let crf = $state<number | undefined>(30);
   let preset = $state(4);
   let lastPreferenceSaveProblem = '';
   function reportPreferenceSave(problem?: string) {
@@ -510,9 +513,70 @@
     audioBackup = audio.map((t) => ({ ...t }));
     perTrackBackup = perTrackRows.map((t) => ({ ...t }));
     if (kind === 'audio') preparePerTrack();
-    if (kind === 'crop') clampCropOnOpen();
+    if (kind === 'crop') {
+      clampCropOnOpen();
+      loadCropPreview();
+    }
     dialog = kind;
   }
+  /** The kept range, shown beside Trim so a set trim is visible at a glance. */
+  const trimRange = $derived.by(() => {
+    const clock = (milliseconds: number) => {
+      const seconds = milliseconds / 1000;
+      const whole = Math.floor(seconds);
+      const fraction = Math.round((seconds - whole) * 1000);
+      return `${formatDuration(whole)}${fraction ? `.${String(fraction).padStart(3, '0')}` : ''}`;
+    };
+    if (trim.mode === 'time')
+      return `${clock(trim.startMilliseconds ?? 0)}–${trim.endMilliseconds === undefined ? 'end' : clock(trim.endMilliseconds)}`;
+    return `frames ${trim.startFrame ?? 0}–${trim.endFrameExclusive === undefined ? 'end' : trim.endFrameExclusive}`;
+  });
+  /** "Audio #02 (AAC) · movie.mkv": kind and number first, as in the Track
+   *  List, so a narrow column cuts the file name rather than the track. */
+  function metadataTrackLabel(row: TrackSelection) {
+    const source = files.find((entry) => entry.id === row.sourceId);
+    const stream = source?.streams.find((entry) => entry.index === row.streamIndex);
+    const kind = trackKind(stream);
+    const label =
+      kind === 'subtitle'
+        ? 'Subtitles'
+        : kind === 'cover'
+          ? 'Cover'
+          : kind
+            ? kind[0].toUpperCase() + kind.slice(1)
+            : 'Track';
+    const codec = stream?.codec ? ` (${displayCodec(stream.codec)})` : '';
+    return `${label} #${String(row.streamIndex + 1).padStart(2, '0')}${codec}${source ? ` · ${source.name}` : ''}`;
+  }
+  // The crop dialog shows one frame as stored (coded orientation, which is
+  // what the crop edges refer to) with the kept area outlined.
+  let cropPreview = $state<FramePreviewResult | null>(null);
+  let cropPreviewAbort: AbortController | undefined;
+  function loadCropPreview() {
+    cropPreviewAbort?.abort();
+    cropPreview = null;
+    if (!desktop || !file || fileMode === 'batch' || videoIndex === undefined) return;
+    const controller = new AbortController();
+    cropPreviewAbort = controller;
+    void previewFrame(
+      {
+        inputPath: file.path,
+        videoStreamIndex: videoIndex,
+        positionSeconds: Math.max(0, (file.durationSeconds ?? 0) * 0.25),
+      },
+      controller.signal,
+    )
+      .then((result) => {
+        if (!controller.signal.aborted) cropPreview = result;
+      })
+      .catch(() => {
+        /* The numbers still work without a picture. */
+      });
+  }
+  const storedRotation = $derived.by(() => {
+    const degrees = Math.round(Number(selectedVideo?.rotationDegrees ?? 0)) % 360;
+    return Number.isFinite(degrees) && degrees !== 0 ? Math.abs(degrees) : 0;
+  });
   function cancelEdit() {
     if (framingBackup) framing = copyFramingDraft(framingBackup);
     if (temporalBackup) temporal = { ...temporalBackup };
@@ -594,12 +658,14 @@
   let audioCodec = $state<AudioTrackDraft['codec']>(
     untrack(() => backend) === 'av1an' ? (initialAv1anPreferences.audio?.codec ?? 'opus') : 'opus',
   );
+  // Keep each track's own channels by default: a 5.1 film stays 5.1 and a
+  // stereo commentary stays stereo. A saved AV1AN choice still wins.
   let audioChannels = $state<AudioTrackDraft['channels']>(
     untrack(() => backend) === 'av1an'
       ? initialAv1anPreferences.audio?.codec === 'copy'
         ? 'preserve'
-        : (initialAv1anPreferences.audio?.channels ?? 'stereo')
-      : 'stereo',
+        : (initialAv1anPreferences.audio?.channels ?? 'preserve')
+      : 'preserve',
   );
   let audioBitrate = $state(
     untrack(() => backend) === 'av1an' ? (initialAv1anPreferences.audio?.bitrateKbps ?? 128) : 128,
@@ -669,7 +735,7 @@
       audioCodec === 'copy'
         ? 'preserve'
         : count === undefined
-          ? audioChannels
+          ? resolvedChannels(audioCodec, audioChannels, stream)
           : {
               explicit: {
                 count,
@@ -783,9 +849,9 @@
     };
   }
 
-  let outputContainer = $state<ContainerFormat>(
-    untrack(() => backend) === 'av1an' ? 'webm' : 'mp4',
-  );
+  // Matroska holds every track kind a source may bring (styled subtitles,
+  // fonts, chapters, covers), so it is the default in both tabs.
+  let outputContainer = $state<ContainerFormat>('matroska');
   let videoChoice = $state('svtAv1Hdr');
   let imageQuality = $state(128);
   let imagePixel = $state<import('$lib/ipc/generated').ImagePixelFormat>('rgb24');
@@ -1039,6 +1105,19 @@
     });
   });
   /** Copied MP4 text tracks that become SubRip because MKV cannot store them. */
+  /** Styled (ASS/SSA) subtitles that MP4, MOV or WebM turn into plain text. */
+  const flattenedStyled = $derived.by(() => {
+    if (!['mp4', 'mov', 'webm'].includes(outputContainer)) return 0;
+    if (chunked ? !copySubs : stripSubs || subtitleMode !== 'copy') return 0;
+    return (file?.streams ?? []).filter(
+      (stream) => included.includes(stream.index) && isStyledSubtitle(stream),
+    ).length;
+  });
+  const flattenedStyledNote = $derived(
+    flattenedStyled
+      ? `${outputContainer === 'webm' ? 'WebM' : outputContainer.toUpperCase()} cannot store styled (ASS) subtitles, so ${flattenedStyled === 1 ? 'the ASS track becomes' : `${flattenedStyled} ASS tracks become`} ${outputContainer === 'webm' ? 'WebVTT' : 'MP4 text'}: styling, positions and fonts are lost. Choose MKV to keep them.`
+      : '',
+  );
   const convertedMovText = $derived(
     subtitles.filter(
       (track) =>
@@ -1525,12 +1604,14 @@
         ].includes(p.label),
       )
       .reverse();
+    // One default quality per encoder in both tabs, so switching between
+    // Quick Convert and AV1AN does not silently change the target quality.
     if (listedSvt(encoder))
       return {
         ...base,
         crfMin: 0,
         crfMax: 63,
-        defaultCrf: chunked ? 35 : encoder === 'svtAv1Hdr' ? 20 : 30,
+        defaultCrf: 30,
         defaultPreset: 4,
         presets: numbers(12),
       };
@@ -1539,7 +1620,7 @@
         ...base,
         crfMin: 0,
         crfMax: 63,
-        defaultCrf: chunked ? 20 : 30,
+        defaultCrf: 30,
         defaultPreset: 6,
         presets: numbers(chunked ? 6 : 8),
       };
@@ -1548,7 +1629,7 @@
         ...base,
         crfMin: 0,
         crfMax: chunked ? 50 : 63,
-        defaultCrf: chunked ? 20 : 30,
+        defaultCrf: 30,
         defaultPreset: 3,
         presets: numbers(chunked ? 6 : 8),
       };
@@ -1557,7 +1638,7 @@
         ...base,
         crfMin: 0,
         crfMax: 51,
-        defaultCrf: encoder === 'x264' ? 20 : chunked ? 20 : 22,
+        defaultCrf: encoder === 'x264' ? 20 : 22,
         defaultPreset: 5,
         presets:
           chunked && encoder === 'x265Standalone'
@@ -2026,6 +2107,14 @@
       (id) => !tools.some((tool) => tool.id === id && tool.available),
     );
   });
+  // Name missing tools as people know them, with the detection's reason (a
+  // missing runtime, a failed integrity check) when the tool check gave one.
+  function missingToolsMessage(ids: string[]) {
+    const found = ids.map((id) => tools.find((tool) => tool.id === id));
+    const names = found.map((tool, index) => tool?.name ?? ids[index]);
+    const detail = found.find((tool) => tool?.detail)?.detail;
+    return `Missing required tool${ids.length === 1 ? '' : 's'}: ${names.join(', ')}.${detail ? ` ${detail}` : ' Settings lists each tool and what was found.'}`;
+  }
   // Track-selection and container problems are decided on other tabs, so the
   // shell repeats them beside Run instead of leaving a silently disabled button.
   const runBlockedReason = $derived(
@@ -2037,9 +2126,7 @@
       (!isImage && !noVideoForRun && !batchWithoutVideo && encodingVideo
         ? videoSettingsIssue
         : null) ??
-      (!isImage && missingRunTools.length
-        ? `Missing required tool${missingRunTools.length === 1 ? '' : 's'}: ${missingRunTools.join(', ')}.`
-        : null) ??
+      (!isImage && missingRunTools.length ? missingToolsMessage(missingRunTools) : null) ??
       sourceTrackIssue ??
       containerIssue ??
       (encodingVideo ? subtitleIssue : null) ??
@@ -2250,7 +2337,7 @@
         : defaultAudio(source?.streams ?? []).map((track) => ({
             ...track,
             codec: 'opus',
-            channels: 'stereo',
+            channels: 'preserve',
             bitrateKbps: 128,
           }));
     subtitles = defaultSubtitles(source?.streams ?? []);
@@ -2951,7 +3038,7 @@
           .map((stream) => ({
             streamIndex: stream.index,
             codec: batchState.audioCodec,
-            channels: batchState.audioChannels,
+            channels: resolvedChannels(batchState.audioCodec, batchState.audioChannels, stream),
             bitrateKbps: Math.round(
               batchState.audioBitrate *
                 audioMultiplier(channelCount(batchState.audioChannels, stream.channels)),
@@ -3166,9 +3253,12 @@
         const job = reviewed.job;
         const finished = await waitForJobTerminal(job.id, controller.signal);
         if (finished.state === 'succeeded') mark(entry.id, { glyph: '✔', text: 'Done' });
-        else if (finished.state === 'canceled' || finished.state === 'stopped')
+        else if (finished.state === 'canceled' || finished.state === 'stopped') {
           mark(entry.id, { glyph: '■', text: 'Canceled', note: finished.error?.message });
-        else
+          // Stop keeps this file's progress and also ends the batch, even when
+          // the stop finished before the batch's own wait was released.
+          if (finished.state === 'stopped') controller.abort();
+        } else
           mark(entry.id, {
             glyph: '✕',
             text: 'Failed',
@@ -3877,6 +3967,7 @@
       if (runMode === 'batch') await runBatch(request, options, controller);
       else {
         imageProgressDescription = 'Preparing command…';
+        if (flattenedStyledNote) onlog?.(flattenedStyledNote);
         batchPendingSource = {
           inputPath: request.source.inputPath,
           outputPath: request.source.outputPath,
@@ -3928,6 +4019,12 @@
         onkeydown={(event) => tabKeys(event, index)}
         onclick={() => (settingsTab = tab.id)}>{tab.label}</button
       >{/each}
+    <!-- Several files can be loaded; say which one Run encodes. -->
+    {#if fileMode === 'batch' && files.length}<span
+        class="source-name"
+        title={files.map((entry) => entry.name).join('\n')}
+        >Batch: {files.length} file{files.length === 1 ? '' : 's'}</span
+      >{:else if file}<span class="source-name" title={file.name}>Source: {file.name}</span>{/if}
   </div>
   <div class="tab-content">
     {#if settingsTab === 'video'}
@@ -4169,7 +4266,10 @@
               onclick={() => {
                 dialog = 'trim';
               }}>Configure…</button
-            >{#if trim.enabled}<button onclick={() => (trim = defaultTrim())}>Clear</button>{/if}
+            >{#if trim.enabled}<button onclick={() => (trim = defaultTrim())}>Clear</button><span
+                class="trim-range"
+                aria-label="Trim range">{trimRange}</span
+              >{/if}
           </div>
           <label for={`${idPrefix}-crop`}>Crop</label>
           <div class="inline">
@@ -4400,7 +4500,10 @@
             <label><input type="checkbox" bind:checked={copySubs} /> Subtitles</label><label
               ><input type="checkbox" bind:checked={copyData} /> Data Tracks</label
             ><label><input type="checkbox" bind:checked={copyAttachments} /> Attachments</label>
-          </div>{:else}<label for="loudness">Loudness</label><select
+          </div>
+          {#if flattenedStyledNote}<p class="geometry-readout subtitle-note">
+              {flattenedStyledNote}
+            </p>{/if}{:else}<label for="loudness">Loudness</label><select
             id="loudness"
             bind:value={loudness}
             disabled={stripAudio || audioCodec === 'copy'}
@@ -4435,6 +4538,8 @@
             {convertedMovText === 1
               ? 'The MP4 text subtitle is converted to SubRip, because MKV cannot store MP4 text.'
               : `${convertedMovText} MP4 text subtitles are converted to SubRip, because MKV cannot store MP4 text.`}
+          </p>{/if}{#if flattenedStyledNote}<p class="geometry-readout subtitle-note">
+            {flattenedStyledNote}
           </p>{/if}
       </div>
     {:else if settingsTab === 'metadata'}
@@ -4480,8 +4585,8 @@
               ></tr
             >{/if}{#each tracks.filter((t) => t.included) as row}<tr
               ><td
-                title={`${files.find((f) => f.id === row.sourceId)?.name ?? ''} #${row.streamIndex}`}
-                >{files.find((f) => f.id === row.sourceId)?.name ?? ''} #{row.streamIndex}</td
+                title={`${files.find((f) => f.id === row.sourceId)?.name ?? ''} #${row.streamIndex + 1}`}
+                >{metadataTrackLabel(row)}</td
               ><td
                 ><input
                   aria-label={`Title for track ${row.streamIndex}`}
@@ -4628,8 +4733,10 @@
         suggestionPending = false;
         suggestedStem = null;
       }}
-    /><button onclick={chooseOutput} aria-label="Browse output path">…</button>{#if chunked}<button
-        onclick={() => void openRecoveries()}
+    />{#if !isImage}<span class="output-extension" title="Added from the chosen container"
+        >.{outputContainer === 'matroska' ? 'mkv' : outputContainer}</span
+      >{/if}<button onclick={chooseOutput} aria-label="Browse output path">…</button
+    >{#if chunked}<button onclick={() => void openRecoveries()}
         >Resume…{recoveries.length ? ` (${recoveries.length})` : ''}</button
       ><button disabled={!recoveries.length} onclick={() => void openClearTemp()}
         >Clear Temp…</button
@@ -4668,7 +4775,11 @@
   onclose={() => (recoveryDialog = null)}
   width={820}
 >
-  <p>Unfinished av1an encodes found in the temp folder. Pick one to resume or delete.</p>
+  <p>
+    {recoveries.length
+      ? 'Unfinished av1an encodes found in the temp folder. Pick one to resume or delete.'
+      : 'No unfinished av1an encodes were found in the temp folder.'}
+  </p>
   <div
     class="recovery-list"
     role="listbox"
@@ -4728,6 +4839,19 @@
   </div>
 </SourceDialog>
 <SourceDialog title="Configure Crop" open={dialog === 'crop'} onclose={cancelEdit} width={460}>
+  {#if cropPreview && selectedVideo?.width && selectedVideo.height}<div class="crop-preview">
+      <img src={cropPreview.imageDataUrl} alt="Source frame as stored" /><span
+        class="crop-keep"
+        style:left={`${(100 * (framing.crop.left ?? 0)) / selectedVideo.width}%`}
+        style:right={`${(100 * (framing.crop.right ?? 0)) / selectedVideo.width}%`}
+        style:top={`${(100 * (framing.crop.top ?? 0)) / selectedVideo.height}%`}
+        style:bottom={`${(100 * (framing.crop.bottom ?? 0)) / selectedVideo.height}%`}
+      ></span>
+    </div>{/if}
+  {#if storedRotation}<p class="crop-note">
+      This video is stored as {selectedVideo?.width}×{selectedVideo?.height} and shown rotated {storedRotation}°.
+      Crop edges refer to the picture as stored, shown above; the crop turns with it.
+    </p>{/if}
   <h3>PIXELS TO CROP OFF EACH SIDE</h3>
   <div class="form dialog-form">
     {#each ['left', 'right', 'top', 'bottom'] as edge}<label for={`crop-${edge}`}
@@ -4989,6 +5113,49 @@
     background: var(--background);
     font-weight: 600;
   }
+  .crop-preview {
+    position: relative;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 auto 10px;
+    overflow: hidden;
+    line-height: 0;
+    background: #111;
+  }
+  .crop-preview img {
+    display: block;
+    max-width: 100%;
+    max-height: 220px;
+  }
+  .crop-keep {
+    position: absolute;
+    border: 2px solid #ffb26b;
+    box-shadow: 0 0 0 9999px #0009;
+    pointer-events: none;
+  }
+  .trim-range {
+    align-self: center;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .crop-note {
+    margin: 0 0 10px;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .source-name {
+    align-self: center;
+    margin-left: auto;
+    max-width: 45%;
+    overflow: hidden;
+    padding-left: 12px;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .tab-content {
     flex: 1;
     overflow: auto;
@@ -5150,6 +5317,10 @@
   }
   .output input {
     flex: 1;
+  }
+  .output-extension {
+    color: var(--muted-foreground);
+    font-size: 13px;
   }
   .metadata-head,
   .filter-head {

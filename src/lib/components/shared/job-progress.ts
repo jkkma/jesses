@@ -9,6 +9,26 @@ const pauseControl = /^(?:Paused|Continued) the media job process trees\./;
 const progressLine =
   /^(?:Encoding:?\s+\d+(?:\/\d+)?\s+Frames\b|Encoding frame\s+\d+\b|Encoding$|frame=\s*\d+|\d+\s+frames:\s+\d+(?:\.\d+)?\s+fps\b|\[\d+(?:\.\d+)?%\]\s+\d+\/\d+\s+frames,)/;
 
+const attachmentProbe = /Could not find codec parameters for stream \d+ \(Attachment\b/;
+const probeAdvice = /Consider increasing the value for the 'analyzeduration'/;
+
+/**
+ * FFmpeg reports every font attached to a Matroska file as a stream it could
+ * not probe, followed by advice to probe longer. Both are expected and only
+ * bury real messages, so the shown logs leave them out; job log files keep them.
+ */
+export function withoutAttachmentProbeNoise(lines: readonly string[]): string[] {
+  const kept: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (attachmentProbe.test(lines[index])) {
+      if (probeAdvice.test(lines[index + 1] ?? '')) index += 1;
+      continue;
+    }
+    kept.push(lines[index]);
+  }
+  return kept;
+}
+
 /** Older job snapshots can still contain tool status updates alongside diagnostics. */
 export function isEncoderProgressLine(line: string): boolean {
   const record = line.trim().replace(/^\[(?:consumer|producer)\]\s*/, '');

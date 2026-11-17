@@ -1634,6 +1634,18 @@ mod tests {
             .is_err()
         );
         doc.streams[0].tags.remove("comment");
+        // Encoder provenance is not user metadata; MP4 may leave it out.
+        doc.streams[0]
+            .tags
+            .insert("ENCODER_SETTINGS".into(), "preset=2 film-grain=4".into());
+        preflight(
+            Path::new("output.mp4"),
+            &doc,
+            &doc.streams.iter().collect::<Vec<_>>(),
+            None,
+        )
+        .unwrap();
+        doc.streams[0].tags.remove("ENCODER_SETTINGS");
         doc.streams[0]
             .disposition
             .insert("hearing_impaired".into(), 1);

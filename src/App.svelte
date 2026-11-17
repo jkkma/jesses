@@ -37,7 +37,12 @@
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
   import SourceSettings from '$lib/features/source/SourceSettings.svelte';
   import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
-  import { batchRunId, firstTrackSelection, trackKind } from '$lib/source-workspace';
+  import {
+    batchRunId,
+    firstTrackSelection,
+    syncSubtitleFonts,
+    trackKind,
+  } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -48,7 +53,11 @@
   import Av1an from '$lib/features/av1an/Av1an.svelte';
   import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
-  import { isEncoderProgressLine, liveJobProgress } from '$lib/components/shared/job-progress';
+  import {
+    isEncoderProgressLine,
+    liveJobProgress,
+    withoutAttachmentProbeNoise,
+  } from '$lib/components/shared/job-progress';
   import {
     ProgressEstimator,
     type ProgressEstimate,
@@ -82,6 +91,7 @@
     enqueueEncode,
     enqueueEncodeBatch,
     cancelAllJobs,
+    stopJob,
     setJobPaused,
     recentPathIsFolder,
     getStorageLocations,
@@ -102,6 +112,8 @@
   } from '$lib/ipc/generated';
   import {
     displayCodec,
+    displayPath,
+    displayPaths,
     errorMessage,
     fileName,
     formatBytes,
@@ -285,6 +297,10 @@
     if (currentJob.state === 'succeeded') return 'Done.';
     if (currentJob.state === 'failed' || currentJob.state === 'interrupted')
       return 'Did not finish - the log has the details.';
+    if (currentJob.state === 'stopped')
+      return currentJob.recovery || currentJob.standaloneRecovery
+        ? 'Stopped. Progress was kept; Resume continues it.'
+        : 'Stopped before any progress was saved.';
     return 'Canceled.';
   });
   function registerWorkspaceAction(tab: TaskView, next: WorkspaceAction | null) {
@@ -332,7 +348,14 @@
         });
       }
     }
-    let next = [...trackSelection, ...firstTrackSelection(additions, kindOf, seen)];
+    let next = syncSubtitleFonts(
+      [...trackSelection, ...firstTrackSelection(additions, kindOf, seen)],
+      (row) =>
+        files
+          .find((file) => file.id === row.sourceId)
+          ?.streams.find((stream) => stream.index === row.streamIndex),
+      trackSelection,
+    );
     for (const kind of ['audio', 'subtitle']) {
       if (kind === 'subtitle' && noDefaultSubtitles) continue;
       const candidates = next.filter(
@@ -342,6 +365,9 @@
             .find((file) => file.id === row.sourceId)
             ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === kind),
       );
+      // A source that marks all of its subtitles as not default wants them
+      // off until chosen; do not make one show automatically.
+      if (kind === 'subtitle' && candidates.every((row) => row.defaultFlag === false)) continue;
       if (candidates.length && !candidates.some((row) => row.defaultFlag === true)) {
         const first = candidates[0];
         next = next.map((row) => (row === first ? { ...row, defaultFlag: true } : row));
@@ -497,6 +523,22 @@
   let activePath: string | null = null;
   let importErrors = $state<{ name: string; message: string }[]>([]);
   let logs = $state<LogEntry[]>([]);
+  // The log follows new entries while it is scrolled to the bottom, and stays
+  // put once the reader scrolls up to read something.
+  let logElement = $state<HTMLDivElement>();
+  let followLog = true;
+  function trackLogScroll() {
+    if (!logElement) return;
+    followLog = logElement.scrollHeight - logElement.scrollTop - logElement.clientHeight < 24;
+  }
+  $effect(() => {
+    void logs.at(-1)?.id;
+    const element = logElement;
+    if (!element || !followLog) return;
+    void tick().then(() => {
+      element.scrollTop = element.scrollHeight;
+    });
+  });
   let logOpen = $state(false);
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
@@ -689,13 +731,14 @@
         jobLogCursors.set(job.id, { last: lines.at(-1), finished });
         continue;
       }
-      if (cursor?.finished) continue;
+      // A finished job stays quiet, unless Resume started it again.
+      if (cursor?.finished && finished) continue;
       // Job logs are a bounded window; continue after the last line already
       // shown, or show the whole window when it has moved past that line.
       const seen = cursor?.last === undefined ? -1 : lines.lastIndexOf(cursor.last);
       const failed = finished && (job.state === 'failed' || job.state === 'interrupted');
       const message = failed ? job.error?.message : undefined;
-      for (const line of lines.slice(seen + 1))
+      for (const line of withoutAttachmentProbeNoise(lines.slice(seen + 1)))
         if (!isEncoderProgressLine(line) && line !== message)
           addLog(line, /\b(?:error|failed)\b/i.test(line) ? 'error' : 'info');
       if (failed) {
@@ -830,6 +873,35 @@
       terminalJob(entry.state) ? entry : (snapshots.find((job) => job.id === entry.id) ?? entry),
     );
   }
+  // The footer's Stop keeps a started encode's verified progress for Resume,
+  // as closing the window does. Discarding saved work stays explicit: Abort
+  // in the encoding window, or Delete in the AV1AN Resume dialog.
+  let stopping = $state(false);
+  async function stopRun() {
+    if (stopping) return;
+    stopping = true;
+    try {
+      // Only a real video encode has progress worth keeping; copy and
+      // audio-only jobs are simply canceled, as before.
+      for (const job of jobs.filter(
+        (entry) =>
+          entry.encodeSettings &&
+          (entry.encodeSettings.videoMode ?? 'encode') === 'encode' &&
+          ['preparing', 'running', 'paused', 'finalizing'].includes(entry.state),
+      )) {
+        try {
+          const snapshot = await stopJob(job.id);
+          jobs = jobs.map((entry) => (entry.id === snapshot.id ? snapshot : entry));
+        } catch (error) {
+          addLog(`Could not stop with progress kept: ${errorMessage(error)}`, 'error');
+        }
+      }
+      if (displayAction?.active) displayAction.stop?.();
+      else await stopQueue();
+    } finally {
+      stopping = false;
+    }
+  }
   const selectedFile = $derived(files.find((file) => file.id === selectedId));
   const visibleFiles = $derived(
     files.filter((file) =>
@@ -850,6 +922,7 @@
     for (const file of files)
       if (file.source?.kind === 'imageSequence')
         message = message.replaceAll(file.path, file.source.directoryPath);
+    message = displayPaths(message);
     logs = [
       ...logs.slice(-199),
       {
@@ -873,8 +946,10 @@
     try {
       tools = await getCapabilities();
       toolsChecked = true;
+      const missing = tools.filter((tool) => !tool.available).map((tool) => tool.name);
       addLog(
-        `Tool check complete: ${tools.filter((tool) => tool.available).length} of ${tools.length} available.`,
+        `Tool check complete: ${tools.length - missing.length} of ${tools.length} available.${missing.length ? ` Missing: ${missing.join(', ')}. Settings lists the reason for each.` : ''}`,
+        missing.length ? 'error' : 'info',
       );
     } catch (error) {
       toolsError = errorMessage(error);
@@ -979,7 +1054,10 @@
 
   function takeImportRecents(generation: number) {
     if (importSession?.generation !== generation) return [];
-    const recent = [...importSession.folders, ...importSession.completed].slice(0, 15);
+    // Remember paths as people write them, not the canonical \\?\ form.
+    const recent = [...importSession.folders, ...importSession.completed]
+      .slice(0, 15)
+      .map(displayPath);
     importSession = null;
     return recent;
   }
@@ -1146,26 +1224,20 @@
       if (!(await reserveImport(generation))) return;
       const folder = await recentPathIsFolder(path);
       if (generation !== importGeneration) return;
-      if (folder) {
-        const existing = files.find((item) => pathKey(displaySourcePath(item)) === pathKey(path));
-        if (existing) {
-          selectFiles([existing.id]);
-          await rememberMedia([path]);
-          return;
-        }
-        queueImportPaths([path], true);
-        await drainImport(generation);
-      } else {
-        const key = pathKey(path);
-        const existing = files.find((file) => pathKey(displaySourcePath(file)) === key);
-        if (existing) {
-          selectFiles([existing.id]);
-          await rememberMedia([existing.path]);
-          return;
-        }
-        queueImportPaths([path]);
-        await drainImport(generation);
+      const key = pathKey(path);
+      const existing = files.find((item) => pathKey(displaySourcePath(item)) === key);
+      if (existing) {
+        selectFiles([existing.id]);
+        await rememberMedia([displayPath(folder ? path : existing.path)]);
+        return;
       }
+      // With files already loaded, ask whether this file replaces them or
+      // joins them, as Add Files and drag and drop do.
+      const selection = await chooseImportItems([path]);
+      if (generation !== importGeneration || !selection?.paths.length) return;
+      if (selection.replace) clearFiles();
+      queueImportPaths(selection.paths, folder);
+      await drainImport(generation);
     } catch (error) {
       if (generation === importGeneration) {
         const message = errorMessage(error);
@@ -1604,6 +1676,15 @@
           }}
         />
         <SavedJobs {jobs} onqueue={queueEncode} />
+        <ToolsPanel
+          {tools}
+          {desktop}
+          loading={toolsLoading}
+          checked={toolsChecked}
+          error={toolsError}
+          onrefresh={refreshTools}
+          preferences={false}
+        />
       {/if}
       {#if (view === 'convert' || view === 'av1an') && jobsError}<p role="alert">
           {jobsError}
@@ -1730,6 +1811,8 @@
       aria-label="Recent activity"
       aria-live="polite"
       style:height={`${logHeight}px`}
+      bind:this={logElement}
+      onscroll={trackLogScroll}
     >
       {#each logs as entry (entry.id)}<div
           class="log-entry"
@@ -1791,14 +1874,22 @@
         type="button"
         disabled={!displayAction.pause}
         onclick={() => displayAction?.pause?.()}>{displayAction.paused ? 'Resume' : 'Pause'}</button
-      ><button type="button" disabled={!displayAction.stop} onclick={() => displayAction?.stop?.()}
-        >Stop</button
+      ><button
+        type="button"
+        title="Stop and keep finished work so the encode can be resumed"
+        disabled={!displayAction.stop || stopping}
+        onclick={stopRun}>Stop</button
       >
     {:else if currentJob && ['preparing', 'running', 'paused', 'finalizing'].includes(currentJob.state)}<button
         type="button"
         onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
         >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
-      ><button type="button" onclick={stopQueue}>Stop</button>{/if}
+      ><button
+        type="button"
+        title="Stop and keep finished work so the encode can be resumed"
+        disabled={stopping}
+        onclick={stopRun}>Stop</button
+      >{/if}
     {#if runBlockedReason && action?.openBlockedSetting}<button
         type="button"
         id="run-blocked-reason"
@@ -1901,6 +1992,23 @@
     justify-content: end;
     gap: 8px;
     margin-top: 12px;
+  }
+  /* Dialog choices must read as buttons, and the initially focused one must
+     show its focus. */
+  .import-actions button {
+    padding: 0.4rem 0.9rem;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    cursor: pointer;
+  }
+  .import-actions button:hover {
+    background: var(--accent);
+  }
+  .import-actions button:focus-visible,
+  .import-actions button:focus {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
   }
   .closing-overlay {
     position: fixed;

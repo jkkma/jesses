@@ -1227,7 +1227,10 @@ impl JobManager {
                     None,
                 )
             })?;
-        if !entry.snapshot.state.is_terminal() {
+        // A stop that keeps progress is already under way. A cancel that
+        // follows it (the UI releasing its own wait) must not discard the
+        // work the stop is saving; discarding stays a separate action.
+        if !entry.snapshot.state.is_terminal() && entry.snapshot.state != JobState::Stopping {
             entry.cancel.send_replace(true);
             entry.snapshot.state = JobState::Canceling;
             append_log(
@@ -1528,7 +1531,8 @@ impl JobManager {
             preflight.cancel.send_replace(true);
         }
         for entry in &mut state.entries {
-            if !entry.snapshot.state.is_terminal() {
+            // Jobs already stopping keep their saved progress.
+            if !entry.snapshot.state.is_terminal() && entry.snapshot.state != JobState::Stopping {
                 entry.cancel.send_replace(true);
                 entry.snapshot.state = JobState::Canceling;
                 append_log(
@@ -2889,6 +2893,42 @@ mod tests {
         drop(source);
         assert_eq!(std::fs::read(input).unwrap(), b"source");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_stop_keeps_the_stop_and_its_progress() {
+        let dir = std::env::temp_dir();
+        let manager = JobManager::new(dir.join("jesses-stop-then-cancel-logs"));
+        let _slot = manager.execution.lock().await;
+        let job = manager
+            .enqueue_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: dir.join("missing-stop-source.mkv").to_string_lossy().into(),
+                    output_path: dir.join("missing-stop-output.mkv").to_string_lossy().into(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    encoder: media_core::VideoEncoder::SvtAv1,
+                    crf: 30,
+                    preset: 8,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        manager.stop_job(job.id.clone()).await.unwrap();
+        // The UI releasing its wait sends cancel_job, and the footer's Stop
+        // also stops the queue; neither may turn the stop into a discard.
+        assert_eq!(
+            manager.cancel_job(job.id.clone()).await.unwrap().state,
+            JobState::Stopping
+        );
+        let after_queue_stop = manager.cancel_all_jobs().await.unwrap();
+        assert_eq!(after_queue_stop[0].state, JobState::Stopping);
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(manager.list_jobs().await[0].state, JobState::Stopped);
     }
 
     #[tokio::test]

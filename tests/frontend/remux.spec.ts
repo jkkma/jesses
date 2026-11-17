@@ -68,7 +68,7 @@ test('copy conversion reports a preparation failure and permits correction and r
             ?.payload.request.source.outputPath,
       ),
     )
-    .toBe('/media/corrected.mp4');
+    .toBe('/media/corrected.mkv');
 });
 
 test('a webview reload follows the existing copy job through failure without reporting success', async ({

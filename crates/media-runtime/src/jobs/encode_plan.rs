@@ -478,6 +478,9 @@ pub(super) struct Plan {
     pub full_range: bool,
     source_full_range: bool,
     pub chroma: &'static str,
+    /// The source's own chroma siting. When it differs from `chroma`, the
+    /// pixel conversion resamples it to the output siting.
+    source_chroma: &'static str,
     hdr10: Option<Hdr10>,
     source_hdr10: Option<Hdr10>,
     authored_hdr: Option<StaticMetadata>,
@@ -485,6 +488,32 @@ pub(super) struct Plan {
 
 pub(super) fn unsupported(message: &str) -> AppError {
     AppError::new("ENCODE_INPUT_UNSUPPORTED", message, None)
+}
+
+/// A source's declared chroma siting, by FFprobe name.
+fn source_chroma_siting(location: Option<&str>) -> &'static str {
+    match location {
+        Some("left") => "left",
+        Some("topleft") => "topleft",
+        Some("center") => "center",
+        Some("top") => "top",
+        Some("bottomleft") => "bottomleft",
+        Some("bottom") => "bottom",
+        _ => "unknown",
+    }
+}
+
+/// Swscale chroma sample position in 1/256 of a luma sample. An unspecified
+/// 4:2:0 siting uses the conventional left position.
+fn chroma_position(siting: &str) -> (u16, u16) {
+    match siting {
+        "topleft" => (0, 0),
+        "center" => (128, 128),
+        "top" => (128, 0),
+        "bottomleft" => (0, 256),
+        "bottom" => (128, 256),
+        _ => (0, 128),
+    }
 }
 
 // Source clocks that canonical source preparation repairs. The encode retries
@@ -1391,28 +1420,25 @@ impl Plan {
             chroma: if tone_map.is_some() {
                 "left"
             } else {
-                match video.chroma_location.as_deref() {
-                    Some("left") => "left",
-                    Some("topleft") => "topleft",
-                    Some("center") if !settings.encoder.is_svt() => "center",
-                    None | Some("unspecified" | "unknown")
-                        if source_pixel_format.contains("444") || rgb_source =>
-                    {
+                match source_chroma_siting(video.chroma_location.as_deref()) {
+                    "left" => "left",
+                    "topleft" => "topleft",
+                    "center" if !settings.encoder.is_svt() => "center",
+                    "unknown" if source_pixel_format.contains("444") || rgb_source => {
                         // 4:4:4 has no chroma sample offset. Conversion to a
                         // subsampled output needs a deterministic destination.
                         "left"
                     }
-                    None | Some("unspecified" | "unknown") if settings.encoder.is_svt() => {
-                        "unknown"
-                    }
-                    None | Some("unspecified" | "unknown") => "left",
-                    _ => {
-                        return Err(unsupported(
-                            "SVT supports left, top-left, or unspecified chroma placement; x264, x265, and VP9 require explicit left, center, or top-left placement.",
-                        ));
-                    }
+                    "unknown" if settings.encoder.is_svt() => "unknown",
+                    "unknown" => "left",
+                    // SVT cannot signal centre siting (JPEG-based camera and
+                    // webcam video), and no encoder here signals the top or
+                    // bottom placements. Resample those to the common left
+                    // position inside the pixel conversion instead of refusing.
+                    _ => "left",
                 }
             },
+            source_chroma: source_chroma_siting(video.chroma_location.as_deref()),
             tone_map,
         })
     }
@@ -2018,7 +2044,17 @@ impl Plan {
         } else {
             self.source_pixel_format
         };
-        if input == self.output_pixel_format && self.source_full_range == self.full_range {
+        let (x, y) = chroma_position(self.chroma);
+        // Tone mapping already renders left-sited chroma.
+        let (in_x, in_y) = if self.tone_map.is_some() {
+            (x, y)
+        } else {
+            chroma_position(self.source_chroma)
+        };
+        if input == self.output_pixel_format
+            && self.source_full_range == self.full_range
+            && (in_x, in_y) == (x, y)
+        {
             return None;
         }
         let matrix = match self.matrix {
@@ -2034,16 +2070,8 @@ impl Plan {
             "limited"
         };
         let output_range = if self.full_range { "full" } else { "limited" };
-        let (x, y) = match self.chroma {
-            "left" => (0, 128),
-            "topleft" => (0, 0),
-            "center" => (128, 128),
-            // An unspecified 4:2:0 input remains unspecified. The scale
-            // operation uses its conventional left sample position.
-            _ => (0, 128),
-        };
         Some(format!(
-            "scale=iw:ih:flags=bilinear+accurate_rnd:in_color_matrix={matrix}:out_color_matrix={matrix}:in_range={input_range}:out_range={output_range}:in_h_chr_pos={x}:out_h_chr_pos={x}:in_v_chr_pos={y}:out_v_chr_pos={y}:sws_dither=ed,format={}",
+            "scale=iw:ih:flags=bilinear+accurate_rnd:in_color_matrix={matrix}:out_color_matrix={matrix}:in_range={input_range}:out_range={output_range}:in_h_chr_pos={in_x}:out_h_chr_pos={x}:in_v_chr_pos={in_y}:out_v_chr_pos={y}:sws_dither=ed,format={}",
             self.output_pixel_format
         ))
     }
@@ -4119,6 +4147,39 @@ mod tests {
         let (hdr, _) = hdr_source_and_frames();
         let error = Plan::build(&hdr, &hdr.selected(&[0]).unwrap(), &x264_settings()).unwrap_err();
         assert!(error.message.contains("SDR output only"));
+    }
+
+    #[test]
+    fn svt_resamples_centre_sited_chroma_to_left() {
+        for (pixel, range) in [("yuvj420p", "pc"), ("yuv420p10le", "tv")] {
+            let mut source = source();
+            source.streams[0].pix_fmt = Some(pixel.into());
+            source.streams[0].color_range = Some(range.into());
+            source.streams[0].chroma_location = Some("center".into());
+            let settings = EncodeSettings {
+                encoder: VideoEncoder::SvtAv1,
+                crf: 30,
+                preset: 8,
+                ..Default::default()
+            };
+            let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+            assert_eq!(plan.chroma, "left");
+            let conversion = plan.pixel_conversion().expect("siting conversion");
+            assert!(
+                conversion.contains("in_h_chr_pos=128:out_h_chr_pos=0"),
+                "{conversion}"
+            );
+            assert!(
+                conversion.contains("in_v_chr_pos=128:out_v_chr_pos=128"),
+                "{conversion}"
+            );
+        }
+        // Encoders that signal centre siting keep it without a conversion.
+        let mut source = source();
+        source.streams[0].chroma_location = Some("center".into());
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).unwrap();
+        assert_eq!(plan.chroma, "center");
+        assert!(plan.pixel_conversion().is_none());
     }
 
     #[test]
