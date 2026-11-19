@@ -2610,7 +2610,10 @@ fn verify_action_tree(root: &Path, manifest: &Manifest) -> Result<(), AppError> 
                 && path == root.join("prepared.mkv"))
                 || (manifest.source_cut_slot && path == manifest.source.path);
             let attempt = rel.starts_with(&format!("attempt-{}-attempt-", manifest.id))
-                && rel.ends_with(".partial.mkv")
+                && matches!(
+                    rel.rsplit_once(".partial."),
+                    Some((_, "mkv" | "mp4" | "mov"))
+                )
                 && !rel.contains('/');
             let chunk = rel.strip_prefix("chunks/encode/").is_some_and(|name| {
                 name.strip_suffix(&format!(
@@ -3219,7 +3222,12 @@ impl Recovery {
                         "av1an",
                         "--ffmpeg",
                     )?
-                    .and_then(|value| value.strip_prefix("-vf ").map(str::to_owned));
+                    .and_then(|value| {
+                        let parsed = crate::jobs::command_edit::rebind::words(&value).ok()?;
+                        parsed
+                            .windows(2)
+                            .find_map(|pair| (pair[0] == "-vf").then(|| pair[1].clone()))
+                    });
                 }
                 workspace.manifest.edited_command = command;
                 workspace.manifest.source_cut_rebind_pending = None;
@@ -3270,6 +3278,59 @@ impl Recovery {
             .lock()
             .map(|workspace| workspace.manifest.source_filter.clone())
             .map_err(|_| AppError::new("RECOVERY_INVALID", "Recovery state lock failed.", None))
+    }
+
+    /// Check whether a saved AV1AN recovery workspace already holds a verified,
+    /// reusable `prepared.mkv` for these unchanged settings and source so resume
+    /// does not re-encode lossless QTGMC / processed FFV1 intermediates before
+    /// entering `Recovery::prepare`.
+    pub(in crate::jobs) async fn reusable_prepared(
+        id: &str,
+        request: &RemuxRequest,
+        settings: &EncodeSettings,
+        source: &Path,
+        locator: &Av1anRecovery,
+        cancel: &watch::Receiver<bool>,
+    ) -> Option<(PreparedSource, usize)> {
+        let (id, request, settings, source, locator, cancel) = (
+            id.to_owned(),
+            request.clone(),
+            settings.clone(),
+            source.to_owned(),
+            locator.clone(),
+            cancel.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let (root, manifest) = load(&id, &request, &settings, &locator).ok()?;
+            if manifest.restart_pending || manifest.settings != settings {
+                return None;
+            }
+            let decoded_identity = manifest.prepared_identity.as_ref()?.clone();
+            let stable = root.join("prepared.mkv");
+            if manifest.source.path != stable {
+                return None;
+            }
+            let saved_original = manifest.original_source.as_ref()?;
+            if saved_original.path != source {
+                return None;
+            }
+            if restamp(saved_original, Some(&cancel)).ok().as_ref() != Some(saved_original) {
+                return None;
+            }
+            if restamp(&manifest.source, Some(&cancel)).ok().as_ref() != Some(&manifest.source) {
+                return None;
+            }
+            Some((
+                PreparedSource {
+                    path: stable,
+                    decoded_identity,
+                },
+                usize::try_from(manifest.total_frames).ok()?,
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3331,7 +3392,24 @@ impl Recovery {
             } else {
                 source_stamp(&source, Some(&cancel))?
             };
-            let source_cut_original=if is_source_cut(&settings){Some(digest(Path::new(&request.input_path),Some(&cancel))?)}else{None};
+            let source_cut_original = if is_source_cut(&settings)
+                && !super::super::source_normalization::exists(&id, &request)?
+            {
+                let original_path = Path::new(&request.input_path);
+                let saved_cut_original = previous
+                    .as_ref()
+                    .and_then(|(_, manifest)| manifest.source_cut_original.as_ref())
+                    .filter(|saved| saved.path == original_path);
+                Some(if let Some(saved) = saved_cut_original {
+                    restamp(saved, Some(&cancel))?
+                } else if super::super::encode::thorough_verification(&settings) {
+                    digest(original_path, Some(&cancel))?
+                } else {
+                    source_stamp(original_path, Some(&cancel))?
+                })
+            } else {
+                None
+            };
             if let Some(original)=&source_cut_original{super::super::source_normalization::av1an_trim::verify_variant(&id,&request,&settings,&source,&original.sha256,original.length,&original_source.sha256,original_source.length)?;}
             let external_sources = external_source_stamps(&settings, Some(&cancel))?;
             let mut tool_guards = tools

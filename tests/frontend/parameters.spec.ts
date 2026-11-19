@@ -99,14 +99,17 @@ test('a late argument catalog cannot replace the newly selected encoder grid', a
   await expect(av.getByLabel('old-option value')).toHaveCount(0);
 });
 
-test('AV1AN VP9 alpha retains the selected pixel format in its WEBM request', async ({ page }) => {
+test('AV1AN VP9 omits unsupported alpha format and retains supported pixel formats in WEBM', async ({
+  page,
+}) => {
   await installSourceEncodeFixture(page);
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
   await av.getByLabel('Encoder', { exact: true }).selectOption('vpxStandalone');
-  await av.getByLabel('Color Format').selectOption('yuva420p');
+  await expect(av.getByLabel('Color Format').locator('option[value="yuva420p"]')).toHaveCount(0);
+  await av.getByLabel('Color Format').selectOption('yuv444p10le');
   await av.getByLabel('Container').selectOption('webm');
   await page.getByRole('button', { name: 'Run: AV1AN encode', exact: true }).click();
   await expect
@@ -117,7 +120,7 @@ test('AV1AN VP9 alpha retains the selected pixel format in its WEBM request', as
             ?.payload.request.settings,
       ),
     )
-    .toMatchObject({ encoder: 'vpxStandalone', av1anOptions: { pixelFormat: 'yuva420p' } });
+    .toMatchObject({ encoder: 'vpxStandalone', av1anOptions: { pixelFormat: 'yuv444p10le' } });
 });
 
 test('batch AV1AN freezes the source argument grid into each per-file request', async ({
@@ -230,4 +233,81 @@ test('named presets save, apply and delete per encoder and route', async ({ page
   await group.getByRole('button', { name: 'Delete', exact: true }).click();
   await expect(saved.getByRole('option', { name: 'Anime' })).toHaveCount(0);
   expect(await page.evaluate(() => (globalThis as any).__parameterPresets)).toEqual([]);
+});
+
+test('AV1AN exposes HDR10 fallback on HDR sources and unblocks MKV when Copy Subtitles is off', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate(() => {
+    (globalThis as any).__setSourceMedia({
+      id: 'hdr-movtext',
+      path: '/media/hdr.mp4',
+      name: 'hdr.mp4',
+      sizeBytes: '4000',
+      durationSeconds: 30,
+      format: 'mov,mp4,m4a,3gp,3g2,mj2',
+      streams: [
+        {
+          index: 0,
+          kind: 'video',
+          codec: 'hevc',
+          width: 3840,
+          height: 2160,
+          frameRate: '24000/1001',
+          pixelFormat: 'yuv420p10le',
+          colorPrimaries: 'bt2020',
+          colorTransfer: 'smpte2084',
+          colorSpace: 'bt2020nc',
+          colorRange: 'tv',
+          hdrFormat: 'Dolby Vision',
+          dynamicHdrFormats: ['Dolby Vision', 'HDR10+'],
+          dolbyVisionProfile: 8,
+        },
+        {
+          index: 1,
+          kind: 'audio',
+          codec: 'aac',
+          sampleRate: 48000,
+          channels: 2,
+          language: 'eng',
+          title: 'English',
+        },
+        {
+          index: 2,
+          kind: 'subtitle',
+          codec: 'mov_text',
+          language: 'eng',
+          title: 'Subtitles',
+        },
+      ],
+    });
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Container').selectOption('matroska');
+  const runButton = page.getByRole('button', { name: 'Run: AV1AN encode', exact: true });
+  // MKV cannot store mov_text while Copy Subtitles is on.
+  await expect(runButton).toBeDisabled();
+  await av.getByRole('tab', { name: 'Audio & Tracks' }).click();
+  await av.getByLabel('Subtitles', { exact: true }).uncheck();
+  await expect(runButton).toBeEnabled();
+
+  await av.getByRole('tab', { name: 'Video', exact: true }).click();
+  await av.getByLabel('Tone Mapping').selectOption('off');
+  const fallback = av.getByLabel('HDR10 fallback (discard DV / HDR10+)');
+  await expect(fallback).toBeVisible();
+  await fallback.check();
+  await runButton.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+            ?.payload.request.settings,
+      ),
+    )
+    .toMatchObject({ hdr10Fallback: true });
 });

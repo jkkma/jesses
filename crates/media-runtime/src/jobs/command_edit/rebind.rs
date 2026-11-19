@@ -11,6 +11,10 @@ struct Token {
 }
 
 fn tokens(text: &str) -> Result<Vec<Token>, AppError> {
+    tokenize(text, cfg!(windows))
+}
+
+fn tokenize(text: &str, windows_double_quotes: bool) -> Result<Vec<Token>, AppError> {
     let mut tokens = Vec::new();
     let mut at = 0;
     while at < text.len() {
@@ -48,6 +52,48 @@ fn tokens(text: &str) -> Result<Vec<Token>, AppError> {
                 }
                 continue;
             }
+            if windows_double_quotes && quote == Some('"') {
+                if character == '\\' {
+                    let mut slashes = 0;
+                    while text.as_bytes().get(at + slashes) == Some(&b'\\') {
+                        slashes += 1;
+                    }
+                    if text.as_bytes().get(at + slashes) == Some(&b'"') {
+                        for _ in 0..(slashes / 2) {
+                            value.push('\\');
+                        }
+                        at += slashes;
+                        if slashes % 2 == 1 {
+                            value.push('"');
+                            at += 1;
+                        }
+                        continue;
+                    }
+                    for _ in 0..slashes {
+                        value.push('\\');
+                    }
+                    at += slashes;
+                    continue;
+                }
+                if character == '"' {
+                    if text.as_bytes().get(at + 1) == Some(&b'"') {
+                        value.push('"');
+                        at += 2;
+                    } else {
+                        quote = None;
+                        at += 1;
+                    }
+                    continue;
+                }
+                if character == '%' && text.as_bytes().get(at + 1) == Some(&b'%') {
+                    value.push('%');
+                    at += 2;
+                    continue;
+                }
+                value.push(character);
+                at += character.len_utf8();
+                continue;
+            }
             if character == '"' {
                 quote = if quote == Some('"') { None } else { Some('"') };
                 at += 1;
@@ -58,7 +104,7 @@ fn tokens(text: &str) -> Result<Vec<Token>, AppError> {
                 at += 1;
                 continue;
             }
-            if character == '\\' {
+            if !windows_double_quotes && character == '\\' {
                 let next = text[at + 1..].chars().next();
                 if let Some(next) = next
                     && (quote.is_none() || matches!(next, '"' | '\\' | '$' | '`'))
@@ -191,7 +237,9 @@ pub(in crate::jobs) fn argument(
 }
 
 pub(in crate::jobs) fn words(value: &str) -> Result<Vec<String>, AppError> {
-    Ok(tokens(value)?
+    // Nested av1an arguments (`--video-params`, `--ffmpeg`) use shlex/POSIX
+    // quoting on all platforms.
+    Ok(tokenize(value, false)?
         .into_iter()
         .map(|token| token.value)
         .collect())
@@ -342,5 +390,16 @@ mod tests {
                 .as_deref(),
             Some("--crf 22")
         );
+    }
+
+    #[test]
+    fn windows_verbatim_paths_and_nested_source_filters_round_trip() {
+        let cmd = r#""C:\tools\av1an.exe" "-i" "\\?\C:\work\job\source.mkv" "-o" "\\?\C:\work\job\launch-1\encoded.mkv" "--ffmpeg" "-vf 'eq=brightness=0.05'""#;
+        let parsed = tokenize(cmd, true).unwrap();
+        assert_eq!(parsed[2].value, r"\\?\C:\work\job\source.mkv");
+        assert_eq!(parsed[4].value, r"\\?\C:\work\job\launch-1\encoded.mkv");
+        assert_eq!(parsed[6].value, "-vf 'eq=brightness=0.05'");
+        let nested = words(&parsed[6].value).unwrap();
+        assert_eq!(nested, vec!["-vf", "eq=brightness=0.05"]);
     }
 }

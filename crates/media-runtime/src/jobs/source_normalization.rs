@@ -163,6 +163,8 @@ pub(super) struct Recipe {
     rotation: i32,
     numerator: u32,
     denominator: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim_end_seconds: Option<f64>,
 }
 impl Recipe {
     fn filter(&self) -> String {
@@ -367,11 +369,31 @@ fn recipe(
                 None,
             )
         })?;
+    let trim_end_seconds = (!super::encode::thorough_verification(settings))
+        .then_some(settings.trim)
+        .flatten()
+        .and_then(|trim| {
+            let end = if let Some(time) = trim.time {
+                f64::from(time.end_milliseconds) / 1000.0
+            } else if trim.end_frame_exclusive > 0 {
+                f64::from(trim.end_frame_exclusive) * f64::from(rate.1) / f64::from(rate.0)
+            } else {
+                return None;
+            };
+            let bound = (end + 2.0).max(1.0);
+            let total = document
+                .duration()
+                .into_iter()
+                .chain(normalized_end(document, origin))
+                .reduce(f64::max)?;
+            (total.is_finite() && bound + 5.0 < total).then_some(bound)
+        });
     Ok(Some(Recipe {
         origin,
         rotation,
         numerator: rate.0,
         denominator: rate.1,
+        trim_end_seconds,
     }))
 }
 fn root_for(id: &str, request: &RemuxRequest) -> Result<PathBuf, AppError> {
@@ -675,6 +697,31 @@ pub(super) fn needs(
 ) -> Result<bool, AppError> {
     Ok(recipe(document, settings, force)?.is_some())
 }
+
+/// Detect sources whose demuxer nominal rate (`r_frame_rate`) disagrees materially
+/// with `avg_frame_rate` (e.g. VFR screen captures). Stream-copied AV1AN cuts
+/// cannot be fed directly to frame-ordinal readers like L-SMASH because the
+/// reader adopts `r_frame_rate` while the encoding plan uses `avg_frame_rate`.
+pub(super) fn has_vfr_rate_mismatch(document: &Document, settings: &EncodeSettings) -> bool {
+    let Some(video) = document.streams.iter().find(|stream| {
+        stream.index == settings.video_stream_index && stream.codec_type.as_deref() == Some("video")
+    }) else {
+        return false;
+    };
+    let parse = |value: Option<&str>| -> Option<f64> {
+        let (n, d) = value?.split_once('/')?;
+        let n: f64 = n.parse().ok()?;
+        let d: f64 = d.parse().ok()?;
+        (n > 0.0 && d > 0.0 && (n / d).is_finite()).then_some(n / d)
+    };
+    let (Some(avg), Some(nominal)) = (
+        parse(video.avg_frame_rate.as_deref()),
+        parse(video.r_frame_rate.as_deref()),
+    ) else {
+        return false;
+    };
+    (nominal - avg).abs() > avg * 0.005
+}
 pub(super) fn exists(id: &str, request: &RemuxRequest) -> Result<bool, AppError> {
     Ok(root_for(id, request)?.symlink_metadata().is_ok())
 }
@@ -716,6 +763,14 @@ impl Cleanup {
             return Err(invalid(
                 &self.0.root,
                 "New-settings resume must keep the original selected video stream.",
+            ));
+        }
+        if self.0.owner.recipe.trim_end_seconds.is_some()
+            && self.0.owner.settings.trim != settings.trim
+        {
+            return Err(invalid(
+                &self.0.root,
+                "New-settings resume cannot change trim bounds on a trim-bounded canonical source.",
             ));
         }
         self.0.owner.settings = settings.clone();
@@ -941,7 +996,23 @@ fn disk_preflight(
         .expect("selected video");
     // Overestimating a shifted Matroska file is safe. Never subtract an origin
     // from a span or allow a short peer track to reduce the allocation bound.
-    let duration=document.duration().into_iter().chain(normalized_end(document,recipe.origin)).reduce(f64::max).filter(|value|*value>0.0).ok_or_else(||invalid(path,"Canonical source preparation needs a known positive duration for disk-capacity preflight."))?;
+    let duration = document
+        .duration()
+        .into_iter()
+        .chain(normalized_end(document, recipe.origin))
+        .reduce(f64::max)
+        .filter(|value| *value > 0.0)
+        .map(|value| {
+            recipe
+                .trim_end_seconds
+                .map_or(value, |bound| value.min(bound))
+        })
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "Canonical source preparation needs a known positive duration for disk-capacity preflight.",
+            )
+        })?;
     let pixels =
         u64::from(video.width.unwrap_or(0)).saturating_mul(u64::from(video.height.unwrap_or(0)));
     let frames = (duration * recipe.numerator as f64 / recipe.denominator as f64).ceil() as u64;
@@ -1070,6 +1141,9 @@ async fn stage_source(
         }
     }
     // A seekable Matroska writer records the authored duration and index.
+    if !compressed && let Some(end) = recipe.trim_end_seconds {
+        args.extend(["-t".into(), format!("{end:.3}").into()]);
+    }
     args.extend([
         "-avoid_negative_ts".into(),
         "disabled".into(),
@@ -1910,5 +1984,23 @@ mod orientation_tests {
             assert_eq!([c.top, c.right, c.bottom, c.left], expected);
         }
         assert_eq!(settings.framing.crop.top, 8);
+    }
+    #[test]
+    fn detects_vfr_nominal_versus_average_rate_mismatch() {
+        let mut document: Document = serde_json::from_value(serde_json::json!({
+            "streams": [{
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "av1",
+                "avg_frame_rate": "2722500/45247",
+                "r_frame_rate": "240/1"
+            }]
+        }))
+        .unwrap();
+        let settings = EncodeSettings::default();
+        assert!(has_vfr_rate_mismatch(&document, &settings));
+        document.streams[0].r_frame_rate = Some("24000/1001".into());
+        document.streams[0].avg_frame_rate = Some("23976/1000".into());
+        assert!(!has_vfr_rate_mismatch(&document, &settings));
     }
 }

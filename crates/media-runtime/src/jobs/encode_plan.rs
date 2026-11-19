@@ -1179,12 +1179,18 @@ impl Plan {
         if let (Some(hdr), Some(authored)) = (&mut hdr10, &authored_hdr) {
             hdr.metadata.apply_authored(authored);
         }
-        if hdr10.as_ref().is_some_and(|hdr| hdr.dolby.is_some())
-            && video.codec_name.as_deref() != Some("hevc")
-        {
-            return Err(unsupported(
-                "Dolby Vision HDR10 fallback supports HEVC profile 7/8 base layers only.",
-            ));
+        if let Some(dolby) = hdr10.as_ref().and_then(|hdr| hdr.dolby.as_ref()) {
+            let codec = video.codec_name.as_deref();
+            let valid_base = match dolby.profile() {
+                7 | 8 => codec == Some("hevc"),
+                10 => codec == Some("av1"),
+                _ => true,
+            };
+            if !valid_base {
+                return Err(unsupported(
+                    "Dolby Vision HDR10 fallback supports HEVC profile 7/8 and AV1 profile 10.1 base layers only.",
+                ));
+            }
         }
         let validation_side_data = video
             .side_data_list
@@ -1434,7 +1440,12 @@ impl Plan {
                 match source_chroma_siting(video.chroma_location.as_deref()) {
                     "left" => "left",
                     "topleft" => "topleft",
-                    "center" if !settings.encoder.is_svt() => "center",
+                    "center"
+                        if !settings.encoder.is_svt()
+                            && settings.encoder != VideoEncoder::AomAv1 =>
+                    {
+                        "center"
+                    }
                     "unknown" if source_pixel_format.contains("444") || rgb_source => {
                         // 4:4:4 has no chroma sample offset. Conversion to a
                         // subsampled output needs a deterministic destination.
@@ -1743,7 +1754,7 @@ impl Plan {
     /// source which all scene, chunk and quality-reference readers share.
     pub fn requires_av1an_preprocess(&self) -> bool {
         if self.source_av1an_workflow {
-            return false;
+            return self.trim.is_some();
         }
         if self.source_filters {
             return self.trim.is_some();
@@ -4997,5 +5008,124 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn aom_resamples_center_chroma_and_never_panics() {
+        let mut source = source();
+        source.streams[0].chroma_location = Some("center".into());
+        let settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::AomAv1,
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p),
+                ..Default::default()
+            }),
+            ..EncodeSettings::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
+        assert_eq!(plan.chroma, "left");
+    }
+
+    #[test]
+    fn source_av1an_workflow_with_trim_requires_preprocess() {
+        let source = source();
+        let trimmed = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::SvtAv1Hdr,
+            av1an_options: Some(media_core::Av1anOptions {
+                source_workflow: true,
+                ..Default::default()
+            }),
+            trim: Some(media_core::VideoTrim {
+                start_frame: 0,
+                end_frame_exclusive: 24,
+                time: None,
+            }),
+            source_trim: false,
+            ..EncodeSettings::default()
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &trimmed).unwrap();
+        assert!(plan.requires_av1an_preprocess());
+
+        let untrimmed = EncodeSettings {
+            trim: None,
+            ..trimmed
+        };
+        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &untrimmed).unwrap();
+        assert!(!plan.requires_av1an_preprocess());
+    }
+
+    #[test]
+    fn av1_dolby_vision_profile_10_1_supports_hdr10_fallback_and_tone_map() {
+        let doc: Document = serde_json::from_value(serde_json::json!({
+            "format": {"duration": "10.0", "start_time": "0.0"},
+            "streams": [{
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "av1",
+                "width": 1920,
+                "height": 1080,
+                "pix_fmt": "yuv420p10le",
+                "start_time": "0.0",
+                "r_frame_rate": "24000/1001",
+                "avg_frame_rate": "24000/1001",
+                "color_primaries": "bt2020",
+                "color_transfer": "smpte2084",
+                "color_space": "bt2020nc",
+                "color_range": "tv",
+                "side_data_list": [
+                    {
+                        "side_data_type": "DOVI configuration record",
+                        "dv_profile": 10,
+                        "dv_bl_signal_compatibility_id": 1,
+                        "bl_present_flag": 1,
+                        "rpu_present_flag": 1,
+                        "el_present_flag": 0
+                    },
+                    {
+                        "side_data_type": "Mastering display metadata",
+                        "red_x": "34000/50000", "red_y": "16000/50000",
+                        "green_x": "13250/50000", "green_y": "34500/50000",
+                        "blue_x": "7500/50000", "blue_y": "3000/50000",
+                        "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+                        "min_luminance": "1/10000", "max_luminance": "10000000/10000"
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        let selected = doc.selected(&[0]).unwrap();
+        let hdr10 = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::SvtAv1Hdr,
+            hdr10_fallback: true,
+            av1an_options: Some(media_core::Av1anOptions {
+                source_workflow: true,
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p10le),
+                ..Default::default()
+            }),
+            ..EncodeSettings::default()
+        };
+        let plan = Plan::build(&doc, &selected, &hdr10).unwrap();
+        assert!(plan.is_hdr10());
+
+        let tone_mapped = EncodeSettings {
+            hdr10_fallback: false,
+            tone_map: Some(
+                serde_json::from_value(serde_json::json!({
+                    "algorithm": "mobius",
+                    "backend": "cpu",
+                    "peakMode": "manual",
+                    "sourcePeakNits": 1000,
+                    "hdr10BaseLayer": false,
+                    "sourceWorkflow": true
+                }))
+                .unwrap(),
+            ),
+            ..hdr10
+        };
+        let plan = Plan::build(&doc, &selected, &tone_mapped).unwrap();
+        assert!(!plan.is_hdr10());
     }
 }

@@ -95,7 +95,7 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
                         match plan.chroma {
                             "left" => "vertical",
                             "topleft" => "colocated",
-                            _ => unreachable!("validated AOM chroma position"),
+                            _ => "unknown",
                         }
                     )
                     .into(),
@@ -329,5 +329,16 @@ mod tests {
         let vpx_args = arguments(&vpx_10, &vpx_settings);
         assert!(vpx_args.iter().any(|argument| argument == "--profile=2"));
         assert!(!vpx_args.iter().any(|argument| argument == "--i420"));
+    }
+
+    #[test]
+    fn aom_arguments_never_panic_on_center_chroma() {
+        let (mut p, settings) = plan(8, VideoEncoder::AomAv1);
+        p.chroma = "center";
+        let args = arguments(&p, &settings);
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--chroma-sample-position=unknown")
+        );
     }
 }

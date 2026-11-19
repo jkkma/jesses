@@ -147,6 +147,9 @@ impl Prepared {
             "1".into(),
             "-slicecrc".into(),
             "1".into(),
+            "-nostats".into(),
+            "-progress".into(),
+            "pipe:2".into(),
             "-f".into(),
             "matroska".into(),
             "pipe:1".into(),
@@ -175,11 +178,12 @@ impl Prepared {
         // Only our reserved handle receives the bytes. FFmpeg never reopens a
         // pathname and cannot replace the file reservation.
         let mut output = self.video.clone_file()?;
-        let result = supervisor::run_streaming_stdout(
+        let result = supervisor::run_streaming_stdout_with_stderr_events(
             &self.producer,
             cancel,
             64 * 1024,
             TIME_LIMIT,
+            events.clone(),
             move |reader| {
                 let bytes = std::io::copy(reader, &mut output).map_err(|e| e.to_string())?;
                 output.sync_all().map_err(|e| e.to_string())?;
@@ -188,16 +192,16 @@ impl Prepared {
         )
         .await
         .map_err(|cause| process_error(cause, &self.video.path))?;
-        let detail = format!(
-            "Processed source: {} bytes.\n{}",
-            result.value,
-            String::from_utf8_lossy(&result.stderr)
-        );
+        let stderr_text = String::from_utf8_lossy(&result.stderr);
+        let detail = format!("Processed source: {} bytes.\n{stderr_text}", result.value);
         // This is the same owned attempt-log namespace as the encoder logs.
         tokio::fs::write(log, detail.as_bytes())
             .await
             .map_err(|cause| error(log, cause.to_string()))?;
-        let _ = events.try_send(ProcessEvent::Stderr(detail));
+        let _ = events.try_send(ProcessEvent::Stderr(format!(
+            "Processed source: {} bytes.",
+            result.value
+        )));
         if !result.status.success() {
             return Err(error(
                 &self.video.path,

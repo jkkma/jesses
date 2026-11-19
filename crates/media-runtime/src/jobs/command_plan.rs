@@ -94,11 +94,14 @@ pub(super) async fn build(
 ) -> Result<(), AppError> {
     check_cancel(cancel)?;
     let temporary = Temporary::create(output, &format!("{id}-plan-mux"))?;
-    let video = if settings.encoder.is_svt()
+    let video = if settings.backend == media_core::EncodeBackend::Av1an {
+        Temporary::create(output, &format!("{id}-plan-video"))?
+    } else if settings.encoder.is_svt()
         || matches!(
             settings.encoder,
             VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
-        ) {
+        )
+    {
         Temporary::create_ivf(output, &format!("{id}-plan-video"))?
     } else if settings.encoder == VideoEncoder::X265Standalone {
         Temporary::create_extension(output, &format!("{id}-plan-video"), "hevc")?
@@ -200,9 +203,13 @@ pub(super) async fn build(
         } else {
             source.path.clone()
         };
-        let source_filter = (!uses_prepared || (qtgmc.is_none() && presented.is_some()))
-            .then(|| plan.av1an_decoder_filter())
-            .flatten();
+        let source_filter = if qtgmc.is_some() && settings.source_filters {
+            plan.source_filter_rows_only()
+        } else {
+            (!uses_prepared || (qtgmc.is_none() && presented.is_some()))
+                .then(|| plan.av1an_decoder_filter())
+                .flatten()
+        };
         let arguments = super::super::av1an::arguments(
             &av1an_input,
             &video.path,
@@ -289,20 +296,36 @@ pub(super) async fn build(
             ));
         }
     }
-    let wrapped_video = if matches!(
-        settings.encoder,
-        VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
-    ) {
+    let needs_timing_wrapper = (settings.backend == media_core::EncodeBackend::Standalone
+        && matches!(
+            settings.encoder,
+            VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
+        ))
+        || (settings.encoder == VideoEncoder::AomAv1 && plan.is_hdr10());
+    let wrapped_video = if needs_timing_wrapper {
         let timed = Temporary::create(output, &format!("{id}-plan-timed"))?;
         let executable = discover("mkvmerge", cancel).await?;
+        let mut args = x265::mkvmerge_arguments(&video.path, &timed.path, plan);
+        if settings.encoder == VideoEncoder::AomAv1 {
+            let metadata = plan.aom_hdr_mkvmerge_arguments();
+            args.splice(args.len() - 1..args.len() - 1, metadata);
+        }
         preview.stages.push(stage(
-            "Standalone rational timing wrapper",
+            if settings.encoder == VideoEncoder::AomAv1 {
+                "HDR10 static metadata wrapper"
+            } else {
+                "Standalone rational timing wrapper"
+            },
             CommandSpec {
                 executable,
-                args: x265::mkvmerge_arguments(&video.path, &timed.path, plan),
+                args,
                 cwd: None,
             },
-            vec!["mkvmerge assigns the validated rational cadence to the standalone video intermediate, including HEVC presentation order and VP9 IVF rate normalization, before the common selected-track mux.".into()],
+            vec![if settings.encoder == VideoEncoder::AomAv1 {
+                "mkvmerge attaches the validated HDR10 mastering and content-light metadata to the AOM video intermediate before the common selected-track mux.".into()
+            } else {
+                "mkvmerge assigns the validated rational cadence to the standalone video intermediate, including HEVC presentation order and VP9 IVF rate normalization, before the common selected-track mux.".into()
+            }],
         ));
         Some(timed)
     } else {

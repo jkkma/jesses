@@ -271,7 +271,7 @@ impl JobManager {
         log_path: &Path,
         frame_count: usize,
         dynamic_hdr: &super::dynamic_hdr::Resources,
-        post_mux: Option<CommandSpec>,
+        post_mux: Vec<CommandSpec>,
     ) -> Result<bool, AppError> {
         validate_encoder_path(encoder, settings)?;
         if plan.is_hdr10()
@@ -554,14 +554,14 @@ impl JobManager {
             cwd: Some(work.clone()),
         };
         let mut generated = super::command_edit::format_command(&native_command);
-        if let Some(mut mux) = post_mux {
-            for argument in &mut mux.args {
+        for mut stage in post_mux {
+            for argument in &mut stage.args {
                 if argument == video.path.as_os_str() {
                     *argument = av1an_output.as_os_str().to_owned();
                 }
             }
             generated.push_str(" &&\n");
-            generated.push_str(&super::command_edit::format_command(&mux));
+            generated.push_str(&super::command_edit::format_command(&stage));
         }
         let saved = recovery.edited_command().await?;
         let output = self

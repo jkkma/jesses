@@ -1072,7 +1072,31 @@ impl JobManager {
                 .expect("registered job")
                 .pause
                 .clone();
-            supervisor::with_pause(control, self.execute(id, cancel, log_path)).await;
+            let runner = self.clone();
+            let task_id = id.clone();
+            let outcome = tokio::spawn(async move {
+                supervisor::with_pause(control, runner.execute(task_id, cancel, log_path)).await;
+            })
+            .await;
+            if let Err(join_error) = outcome {
+                let detail = if join_error.is_panic() {
+                    "The media job stopped unexpectedly because of an internal error."
+                } else {
+                    "The media job task ended unexpectedly."
+                };
+                self.change(&id, |snapshot| {
+                    if !snapshot.state.is_terminal() {
+                        snapshot.state = JobState::Failed;
+                        snapshot.encoder_progress = None;
+                        append_log(snapshot, format!("{detail} ({join_error})"));
+                        snapshot.error = Some(AppError::new("INTERNAL_ERROR", detail, None));
+                    }
+                })
+                .await;
+                if let Some(review) = self.command_review(&id).await {
+                    review.finish(Some(AppError::new("INTERNAL_ERROR", detail, None)));
+                }
+            }
         } else {
             let storage_error = self.state.lock().await.storage_error.clone();
             self.change(&id, |snapshot| {

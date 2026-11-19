@@ -142,7 +142,7 @@ export function av1anError(
       encoder === 'x264' || encoder === 'x265Standalone' || encoder === 'aomAv1'
         ? ['yuv420p', 'yuv420p10le', 'yuv422p', 'yuv422p10le', 'yuv444p', 'yuv444p10le']
         : encoder === 'vpxStandalone'
-          ? ['yuv420p', 'yuva420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le']
+          ? ['yuv420p', 'yuv420p10le', 'yuv444p', 'yuv444p10le']
           : ['yuv420p', 'yuv420p10le']
     ).includes(draft.pixelFormat)
   )
@@ -195,9 +195,9 @@ export function av1anError(
       ((q.metric === 'xpsnr' || q.metric === 'xpsnrWeighted') &&
         !sourceDefaults &&
         q.probingRate > 1)) &&
-    ['select', 'hybrid'].includes(draft.chunkMethod)
+    ['select', 'hybrid', 'segment'].includes(draft.chunkMethod)
   )
-    return 'This scorer needs L-SMASH, FFMS2, or BestSource. XPSNR with every frame can use FFmpeg select or hybrid.';
+    return 'This scorer needs L-SMASH, FFMS2, or BestSource. XPSNR with every frame can use FFmpeg select, hybrid, or segment.';
   return null;
 }
 export function selectedAv1an(

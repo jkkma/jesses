@@ -757,7 +757,9 @@
     const before = jobs.find((entry) => entry.id === id);
     const snapshot = await setJobPaused(id, paused);
     jobs = jobs.map((entry) => (entry.id === id && entry === before ? snapshot : entry));
-    addLog(paused ? 'Paused live av1an workers.' : 'Continued live av1an workers.');
+    const label =
+      before?.encodeSettings?.backend === 'av1an' ? 'live av1an workers' : 'live media job';
+    addLog(paused ? `Paused ${label}.` : `Continued ${label}.`);
   }
   async function activateRecoverySource(path: string) {
     if (importing) throw new Error('Wait for the current import to finish before resuming.');

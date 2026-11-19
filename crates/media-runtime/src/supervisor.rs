@@ -706,15 +706,42 @@ where
     F: FnOnce(&mut dyn io::Read) -> Result<T, String> + Send + 'static,
 {
     console::scope(console::explicit_profile(), &[spec], cancel, |cancel| {
-        run_streaming_stdout_inner(spec, cancel, stderr_max_bytes, time_limit, parse)
+        run_streaming_stdout_inner(spec, cancel, stderr_max_bytes, time_limit, None, parse)
     })
     .await
 }
+
+pub async fn run_streaming_stdout_with_stderr_events<T, F>(
+    spec: &CommandSpec,
+    cancel: watch::Receiver<bool>,
+    stderr_max_bytes: usize,
+    time_limit: Duration,
+    events: mpsc::Sender<ProcessEvent>,
+    parse: F,
+) -> Result<StreamedOutput<T>, SupervisorError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn io::Read) -> Result<T, String> + Send + 'static,
+{
+    console::scope(console::explicit_profile(), &[spec], cancel, |cancel| {
+        run_streaming_stdout_inner(
+            spec,
+            cancel,
+            stderr_max_bytes,
+            time_limit,
+            Some(events),
+            parse,
+        )
+    })
+    .await
+}
+
 async fn run_streaming_stdout_inner<T, F>(
     spec: &CommandSpec,
     cancel: watch::Receiver<bool>,
     stderr_max_bytes: usize,
     time_limit: Duration,
+    stderr_events: Option<mpsc::Sender<ProcessEvent>>,
     parse: F,
 ) -> Result<StreamedOutput<T>, SupervisorError>
 where
@@ -753,7 +780,7 @@ where
     let execution = async {
         let ((), stderr, status, value) = tokio::try_join!(
             forward_stdout(stdout, sender),
-            capture_tail(stderr, stderr_max_bytes),
+            capture_tail_with_events(stderr, stderr_max_bytes, stderr_events),
             async {
                 child
                     .wait_and_terminate_descendants()
@@ -830,18 +857,51 @@ async fn forward_stdout(
     }
 }
 
+#[cfg(test)]
 async fn capture_tail(
+    stream: impl AsyncRead + Unpin,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SupervisorError> {
+    capture_tail_with_events(stream, max_bytes, None).await
+}
+
+async fn capture_tail_with_events(
     mut stream: impl AsyncRead + Unpin,
     max_bytes: usize,
+    events: Option<mpsc::Sender<ProcessEvent>>,
 ) -> Result<Vec<u8>, SupervisorError> {
     let mut result = Vec::with_capacity(max_bytes.min(RECORD_BYTES));
     let mut buffer = [0; RECORD_BYTES];
+    let mut pending = Vec::new();
     loop {
         let count = read_pipe(&mut stream, &mut buffer).await?;
         if count == 0 {
+            if let Some(tx) = &events
+                && !pending.is_empty()
+            {
+                let line = String::from_utf8_lossy(&pending).trim().to_owned();
+                if !line.is_empty() {
+                    let _ = tx.try_send(ProcessEvent::Stderr(line));
+                }
+            }
             return Ok(result);
         }
         console::emit(1, &buffer[..count]);
+        if let Some(tx) = &events {
+            for &byte in &buffer[..count] {
+                if byte == b'\n' || byte == b'\r' {
+                    if !pending.is_empty() {
+                        let line = String::from_utf8_lossy(&pending).trim().to_owned();
+                        pending.clear();
+                        if !line.is_empty() {
+                            let _ = tx.try_send(ProcessEvent::Stderr(line));
+                        }
+                    }
+                } else if pending.len() < 4096 {
+                    pending.push(byte);
+                }
+            }
+        }
         if count >= max_bytes {
             result.clear();
             result.extend_from_slice(&buffer[count - max_bytes..count]);

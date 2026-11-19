@@ -373,9 +373,10 @@ impl Prepared {
         let root = cut_root(id, request, settings)?;
         let ffprobe = discover("ffprobe", cancel).await?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
-        let document = probe(&ffprobe, &original.path, cancel, None).await?;
+        let thorough = super::encode::thorough_verification(settings);
+        let document = probe_headers(&ffprobe, &original.path, cancel, None).await?;
         let section = section(settings, &document, &original.path)?;
-        let original_stamp = stamp(&original, cancel).await?;
+        let original_stamp = recovery_stamp(&original, cancel, thorough).await?;
         // Other trim variants remain immutable for canceled New-settings review.
         // Their original-source authority must agree before any replacement is made.
         for prior_root in cut_roots(id, request)? {
@@ -383,7 +384,12 @@ impl Prepared {
                 continue;
             }
             let prior = CutWorkspace::open_path(prior_root, id, request)?;
-            if prior.owner.original != original_stamp {
+            let current = if prior.owner.original.includes_contents() == thorough {
+                original_stamp.clone()
+            } else {
+                recovery_stamp(&original, cancel, prior.owner.original.includes_contents()).await?
+            };
+            if prior.owner.original != current {
                 return Err(invalid(
                     &prior.root,
                     "The original source changed since a saved source-cut variant; cached files were preserved.",
@@ -393,7 +399,17 @@ impl Prepared {
         }
         if root.symlink_metadata().is_ok() {
             let workspace = CutWorkspace::open(id, request, settings)?;
-            if workspace.owner.original != original_stamp || workspace.owner.section != section {
+            let current = if workspace.owner.original.includes_contents() == thorough {
+                original_stamp.clone()
+            } else {
+                recovery_stamp(
+                    &original,
+                    cancel,
+                    workspace.owner.original.includes_contents(),
+                )
+                .await?
+            };
+            if workspace.owner.original != current || workspace.owner.section != section {
                 return Err(invalid(
                     &root,
                     "The original source or source-cut section changed; cached chunks were preserved.",
@@ -698,7 +714,12 @@ impl Cleanup {
         let (_owner, cancel) = watch::channel(false);
         for workspace in &self.0 {
             let original = Source::open(&workspace.owner.original.path)?;
-            if digest(&original, &cancel)? != workspace.owner.original {
+            let actual = if workspace.owner.original.includes_contents() {
+                digest(&original, &cancel)?
+            } else {
+                metadata_stamp(&original, &cancel)?
+            };
+            if actual != workspace.owner.original {
                 return Err(invalid(
                     &original.path,
                     "The original source changed since copied input preparation.",

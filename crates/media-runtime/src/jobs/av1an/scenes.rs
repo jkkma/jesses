@@ -53,11 +53,13 @@ impl Prepared {
 }
 
 pub(super) fn supports_preload(version: &str) -> bool {
-    // This revision only clears --temp when --resume is absent. With no
-    // queue or completion marker, it then changes back to normal fresh mode.
-    version.lines().any(|line| {
-        line.starts_with("av1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) ")
-    })
+    // This revision (or any build advertising the preload capability tag) only
+    // clears --temp when --resume is absent. With no queue or completion
+    // marker, it then changes back to normal fresh mode.
+    version.contains("[preload-scenes-v1]")
+        || version.lines().any(|line| {
+            line.starts_with("av1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) ")
+        })
 }
 
 fn failure(path: &Path, detail: impl Into<String>) -> AppError {
@@ -958,5 +960,13 @@ mod tests {
         assert!(!launch.join("scene-prepass").exists());
         assert!(!abort_chunks.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supports_preload_accepts_capability_tag() {
+        assert!(supports_preload(
+            "av1an 0.6.0 (Release) [preload-scenes-v1]"
+        ));
+        assert!(!supports_preload("av1an 0.5.0 (Release)"));
     }
 }

@@ -318,6 +318,21 @@ pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: 
             .any(|line| line.trim() == WINDOWS_HDR_RELEASE)
 }
 
+fn has_explicit_ten_bit_output(settings: &EncodeSettings) -> bool {
+    matches!(
+        settings.output_pixel_format.or_else(|| {
+            settings
+                .av1an_options
+                .and_then(|options| options.pixel_format)
+        }),
+        Some(
+            media_core::Av1anPixelFormat::Yuv420p10le
+                | media_core::Av1anPixelFormat::Yuv422p10le
+                | media_core::Av1anPixelFormat::Yuv444p10le
+        )
+    )
+}
+
 pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
     validate_values(settings.encoder, settings.backend, &settings.parameters)?;
     if let Some(quantizer) = settings.constant_quantizer
@@ -369,16 +384,7 @@ pub(super) fn validate(settings: &EncodeSettings) -> Result<(), AppError> {
                     "Select lossless mode before using the lossless encoder tune.",
                 ));
             }
-            ("highbitdepth", "1")
-                if !matches!(
-                    settings.output_pixel_format,
-                    Some(
-                        media_core::Av1anPixelFormat::Yuv420p10le
-                            | media_core::Av1anPixelFormat::Yuv422p10le
-                            | media_core::Av1anPixelFormat::Yuv444p10le
-                    )
-                ) =>
-            {
+            ("highbitdepth", "1") if !has_explicit_ten_bit_output(settings) => {
                 return Err(error(
                     "highbitdepth requires an explicitly planned 10-bit output pixel format.",
                 ));
@@ -1299,6 +1305,28 @@ mod tests {
         settings.backend = EncodeBackend::Standalone;
         settings.encoder = VideoEncoder::SvtAv1;
         assert!(!allows_parallel_svt(&settings, &identity));
+    }
+
+    #[test]
+    fn highbitdepth_accepts_av1an_ten_bit_pixel_format() {
+        let mut settings = EncodeSettings {
+            backend: EncodeBackend::Av1an,
+            encoder: VideoEncoder::VpxStandalone,
+            output_pixel_format: None,
+            av1an_options: Some(media_core::Av1anOptions {
+                pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p10le),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(has_explicit_ten_bit_output(&settings));
+        settings.av1an_options = Some(media_core::Av1anOptions {
+            pixel_format: Some(media_core::Av1anPixelFormat::Yuv420p),
+            ..Default::default()
+        });
+        assert!(!has_explicit_ten_bit_output(&settings));
+        settings.output_pixel_format = Some(media_core::Av1anPixelFormat::Yuv420p10le);
+        assert!(has_explicit_ten_bit_output(&settings));
     }
 
     #[tokio::test]

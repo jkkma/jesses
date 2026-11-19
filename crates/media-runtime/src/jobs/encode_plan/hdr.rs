@@ -306,23 +306,27 @@ impl DolbyVision {
         let compatibility = number("dv_bl_signal_compatibility_id");
         if !matches!(
             (profile, compatibility),
-            (Some(7), Some(6)) | (Some(8), Some(1))
+            (Some(7), Some(6)) | (Some(8), Some(1)) | (Some(10), Some(1))
         ) && !(allow_profile5 && (profile, compatibility) == (Some(5), Some(0)))
             || number("bl_present_flag") != Some(1)
             || number("rpu_present_flag") != Some(1)
             || (profile == Some(7) && number("el_present_flag") != Some(1))
-            || (matches!(profile, Some(5 | 8)) && number("el_present_flag") != Some(0))
+            || (matches!(profile, Some(5 | 8 | 10)) && number("el_present_flag") != Some(0))
         {
             return Err(unsupported(if allow_profile5 {
-                "Dolby Vision rendering requires profile 5/compatibility 0 with an intact single-layer RPU, or a confirmed profile 7/8 HDR10 base layer with its required layer flags."
+                "Dolby Vision rendering requires profile 5/compatibility 0 with an intact single-layer RPU, or a confirmed profile 7/8/10 HDR10 base layer with its required layer flags."
             } else {
-                "HDR10 fallback requires a confirmed Dolby Vision profile 7/compatibility 6 or profile 8/compatibility 1 HDR10 base layer. Profile 5 requires GPU/RPU rendering instead."
+                "HDR10 fallback requires a confirmed Dolby Vision profile 7/compatibility 6, profile 8/compatibility 1, or AV1 profile 10/compatibility 1 HDR10 base layer. Profile 5 requires GPU/RPU rendering instead."
             }));
         }
         Ok(Self {
             profile: profile.unwrap(),
             compatibility: compatibility.unwrap(),
         })
+    }
+
+    pub(super) fn profile(&self) -> u64 {
+        self.profile
     }
 
     fn is_profile5(&self) -> bool {

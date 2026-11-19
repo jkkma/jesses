@@ -57,7 +57,10 @@ pub(super) fn compatible_dolby_base(video: &Stream) -> bool {
             .get("side_data_type")
             .and_then(serde_json::Value::as_str)
             == Some("DOVI configuration record")
-            && value.get("dv_profile").and_then(serde_json::Value::as_u64) == Some(8)
+            && matches!(
+                value.get("dv_profile").and_then(serde_json::Value::as_u64),
+                Some(8 | 10)
+            )
             && value
                 .get("dv_bl_signal_compatibility_id")
                 .and_then(serde_json::Value::as_u64)
@@ -107,7 +110,10 @@ impl Transform {
                 .get("side_data_type")
                 .and_then(serde_json::Value::as_str)
                 == Some("DOVI configuration record")
-                && value.get("dv_profile").and_then(serde_json::Value::as_u64) == Some(8)
+                && matches!(
+                    value.get("dv_profile").and_then(serde_json::Value::as_u64),
+                    Some(8 | 10)
+                )
                 && value
                     .get("dv_bl_signal_compatibility_id")
                     .and_then(serde_json::Value::as_u64)
@@ -125,7 +131,7 @@ impl Transform {
             })
         {
             return Err(unsupported(
-                "Source tone mapping requires a supported single-layer Dolby profile5 or HDR10-compatible profile8.1 configuration.",
+                "Source tone mapping requires a supported single-layer Dolby profile5 or HDR10-compatible profile8.1/10.1 configuration.",
             ));
         }
         let dolby_rpu = (dv5 || dv8)
@@ -135,7 +141,7 @@ impl Transform {
             && tone.backend != ToneMapBackend::Cpu;
         if dv8 && !tone.hdr10_base_layer && !dolby_rpu && !source_compatible_base {
             return Err(unsupported(
-                "Dolby Vision profile8.1 requires standalone measured Vulkan rendering with its RPU, or an explicit HDR10-base-layer tone map.",
+                "Dolby Vision profile8.1/10.1 requires standalone measured Vulkan rendering with its RPU, or an explicit HDR10-base-layer tone map.",
             ));
         }
         if dolby_rpu
@@ -192,6 +198,7 @@ impl Transform {
             Some("left") => "left",
             Some("topleft") if !dv5 => "topleft",
             Some("center") => "center",
+            None | Some("unspecified" | "unknown") if !dv5 => "left",
             _ => {
                 return Err(unsupported(
                     "Tone mapping requires explicit left, center or top-left source chroma placement.",

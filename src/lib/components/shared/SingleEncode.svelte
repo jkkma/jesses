@@ -1661,14 +1661,7 @@
       p444 = y('yuv444p', 'YUV - 4:4:4 - 8 bit'),
       p44410 = y('yuv444p10le', 'YUV - 4:4:4 - 10 bit');
     if (listedSvt(encoder)) return [p420, p42010];
-    if (encoder === 'vpxStandalone')
-      return [
-        p420,
-        ...(chunked ? [y('yuva420p', 'YUVA - 4:2:0 - 8 bit')] : []),
-        p444,
-        p42010,
-        p44410,
-      ];
+    if (encoder === 'vpxStandalone') return [p420, p444, p42010, p44410];
     return [p420, p422, p444, p42010, p42210, p44410];
   });
   const metricFields: Record<string, { min: number; max: number; step: number; default: number }> =
@@ -1744,8 +1737,11 @@
     validFramingDraft(activeFraming, selectedVideo) &&
       (cropMode !== 'manual' || cropFits(framing, selectedVideo)),
   );
+  const supportsHdr10Output = $derived(
+    isSvtEncoder(encoder) || ['aomAv1', 'x265Standalone', 'x265'].includes(encoder),
+  );
   const toneMapIssue = $derived(
-    toneMapError(toneMap, backend, selectedVideo, isSvtEncoder(encoder) && hdr10Fallback),
+    toneMapError(toneMap, backend, selectedVideo, supportsHdr10Output && hdr10Fallback),
   );
   const trimIssue = $derived(
     trimError(
@@ -1765,10 +1761,20 @@
         ? 'Choose time boundaries for an audio-only source.'
         : null),
   );
+  const subtitleIncluded = $derived(
+    included.filter((index) => {
+      const stream = file?.streams.find((entry) => entry.index === index);
+      if (stream?.kind !== 'subtitle') return true;
+      if (stripSubs || (chunked && !copySubs)) {
+        return encodingVideo && String(stream.index) === activeBurn;
+      }
+      return true;
+    }),
+  );
   const subtitleIssue = $derived(
     subtitleError(
       subtitles,
-      included,
+      subtitleIncluded,
       file?.streams ?? [],
       backend,
       selectedVideo,
@@ -1829,7 +1835,7 @@
       ? !chunked || !!av1anBatchSource
       : (!encodingVideo && videoMode === 'drop') ||
           (videos.some((stream) => stream.index === videoIndex) &&
-            (!chunked || videoIndex === videos.find((stream) => !stream.attachedPic)?.index)),
+            (!chunked || videoIndex === videos[0]?.index)),
   );
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const externalIssue = $derived(
@@ -2014,9 +2020,9 @@
       : null,
   );
   const pixelFormatIssue = $derived(
-    outputPixelFormat && !sourceColors.some((option) => option.value === outputPixelFormat)
+    chosenPixelFormat && !sourceColors.some((option) => option.value === chosenPixelFormat)
       ? 'Choose an output pixel format supported by this encoder.'
-      : outputPixelFormat === 'yuva420p' && !['matroska', 'webm'].includes(outputContainer)
+      : chosenPixelFormat === 'yuva420p' && !['matroska', 'webm'].includes(outputContainer)
         ? 'VP9 alpha requires a Matroska or WebM destination.'
         : null,
   );
@@ -2167,11 +2173,32 @@
       (suggestionPending ? 'Preparing the suggested output path…' : null) ??
       (!destination.trim() ? 'Choose an output path to continue.' : null) ??
       (!isImage && !noVideoForRun && !batchWithoutVideo && encodingVideo
-        ? videoSettingsIssue
+        ? (videoSettingsIssue ??
+          tuningSettingsIssue ??
+          customFiltersIssue ??
+          pixelFormatIssue ??
+          (!selectedVideoSupported && fileMode !== 'batch'
+            ? 'AV1AN currently encodes the first video track. Choose that track or use Quick Convert.'
+            : null) ??
+          (hdrUnsupported
+            ? 'The selected encoder supports SDR output only. Enable Tone Mapping or choose an HDR10 encoder.'
+            : null) ??
+          toneMapIssue ??
+          temporalError(temporal, backend) ??
+          grainConflict ??
+          parameterIssue ??
+          dynamicHdrIssue ??
+          gridGrainIssue ??
+          grainTableError ??
+          parsedHdr.error)
         : null) ??
       (!isImage && missingRunTools.length ? missingToolsMessage(missingRunTools) : null) ??
       sourceTrackIssue ??
       containerIssue ??
+      trimIssue ??
+      externalIssue ??
+      layoutIssue ??
+      timecodeIssue ??
       (encodingVideo ? subtitleIssue : null) ??
       (chunked && fileMode === 'batch' && files.length > 0 && !av1anBatchSource
         ? 'AV1AN requires at least one movie video stream in the batch.'
@@ -2806,7 +2833,11 @@
         // Source quality zero is distinct from the explicit native lossless
         // API; source scalar zero remains a literal quality value.
         lossless: pictureEnabled && rate.mode === 'lossless',
-        ...(pictureEnabled && isSvtEncoder(encoder) && rate.mode === 'quality' && crf !== 0
+        ...(pictureEnabled &&
+        isSvtEncoder(encoder) &&
+        rate.mode === 'quality' &&
+        !(chunked && av1an.targetEnabled) &&
+        crf !== 0
           ? { svtCrfQuarterSteps: Math.round(crf! * 4) }
           : {}),
         ...(isSvtEncoder(encoder) ? { svtPreset: preset } : {}),
@@ -2817,7 +2848,8 @@
           pictureEnabled && !gridGrain && (isSvtEncoder(encoder) || encoder === 'aomAv1')
             ? filmGrain!
             : 0,
-        hdr10Fallback: pictureEnabled && isSvtEncoder(encoder) ? hdr10Fallback : false,
+        hdr10Fallback:
+          pictureEnabled && supportsHdr10Output && !toneMap.enabled ? hdr10Fallback : false,
         lineartPsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
         texturePsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
         hdrTune: pictureEnabled && encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
@@ -3930,6 +3962,7 @@
         !batchWithoutVideo &&
         encodingVideo &&
         rate.mode === 'quality' &&
+        !(chunked && av1an.targetEnabled) &&
         crf === undefined) ||
       (!noVideoForRun &&
         !batchWithoutVideo &&
@@ -4215,15 +4248,19 @@
               max={metricFields[av1an.target.metric]?.max}
               step={metricFields[av1an.target.metric]?.step}
               value={av1an.target.minimumScoreTenths / 10}
-              oninput={(event) =>
-                (av1an = {
+              oninput={(event) => {
+                const value = event.currentTarget.valueAsNumber;
+                if (!Number.isFinite(value)) return;
+                const tenths = Math.round(value * 10);
+                av1an = {
                   ...av1an,
                   target: {
                     ...av1an.target,
-                    minimumScoreTenths: Math.round(event.currentTarget.valueAsNumber * 10),
-                    maximumScoreTenths: Math.round(event.currentTarget.valueAsNumber * 10),
+                    minimumScoreTenths: tenths,
+                    maximumScoreTenths: tenths,
                   },
-                })}
+                };
+              }}
             />
           {:else if rate.mode === 'bitrate'}<input
               id={`${idPrefix}-quality`}
@@ -4479,22 +4516,31 @@
                   /> One frame per field</label
                 >{/if}
             </div>{/if}
-          {#if knownHdr(selectedVideo)}<label for={`${idPrefix}-tone`}>Tone Mapping</label><select
-              id={`${idPrefix}-tone`}
-              disabled={!encodingVideo}
-              value={toneMap.enabled ? toneMap.algorithm : 'off'}
-              onchange={(event) =>
-                (toneMap = {
-                  ...toneMap,
-                  enabled: event.currentTarget.value !== 'off',
-                  algorithm: (event.currentTarget.value === 'off'
-                    ? 'hable'
-                    : event.currentTarget.value) as ToneMapDraft['algorithm'],
-                })}
-              ><option value="off">No tone mapping</option><option value="hable">Hable</option
-              ><option value="mobius">Mobius</option><option value="reinhard">Reinhard</option
-              >{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}</select
-            >{/if}
+          {#if knownHdr(selectedVideo)}<label for={`${idPrefix}-tone`}>Tone Mapping</label>
+            <div class="inline">
+              <select
+                id={`${idPrefix}-tone`}
+                disabled={!encodingVideo}
+                value={toneMap.enabled ? toneMap.algorithm : 'off'}
+                onchange={(event) => {
+                  const enabled = event.currentTarget.value !== 'off';
+                  if (enabled) hdr10Fallback = false;
+                  toneMap = {
+                    ...toneMap,
+                    enabled,
+                    algorithm: (enabled
+                      ? event.currentTarget.value
+                      : 'hable') as ToneMapDraft['algorithm'],
+                  };
+                }}
+                ><option value="off">No tone mapping</option><option value="hable">Hable</option
+                ><option value="mobius">Mobius</option><option value="reinhard">Reinhard</option
+                >{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}</select
+              >{#if !toneMap.enabled && supportsHdr10Output}<label
+                  ><input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
+                  fallback (discard DV / HDR10+)</label
+                >{/if}
+            </div>{/if}
         </div>
       </div>
     {:else if settingsTab === 'audio'}

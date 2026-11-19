@@ -259,6 +259,16 @@ fn tags_preserved(source: &BTreeMap<String, String>, output: &BTreeMap<String, S
     changed_tag(source, output).is_none()
 }
 
+fn lookup_tag<'a>(output: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    // FFmpeg's Matroska muxer normalizes spaces in custom SimpleTag names to
+    // underscores per the Matroska TagName specification while preserving the value.
+    output.get(key).or_else(|| {
+        key.contains(' ')
+            .then(|| output.get(&key.replace(' ', "_")))
+            .flatten()
+    })
+}
+
 /// The first expected stream tag the output lost or changed, with its value there.
 fn changed_tag(
     source: &BTreeMap<String, String>,
@@ -267,9 +277,9 @@ fn changed_tag(
     let output = stable_tags(output);
     stable_tags(source)
         .into_iter()
-        .find(|(key, value)| output.get(key) != Some(value))
+        .find(|(key, value)| lookup_tag(&output, key) != Some(value))
         .map(|(key, value)| {
-            let actual = output.get(&key).cloned();
+            let actual = lookup_tag(&output, &key).cloned();
             (key, value, actual)
         })
 }
@@ -286,7 +296,7 @@ fn format_tags_preserved(
         matches!(
             key.as_str(),
             "major_brand" | "minor_version" | "compatible_brands"
-        ) || output.get(key) == Some(value)
+        ) || lookup_tag(&output, key) == Some(value)
     })
 }
 
@@ -742,6 +752,23 @@ mod tests {
         assert_eq!(
             changed_tag(&source, &renamed),
             Some(("handler_name".into(), "VideoHandler".into(), None))
+        );
+        let spaced_source = BTreeMap::from([
+            ("Encoded by".into(), "Ironclad".into()),
+            ("Film grain synthesis".into(), "svt-av1".into()),
+        ]);
+        let underscore_output = BTreeMap::from([
+            ("ENCODED_BY".into(), "Ironclad".into()),
+            ("FILM_GRAIN_SYNTHESIS".into(), "svt-av1".into()),
+        ]);
+        assert!(tags_preserved(&spaced_source, &underscore_output));
+        let mutated_output = BTreeMap::from([
+            ("ENCODED_BY".into(), "Other".into()),
+            ("FILM_GRAIN_SYNTHESIS".into(), "svt-av1".into()),
+        ]);
+        assert_eq!(
+            changed_tag(&spaced_source, &mutated_output),
+            Some(("encoded by".into(), "Ironclad".into(), Some("Other".into())))
         );
     }
 

@@ -517,10 +517,20 @@ fn arguments(
             // Restore the independently validated frame clock after Matroska's
             // millisecond quantization. Composition timestamps keep their rank,
             // including B-frame packet reordering; packet number is never PTS.
-            let scale = clock.numerator.checked_mul(1000).ok_or_else(|| {
-                invalid("The verified frame clock exceeds the final-container timebase.")
-            })?;
-            let step = u64::from(clock.denominator) * 1000;
+            // Keep the scaled timebase within FFmpeg's signed 32-bit AVRational
+            // range while retaining millisecond-or-finer origin precision.
+            if clock.numerator == 0 || clock.numerator > i32::MAX as u32 {
+                return Err(invalid(
+                    "The verified frame clock exceeds the final-container timebase.",
+                ));
+            }
+            let factor = (i32::MAX as u64 / u64::from(clock.numerator)).clamp(1, 1000);
+            let scale = u64::from(clock.numerator) * factor;
+            let step = u64::from(clock.denominator)
+                .checked_mul(factor)
+                .ok_or_else(|| {
+                    invalid("The verified frame clock exceeds the final-container timebase.")
+                })?;
             let origin = stream
                 .packet_start_time
                 .or_else(|| {
@@ -535,7 +545,7 @@ fn arguments(
                     "The verified frame clock has no finite mux origin.",
                 ));
             }
-            let origin_ticks = (origin * f64::from(scale)).round();
+            let origin_ticks = (origin * scale as f64).round();
             // A frame-sized timebase cannot represent source mux preroll such
             // as0.979s at24fps. Keep the proven origin and restore only each
             // frame's relative ordinal, including reordered composition times.
@@ -1740,5 +1750,38 @@ mod tests {
         doc.streams[2].disposition.insert("default".into(), 0);
         let selected = doc.streams.iter().collect::<Vec<_>>();
         assert!(preflight_explicit_defaults(Path::new("out.mp4"), &selected, &[3]).is_ok());
+    }
+
+    #[test]
+    fn high_numerator_clocks_scale_within_i32_rational_range() {
+        let doc = document();
+        let cadence = Cadence {
+            index: 0,
+            numerator: 134_790_000,
+            denominator: 2_245_573,
+            frames: 60,
+            source_iso: None,
+            full_verification: false,
+            basic_video_check: None,
+            expected_kinds: None,
+        };
+        let args = arguments(
+            Path::new("in.mkv"),
+            Path::new("out.webm"),
+            &doc,
+            ContainerFormat::Webm,
+            Some(cadence),
+            None,
+            false,
+        )
+        .unwrap();
+        let bsf = args
+            .iter()
+            .find_map(|arg| {
+                let s = arg.to_string_lossy();
+                s.contains("setts=").then(|| s.into_owned())
+            })
+            .expect("setts bitstream filter");
+        assert!(bsf.contains("time_base=1/2021850000"), "{bsf}");
     }
 }

@@ -303,6 +303,12 @@ pub(in crate::jobs) fn aom_parameters(settings: &EncodeSettings) -> Vec<OsString
 
 pub(in crate::jobs) fn parameters(args: &mut Vec<OsString>, settings: &EncodeSettings) {
     if settings.encoder == media_core::VideoEncoder::AomAv1 {
+        args.retain(|argument| {
+            let text = argument.to_string_lossy();
+            !text.starts_with("--film-grain-table=")
+                && !text.starts_with("--denoise-noise-level=")
+                && !text.starts_with("--enable-dnl-denoising=")
+        });
         args.extend(aom_parameters(settings));
         return;
     }
@@ -565,5 +571,33 @@ mod tests {
         std::fs::remove_file(selected).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn aom_grain_parameters_are_not_duplicated_when_reapplied() {
+        let settings = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            encoder: media_core::VideoEncoder::AomAv1,
+            film_grain: 8,
+            ..Default::default()
+        };
+        let mut args = vec![
+            OsString::from("--cq-level=35"),
+            OsString::from("--denoise-noise-level=8"),
+            OsString::from("--enable-dnl-denoising=0"),
+        ];
+        parameters(&mut args, &settings);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--denoise-noise-level=8")
+                .count(),
+            1
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--enable-dnl-denoising=0")
+                .count(),
+            1
+        );
     }
 }

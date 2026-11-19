@@ -115,16 +115,43 @@ impl JobManager {
             && settings.trim.is_some()
             && settings.backend == media_core::EncodeBackend::Av1an
         {
-            boxed(|| {
-                self.encode_source_av1an_mode(
-                    id, request, settings, cancel, log_path, temporary, scratch, preview,
-                )
-            })
-            .await
+            let use_canonical_vfr = if super::source_normalization::exists(id, request)? {
+                true
+            } else if let Ok((_, document)) =
+                super::source_normalization::inspect(request, settings, cancel).await
+            {
+                super::source_normalization::has_vfr_rate_mismatch(&document, settings)
+                    && super::source_normalization::needs(&document, settings, true)
+                        .unwrap_or(false)
+            } else {
+                false
+            };
+            if use_canonical_vfr {
+                self.change(id, |snapshot| {
+                    append_log(
+                        snapshot,
+                        "Source video has a variable frame rate (r_frame_rate differs from avg_frame_rate); using CFR canonical normalization instead of a stream-copied AV1AN section so AV1AN preserves A/V sync and frame-rate consistency.".into(),
+                    )
+                })
+                .await;
+                boxed(|| {
+                    self.encode_source_mode(
+                        id, request, settings, cancel, log_path, temporary, scratch, preview, true,
+                    )
+                })
+                .await
+            } else {
+                boxed(|| {
+                    self.encode_source_av1an_mode(
+                        id, request, settings, cancel, log_path, temporary, scratch, preview,
+                    )
+                })
+                .await
+            }
         } else {
             boxed(|| {
                 self.encode_source_mode(
-                    id, request, settings, cancel, log_path, temporary, scratch, preview,
+                    id, request, settings, cancel, log_path, temporary, scratch, preview, false,
                 )
             })
             .await
@@ -200,6 +227,7 @@ impl JobManager {
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
         mut preview: Option<&mut media_core::EncodeCommandPlan>,
+        force_normalize: bool,
     ) -> Result<(), AppError> {
         self.phase(
             id,
@@ -210,7 +238,8 @@ impl JobManager {
         let (original, document) =
             super::source_normalization::inspect(request, settings, cancel).await?;
         let existing = super::source_normalization::exists(id, request)?;
-        let mut required = super::source_normalization::needs(&document, settings, false)?;
+        let mut required =
+            super::source_normalization::needs(&document, settings, force_normalize)?;
         if !existing && required {
             // A canonical source decodes the complete video. Check the selection
             // and destination against stream headers before that pass.
@@ -330,7 +359,10 @@ impl JobManager {
             &log_path.with_extension("source-normalization.log"),
         ))
         .await?;
-        let effective = prepared.effective_settings(settings);
+        let mut effective = prepared.effective_settings(settings);
+        if force_normalize {
+            effective.source_trim = false;
+        }
         let result = boxed(|| {
             self.encode_video_mode(
                 id,
@@ -1290,6 +1322,36 @@ impl JobManager {
         }
         source.verify()?;
         check_cancel(cancel)?;
+        let av1an_locator = if settings.backend == media_core::EncodeBackend::Av1an {
+            self.state
+                .lock()
+                .await
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .and_then(|entry| entry.snapshot.recovery.clone())
+        } else {
+            None
+        };
+        let reusable_av1an_prepared = if preview.is_none()
+            && settings.backend == media_core::EncodeBackend::Av1an
+            && (plan.requires_qtgmc()
+                || plan.requires_av1an_preprocess()
+                || plan.av1an_presented_rate.is_some())
+            && let Some(locator) = av1an_locator.as_ref()
+        {
+            super::av1an::Recovery::reusable_prepared(
+                id,
+                authority_request.unwrap_or(request),
+                authority_settings.unwrap_or(settings),
+                &source.path,
+                locator,
+                cancel,
+            )
+            .await
+        } else {
+            None
+        };
         let source_qtgmc = settings.source_filters
             && settings.backend == media_core::EncodeBackend::Standalone
             && plan.requires_qtgmc();
@@ -1306,12 +1368,14 @@ impl JobManager {
             && !source_qtgmc_checkpoint_ready
             && self.command_review(id).await.is_some();
         let mut qtgmc = boxed(||async {Ok::<_,AppError>(if plan.requires_qtgmc() {
-            self.phase(
-                id,
-                JobState::Preparing,
-                "Preparing a verified lossless QTGMC intermediate with the configured VapourSynth runtime.",
-            )
-            .await;
+            if reusable_av1an_prepared.is_none() {
+                self.phase(
+                    id,
+                    JobState::Preparing,
+                    "Preparing a verified lossless QTGMC intermediate with the configured VapourSynth runtime.",
+                )
+                .await;
+            }
             let qtgmc_plan=if settings.source_filters && settings.backend==media_core::EncodeBackend::Av1an {plan.without_source_filter_rows()}else{plan.clone()};
             let prepared = super::qtgmc::Prepared::build(
                 &source.path,
@@ -1329,7 +1393,18 @@ impl JobManager {
                 cancel,
             )
             .await?;
-            if preview.is_none() && !defer_source_qtgmc && !source_qtgmc_checkpoint_ready {
+            if let Some((_, saved_frames)) = &reusable_av1an_prepared {
+                if settings.source_filters {
+                    frame_count = *saved_frames;
+                }
+                self.change(id, |snapshot| {
+                    append_log(
+                        snapshot,
+                        "Reusing the verified prepared QTGMC intermediate from the saved AV1AN workspace.".into(),
+                    );
+                })
+                .await;
+            } else if preview.is_none() && !defer_source_qtgmc && !source_qtgmc_checkpoint_ready {
                 let prep_log = log_path.with_extension("qtgmc.log");
                 self.change(id, |snapshot| {
                     snapshot.log_path = Some(prep_log.to_string_lossy().into_owned());
@@ -1383,7 +1458,21 @@ impl JobManager {
                 ),
             );
             if settings.encoder.is_svt() {
-                append_log(snapshot, format!("Film grain synthesis {} (denoising off).", settings.film_grain));
+                let grain_note = match settings.av1an_grain.as_ref() {
+                    Some(grain) if grain.table.is_some() => format!(
+                        "Film grain table attached (denoising {}).",
+                        if grain.denoise { "on" } else { "off" }
+                    ),
+                    Some(grain) if grain.denoise => format!(
+                        "Film grain synthesis {} (denoising on).",
+                        settings.film_grain
+                    ),
+                    _ => format!(
+                        "Film grain synthesis {} (denoising off).",
+                        settings.film_grain
+                    ),
+                };
+                append_log(snapshot, grain_note);
             }
             match settings.encoder {
                 VideoEncoder::SvtAv1FiveFish => append_log(snapshot, format!("SVT-AV1 5fish: line-art bias {}, texture bias {}.", settings.lineart_psy_bias, settings.texture_psy_bias)),
@@ -1428,7 +1517,10 @@ impl JobManager {
             external.verify()?;
             return check_cancel(cancel);
         }
-        let qtgmc_identity = if !source_qtgmc && let Some(prepared) = &qtgmc {
+        let qtgmc_identity = if !source_qtgmc
+            && reusable_av1an_prepared.is_none()
+            && let Some(prepared) = &qtgmc
+        {
             self.phase(
                 id,
                 JobState::Preparing,
@@ -1449,6 +1541,7 @@ impl JobManager {
         let av1an_prepared = if settings.backend == media_core::EncodeBackend::Av1an
             && qtgmc.is_none()
             && (plan.requires_av1an_preprocess() || plan.av1an_presented_rate.is_some())
+            && reusable_av1an_prepared.is_none()
         {
             if subtitle_assets.bitmap_input().is_some() {
                 return Err(AppError::new(
@@ -1549,15 +1642,20 @@ impl JobManager {
         let mut standalone_final = None;
         let durable = if settings.backend == media_core::EncodeBackend::Av1an {
             let executable = discover("av1an", cancel).await?;
-            let locator = self
-                .state
-                .lock()
-                .await
-                .entries
-                .iter()
-                .find(|entry| entry.snapshot.id == id)
-                .and_then(|entry| entry.snapshot.recovery.clone());
-            let prepared_source = if let (Some(prepared), Some(identity)) =
+            let locator = av1an_locator;
+            let prepared_source = if let Some((reusable, _)) = reusable_av1an_prepared {
+                if qtgmc.is_none() {
+                    self.change(id, |snapshot| {
+                        append_log(
+                            snapshot,
+                            "Reusing the verified processed source from the saved AV1AN workspace."
+                                .into(),
+                        );
+                    })
+                    .await;
+                }
+                Some(reusable)
+            } else if let (Some(prepared), Some(identity)) =
                 (qtgmc.as_ref(), qtgmc_identity.as_ref())
             {
                 Some(av1an::PreparedSource {
@@ -2016,12 +2114,37 @@ impl JobManager {
                     })
                     .transpose()?
                     .flatten();
+                    let mut review_hdr_wrap = None;
                     let post_mux = if self.command_review(id).await.is_some()
                         || recovery.edited_command().await?.is_some()
                     {
+                        let mut stages = Vec::new();
+                        let mux_video_path = if settings.encoder == VideoEncoder::AomAv1
+                            && plan.is_hdr10()
+                            && let Some(tool) = mkvmerge.as_ref()
+                        {
+                            let wrapped = Temporary::create(
+                                &output,
+                                &format!("{attempt_id}-aomenc-review-hdr"),
+                            )?;
+                            let mut wrap_args =
+                                x265::mkvmerge_arguments(&intermediate.path, &wrapped.path, &plan);
+                            let metadata = plan.aom_hdr_mkvmerge_arguments();
+                            wrap_args.splice(wrap_args.len() - 1..wrap_args.len() - 1, metadata);
+                            stages.push(CommandSpec {
+                                executable: tool.clone(),
+                                args: wrap_args,
+                                cwd: None,
+                            });
+                            let path = wrapped.path.clone();
+                            review_hdr_wrap = Some(wrapped);
+                            path
+                        } else {
+                            intermediate.path.clone()
+                        };
                         let mut args = mux_args(
                             &source.path,
-                            &intermediate.path,
+                            &mux_video_path,
                             &temp.path,
                             &output_selected,
                             &plan,
@@ -2040,14 +2163,18 @@ impl JobManager {
                             cover_art.as_ref(),
                             review_attachment.as_ref(),
                         );
-                        Some(CommandSpec {
+                        stages.push(CommandSpec {
                             executable: ffmpeg.clone(),
                             args,
                             cwd: None,
-                        })
+                        });
+                        stages
                     } else {
-                        None
+                        Vec::new()
                     };
+                    if let Some(wrapped) = review_hdr_wrap.as_mut() {
+                        wrapped.close_for_path_writer()?;
+                    }
                     let edited = self
                         .encode_av1an(
                             id,
@@ -2068,6 +2195,9 @@ impl JobManager {
                             post_mux,
                         )
                         .await?;
+                    if let Some(mut wrapped) = review_hdr_wrap {
+                        let _ = wrapped.reopen_after_path_writer();
+                    }
                     if let Some(actual) = plan.source_queue_frame_count() {
                         frame_count = actual;
                     } else if plan.source_frames_estimated {

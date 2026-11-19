@@ -1026,7 +1026,7 @@ test('AV1AN source-specific codec defaults, options and fixed-image controls', a
       max: '50',
       p: '3',
       poptions: Array.from({ length: 7 }, (_, i) => String(i)),
-      colors: [yuv[0], 'YUVA - 4:2:0 - 8 bit', yuv[2], yuv[3], yuv[5]],
+      colors: [yuv[0], yuv[2], yuv[3], yuv[5]],
       format: 'yuv420p10le',
     },
     {
