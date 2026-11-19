@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import {
     getEncoderParameters,
     getParameterPresets,
@@ -42,13 +43,15 @@
     onraw?: (value: Record<string, string>) => void;
     onresource?: (name: string, path: string) => void;
   } = $props();
+  const uid = $props.id();
   /** A preset waiting for confirmation; null parameters clear the grid. */
   type PendingPreset = { name: string; parameters: EncoderParameter[] | null };
   let catalog = $state<EncoderParameterCatalog | null>(null),
     category = $state(''),
     error = $state(''),
     help = $state<string | null>(null),
-    pendingPreset = $state<PendingPreset | null>(null);
+    pendingPreset = $state<PendingPreset | null>(null),
+    categoryListEl = $state<HTMLDivElement>();
   // Named presets the user saved, kept in preferences per encoder and route.
   let saved = $state<EncoderParameterPreset[]>([]),
     savedChoice = $state(''),
@@ -129,6 +132,8 @@
       ...virtuals.map((p) => p.group),
     ]),
   ]);
+  const activeCategory = $derived(groups.includes(category) ? category : (groups[0] ?? ''));
+  const activeCategoryIndex = $derived(Math.max(0, groups.indexOf(activeCategory)));
   const presets = $derived(contentPresets(encoder));
   const helpRow = $derived(help ? sourceRows[help] : undefined);
   const examples = $derived(
@@ -185,6 +190,30 @@
   function applyPreset(name: string) {
     applyParameters(name, presets.find((p) => p.name === name)?.parameters ?? null);
   }
+  function handleCategoryKeys(event: KeyboardEvent, index: number) {
+    if (!groups.length) return;
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? groups.length - 1
+          : event.key === 'ArrowRight'
+            ? (index + 1) % groups.length
+            : event.key === 'ArrowLeft'
+              ? (index + groups.length - 1) % groups.length
+              : -1;
+    if (next < 0) return;
+    event.preventDefault();
+    category = groups[next];
+    void tick().then(() => {
+      categoryListEl?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+    });
+  }
+  function handleRowContextMenu(event: MouseEvent, name: string) {
+    if ((event.target as HTMLElement | null)?.closest('input, textarea')) return;
+    event.preventDefault();
+    help = name;
+  }
   $effect(() => {
     const currentEncoder = encoder,
       currentBackend = backend,
@@ -219,10 +248,11 @@
 {#if error}<p role="alert">{error}</p>{/if}
 {#if presets.length}<div class="preset-row">
     <span>Presets</span>{#each presets as preset}<button
+        type="button"
         disabled={!catalog || disabled}
         title={preset.description}
         onclick={() => applyPreset(preset.name)}>{preset.name}</button
-      >{/each}<button {disabled} onclick={() => applyPreset('')}>Clear</button>
+      >{/each}<button type="button" {disabled} onclick={() => applyPreset('')}>Clear</button>
   </div>{/if}
 {#if isDesktop()}<div class="preset-row" role="group" aria-label="Saved presets">
     <span>My presets</span><select
@@ -232,10 +262,12 @@
       ><option value="">{savedHere.length ? 'Choose a saved preset' : 'None saved yet'}</option
       >{#each savedHere as preset}<option value={preset.name}>{preset.name}</option>{/each}</select
     ><button
+      type="button"
       disabled={!catalog || disabled || !chosenSaved}
       onclick={() => chosenSaved && applyParameters(chosenSaved.name, chosenSaved.parameters)}
       >Apply</button
     ><button
+      type="button"
       disabled={disabled || !value.length}
       title="Save the arguments set in this grid under a name"
       onclick={() => {
@@ -243,26 +275,54 @@
         saveError = '';
         saveOpen = true;
       }}>Save as…</button
-    ><button disabled={disabled || !chosenSaved} onclick={() => void deletePreset()}>Delete</button>
+    ><button type="button" disabled={disabled || !chosenSaved} onclick={() => void deletePreset()}
+      >Delete</button
+    >
   </div>{/if}
-<div role="tablist" aria-label="Encoder argument categories" class="categories">
-  {#each groups as group}<button
+<div
+  role="tablist"
+  aria-label="Encoder argument categories"
+  class="categories"
+  bind:this={categoryListEl}
+>
+  {#each groups as group, index}<button
+      type="button"
+      id={`${uid}-cat-${index}`}
       role="tab"
-      aria-selected={category === group}
-      class:active={category === group}
+      aria-selected={activeCategory === group}
+      tabindex={activeCategory === group ? 0 : -1}
+      class:active={activeCategory === group}
+      onkeydown={(event) => handleCategoryKeys(event, index)}
       onclick={() => (category = group)}>{group}</button
     >{/each}
 </div>
-<div class="grid">
+<div
+  class="grid"
+  role="tabpanel"
+  aria-labelledby={groups.length ? `${uid}-cat-${activeCategoryIndex}` : undefined}
+>
   <table>
-    <thead><tr><th>Argument</th><th>Value</th><th>Description, Possible Values</th></tr></thead
-    ><tbody>
-      {#each (catalog?.parameters ?? []).filter((p) => (p.group || 'Arguments') === category && !virtuals.some((managed) => managed.name === p.name)) as spec}<tr
-          oncontextmenu={(event) => {
-            event.preventDefault();
-            help = spec.name;
-          }}
-          ><td>{spec.argument}</td><td
+    <thead>
+      <tr>
+        <th scope="col">Argument</th>
+        <th scope="col">Value</th>
+        <th scope="col">Description, Possible Values</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each (catalog?.parameters ?? []).filter((p) => (p.group || 'Arguments') === activeCategory && !virtuals.some((managed) => managed.name === p.name)) as spec}<tr
+          oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
+          ><td
+            ><div class="arg-cell">
+              <span class="mono">{spec.argument}</span><button
+                type="button"
+                class="arg-help"
+                aria-label={`Details for ${spec.argument}`}
+                title="Show argument details"
+                onclick={() => (help = spec.name)}>?</button
+              >
+            </div></td
+          ><td
             ><input
               aria-label={`${spec.label} value`}
               {disabled}
@@ -271,12 +331,19 @@
             /></td
           ><td>{sourceRows[spec.name]?.summary ?? spec.description.split('\n\n')[0]}</td></tr
         >{/each}
-      {#each virtuals.filter((p) => p.group === category) as spec}<tr
-          oncontextmenu={(event) => {
-            event.preventDefault();
-            help = spec.name;
-          }}
-          ><td>{spec.name}</td><td
+      {#each virtuals.filter((p) => p.group === activeCategory) as spec}<tr
+          oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
+          ><td
+            ><div class="arg-cell">
+              <span class="mono">{spec.name}</span><button
+                type="button"
+                class="arg-help"
+                aria-label={`Details for ${spec.name}`}
+                title="Show argument details"
+                onclick={() => (help = spec.name)}>?</button
+              >
+            </div></td
+          ><td
             ><input
               aria-label={`${spec.name} value`}
               {disabled}
@@ -307,7 +374,9 @@
         {#each examples as example}<div class="example">
             <code>{example.value}</code><span>{example.text}</span>
           </div>{/each}{/if}
-      <div class="help-actions"><button onclick={() => (help = null)}>Close</button></div>
+      <div class="help-actions">
+        <button type="button" onclick={() => (help = null)}>Close</button>
+      </div>
     </div></SourceDialog
   >{/if}
 <SourceDialog
@@ -331,7 +400,10 @@
       : 'Clearing empties them all. Continue?'}
   </p>
   <div class="help-actions">
-    <button onclick={() => (pendingPreset = null)}>No</button><button
+    <button type="button" data-dialog-initial-focus onclick={() => (pendingPreset = null)}
+      >No</button
+    ><button
+      type="button"
       onclick={() => {
         const choice = pendingPreset;
         pendingPreset = null;
@@ -347,7 +419,7 @@
       maxlength="64"
       bind:value={saveName}
       onkeydown={(event) => {
-        if (event.key === 'Enter') void savePreset();
+        if (event.key === 'Enter' && !event.isComposing) void savePreset();
       }}
     /></label
   >
@@ -360,7 +432,8 @@
     </p>{/if}
   {#if saveError}<p role="alert">{saveError}</p>{/if}
   <div class="help-actions">
-    <button onclick={() => (saveOpen = false)}>Cancel</button><button
+    <button type="button" onclick={() => (saveOpen = false)}>Cancel</button><button
+      type="button"
       disabled={!saveName.trim() || savingPreset}
       onclick={() => void savePreset()}>Save</button
     >
@@ -374,7 +447,7 @@
     align-items: center;
     flex-wrap: wrap;
     margin: 6px 0;
-    font-size: 12px;
+    font-size: 0.92rem;
   }
   .preset-row select {
     color: inherit;
@@ -390,7 +463,8 @@
   .categories {
     display: flex;
     gap: 2px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
     border-bottom: 1px solid var(--border);
   }
   button {
@@ -400,11 +474,32 @@
     padding: 5px 10px;
     cursor: pointer;
   }
-  .categories button {
-    border-bottom: 0;
+  button:hover:not(:disabled) {
+    background: var(--secondary);
   }
-  .active {
-    font-weight: bold;
+  .categories button {
+    position: relative;
+    flex: 0 0 auto;
+    border-color: transparent;
+    border-bottom: 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+  }
+  .categories button:hover:not([aria-selected='true']) {
+    background: var(--secondary);
+    color: var(--foreground);
+  }
+  .categories button[aria-selected='true'] {
+    background: var(--primary);
+    color: var(--primary-foreground);
+    border-color: var(--primary);
+  }
+  .categories button[aria-selected='true']::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 0;
+    border-bottom: 2px solid var(--primary-foreground);
   }
   .grid {
     overflow: auto;
@@ -413,7 +508,7 @@
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: 0.92rem;
   }
   th,
   td {
@@ -427,6 +522,27 @@
   th:nth-child(2) {
     width: 110px;
   }
+  .arg-cell {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .arg-help {
+    flex: 0 0 auto;
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0 5px;
+    font-size: 0.85rem;
+    line-height: 1;
+    color: var(--muted-foreground);
+    background: var(--secondary);
+    border: 1px solid var(--border);
+  }
+  .arg-help:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
   input {
     width: 100%;
     padding: 4px;
@@ -439,7 +555,7 @@
     overflow: auto;
   }
   .help-content strong {
-    font-size: 18px;
+    font-size: 1.38rem;
   }
   .details {
     white-space: pre-wrap;
@@ -461,5 +577,9 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+  }
+  p[role='alert'] {
+    color: var(--destructive);
+    font-weight: 600;
   }
 </style>

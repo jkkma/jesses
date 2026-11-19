@@ -129,7 +129,7 @@ const calls = (page: Page, command: string) =>
 async function configure(page: Page) {
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Get Metrics/ })
+    .getByRole('button', { name: 'Get Metrics', exact: true })
     .click();
   return page.getByRole('dialog', { name: 'Quality Metrics' });
 }

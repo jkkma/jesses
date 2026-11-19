@@ -78,7 +78,7 @@ test('AV1AN validates source worker count and submits the selected segment reade
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await av.getByLabel('Chunk Method').selectOption('segment');
   await av.getByLabel('Workers', { exact: true }).fill('0');
   await expect(page.getByRole('button', { name: 'Run: AV1AN encode' })).toBeDisabled();
@@ -487,7 +487,7 @@ test('AV1AN exposes scene slices only when the prepass prerequisites are selecte
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   const slices = av.getByLabel('Detection Slices');
   // The parallel prepass runs on default jobs; Thorough verification stays off here.
   await expect(av.getByText(/Detects scenes in this many parallel parts/)).toBeVisible();
@@ -507,7 +507,7 @@ test('AV1AN accepts 64 workers and rejects 65', async ({ page }) => {
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   const workers = av.getByLabel('Workers', { exact: true });
   await expect(workers).toHaveAttribute('max', '64');
   await workers.fill('65');

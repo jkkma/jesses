@@ -275,20 +275,33 @@
     oninput={(event) => seek(event.currentTarget.valueAsNumber)}
   />
   <div class="range">
-    <div
-      style={`left:${duration ? Math.max(0, ((fromText(startText) ?? 0) / 1000 / duration) * 100) : 0}%;right:${duration ? Math.max(0, 100 - ((fromText(endText) ?? 0) / 1000 / duration) * 100) : 0}%`}
-    ></div>
-    <i style={`left:${duration ? (position / duration) * 100 : 0}%`}></i>
+    {#if duration > 0}
+      {@const startPct = Math.max(
+        0,
+        Math.min(100, ((fromText(startText) ?? 0) / 1000 / duration) * 100),
+      )}
+      {@const endPct = Math.max(
+        startPct,
+        Math.min(100, ((fromText(endText) ?? 0) / 1000 / duration) * 100),
+      )}
+      <div style={`left:${startPct}%;right:${100 - endPct}%`}></div>
+    {/if}
+    <i style={`left:${duration > 0 ? (position / duration) * 100 : 0}%`}></i>
   </div>
   <div class="position">
     <span>{format(position * 1000)}</span>
     <div>
       <button
+        type="button"
+        aria-label="Jump to start point"
         title="Jump to the start point"
         onclick={() => seek((fromText(startText) ?? 0) / 1000)}>⏮</button
       >{#each [{ l: '-10s', n: -10 }, { l: '-1s', n: -1 }, { l: '-1f', n: -frameDuration / 1000 }, { l: '+1f', n: frameDuration / 1000 }, { l: '+1s', n: 1 }, { l: '+10s', n: 10 }] as item}<button
+          type="button"
           onclick={() => seek(position + item.n)}>{item.l}</button
         >{/each}<button
+        type="button"
+        aria-label="Jump to end point"
         title="Jump to the end point"
         onclick={() => seek((fromText(endText) ?? 0) / 1000)}>⏭</button
       >
@@ -323,16 +336,17 @@
               });
         }
       }}
-    /><button onclick={() => void markStart()}>Set to playhead</button>
+    /><button type="button" onclick={() => void markStart()}>Set start to playhead</button>
     <label for="cut-end">End</label><input
       id="cut-end"
       bind:value={endText}
       oninput={invalidateSnap}
     /><button
+      type="button"
       onclick={() => {
         invalidateSnap();
         endText = textValue(position * 1000);
-      }}>Set to playhead</button
+      }}>Set end to playhead</button
     >
     <label for="cut-duration">Duration</label><input
       id="cut-duration"
@@ -345,6 +359,7 @@
           )
         : format(Math.max(0, (fromText(endText) ?? 0) - (fromText(startText) ?? 0)))}
     />{#if !copied}<button
+        type="button"
         onclick={() => {
           const ms = fromText(startText);
           if (ms !== null)
@@ -360,7 +375,10 @@
       {error}
     </p>{/if}
   <div class="actions">
-    <button onclick={reset}>Reset</button><button onclick={() => void confirm()}>OK</button>
+    <button type="button" onclick={reset}>Reset</button><button
+      type="button"
+      onclick={() => void confirm()}>OK</button
+    >
   </div>
 </SourceDialog>
 
@@ -440,7 +458,14 @@
   button {
     cursor: pointer;
   }
+  button:hover:not(:disabled) {
+    background: var(--accent);
+  }
   p {
-    font-size: 12px;
+    font-size: 0.92rem;
+  }
+  p[role='alert'] {
+    color: var(--destructive);
+    font-weight: 600;
   }
 </style>

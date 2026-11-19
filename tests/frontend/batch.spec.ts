@@ -1213,7 +1213,7 @@ test('AV1AN batch freezes source worker, split and custom-filter settings', asyn
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await av.getByLabel('Workers', { exact: true }).fill('3');
   await av.getByLabel('Split Method').selectOption('fixedChunks');
   await av.getByRole('tab', { name: 'Advanced' }).click();

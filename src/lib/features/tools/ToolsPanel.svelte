@@ -1,21 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import {
-    Check,
-    CircleAlert,
-    ExternalLink,
-    FolderSearch,
-    Info,
-    LoaderCircle,
-    RefreshCw,
-    Wrench,
-  } from '@lucide/svelte';
-  import { Button } from '$lib/components/ui/button';
-  import PreferencesPanel from './PreferencesPanel.svelte';
+  import { Check, CircleAlert, ExternalLink, Info, LoaderCircle, RefreshCw } from '@lucide/svelte';
   import { appVersion } from '../../app-version';
   import type { ToolInfo } from '$lib/ipc/generated';
   import { getStorageLocations } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
+
   let {
     tools,
     desktop,
@@ -23,7 +13,6 @@
     checked,
     error,
     onrefresh,
-    preferences = true,
   }: {
     tools: ToolInfo[];
     desktop: boolean;
@@ -31,12 +20,13 @@
     checked: boolean;
     error: string | null;
     onrefresh: () => void;
-    /** Settings shows its own preferences above this panel. */
     preferences?: boolean;
   } = $props();
+
   const available = $derived(tools.filter((tool) => tool.available).length);
   let locations = $state<[string, string][]>([]);
   let storageError = $state<string | null>(null);
+
   onMount(() => {
     let active = true;
     if (desktop) {
@@ -44,8 +34,8 @@
         .then((result) => {
           if (active) locations = result;
         })
-        .catch((error) => {
-          if (active) storageError = errorMessage(error);
+        .catch((err) => {
+          if (active) storageError = errorMessage(err);
         });
     }
     return () => {
@@ -55,25 +45,10 @@
 </script>
 
 <section class="tools-workspace" aria-label="Installed tools">
-  <div class="view-intro">
-    <div>
-      <span class="eyebrow">Installed tools</span>
-      <h1>Tools & environment</h1>
-      <p>Check which tools jesses found, and why one is missing.</p>
-    </div>
-    <Button variant="outline" onclick={onrefresh} disabled={!desktop || loading}
-      ><RefreshCw size={14} class={loading ? 'spinning' : ''} aria-hidden="true" />Check again</Button
-    >
-  </div>
-  {#if error}<div class="notice error-notice" role="alert">
-      <CircleAlert size={16} aria-hidden="true" />
-      <p>{error}</p>
-    </div>{/if}
-  <section class="panel tool-detection">
-    <div class="section-heading">
-      <span class="heading-with-icon"
-        ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Tool readiness</span></span
-      ><span class="small-muted"
+  <div class="section-bar">
+    <h2>INSTALLED TOOLS</h2>
+    <div class="section-meta">
+      <span class="small-muted"
         >{desktop && loading
           ? 'Checking local tools…'
           : desktop && !checked
@@ -84,15 +59,25 @@
                 ? 'No tool results'
                 : 'Desktop required'}</span
       >
+      <button type="button" onclick={onrefresh} disabled={!desktop || loading}>
+        <RefreshCw size={13} class={loading ? 'spinning' : ''} aria-hidden="true" />Check again
+      </button>
     </div>
-    <p class="tool-guidance">
-      Tool availability varies by workflow. A missing tool affects only the features that depend on
-      it.
-    </p>
+  </div>
+  <p class="tool-guidance">
+    Check which tools jesses found and why one is missing. A missing tool affects only the features
+    that depend on it.
+  </p>
+  {#if error}
+    <div class="error-banner" role="alert">
+      <CircleAlert size={15} aria-hidden="true" />
+      <p>{error}</p>
+    </div>
+  {/if}
+  <div class="tool-box">
     {#if !desktop}
       <div class="tools-empty">
-        <FolderSearch size={34} strokeWidth={1.2} aria-hidden="true" />
-        <h2>Connect to your desktop.</h2>
+        <h3>Connect to your desktop</h3>
         <p>
           Open the jesses desktop app to locate media tools and inspect local files. Tool
           availability cannot be checked in this browser preview.
@@ -100,34 +85,43 @@
       </div>
     {:else if loading && !tools.length}
       <div class="tools-empty" role="status">
-        <LoaderCircle size={25} class="spinning" aria-hidden="true" />
-        <h2>Checking tools…</h2>
+        <LoaderCircle size={20} class="spinning" aria-hidden="true" />
+        <h3>Checking tools…</h3>
         <p>Checking the required media tools and additional capabilities.</p>
       </div>
     {:else if tools.length}
       <div class="tools-table-scroll">
         <table class="tools-table">
-          <thead><tr><th>Tool</th><th>Status</th><th>Diagnostics</th></tr></thead><tbody>
+          <thead>
+            <tr>
+              <th scope="col">Tool</th>
+              <th scope="col">Status</th>
+              <th scope="col">Diagnostics</th>
+            </tr>
+          </thead>
+          <tbody>
             {#each tools as tool (tool.id)}
-              <tr
-                ><td><strong>{tool.name}</strong><span class="tool-id mono">{tool.id}</span></td><td
-                  ><span class:available={tool.available} class="tool-status"
-                    >{#if loading}<LoaderCircle
-                        size={13}
-                        class="spinning"
-                        aria-hidden="true"
-                      />{checked ? 'Refreshing…' : 'Checking…'}{:else if !checked}<Info
-                        size={13}
-                        aria-hidden="true"
-                      />Not checked{:else if tool.available}<Check
-                        size={13}
-                        aria-hidden="true"
-                      />Available{:else}<CircleAlert size={13} aria-hidden="true" />{tool.path
+              <tr>
+                <td><strong>{tool.name}</strong><span class="tool-id mono">{tool.id}</span></td>
+                <td>
+                  <span class:available={tool.available} class="tool-status">
+                    {#if loading}
+                      <LoaderCircle size={13} class="spinning" aria-hidden="true" />{checked
+                        ? 'Refreshing…'
+                        : 'Checking…'}
+                    {:else if !checked}
+                      <Info size={13} aria-hidden="true" />Not checked
+                    {:else if tool.available}
+                      <Check size={13} aria-hidden="true" />Available
+                    {:else}
+                      <CircleAlert size={13} aria-hidden="true" />{tool.path
                         ? 'Check failed'
-                        : 'Not found'}{/if}</span
-                  ></td
-                ><td
-                  ><details class="tool-diagnostics">
+                        : 'Not found'}
+                    {/if}
+                  </span>
+                </td>
+                <td>
+                  <details class="tool-diagnostics">
                     <summary>Show details</summary>
                     <dl>
                       <div>
@@ -138,129 +132,241 @@
                         <dt>Location</dt>
                         <dd class="mono">{tool.path ?? 'Not detected'}</dd>
                       </div>
-                      {#if tool.detail}<div>
+                      {#if tool.detail}
+                        <div>
                           <dt>Detection</dt>
                           <dd>{tool.detail}</dd>
-                        </div>{/if}
+                        </div>
+                      {/if}
                     </dl>
-                  </details></td
-                ></tr
-              >
+                  </details>
+                </td>
+              </tr>
             {/each}
           </tbody>
         </table>
       </div>
     {:else}
       <div class="tools-empty">
-        <FolderSearch size={30} strokeWidth={1.2} aria-hidden="true" />
-        <h2>No detection results.</h2>
+        <h3>No detection results</h3>
         <p>Choose “Check again” to inspect this environment.</p>
       </div>
     {/if}
-    <div class="panel-footnote">
-      <Info size={14} aria-hidden="true" /><span
-        >Open a row’s details first. If a Windows package is missing a bundled file, repair or
+    <div class="footnote">
+      <Info size={13} aria-hidden="true" />
+      <span>
+        Open a row’s details first. If a Windows package is missing a bundled file, repair or
         reinstall Jesses, then choose Check again. If a configured override fails, correct that path
-        and recheck.</span
-      >
+        and recheck.
+      </span>
     </div>
-  </section>
+  </div>
+
   {#if desktop}
-    {#if preferences}<PreferencesPanel />{/if}
-    <section class="panel scorer-panel">
-      <div class="section-heading">
-        <span class="heading-with-icon"
-          ><Wrench size={15} aria-hidden="true" /><span class="eyebrow">Quality scoring</span></span
-        >
-      </div>
+    <div class="sub-section">
+      <h2>QUALITY SCORING</h2>
       <p class="scorer-summary">
         Windows packages include Vship and CPU quality scorers. Jesses checks GPU support for
         SSIMULACRA2 and Butteraugli jobs and uses CPU scoring when the GPU check fails. No extra
         setup is needed for the Windows package.
       </p>
-    </section>
-    <details class="panel optional-panel storage-panel" open={storageError !== null}>
-      <summary class="section-heading"
-        ><span class="eyebrow">Application storage</span><span class="small-muted"
-          >Paths & portability</span
-        ></summary
-      >
-      {#if storageError}<p class="storage-error" role="alert">{storageError}</p>
-      {:else if !locations.length}<p class="small-muted storage-error">
-          Reading application locations…
+    </div>
+
+    <details class="storage-disclosure" open={storageError !== null}>
+      <summary>
+        <span>APPLICATION STORAGE</span>
+        <span class="small-muted">Paths &amp; portability</span>
+      </summary>
+      <div class="storage-body">
+        {#if storageError}
+          <p class="storage-error" role="alert">{storageError}</p>
+        {:else if !locations.length}
+          <p class="small-muted">Reading application locations…</p>
+        {:else}
+          <dl class="storage-locations">
+            {#each locations as [label, value] (label)}
+              <div>
+                <dt>{label}</dt>
+                <dd class="mono">{value}</dd>
+              </div>
+            {/each}
+          </dl>
+        {/if}
+        <p class="footnote-plain">
+          Portable packages keep preferences, history and logs beside the app. Installed copies use
+          your profile folders.
         </p>
-      {:else}
-        <dl class="storage-locations">
-          {#each locations as [label, value] (label)}
-            <div>
-              <dt>{label}</dt>
-              <dd class="mono">{value}</dd>
-            </div>
-          {/each}
-        </dl>
-      {/if}
-      <div class="panel-footnote">
-        Portable packages keep preferences, history and logs beside the app. Installed copies use
-        your profile folders.
       </div>
     </details>
   {/if}
-  <section class="panel about-panel">
-    <div>
-      <div class="brand-wordmark">jesses<span class="version-tag">{appVersion}</span></div>
-      <p>Desktop media encoding, muxing, and analysis.</p>
-      <span class="small-muted">Created by jkkma.</span>
+
+  <div class="sub-section">
+    <h2>ABOUT</h2>
+    <div class="about-row">
+      <div>
+        <div class="about-title">
+          <strong>jesses</strong><span class="version-tag mono">v{appVersion}</span>
+        </div>
+        <p class="small-muted">Desktop media encoding, muxing, and analysis. Created by jkkma.</p>
+      </div>
+      <a href="https://github.com/jkkma/jesses" target="_blank" rel="noreferrer" class="repo-link">
+        Project repository<ExternalLink size={13} aria-hidden="true" />
+      </a>
     </div>
-    <a href="https://github.com/jkkma/jesses" target="_blank" rel="noreferrer" class="text-button"
-      >Project repository<ExternalLink size={13} aria-hidden="true" /></a
-    >
-  </section>
+  </div>
 </section>
 
 <style>
-  .storage-locations {
-    margin: 0;
-    padding: 14px;
+  .tools-workspace {
     display: grid;
+    align-content: start;
+    gap: 10px;
+    max-width: 920px;
+    padding: 0 8px 14px;
+  }
+  .section-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 4px;
+  }
+  h2 {
+    margin: 0;
+    color: var(--foreground);
+    font-size: 0.85rem;
+    letter-spacing: 0.12em;
+  }
+  .sub-section {
+    display: grid;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .sub-section h2 {
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 3px;
+  }
+  .section-meta {
+    display: flex;
+    align-items: center;
     gap: 10px;
   }
-  .storage-locations div {
-    display: grid;
-    grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
-    gap: 12px;
+  button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0.35rem 0.7rem;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    font-size: 0.92rem;
   }
-  .storage-locations dt {
-    font-size: 0.8rem;
-  }
-  .storage-locations dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-    font-size: 0.75rem;
-  }
-  .storage-error {
-    padding: 14px;
+  button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
   .tool-guidance,
   .scorer-summary {
-    margin: 0;
-    padding: 0 17px 13px;
     color: var(--muted-foreground);
-    font-size: 11px;
-    line-height: 1.55;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    max-width: 78ch;
   }
-  .tool-detection .section-heading > :global(.small-muted) {
-    max-width: 55%;
-    text-align: right;
+  .error-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--destructive);
+    background: var(--background);
+    color: var(--destructive);
+    font-weight: 600;
+  }
+  .tool-box {
+    border: 1px solid var(--border);
+    background: var(--background);
+  }
+  .tools-empty {
+    display: grid;
+    gap: 4px;
+    padding: 18px 14px;
+    color: var(--muted-foreground);
+  }
+  .tools-empty h3 {
+    color: var(--foreground);
+    font-size: 1rem;
+  }
+  .tools-empty p {
+    max-width: 66ch;
+    font-size: 0.92rem;
+  }
+  .tools-table-scroll {
+    overflow-x: auto;
+  }
+  .tools-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+    table-layout: fixed;
+  }
+  .tools-table thead {
+    background: var(--secondary);
+  }
+  .tools-table th {
+    padding: 8px 12px;
+    font-size: 0.77rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--foreground);
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+  }
+  .tools-table th:first-child {
+    width: 24%;
+  }
+  .tools-table th:nth-child(2) {
+    width: 20%;
+  }
+  .tools-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    background: var(--card);
+  }
+  .tools-table tr:last-child td {
+    border-bottom: 0;
+  }
+  .tool-id {
+    display: block;
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+    margin-top: 2px;
+  }
+  .tool-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.92rem;
+    color: var(--destructive);
+    white-space: nowrap;
+  }
+  .tool-status.available {
+    color: var(--success);
   }
   .tool-diagnostics summary {
     cursor: pointer;
     color: var(--muted-foreground);
-    font-size: 10px;
+    font-size: 0.85rem;
+  }
+  .tool-diagnostics summary:hover {
+    color: var(--foreground);
   }
   .tool-diagnostics dl {
-    margin: 8px 0 0;
+    margin: 6px 0 0;
     display: grid;
-    gap: 7px;
+    gap: 6px;
   }
   .tool-diagnostics dl > div {
     display: grid;
@@ -268,57 +374,120 @@
   }
   .tool-diagnostics dt {
     color: var(--muted-foreground);
-    font-size: 9px;
+    font-size: 0.77rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
   .tool-diagnostics dd {
     margin: 0;
     overflow-wrap: anywhere;
-    font-size: 10px;
+    font-size: 0.85rem;
     line-height: 1.45;
   }
-  .optional-panel {
-    margin-top: 12px;
+  .footnote {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--rule);
+    background: var(--card);
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+    line-height: 1.45;
   }
-  .optional-panel > summary {
+  .footnote > :global(svg) {
+    margin-top: 2px;
+  }
+  .storage-disclosure {
+    border: 1px solid var(--border);
+    background: var(--background);
+  }
+  .storage-disclosure summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    letter-spacing: 0.08em;
     cursor: pointer;
-    list-style-position: inside;
   }
-  .optional-panel > summary::after {
-    content: '›';
-    margin-left: auto;
-    transition: transform 100ms ease;
+  .storage-disclosure summary:hover {
+    background: var(--secondary);
   }
-  .optional-panel[open] > summary::after {
-    transform: rotate(90deg);
+  .storage-body {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border-top: 1px solid var(--rule);
+    background: var(--card);
   }
-  .optional-panel[open] > summary {
-    border-bottom: 1px solid var(--rule);
+  .storage-locations {
+    margin: 0;
+    display: grid;
+    gap: 8px;
   }
-  .optional-panel:not([open]) > summary {
-    border-bottom: 0;
+  .storage-locations div {
+    display: grid;
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
+    gap: 12px;
   }
-  .tools-table td {
-    padding-block: 10px;
+  .storage-locations dt {
+    font-size: 0.92rem;
+    font-weight: 600;
   }
-  .about-panel {
-    margin-top: 12px;
-    padding: 14px 17px;
+  .storage-locations dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.85rem;
   }
-  .about-panel p {
-    margin-top: 6px;
+  .storage-error {
+    color: var(--destructive);
+    font-weight: 600;
   }
-  .scorer-panel {
-    margin-top: 12px;
+  .footnote-plain {
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+  }
+  .about-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 0;
+  }
+  .about-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 2px;
+  }
+  .about-title strong {
+    font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
+    font-size: 1.08rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .version-tag {
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    font-size: 0.85rem;
+    color: var(--muted-foreground);
+    background: var(--background);
+  }
+  .repo-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 600;
+    font-size: 0.92rem;
   }
   @media (max-width: 800px) {
     .storage-locations div {
       grid-template-columns: 1fr;
-      gap: 0.3rem;
-    }
-    .optional-panel > summary {
-      height: auto;
-      min-height: 43px;
-      padding-block: 10px;
+      gap: 0.2rem;
     }
   }
 </style>

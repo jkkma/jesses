@@ -32,10 +32,10 @@ test('source tabs, defaults and conditional options follow each encoding view', 
   await expect(av1an.getByRole('tab').allTextContents()).resolves.toEqual([
     'Video',
     'Audio & Tracks',
-    'Av1an Options',
+    'AV1AN Options',
     'Advanced',
   ]);
-  await av1an.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av1an.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(av1an.getByLabel('Split Method')).toHaveValue('sceneDetection');
 });
 
@@ -1338,14 +1338,14 @@ test('advanced help, overwrite confirmation and managed grain table precedence',
   await q.getByRole('tab', { name: 'Advanced' }).click();
   const row = q.getByLabel('rc value');
   await row.fill('vbr');
-  await row.click({ button: 'right' });
+  await q.getByRole('cell', { name: /-rc/ }).click({ button: 'right' });
   await expect(page.getByRole('dialog', { name: 'Argument Details' })).toBeVisible();
   await page
     .getByRole('dialog', { name: 'Argument Details' })
     .getByRole('button', { name: 'Close' })
     .first()
     .click();
-  await q.getByLabel('tune value').click({ button: 'right' });
+  await q.getByRole('button', { name: 'Details for --tune' }).click();
   const help = page.getByRole('dialog', { name: 'Argument Details' });
   await expect(help.getByText('EXAMPLES')).toBeVisible();
   await expect(help.getByText(/quality model the encoder optimises/)).toBeVisible();
@@ -1418,11 +1418,11 @@ test('AV1AN restores audio, track choices and the encoder worker baseline', asyn
   await a.getByLabel('Bitrate (Kbps)').fill('224');
   await a.getByLabel('Subtitles', { exact: true }).uncheck();
   await a.getByLabel('Data Tracks', { exact: true }).check();
-  await a.getByRole('tab', { name: 'Av1an Options' }).click();
+  await a.getByRole('tab', { name: 'AV1AN Options' }).click();
   await a.getByLabel('Workers', { exact: true }).fill('4');
   await a.getByRole('tab', { name: 'Video', exact: true }).click();
   await a.getByLabel('Encoder').selectOption('x264');
-  await a.getByRole('tab', { name: 'Av1an Options' }).click();
+  await a.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(a.getByLabel('Workers', { exact: true })).toHaveValue('6');
   await page.reload();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
@@ -1432,7 +1432,7 @@ test('AV1AN restores audio, track choices and the encoder worker baseline', asyn
   await expect(a.getByLabel('Bitrate (Kbps)')).toHaveValue('224');
   await expect(a.getByLabel('Subtitles', { exact: true })).not.toBeChecked();
   await expect(a.getByLabel('Data Tracks', { exact: true })).toBeChecked();
-  await a.getByRole('tab', { name: 'Av1an Options' }).click();
+  await a.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(a.getByLabel('Workers', { exact: true })).toHaveValue('4');
 });
 

@@ -141,24 +141,34 @@
 
 <style>
   .saved-jobs {
-    border: 1px solid #c0b7aa;
-    background: var(--card);
-    margin: 12px 0;
+    max-width: 920px;
+    margin: 4px 8px 12px;
+    border: 1px solid var(--border);
+    background: var(--background);
   }
   summary {
     cursor: pointer;
     font-weight: 600;
-    padding: 12px 14px;
+    font-size: 0.85rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 8px 12px;
+    color: var(--foreground);
+  }
+  summary:hover {
+    background: var(--secondary);
   }
   .saved-jobs-body {
     display: grid;
-    gap: 12px;
-    padding: 14px;
-    border-top: 1px solid #c0b7aa;
+    gap: 10px;
+    padding: 12px;
+    border-top: 1px solid var(--rule);
+    background: var(--card);
   }
   .saved-jobs-body > p {
     margin: 0;
-    max-width: 90ch;
+    max-width: 80ch;
+    color: var(--muted-foreground);
   }
   .saved-job-controls {
     display: flex;
@@ -171,7 +181,7 @@
     flex: 1 1 20rem;
     min-width: 0;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.35rem;
   }
   .actions {
     display: flex;
@@ -181,17 +191,25 @@
   select,
   button {
     font: inherit;
-    padding: 0.5rem;
-    border: 1px solid #9b8c7a;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--border);
     background: var(--background);
+    color: var(--foreground);
     max-width: 100%;
   }
   button {
+    background: var(--secondary);
+    color: var(--secondary-foreground);
     cursor: pointer;
   }
+  button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
   .inspection {
-    padding: 12px;
-    border: 1px solid #c0b7aa;
+    padding: 10px 12px;
+    border: 1px solid var(--rule);
+    background: var(--background);
   }
   .inspection p,
   .inspection dl {
@@ -205,5 +223,9 @@
   dd {
     margin: 0;
     overflow-wrap: anywhere;
+  }
+  p[role='alert'] {
+    color: var(--destructive);
+    font-weight: 600;
   }
 </style>

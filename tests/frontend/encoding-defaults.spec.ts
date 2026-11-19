@@ -151,7 +151,7 @@ test('explicit AV1AN scene detection survives reload and a source change', async
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   let av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await av.getByLabel('Split Method').selectOption('sceneDetection');
   await expect
     .poll(() =>
@@ -163,7 +163,7 @@ test('explicit AV1AN scene detection survives reload and a source change', async
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Reset Now', exact: true }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(av.getByLabel('Split Method')).toHaveValue('sceneDetection');
   await page.reload();
   const second = { ...source, id: 'source-2', path: '/media/other.mkv', name: 'other.mkv' };
@@ -177,7 +177,7 @@ test('explicit AV1AN scene detection survives reload and a source change', async
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(av.getByLabel('Split Method')).toHaveValue('sceneDetection');
   await page.getByRole('button', { name: 'Run: AV1AN encode', exact: true }).click();
   await expect
@@ -219,7 +219,7 @@ test('saved AV1AN scene detection and other preferences remain unchanged', async
   await installSourceEncodeFixture(page);
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(av.getByLabel('Split Method')).toHaveValue('sceneDetection');
   await expect(av.getByLabel('Split Method').locator('option[value="fixedChunks"]')).toHaveText(
     'Fixed chunks',
@@ -254,7 +254,7 @@ test('saved AV1AN scene detection and other preferences remain unchanged', async
     .toBe('sceneDetection');
   await page.reload();
   await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
-  await av.getByRole('tab', { name: 'Av1an Options' }).click();
+  await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   await expect(av.getByLabel('Split Method')).toHaveValue('sceneDetection');
 });
 

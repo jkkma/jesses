@@ -138,7 +138,13 @@
             dirty = true;
           }}
           onblur={saveFolder}
-        /><button type="button" onclick={browse} disabled={!isDesktop()}>…</button><button
+        /><button
+          type="button"
+          aria-label="Browse default output folder"
+          title="Browse default output folder"
+          onclick={browse}
+          disabled={!isDesktop()}>…</button
+        ><button
           type="button"
           onclick={() => {
             folder = '';
@@ -212,6 +218,7 @@
     >{/each}
   <div class="reset">
     <button
+      type="button"
       onclick={() => {
         void savePatch({ resetOnNewFile: { ...draft } });
         resetOpen = false;
@@ -225,14 +232,16 @@
     display: grid;
     align-content: start;
     gap: 0.6rem;
-    max-width: 800px;
+    max-width: 920px;
     padding: 8px;
   }
   h2 {
     margin: 0.5rem 0 0;
-    color: var(--muted-foreground);
-    font-size: 11px;
-    letter-spacing: 0.08em;
+    color: var(--foreground);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 3px;
+    font-size: 0.85rem;
+    letter-spacing: 0.12em;
   }
   .form {
     display: grid;
@@ -244,12 +253,15 @@
     align-items: center;
     gap: 0.5rem;
   }
+  .form > label select {
+    width: min(100%, 225px);
+    justify-self: start;
+  }
   select,
   input {
     min-width: 0;
     padding: 0.4rem;
     border: 1px solid var(--border);
-    border-radius: var(--radius);
     background: var(--background);
     color: var(--foreground);
   }
@@ -259,6 +271,7 @@
   .folder,
   .reset {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.4rem;
   }
@@ -271,10 +284,13 @@
   }
   button {
     padding: 0.4rem 0.7rem;
-    border: 0;
-    border-radius: var(--radius);
+    border: 1px solid var(--border);
     background: var(--secondary);
     color: var(--secondary-foreground);
+  }
+  button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
   button:disabled,
   input:disabled,
@@ -291,20 +307,6 @@
   }
   p[role='alert'] {
     color: var(--destructive);
-  }
-  select,
-  input,
-  button {
-    border-radius: 0;
-  }
-  .form > label select {
-    width: min(100%, 225px);
-    justify-self: start;
-  }
-  h2 {
-    color: var(--foreground);
-    border-bottom: 1px solid var(--rule);
-    padding-bottom: 3px;
-    letter-spacing: 0.12em;
+    font-weight: 600;
   }
 </style>

@@ -1,8 +1,11 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { MediaFile } from '$lib/ipc/generated';
   import type { FileListMode } from '$lib/source-workspace';
   import { displayPath, fileName, formatBytes } from '$lib/components/shared/format';
+  import { placePopover } from '$lib/components/shared/popover-position';
   import SourceThumbnail from './SourceThumbnail.svelte';
+
   let {
     files,
     selectedIds,
@@ -46,6 +49,19 @@
     onmove: (offset: number) => void;
     onsort: (sort: string) => void;
   } = $props();
+
+  const uid = $props.id();
+  const helpId = `${uid}-batch-help`;
+  const recentId = `${uid}-recent-menu`;
+  const sortId = `${uid}-sort-menu`;
+
+  let rowsEl = $state<HTMLDivElement>();
+  let helpTrigger = $state<HTMLButtonElement>();
+  let recentTrigger = $state<HTMLButtonElement>();
+  let sortTrigger = $state<HTMLButtonElement>();
+  let recentPopover = $state<HTMLDivElement>();
+  let sortPopover = $state<HTMLDivElement>();
+
   function select(event: MouseEvent, file: MediaFile) {
     if (event.ctrlKey || event.metaKey)
       onselect(
@@ -60,6 +76,44 @@
         files.slice(Math.min(start, end), Math.max(start, end) + 1).map((entry) => entry.id),
       );
     } else onselect([file.id]);
+  }
+
+  function handleListKeys(event: KeyboardEvent) {
+    if (event.key === 'Delete' && selectedIds.length && !importing) {
+      event.preventDefault();
+      onremove();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+      event.preventDefault();
+      onselect(files.map((file) => file.id));
+      return;
+    }
+    if (!files.length) return;
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const activeId = selectedIds.at(-1);
+    const current = activeId ? files.findIndex((file) => file.id === activeId) : -1;
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? files.length - 1
+          : event.key === 'ArrowDown'
+            ? Math.min(files.length - 1, current + 1)
+            : Math.max(0, current <= 0 ? 0 : current - 1);
+    if (event.shiftKey && selectedIds.length) {
+      const anchor = files.findIndex((file) => file.id === selectedIds[0]);
+      const start = anchor < 0 ? next : anchor;
+      onselect(
+        files.slice(Math.min(start, next), Math.max(start, next) + 1).map((entry) => entry.id),
+      );
+    } else {
+      onselect([files[next].id]);
+    }
+    void tick().then(() => {
+      rowsEl?.querySelectorAll<HTMLButtonElement>('[role="option"]')[next]?.focus();
+    });
   }
 </script>
 
@@ -81,13 +135,24 @@
           oninput={(event) => onname(event.currentTarget.value)}
         /></label
       >
-      <details class="help">
-        <summary aria-label="Batch naming help">?</summary>
+      <button
+        type="button"
+        class="help-trigger"
+        aria-label="Batch naming help"
+        popovertarget={helpId}
+        bind:this={helpTrigger}>?</button
+      >
+      <div
+        id={helpId}
+        popover="auto"
+        class="popover-surface help-popover"
+        use:placePopover={{ trigger: () => helpTrigger, placement: 'below', align: 'start' }}
+      >
         <p>
           Use {`{name}`}, {`{ext}`}, {`{index}`}, {`{codec}`}, {`{crf}`}, {`{quality}`}, {`{preset}`},
           {`{width}`}, {`{height}`} and {`{date}`} in the output name.
         </p>
-      </details>
+      </div>
       <span class="batch-example">{batchExample}</span>{/if}
   </div>
   <div class="files-body">
@@ -97,15 +162,8 @@
       aria-label="Files"
       aria-multiselectable="true"
       tabindex="-1"
-      onkeydown={(event) => {
-        if (event.key === 'Delete' && selectedIds.length && !importing) {
-          event.preventDefault();
-          onremove();
-        } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
-          event.preventDefault();
-          onselect(files.map((file) => file.id));
-        }
-      }}
+      bind:this={rowsEl}
+      onkeydown={handleListKeys}
     >
       {#each files as file (file.id)}<button
           type="button"
@@ -143,43 +201,65 @@
       }`}</span
     >
     <button type="button" onclick={onadd} disabled={!desktop || importing}>Add Files…</button
-    ><button type="button" onclick={onfolder} disabled={!desktop || importing}>Add Folder…</button>
-    <details>
-      <summary class:disabled={!recentPaths.length}>Recent…</summary>
-      <div class="menu recent">
-        {#each recentPaths as path}{@const shown = displayPath(path)}<button
-            type="button"
-            title={shown}
-            aria-label={shown}
-            onclick={(event) => {
-              onrecent(path);
-              (event.currentTarget.closest('details') as HTMLDetailsElement).open = false;
-            }}
-            ><span class="recent-name">{fileName(shown)}</span><span class="recent-folder"
-              >{shown
-                .slice(0, Math.max(0, shown.length - fileName(shown).length))
-                .replace(/[\\/]$/, '')}</span
-            ></button
-          >{:else}<span class="recent-empty">No recent files yet.</span>{/each}
-      </div>
-    </details>
+    ><button type="button" onclick={onfolder} disabled={!desktop || importing}>Add Folder…</button
+    ><button
+      type="button"
+      popovertarget={recentId}
+      disabled={!recentPaths.length}
+      bind:this={recentTrigger}>Recent…</button
+    >
+    <div
+      id={recentId}
+      popover="auto"
+      class="popover-surface menu recent"
+      bind:this={recentPopover}
+      use:placePopover={{
+        trigger: () => recentTrigger,
+        placement: 'above',
+        align: 'end',
+        constrainToMain: true,
+      }}
+    >
+      {#each recentPaths as path}{@const shown = displayPath(path)}<button
+          type="button"
+          title={shown}
+          aria-label={shown}
+          onclick={() => {
+            onrecent(path);
+            recentPopover?.hidePopover();
+          }}
+          ><span class="recent-name">{fileName(shown)}</span><span class="recent-folder"
+            >{shown
+              .slice(0, Math.max(0, shown.length - fileName(shown).length))
+              .replace(/[\\/]$/, '')}</span
+          ></button
+        >{:else}<span class="recent-empty">No recent files yet.</span>{/each}
+    </div>
     <button
       type="button"
       onclick={onload}
       disabled={!selectedIds.length || importing || mode === 'batch'}>Load Tracks</button
+    ><button type="button" popovertarget={sortId} bind:this={sortTrigger}>Sort…</button>
+    <div
+      id={sortId}
+      popover="auto"
+      class="popover-surface menu"
+      bind:this={sortPopover}
+      use:placePopover={{
+        trigger: () => sortTrigger,
+        placement: 'above',
+        align: 'end',
+        constrainToMain: true,
+      }}
     >
-    <details>
-      <summary>Sort…</summary>
-      <div class="menu">
-        {#each [['name:asc', 'Name (A-Z)'], ['name:desc', 'Name (Z-A)'], ['size:desc', 'Size (Largest First)'], ['size:asc', 'Size (Smallest First)'], ['mtime:desc', 'Most Recent First'], ['mtime:asc', 'Oldest First']] as [value, label]}<button
-            type="button"
-            onclick={(event) => {
-              onsort(value);
-              (event.currentTarget.closest('details') as HTMLDetailsElement).open = false;
-            }}>{label}</button
-          >{/each}
-      </div>
-    </details>
+      {#each [['name:asc', 'Name (A-Z)'], ['name:desc', 'Name (Z-A)'], ['size:desc', 'Size (Largest First)'], ['size:asc', 'Size (Smallest First)'], ['mtime:desc', 'Most Recent First'], ['mtime:asc', 'Oldest First']] as [value, label]}<button
+          type="button"
+          onclick={() => {
+            onsort(value);
+            sortPopover?.hidePopover();
+          }}>{label}</button
+        >{/each}
+    </div>
     <button
       type="button"
       aria-label="Move file up"
@@ -204,7 +284,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--muted-foreground);
-    font-size: 11px;
+    font-size: 0.85rem;
   }
   .batch-status {
     margin-left: auto;
@@ -213,7 +293,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--muted-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
   }
   .file-name {
     min-width: 0;
@@ -226,7 +306,7 @@
   .file-list {
     height: 100%;
     display: grid;
-    grid-template-rows: auto minmax(120px, 1fr) auto;
+    grid-template-rows: auto minmax(100px, 1fr) auto;
     gap: 0.6rem;
   }
   .mode-line,
@@ -243,15 +323,14 @@
     background: var(--background);
     color: var(--foreground);
     border: 1px solid var(--border);
-    border-radius: var(--radius);
     padding: 0.45rem;
   }
   select {
-    min-width: 420px;
+    min-width: min(420px, 100%);
     max-width: 100%;
   }
   .files-body {
-    min-height: 120px;
+    min-height: 100px;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(200px, 384px);
     grid-template-rows: minmax(0, 1fr);
@@ -260,7 +339,7 @@
   .rows {
     position: relative;
     overflow: auto;
-    border-radius: var(--radius);
+    border: 1px solid var(--border);
     background: var(--background);
   }
   .rows > button {
@@ -270,13 +349,17 @@
     text-align: left;
     width: 100%;
     border: 0;
-    border-left: 4px solid var(--primary);
-    border-radius: 0;
+    border-left: 4px solid transparent;
+    border-bottom: 1px solid var(--rule);
     padding: 0.5rem 0.7rem;
     color: var(--foreground);
     background: transparent;
   }
+  .rows > button:hover {
+    background: var(--secondary);
+  }
   .rows > button.selected {
+    border-left-color: var(--primary);
     background: var(--accent);
     color: var(--foreground);
   }
@@ -284,6 +367,8 @@
     display: grid;
     place-items: center;
     height: 100%;
+    padding: 12px;
+    text-align: center;
     color: var(--muted-foreground);
   }
   .file-actions {
@@ -291,60 +376,72 @@
     flex-wrap: wrap;
     align-items: center;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: 0.35rem;
   }
   .file-count {
-    flex: 1;
-    min-width: 180px;
+    flex: 1 1 100px;
+    min-width: 100px;
     color: var(--muted-foreground);
     font-size: 0.85rem;
   }
-  button,
-  summary {
-    padding: 0.4rem 0.7rem;
+  button {
+    padding: 0.4rem 0.68rem;
     border: 0;
-    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
     cursor: pointer;
   }
-  button:disabled,
-  .disabled {
+  button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
+  button:disabled {
     opacity: 0.5;
-    cursor: default;
+    cursor: not-allowed;
   }
-  details {
-    position: relative;
+  .help-trigger {
+    min-width: 28px;
+    padding: 0.4rem 0.55rem;
+    font-weight: 600;
   }
-  summary {
-    list-style: none;
-  }
-  .menu,
-  .help p {
-    position: absolute;
-    bottom: 100%;
-    right: 0;
-    z-index: 4;
-    width: 250px;
-    display: grid;
+  .popover-surface {
+    position: fixed;
+    margin: 0;
     padding: 0.3rem;
-    background: var(--background);
+    overflow-y: auto;
     border: 1px solid var(--border);
+    background: var(--popover);
+    color: var(--popover-foreground);
+    box-shadow: 3px 3px 0 #454b3c38;
+  }
+  .popover-surface:not(:popover-open) {
+    display: none;
+  }
+  .help-popover {
+    width: min(280px, calc(100vw - 24px));
+    padding: 0.5rem 0.7rem;
+    line-height: 1.5;
+  }
+  .menu {
+    width: 250px;
+  }
+  .menu:popover-open {
+    display: grid;
   }
   .menu button {
     overflow: hidden;
     text-overflow: ellipsis;
     text-align: left;
     white-space: nowrap;
-    background: none;
+    background: transparent;
+    color: var(--popover-foreground);
   }
-  .menu button:hover {
+  .menu button:hover:not(:disabled) {
     background: var(--accent);
+    color: var(--accent-foreground);
   }
   .menu.recent {
     width: min(420px, 70vw);
-    max-height: 60vh;
-    overflow-y: auto;
   }
   .menu.recent button {
     display: grid;
@@ -357,42 +454,19 @@
   }
   .recent-folder {
     color: var(--muted-foreground);
-    font-size: 11px;
+    font-size: 0.85rem;
   }
   .recent-empty {
     padding: 0.4rem 0.7rem;
     color: var(--muted-foreground);
   }
-  .help p {
-    bottom: auto;
-    top: 100%;
-    left: 0;
-    right: auto;
-    line-height: 1.5;
-  }
-  .rows,
-  select,
-  input,
-  button,
-  summary {
-    border-radius: 0;
-  }
-  .rows {
-    border: 1px solid var(--border);
-  }
-  .rows > button {
-    border-left: 4px solid transparent;
-    border-bottom: 1px solid var(--rule);
-  }
-  .rows > button.selected {
-    border-left-color: var(--primary);
-    background: var(--accent);
-  }
-  .rows > button:hover {
-    background: var(--secondary);
-  }
-  .menu {
-    background: var(--popover);
-    box-shadow: 3px 3px 0 #454b3c38;
+  @media (max-width: 820px) {
+    .file-actions {
+      gap: 0.25rem;
+    }
+    .file-actions > button {
+      padding: 0.36rem 0.5rem;
+      font-size: 0.92rem;
+    }
   }
 </style>

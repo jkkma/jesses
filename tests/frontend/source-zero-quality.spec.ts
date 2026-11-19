@@ -17,7 +17,7 @@ for (const workflow of ['Quick Convert', 'AV1AN'] as const) {
     await page.getByRole('button', { name: workflow, exact: true }).click();
     const region = page.getByRole('region', { name: workflow, exact: true });
     if (workflow === 'AV1AN') {
-      await region.getByRole('tab', { name: 'Av1an Options', exact: true }).click();
+      await region.getByRole('tab', { name: 'AV1AN Options', exact: true }).click();
       await region.getByLabel('Concat Method', { exact: true }).selectOption('ffmpeg');
       await region.getByRole('tab', { name: 'Video', exact: true }).click();
     }

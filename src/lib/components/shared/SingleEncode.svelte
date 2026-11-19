@@ -39,15 +39,9 @@
     RegisterWorkspaceAction,
     BatchRowStatus,
   } from '$lib/source-workspace';
-  import CommandPlanPreview from './CommandPlanPreview.svelte';
   import { parameterError } from './encoder-parameters';
   import type { EncoderParameter } from '$lib/ipc/generated';
   import type { EncoderParameterCatalog } from '$lib/ipc/generated';
-  import Av1anResources from './Av1anResources.svelte';
-  import Av1anGrain from './Av1anGrain.svelte';
-  import Av1anFilters from './Av1anFilters.svelte';
-  import OutputPixelFormat from './OutputPixelFormat.svelte';
-  import { allowedOutputPixelFormats } from './output-pixel-format';
   import type { Av1anPixelFormat } from '$lib/ipc/generated';
   import {
     defaultAv1anAudio,
@@ -57,35 +51,26 @@
   } from './av1an-preferences';
   import {
     defaultAv1an,
-    copyAv1an,
     selectedAv1an,
     av1anError,
     av1anGrainConflict,
     grainTableIssue,
     type Av1anDraft,
   } from './av1an-options';
-  import TemporalOptions from './TemporalOptions.svelte';
   import {
     defaultTemporal,
     temporalError,
     selectedTemporal,
     type TemporalDraft,
   } from './temporal-options';
-  import ContainerOptions from '$lib/components/shared/ContainerOptions.svelte';
   import { untrack, type Snippet } from 'svelte';
-  import { ArrowRight, FolderOutput, Info, Play, RotateCcw } from '@lucide/svelte';
-  import { Button } from '$lib/components/ui/button';
   import { chooseEncodeDestination, isDesktop } from '$lib/ipc/client';
   import { displayCodec, errorMessage, formatDuration } from '$lib/components/shared/format';
-  import EncodeOptions from '$lib/components/shared/EncodeOptions.svelte';
-  import AudioOptions from './AudioOptions.svelte';
-  import SubtitleOptions from './SubtitleOptions.svelte';
   import {
     defaultSubtitles,
     selectedSubtitles,
     storableSubtitleMode,
     subtitleError,
-    subtitleSummary,
   } from './subtitle-options';
   import {
     adjustedOutputStem,
@@ -94,10 +79,6 @@
   } from './output-title';
   import type { SubtitleTrackSettings } from '$lib/ipc/generated';
   import { terminalJob } from './job-state';
-  import FramingOptions from './FramingOptions.svelte';
-  import TrimOptions from './TrimOptions.svelte';
-  import ToneMapOptions from './ToneMapOptions.svelte';
-  import RateControlOptions from './RateControlOptions.svelte';
   import {
     supportsHdrMetadata,
     supportsDynamicHdr,
@@ -109,7 +90,6 @@
     selectedRate,
     validRate,
     rateEncoderError,
-    rateSummary,
     type RateDraft,
   } from './rate-control-options';
   import {
@@ -119,9 +99,6 @@
     type ToneMapDraft,
   } from './tone-map-options';
   import { defaultTrim, selectedTrim, trimError, type TrimDraft } from './trim-options';
-  import SourcePreview from './SourcePreview.svelte';
-  import ExternalTracks from './ExternalTracks.svelte';
-  import TrackLayout from './TrackLayout.svelte';
   import {
     invalidateMovTimecodeChoice,
     movTimecodeIssue,
@@ -139,9 +116,7 @@
     type TrackTags,
   } from './track-layout';
   import {
-    copyExternalChoices,
     externalTrackIssue,
-    externalTrackSummary,
     invalidateExternalChoices,
     requestExternalTracks,
     type ExternalTrackChoice,
@@ -158,22 +133,18 @@
     defaultAudio,
     validAudio,
     selectedAudio,
-    audioSummary,
     resolvedChannels,
     type AudioTrackDraft,
   } from './audio-options';
   import {
     encoderOptions,
     requiredEncoderTools,
-    presetLabel,
     sourceBitDepth,
     knownHdr,
     preservableHdr10,
-    encoderChoices,
     isAv1anEncoder,
     isSvtEncoder,
     validForkSettings,
-    forkSettingsSummary,
     type HdrTune,
   } from './encoder-options';
   import type {
@@ -499,7 +470,7 @@
   const av1anTabs = [
     { id: 'video', label: 'Video' },
     { id: 'audio', label: 'Audio & Tracks' },
-    { id: 'av1an', label: 'Av1an Options' },
+    { id: 'av1an', label: 'AV1AN Options' },
     { id: 'advanced', label: 'Advanced' },
   ] as const;
   let settingsTab = $state('video');
@@ -1711,6 +1682,14 @@
   const active = $derived(jobs.find((job) => !terminalJob(job.state)));
   const videos = $derived(file?.streams.filter((stream) => stream.kind === 'video') ?? []);
   const selectedVideo = $derived(videos.find((stream) => stream.index === videoIndex));
+  const showDeinterlace = $derived(
+    Boolean(
+      selectedVideo &&
+      selectedVideo.fieldOrder &&
+      !['progressive', 'unknown'].includes(selectedVideo.fieldOrder),
+    ),
+  );
+  const showToneMap = $derived(knownHdr(selectedVideo));
   const sourceMultipleVideos = $derived(!chunked && videoMode === 'copy');
   const sourceDetails = $derived.by(() => {
     const details: string[] = [];
@@ -4094,18 +4073,23 @@
 </script>
 
 <section class="source-encode" aria-label={chunked ? 'AV1AN' : 'Quick Convert'}>
-  <div
-    class="tabs"
-    role="tablist"
-    aria-label={chunked ? 'AV1AN settings' : 'Quick Convert settings'}
-  >
-    {#each tabs as tab, index}<button
-        role="tab"
-        aria-selected={settingsTab === tab.id}
-        class:active={settingsTab === tab.id}
-        onkeydown={(event) => tabKeys(event, index)}
-        onclick={() => (settingsTab = tab.id)}>{tab.label}</button
-      >{/each}
+  <div class="tabs-bar">
+    <div
+      class="tabs"
+      role="tablist"
+      aria-label={chunked ? 'AV1AN settings' : 'Quick Convert settings'}
+    >
+      {#each tabs as tab, index}<button
+          type="button"
+          id={`${idPrefix}-tab-${tab.id}`}
+          role="tab"
+          aria-selected={settingsTab === tab.id}
+          tabindex={settingsTab === tab.id ? 0 : -1}
+          class:active={settingsTab === tab.id}
+          onkeydown={(event) => tabKeys(event, index)}
+          onclick={() => (settingsTab = tab.id)}>{tab.label}</button
+        >{/each}
+    </div>
     <!-- Several files can be loaded; say which one Run encodes. -->
     {#if fileMode === 'batch' && files.length}<span
         class="source-name"
@@ -4113,9 +4097,13 @@
         >Batch: {files.length} file{files.length === 1 ? '' : 's'}</span
       >{:else if file}<span class="source-name" title={file.name}>Source: {file.name}</span>{/if}
   </div>
-  <div class="tab-content">
+  <div class="tab-content" role="tabpanel" aria-labelledby={`${idPrefix}-tab-${settingsTab}`}>
     {#if settingsTab === 'video'}
-      <div class="video-columns" use:optionTooltips>
+      <div
+        class="video-columns"
+        class:balanced-two-col={!showDeinterlace && !showToneMap}
+        use:optionTooltips
+      >
         <div class="form">
           <label for={`${idPrefix}-codec`}>{chunked ? 'Encoder' : 'Codec'}</label>
           <select
@@ -4353,13 +4341,13 @@
           <span>Trim</span>
           <div class="inline">
             <button
+              type="button"
               onclick={() => {
                 dialog = 'trim';
               }}>Configure…</button
-            >{#if trim.enabled}<button onclick={() => (trim = defaultTrim())}>Clear</button><span
-                class="trim-range"
-                aria-label="Trim range">{trimRange}</span
-              >{/if}
+            >{#if trim.enabled}<button type="button" onclick={() => (trim = defaultTrim())}
+                >Clear</button
+              ><span class="trim-range" aria-label="Trim range">{trimRange}</span>{/if}
           </div>
           <label for={`${idPrefix}-crop`}>Crop</label>
           <div class="inline">
@@ -4367,7 +4355,8 @@
               ><option value="disabled">Disabled</option><option value="automatic"
                 >Automatic (detect black bars)</option
               ><option value="manual">Manual</option></select
-            >{#if cropMode === 'manual'}<button onclick={() => openEdit('crop')}>Configure…</button
+            >{#if cropMode === 'manual'}<button type="button" onclick={() => openEdit('crop')}
+                >Configure…</button
               >{/if}
           </div>
           <label for={`${idPrefix}-resize`}>Resize</label>
@@ -4379,7 +4368,7 @@
               onchange={(event) => setResize(event.currentTarget.value)}
               >{#each resizeLabels as option}<option value={option.value}>{option.name}</option
                 >{/each}</select
-            >{#if resizeChoice === 'custom'}<button onclick={() => openEdit('resize')}
+            >{#if resizeChoice === 'custom'}<button type="button" onclick={() => openEdit('resize')}
                 >Configure…</button
               >{/if}
           </div>
@@ -4438,8 +4427,10 @@
                 placeholder="Path to a .tbl grain table"
                 bind:value={grainPath}
                 onblur={() => void loadGrainTable(grainPath)}
-              /><button aria-label="Browse grain table" onclick={() => void chooseGrainTable()}
-                >…</button
+              /><button
+                type="button"
+                aria-label="Browse grain table"
+                onclick={() => void chooseGrainTable()}>…</button
               >{:else if grainMode === 'preset'}<select
                 aria-label="Film stock preset"
                 bind:value={grainPreset}
@@ -4560,7 +4551,7 @@
               ><option value="same">Same settings for all tracks</option><option value="perTrack"
                 >Configure each track separately</option
               ></select
-            >{#if audioConfig === 'perTrack'}<button onclick={() => openEdit('audio')}
+            >{#if audioConfig === 'perTrack'}<button type="button" onclick={() => openEdit('audio')}
                 >Configure…</button
               >{/if}
           </div>{/if}
@@ -4770,7 +4761,7 @@
       </div>
     {:else}
       <h3>ENCODER ARGUMENTS</h3>
-      <p>Right-click an argument for a full explanation and example values.</p>
+      <p>Click ? or right-click an argument for a full explanation and example values.</p>
       <AdvancedEncoderOptions
         {encoder}
         {backend}
@@ -4793,11 +4784,13 @@
       <div class="filter-head">
         <h3>CUSTOM VIDEO FILTERS</h3>
         <button
+          type="button"
           onclick={() => {
             av1anFilters = [...av1anFilters, ''];
             selectedFilterIndex = av1anFilters.length - 1;
           }}>Add</button
         ><button
+          type="button"
           onclick={() => {
             const index = selectedFilterIndex ?? av1anFilters.length - 1;
             if (index >= 0) av1anFilters = av1anFilters.filter((_, i) => i !== index);
@@ -4806,7 +4799,7 @@
         >
       </div>
       <table>
-        <thead><tr><th>Filter</th></tr></thead><tbody
+        <thead><tr><th scope="col">Filter</th></tr></thead><tbody
           >{#each av1anFilters as filter, index}<tr
               ><td
                 ><input
@@ -4836,10 +4829,10 @@
       }}
     />{#if !isImage}<span class="output-extension" title="Added from the chosen container"
         >.{outputContainer === 'matroska' ? 'mkv' : outputContainer}</span
-      >{/if}<button onclick={chooseOutput} aria-label="Browse output path">…</button
-    >{#if chunked}<button onclick={() => void openRecoveries()}
+      >{/if}<button type="button" onclick={chooseOutput} aria-label="Browse output path">…</button
+    >{#if chunked}<button type="button" onclick={() => void openRecoveries()}
         >Resume…{recoveries.length ? ` (${recoveries.length})` : ''}</button
-      ><button disabled={!recoveries.length} onclick={() => void openClearTemp()}
+      ><button type="button" disabled={!recoveries.length} onclick={() => void openClearTemp()}
         >Clear Temp…</button
       >{/if}
   </div>
@@ -4890,6 +4883,7 @@
     use:recoveryKeys
   >
     {#each recoveries as entry (entry.job.id)}<button
+        type="button"
         role="option"
         tabindex={recoverySelected === entry.job.id ? 0 : -1}
         aria-selected={recoverySelected === entry.job.id}
@@ -4900,16 +4894,20 @@
   {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
   <div class="dialog-actions">
     <button
+      type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={() => void recoveryAction('deleteEncode')}>Delete Encode</button
     ><button
+      type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={() => void recoveryAction('deleteChunks')}>Delete Chunks</button
     ><button
+      type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={(event) => void recoveryAction('resumeNew', event.shiftKey)}
       >Resume (New Settings)</button
     ><button
+      type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={(event) => void recoveryAction('resumeSaved', event.shiftKey)}
       >Resume (Saved Settings)</button
@@ -4933,9 +4931,13 @@
   </p>
   {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
   <div class="dialog-actions">
-    <button disabled={recoveryBusy} onclick={() => (recoveryDialog = null)}>No</button><button
+    <button
+      type="button"
+      data-dialog-initial-focus
       disabled={recoveryBusy}
-      onclick={() => void recoveryAction('clearAll')}>Yes</button
+      onclick={() => (recoveryDialog = null)}>No</button
+    ><button type="button" disabled={recoveryBusy} onclick={() => void recoveryAction('clearAll')}
+      >Yes</button
     >
   </div>
 </SourceDialog>
@@ -4981,11 +4983,12 @@
   </p>
   <div class="dialog-actions">
     <button
+      type="button"
       onclick={() => {
         framing = { ...framing, crop: { top: 0, right: 0, bottom: 0, left: 0 } };
         cropReduced = false;
       }}>Reset</button
-    ><button onclick={() => (dialog = null)}>OK</button>
+    ><button type="button" onclick={() => (dialog = null)}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog title="Configure Resize" open={dialog === 'resize'} onclose={cancelEdit}>
@@ -5090,6 +5093,7 @@
   </p>
   <div class="dialog-actions">
     <button
+      type="button"
       onclick={() => {
         framing = {
           ...framing,
@@ -5104,7 +5108,7 @@
         };
         temporal = { ...temporal, resizeFilter: 'bicubic' };
       }}>Reset</button
-    ><button onclick={() => (dialog = null)}>OK</button>
+    ><button type="button" onclick={() => (dialog = null)}>OK</button>
   </div>
 </SourceDialog>
 <SharedCutDialog
@@ -5123,10 +5127,15 @@
 <SourceDialog title="Configure Audio Tracks" open={dialog === 'audio'} onclose={cancelEdit}>
   <p>Configure channels and bitrate for each audio track.</p>
   <table>
-    <thead
-      ><tr><th>Track</th><th>Title</th><th>Lang</th><th>Channels</th><th>Bitrate (Kbps)</th></tr
-      ></thead
-    ><tbody
+    <thead>
+      <tr>
+        <th scope="col">Track</th>
+        <th scope="col">Title</th>
+        <th scope="col">Lang</th>
+        <th scope="col">Channels</th>
+        <th scope="col">Bitrate (Kbps)</th>
+      </tr>
+    </thead><tbody
       >{#each perTrackRows as row, index}{@const source = files.find(
           (f) => f.id === row.sourceId,
         )}{@const stream = source?.streams.find((s) => s.index === row.streamIndex)}<tr
@@ -5156,6 +5165,7 @@
   </table>
   <div class="dialog-actions">
     <button
+      type="button"
       onclick={() => {
         perTrackRows = perTrackRows.map((row) => ({
           ...row,
@@ -5185,8 +5195,12 @@
     padding: 6px;
     color: inherit;
   }
+  .recovery-list button:hover:not(:disabled) {
+    background: var(--secondary);
+  }
   .recovery-list button.selected {
     background: var(--accent);
+    box-shadow: inset 3px 0 var(--primary);
   }
   .source-encode {
     display: flex;
@@ -5195,24 +5209,45 @@
     height: 100%;
     gap: 8px;
   }
+  .tabs-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    min-width: 0;
+  }
   .tabs {
     display: flex;
     gap: 2px;
-    border-bottom: 1px solid var(--border);
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    min-width: 0;
   }
   .tabs button {
+    position: relative;
+    flex: 0 0 auto;
     border: 1px solid transparent;
     border-bottom: 0;
     background: transparent;
-    color: inherit;
+    color: var(--muted-foreground);
     padding: 6px 13px;
+    white-space: nowrap;
     cursor: pointer;
   }
-  .tabs button.active {
-    border-color: var(--border);
-    background: var(--background);
-    font-weight: 600;
+  .tabs button:not([aria-selected='true']):hover {
+    background: var(--secondary);
+    color: var(--foreground);
+  }
+  .tabs button[aria-selected='true'] {
+    color: var(--primary-foreground);
+    background: var(--primary);
+    border-color: var(--primary);
+  }
+  .tabs button[aria-selected='true']::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 0;
+    border-bottom: 2px solid var(--primary-foreground);
   }
   .crop-preview {
     position: relative;
@@ -5237,13 +5272,13 @@
   .trim-range {
     align-self: center;
     color: var(--muted-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
     white-space: nowrap;
   }
   .crop-note {
     margin: 0 0 10px;
     color: var(--muted-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
     line-height: 1.4;
   }
   .source-name {
@@ -5253,7 +5288,7 @@
     overflow: hidden;
     padding-left: 12px;
     color: var(--muted-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -5269,12 +5304,20 @@
     align-items: start;
     gap: 12px 20px;
   }
+  /* When Deinterlace and Tone Mapping are hidden, avoid a lone 1-control 3rd column. */
+  .video-columns.balanced-two-col {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-width: 960px;
+  }
+  .video-columns.balanced-two-col > .form:nth-child(3) {
+    grid-column: 1 / -1;
+  }
   .form {
     display: grid;
     grid-template-columns: minmax(88px, 105px) minmax(0, 1fr);
     align-items: center;
     gap: 5px 8px;
-    font-size: 13px;
+    font-size: 1rem;
     min-width: 0;
   }
   .field-hint {
@@ -5322,7 +5365,7 @@
   @media (max-width: 1050px) {
     .video-columns {
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px 16px;
+      gap: 6px 16px;
     }
     .video-columns.av1an-infrastructure {
       grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
@@ -5333,27 +5376,6 @@
     .video-columns > .form:nth-child(3) {
       grid-column: 1 / -1;
     }
-  }
-  .geometry-readout {
-    grid-column: 1 / -1;
-    min-width: 0;
-    margin: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 11px;
-    line-height: 12px;
-    color: var(--muted-foreground);
-  }
-  .subtitle-note {
-    margin-top: 4px;
-    white-space: normal;
-    line-height: 15px;
-  }
-  @media (max-width: 1050px) {
-    .video-columns {
-      row-gap: 6px;
-    }
     .video-columns .form {
       row-gap: 2px;
     }
@@ -5363,6 +5385,22 @@
     .video-columns button {
       padding-block: 4px;
     }
+  }
+  .geometry-readout {
+    grid-column: 1 / -1;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.85rem;
+    line-height: 1.15;
+    color: var(--muted-foreground);
+  }
+  .subtitle-note {
+    margin-top: 4px;
+    white-space: normal;
+    line-height: 1.35;
   }
   @media (max-width: 1050px) and (max-height: 750px) {
     .tab-content {
@@ -5410,18 +5448,21 @@
     padding: 5px 10px;
     font: inherit;
   }
+  button:hover:not(:disabled) {
+    background: var(--secondary);
+  }
   .output {
     display: flex;
     gap: 6px;
     align-items: center;
-    font-size: 13px;
+    font-size: 1rem;
   }
   .output input {
     flex: 1;
   }
   .output-extension {
     color: var(--muted-foreground);
-    font-size: 13px;
+    font-size: 1rem;
   }
   .metadata-head,
   .filter-head {
@@ -5435,11 +5476,11 @@
     flex: 1;
   }
   h3 {
-    font-size: 12px;
+    font-size: 0.92rem;
     margin: 14px 0 8px;
   }
   p {
-    font-size: 12px;
+    font-size: 0.92rem;
   }
   /* A reason that blocks Run must read as an error, not as a hint. */
   p[role='alert'] {
@@ -5450,7 +5491,7 @@
     width: 100%;
     border-collapse: collapse;
     margin-top: 8px;
-    font-size: 12px;
+    font-size: 0.92rem;
   }
   th,
   td {
@@ -5484,20 +5525,5 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 18px;
-  }
-  .tabs {
-    gap: 2px;
-  }
-  .tabs button.active {
-    color: var(--primary-foreground);
-    background: var(--primary);
-    border-color: var(--primary);
-  }
-  .tabs button:not(.active):hover {
-    background: var(--secondary);
-  }
-  .recovery-list button.selected {
-    background: var(--accent);
-    box-shadow: inset 3px 0 var(--primary);
   }
 </style>

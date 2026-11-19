@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { MediaFile, MediaStream } from '$lib/ipc/generated';
   import {
     firstTrackSelection,
@@ -11,6 +12,8 @@
   import SourceThumbnail from './SourceThumbnail.svelte';
   import { preferences } from '$lib/preferences.svelte';
   import { formatBytes, formatDuration, formatFrameRate } from '$lib/components/shared/format';
+  import { placePopover } from '$lib/components/shared/popover-position';
+
   let {
     files,
     tracks,
@@ -28,31 +31,22 @@
     onchange: (tracks: TrackSelection[], noDefaultSubtitles?: boolean) => void;
     onextract: (track: TrackSelection) => Promise<void>;
   } = $props();
+
+  const uid = $props.id();
+  const selectMenuId = `${uid}-select-menu`;
+  const sortMenuId = `${uid}-sort-menu`;
+  const defaultAudioId = `${uid}-default-audio`;
+  const defaultSubtitlesId = `${uid}-default-subtitles`;
+
   let selected = $state('');
   let extracting = $state(false);
   let extractError = $state('');
-  function fitMenu(menu: HTMLDivElement) {
-    const details = menu.closest('details')!;
-    const workspace = menu.closest('main')!;
-    const update = () => {
-      if (!details.open) return;
-      const top = Math.max(0, workspace.getBoundingClientRect().top);
-      menu.style.maxHeight = `${Math.max(0, details.getBoundingClientRect().top - top - 4)}px`;
-    };
-    const observer = new ResizeObserver(update);
-    observer.observe(workspace);
-    const rows = menu.closest('section')?.querySelector('.track-body');
-    if (rows) observer.observe(rows);
-    details.addEventListener('toggle', update);
-    window.addEventListener('resize', update);
-    return {
-      destroy() {
-        observer.disconnect();
-        details.removeEventListener('toggle', update);
-        window.removeEventListener('resize', update);
-      },
-    };
-  }
+  let rowsEl = $state<HTMLDivElement>();
+  let selectTrigger = $state<HTMLButtonElement>();
+  let sortTrigger = $state<HTMLButtonElement>();
+  let selectPopover = $state<HTMLDivElement>();
+  let sortPopover = $state<HTMLDivElement>();
+
   async function extract(row: TrackSelection) {
     extracting = true;
     extractError = '';
@@ -77,6 +71,27 @@
   const subtitles = $derived(checked.filter((row) => stream(row)?.kind === 'subtitle'));
   const selectedRow = $derived(tracks.find((row) => key(row) === selected));
   const selectedStream = $derived(selectedRow ? stream(selectedRow) : undefined);
+
+  function handleTrackKeys(event: KeyboardEvent) {
+    if (!tracks.length) return;
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    if ((event.target as HTMLElement | null)?.tagName === 'INPUT') return;
+    event.preventDefault();
+    const current = tracks.findIndex((row) => key(row) === selected);
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? tracks.length - 1
+          : event.key === 'ArrowDown'
+            ? Math.min(tracks.length - 1, current + 1)
+            : Math.max(0, current <= 0 ? 0 : current - 1);
+    selected = key(tracks[next]);
+    void tick().then(() => {
+      rowsEl?.querySelectorAll<HTMLButtonElement>('[role="option"]')[next]?.focus();
+    });
+  }
+
   function details(item: MediaStream, row: TrackSelection) {
     const source = files.find((file) => file.id === row.sourceId);
     const lines = [
@@ -338,21 +353,17 @@
     </p>{/if}
   {#if blocked}<p>Manual track selection is not available in Batch Processing Mode.</p>{/if}
   <div class="track-body">
-    <div class="rows" role="listbox" aria-label="Tracks" aria-disabled={blocked}>
+    <div
+      class="rows"
+      role="listbox"
+      aria-label="Tracks"
+      aria-disabled={blocked}
+      tabindex="-1"
+      bind:this={rowsEl}
+      onkeydown={handleTrackKeys}
+    >
       {#each tracks as row (key(row))}
-        <div
-          role="option"
-          aria-selected={selected === key(row)}
-          class:selected={selected === key(row)}
-          onclick={() => (selected = key(row))}
-          onkeydown={(event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              selected = key(row);
-            }
-          }}
-          tabindex="0"
-        >
+        <div class="track-row" class:selected={selected === key(row)}>
           <input
             type="checkbox"
             aria-label={`Include ${display(row)}`}
@@ -360,39 +371,67 @@
             disabled={blocked}
             onchange={() => toggle(row)}
           />
-          <span>{display(row)}</span>
+          <button
+            type="button"
+            role="option"
+            class="track-option"
+            aria-selected={selected === key(row)}
+            onclick={() => (selected = key(row))}>{display(row)}</button
+          >
         </div>
       {:else}<p class="empty">Load tracks from the File List.</p>{/each}
     </div>
     <SourceThumbnail file={mainFile} />
   </div>
   <div class="actions">
-    <details>
-      <summary>Select…</summary>
-      <div class="menu" use:fitMenu>
-        {#each [['all', 'Check All'], ['none', 'Check None'], ['invert', 'Invert Selection'], ['video', 'All Video Tracks'], ['audio', 'All Audio Tracks'], ['subtitle', 'All Subtitle Tracks'], ['first', 'First Track Of Each Type'], ['firstLanguage', 'First Track Of Each Language Per Type']] as [value, label]}<button
-            type="button"
-            disabled={blocked}
-            onclick={(event) => {
-              selectAll(value);
-              (event.currentTarget.closest('details') as HTMLDetailsElement).open = false;
-            }}>{label}</button
-          >{/each}
-      </div>
-    </details>
-    <details>
-      <summary>Sort…</summary>
-      <div class="menu" use:fitMenu>
-        {#each [['language:asc', 'Language (A-Z)'], ['language:desc', 'Language (Z-A)'], ['title:asc', 'Title (A-Z)'], ['title:desc', 'Title (Z-A)'], ['codec:asc', 'Codec (A-Z)'], ['codec:desc', 'Codec (Z-A)']] as [value, label]}<button
-            type="button"
-            disabled={blocked}
-            onclick={(event) => {
-              sortBy(value);
-              (event.currentTarget.closest('details') as HTMLDetailsElement).open = false;
-            }}>{label}</button
-          >{/each}
-      </div>
-    </details>
+    <button type="button" popovertarget={selectMenuId} disabled={blocked} bind:this={selectTrigger}
+      >Select…</button
+    >
+    <div
+      id={selectMenuId}
+      popover="auto"
+      class="menu"
+      bind:this={selectPopover}
+      use:placePopover={{
+        trigger: () => selectTrigger,
+        placement: 'above',
+        align: 'end',
+        constrainToMain: true,
+      }}
+    >
+      {#each [['all', 'Check All'], ['none', 'Check None'], ['invert', 'Invert Selection'], ['video', 'All Video Tracks'], ['audio', 'All Audio Tracks'], ['subtitle', 'All Subtitle Tracks'], ['first', 'First Track Of Each Type'], ['firstLanguage', 'First Track Of Each Language Per Type']] as [value, label]}<button
+          type="button"
+          disabled={blocked}
+          onclick={() => {
+            selectAll(value);
+            selectPopover?.hidePopover();
+          }}>{label}</button
+        >{/each}
+    </div>
+    <button type="button" popovertarget={sortMenuId} disabled={blocked} bind:this={sortTrigger}
+      >Sort…</button
+    >
+    <div
+      id={sortMenuId}
+      popover="auto"
+      class="menu"
+      bind:this={sortPopover}
+      use:placePopover={{
+        trigger: () => sortTrigger,
+        placement: 'above',
+        align: 'end',
+        constrainToMain: true,
+      }}
+    >
+      {#each [['language:asc', 'Language (A-Z)'], ['language:desc', 'Language (Z-A)'], ['title:asc', 'Title (A-Z)'], ['title:desc', 'Title (Z-A)'], ['codec:asc', 'Codec (A-Z)'], ['codec:desc', 'Codec (Z-A)']] as [value, label]}<button
+          type="button"
+          disabled={blocked}
+          onclick={() => {
+            sortBy(value);
+            sortPopover?.hidePopover();
+          }}>{label}</button
+        >{/each}
+    </div>
     {#if selectedRow && selectedStream?.kind === 'attachment'}<button
         type="button"
         disabled={blocked || extracting}
@@ -410,27 +449,20 @@
   {#if extractError}<p role="alert">{extractError}</p>{/if}
   {#if selectedStream && selectedRow}<pre>{details(selectedStream, selectedRow)}</pre>{/if}
   <div class="defaults">
-    <label
-      >Default Audio <select
+    <div class="default-field">
+      <label for={defaultAudioId}>Default Audio</label><select
+        id={defaultAudioId}
         disabled={blocked || !audio.length}
-        value={key(
-          audio.find((row) => row.defaultFlag === true) ??
-            audio[0] ?? {
-              sourceId: '',
-              streamIndex: -1,
-              included: false,
-              title: '',
-              language: '',
-              defaultFlag: null,
-              forcedFlag: null,
-            },
-        )}
+        value={audio.length ? key(audio.find((row) => row.defaultFlag === true) ?? audio[0]) : ''}
         onchange={(event) => setDefault('audio', event.currentTarget.value)}
-        >{#each audio as row}<option value={key(row)}>{defaultDisplay(row, false)}</option
+        >{#if !audio.length}<option value="">None</option>{/if}{#each audio as row}<option
+            value={key(row)}>{defaultDisplay(row, false)}</option
           >{/each}</select
-      ></label
-    ><label
-      >Default Subtitles <select
+      >
+    </div>
+    <div class="default-field">
+      <label for={defaultSubtitlesId}>Default Subtitles</label><select
+        id={defaultSubtitlesId}
         disabled={blocked || !subtitles.length}
         value={subtitles.find((row) => row.defaultFlag === true)
           ? key(subtitles.find((row) => row.defaultFlag === true)!)
@@ -439,8 +471,8 @@
         ><option value="">None</option>{#each subtitles as row}<option value={key(row)}
             >{defaultDisplay(row, true)}</option
           >{/each}</select
-      ></label
-    >
+      >
+    </div>
   </div>
 </section>
 
@@ -462,7 +494,7 @@
   .format-info {
     margin: 0;
     color: var(--muted-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -477,79 +509,107 @@
   }
   .rows {
     min-height: 0;
+    border: 1px solid var(--border);
     background: var(--background);
-    border-radius: var(--radius);
     overflow: auto;
   }
-  .rows > div {
+  .track-row {
     display: flex;
-    gap: 0.65rem;
+    gap: 0.55rem;
     align-items: center;
-    padding: 0.45rem 0.65rem;
-    border-left: 4px solid var(--primary);
+    padding-left: 0.65rem;
+    border-left: 4px solid transparent;
+    border-bottom: 1px solid var(--rule);
   }
-  .rows > div.selected {
+  .track-row:hover {
+    background: var(--secondary);
+  }
+  .track-row.selected {
+    border-left-color: var(--primary);
     background: var(--accent);
     color: var(--foreground);
+  }
+  .track-option {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    padding: 0.45rem 0.65rem 0.45rem 0.1rem;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .track-option:hover:not(:disabled) {
+    background: transparent;
   }
   .empty,
   p {
     padding: 0.6rem;
     color: var(--muted-foreground);
   }
+  p[role='alert'] {
+    color: var(--destructive);
+  }
   .actions {
     display: flex;
     justify-content: flex-end;
     gap: 0.4rem;
   }
-  button,
-  summary {
+  .actions > button {
     padding: 0.38rem 0.75rem;
     border: 0;
-    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
     cursor: pointer;
   }
-  details {
-    position: relative;
-  }
-  summary {
-    list-style: none;
+  .actions > button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
   .menu {
-    position: absolute;
-    bottom: 100%;
+    position: fixed;
+    margin: 0;
     box-sizing: border-box;
     overflow-y: auto;
-    right: 0;
-    z-index: 4;
     width: 250px;
-    display: grid;
     padding: 0.3rem;
-    background: var(--background);
+    background: var(--popover);
+    color: var(--popover-foreground);
     border: 1px solid var(--border);
+    box-shadow: 3px 3px 0 #454b3c38;
+  }
+  .menu:not(:popover-open) {
+    display: none;
+  }
+  .menu:popover-open {
+    display: grid;
   }
   .menu button {
+    padding: 0.38rem 0.75rem;
+    border: 0;
     text-align: left;
-    background: none;
+    background: transparent;
+    color: var(--popover-foreground);
+    cursor: pointer;
   }
-  .menu button:hover {
+  .menu button:hover:not(:disabled) {
     background: var(--accent);
+    color: var(--accent-foreground);
   }
   pre {
     margin: 0;
     padding: 0.5rem;
     max-height: 110px;
     overflow: auto;
+    border: 1px solid var(--rule);
     background: var(--background);
   }
   .defaults {
     display: flex;
     flex-wrap: wrap;
-    gap: 2rem;
+    gap: 1.5rem 2rem;
   }
-  .defaults label {
+  .default-field {
     display: flex;
     align-items: center;
     gap: 0.7rem;
@@ -558,25 +618,7 @@
     min-width: 210px;
     padding: 0.4rem;
     background: var(--background);
+    color: var(--foreground);
     border: 1px solid var(--border);
-  }
-  .rows,
-  button,
-  summary {
-    border-radius: 0;
-  }
-  .rows {
-    border: 1px solid var(--border);
-  }
-  .rows > div {
-    border-left: 4px solid transparent;
-    border-bottom: 1px solid var(--rule);
-  }
-  .rows > div.selected {
-    border-left-color: var(--primary);
-  }
-  .menu {
-    background: var(--popover);
-    box-shadow: 3px 3px 0 #454b3c38;
   }
 </style>

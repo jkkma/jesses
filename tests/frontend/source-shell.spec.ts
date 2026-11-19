@@ -521,12 +521,12 @@ test('utility cards use the shared Run action and cancel metric edits', async ({
   await expect(utilities.locator('.card')).toHaveCount(11);
   if (process.env.JESSES_CAPTURE_UI) await page.screenshot({ path: 'target/source-utilities.png' });
   await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
-  await utilities.getByRole('button', { name: /Get Metrics/ }).click();
+  await utilities.getByRole('button', { name: 'Get Metrics', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Quality Metrics' });
   await expect(dialog).toBeVisible();
   await dialog.getByLabel('SSIM', { exact: true }).check();
   await dialog.getByRole('button', { name: 'Close' }).click();
-  await utilities.getByRole('button', { name: /Get Metrics/ }).click();
+  await utilities.getByRole('button', { name: 'Get Metrics', exact: true }).click();
   await expect(dialog.getByLabel('SSIM', { exact: true })).not.toBeChecked();
   await dialog.getByRole('button', { name: 'OK' }).click();
   await expect(page.getByRole('button', { name: 'Run: Metrics calculation' })).toBeEnabled();
@@ -600,7 +600,7 @@ test('Film Grain runs through the shared action with automatic output naming', a
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Film Grain (AV1)', exact: true })
     .click();
   await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
   await expect
@@ -661,8 +661,9 @@ test('utility settings restore on reload, retain live edits on close and reset t
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ });
-  const open = async () => card.getByRole('button', { name: 'Configure…' }).click();
+    .locator('article')
+    .filter({ hasText: /Film Grain/ });
+  const open = async () => card.getByRole('button', { name: /Configure/ }).click();
   const dialog = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
   await open();
   await dialog.getByLabel('Denoise strength').fill('7');
@@ -701,15 +702,17 @@ test('invalid stored utility settings fall back to safe source defaults', async 
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const utilities = page.getByRole('region', { name: 'Utilities' });
   await utilities
-    .getByRole('button', { name: /Film Grain/ })
-    .getByRole('button', { name: 'Configure…' })
+    .locator('article')
+    .filter({ hasText: /Film Grain/ })
+    .getByRole('button', { name: /Configure/ })
     .click();
   const grain = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
   await expect(grain.getByLabel('Denoise strength')).toHaveValue('4');
   await grain.getByRole('button', { name: 'Close' }).click();
   await utilities
-    .getByRole('button', { name: /Sample Encodes/ })
-    .getByRole('button', { name: 'Configure…' })
+    .locator('article')
+    .filter({ hasText: /Sample Encodes/ })
+    .getByRole('button', { name: /Configure/ })
     .click();
   const ladder = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
   await expect(ladder.getByLabel('Encoder', { exact: true })).toHaveValue('av1');
@@ -721,13 +724,15 @@ test('deinterlace and sample encode choices persist independently', async ({ pag
   const utilities = page.getByRole('region', { name: 'Utilities' });
   const openDeint = async () =>
     utilities
-      .getByRole('button', { name: /Deinterlace Video/ })
-      .getByRole('button', { name: 'Configure…' })
+      .locator('article')
+      .filter({ hasText: /Deinterlace Video/ })
+      .getByRole('button', { name: /Configure/ })
       .click();
   const openLadder = async () =>
     utilities
-      .getByRole('button', { name: /Sample Encodes/ })
-      .getByRole('button', { name: 'Configure…' })
+      .locator('article')
+      .filter({ hasText: /Sample Encodes/ })
+      .getByRole('button', { name: /Configure/ })
       .click();
   const deint = page.getByRole('dialog', { name: 'Configure Deinterlace Video' });
   const ladder = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
@@ -760,8 +765,9 @@ test('automatic utility deinterlace uses resolved method and detected field orde
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Deinterlace Video/ })
-    .getByRole('button', { name: 'Configure…' })
+    .locator('article')
+    .filter({ hasText: /Deinterlace Video/ })
+    .getByRole('button', { name: /Configure/ })
     .click();
   const dialog = page.getByRole('dialog', { name: 'Configure Deinterlace Video' });
   await dialog.getByLabel('Deinterlacer').selectOption('automatic');
@@ -830,20 +836,21 @@ test('Cut Video uses shared time editor, snaps copy start and keeps prior range 
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Cut Video/ });
-  await card.click();
+    .locator('article')
+    .filter({ hasText: /Cut Video/ });
+  await card.getByRole('button', { name: 'Cut Video', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Cut Video' });
   await expect(dialog.getByLabel('Start', { exact: true })).toHaveValue('00:00:00');
   await dialog.getByLabel('Start', { exact: true }).fill('12');
   await dialog.getByLabel('End', { exact: true }).fill('40');
   await dialog.getByRole('button', { name: 'OK' }).click();
   await expect(dialog).toHaveCount(0);
-  await card.getByRole('button', { name: 'Configure…' }).click();
+  await card.getByRole('button', { name: /Configure/ }).click();
   await expect(dialog.getByLabel('Start', { exact: true })).toHaveValue('00:00:10');
   await expect(dialog.getByLabel('End', { exact: true })).toHaveValue('00:00:40');
   await dialog.getByLabel('End', { exact: true }).fill('50');
   await dialog.getByRole('button', { name: 'Close' }).click();
-  await card.getByRole('button', { name: 'Configure…' }).click();
+  await card.getByRole('button', { name: /Configure/ }).click();
   await expect(dialog.getByLabel('End', { exact: true })).toHaveValue('00:00:40');
 });
 
@@ -915,8 +922,9 @@ test('Color Data with no target logs the complete native report without a utilit
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Transfer Color Metadata/ });
-  await card.getByRole('button', { name: 'Configure…' }).click();
+    .locator('article')
+    .filter({ hasText: /Transfer Color Metadata/ });
+  await card.getByRole('button', { name: /Configure/ }).click();
   await page
     .getByRole('dialog', { name: 'Transfer Color Metadata' })
     .getByRole('button', { name: 'OK' })
@@ -942,8 +950,9 @@ test('Sample Encodes parses integer CRFs like the fork and falls back for invali
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Sample Encodes/ });
-  await card.getByRole('button', { name: 'Configure…' }).click();
+    .locator('article')
+    .filter({ hasText: /Sample Encodes/ });
+  await card.getByRole('button', { name: /Configure/ }).click();
   let dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
   await dialog.getByLabel('CRF values').fill('-4, 10.5, nope');
   await dialog.getByRole('button', { name: 'OK' }).click();
@@ -957,7 +966,7 @@ test('Sample Encodes parses integer CRFs like the fork and falls back for invali
       ),
     )
     .toEqual([25, 30, 35]);
-  await card.getByRole('button', { name: 'Configure…' }).click();
+  await card.getByRole('button', { name: /Configure/ }).click();
   dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
   await dialog.getByLabel('CRF values').fill('70, 30, 30, -2, 1.5, 20');
   await dialog.getByRole('button', { name: 'OK' }).click();
@@ -1013,8 +1022,10 @@ test('an in-place color transfer keeps its original target during donor inspecti
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const configure = page
-    .getByRole('button', { name: /Transfer Color Metadata/ })
-    .getByRole('button', { name: 'Configure…' });
+    .getByRole('region', { name: 'Utilities' })
+    .locator('article')
+    .filter({ hasText: /Transfer Color Metadata/ })
+    .getByRole('button', { name: /Configure/ });
   const dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   await configure.click();
   await dialog.getByLabel('Target Video').selectOption(originalTarget);
@@ -1056,7 +1067,8 @@ test('Color Data sends each source flag combination to the selected target in pl
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Transfer Color Metadata/ });
+    .locator('article')
+    .filter({ hasText: /Transfer Color Metadata/ });
   const dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   let count = 0;
   for (const [color, hdr] of [
@@ -1065,7 +1077,7 @@ test('Color Data sends each source flag combination to the selected target in pl
     [false, true],
     [false, false],
   ]) {
-    await card.getByRole('button', { name: 'Configure…' }).click();
+    await card.getByRole('button', { name: /Configure/ }).click();
     await expect(dialog).toContainText('rewrites that file in place');
     await dialog.getByLabel('Target Video').selectOption('C:\\media\\B.mkv');
     await dialog.getByLabel(/Color space/).setChecked(color);
@@ -1109,15 +1121,16 @@ test('Color Data batch mode only reads each file even after a target was configu
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Transfer Color Metadata/ });
-  await card.getByRole('button', { name: 'Configure…' }).click();
+    .locator('article')
+    .filter({ hasText: /Transfer Color Metadata/ });
+  await card.getByRole('button', { name: /Configure/ }).click();
   let dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   await dialog.getByLabel('Target Video').selectOption('C:\\media\\B.mkv');
   await dialog.getByRole('button', { name: 'OK' }).click();
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
-  await card.getByRole('button', { name: 'Configure…' }).click();
+  await card.getByRole('button', { name: /Configure/ }).click();
   dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   await expect(dialog.getByLabel('Target Video')).toBeDisabled();
   await dialog.getByRole('button', { name: 'Close' }).click();
@@ -1152,7 +1165,8 @@ test('Sample Encodes shows the exact per-encoder source color menus and sends se
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Sample Encodes/ });
+    .locator('article')
+    .filter({ hasText: /Sample Encodes/ });
   const dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
   const wide = ['yuv420p', 'yuv422p', 'yuv444p', 'yuv420p10le', 'yuv422p10le', 'yuv444p10le'];
   const matrix: [string, string[], string][] = [
@@ -1168,7 +1182,7 @@ test('Sample Encodes shows the exact per-encoder source color menus and sends se
   ];
   let runs = 0;
   for (const [encoder, options, defaultFormat] of matrix) {
-    await card.getByRole('button', { name: 'Configure…' }).click();
+    await card.getByRole('button', { name: /Configure/ }).click();
     expect(
       await dialog
         .getByLabel('Encoder', { exact: true })
@@ -1268,7 +1282,7 @@ test('image sequence folder prompts for rate, displays original folder, and rele
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Film Grain (AV1)', exact: true })
     .click();
   await page.getByRole('button', { name: 'Run: Film grain edit' }).click();
   await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
@@ -1395,7 +1409,7 @@ test('batch utility file rows reflect individual success and failure', async ({ 
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Film Grain (AV1)', exact: true })
     .click();
   await page.getByRole('button', { name: 'Run Batch: Film grain edit' }).click();
   await expect
@@ -1625,8 +1639,9 @@ test('Film Grain Apply replaces existing grain headers as the fork does', async 
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const card = page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ });
-  await card.getByRole('button', { name: 'Configure…' }).click();
+    .locator('article')
+    .filter({ hasText: /Film Grain/ });
+  await card.getByRole('button', { name: /Configure/ }).click();
   const dialog = page.getByRole('dialog', { name: 'Configure Film Grain (AV1)' });
   await dialog.getByLabel('Do', { exact: true }).selectOption('apply');
   await dialog.getByLabel('Grain from').selectOption('preset');
@@ -1734,40 +1749,40 @@ test('unsupported utility batches show the source-specific warning', async ({ pa
   const utilities = page.getByRole('region', { name: 'Utilities' });
   const cases = [
     {
-      card: /Get Metrics/,
+      card: 'Get Metrics',
       task: 'Metrics calculation',
       reason:
         'It compares two loaded files against each other, so a single file means nothing to it.',
       config: 'Quality Metrics',
     },
     {
-      card: /Sample Encodes/,
+      card: 'Sample Encodes',
       task: 'CRF ladder',
       reason:
         'It ends in a results window, which a queue would raise once per file with nobody there',
     },
     {
-      card: /Show Bitrate Chart/,
+      card: 'Show Bitrate Chart',
       task: 'Bitrate chart',
       reason:
         'It opens a chart window for the file it analysed, and a queue would raise one per file.',
     },
     {
-      card: /Concatenate Into Single MKV/,
+      card: 'Concatenate Into Single MKV',
       task: 'Concatenation',
       reason:
         'It joins the whole file list into one output, which is the opposite of running per file.',
     },
   ];
   for (const entry of cases) {
-    await utilities.getByRole('button', { name: entry.card }).click();
+    await utilities.getByRole('button', { name: entry.card, exact: true }).click();
     if (entry.config)
       await page
         .getByRole('dialog', { name: entry.config })
         .getByRole('button', { name: 'Close' })
         .click();
     await page.getByRole('button', { name: `Run Batch: ${entry.task}` }).click();
-    const warning = page.getByRole('dialog', { name: 'Nmkoder - Warning' });
+    const warning = page.getByRole('dialog', { name: 'jesses - Warning' });
     await expect(warning).toContainText(`${entry.task} cannot be run per file.`);
     await expect(warning).toContainText(entry.reason);
     await expect(warning).toContainText('Switch the File List tab to Muxing Mode to use it.');
@@ -1784,7 +1799,7 @@ test('utility progress accepts only its active ticket, supports pause and discar
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Film Grain (AV1)', exact: true })
     .click();
   await page.evaluate(() => {
     (globalThis as any).__holdUtility = true;
@@ -2001,8 +2016,9 @@ test('historical hardware Sample Encodes preferences visibly select a valid CPU 
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Sample Encodes/ })
-    .getByRole('button', { name: 'Configure…' })
+    .locator('article')
+    .filter({ hasText: /Sample Encodes/ })
+    .getByRole('button', { name: /Configure/ })
     .click();
   const dialog = page.getByRole('dialog', { name: 'Configure Sample Encodes' });
   await expect(dialog.getByLabel('Encoder', { exact: true })).toHaveValue('av1');
@@ -2155,7 +2171,10 @@ for (const receipt of ['table', 'retained-ladder', 'private-ladder'] as const)
     await page.getByRole('button', { name: 'Utilities', exact: true }).click();
     await page
       .getByRole('region', { name: 'Utilities' })
-      .getByRole('button', { name: receipt === 'table' ? /Film Grain/ : /Sample Encodes/ })
+      .getByRole('button', {
+        name: receipt === 'table' ? 'Film Grain (AV1)' : 'Sample Encodes',
+        exact: true,
+      })
       .click();
     await page.evaluate((receipt) => {
       const h = globalThis as any;
@@ -2222,7 +2241,7 @@ test('native measured grain table bytes contribute to source batch totals', asyn
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
-    .getByRole('button', { name: /Film Grain/ })
+    .getByRole('button', { name: 'Film Grain (AV1)', exact: true })
     .click();
   await page.evaluate(() => {
     (globalThis as any).__utilityBatchResult = {

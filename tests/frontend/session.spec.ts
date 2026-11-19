@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
 test('active source tab and keyboard-adjusted log height survive a restart', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
-  const splitter = page.getByRole('slider', { name: 'Resize log' });
+  const splitter = page.getByRole('separator', { name: 'Resize log' });
   await splitter.focus();
   for (let index = 0; index < 8; index++) await page.keyboard.press('ArrowUp');
   await expect(splitter).toHaveAttribute('aria-valuenow', '220');

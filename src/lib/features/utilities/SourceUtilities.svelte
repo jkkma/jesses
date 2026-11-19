@@ -1289,48 +1289,54 @@
 </script>
 
 <section class="source-utilities" aria-label="Utilities">
-  <p>
-    Pick a utility, then press Run. Utilities are shortcuts for actions that normally need long CLI
-    commands.
-  </p>
+  <div class="utilities-intro">
+    <p>
+      Pick a utility, then press Run. Utilities are shortcuts for actions that normally need long
+      CLI commands.
+    </p>
+    {#if fileMode === 'batch'}
+      <span class="batch-indicator" role="status">
+        Batch Mode: runs per file (multi-file utilities require Muxing Mode)
+      </span>
+    {/if}
+  </div>
   <div class="cards">
-    {#each cards as card}<div
-        class:chosen={task === card.id}
-        class="card"
-        role="button"
-        tabindex="0"
-        onclick={() => choose(card.id)}
-        onkeydown={(event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            choose(card.id);
-          }
-        }}
-      >
+    {#each cards as card}<article class:chosen={task === card.id} class="card">
         <div class="card-head">
-          <strong>{card.label}</strong>{#if card.configure}<button
+          <button
+            type="button"
+            class="card-select"
+            aria-pressed={task === card.id}
+            onclick={() => choose(card.id)}
+          >
+            <strong>{card.label}</strong>
+          </button>
+          {#if card.configure}
+            {@const label = configureText(card.id)}
+            <button
               type="button"
-              aria-label="Configure…"
-              onclick={(event) => {
-                event.stopPropagation();
-                choose(card.id, true);
-              }}>{configureText(card.id)}</button
-            >{/if}
+              class="card-configure"
+              aria-label={label === 'Configure…'
+                ? `Configure… (${card.label})`
+                : `${label} — Configure ${card.label}`}
+              onclick={() => choose(card.id, true)}>{label}</button
+            >
+          {/if}
         </div>
         <small>{card.description}</small>
-      </div>{/each}
+      </article>{/each}
   </div>
 </section>
 <SourceDialog
-  title="Nmkoder - Warning"
+  title="jesses - Warning"
   open={unsupportedBatchTask !== null}
   onclose={() => (unsupportedBatchTask = null)}
 >
   {#if unsupportedBatchTask}<p>{labels[unsupportedBatchTask]} cannot be run per file.</p>
     <p>{batchReasons[unsupportedBatchTask]}</p>
     <p>Switch the File List tab to Muxing Mode to use it.</p>{/if}
-  <div class="dialog-actions">
-    <button onclick={() => (unsupportedBatchTask = null)}>OK</button>
+  <div class="actions">
+    <button type="button" onclick={() => (unsupportedBatchTask = null)}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog title="Quality Metrics" open={dialog === 'metrics'} onclose={() => (dialog = null)}>
@@ -1375,6 +1381,7 @@
   </div>
   <div class="actions">
     <button
+      type="button"
       onclick={() => {
         metricsEncoded = dialogMetricsEncoded;
         metricsReference = dialogMetricsReference;
@@ -1425,6 +1432,7 @@
     </p>{/if}
   <div class="actions">
     <button
+      type="button"
       onclick={() => {
         colorSource = dialogColorSource;
         colorTarget = dialogColorTarget;
@@ -1471,12 +1479,13 @@
   </p>
   <div class="actions">
     <button
+      type="button"
       onclick={() => {
         deinterlace = 'qtgmc';
         qtgmcPreset = 'verySlow';
         doubleRate = true;
       }}>Reset</button
-    ><button onclick={() => saveUtilitySettings('deinterlace')}>OK</button>
+    ><button type="button" onclick={() => saveUtilitySettings('deinterlace')}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1519,6 +1528,9 @@
             bind:value={grainTable}
             placeholder="Path to a .tbl grain table"
           /><button
+            type="button"
+            aria-label="Browse grain table"
+            title="Browse grain table"
             onclick={async () => {
               const path = await chooseUtilityFile('Pick a film grain table', ['tbl']);
               if (path) grainTable = path;
@@ -1555,6 +1567,7 @@
     <p>{grainWarning()}</p>{/if}
   <div class="actions">
     <button
+      type="button"
       onclick={() => {
         grainOp = 'measureSource';
         grainSource = 'table';
@@ -1565,7 +1578,7 @@
         iso = 400;
         chroma = false;
       }}>Reset</button
-    ><button onclick={() => saveUtilitySettings('grain')}>OK</button>
+    ><button type="button" onclick={() => saveUtilitySettings('grain')}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1647,7 +1660,8 @@
   <h3>RESULT</h3>
   <p>{ladderDescription()}</p>
   <div class="actions">
-    <button onclick={resetLadder}>Reset</button><button
+    <button type="button" onclick={resetLadder}>Reset</button><button
+      type="button"
       onclick={() => saveUtilitySettings('ladder')}>OK</button
     >
   </div>
@@ -1674,12 +1688,17 @@
 >
   {#if ladderResult?.kind === 'crfLadder'}<h3>CRF LADDER</h3>
     <table>
-      <thead
-        ><tr
-          ><th>CRF</th><th>Video bitrate</th><th>Per minute</th><th>Whole file</th><th>Of source</th
-          >{#if ladderResult.result.metric !== 'none'}<th>Score</th>{/if}<th>Encode time</th></tr
-        ></thead
-      ><tbody
+      <thead>
+        <tr>
+          <th scope="col">CRF</th>
+          <th scope="col">Video bitrate</th>
+          <th scope="col">Per minute</th>
+          <th scope="col">Whole file</th>
+          <th scope="col">Of source</th>
+          {#if ladderResult.result.metric !== 'none'}<th scope="col">Score</th>{/if}
+          <th scope="col">Encode time</th>
+        </tr>
+      </thead><tbody
         >{#each ladderResult.result.rungs as row}<tr
             ><td>{row.crf}</td><td>{row.bitrateKbps.toFixed(1)} kb/s</td><td
               >{formatBytes(row.bytesPerMinute)}</td
@@ -1693,7 +1712,10 @@
       >
     </table>{/if}
   <div class="actions">
-    <button onclick={copyLadder}>Copy</button><button onclick={() => (dialog = null)}>Close</button>
+    <button type="button" onclick={copyLadder}>Copy</button><button
+      type="button"
+      onclick={() => (dialog = null)}>Close</button
+    >
   </div>
 </SourceDialog>
 <SourceDialog title="Bitrate Chart" open={dialog === 'chartResult'} onclose={() => (dialog = null)}>
@@ -1775,7 +1797,9 @@
         /></svg
       >
     </div>{/if}
-  <div class="actions"><button onclick={() => (dialog = null)}>Close</button></div>
+  <div class="actions">
+    <button type="button" onclick={() => (dialog = null)}>Close</button>
+  </div>
 </SourceDialog>
 
 <style>
@@ -1786,10 +1810,26 @@
     overflow-y: auto;
     padding: 2px 0;
   }
-  .source-utilities > p {
-    color: var(--muted-foreground);
-    font-size: 11px;
+  .utilities-intro {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 12px;
     margin-bottom: 8px;
+    max-width: 1280px;
+  }
+  .utilities-intro > p {
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+  }
+  .batch-indicator {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--foreground);
+    font-size: 0.85rem;
+    font-weight: 600;
   }
   .cards {
     display: grid;
@@ -1814,21 +1854,24 @@
       margin-top: 3px;
       line-height: 1.2;
     }
-    .cards .card button {
+    .cards .card .card-configure {
       padding: 4px 7px;
     }
   }
   .card {
+    position: relative;
     min-height: 84px;
     padding: 10px;
     border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--background);
-    cursor: pointer;
+    background: #dfdac5;
+  }
+  .card:hover {
+    background: var(--secondary);
   }
   .card.chosen {
-    border-color: var(--primary);
     background: var(--accent);
+    border-color: var(--primary);
+    box-shadow: inset 3px 0 var(--primary);
   }
   .card-head {
     display: flex;
@@ -1836,10 +1879,41 @@
     align-items: center;
     gap: 6px;
   }
+  .card-select {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--foreground);
+    text-align: left;
+    cursor: pointer;
+  }
+  .card-select::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+  }
+  .card-select:focus-visible {
+    outline: 0;
+  }
+  .card:has(.card-select:focus-visible) {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  .card-head strong {
+    letter-spacing: 0.045em;
+  }
+  .card-configure {
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+  }
   .card small {
     display: block;
     margin-top: 6px;
     color: var(--muted-foreground);
+    font-size: 0.85rem;
   }
   .form {
     display: grid;
@@ -1867,6 +1941,12 @@
     color: var(--foreground);
     cursor: pointer;
   }
+  button:hover:not(:disabled) {
+    background: var(--accent);
+  }
+  .card-select:hover:not(:disabled) {
+    background: transparent;
+  }
   .inline {
     display: flex;
     gap: 7px;
@@ -1881,7 +1961,7 @@
   }
   h3 {
     margin: 14px 0 5px;
-    font-size: 11px;
+    font-size: 0.85rem;
     letter-spacing: 0.08em;
   }
   table {
@@ -1898,26 +1978,5 @@
     width: 100%;
     height: 240px;
     color: var(--primary);
-  }
-  @media (max-width: 900px) {
-    .cards {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-  }
-  .card {
-    border-radius: 0;
-    background: #dfdac5;
-    border-color: var(--border);
-  }
-  .card:hover {
-    background: var(--secondary);
-  }
-  .card.chosen {
-    background: var(--accent);
-    border-color: var(--primary);
-    box-shadow: inset 3px 0 var(--primary);
-  }
-  .card-head strong {
-    letter-spacing: 0.045em;
   }
 </style>

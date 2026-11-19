@@ -36,10 +36,11 @@ for (const height of [600, 720]) {
     const panel = page.getByRole('region', { name: 'Track List' });
     if (height === 600) await panel.getByRole('option').first().click();
     for (const name of ['Select…', 'Sort…']) {
-      const menu = panel
-        .locator('details')
-        .filter({ has: page.locator('summary', { hasText: name }) });
-      await menu.locator('summary').click();
+      const trigger = panel.getByRole('button', { name, exact: true });
+      await trigger.click();
+      const menuId = await trigger.getAttribute('popovertarget');
+      const menu = page.locator(`#${menuId}`);
+      await expect(menu).toBeVisible();
       const workspace = (await page.locator('main').boundingBox())!;
       for (const button of await menu.getByRole('button').all()) {
         await button.scrollIntoViewIfNeeded();
@@ -47,7 +48,8 @@ for (const height of [600, 720]) {
         expect(box.y).toBeGreaterThanOrEqual(workspace.y);
         expect(box.y + box.height).toBeLessThanOrEqual(workspace.y + workspace.height);
       }
-      await menu.locator('summary').click();
+      await page.keyboard.press('Escape');
+      await expect(menu).toBeHidden();
     }
     await panel.getByText('Select…', { exact: true }).click();
     await panel.getByRole('button', { name: 'Check None', exact: true }).click();

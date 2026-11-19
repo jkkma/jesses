@@ -8,30 +8,6 @@
     updatePreferences,
     rememberMedia,
   } from '$lib/preferences.svelte';
-  import {
-    ArrowRight,
-    Check,
-    Clapperboard,
-    ChevronDown,
-    ChevronUp,
-    CircleAlert,
-    FilePlus2,
-    Files,
-    Film,
-    FlaskConical,
-    FolderOpen,
-    Layers,
-    LoaderCircle,
-    Monitor,
-    Plus,
-    Search,
-    SlidersHorizontal,
-    Terminal,
-    Trash2,
-    Wrench,
-    X,
-  } from '@lucide/svelte';
-  import { Button } from '$lib/components/ui/button';
   import WindowControls from '$lib/components/WindowControls.svelte';
   import SourceFileList from '$lib/features/source/FileList.svelte';
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
@@ -51,7 +27,6 @@
   } from '$lib/source-workspace';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
   import Av1an from '$lib/features/av1an/Av1an.svelte';
-  import JobStatus from '$lib/components/shared/JobStatus.svelte';
   import { terminalJob } from '$lib/components/shared/job-state';
   import {
     isEncoderProgressLine,
@@ -110,15 +85,16 @@
     MediaFile,
     ToolInfo,
   } from '$lib/ipc/generated';
-  import {
-    displayCodec,
-    displayPath,
-    displayPaths,
-    errorMessage,
-    fileName,
-    formatBytes,
-    formatDuration,
-  } from '$lib/components/shared/format';
+  import { displayPath, displayPaths, errorMessage, fileName } from '$lib/components/shared/format';
+
+  const workspaceTabs: { id: View; label: string }[] = [
+    { id: 'files', label: 'File List' },
+    { id: 'tracks', label: 'Track List' },
+    { id: 'av1an', label: 'AV1AN' },
+    { id: 'convert', label: 'Quick Convert' },
+    { id: 'utilities', label: 'Utilities' },
+    { id: 'tools', label: 'Settings' },
+  ];
 
   type View = 'files' | 'tracks' | 'convert' | 'av1an' | 'tools' | 'utilities';
   type LogEntry = { id: number; time: string; level: 'info' | 'error'; message: string };
@@ -1594,7 +1570,11 @@
   ondrop={(event) => event.preventDefault()}
 />
 
-<div class="app-shell" class:compact-utilities={view === 'utilities' && !logUserAdjusted}>
+<div
+  class="app-shell"
+  class:compact-utilities={view === 'utilities' && !logUserAdjusted}
+  class:log-user-adjusted={logUserAdjusted}
+>
   <header class="app-header" data-tauri-drag-region={desktop ? '' : undefined}>
     <div class="brand" data-tauri-drag-region={desktop ? '' : undefined}>
       <img
@@ -1614,13 +1594,13 @@
   </header>
   <div class="work-area">
     <nav class="workspace-nav" aria-label="Workspace workflows">
-      {#each [{ id: 'files', label: 'File List' }, { id: 'tracks', label: 'Track List' }, { id: 'av1an', label: 'AV1AN' }, { id: 'convert', label: 'Quick Convert' }, { id: 'utilities', label: 'Utilities' }, { id: 'tools', label: 'Settings' }] as tab}
+      {#each workspaceTabs as tab}
         <button
           type="button"
           class:active={view === tab.id}
           aria-current={view === tab.id ? 'page' : undefined}
           onclick={() => {
-            view = tab.id as View;
+            view = tab.id;
             if (tab.id === 'convert' || tab.id === 'av1an') lastTaskTab = tab.id;
             else if (tab.id === 'utilities' && workspaceActions.utilities?.label !== 'Run')
               lastTaskTab = 'utilities';
@@ -1629,6 +1609,9 @@
       {/each}
     </nav>
     <main>
+      <h1 class="visually-hidden">
+        {workspaceTabs.find((tab) => tab.id === view)?.label ?? 'Workspace'}
+      </h1>
       {#if view === 'files'}
         <SourceFileList
           {files}
@@ -1757,9 +1740,10 @@
       </div>
     </main>
   </div>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="log-splitter"
-    role="slider"
+    role="separator"
     aria-label="Resize log"
     aria-orientation="horizontal"
     aria-valuenow={logHeight}
@@ -1930,7 +1914,8 @@
     {/each}
   </div>
   <div class="import-actions">
-    <button onclick={() => finishImportDialog(true)}>Replace file list</button><button
+    <button type="button" onclick={() => finishImportDialog(true)}>Replace file list</button><button
+      type="button"
       onclick={() => finishImportDialog(false)}>Add to file list</button
     >
   </div>
@@ -1952,11 +1937,13 @@
       aria-label="Frame rate"
       bind:value={sequencePrompt.text}
       onkeydown={(event) => {
-        if (event.key === 'Enter') finishSequenceRate();
+        if (event.key === 'Enter' && !event.isComposing) finishSequenceRate();
       }}
     />
     {#if sequencePrompt.error}<p role="alert">{sequencePrompt.error}</p>{/if}
-    <div class="import-actions"><button onclick={() => finishSequenceRate()}>OK</button></div>
+    <div class="import-actions">
+      <button type="button" onclick={() => finishSequenceRate()}>OK</button>
+    </div>
   {/if}
 </SourceDialog>
 <SourceDialog
@@ -1970,8 +1957,9 @@
     {activeJobCount === 1 ? 'it' : 'them'}; only encodes with saved progress can be resumed later.
   </p>
   <div class="import-actions">
-    <button data-dialog-initial-focus onclick={() => (closePrompt = false)}>Keep running</button
-    ><button onclick={() => void finishClose()}>Close anyway</button>
+    <button type="button" data-dialog-initial-focus onclick={() => (closePrompt = false)}
+      >Keep running</button
+    ><button type="button" onclick={() => void finishClose()}>Close anyway</button>
   </div>
 </SourceDialog>
 {#if closing}
@@ -2002,7 +1990,7 @@
     color: var(--secondary-foreground);
     cursor: pointer;
   }
-  .import-actions button:hover {
+  .import-actions button:hover:not(:disabled) {
     background: var(--accent);
   }
   .import-actions button:focus-visible,
@@ -2022,11 +2010,17 @@
     letter-spacing: 0.04em;
   }
   .app-shell {
-    height: 100vh;
-    min-height: 680px;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
     padding: 0 10px 10px;
     gap: 8px;
-    background: var(--background);
+    background-color: #c9c1a9;
+    background-image:
+      repeating-linear-gradient(0deg, transparent 0 31px, #7278660b 31px 32px),
+      repeating-linear-gradient(90deg, transparent 0 31px, #7278660b 31px 32px);
     color: var(--foreground);
   }
   .app-header {
@@ -2035,6 +2029,7 @@
     margin: 0 -10px -4px;
     padding: 0 0 0 10px;
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     justify-content: space-between;
     border: 0;
@@ -2045,62 +2040,88 @@
     -webkit-app-region: drag;
   }
   .brand {
+    display: flex;
     align-items: center;
     gap: 8px;
+    white-space: nowrap;
   }
   .brand img {
     width: 20px;
     height: 20px;
-    border-radius: var(--radius);
+    object-fit: cover;
+    border: 1px solid var(--rule);
   }
   .brand-wordmark {
     color: var(--foreground);
-    font-size: 21px;
+    font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
+    font-size: 1.23rem;
+    line-height: 1;
     font-weight: 650;
-    letter-spacing: -0.9px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
   }
   .version {
     color: var(--muted-foreground);
-    font-size: 10px;
+    font-size: 0.85rem;
+    letter-spacing: 0.06em;
   }
   .work-area {
-    min-height: 260px;
+    min-height: 180px;
     flex: 1;
     display: flex;
     flex-direction: column;
     padding: 8px;
-    border-radius: var(--radius);
+    border: 1px solid var(--border);
     background: var(--card);
     overflow: hidden;
   }
   .workspace-nav {
+    display: flex;
+    flex-shrink: 0;
     min-height: 35px;
-    gap: 20px;
+    gap: 4px;
     align-items: flex-start;
-    padding: 0 8px;
+    padding: 0 4px;
+    min-width: 0;
     overflow-x: auto;
   }
   .workspace-nav button {
-    height: 29px;
-    padding: 0;
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    min-height: 29px;
+    padding: 4px 10px 4px 16px;
     border: 0;
-    border-bottom: 2px solid transparent;
-    border-radius: 0;
     background: transparent;
     color: var(--muted-foreground);
-    font-size: 13px;
+    font-size: 0.92rem;
+    letter-spacing: 0.045em;
+    white-space: nowrap;
+  }
+  .workspace-nav button::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    width: 4px;
+    height: 4px;
+    background: var(--border);
   }
   .workspace-nav button:hover {
-    background: transparent;
+    background: var(--secondary);
     color: var(--foreground);
   }
   .workspace-nav button.active {
-    color: var(--foreground);
-    border-color: var(--primary);
-    background: transparent;
+    background: var(--primary);
+    color: var(--primary-foreground);
+    font-weight: 600;
+  }
+  .workspace-nav button.active::before {
+    background: var(--primary-foreground);
   }
   main {
     display: flex;
+    flex-direction: column;
     flex: 1;
     min-height: 0;
     overflow: auto;
@@ -2114,35 +2135,43 @@
     flex-direction: column;
     overflow: hidden;
   }
+  .log-splitter {
+    position: relative;
+    height: 5px;
+    flex: 0 0 5px;
+    background: repeating-linear-gradient(90deg, var(--border) 0 36px, transparent 36px 39px);
+    cursor: ns-resize;
+    touch-action: none;
+  }
+  /* Keep the crisp 5px visual stripe while widening the pointer hit target. */
+  .log-splitter::after {
+    content: '';
+    position: absolute;
+    inset: -5px 0;
+  }
   .log-panel {
     flex: 0 0 auto;
     padding: 0;
     border: 0;
     background: transparent;
   }
-  .log-splitter {
-    height: 5px;
-    flex: 0 0 5px;
-    border-radius: var(--radius);
-    background: var(--rule);
-    cursor: ns-resize;
-    touch-action: none;
-  }
   .log-bar {
     min-height: 30px;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 12px;
     padding: 0;
     border: 0;
   }
   .log-bar strong {
-    font-size: 10px;
-    letter-spacing: 0.08em;
+    font-size: 0.85rem;
+    letter-spacing: 0.13em;
     color: var(--muted-foreground);
   }
   .log-bar-right {
     display: flex;
+    align-items: center;
     gap: 5px;
   }
   .log-bar button,
@@ -2150,10 +2179,15 @@
   .finish-action button {
     padding: 0.38rem 0.7rem;
     border: 0;
-    border-radius: var(--radius);
     background: var(--secondary);
     color: var(--secondary-foreground);
-    font-size: 12px;
+    font-size: 0.92rem;
+  }
+  .log-bar button:hover:not(:disabled),
+  .status-bar button:hover:not(:disabled),
+  .finish-action button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
   .log-bar button:disabled,
   .status-bar button:disabled,
@@ -2161,17 +2195,21 @@
     opacity: 0.5;
   }
   .log-entries {
-    min-height: 90px;
-    max-height: 400px;
+    min-height: 64px;
+    max-height: min(400px, 45dvh);
     overflow: auto;
     padding: 6px;
-    background: var(--background);
+    border: 1px solid var(--border);
+    background: #d6d0b8;
     color: var(--foreground);
-    border: 0;
-    border-radius: var(--radius);
     font:
-      11px Consolas,
+      0.85rem/1.35 Consolas,
       monospace;
+  }
+  @media (max-height: 660px) {
+    .app-shell:not(.log-user-adjusted) .log-entries {
+      height: 84px !important;
+    }
   }
   @media (max-width: 1000px) and (max-height: 800px) {
     .compact-utilities .log-entries {
@@ -2183,11 +2221,23 @@
     display: block;
     padding: 0;
     line-height: 1.35;
+    overflow-wrap: anywhere;
   }
   .log-entry.log-error {
     color: var(--destructive);
   }
+  .finish-action {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 8px;
+    border: 1px solid var(--primary);
+    font-size: 1rem;
+  }
   .status-bar {
+    flex-shrink: 0;
     min-height: 32px;
     padding: 0;
     display: flex;
@@ -2196,16 +2246,7 @@
     background: transparent;
     border: 0;
     color: var(--foreground);
-    font-size: 13px;
-  }
-  .finish-action {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 6px 8px;
-    border: 1px solid var(--primary);
-    font-size: 13px;
+    font-size: 1rem;
   }
   .current-action {
     flex: 1;
@@ -2217,8 +2258,8 @@
   .current-action span {
     display: block;
     min-height: 12px;
-    font-size: 11px;
-    line-height: 12px;
+    font-size: 0.85rem;
+    line-height: 1.15;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2265,11 +2306,16 @@
     color: var(--primary-foreground);
     background: var(--primary);
     font-weight: 600;
+    letter-spacing: 0.035em;
+  }
+  .status-bar .run-button:hover:not(:disabled) {
+    background: var(--jesses-primary-hover);
+    color: var(--primary-foreground);
   }
   .status-bar .run-blocked {
     max-width: 46ch;
     color: var(--destructive);
-    font-size: 11px;
+    font-size: 0.85rem;
     font-weight: 600;
     line-height: 1.3;
     overflow: hidden;
@@ -2278,72 +2324,15 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
   }
-  /* Paper shell and menu selection stay compact at desktop and laptop widths. */
-  .app-shell {
-    background-color: #c9c1a9;
-    background-image:
-      repeating-linear-gradient(0deg, transparent 0 31px, #7278660b 31px 32px),
-      repeating-linear-gradient(90deg, transparent 0 31px, #7278660b 31px 32px);
+  .status-bar button.run-blocked {
+    padding: 2px 4px;
+    background: transparent;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
-  .brand-wordmark {
-    letter-spacing: 0.11em;
-    text-transform: uppercase;
-    font-size: 16px;
-    font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
-  }
-  .version {
-    letter-spacing: 0.06em;
-  }
-  .work-area {
-    border: 1px solid var(--border);
-    border-radius: 0;
-    background: var(--card);
-  }
-  .workspace-nav {
-    gap: 4px;
-  }
-  .workspace-nav button {
-    position: relative;
-    padding: 0 9px 0 16px;
-    border: 0;
-    letter-spacing: 0.045em;
-    font-size: 12px;
-  }
-  .workspace-nav button::before {
-    content: '';
-    position: absolute;
-    left: 6px;
-    width: 4px;
-    height: 4px;
-    background: var(--border);
-  }
-  .workspace-nav button:hover {
+  .status-bar button.run-blocked:hover:not(:disabled) {
     background: var(--secondary);
-  }
-  .workspace-nav button.active {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-  .workspace-nav button.active::before {
-    background: var(--primary-foreground);
-  }
-  .log-splitter {
-    border-radius: 0;
-    background: repeating-linear-gradient(90deg, var(--border) 0 36px, transparent 36px 39px);
-  }
-  .log-bar strong {
-    letter-spacing: 0.13em;
-  }
-  .log-entries {
-    border: 1px solid var(--border);
-    border-radius: 0;
-    background: #d6d0b8;
-  }
-  .log-bar button,
-  .status-bar button {
-    border-radius: 0;
-  }
-  .status-bar .run-button {
-    letter-spacing: 0.035em;
+    color: var(--destructive);
   }
 </style>

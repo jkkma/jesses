@@ -212,7 +212,7 @@ for (const { width, height } of [
     );
     await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
     const av1an = page.getByRole('region', { name: 'AV1AN', exact: true });
-    await av1an.getByRole('tab', { name: 'Av1an Options', exact: true }).click();
+    await av1an.getByRole('tab', { name: 'AV1AN Options', exact: true }).click();
     for (const name of ['Split Method', 'Chunk Order']) {
       const select = av1an.getByLabel(name, { exact: true });
       const fit = await select.evaluate((element: HTMLSelectElement) => {
