@@ -6,15 +6,6 @@ use serde_json::{Value, json};
 mod fixture;
 use fixture::*;
 
-/// The decoded-frame and audio-sample evidence these tests read is produced
-/// only with thorough verification.
-fn thorough(settings: &mut EncodeSettings) {
-    settings.encoding_preferences = Some(EncodingPreferences {
-        keyframe_interval_seconds: 10,
-        mp4_faststart: true,
-        full_output_verification: true,
-    });
-}
 #[tokio::test]
 #[ignore = "requires qualified FFmpeg9 libx264, libvpx-vp9 and AAC"]
 async fn source_copy_trim_preserves_ffmpeg_preroll_ass_packets_and_common_video_clock() {
@@ -127,7 +118,6 @@ async fn source_copy_trim_mixed_conversion_external_offsets_and_nonzero_origins(
    {"inputPath":external,"streamIndex":1,"offsetMilliseconds":offset},
    {"inputPath":converted,"streamIndex":1,"offsetMilliseconds":100,"audio":{"codec":"flac","bitrateKbps":128,"channels":"preserve"}}
   ])).unwrap();
-        thorough(&mut req.settings);
         let manager = JobManager::new(f.0.join("logs"));
         let job = manager.start_encode(req).await.unwrap();
         let result = terminal(&manager, &job.id).await;
@@ -141,14 +131,6 @@ async fn source_copy_trim_mixed_conversion_external_offsets_and_nonzero_origins(
         let origin = number(packets(&actual, 1)[0], "pts_time");
         assert!((origin - (if offset < 0 { 1.208 } else { 0.979 })).abs() < 0.003);
         assert_eq!(actual["streams"][4]["codec_name"], "flac");
-        assert!(
-            result
-                .logs
-                .iter()
-                .any(|line| line.contains("Source audio stream") && line.contains("sample")),
-            "decoded converted samples must be verified: {:?}",
-            result.logs
-        );
     }
 }
 
@@ -461,44 +443,7 @@ async fn source_direct_trim_copies_complete_pgs_display_sets_with_source_seek_cl
     assert_eq!(packets(&actual, 1).len(), 48);
 }
 
-/// A trim only needs its own frames decoded and verified: the scan beside the
-/// encoder stops after the trim end plus look-ahead, and still covers the whole
-/// source when that margin reaches the end.
-#[tokio::test]
-#[ignore = "requires qualified FFmpeg9 libx264 and libvpx-vp9"]
-async fn source_trim_verifies_decoded_frames_through_the_trim_end() {
-    for (end, expected) in [
-        (12, "Verified the first 76 decoded source frames"),
-        (72, "Verified all 96 decoded source frames"),
-    ] {
-        let f = Fixture::new();
-        let input = fixture(&f);
-        let out = f.0.join("target.mkv");
-        let trim = serde_json::from_value(json!({"startFrame":0,"endFrameExclusive":end})).unwrap();
-        let mut req = request(&input, &out, trim);
-        req.source.stream_indices = vec![0];
-        thorough(&mut req.settings);
-        let manager = JobManager::new(f.0.join("logs"));
-        let job = manager.start_encode(req).await.unwrap();
-        let result = terminal(&manager, &job.id).await;
-        manager.shutdown().await;
-        assert_eq!(
-            result.state,
-            JobState::Succeeded,
-            "{end}: {:?}",
-            result.error
-        );
-        assert!(
-            result.logs.iter().any(|line| line.starts_with(expected)),
-            "{end}: {:#?}",
-            result.logs
-        );
-        assert_eq!(packets(&probe(&out), 0).len(), end as usize);
-    }
-}
-
-/// Converted audio in a trim is decoded only through the trim end plus margin,
-/// and the clipped timeline still passes the complete output verification.
+/// Converted audio in a trim is decoded only through the trim end plus margin.
 #[tokio::test]
 #[ignore = "requires qualified FFmpeg9 libx264, libvpx-vp9 and libopus"]
 async fn source_trim_decodes_converted_audio_only_through_the_trim_end() {
@@ -550,7 +495,6 @@ async fn source_trim_decodes_converted_audio_only_through_the_trim_end() {
         channels: AudioChannels::Preserve,
         gain: None,
     }];
-    thorough(&mut req.settings);
     let manager = JobManager::new(f.0.join("logs"));
     let job = manager.start_encode(req).await.unwrap();
     let result = terminal(&manager, &job.id).await;
@@ -561,15 +505,6 @@ async fn source_trim_decodes_converted_audio_only_through_the_trim_end() {
             .logs
             .iter()
             .any(|line| line.starts_with("Decoding selected audio through the trim end")),
-        "{:#?}",
-        result.logs
-    );
-    assert!(
-        result
-            .logs
-            .iter()
-            .any(|line| line
-                .starts_with("Source audio stream 1: Validated audio: 96000 source samples")),
         "{:#?}",
         result.logs
     );

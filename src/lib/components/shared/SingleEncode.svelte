@@ -1922,15 +1922,13 @@
           : null
       : null,
   );
-  // The header length the native estimate uses, and only where it uses one:
-  // the output keeps the source clock, and Thorough verification, which
-  // counts frames before encoding, is off.
+  // The native estimate uses the duration from the headers when the output
+  // keeps the source clock.
   const grainVideoSeconds = $derived(
     trim.enabled ||
       temporal.deinterlace !== 'off' ||
       temporal.changeRate ||
-      sourceFilterRows(av1anFilters).length > 0 ||
-      sourcePreferences?.fullOutputVerification
+      sourceFilterRows(av1anFilters).length > 0
       ? undefined
       : (selectedVideo?.durationSeconds ?? file?.durationSeconds ?? undefined),
   );
@@ -2777,7 +2775,6 @@
               encodingPreferences: {
                 keyframeIntervalSeconds: sourcePreferences.keyframeIntervalSeconds ?? 10,
                 mp4Faststart: sourcePreferences.mp4Faststart ?? true,
-                fullOutputVerification: sourcePreferences.fullOutputVerification ?? false,
               },
             }
           : {}),

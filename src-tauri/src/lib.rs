@@ -600,6 +600,11 @@ async fn stop_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppE
 }
 
 #[tauri::command]
+async fn discard_job_progress(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
+    jobs.manager.discard_av1an_recovery(id).await
+}
+
+#[tauri::command]
 async fn resume_job(
     id: String,
     jobs: State<'_, Jobs>,
@@ -854,6 +859,7 @@ fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
         cancel_all_jobs,
         cancel_job,
         stop_job,
+        discard_job_progress,
         resume_job,
         list_av1an_recoveries,
         av1an_recovery_action,
@@ -925,6 +931,7 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "cancel_all_jobs"
         | "cancel_job"
         | "stop_job"
+        | "discard_job_progress"
         | "resume_job"
         | "list_av1an_recoveries"
         | "av1an_recovery_action"

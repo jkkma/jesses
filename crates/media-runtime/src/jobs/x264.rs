@@ -106,60 +106,6 @@ pub(super) fn output_csp(pixel_format: &str) -> &'static str {
     }
 }
 
-pub(super) fn validate_help(help: &str, depth: u8, csp: &str) -> Result<(), String> {
-    let required = [
-        "--demuxer",
-        "--muxer",
-        "--force-cfr",
-        "--fps",
-        "--output-depth",
-        "--output-csp",
-        "--input-range",
-        "--range",
-        "--sar",
-        "--colorprim",
-        "--transfer",
-        "--colormatrix",
-        "--chromaloc",
-        "--crf",
-        "--preset",
-    ];
-    if required
-        .iter()
-        .any(|option| !help.split_whitespace().any(|word| word == *option))
-        || !advertises_choice(help, "--muxer", "mkv")
-        || !advertises_choice(help, "--demuxer", "y4m")
-        || !advertises_choice(help, "--output-csp", csp)
-    {
-        return Err("The installed x264 must advertise Y4M input, Matroska output, and the required CFR, pixel format, and color options.".into());
-    }
-    if !help.lines().any(|line| {
-        line.trim()
-            .strip_prefix("Output bit depth:")
-            .is_some_and(|value| {
-                value
-                    .split('/')
-                    .any(|value| value.trim().parse::<u8>() == Ok(depth))
-            })
-    }) {
-        return Err(format!(
-            "The installed x264 does not advertise {depth}-bit output. Install a build supporting the selected source bit depth."
-        ));
-    }
-    Ok(())
-}
-
-fn advertises_choice(help: &str, option: &str, choice: &str) -> bool {
-    let mut lines = help.lines();
-    if !lines.any(|line| line.split_whitespace().next() == Some(option)) {
-        return false;
-    }
-    lines
-        .next()
-        .and_then(|line| line.trim().strip_prefix("- "))
-        .is_some_and(|list| list.split(',').any(|value| value.trim() == choice))
-}
-
 pub(super) fn frame_counter(line: &str) -> Option<u64> {
     let line = line
         .trim()
@@ -244,18 +190,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn rejects_missing_container_and_depth_capabilities() {
-        let help = "--demuxer <string>\n - auto, raw, y4m\n--muxer <string>\n - auto, raw, mkv\n--output-csp <string>\n - i420, i444\n--force-cfr --fps --output-depth --input-range --range --sar --colorprim --transfer --colormatrix --chromaloc --crf --preset\nOutput bit depth: 8/10\n";
-        assert!(validate_help(help, 8, "i420").is_ok());
-        assert!(validate_help(help, 10, "i444").is_ok());
-        assert!(validate_help(help, 8, "i422").is_err());
-        assert!(validate_help(&help.replace("8/10", "8"), 10, "i420").is_err());
-        assert!(validate_help(&help.replace(", mkv", ""), 8, "i420").is_err());
-        assert!(validate_help(&help.replace(", y4m", ""), 8, "i420").is_err());
-        assert!(validate_help(&help.replace("--force-cfr", ""), 8, "i420").is_err());
     }
 
     #[test]

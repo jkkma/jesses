@@ -73,7 +73,7 @@ impl TableCoverage {
             return Err(AppError::new(
                 "ENCODE_SETTINGS_INVALID",
                 format!(
-                    "The grain table ends at {:.3} s but the video needs about {:.3} s. Use a grain table with one segment covering the whole video. The video length was read from the file headers; if it is wrong, turn on Thorough verification to count the frames first.",
+                    "The grain table ends at {:.3} s but the video needs about {:.3} s based on the file headers. Use a grain table with one segment covering the whole video.",
                     end as f64 / 10_000_000.0,
                     video_end as f64 / 10_000_000.0
                 ),
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(error.code, "ENCODE_SETTINGS_INVALID");
         assert!(error.message.contains("ends at 98.000 s"));
         assert!(error.message.contains("the video needs about 100.000 s"));
-        assert!(error.message.contains("Thorough verification"));
+        assert!(error.message.contains("based on the file headers"));
         // The exact check still refuses what the estimate lets through.
         assert!(
             TableCoverage(Some(NEEDED - 20_000_000))

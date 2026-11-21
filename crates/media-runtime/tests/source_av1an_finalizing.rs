@@ -35,7 +35,7 @@ fn source_request(input: &Path, output: &Path) -> EncodeRequest {
             encoding_preferences: Some(EncodingPreferences {
                 keyframe_interval_seconds: 1,
                 mp4_faststart: true,
-                full_output_verification: true,
+                retired_verification: (),
             }),
             av1an_options: Some(Av1anOptions {
                 source_workflow: true,

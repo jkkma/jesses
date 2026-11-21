@@ -76,17 +76,17 @@ recipe use the frozen chunk count and a joined-video header check. The muxed
 output is checked for its planned streams, video packet count, codec and
 dimensions. Declared video duration is checked for a known cadence starting
 at zero.
-Saved chunks still have identity, size and SHA-256 receipts.
+Saved chunks and original sources have identity, size and SHA-256 receipts.
 
 New Settings obtains decoded property/count receipts for retained chunks when
 the user selects that action. Mixed-source or resampled queues and the Dolby
-Vision base-layer clock still need decoded region or timing evidence. Those
-jobs and jobs with Thorough verification enabled independently reproduce the
-join with the selected concat method. Packet/header/order/timestamp equality
-and a strictly increasing decoded clock establish the actual per-region
-geometry and frame count. Older workspaces with decoded contracts and no
-mixed-chunk provenance use this detailed join check conservatively. Thorough
-verification also checks complete final decode and exact copied video packets.
+Vision base-layer clock need decoded region or timing evidence. These jobs
+independently reproduce the join with the selected concat method. Header and
+packet equality, including order and timestamps, and a strictly increasing
+decoded clock establish the actual per-region geometry and frame count. With
+mkvmerge, warnings are logged and the reference must still pass these checks.
+Older workspaces with decoded contracts and no mixed-chunk provenance use
+this detailed join check conservatively.
 
 For source copied cuts, a stable owned decoder slot preserves the original
 queue's source path while immutable cut variants preserve rollback authority.

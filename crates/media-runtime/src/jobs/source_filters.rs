@@ -209,6 +209,21 @@ impl Observation {
 fn invalid(message: &str) -> AppError {
     AppError::new("SOURCE_FILTER_OBSERVATION_INVALID", message, None)
 }
+pub(super) fn y4m_sample_aspect(prefix: &[u8]) -> Result<&str, AppError> {
+    let header = prefix
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .and_then(|end| prefix[..end].strip_prefix(b"YUV4MPEG2 "))
+        .and_then(|header| std::str::from_utf8(header).ok())
+        .ok_or_else(|| invalid("The filtered producer has no readable Y4M header."))?;
+    let sample_aspect = header
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix('A'));
+    Ok(match sample_aspect {
+        None | Some("0:0" | "0:1") => "1:1",
+        Some(sar) => sar,
+    })
+}
 fn read_file(
     file: &mut StatsFile,
     cancel: &watch::Receiver<bool>,
@@ -347,6 +362,19 @@ pub(in crate::jobs) async fn with_observer<T>(
 mod tests {
     use super::*;
     use crate::supervisor;
+    #[test]
+    fn y4m_sample_aspect_comes_from_the_header() {
+        assert_eq!(
+            y4m_sample_aspect(b"YUV4MPEG2 W128 H96 F24:1 Ip A3:4 C420p10\nFRAME\n\xff").unwrap(),
+            "3:4"
+        );
+        assert_eq!(
+            y4m_sample_aspect(b"YUV4MPEG2 W128 H96 F24:1 Ip A0:0 C420\n").unwrap(),
+            "1:1"
+        );
+        assert!(y4m_sample_aspect(b"YUV4MPEG2 W128 H96").is_err());
+        assert!(y4m_sample_aspect(b"raw bytes\n").is_err());
+    }
     #[test]
     fn inline_records_are_bounded_per_stream_and_do_not_assume_filter_pts_are_encoder_clock() {
         let mut clocks = BTreeMap::new();

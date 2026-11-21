@@ -1,8 +1,7 @@
-//! Durable whole-phase checkpoints for standalone encoders. Recovery never
-//! resumes inside an encoder process: an unfinished phase is rerun from the
-//! last artifact whose complete bytes were sealed and whose structure was
-//! verified at the job's output verification level (every frame decoded, or
-//! the frame count read from packets in fast verification).
+//! Resume durable whole-phase checkpoints created by older standalone jobs.
+//! Each retained input, tool and artifact is checked against its original
+//! content fingerprint before another phase can use it.
+
 use super::{
     check_cancel,
     files::{self, Source, Temporary, WorkspaceLock},
@@ -371,44 +370,11 @@ struct Manifest {
     source_qtgmc: Option<SourceQtgmc>,
 }
 
-/// A fresh job's source digest is first written at its first checkpoint, after
-/// the encoder ran, so it is taken beside the encoder instead of before it.
-/// The job holds the source open read-only for its whole run (Windows denies
-/// writers; elsewhere its fingerprint is rechecked), so the hashed bytes are
-/// the encoded bytes. A resume compares the digest first, so it hashes first.
-enum SourceStamp {
-    Ready(Stamp),
-    Hashing(Hashing),
-}
-
-struct Hashing {
-    task: Option<tokio::task::JoinHandle<Result<Stamp, AppError>>>,
-    stop: watch::Sender<bool>,
-}
-
-impl Hashing {
-    fn start(path: PathBuf) -> Self {
-        let (stop, stopped) = watch::channel(false);
-        let task = tokio::task::spawn_blocking(move || digest(&path, Some(&stopped)));
-        Self {
-            task: Some(task),
-            stop,
-        }
-    }
-}
-
-impl Drop for Hashing {
-    /// An abandoned job stops reading its source instead of hashing on.
-    fn drop(&mut self) {
-        self.stop.send_replace(true);
-    }
-}
-
 struct Seed {
     id: String,
     request: RemuxRequest,
     settings: EncodeSettings,
-    source: SourceStamp,
+    source: Stamp,
     external_sources: Vec<ExternalStamp>,
     tools: Vec<Stamp>,
     plan: Vec<String>,
@@ -710,7 +676,7 @@ fn validate_layout(root: &Path, manifest: &Manifest) -> Result<(), AppError> {
 
 impl Recovery {
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare(
+    pub async fn resume(
         id: &str,
         request: &RemuxRequest,
         settings: &EncodeSettings,
@@ -720,19 +686,16 @@ impl Recovery {
         total_frames: usize,
         two_pass: bool,
         video_extension: &str,
-        locator: Option<StandaloneRecovery>,
+        locator: StandaloneRecovery,
         cancel: &watch::Receiver<bool>,
     ) -> Result<Prepared, AppError> {
         let root = root_for(id, request)?;
         let source_path = source.to_owned();
         let cancel_copy = cancel.clone();
         let external_settings = settings.clone();
-        let resume = locator.is_some();
         let (source_stamp, external_sources, tool_guards, tool_stamps) =
             tokio::task::spawn_blocking(move || {
-                let source_stamp = resume
-                    .then(|| digest(&source_path, Some(&cancel_copy)))
-                    .transpose()?;
+                let source_stamp = digest(&source_path, Some(&cancel_copy))?;
                 let external_sources = external_stamps(
                     &external_settings,
                     Some(source_path.as_path()),
@@ -754,10 +717,7 @@ impl Recovery {
             id: id.to_owned(),
             request: request.clone(),
             settings: settings.clone(),
-            source: match source_stamp {
-                Some(stamp) => SourceStamp::Ready(stamp),
-                None => SourceStamp::Hashing(Hashing::start(source.to_owned())),
-            },
+            source: source_stamp,
             external_sources,
             tools: tool_stamps,
             plan,
@@ -765,140 +725,118 @@ impl Recovery {
             two_pass,
             video_extension: video_extension.to_owned(),
         };
-        if let Some(locator) = locator {
-            if Path::new(&locator.workspace) != root {
+        if Path::new(&locator.workspace) != root {
+            return Err(error(
+                &root,
+                "The recovery locator does not belong to this output directory.",
+            ));
+        }
+        let (directory_guard, lock) = lock_workspace(&root)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes(&root.join("manifest.json"))?)
+            .map_err(|cause| error(&root, cause.to_string()))?;
+        let mut changed = Vec::new();
+        if manifest.version != 1 {
+            changed.push("version");
+        }
+        if manifest.id != seed.id {
+            changed.push("job identifier");
+        }
+        if manifest.directory != identity(&root)? {
+            changed.push("workspace identity");
+        }
+        if manifest.request != seed.request {
+            changed.push("request");
+        }
+        if manifest.settings != seed.settings {
+            changed.push("settings");
+        }
+        if seed.source != manifest.source {
+            changed.push("source content");
+        }
+        if with_source(&seed.external_sources, &seed.source) != manifest.external_sources {
+            changed.push("external source content");
+        }
+        if manifest.tools != seed.tools {
+            changed.push("tools");
+        }
+        if manifest.plan != seed.plan {
+            changed.push("processing plan");
+        }
+        if manifest.total_frames != seed.total_frames {
+            changed.push("frame count");
+        }
+        if manifest.two_pass != seed.two_pass {
+            changed.push("pass mode");
+        }
+        if manifest.video_extension != seed.video_extension {
+            changed.push("video format");
+        }
+        if !phase_at_least(manifest.phase, locator.phase) {
+            changed.push("checkpoint phase");
+        }
+        if locator.total_frames != seed.total_frames {
+            changed.push("locator frame count");
+        }
+        if !changed.is_empty() {
+            return Err(error(
+                &root,
+                format!(
+                    "Standalone recovery bindings changed: {}.",
+                    changed.join(", ")
+                ),
+            ));
+        }
+        validate_layout(&root, &manifest)?;
+        let stamps = manifest
+            .stats
+            .iter()
+            .chain(manifest.video.iter())
+            .chain(manifest.timed_video.iter())
+            .chain(manifest.final_stage.iter());
+        for stamp in stamps {
+            if digest(&stamp.path, Some(cancel))? != *stamp {
                 return Err(error(
-                    &root,
-                    "The recovery locator does not belong to this output directory.",
+                    &stamp.path,
+                    "A verified standalone recovery artifact changed.",
                 ));
             }
-            let (directory_guard, lock) = lock_workspace(&root)?;
-            let manifest: Manifest = serde_json::from_slice(&bytes(&root.join("manifest.json"))?)
-                .map_err(|cause| error(&root, cause.to_string()))?;
-            let mut changed = Vec::new();
-            if manifest.version != 1 {
-                changed.push("version");
-            }
-            if manifest.id != seed.id {
-                changed.push("job identifier");
-            }
-            if manifest.directory != identity(&root)? {
-                changed.push("workspace identity");
-            }
-            if manifest.request != seed.request {
-                changed.push("request");
-            }
-            if manifest.settings != seed.settings {
-                changed.push("settings");
-            }
-            if !matches!(&seed.source, SourceStamp::Ready(stamp) if *stamp == manifest.source) {
-                changed.push("source content");
-            }
-            let external_sources = match &seed.source {
-                SourceStamp::Ready(source) => Some(with_source(&seed.external_sources, source)),
-                SourceStamp::Hashing(_) => None,
-            };
-            if external_sources.as_ref() != Some(&manifest.external_sources) {
-                changed.push("external source content");
-            }
-            if manifest.tools != seed.tools {
-                changed.push("tools");
-            }
-            if manifest.plan != seed.plan {
-                changed.push("processing plan");
-            }
-            if manifest.total_frames != seed.total_frames {
-                changed.push("frame count");
-            }
-            if manifest.two_pass != seed.two_pass {
-                changed.push("pass mode");
-            }
-            if manifest.video_extension != seed.video_extension {
-                changed.push("video format");
-            }
-            if !phase_at_least(manifest.phase, locator.phase) {
-                changed.push("checkpoint phase");
-            }
-            if locator.total_frames != seed.total_frames {
-                changed.push("locator frame count");
-            }
-            if !changed.is_empty() {
-                return Err(error(
-                    &root,
-                    format!(
-                        "Standalone recovery bindings changed: {}.",
-                        changed.join(", ")
-                    ),
-                ));
-            }
-            validate_layout(&root, &manifest)?;
-            let stamps = manifest
-                .stats
-                .iter()
-                .chain(manifest.video.iter())
-                .chain(manifest.timed_video.iter())
-                .chain(manifest.final_stage.iter());
-            for stamp in stamps {
-                if digest(&stamp.path, Some(cancel))? != *stamp {
-                    return Err(error(
-                        &stamp.path,
-                        "A verified standalone recovery artifact changed.",
-                    ));
-                }
-            }
-            let video = manifest
-                .video
-                .as_ref()
-                .map(|stamp| Temporary::durable(&stamp.path, true))
-                .transpose()?;
-            let timed_video = manifest
-                .timed_video
-                .as_ref()
-                .map(|stamp| Temporary::durable(&stamp.path, true))
-                .transpose()?;
-            let final_stage = manifest
-                .final_stage
-                .as_ref()
-                .map(|stamp| Temporary::durable(&stamp.path, true))
-                .transpose()?;
-            let stats = stats_path(&manifest)?
-                .map(|path| Stats::durable(&path, true))
-                .transpose()?;
-            if let Some(stats) = &stats {
-                stats.verify_stats()?;
-            }
-            return Ok(Prepared {
-                recovery: Self {
-                    root,
-                    seed,
-                    source_filter_contract: manifest.source_filter_contract.clone(),
-                    source_qtgmc: manifest.source_qtgmc.clone(),
-                    manifest: Some(manifest),
-                    _tool_guards: tool_guards,
-                    directory_guard: Some(directory_guard),
-                    lock: Some(lock),
-                },
-                video,
-                timed_video,
-                final_stage,
-                stats,
-            });
+        }
+        let video = manifest
+            .video
+            .as_ref()
+            .map(|stamp| Temporary::durable(&stamp.path, true))
+            .transpose()?;
+        let timed_video = manifest
+            .timed_video
+            .as_ref()
+            .map(|stamp| Temporary::durable(&stamp.path, true))
+            .transpose()?;
+        let final_stage = manifest
+            .final_stage
+            .as_ref()
+            .map(|stamp| Temporary::durable(&stamp.path, true))
+            .transpose()?;
+        let stats = stats_path(&manifest)?
+            .map(|path| Stats::durable(&path, true))
+            .transpose()?;
+        if let Some(stats) = &stats {
+            stats.verify_stats()?;
         }
         Ok(Prepared {
             recovery: Self {
                 root,
                 seed,
-                manifest: None,
-                source_filter_contract: None,
-                source_qtgmc: source_qtgmc(settings).then_some(SourceQtgmc::Deferred),
+                source_filter_contract: manifest.source_filter_contract.clone(),
+                source_qtgmc: manifest.source_qtgmc.clone(),
+                manifest: Some(manifest),
                 _tool_guards: tool_guards,
-                directory_guard: None,
-                lock: None,
+                directory_guard: Some(directory_guard),
+                lock: Some(lock),
             },
-            video: None,
-            timed_video: None,
-            final_stage: None,
-            stats: None,
+            video,
+            timed_video,
+            final_stage,
+            stats,
         })
     }
 
@@ -998,34 +936,12 @@ impl Recovery {
         Ok(())
     }
 
-    /// Waits for a fresh job's source digest; a canceled wait keeps the digest
-    /// running for a later checkpoint.
-    async fn settle_source(&mut self, cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
-        let SourceStamp::Hashing(hashing) = &mut self.seed.source else {
-            return Ok(());
-        };
-        let task = hashing.task.as_mut().expect("source digest still running");
-        let mut cancel = cancel.clone();
-        let joined = tokio::select! {
-            joined = task => joined,
-            Ok(_) = cancel.wait_for(|canceled| *canceled) => return Err(super::canceled()),
-        };
-        let stamp = joined.map_err(|cause| error(&self.root, cause.to_string()))??;
-        self.seed.source = SourceStamp::Ready(stamp);
-        Ok(())
-    }
-
+    #[cfg(test)]
     fn ensure_workspace(&mut self, initial: StandaloneRecoveryPhase) -> Result<(), AppError> {
         if self.manifest.is_some() {
             return Ok(());
         }
-        let SourceStamp::Ready(source) = &self.seed.source else {
-            return Err(error(
-                &self.root,
-                "The source fingerprint was not settled before the first checkpoint.",
-            ));
-        };
-        let source = source.clone();
+        let source = self.seed.source.clone();
         fs::create_dir(&self.root).map_err(|cause| error(&self.root, cause.to_string()))?;
         let (directory_guard, lock) = lock_workspace(&self.root)?;
         let manifest = Manifest {
@@ -1072,8 +988,9 @@ impl Recovery {
         stats: &Stats,
         cancel: &watch::Receiver<bool>,
     ) -> Result<StandaloneRecovery, AppError> {
+        check_cancel(cancel)?;
         stats.verify_stats()?;
-        self.settle_source(cancel).await?;
+        #[cfg(test)]
         self.ensure_workspace(StandaloneRecoveryPhase::PassOneComplete)?;
         let target = self.root.join(format!(
             "uncommitted-stats-{}-{}",
@@ -1111,7 +1028,8 @@ impl Recovery {
         phase: StandaloneRecoveryPhase,
         cancel: &watch::Receiver<bool>,
     ) -> Result<StandaloneRecovery, AppError> {
-        self.settle_source(cancel).await?;
+        check_cancel(cancel)?;
+        #[cfg(test)]
         self.ensure_workspace(phase)?;
         let (label, extension) = match phase {
             StandaloneRecoveryPhase::VideoComplete => ("video", self.seed.video_extension.as_str()),
@@ -1543,7 +1461,7 @@ mod tests {
                     id: "job-1".into(),
                     request,
                     settings: EncodeSettings::default(),
-                    source: SourceStamp::Ready(digest(&self.source, None).unwrap()),
+                    source: digest(&self.source, None).unwrap(),
                     external_sources: vec![],
                     tools: vec![tool_stamp],
                     plan: vec!["verified plan".into()],
@@ -1670,6 +1588,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_job_can_explicitly_discard_its_saved_checkpoint() {
+        use crate::jobs::{JobManager, history::History};
+        use media_core::{JobSnapshot, JobState};
+
+        let fixture = Fixture::new();
+        let mut recovery = fixture.recovery(false, "ivf");
+        let video = fixture.video("saved-video");
+        let (_owner, cancel) = watch::channel(false);
+        let checkpoint = recovery
+            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
+            .await
+            .unwrap();
+        let workspace = recovery.root.clone();
+        let settings = recovery.seed.settings.clone();
+        drop(recovery);
+
+        let history_dir = fixture.directory.join("history");
+        let (history, _) = History::open(history_dir.clone()).await.unwrap();
+        history
+            .save(vec![JobSnapshot {
+                id: "job-1".into(),
+                state: JobState::Canceled,
+                request: fixture.request(),
+                mux_request: None,
+                encode_settings: Some(settings),
+                edited_command: None,
+                recovery: None,
+                standalone_recovery: Some(checkpoint),
+                input_size_bytes: None,
+                output_size_bytes: None,
+                encoder_progress: None,
+                progress_seconds: None,
+                duration_seconds: None,
+                logs: vec![],
+                error: None,
+                log_path: None,
+            }])
+            .await
+            .unwrap();
+        drop(history);
+        let neighbor = fixture.directory.join("unrelated.mkv");
+        fs::write(&neighbor, b"unrelated").unwrap();
+        let manager = JobManager::open(fixture.directory.join("logs"), history_dir).await;
+        let snapshot = manager.cancel_job("job-1".into()).await.unwrap();
+        assert!(snapshot.standalone_recovery.is_some());
+        assert!(workspace.exists());
+        let discarded = manager
+            .discard_av1an_recovery("job-1".into())
+            .await
+            .unwrap();
+        assert_eq!(discarded.state, JobState::Canceled);
+        assert!(discarded.standalone_recovery.is_none());
+        assert!(!workspace.exists());
+        assert_eq!(fs::read(&neighbor).unwrap(), b"unrelated");
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"immutable source");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn canceled_checkpoint_before_copy_does_not_poison_the_next_checkpoint() {
         let fixture = Fixture::new();
         let mut recovery = fixture.recovery(false, "ivf");
@@ -1705,106 +1682,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_prepare_hashes_the_source_beside_the_encoder() {
-        let fixture = Fixture::new();
-        let request = fixture.request();
-        let (_owner, cancel) = watch::channel(false);
-        let mut prepared = Recovery::prepare(
-            "job-1",
-            &request,
-            &EncodeSettings::default(),
-            &fixture.source,
-            vec![fixture.tool.clone()],
-            vec!["verified plan".into()],
-            48,
-            false,
-            "ivf",
-            None,
-            &cancel,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            prepared.recovery.seed.source,
-            SourceStamp::Hashing(_)
-        ));
-        let video = fixture.video("video");
-        prepared
-            .recovery
-            .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
-            .await
-            .unwrap();
-        assert_eq!(
-            prepared.recovery.manifest.as_ref().unwrap().source,
-            digest(&fixture.source, None).unwrap()
-        );
-        prepared.recovery.cleanup().unwrap();
-    }
-
-    #[tokio::test]
-    async fn canceled_source_digest_wait_keeps_the_digest_for_the_next_checkpoint() {
-        let fixture = Fixture::new();
-        let request = fixture.request();
-        let (_owner, active) = watch::channel(false);
-        let mut prepared = Recovery::prepare(
-            "job-1",
-            &request,
-            &EncodeSettings::default(),
-            &fixture.source,
-            vec![fixture.tool.clone()],
-            vec!["verified plan".into()],
-            48,
-            false,
-            "ivf",
-            None,
-            &active,
-        )
-        .await
-        .unwrap();
-        // Hold the digest result pending: an already completed digest may
-        // legitimately win the select against cancellation.
-        let SourceStamp::Hashing(hashing) = &mut prepared.recovery.seed.source else {
-            panic!("fresh source digest must still be owned by recovery");
-        };
-        let task = hashing.task.take().unwrap();
-        let (finish, pending) = tokio::sync::oneshot::channel();
-        hashing.task = Some(tokio::spawn(async move {
-            pending.await.unwrap();
-            task.await.unwrap()
-        }));
-        let (_canceler, canceled) = watch::channel(true);
-        assert!(prepared.recovery.settle_source(&canceled).await.is_err());
-        assert!(matches!(
-            prepared.recovery.seed.source,
-            SourceStamp::Hashing(_)
-        ));
-        finish.send(()).unwrap();
-        prepared.recovery.settle_source(&active).await.unwrap();
-        assert!(matches!(
-            prepared.recovery.seed.source,
-            SourceStamp::Ready(_)
-        ));
-        let SourceStamp::Ready(stamp) = &prepared.recovery.seed.source else {
-            unreachable!();
-        };
-        assert_eq!(stamp, &digest(&fixture.source, None).unwrap());
-    }
-
-    #[test]
-    fn dropping_a_fresh_recovery_stops_its_source_digest() {
-        let fixture = Fixture::new();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _entered = runtime.enter();
-        let hashing = Hashing::start(fixture.source.clone());
-        let stopped = hashing.stop.subscribe();
-        drop(hashing);
-        assert!(*stopped.borrow());
-    }
-
-    #[tokio::test]
     async fn resume_prepare_still_hashes_the_source_before_comparing() {
         let fixture = Fixture::new();
         let request = fixture.request();
@@ -1820,7 +1697,7 @@ mod tests {
             .unwrap();
         drop(recovery);
         fs::write(&fixture.source, b"edited source").unwrap();
-        let resumed = Recovery::prepare(
+        let resumed = Recovery::resume(
             "job-1",
             &request,
             &EncodeSettings::default(),
@@ -1830,7 +1707,7 @@ mod tests {
             48,
             false,
             "ivf",
-            Some(locator),
+            locator,
             &cancel,
         )
         .await;
@@ -1839,6 +1716,63 @@ mod tests {
                 .err()
                 .is_some_and(|error| error.message.contains("source content"))
         );
+    }
+
+    #[tokio::test]
+    async fn resumes_legacy_standalone_checkpoint_with_retired_preference() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let (_owner, cancel) = watch::channel(false);
+        let settings = EncodeSettings {
+            encoding_preferences: Some(media_core::EncodingPreferences::from(
+                &media_core::GeneralPreferences::default(),
+            )),
+            ..Default::default()
+        };
+        let mut recovery = fixture.recovery(false, "ivf");
+        recovery.seed.settings = settings.clone();
+        let locator = recovery
+            .checkpoint_video(
+                &fixture.video("legacy-video"),
+                StandaloneRecoveryPhase::VideoComplete,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let manifest = recovery.root.join("manifest.json");
+        drop(recovery);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        legacy["settings"]["encodingPreferences"]["fullOutputVerification"] = true.into();
+        fs::write(&manifest, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let locator = discover_locator("job-1", &request, &settings, Some(&locator))
+            .unwrap()
+            .unwrap();
+        let checkpoint = Recovery::resume(
+            "job-1",
+            &request,
+            &settings,
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec!["verified plan".into()],
+            48,
+            false,
+            "ivf",
+            locator,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            checkpoint.recovery.phase(),
+            Some(StandaloneRecoveryPhase::VideoComplete)
+        );
+        let video = checkpoint.video.unwrap();
+        assert_eq!(fs::read(&video.path).unwrap(), b"complete encoded artifact");
+        drop(video);
+        checkpoint.recovery.cleanup().unwrap();
+        assert!(!manifest.exists());
     }
 
     #[test]
@@ -1941,38 +1875,20 @@ mod tests {
         };
         let (_, cancel) = watch::channel(false);
         let request = fixture.request();
-        let mut prepared = Recovery::prepare(
-            "job-1",
-            &request,
-            &settings,
-            &fixture.source,
-            vec![fixture.tool.clone()],
-            vec!["verified plan".into()],
-            48,
-            false,
-            "mkv",
-            None,
-            &cancel,
-        )
-        .await
-        .unwrap();
+        let mut recovery = fixture.recovery(false, "mkv");
+        recovery.seed.settings = settings.clone();
+        recovery.seed.external_sources =
+            external_stamps(&settings, Some(&fixture.source), Some(&cancel)).unwrap();
         let video = fixture.video("external-video");
-        let locator = prepared
-            .recovery
+        let locator = recovery
             .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
             .await
             .unwrap();
         assert_eq!(
-            prepared
-                .recovery
-                .manifest
-                .as_ref()
-                .unwrap()
-                .external_sources
-                .len(),
+            recovery.manifest.as_ref().unwrap().external_sources.len(),
             1
         );
-        drop(prepared);
+        drop(recovery);
         assert!(discover_locator("job-1", &request, &settings, Some(&locator)).is_ok());
         assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
 
@@ -2004,27 +1920,15 @@ mod tests {
         };
         let (_, cancel) = watch::channel(false);
         let request = fixture.request();
-        let mut prepared = Recovery::prepare(
-            "job-1",
-            &request,
-            &settings,
-            &fixture.source,
-            vec![fixture.tool.clone()],
-            vec!["verified plan".into()],
-            48,
-            false,
-            "mkv",
-            None,
-            &cancel,
-        )
-        .await
-        .unwrap();
+        let mut recovery = fixture.recovery(false, "mkv");
+        recovery.seed.settings = settings.clone();
+        recovery.seed.external_sources =
+            external_stamps(&settings, Some(&fixture.source), Some(&cancel)).unwrap();
         assert!(matches!(
-            prepared.recovery.seed.external_sources.as_slice(),
+            recovery.seed.external_sources.as_slice(),
             [ExternalStamp::Source(_)]
         ));
-        let locator = prepared
-            .recovery
+        let locator = recovery
             .checkpoint_video(
                 &fixture.video("shared-donor-video"),
                 StandaloneRecoveryPhase::VideoComplete,
@@ -2035,17 +1939,12 @@ mod tests {
         // The record matches a donor hashed on its own, so resume checks and
         // records written before the source was shared both still agree.
         assert_eq!(
-            prepared
-                .recovery
-                .manifest
-                .as_ref()
-                .unwrap()
-                .external_sources,
+            recovery.manifest.as_ref().unwrap().external_sources,
             external_source_stamps(&settings, None).unwrap()
         );
-        drop(prepared);
+        drop(recovery);
         assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
-        let resumed = Recovery::prepare(
+        let resumed = Recovery::resume(
             "job-1",
             &request,
             &settings,
@@ -2055,7 +1954,7 @@ mod tests {
             48,
             false,
             "mkv",
-            Some(locator),
+            locator,
             &cancel,
         )
         .await
@@ -2089,38 +1988,20 @@ mod tests {
         };
         let (_, cancel) = watch::channel(false);
         let request = fixture.request();
-        let mut prepared = Recovery::prepare(
-            "job-1",
-            &request,
-            &settings,
-            &fixture.source,
-            vec![fixture.tool.clone()],
-            vec!["verified plan".into()],
-            48,
-            false,
-            "mkv",
-            None,
-            &cancel,
-        )
-        .await
-        .unwrap();
+        let mut recovery = fixture.recovery(false, "mkv");
+        recovery.seed.settings = settings.clone();
+        recovery.seed.external_sources =
+            external_stamps(&settings, Some(&fixture.source), Some(&cancel)).unwrap();
         let video = fixture.video("donor-video");
-        let locator = prepared
-            .recovery
+        let locator = recovery
             .checkpoint_video(&video, StandaloneRecoveryPhase::VideoComplete, &cancel)
             .await
             .unwrap();
         assert_eq!(
-            prepared
-                .recovery
-                .manifest
-                .as_ref()
-                .unwrap()
-                .external_sources
-                .len(),
+            recovery.manifest.as_ref().unwrap().external_sources.len(),
             4
         );
-        drop(prepared);
+        drop(recovery);
         assert!(validate_locator("job-1", &request, &settings, &locator).is_ok());
         fs::write(&chapters, b"changed chapter donor").unwrap();
         assert!(validate_locator("job-1", &request, &settings, &locator).is_err());
@@ -2230,7 +2111,7 @@ mod tests {
             latest
         );
 
-        let prepared = Recovery::prepare(
+        let prepared = Recovery::resume(
             "job-1",
             &request,
             &settings,
@@ -2240,7 +2121,7 @@ mod tests {
             48,
             false,
             "ivf",
-            Some(stale),
+            stale,
             &cancel,
         )
         .await

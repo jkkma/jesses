@@ -408,6 +408,56 @@ async fn ffmpeg_encoders_preserve_depth_color_fractional_timing_and_copied_track
 
 #[tokio::test]
 #[ignore = "requires FFmpeg libx265/libvpx-vp9"]
+async fn ffmpeg_encoders_keep_the_anamorphic_sar_from_filtered_y4m() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("anamorphic.mkv");
+    output(
+        command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=128x96:rate=24:duration=1",
+                "-vf",
+                "setsar=4/3,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                "-chroma_sample_location",
+                "left",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&input),
+    )
+    .await;
+    let original = std::fs::read(&input).unwrap();
+    for encoder in [VideoEncoder::X265, VideoEncoder::Vp9] {
+        for (filter, sar, dar) in [("null", "4:3", "16:9"), ("setsar=3/4", "3:4", "1:1")] {
+            let destination = fixture
+                .0
+                .join(format!("{encoder:?}-{}.mkv", sar.replace(':', "-")));
+            let manager = JobManager::new(fixture.0.join("sar-logs"));
+            let mut request = request(&input, &destination, encoder, 4);
+            request.source.stream_indices = vec![0];
+            request.settings.video_stream_index = 0;
+            request.settings.source_filters = true;
+            request.settings.av1an_filters = vec![filter.into()];
+            let job = manager.start_encode(request).await.unwrap();
+            let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
+            manager.shutdown().await;
+            assert_eq!(result.state, JobState::Succeeded, "{result:#?}");
+            let artifact = probe(&destination, &["-show_streams"]).await;
+            let video = &artifact["streams"][0];
+            assert_eq!(video["sample_aspect_ratio"], sar, "{encoder:?} {filter}");
+            assert_eq!(video["display_aspect_ratio"], dar, "{encoder:?} {filter}");
+        }
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert_no_partial_output(&fixture.0);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg libx265/libvpx-vp9"]
 async fn ffmpeg_encoders_preserve_supported_sdr_color_and_chroma_tags() {
     for encoder in [VideoEncoder::X265, VideoEncoder::Vp9] {
         for (color, chroma) in [
@@ -567,10 +617,7 @@ async fn ffmpeg_encoders_reject_hdr_and_cancel_active_pipeline_without_publishin
             .unwrap();
         let running = wait_for(&manager, &job.id, |job| {
             job.state == JobState::Running
-                && job
-                    .logs
-                    .iter()
-                    .any(|line| line.contains("[consumer] frame="))
+                && job.progress_seconds.is_some_and(|seconds| seconds > 0.0)
         })
         .await;
         if running.state != JobState::Running {

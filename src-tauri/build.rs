@@ -61,6 +61,7 @@ fn main() {
             "cancel_all_jobs",
             "cancel_job",
             "stop_job",
+            "discard_job_progress",
             "resume_job",
             "list_jobs",
             "open_encode_window",

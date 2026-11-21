@@ -489,7 +489,6 @@ test('AV1AN exposes scene slices only when the prepass prerequisites are selecte
   const av = page.getByRole('region', { name: 'AV1AN', exact: true });
   await av.getByRole('tab', { name: 'AV1AN Options' }).click();
   const slices = av.getByLabel('Detection Slices');
-  // The parallel prepass runs on default jobs; Thorough verification stays off here.
   await expect(av.getByText(/Detects scenes in this many parallel parts/)).toBeVisible();
   await av.getByLabel('Split Method').selectOption('sceneDetection');
   await av.getByLabel('Chunk Method').selectOption('lsmash');

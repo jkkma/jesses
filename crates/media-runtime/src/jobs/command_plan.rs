@@ -121,11 +121,6 @@ pub(super) async fn build(
         "Requested subtitle assets and target-size measurements are prepared using the normal execution path. Arguments are separate native argv values; the application never evaluates them through a shell. This preview's temporary files are removed before it returns. Execution creates fresh owned paths and repeats preparation.".into(),
         "Validation probes and font/subtitle preparation are additional supervised steps. Output checks run before atomic no-overwrite publication.".into(),
     ];
-    if settings.lossless
-        && (thorough_verification(settings) || settings.backend == media_core::EncodeBackend::Av1an)
-    {
-        preview.notes.push("Before publication, execution compares the complete decoded pixel stream with the processed encoder input. A mismatch fails the job even when the encoder reports lossless coding; try another preset or encoder.".into());
-    }
     if !external.is_empty() {
         preview.notes.push("Additional audio, subtitles and attachments come from their displayed input files. Selected audio conversions preserve the shifted decoded sample timeline; copied tracks preserve packet contents and their requested timing offsets. The primary source owns video processing; container metadata and chapters use their selected donors. Every additional source is verified before publication and bound to recovery.".into());
     }

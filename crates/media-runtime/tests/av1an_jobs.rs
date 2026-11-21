@@ -345,34 +345,12 @@ async fn av1an_preserves_frame_rate_color_audio_and_immutable_request() {
 async fn av1an_aac_mp4_checks_the_audio_prefix_before_encoding() {
     let fixture = Fixture::new();
     let input = fixture.0.join("source.mkv");
-    let gapped = fixture.0.join("gapped.mkv");
     let destination = fixture.0.join("encoded.mp4");
     synthesize(&input, "128x96", 96).await;
     let original = std::fs::read(&input).unwrap();
-    let gap = output(
-        command("ffmpeg")
-            .await
-            .args(["-v", "error", "-n", "-i"])
-            .arg(&input)
-            .args([
-                "-c:v",
-                "copy",
-                "-c:a",
-                "pcm_s16le",
-                "-af",
-                r"aselect=not(between(t\,2\,2.25))",
-            ])
-            .arg(&gapped),
-    )
-    .await;
-    assert!(
-        gap.status.success(),
-        "{}",
-        String::from_utf8_lossy(&gap.stderr)
-    );
 
     let manager = JobManager::new(fixture.0.join("logs"));
-    let aac_request = |source: &Path, destination: &Path, thorough| {
+    let aac_request = |source: &Path, destination: &Path| {
         let mut request = request(source, destination, 5);
         request.settings.encoder = media_core::VideoEncoder::X264;
         request.settings.audio = vec![media_core::AudioTrackSettings {
@@ -386,31 +364,12 @@ async fn av1an_aac_mp4_checks_the_audio_prefix_before_encoding() {
         request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
             keyframe_interval_seconds: 10,
             mp4_faststart: true,
-            full_output_verification: thorough,
+            retired_verification: (),
         });
         request
     };
-    let rejected = fixture.0.join("rejected.mp4");
     let submitted = manager
-        .start_encode(aac_request(&gapped, &rejected, true))
-        .await
-        .unwrap();
-    let thorough = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
-    assert_eq!(thorough.state, JobState::Failed, "{thorough:#?}");
-    assert_eq!(
-        thorough.error.as_ref().unwrap().code,
-        "AUDIO_TIMELINE_INVALID"
-    );
-    assert!(
-        thorough
-            .logs
-            .iter()
-            .any(|line| line.contains("complete sample timeline"))
-    );
-    assert!(!rejected.exists());
-
-    let submitted = manager
-        .start_encode(aac_request(&input, &destination, false))
+        .start_encode(aac_request(&input, &destination))
         .await
         .unwrap();
     let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
@@ -628,7 +587,7 @@ async fn av1an_lsmash_encodes_only_the_presented_mp4_edit_frames() {
     request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
         keyframe_interval_seconds: 1,
         mp4_faststart: false,
-        full_output_verification: true,
+        retired_verification: (),
     });
     request.settings.source_filters = true;
     request.settings.av1an_filters = vec!["hflip".into()];
@@ -1606,7 +1565,7 @@ async fn av1an_filtered_non_vmaf_targets_score_the_verified_processed_source() {
 
 #[tokio::test]
 #[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
-async fn source_queue_default_skips_decode_and_reference_join_while_thorough_keeps_them() {
+async fn source_queue_runs_decoded_proof_when_resampling_frames() {
     let fixture = Fixture::new();
     let input = fixture.0.join("source.mkv");
     let fixture_input = fixture.0.join("fixture.mkv");
@@ -1633,11 +1592,10 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
     let original = std::fs::read(&input).unwrap();
     let manager = JobManager::new(fixture.0.join("logs"));
 
-    for (name, thorough, raw_filter, resample, extension) in [
-        ("default", false, false, false, "mkv"),
-        ("thorough", true, false, false, "mkv"),
-        ("raw-filter", false, true, false, "webm"),
-        ("resample", false, false, true, "mkv"),
+    for (name, raw_filter, resample, extension) in [
+        ("original-queue", false, false, "mkv"),
+        ("raw-filter", true, false, "webm"),
+        ("resample", false, true, "mkv"),
     ] {
         let output = fixture.0.join(format!("{name}.{extension}"));
         let mut encode = request(&input, &output, 12);
@@ -1655,7 +1613,7 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
         encode.settings.encoding_preferences = Some(media_core::EncodingPreferences {
             keyframe_interval_seconds: 10,
             mp4_faststart: true,
-            full_output_verification: thorough,
+            retired_verification: (),
         });
         if raw_filter {
             encode.settings.source_filters = true;
@@ -1686,7 +1644,7 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
             "{name} published after {:.2}s",
             began.elapsed().as_secs_f64()
         );
-        if !thorough && !resample {
+        if !resample {
             assert!(
                 job.logs
                     .iter()
@@ -1697,7 +1655,7 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
                 !job.logs
                     .iter()
                     .any(|line| line.contains("every packet timestamp")),
-                "normal AV1AN startup must not scan the whole source: {:?}",
+                "ordinary AV1AN startup must not scan every source packet timestamp: {:?}",
                 job.logs
             );
         }
@@ -1705,8 +1663,8 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
             job.logs
                 .iter()
                 .any(|line| line.starts_with("Verifying AV1AN chunks (")),
-            thorough || resample,
-            "decoded chunk proof should follow the verification and source-count policy: {:?}",
+            resample,
+            "decoded chunk proof should follow the source-count policy: {:?}",
             job.logs
         );
         assert_eq!(
@@ -1714,8 +1672,8 @@ async fn source_queue_default_skips_decode_and_reference_join_while_thorough_kee
                 .iter()
                 .any(|line| line
                     == "Checking the joined AV1AN video against the sealed chunk queue."),
-            thorough || resample,
-            "reference join proof should follow the verification and source-count policy"
+            resample,
+            "reference join proof should follow the source-count policy"
         );
         let decoded = probe(&output).await;
         let streams = decoded["streams"].as_array().unwrap();

@@ -3,7 +3,6 @@
 use super::{check_cancel, encode_plan::Plan, files, process_error};
 use crate::supervisor::{self, CommandSpec, ProcessEvent};
 use media_core::AppError;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
@@ -211,16 +210,6 @@ impl Prepared {
         self.video.flush_nonempty_async().await
     }
 
-    pub async fn validate(
-        &self,
-        ffprobe: &Path,
-        plan: &Plan,
-        expected_frames: usize,
-        cancel: &watch::Receiver<bool>,
-    ) -> Result<(), AppError> {
-        validate(ffprobe, &self.video.path, plan, expected_frames, cancel).await
-    }
-
     pub async fn decoded_identity(
         &self,
         ffmpeg: &Path,
@@ -303,156 +292,6 @@ pub(super) async fn verify_presented(
         ));
     }
     Ok(staged)
-}
-
-fn primaries(value: u8) -> &'static str {
-    match value {
-        1 => "bt709",
-        5 => "bt470bg",
-        6 => "smpte170m",
-        9 => "bt2020",
-        _ => "unknown",
-    }
-}
-fn transfer(value: u8) -> &'static str {
-    match value {
-        1 => "bt709",
-        5 => "bt470bg",
-        6 => "smpte170m",
-        16 => "smpte2084",
-        18 => "arib-std-b67",
-        _ => "unknown",
-    }
-}
-fn matrix(value: u8) -> &'static str {
-    match value {
-        1 => "bt709",
-        5 => "bt470bg",
-        6 => "smpte170m",
-        9 => "bt2020nc",
-        _ => "unknown",
-    }
-}
-
-#[derive(Deserialize)]
-struct Frame {
-    best_effort_timestamp_time: Option<String>,
-    interlaced_frame: Option<u8>,
-    width: Option<u32>,
-    height: Option<u32>,
-    pix_fmt: Option<String>,
-    sample_aspect_ratio: Option<String>,
-    color_space: Option<String>,
-    color_transfer: Option<String>,
-    color_primaries: Option<String>,
-    color_range: Option<String>,
-}
-
-async fn validate(
-    ffprobe: &Path,
-    input: &Path,
-    plan: &Plan,
-    expected_frames: usize,
-    cancel: &watch::Receiver<bool>,
-) -> Result<(), AppError> {
-    let document = super::probe(ffprobe, input, cancel, Some(&[0])).await?;
-    let stream = document
-        .streams
-        .first()
-        .ok_or_else(|| error(input, "The processed source has no video."))?;
-    let rate_ok = stream
-        .avg_frame_rate
-        .as_deref()
-        .and_then(|s| s.split_once('/'))
-        .and_then(|(n, d)| Some((n.parse::<u64>().ok()?, d.parse::<u64>().ok()?)))
-        .is_some_and(|(n, d)| {
-            n > 0 && d > 0 && n * u64::from(plan.fps_den) == d * u64::from(plan.fps_num)
-        });
-    if expected_frames == 0
-        || document.streams.len() != 1
-        || stream.codec_name.as_deref() != Some("ffv1")
-        || stream.width != Some(plan.width)
-        || stream.height != Some(plan.height)
-        || !plan.matches_output_format(stream.pix_fmt.as_deref())
-        || stream.sample_aspect_ratio.as_deref() != Some(plan.output_sar())
-        || !rate_ok
-        || stream.color_primaries.as_deref() != Some(primaries(plan.primaries))
-        || stream.color_transfer.as_deref() != Some(transfer(plan.transfer))
-        || stream.color_space.as_deref() != Some(matrix(plan.matrix))
-        || stream.color_range.as_deref() != Some(if plan.full_range { "pc" } else { "tv" })
-    {
-        return Err(error(
-            input,
-            "The FFV1 source codec, geometry, color, pixel aspect ratio or frame rate differs from its validated plan.",
-        ));
-    }
-    let mut args: Vec<OsString> = ["-v", "error", "-err_detect", "explode", "-select_streams", "0", "-show_frames", "-show_entries",
-        "frame=best_effort_timestamp_time,interlaced_frame,width,height,pix_fmt,sample_aspect_ratio,color_space,color_transfer,color_primaries,color_range", "-of", "json", "-i"]
-        .into_iter().map(OsString::from).collect();
-    args.push(input.as_os_str().to_owned());
-    let plan = plan.clone();
-    let result = supervisor::run_streaming_stdout(
-        &CommandSpec {
-            executable: ffprobe.to_owned(),
-            args,
-            cwd: None,
-        },
-        cancel.clone(),
-        64 * 1024,
-        TIME_LIMIT,
-        move |reader| {
-            let mut count = 0usize;
-            let mut failure = None;
-            super::encode::frame_scan::parse::<Frame>(reader, |frame| {
-                if failure.is_some() {
-                    return;
-                }
-                let time = frame
-                    .best_effort_timestamp_time
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok());
-                if count >= expected_frames
-                    || !time.is_some_and(|t| {
-                        t.is_finite()
-                            && (t - count as f64 * plan.frame_seconds()).abs() <= 0.001_002
-                    })
-                    || frame.interlaced_frame != Some(0)
-                    || frame.width != Some(plan.width)
-                    || frame.height != Some(plan.height)
-                    || !plan.matches_output_format(frame.pix_fmt.as_deref())
-                    || frame.sample_aspect_ratio.as_deref() != Some(plan.output_sar())
-                    || frame.color_primaries.as_deref() != Some(primaries(plan.primaries))
-                    || frame.color_transfer.as_deref() != Some(transfer(plan.transfer))
-                    || frame.color_space.as_deref() != Some(matrix(plan.matrix))
-                    || frame.color_range.as_deref()
-                        != Some(if plan.full_range { "pc" } else { "tv" })
-                {
-                    failure = Some(format!(
-                        "Processed frame {count} has unexpected timing, scan, geometry or color."
-                    ));
-                }
-                count += 1;
-            })?;
-            if let Some(failure) = failure {
-                return Err(failure);
-            }
-            if count != expected_frames {
-                return Err(format!(
-                    "Processed source decoded {count} frames; expected {expected_frames}."
-                ));
-            }
-            Ok(())
-        },
-    )
-    .await
-    .map_err(|cause| process_error(cause, input))?;
-    if !result.status.success() || !result.stderr.is_empty() {
-        return Err(error(
-            input,
-            "The processed source failed complete frame decoding.",
-        ));
-    }
-    check_cancel(cancel)
 }
 
 fn checksum(reader: &mut dyn Read, expected_frames: usize) -> Result<String, String> {
@@ -798,16 +637,6 @@ mod tests {
                 .await
                 .unwrap();
             observer.await.unwrap();
-            prepared
-                .validate(&ffprobe, &plan, 12, &cancel)
-                .await
-                .unwrap();
-            assert!(
-                prepared
-                    .validate(&ffprobe, &plan, 11, &cancel)
-                    .await
-                    .is_err()
-            );
             let fingerprint = prepared
                 .decoded_identity(&ffmpeg, 12, &cancel)
                 .await

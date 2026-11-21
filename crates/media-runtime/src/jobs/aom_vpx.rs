@@ -150,70 +150,6 @@ pub(super) fn configure_producer_output(
     true
 }
 
-pub(super) fn validate_help(
-    help: &str,
-    encoder: VideoEncoder,
-    depth: u8,
-    lossless: bool,
-    output_pixel_format: &str,
-) -> Result<(), String> {
-    let mut required = vec![
-        "--ivf",
-        "--output",
-        "--passes",
-        "--pass",
-        "--fpf",
-        "--end-usage",
-        "--target-bitrate",
-        "--cq-level",
-        "--cpu-used",
-        "--row-mt",
-        "--profile",
-        "--bit-depth",
-        "--input-bit-depth",
-        "--fps",
-        "--disable-warning-prompt",
-    ];
-    match encoder {
-        VideoEncoder::AomAv1 => required.extend([
-            "--color-primaries",
-            "--transfer-characteristics",
-            "--matrix-coefficients",
-            "--chroma-sample-position",
-        ]),
-        VideoEncoder::VpxStandalone => required.extend(["--codec", "--color-space"]),
-        _ => unreachable!("standalone AOM/VPX encoder"),
-    }
-    if lossless {
-        required.push("--lossless");
-    }
-    if encoder == VideoEncoder::AomAv1 && (depth > 8 || !output_pixel_format.contains("420")) {
-        required.extend(["--width", "--height"]);
-        required.push(if output_pixel_format.contains("444") {
-            "--i444"
-        } else if output_pixel_format.contains("422") {
-            "--i422"
-        } else {
-            "--i420"
-        });
-    }
-    if encoder == VideoEncoder::VpxStandalone && output_pixel_format.contains("444") {
-        required.push("--i444");
-    }
-    if required.iter().any(|flag| {
-        !help
-            .split_whitespace()
-            .any(|word| word.trim_end_matches("=<arg>") == *flag)
-    }) || !help.contains(&format!(" {depth}"))
-    {
-        return Err(format!(
-            "The installed {} must advertise timed IVF input/output, the selected Y4M or raw-I420 input controls, {depth}-bit coding, bounded rate control, color signaling, and the selected lossless capability.",
-            encoder.name()
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,27 +175,6 @@ mod tests {
             Plan::build(&document, &[&document.streams[0]], &settings).unwrap(),
             settings,
         )
-    }
-
-    #[test]
-    fn capability_check_requires_lossless_and_depth_when_selected() {
-        let common = "--ivf --output=<arg> --passes=<arg> --pass=<arg> --fpf=<arg> --end-usage=<arg> --target-bitrate=<arg> --cq-level=<arg> --cpu-used=<arg> --row-mt=<arg> --profile=<arg> --bit-depth=<arg> 8, 10 --input-bit-depth=<arg> --fps=<arg> --disable-warning-prompt";
-        let aom = format!(
-            "{common} --lossless=<arg> --color-primaries=<arg> --transfer-characteristics=<arg> --matrix-coefficients=<arg> --chroma-sample-position=<arg> --i420 --width=<arg> --height=<arg>"
-        );
-        assert!(validate_help(&aom, VideoEncoder::AomAv1, 10, true, "yuv420p10le").is_ok());
-        assert!(
-            validate_help(
-                &aom.replace("--lossless=<arg>", ""),
-                VideoEncoder::AomAv1,
-                10,
-                true,
-                "yuv420p10le"
-            )
-            .is_err()
-        );
-        let vpx = format!("{common} --codec=<arg> --color-space=<arg>");
-        assert!(validate_help(&vpx, VideoEncoder::VpxStandalone, 8, false, "yuv420p").is_ok());
     }
 
     #[test]

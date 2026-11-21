@@ -1,7 +1,6 @@
 //! Explicit temporal processing preserves source time. BWDIF, QTGMC and inverse
 //! telecine have distinct dependency and cadence contracts.
 use super::{Frame, Plan};
-use crate::jobs::metadata;
 use media_core::{
     AppError, CadenceRepairKind, DeinterlaceMode, EncodeSettings, FieldOrder, FrameRate,
     TemporalSettings,
@@ -531,20 +530,6 @@ impl Plan {
         } else {
             "An interlaced source frame requires explicit BWDIF/YADIF deinterlacing and the matching source field order."
         }))
-    }
-    pub fn temporal_document(&self, mut document: metadata::Document) -> metadata::Document {
-        if let Some(frames) = self
-            .temporal
-            .as_ref()
-            .and_then(|transform| transform.frames)
-            && let Some(video) = document
-                .streams
-                .iter_mut()
-                .find(|stream| stream.index == self.video_index)
-        {
-            video.duration = Some((frames as f64 * self.frame_seconds()).to_string());
-        }
-        document
     }
 }
 

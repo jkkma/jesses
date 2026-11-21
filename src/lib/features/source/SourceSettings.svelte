@@ -172,16 +172,6 @@
       onchange={(e) => void savePatch({ mp4Faststart: e.currentTarget.checked })}
     /> Web-optimize MP4 output (+faststart)</label
   >
-  <label
-    class="check"
-    title="Off: The finished output is checked for readable video and the planned streams. Trims, frame-specific metadata and resumed jobs can require extra preparation. An interrupted job restarts, except AV1AN can resume saved chunks. On: codec tests, source and tool fingerprints, and complete frame and track comparisons are also performed."
-    ><input
-      type="checkbox"
-      checked={saved.fullOutputVerification ?? false}
-      disabled={!isDesktop()}
-      onchange={(e) => void savePatch({ fullOutputVerification: e.currentTarget.checked })}
-    /> Thorough verification (slower)</label
-  >
   <label class="check"
     ><input
       type="checkbox"

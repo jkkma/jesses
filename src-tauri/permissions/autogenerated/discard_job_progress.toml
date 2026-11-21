@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discard-job-progress"
+description = "Enables the discard_job_progress command without any pre-configured scope."
+commands.allow = ["discard_job_progress"]
+
+[[permission]]
+identifier = "deny-discard-job-progress"
+description = "Denies the discard_job_progress command without any pre-configured scope."
+commands.deny = ["discard_job_progress"]

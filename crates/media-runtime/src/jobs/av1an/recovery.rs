@@ -86,6 +86,18 @@ struct Stamp {
     sha256: String,
 }
 
+impl Stamp {
+    fn require_contents(&self) -> Result<(), AppError> {
+        if self.sha256.starts_with("metadata-v1:") {
+            return Err(error(
+                &self.path,
+                "This saved AV1AN job recorded source metadata without a content fingerprint. Start a new encode to use the current source. The saved workspace is still available for explicit deletion.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LaunchArtifact {
     path: PathBuf,
@@ -192,9 +204,8 @@ fn source_stamp(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<S
         path: path.to_owned(),
         identity: file_identity(guard.file()).map_err(|e| error(path, e.to_string()))?,
         length: metadata.len(),
-        // Versioned separately from the legacy full-content SHA-256 receipt.
-        // Normal jobs use file identity, size and modification time, like a
-        // media application; explicit thorough verification keeps full hashes.
+        // Metadata-only stamps are read for legacy workspaces, but cannot
+        // authorize AV1AN reuse of an original source.
         sha256: format!("metadata-v1:{}", modified.as_nanos()),
     };
     guard.verify()?;
@@ -750,6 +761,31 @@ fn settings_digest(settings: &EncodeSettings) -> Result<String, AppError> {
         .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
         .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))
 }
+
+fn settings_match_digest(settings: &EncodeSettings, expected: &str) -> Result<bool, AppError> {
+    if settings_digest(settings)? == expected {
+        return Ok(true);
+    }
+    let Some(preferences) = settings.encoding_preferences else {
+        return Ok(false);
+    };
+    // Older pending cut transactions hashed the same serialized settings with
+    // the retired boolean appended to the first (encoding preferences) field.
+    // Either boolean has the same meaning now. Every other setting stays bound.
+    let json = serde_json::to_string(settings)
+        .map_err(|cause| AppError::new("RECOVERY_INVALID", cause.to_string(), None))?;
+    let old_suffix_position = format!(
+        "{{\"encodingPreferences\":{{\"keyframeIntervalSeconds\":{},\"mp4Faststart\":{}",
+        preferences.keyframe_interval_seconds, preferences.mp4_faststart,
+    );
+    let Some(suffix) = json.strip_prefix(&old_suffix_position) else {
+        return Ok(false);
+    };
+    Ok([false, true].into_iter().any(|flag| {
+        let legacy = format!("{old_suffix_position},\"fullOutputVerification\":{flag}{suffix}");
+        format!("{:x}", Sha256::digest(legacy)) == expected
+    }))
+}
 fn verify_source_cut_original(
     manifest: &Manifest,
     cancel: Option<&watch::Receiver<bool>>,
@@ -761,6 +797,24 @@ fn verify_source_cut_original(
             &original.path,
             "The immutable original file changed; a copied-input job cannot adopt or resume this source.",
         ));
+    }
+    Ok(())
+}
+
+fn require_resumable_sources(manifest: &Manifest) -> Result<(), AppError> {
+    manifest.source.require_contents()?;
+    for original in manifest
+        .original_source
+        .iter()
+        .chain(&manifest.source_cut_original)
+    {
+        original.require_contents()?;
+    }
+    if let Some(recipe) = &manifest.queue_recipe {
+        recipe.source.require_contents()?;
+        if let Some(original) = &recipe.original_source {
+            original.require_contents()?;
+        }
     }
     Ok(())
 }
@@ -1237,7 +1291,6 @@ struct Workspace {
     // durable manifest use the cadence independently proven by every timestamp.
     // Recompute this declaration from the immutable source on every attempt.
     source_rate: (u32, u32),
-    segments_verified: bool,
     // Protect tools from modification during the resumed job on Windows.
     _tools: Vec<Source>,
     // Keep the exact source admitted into av1an immutable for the whole run.
@@ -1738,10 +1791,8 @@ impl Workspace {
             check_cancel(cancel)?;
         }
         if let Some(recipe) = &self.manifest.queue_recipe {
-            for stamp in recipe.tools.iter().chain(std::iter::once(
-                recipe.original_source.as_ref().unwrap_or(&recipe.source),
-            )) {
-                if restamp(stamp, cancel)? != *stamp {
+            for stamp in &recipe.tools {
+                if digest(&stamp.path, cancel)? != *stamp {
                     return Err(error(
                         &stamp.path,
                         "An immutable source queue resource changed.",
@@ -1790,8 +1841,27 @@ impl Workspace {
         Ok(())
     }
 
+    fn verify_queue_source(
+        &self,
+        checked: Option<&Stamp>,
+        cancel: Option<&watch::Receiver<bool>>,
+    ) -> Result<(), AppError> {
+        if let Some(recipe) = &self.manifest.queue_recipe {
+            let expected = recipe.original_source.as_ref().unwrap_or(&recipe.source);
+            expected.require_contents()?;
+            if Some(expected) != checked && digest(&expected.path, cancel)? != *expected {
+                return Err(error(
+                    &expected.path,
+                    "The frozen source queue input changed.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn verify_source_seal(&self, cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
         self.verify_owner()?;
+        self.verify_queue_source(None, Some(cancel))?;
         self.verify_saved(Some(cancel))?;
         if self.manifest.queue_recipe.is_none() {
             for tool in &self.manifest.tools {
@@ -2680,13 +2750,15 @@ impl OwnedRecovery {
         if current != manifest {
             return Err(error(&root, "Recovery changed while acquiring ownership."));
         }
+        if require_source {
+            require_resumable_sources(&manifest)?;
+        }
         sweep_interrupted_writes(&root)?;
         verify_action_tree(&root, &manifest)?;
         let workspace = Workspace {
             root,
             source_rate: (manifest.fps_num, manifest.fps_den),
             manifest,
-            segments_verified: false,
             _tools: vec![],
             _source: None,
             chunks: vec![],
@@ -2711,12 +2783,13 @@ impl OwnedRecovery {
                 .original_source
                 .as_ref()
                 .unwrap_or(&workspace.manifest.source);
-            if restamp(original, None)? != *original {
+            if digest(&original.path, None)? != *original {
                 return Err(error(
                     &original.path,
                     "The original source changed; resume is unavailable.",
                 ));
             }
+            workspace.verify_queue_source(Some(original), None)?;
             if (workspace.manifest.prepared_identity.is_some()
                 || workspace.manifest.source_cut_slot)
                 && workspace.manifest.source_slot_write.is_none()
@@ -3086,9 +3159,7 @@ impl Recovery {
                     "The completed chunk receipts do not cover the frozen source queue.",
                 ));
             }
-            let reason = if super::super::encode::thorough_verification(&manifest.settings) {
-                Some("Thorough verification is enabled.")
-            } else if requires_clock {
+            let reason = if requires_clock {
                 Some("The original Dolby Vision base-layer clock needs decoded timing verification.")
             } else if recipe.ignore_frame_mismatch
                 || super::options::source_resamples(&manifest.settings, workspace.source_rate)
@@ -3174,14 +3245,8 @@ impl Recovery {
     pub(in crate::jobs) async fn commit_source_cut_recipe(&self) -> Result<(), AppError> {
         self.with(|workspace| {
             workspace.transaction(|workspace| {
-                if workspace
-                    .manifest
-                    .source_cut_rebind_pending
-                    .as_ref()
-                    .is_some_and(|authorized| {
-                        settings_digest(&workspace.manifest.settings).as_ref().ok()
-                            != Some(authorized)
-                    })
+                if let Some(authorized) = &workspace.manifest.source_cut_rebind_pending
+                    && !settings_match_digest(&workspace.manifest.settings, authorized)?
                 {
                     return Err(error(
                         &workspace.root,
@@ -3314,6 +3379,7 @@ impl Recovery {
             if saved_original.path != source {
                 return None;
             }
+            require_resumable_sources(&manifest).ok()?;
             if restamp(saved_original, Some(&cancel)).ok().as_ref() != Some(saved_original) {
                 return None;
             }
@@ -3384,29 +3450,22 @@ impl Recovery {
             };
         let (recovery, intermediate, input, legacy_svt_parameters) = tokio::task::spawn_blocking(move || {
             let previous = locator.as_ref().map(|locator| load(&id, &request, &settings, locator)).transpose()?;
-            let saved_source = previous.as_ref().map(|(_, manifest)| manifest.original_source.as_ref().unwrap_or(&manifest.source));
-            let original_source = if let Some(saved) = saved_source.filter(|saved| saved.path == source) {
-                restamp(saved, Some(&cancel))?
-            } else if super::super::encode::thorough_verification(&settings) || is_source_cut(&settings) {
-                digest(&source, Some(&cancel))?
-            } else {
-                source_stamp(&source, Some(&cancel))?
-            };
+            if let Some((_, manifest)) = &previous {
+                require_resumable_sources(manifest)?;
+            }
+            let original_guard = Source::open(&source)?;
+            let original_source = digest(&source, Some(&cancel))?;
+            original_guard.verify()?;
+            if let Some((_, manifest)) = &previous {
+                let saved = manifest.original_source.as_ref().unwrap_or(&manifest.source);
+                if saved.path == source && saved != &original_source {
+                    return Err(error(&source, "The original source changed; resume is unavailable."));
+                }
+            }
             let source_cut_original = if is_source_cut(&settings)
                 && !super::super::source_normalization::exists(&id, &request)?
             {
-                let original_path = Path::new(&request.input_path);
-                let saved_cut_original = previous
-                    .as_ref()
-                    .and_then(|(_, manifest)| manifest.source_cut_original.as_ref())
-                    .filter(|saved| saved.path == original_path);
-                Some(if let Some(saved) = saved_cut_original {
-                    restamp(saved, Some(&cancel))?
-                } else if super::super::encode::thorough_verification(&settings) {
-                    digest(original_path, Some(&cancel))?
-                } else {
-                    source_stamp(original_path, Some(&cancel))?
-                })
+                Some(digest(Path::new(&request.input_path), Some(&cancel))?)
             } else {
                 None
             };
@@ -3433,7 +3492,7 @@ impl Recovery {
                     }
                 }
                 if manifest.restart_pending&&source_workflow(&settings)&&manifest.queue_recipe.is_some() {
-                    if manifest.source_cut_rebind_pending.as_ref()!=Some(&settings_digest(&settings)?) {
+                    if !settings_match_digest(&settings, manifest.source_cut_rebind_pending.as_deref().unwrap_or_default())? {
                         return Err(error(&root,"The retained source queue is not authorized for these exact new settings."));
                     }
                     verify_source_cut_original(&manifest,Some(&cancel))?;
@@ -3462,7 +3521,7 @@ impl Recovery {
                     }
                     manifest.settings=settings.clone();manifest.previous_settings=None;
                     verify_source_cut_original(&manifest,Some(&cancel))?;
-                    let authorized_cut=if let Some(authorized)=&manifest.source_cut_rebind_pending {if *authorized!=settings_digest(&settings)?{return Err(error(&root,"The pending source-cut replacement is not authorized for these exact new settings."));}true}else{false};
+                    let authorized_cut=if let Some(authorized)=&manifest.source_cut_rebind_pending {if !settings_match_digest(&settings, authorized)?{return Err(error(&root,"The pending source-cut replacement is not authorized for these exact new settings."));}true}else{false};
                     let saved_original = manifest.original_source.as_ref().unwrap_or(&manifest.source);
                     if saved_original != &original_source && !authorized_cut { return Err(error(&root, "The original source changed before new-settings resume.")); }
                     if authorized_cut&&is_source_cut(&settings)&&source_cut_original.is_none(){return Err(error(&root,"The new source-cut reader lacks immutable original authority."));}
@@ -3490,8 +3549,14 @@ impl Recovery {
                 verify_source_cut_original(&manifest,Some(&cancel))?;
                 let source_matches = if source_workflow(&settings)&&manifest.queue_recipe.is_some(){
                     if manifest.source_cut_slot&&is_source_cut(&settings)&&manifest.original_source.as_ref()!=Some(&original_source) {return Err(error(&root,"Saved Settings cannot adopt an arbitrary replacement cut."));}
-                    restamp(&manifest.source,Some(&cancel))?==manifest.source
-                        &&manifest.original_source.as_ref().is_none_or(|source|restamp(source,Some(&cancel)).ok().as_ref()==Some(source))
+                    let same_source = |saved: &Stamp| -> Result<bool, AppError> {
+                        if saved.path == original_source.path {
+                            Ok(saved == &original_source)
+                        } else {
+                            Ok(digest(&saved.path, Some(&cancel))? == *saved)
+                        }
+                    };
+                    same_source(&manifest.source)? && manifest.original_source.as_ref().map_or(Ok(true), same_source)?
                 }else{source_matches_attempt(
                     &manifest,
                     &root,
@@ -3533,13 +3598,13 @@ impl Recovery {
                     if let Some(prepared) = &prepared {
                         (
                             copy_prepared(&prepared.path, &root.join("prepared.mkv"), &cancel)?,
-                            Some(original_source),
+                            Some(original_source.clone()),
                             Some(prepared.decoded_identity.clone()),
                         )
                     } else if source_cut_slot {
-                        (copy_prepared(&source,&cut_slot(&root,&source),&cancel)?,Some(original_source),None)
+                        (copy_prepared(&source,&cut_slot(&root,&source),&cancel)?,Some(original_source.clone()),None)
                     } else {
-                        (original_source, None, None)
+                        (original_source.clone(), None, None)
                     };
                 let manifest = Manifest {
                     edited_command: None,
@@ -3590,7 +3655,7 @@ impl Recovery {
             };
             manifest.last_run_at=epoch_milliseconds();
             let input = manifest.source.path.clone();
-            let source_guard = Source::open(&input)?;
+            let source_guard = if input == source { original_guard } else { Source::open(&input)? };
             let (directory_guard, lock) = match preparation_lock {Some(owned)=>owned,None=>lock_workspace(&root)?};
             let chunk_guards = manifest
                 .completed
@@ -3610,7 +3675,6 @@ impl Recovery {
                 } else {
                     source_rate
                 },
-                segments_verified: false,
                 _tools: tool_guards,
                 _source: Some(source_guard),
                 chunks: chunk_guards,
@@ -3619,6 +3683,7 @@ impl Recovery {
             };
             workspace.verify_owner()?;
             workspace.verify_saved(Some(&cancel))?;
+            workspace.verify_queue_source(Some(&original_source), Some(&cancel))?;
             if resuming {
                 sweep_interrupted_writes(&workspace.root)?;
             }
@@ -3824,142 +3889,6 @@ impl Recovery {
         self.with(|workspace| workspace.transaction(|workspace| workspace.seal_target_artifacts()))
             .await
     }
-    /// Hybrid and Segment create copied source segments. Fingerprint/lock each file at its
-    /// first checkpoint, and independently compare their complete decoded pixel
-    /// sequence to the source before reuse or publication. No size/count-only
-    /// receipt is accepted as evidence that a segment contains the right frames.
-    pub(in crate::jobs) async fn verify_segments(
-        &self,
-        ffmpeg: &Path,
-        input: &Path,
-        cancel: &watch::Receiver<bool>,
-    ) -> Result<(), AppError> {
-        let queue_source = self
-            .with(|workspace| {
-                Ok(workspace.manifest.queue_recipe.as_ref().map(|recipe| {
-                    recipe
-                        .original_source
-                        .as_ref()
-                        .unwrap_or(&recipe.source)
-                        .path
-                        .clone()
-                }))
-            })
-            .await?;
-        let input = queue_source.as_deref().unwrap_or(input);
-        let segments = self
-            .with(|w| {
-                for guard in &w.chunks {
-                    guard.verify()?;
-                }
-                Ok(if w.segments_verified {
-                    Vec::new()
-                } else {
-                    w.manifest.segments.clone()
-                })
-            })
-            .await?;
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let list = self.root.join("segments.ffconcat");
-        let text = segment_list_text(&self.root, &segments)?;
-        match OpenOptions::new().write(true).create_new(true).open(&list) {
-            Ok(mut file) => {
-                file.write_all(text.as_bytes())
-                    .map_err(|e| error(&list, e.to_string()))?;
-                file.sync_all().map_err(|e| error(&list, e.to_string()))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if bytes(&list)? != text.as_bytes() {
-                    return Err(error(&list, "Source segment verification list changed."));
-                }
-            }
-            Err(e) => return Err(error(&list, e.to_string())),
-        }
-        let list_guard = Source::open(&list)?;
-        let mut hashes = Vec::new();
-        for concatenated in [false, true] {
-            let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-threads", "2"]
-                .into_iter()
-                .map(Into::into)
-                .collect();
-            if concatenated {
-                args.extend(["-f".into(), "concat".into(), "-safe".into(), "1".into()]);
-            }
-            args.extend([
-                "-i".into(),
-                if concatenated {
-                    OsString::from("segments.ffconcat")
-                } else {
-                    input.as_os_str().to_owned()
-                },
-            ]);
-            args.extend(
-                [
-                    "-map",
-                    "0:V:0",
-                    "-an",
-                    "-sn",
-                    "-dn",
-                    "-fps_mode",
-                    "passthrough",
-                    "-pix_fmt",
-                    "yuv420p10le",
-                    "-f",
-                    "hash",
-                    "-hash",
-                    "sha256",
-                    "-",
-                ]
-                .into_iter()
-                .map(Into::into),
-            );
-            let result = supervisor::run_capture(
-                &CommandSpec {
-                    executable: ffmpeg.to_owned(),
-                    args,
-                    cwd: Some(self.root.clone()),
-                },
-                cancel.clone(),
-                64 * 1024,
-                Duration::from_secs(24 * 60 * 60),
-            )
-            .await
-            .map_err(|e| process_error(e, input))?;
-            let hash = String::from_utf8_lossy(&result.stdout).trim().to_owned();
-            if !result.status.success()
-                || !hash.strip_prefix("SHA256=").is_some_and(|value| {
-                    value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
-                })
-            {
-                return Err(error(
-                    input,
-                    format!(
-                        "Source segment identity decode failed: {}",
-                        String::from_utf8_lossy(&result.stderr)
-                    ),
-                ));
-            }
-            hashes.push(hash);
-        }
-        list_guard.verify()?;
-        if hashes[0] != hashes[1] {
-            return Err(error(
-                input,
-                "Source segments changed, reordered, omitted, or duplicated decoded source frames.",
-            ));
-        }
-        self.with(|w| {
-            for guard in &w.chunks {
-                guard.verify()?;
-            }
-            w.segments_verified = true;
-            Ok(())
-        })
-        .await
-    }
-
     pub(in crate::jobs) async fn version(&self, version: String) -> Result<(), AppError> {
         self.with(move |w| {
             w.transaction(|w| {
@@ -4590,7 +4519,6 @@ mod tests {
                 root,
                 manifest,
                 source_rate: (24, 1),
-                segments_verified: false,
                 _tools: vec![],
                 _source: Some(Source::open(&source).unwrap()),
                 chunks: vec![],
@@ -4608,30 +4536,92 @@ mod tests {
     }
 
     #[test]
-    fn normal_source_identity_skips_media_reads_and_detects_changes() {
+    fn resume_rejects_same_size_edit_with_original_modification_time() {
         let fixture = Fixture::new();
-        let source = fixture.0.join("large-source.mkv");
-        let file = File::create(&source).unwrap();
-        file.set_len(32 * 1024 * 1024).unwrap();
-        drop(file);
-        COUNT_SOURCE_HASHES.with(|counter| *counter.borrow_mut() = Some((source.clone(), 0)));
+        let (workspace, intermediate) = fixture.workspace();
+        let source = workspace.manifest.source.path.clone();
+        let snapshot = saved_snapshot(
+            &workspace.manifest.request,
+            &workspace.manifest.settings,
+            &workspace.summary(),
+        );
+        let manifest_path = workspace.root.join("manifest.json");
+        let manifest = fs::read(&manifest_path).unwrap();
         let before = source_stamp(&source, None).unwrap();
-        let reads = COUNT_SOURCE_HASHES.with(|counter| counter.borrow_mut().take().unwrap().1);
-        assert_eq!(reads, 0, "normal startup must not hash the entire video");
-        assert_eq!(source_stamp(&source, None).unwrap(), before);
-        let legacy = digest(&source, None).unwrap();
-        assert_eq!(restamp(&legacy, None).unwrap(), legacy);
+        let modified = fs::metadata(&source).unwrap().modified().unwrap();
+        drop(intermediate);
+        drop(workspace);
+        OwnedRecovery::open(&snapshot, true).unwrap();
         let mut writer = OpenOptions::new().write(true).open(&source).unwrap();
         writer.write_all(b"changed").unwrap();
         writer
-            .set_times(
-                std::fs::FileTimes::new()
-                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1234)),
-            )
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
         drop(writer);
-        assert_ne!(source_stamp(&source, None).unwrap(), before);
-        assert_ne!(restamp(&legacy, None).unwrap(), legacy);
+        assert_eq!(source_stamp(&source, None).unwrap(), before);
+        let Err(cause) = OwnedRecovery::open(&snapshot, true) else {
+            panic!("an edit must not authorize reuse");
+        };
+        assert_eq!(cause.code, "RECOVERY_INVALID");
+        assert!(cause.message.contains("original source changed"));
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+        OwnedRecovery::open(&snapshot, false).unwrap();
+    }
+
+    #[test]
+    fn legacy_metadata_only_jobs_remain_discoverable_and_deletable_but_cannot_resume() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let source = workspace.manifest.source.path.clone();
+        workspace.manifest.source = source_stamp(&source, None).unwrap();
+        workspace.save().unwrap();
+        let snapshot = saved_snapshot(
+            &workspace.manifest.request,
+            &workspace.manifest.settings,
+            &workspace.summary(),
+        );
+        let root = workspace.root.clone();
+        let manifest_path = root.join("manifest.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        drop(intermediate);
+        drop(workspace);
+        let Err(cause) = OwnedRecovery::open(&snapshot, true) else {
+            panic!("metadata alone must not authorize resume");
+        };
+        assert!(cause.message.contains("Start a new encode"));
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+        let moved = fixture.0.join("moved.mkv");
+        fs::rename(&source, &moved).unwrap();
+        OwnedRecovery::open(&snapshot, false)
+            .unwrap()
+            .discard()
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(moved).unwrap(), b"source bytes");
+    }
+
+    #[test]
+    fn pending_settings_digest_accepts_the_removed_verification_field_only() {
+        let settings = EncodeSettings {
+            encoding_preferences: Some((&media_core::GeneralPreferences::default()).into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        for flag in [false, true] {
+            let old = json.replacen(
+                "\"mp4Faststart\":true}",
+                &format!("\"mp4Faststart\":true,\"fullOutputVerification\":{flag}}}"),
+                1,
+            );
+            assert_ne!(old, json);
+            let expected = format!("{:x}", Sha256::digest(old));
+            assert!(settings_match_digest(&settings, &expected).unwrap());
+            let changed = EncodeSettings {
+                crf: settings.crf + 1,
+                ..settings.clone()
+            };
+            assert!(!settings_match_digest(&changed, &expected).unwrap());
+        }
     }
 
     fn frozen_source_recipe(workspace: &Workspace, ignore_frame_mismatch: bool) -> QueueRecipe {
@@ -6561,7 +6551,7 @@ mod tests {
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 1,
                     mp4_faststart: false,
-                    full_output_verification: false,
+                    retired_verification: (),
                 }),
                 av1an_options: Some(media_core::Av1anOptions {
                     encoder_threads: Some(4),

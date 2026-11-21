@@ -6,8 +6,7 @@ when the configured executable has the wrong identity. x264 and x265 write raw
 chunks and require mkvmerge to make a timed video intermediate. vpxenc also
 uses mkvmerge to assign exact rational timing to its VP9 chunks. SVT and AOM
 use IVF with FFmpeg concatenation by default. The final mux retains selected
-tracks and checks the finished frame and stream counts. Thorough verification
-adds complete frame, timing, color, audio, and metadata checks.
+tracks and checks the finished file for readable video and the planned streams.
 
 Normal AV1AN startup uses stream headers and a bounded first-frame inspection,
 without a separate whole-video packet or decoded-frame scan. Header frame counts
@@ -17,13 +16,9 @@ count for recovery, progress and final output checks. Exact-boundary operations
 planning they need. Missing duration/count metadata also falls back to packet
 planning.
 
-Fresh normal jobs identify the original source by file identity, size and
-modification time instead of reading the entire file for SHA-256. This detects
-ordinary edits/replacements, not content changes that deliberately preserve all
-those attributes. Thorough jobs and older recovery receipts retain their full
-source hashes; completed chunks and tool receipts retain full content checks.
-Normal startup skips separate encoder/metric smoke tests and lets the actual
-encode report unsupported options or missing runtime dependencies.
+Resumable AV1AN jobs bind the source and completed chunks to SHA-256 content
+receipts. The actual encode reports unsupported options or missing runtime
+dependencies.
 
 The av1an controls include encoder threads (0 asks the encoder to choose),
 1–10 chunk attempts, FFmpeg or mkvmerge concatenation where supported, and
@@ -47,9 +42,8 @@ accepted as advanced overrides. Scaling and pixel conversion use the verified
 FFmpeg preparation path.
 
 Scene detection can divide a sufficiently long L-SMASH source into 2–16
-parallel slices before encoding, on default jobs and with Thorough verification
-alike. Each slice needs at least 1,200 frames. A default job plans its length
-from the file headers, so the slices tile the frame count of the L-SMASH index
+parallel slices before encoding. Each slice needs at least 1,200 frames. When
+planning uses the file headers, the slices tile the frame count of the L-SMASH index
 that the prepass builds and av1an then reuses; a counted source must match that
 index exactly. Jesses validates and merges the scene lists into av1an's durable
 receipt path; shorter inputs, other readers, resumed jobs and fixed-chunk

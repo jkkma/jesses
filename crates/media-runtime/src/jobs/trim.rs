@@ -445,12 +445,6 @@ impl Prepared {
         Ok(())
     }
 
-    pub fn audio_origin(&self, video_origin: f64) -> f64 {
-        self.source
-            .as_ref()
-            .map_or(video_origin, |source| source.audio_origin(video_origin))
-    }
-
     pub fn copied_indices(&self) -> Vec<u32> {
         self.source
             .as_ref()

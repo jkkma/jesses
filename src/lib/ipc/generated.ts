@@ -196,22 +196,9 @@ export type CrfLadderRung = { crf: number, encodedBytes: string, encodedSeconds:
 
 export type ToolInfo = { id: string, name: string, available: boolean, path: string | null, version: string | null, detail: string | null, };
 
-export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean,
-/**
- * Thorough verification. Off (default), an encode checks that the finished
- * file has readable video and the planned streams. AV1AN can resume saved chunks and still
- * checks timing or retained chunks where needed. On, the source and tools
- * are fingerprinted for resume, every output frame is decoded and every
- * track is re-checked.
- */
-fullOutputVerification?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
+export type GeneralPreferences = { defaultOutputDirectory: string, recursiveImport: boolean, consoleWindow?: ConsoleWindowMode, autoCropSamples?: number, keyframeIntervalSeconds?: number, zeroIndexedStreams?: boolean, mp4Faststart?: boolean, av1anConsoleVisible?: boolean, resetOnNewFile?: ResetOnNewFilePreferences, };
 
-export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean,
-/**
- * Absent in plans saved before this option: those run without thorough
- * verification.
- */
-fullOutputVerification?: boolean, };
+export type EncodingPreferences = { keyframeIntervalSeconds: number, mp4Faststart: boolean, };
 
 export type ConsoleWindowMode = "hidden" | "visible" | "visibleStayOpen";
 

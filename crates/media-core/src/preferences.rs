@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+fn discard_retired_verification<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| ())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ConsoleWindowMode {
@@ -55,13 +61,15 @@ pub struct GeneralPreferences {
     pub zero_indexed_streams: bool,
     #[ts(optional, as = "Option<_>")]
     pub mp4_faststart: bool,
-    /// Thorough verification. Off (default), an encode checks that the finished
-    /// file has readable video and the planned streams. AV1AN can resume saved chunks and still
-    /// checks timing or retained chunks where needed. On, the source and tools
-    /// are fingerprinted for resume, every output frame is decoded and every
-    /// track is re-checked.
-    #[ts(optional, as = "Option<_>")]
-    pub full_output_verification: bool,
+    // Accept the retired setting in saved preferences without retaining its value.
+    #[doc(hidden)]
+    #[serde(
+        rename = "fullOutputVerification",
+        skip_serializing,
+        deserialize_with = "discard_retired_verification"
+    )]
+    #[ts(skip)]
+    pub retired_verification: (),
     #[ts(optional, as = "Option<_>")]
     pub av1an_console_visible: bool,
     #[ts(optional, as = "Option<_>")]
@@ -78,7 +86,7 @@ impl Default for GeneralPreferences {
             keyframe_interval_seconds: 10,
             zero_indexed_streams: false,
             mp4_faststart: true,
-            full_output_verification: false,
+            retired_verification: (),
             av1an_console_visible: true,
             reset_on_new_file: ResetOnNewFilePreferences::default(),
         }
@@ -91,11 +99,16 @@ impl Default for GeneralPreferences {
 pub struct EncodingPreferences {
     pub keyframe_interval_seconds: u16,
     pub mp4_faststart: bool,
-    /// Absent in plans saved before this option: those run without thorough
-    /// verification.
-    #[serde(default)]
-    #[ts(optional, as = "Option<_>")]
-    pub full_output_verification: bool,
+    // Older saved jobs and recovery manifests include the retired setting.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        rename = "fullOutputVerification",
+        skip_serializing,
+        deserialize_with = "discard_retired_verification"
+    )]
+    #[ts(skip)]
+    pub retired_verification: (),
 }
 
 impl From<&GeneralPreferences> for EncodingPreferences {
@@ -103,7 +116,7 @@ impl From<&GeneralPreferences> for EncodingPreferences {
         Self {
             keyframe_interval_seconds: value.keyframe_interval_seconds,
             mp4_faststart: value.mp4_faststart,
-            full_output_verification: value.full_output_verification,
+            retired_verification: (),
         }
     }
 }
@@ -138,4 +151,35 @@ pub struct PreferenceImportPreview {
     pub accepted_keys: Vec<String>,
     pub ignored_key_count: u32,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_retired_verification_from_saved_preferences_and_jobs() {
+        let general: GeneralPreferences = serde_json::from_value(serde_json::json!({
+            "fullOutputVerification": true,
+            "mp4Faststart": false,
+        }))
+        .unwrap();
+        assert!(!general.mp4_faststart);
+        let value = serde_json::to_value(&general).unwrap();
+        assert!(value.get("fullOutputVerification").is_none());
+
+        let settings: EncodingPreferences = serde_json::from_value(serde_json::json!({
+            "keyframeIntervalSeconds": 3,
+            "mp4Faststart": false,
+            "fullOutputVerification": true,
+        }))
+        .unwrap();
+        assert_eq!(settings.keyframe_interval_seconds, 3);
+        assert!(!settings.mp4_faststart);
+        let value = serde_json::to_value(settings).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"keyframeIntervalSeconds": 3, "mp4Faststart": false})
+        );
+    }
 }

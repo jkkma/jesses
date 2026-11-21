@@ -819,17 +819,11 @@ async fn bounded_authored_audio_timestamp_jitter_uses_sample_clock_without_sampl
         "fixture must exercise authored quantization beyond2ms: {residual}"
     );
     let manager = JobManager::new(fixture.0.join("logs"));
-    let mut jittered_request = request(
+    let jittered_request = request(
         &jittered,
         &destination,
         vec![track(1, AudioCodec::Opus, AudioChannels::Preserve)],
     );
-    // The source continuity evidence comes from thorough verification.
-    jittered_request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
-        keyframe_interval_seconds: 10,
-        mp4_faststart: true,
-        full_output_verification: true,
-    });
     let started = manager.start_encode(jittered_request).await.unwrap();
     let completed = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
     manager.shutdown().await;
@@ -837,12 +831,6 @@ async fn bounded_authored_audio_timestamp_jitter_uses_sample_clock_without_sampl
     let decoded = decoded_timeline(&destination, 3).await;
     assert!((decoded.0 - start).abs() <= 0.002);
     assert!((decoded.1 as f64 - samples as f64 * 48000.0 / 44100.0).abs() <= 2.0);
-    assert!(
-        completed
-            .logs
-            .iter()
-            .any(|line| line.contains("Source continuity bound"))
-    );
 }
 
 #[tokio::test]

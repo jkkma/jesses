@@ -114,83 +114,6 @@ pub(super) fn validate_plugin(
     Ok(())
 }
 
-pub(super) async fn check(
-    ffmpeg: &Path,
-    environment: &supervisor::ChildEnvironment,
-    work: &Path,
-    target: Av1anTargetQuality,
-    cancel: &watch::Receiver<bool>,
-) -> Result<(), AppError> {
-    if needs_vapoursynth(target) {
-        return check_vapoursynth(environment, work, target.metric, cancel).await;
-    }
-    let (graph, marker) = if target.metric == Av1anTargetMetric::Vmaf {
-        (
-            "testsrc2=s=192x128:r=24,format=yuv420p10le,split=2[reference][distorted];[distorted][reference]libvmaf=model=version=vmaf_v0.6.1:n_threads=2",
-            "VMAF score:",
-        )
-    } else {
-        (
-            "testsrc2=s=192x128:r=24,format=yuv420p10le,split=2[reference][a];[a]noise=alls=2:allf=t[distorted];[distorted][reference]xpsnr",
-            "XPSNR  y:",
-        )
-    };
-    let result = supervisor::run_capture_with_environment(
-        &CommandSpec {
-            executable: ffmpeg.to_owned(),
-            args: [
-                "-v",
-                "info",
-                "-nostdin",
-                "-f",
-                "lavfi",
-                "-i",
-                graph,
-                "-frames:v",
-                "2",
-                "-f",
-                "null",
-                "-",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-            cwd: Some(work.to_owned()),
-        },
-        cancel.clone(),
-        128 * 1024,
-        Duration::from_secs(30),
-        Some(environment),
-    )
-    .await
-    .map_err(|e| process_error(e, ffmpeg))?;
-    let diagnostic = String::from_utf8_lossy(&result.stderr);
-    if !result.status.success() || !diagnostic.contains(marker) {
-        return Err(dependency_error(target.metric, &diagnostic, ffmpeg));
-    }
-    Ok(())
-}
-
-fn dependency_error(metric: Av1anTargetMetric, diagnostic: &str, executable: &Path) -> AppError {
-    files::error(
-        "AV1AN_DEPENDENCY_MISSING",
-        format!(
-            "The actual {} scorer check failed. Install the matching working filter/plugin in the selected tool environment. {}",
-            label(metric),
-            diagnostic
-                .lines()
-                .rev()
-                .take(8)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-        executable,
-    )
-}
-
 // The program is fixed application code; only validated probe dimensions and
 // the pinned optional plugin path enter it.
 fn script_prefix(width: u16, height: u16) -> String {
@@ -203,10 +126,6 @@ reference = core.std.SetFrameProps(reference, _Matrix=1, _Transfer=1, _Primaries
 distorted = core.std.BlankClip(reference, color=[264, 520, 520])
 "
     )
-}
-
-fn script(metric: Av1anTargetMetric) -> String {
-    script_with_plugin(metric, None, 192, 128)
 }
 
 fn script_with_plugin(
@@ -467,61 +386,6 @@ impl Drop for Script {
     }
 }
 
-async fn check_vapoursynth(
-    environment: &supervisor::ChildEnvironment,
-    work: &Path,
-    metric: Av1anTargetMetric,
-    cancel: &watch::Receiver<bool>,
-) -> Result<(), AppError> {
-    let name = if cfg!(windows) {
-        "vspipe.exe"
-    } else {
-        "vspipe"
-    };
-    let executable = environment
-        .path
-        .as_ref()
-        .and_then(|path| {
-            std::env::split_paths(path)
-                .map(|directory| directory.join(name))
-                .find(|path| path.is_file())
-        })
-        .ok_or_else(|| {
-            dependency_error(
-                metric,
-                "VSPipe is missing from the selected av1an child PATH.",
-                work,
-            )
-        })?;
-    let script = Script::create("metric-check", &script(metric))?;
-    let result = supervisor::run_capture_with_environment(
-        &CommandSpec {
-            executable: executable.clone(),
-            args: vec![
-                "--info".into(),
-                script.path.as_os_str().to_owned(),
-                "-".into(),
-            ],
-            cwd: Some(work.to_owned()),
-        },
-        cancel.clone(),
-        128 * 1024,
-        Duration::from_secs(45),
-        Some(environment),
-    )
-    .await
-    .map_err(|e| process_error(e, &executable))?;
-    let diagnostic = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-    if !result.status.success() || !diagnostic.contains("JESSES_SCORER_OK") {
-        return Err(dependency_error(metric, &diagnostic, &executable));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +404,7 @@ mod tests {
             assert!(gpu.contains("assert hasattr(core, 'vship')"));
             assert!(gpu.contains("JESSES_SCORER_OK"));
         }
-        let cpu = script(Av1anTargetMetric::Ssimulacra2);
+        let cpu = script_with_plugin(Av1anTargetMetric::Ssimulacra2, None, 192, 128);
         assert!(cpu.contains("BlankClip(width=192, height=128"));
         assert!(!cpu.contains("LoadPlugin"));
     }
@@ -553,35 +417,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "print('probe')\n");
         drop(script);
         assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn a_failed_scorer_check_leaves_nothing_in_the_recovery_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "jesses-metric-probe-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let (tools, work) = (root.join("tools"), root.join("work"));
-        std::fs::create_dir_all(&tools).unwrap();
-        std::fs::create_dir(&work).unwrap();
-        // An empty file is found as VSPipe and then fails to start.
-        std::fs::write(
-            tools.join(if cfg!(windows) {
-                "vspipe.exe"
-            } else {
-                "vspipe"
-            }),
-            b"",
-        )
-        .unwrap();
-        let environment = supervisor::ChildEnvironment::with_path(tools.as_os_str());
-        let (_owner, cancel) = watch::channel(false);
-        let checked =
-            check_vapoursynth(&environment, &work, Av1anTargetMetric::Ssimulacra2, &cancel).await;
-        assert!(checked.is_err());
-        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -787,9 +622,15 @@ mod tests {
             .unwrap()
             .probing_rate = 2;
         assert!(options::validate_settings(&settings).is_err());
-        assert!(script(Av1anTargetMetric::Butteraugli).contains("core.julek.Butteraugli("));
+        assert!(
+            script_with_plugin(Av1anTargetMetric::Butteraugli, None, 192, 128)
+                .contains("core.julek.Butteraugli(")
+        );
         assert_eq!(cli(Av1anTargetMetric::XpsnrWeighted), "xpsnr-weighted");
         assert_eq!(receipt(Av1anTargetMetric::XpsnrWeighted), "XPSNRWeighted");
-        assert!(script(Av1anTargetMetric::XpsnrWeighted).contains("core.vszip.XPSNR("));
+        assert!(
+            script_with_plugin(Av1anTargetMetric::XpsnrWeighted, None, 192, 128)
+                .contains("core.vszip.XPSNR(")
+        );
     }
 }

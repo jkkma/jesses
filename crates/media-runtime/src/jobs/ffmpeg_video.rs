@@ -89,18 +89,23 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     // the installed encoder cannot produce the source's validated bit depth.
     let encoder_format = output_format(plan);
     args.push(format!("+{encoder_format}").into());
+    // Filtered Y4M already carries the processed SAR. Rawvideo has no header.
+    let sar_filter = if alpha || !settings.source_filters {
+        format!("setsar={}:max=65535,", plan.output_sar().replace(':', "/"))
+    } else {
+        String::new()
+    };
     args.extend([
         // Y4M carries pixel depth/range but not all colorimetry. Reattach the
         // validated tags without transforming samples or allowing auto-scale.
         "-vf".into(),
         format!(
-            "{}setsar={},setparams=field_mode=prog:range={}:color_primaries={}:color_trc={}:colorspace={}",
+            "{}{sar_filter}setparams=field_mode=prog:range={}:color_primaries={}:color_trc={}:colorspace={}",
             if encoder_format == plan.output_pixel_format {
                 String::new()
             } else {
                 format!("format={encoder_format},")
             },
-            plan.output_sar(),
             if plan.full_range { "full" } else { "limited" },
             plan.primaries,
             plan.transfer,
@@ -216,47 +221,6 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     args
 }
 
-pub(super) fn validate_help(help: &str, encoder: VideoEncoder, format: &str) -> Result<(), String> {
-    if encoder.is_hardware() {
-        return Err("Jesses supports CPU video encoding only.".into());
-    }
-    let name = library(encoder);
-    let has_encoder = help
-        .lines()
-        .any(|line| line.starts_with(&format!("Encoder {name} [")));
-    let has_format = help
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Supported pixel formats:"))
-        .is_some_and(|formats| formats.split_whitespace().any(|value| value == format));
-    let options: &[&str] = match encoder {
-        VideoEncoder::X265 => &["-crf", "-preset", "-x265-params"],
-        VideoEncoder::Vp9 if format == "yuva420p" => &[
-            "-crf",
-            "-cpu-used",
-            "-deadline",
-            "-row-mt",
-            "-lossless",
-            "-auto-alt-ref",
-        ],
-        VideoEncoder::Vp9 => &["-crf", "-cpu-used", "-deadline", "-row-mt", "-lossless"],
-        VideoEncoder::H264Nvenc | VideoEncoder::HevcNvenc => {
-            &["-cq", "-preset", "-tune", "-rc", "-qp"]
-        }
-        _ => unreachable!("FFmpeg video encoder"),
-    };
-    if !has_encoder
-        || !has_format
-        || options
-            .iter()
-            .any(|option| !help.split_whitespace().any(|word| word == *option))
-    {
-        return Err(format!(
-            "FFmpeg must include {name} with {format} output and the required quality/speed options. The source bit depth will not be reduced."
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,23 +269,5 @@ mod tests {
             .parse()
             .unwrap();
         assert!((1..=64).contains(&threads));
-    }
-
-    #[test]
-    fn missing_cpu_library_or_selected_depth_is_rejected() {
-        assert!(
-            validate_help("Codec is not recognized", VideoEncoder::X265, "yuv420p10le").is_err()
-        );
-        assert!(validate_help("Encoder libx265 [x265]\nSupported pixel formats: yuv420p\n-crf -preset -x265-params",VideoEncoder::X265,"yuv420p10le").is_err());
-    }
-    #[test]
-    fn hardware_library_catalog_is_not_a_supported_cpu_encoder() {
-        for encoder in [VideoEncoder::H264Nvenc, VideoEncoder::HevcNvenc] {
-            assert!(
-                validate_help("Encoder h264_nvenc [legacy]", encoder, "yuv420p")
-                    .unwrap_err()
-                    .contains("CPU")
-            );
-        }
     }
 }

@@ -92,7 +92,7 @@ test('the trim preview shows a portrait frame whole instead of clipping it', asy
   expect(box!.width).toBeLessThanOrEqual(frame!.width + 1);
 });
 
-test('Stop asks the job to keep its progress before releasing the run', async ({ page }) => {
+test('Stop ends the active encode before releasing the batch', async ({ page }) => {
   await installSourceEncodeFixture(page);
   await page.evaluate(() => ((globalThis as any).__holdTerminal = true));
   await loadMedia(page, {

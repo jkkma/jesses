@@ -79,7 +79,7 @@ async fn default_preview_reports_header_estimate_without_claiming_complete_valid
     assert!(!output.exists());
     let mut lossless = request;
     lossless.settings.lossless = true;
-    let quick_lossless = media_runtime::preview_encode_plan(lossless.clone(), cancel.clone())
+    let quick_lossless = media_runtime::preview_encode_plan(lossless, cancel)
         .await
         .unwrap();
     assert!(
@@ -88,20 +88,12 @@ async fn default_preview_reports_header_estimate_without_claiming_complete_valid
             .iter()
             .any(|note| note.contains("compares the complete decoded pixel stream"))
     );
-    lossless.settings.encoding_preferences = Some(media_core::EncodingPreferences {
-        keyframe_interval_seconds: 10,
-        mp4_faststart: false,
-        full_output_verification: true,
-    });
-    let thorough_lossless = media_runtime::preview_encode_plan(lossless, cancel)
-        .await
-        .unwrap();
-    assert!(
-        thorough_lossless
-            .notes
-            .iter()
-            .any(|note| note.contains("compares the complete decoded pixel stream"))
-    );
+    assert!(quick_lossless.stages.iter().any(|stage| {
+        stage
+            .arguments
+            .windows(2)
+            .any(|args| args == ["--lossless", "1"])
+    }));
     std::fs::remove_file(input).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }

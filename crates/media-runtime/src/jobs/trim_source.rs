@@ -221,9 +221,6 @@ impl SourceTrim {
             args.extend(["-i".into(), track.path.as_os_str().to_owned()]);
         }
     }
-    pub(super) fn audio_origin(&self, video_origin: f64) -> f64 {
-        video_origin
-    }
     pub(super) fn indices(&self) -> Vec<u32> {
         self.tracks.iter().map(|track| track.index).collect()
     }

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     ffi::OsString,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -25,6 +25,7 @@ use tokio::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+const DIAGNOSTIC_BYTES: usize = 64 * 1024;
 #[cfg(not(windows))]
 const GROUP: usize = 960;
 
@@ -155,30 +156,80 @@ async fn copy(
     spec: &CommandSpec,
     output: &mut Temporary,
     cancel: &watch::Receiver<bool>,
+    mkvmerge_warnings: Option<&mut Vec<String>>,
 ) -> Result<(), AppError> {
     checkpoint(cancel, &output.path).await?;
     output.close_for_path_writer()?;
-    let result = supervisor::run_streaming_stdout(spec, cancel.clone(), 65536, LIMIT, |reader| {
-        io::copy(reader, &mut io::sink()).map_err(|cause| cause.to_string())
-    })
+    let mkvmerge = mkvmerge_warnings.is_some();
+    let result = supervisor::run_streaming_stdout(
+        spec,
+        cancel.clone(),
+        DIAGNOSTIC_BYTES,
+        LIMIT,
+        move |reader| {
+            if mkvmerge {
+                diagnostic_tail(reader).map_err(|cause| cause.to_string())
+            } else {
+                io::copy(reader, &mut io::sink())
+                    .map(|_| Vec::new())
+                    .map_err(|cause| cause.to_string())
+            }
+        },
+    )
     .await;
     // Rebind even after cancellation so exact owned paths are cleaned. A
     // replaced inode is retained rather than deleting somebody else's file.
     let rebound = output.reopen_after_path_writer();
     let result = result.map_err(|cause| process_error(cause, &output.path))?;
+    let warning = mkvmerge && result.status.code() == Some(1);
+    let diagnostic = || {
+        let stdout = String::from_utf8_lossy(&result.value);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if let Some(warnings) = mkvmerge_warnings
+        && warning
+    {
+        let detail = diagnostic();
+        let headline =
+            "mkvmerge reported a warning while building the AV1AN concat reference (exit 1).";
+        warnings.push(if detail.is_empty() {
+            headline.into()
+        } else {
+            format!("{headline}\n{detail}")
+        });
+    }
     rebound?;
-    if !result.status.success() {
+    if !result.status.success() && !warning {
         return Err(invalid(
             &output.path,
             format!(
                 "The source-compatible concat reference failed ({}): {}",
                 result.status,
-                String::from_utf8_lossy(&result.stderr)
+                diagnostic()
             ),
         ));
     }
     output.flush_nonempty_async().await?;
     checkpoint(cancel, &output.path).await
+}
+
+fn diagnostic_tail(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(tail);
+        }
+        let excess = (tail.len() + count).saturating_sub(DIAGNOSTIC_BYTES);
+        tail.drain(..excess);
+        tail.extend_from_slice(&buffer[..count]);
+    }
 }
 async fn mkvmerge(
     executable: &Path,
@@ -187,8 +238,9 @@ async fn mkvmerge(
     force_rate: bool,
     output: &mut Temporary,
     cancel: &watch::Receiver<bool>,
+    warnings: &mut Vec<String>,
 ) -> Result<(), AppError> {
-    let mut args = vec!["-o".to_owned(), native_path(&output.path)?];
+    let mut args = vec!["--quiet".into(), "-o".into(), native_path(&output.path)?];
     if force_rate {
         args.extend([
             "--default-duration".into(),
@@ -216,6 +268,7 @@ async fn mkvmerge(
         },
         output,
         cancel,
+        Some(warnings),
     )
     .await?;
     if temporary_digest(&options, cancel).await? != identity {
@@ -237,6 +290,7 @@ async fn reference(
     force_rate: bool,
     format: &str,
     cancel: &watch::Receiver<bool>,
+    warnings: &mut Vec<String>,
 ) -> Result<Temporary, AppError> {
     #[cfg(test)]
     super::tests::REFERENCE_JOIN_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -299,6 +353,7 @@ async fn reference(
                 },
                 &mut output,
                 cancel,
+                None,
             )
             .await?;
             if temporary_digest(&manifest, cancel).await? != identity {
@@ -321,7 +376,10 @@ async fn reference(
             let paths = if paths.len() > GROUP {
                 for group in paths.chunks(GROUP) {
                     let mut part = reserve(joined, "group", "mkv")?;
-                    mkvmerge(executable, group, rate, force_rate, &mut part, cancel).await?;
+                    mkvmerge(
+                        executable, group, rate, force_rate, &mut part, cancel, warnings,
+                    )
+                    .await?;
                     groups.push(part);
                 }
                 groups
@@ -331,7 +389,16 @@ async fn reference(
             } else {
                 paths
             };
-            mkvmerge(executable, &paths, rate, force_rate, &mut output, cancel).await?;
+            mkvmerge(
+                executable,
+                &paths,
+                rate,
+                force_rate,
+                &mut output,
+                cancel,
+                warnings,
+            )
+            .await?;
         }
     }
     Ok(output)
@@ -450,9 +517,19 @@ pub(in crate::jobs) async fn verify(
     force_rate: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Stream, AppError> {
+    let mut warnings = Vec::new();
     supervisor::with_console_profile(ConsoleProfile::Hidden, || {
         verify_inner(
-            ffmpeg, ffprobe, mkvmerge, joined, chunks, method, rate, force_rate, cancel, true,
+            ffmpeg,
+            ffprobe,
+            mkvmerge,
+            joined,
+            chunks,
+            method,
+            rate,
+            force_rate,
+            cancel,
+            &mut warnings,
         )
     })
     .await
@@ -470,14 +547,14 @@ pub(in crate::jobs) async fn verify_with_clock(
     rate: (u32, u32),
     force_rate: bool,
     cancel: &watch::Receiver<bool>,
+    warnings: &mut Vec<String>,
 ) -> Result<(Stream, Clock), AppError> {
     supervisor::with_console_profile(ConsoleProfile::Hidden, || {
         verify_inner(
-            ffmpeg, ffprobe, mkvmerge, joined, chunks, method, rate, force_rate, cancel, true,
+            ffmpeg, ffprobe, mkvmerge, joined, chunks, method, rate, force_rate, cancel, warnings,
         )
     })
     .await
-    .map(|(header, clock)| (header, clock.expect("requested decoded reference clock")))
 }
 #[allow(clippy::too_many_arguments)]
 async fn verify_inner(
@@ -490,8 +567,8 @@ async fn verify_inner(
     rate: (u32, u32),
     force_rate: bool,
     cancel: &watch::Receiver<bool>,
-    with_clock: bool,
-) -> Result<(Stream, Option<Clock>), AppError> {
+    warnings: &mut Vec<String>,
+) -> Result<(Stream, Clock), AppError> {
     checkpoint(cancel, &joined.path).await?;
     if chunks.is_empty()
         || rate.0 == 0
@@ -529,7 +606,7 @@ async fn verify_inner(
     let actual = only_video(&actual_document, &joined.path)?;
     let format = joined_format(&actual_document, &joined.path, method)?;
     let reference = reference(
-        ffmpeg, mkvmerge, joined, chunks, method, rate, force_rate, format, cancel,
+        ffmpeg, mkvmerge, joined, chunks, method, rate, force_rate, format, cancel, warnings,
     )
     .await?;
     let reference_identity = temporary_digest(&reference, cancel).await?;
@@ -550,11 +627,7 @@ async fn verify_inner(
             "The complete concat packet duration declarations differ.",
         ));
     }
-    let clock = if with_clock {
-        Some(decoded_clock(ffprobe, &reference.path, &expected, cancel).await?)
-    } else {
-        None
-    };
+    let clock = decoded_clock(ffprobe, &reference.path, &expected, cancel).await?;
     for (source, chunk) in sources.iter().zip(chunks) {
         if source_digest(source, cancel).await? != (chunk.bytes, chunk.sha256) {
             return Err(invalid(

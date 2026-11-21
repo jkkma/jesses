@@ -130,6 +130,8 @@ pub struct PipelineResult {
     pub producer_status: ExitStatus,
     pub consumer_status: ExitStatus,
     pub bytes_transferred: u64,
+    /// Bounded stream prefix for callers that need the binary producer header.
+    pub(crate) producer_prefix: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1117,7 +1119,7 @@ async fn run_pipeline_execute(
         let consumer_wait = consumer.wait_and_terminate_descendants();
         let transfer = transfer_binary(producer_stdout, consumer_stdin, &delivered);
         tokio::pin!(producer_wait, consumer_wait, transfer);
-        let (mut producer_status, mut consumer_status, mut bytes_transferred) = (None, None, None);
+        let (mut producer_status, mut consumer_status, mut transferred) = (None, None, None);
         loop {
             tokio::select! {
                 biased;
@@ -1136,8 +1138,8 @@ async fn run_pipeline_execute(
                     if !delivered.load(Ordering::Acquire) { return Err(SupervisorError::EarlyConsumerExit); }
                     consumer_status = Some(status);
                 }
-                result = &mut transfer, if bytes_transferred.is_none() => {
-                    bytes_transferred = Some(result?);
+                result = &mut transfer, if transferred.is_none() => {
+                    transferred = Some(result?);
                 }
                 result = &mut diagnostics, if !diagnostics_done => {
                     diagnostics_done = true;
@@ -1151,20 +1153,21 @@ async fn run_pipeline_execute(
             if let (
                 Some(producer_status),
                 Some(consumer_status),
-                Some(bytes_transferred),
+                Some((bytes_transferred, producer_prefix)),
                 true,
                 true,
             ) = (
                 producer_status,
                 consumer_status,
-                bytes_transferred,
+                transferred.as_mut(),
                 diagnostics_done,
                 consumer_output_done,
             ) {
                 return Ok(PipelineResult {
                     producer_status,
                     consumer_status,
-                    bytes_transferred,
+                    bytes_transferred: *bytes_transferred,
+                    producer_prefix: std::mem::take(producer_prefix),
                 });
             }
         }
@@ -1204,16 +1207,20 @@ async fn transfer_binary(
     mut producer: impl AsyncRead + Unpin,
     mut consumer: impl AsyncWrite + Unpin,
     delivered: &AtomicBool,
-) -> io::Result<u64> {
+) -> io::Result<(u64, Vec<u8>)> {
     // Keep large buffers off the async state-machine stack. Nested job/pipeline
     // futures otherwise overflow Windows' default thread stack when moved.
     let mut buffer = vec![0_u8; PIPE_BYTES];
     let mut total = 0_u64;
+    let mut prefix = Vec::new();
+    const PREFIX_LIMIT: usize = 512;
     loop {
         let count = read_pipe(&mut producer, &mut buffer).await?;
         if count == 0 {
             break;
         }
+        let capture = count.min(PREFIX_LIMIT - prefix.len());
+        prefix.extend_from_slice(&buffer[..capture]);
         consumer.write_all(&buffer[..count]).await?;
         total += count as u64;
     }
@@ -1221,7 +1228,7 @@ async fn transfer_binary(
     consumer.shutdown().await?;
     drop(consumer); // EOF must reach the encoder before its success is accepted.
     delivered.store(true, Ordering::Release);
-    Ok(total)
+    Ok((total, prefix))
 }
 
 async fn read_pipe(stream: &mut (impl AsyncRead + Unpin), buffer: &mut [u8]) -> io::Result<usize> {

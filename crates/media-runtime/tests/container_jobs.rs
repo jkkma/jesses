@@ -353,7 +353,7 @@ async fn mp4_preserves_translated_and_commentary_tracks_through_remux_and_encode
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 10,
                     mp4_faststart: true,
-                    full_output_verification: true,
+                    retired_verification: (),
                 }),
                 ..Default::default()
             },

@@ -642,6 +642,11 @@ export async function stopJob(id: string): Promise<JobSnapshot> {
   return invoke<JobSnapshot>('stop_job', { id });
 }
 
+export async function discardJobProgress(id: string): Promise<JobSnapshot> {
+  requireDesktop();
+  return invoke<JobSnapshot>('discard_job_progress', { id });
+}
+
 export async function resumeJob(id: string): Promise<JobSnapshot> {
   requireDesktop();
   return invoke<JobSnapshot>('resume_job', { id });

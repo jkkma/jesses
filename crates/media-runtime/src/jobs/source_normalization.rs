@@ -102,8 +102,8 @@ fn digest(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Stamp, AppE
         sha256: format!("{:x}", hash.finalize()),
     })
 }
-// Match AV1AN's ordinary recovery policy. Full-byte receipts remain valid
-// and are checked byte-for-byte when reopening older or thorough jobs.
+// Retain the legacy reader for saved standalone workspaces. AV1AN resume
+// requires complete source fingerprints.
 fn metadata_stamp(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Stamp, AppError> {
     check_cancel(cancel)?;
     source.verify()?;
@@ -129,6 +129,16 @@ fn metadata_stamp(source: &Source, cancel: &watch::Receiver<bool>) -> Result<Sta
 impl Stamp {
     fn includes_contents(&self) -> bool {
         !self.sha256.starts_with("metadata-v1:")
+    }
+
+    fn require_contents(&self) -> Result<(), AppError> {
+        if !self.includes_contents() {
+            return Err(invalid(
+                &self.path,
+                "This AV1AN workspace saved source metadata without a content fingerprint. Start a new encode to use the current source. The saved workspace remains available for explicit deletion.",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -369,25 +379,22 @@ fn recipe(
                 None,
             )
         })?;
-    let trim_end_seconds = (!super::encode::thorough_verification(settings))
-        .then_some(settings.trim)
-        .flatten()
-        .and_then(|trim| {
-            let end = if let Some(time) = trim.time {
-                f64::from(time.end_milliseconds) / 1000.0
-            } else if trim.end_frame_exclusive > 0 {
-                f64::from(trim.end_frame_exclusive) * f64::from(rate.1) / f64::from(rate.0)
-            } else {
-                return None;
-            };
-            let bound = (end + 2.0).max(1.0);
-            let total = document
-                .duration()
-                .into_iter()
-                .chain(normalized_end(document, origin))
-                .reduce(f64::max)?;
-            (total.is_finite() && bound + 5.0 < total).then_some(bound)
-        });
+    let trim_end_seconds = settings.trim.and_then(|trim| {
+        let end = if let Some(time) = trim.time {
+            f64::from(time.end_milliseconds) / 1000.0
+        } else if trim.end_frame_exclusive > 0 {
+            f64::from(trim.end_frame_exclusive) * f64::from(rate.1) / f64::from(rate.0)
+        } else {
+            return None;
+        };
+        let bound = (end + 2.0).max(1.0);
+        let total = document
+            .duration()
+            .into_iter()
+            .chain(normalized_end(document, origin))
+            .reduce(f64::max)?;
+        (total.is_finite() && bound + 5.0 < total).then_some(bound)
+    });
     Ok(Some(Recipe {
         origin,
         rotation,
@@ -428,10 +435,6 @@ struct Owner {
 struct Complete {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<Stamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    decoded_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    decoded_bytes: Option<u64>,
 }
 struct Workspace {
     root: PathBuf,
@@ -737,6 +740,9 @@ impl Cleanup {
                 "This canonical source does not have a recovery fingerprint.",
             )
         })?;
+        if self.0.owner.settings.backend == media_core::EncodeBackend::Av1an {
+            expected.require_contents()?;
+        }
         let original = Source::open(&expected.path)?;
         let (_owner, cancel) = watch::channel(false);
         let actual = if expected.includes_contents() {
@@ -1170,51 +1176,15 @@ async fn stage_source(
     rebound?;
     Ok(result)
 }
-async fn pixels(
-    spec: CommandSpec,
-    cancel: &watch::Receiver<bool>,
-    path: &Path,
-) -> Result<(u64, String), AppError> {
-    let result =
-        supervisor::run_streaming_stdout(&spec, cancel.clone(), 64 * 1024, TIME, |reader| {
-            let mut bytes = [0_u8; 65536];
-            let mut length = 0_u64;
-            let mut hash = Sha256::new();
-            loop {
-                let count = reader.read(&mut bytes).map_err(|e| e.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                length = length
-                    .checked_add(count as u64)
-                    .ok_or("Decoded canonical byte count overflow.")?;
-                hash.update(&bytes[..count]);
-            }
-            Ok((length, format!("{:x}", hash.finalize())))
-        })
-        .await
-        .map_err(|e| process_error(e, path))?;
-    if !result.status.success() {
-        return Err(invalid(
-            path,
-            format!(
-                "Canonical pixel verification failed: {}",
-                String::from_utf8_lossy(&result.stderr)
-            ),
-        ));
-    }
-    Ok(result.value)
-}
-
 async fn static_hdr_metadata(
     ffprobe: &Path,
     input: &Path,
     index: u32,
     header: &[serde_json::Value],
-    thorough: bool,
+    scan_all: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<encode_plan::hdr::StaticMetadata, AppError> {
-    let limits: &[Option<u32>] = if thorough {
+    let limits: &[Option<u32>] = if scan_all {
         &[None]
     } else {
         &[Some(16), Some(256), Some(1024)]
@@ -1317,6 +1287,9 @@ impl Prepared {
                     "This canonical source does not have a recovery fingerprint.",
                 )
             })?;
+            if settings.backend == media_core::EncodeBackend::Av1an {
+                expected.require_contents()?;
+            }
             let actual = recovery_stamp(&original, cancel, expected.includes_contents()).await?;
             if actual != *expected {
                 return Err(invalid(
@@ -1331,6 +1304,9 @@ impl Prepared {
                     "This canonical artifact does not have a recovery fingerprint.",
                 )
             })?;
+            if settings.backend == media_core::EncodeBackend::Av1an {
+                expected.require_contents()?;
+            }
             let source_path = root.join("source.mkv");
             if expected.path != source_path
                 || expected.identity != workspace.owner.files["source.mkv"]
@@ -1358,21 +1334,7 @@ impl Prepared {
         }
         let ffprobe = discover("ffprobe", cancel).await?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
-        let thorough = super::encode::thorough_verification(settings);
-        let counted = if thorough {
-            Some(
-                probe(
-                    &ffprobe,
-                    &original.path,
-                    cancel,
-                    Some(&request.stream_indices),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let document = counted.as_ref().unwrap_or(headers);
+        let document = headers;
         let recipe = recipe(document, settings, force)?.ok_or_else(|| {
             invalid(
                 &original.path,
@@ -1412,14 +1374,14 @@ impl Prepared {
         } else {
             None
         };
-        let recovery = thorough || settings.backend == media_core::EncodeBackend::Av1an;
+        let recovery = settings.backend == media_core::EncodeBackend::Av1an;
         let source_length = original
             .file()
             .metadata()
             .map_err(|error| invalid(&original.path, error.to_string()))?
             .len();
         let original_stamp = if recovery {
-            Some(recovery_stamp(&original, cancel, thorough).await?)
+            Some(stamp(&original, cancel).await?)
         } else {
             None
         };
@@ -1527,8 +1489,8 @@ impl Prepared {
             } else {
                 // The transform cannot preserve arbitrary dynamic HDR. A
                 // declared HDR source needs complete eligibility evidence
-                // before rendering even when output verification is lean.
-                Some(static_hdr_metadata(&ffprobe, &original.path, metadata_video.index, &metadata_video.side_data_list, thorough || hdr_video.is_some(), cancel).await?)
+                // before rendering.
+                Some(static_hdr_metadata(&ffprobe, &original.path, metadata_video.index, &metadata_video.side_data_list, hdr_video.is_some(), cancel).await?)
             };
             let prepared = if let Some(prepared) = compressed {
                 prepared
@@ -1541,11 +1503,7 @@ impl Prepared {
             tokio::fs::write(log,diagnostic.as_bytes()).await.map_err(|e|invalid(log,e.to_string()))?;
             if !prepared.status.success() {return Err(invalid(&original.path,format!("FFmpeg could not prepare the canonical source: {}",String::from_utf8_lossy(&prepared.stderr))));}
             temporary.flush_nonempty_async().await?;
-            let actual = if thorough {
-                probe(&ffprobe, &temporary.path, cancel, None).await?
-            } else {
-                probe_headers(&ffprobe, &temporary.path, cancel, None).await?
-            };
+            let actual = probe_headers(&ffprobe, &temporary.path, cancel, None).await?;
             let kinds = document.streams.iter().map(|stream| stream.codec_type.as_deref().unwrap_or_default()).collect::<Vec<_>>();
             super::output_counts::check_streams(&actual, &kinds)?;
             let selected_video=actual.streams.iter().find(|stream|stream.index==settings.video_stream_index).ok_or_else(||invalid(&temporary.path,"The canonical video stream is absent."))?;
@@ -1559,53 +1517,18 @@ impl Prepared {
                 return Err(invalid(&temporary.path, "The canonical video header does not match the planned codec and display dimensions."));
             }
             if let Some(original_hdr) = original_hdr {
-                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,thorough,cancel).await?;
+                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,false,cancel).await?;
                 original_hdr.validate_present(&observed,false)?;observed.validate_present(&original_hdr,false)?;
                 if let Some(original_video)=hdr_video
                     && (selected_video.color_primaries!=original_video.color_primaries||selected_video.color_transfer!=original_video.color_transfer||selected_video.color_space!=original_video.color_space||selected_video.color_range!=original_video.color_range||selected_video.pix_fmt!=original_video.pix_fmt) {return Err(invalid(&temporary.path,"Lossless canonicalization changed HDR color interpretation or sample format."));}
             }
-            let decoded = if thorough {
-            let format=selected_video.pix_fmt.as_deref().ok_or_else(||invalid(&temporary.path,"The canonical source pixel format is unknown."))?;
-            let mut reference=input_arguments(&original.path,&recipe);reference.extend(["-map".into(),format!("0:{}",settings.video_stream_index).into(),"-vf".into(),recipe.filter().into()]);
-            let mut candidate:Vec<OsString>=["-v","error","-nostdin","-noautorotate","-protocol_whitelist","file","-i"].into_iter().map(OsString::from).chain([temporary.path.as_os_str().to_owned()]).collect();candidate.extend(["-map".into(),format!("0:{}",settings.video_stream_index).into()]);
-            let suffix=["-an","-sn","-dn","-pix_fmt",format,"-f","rawvideo","pipe:1"].into_iter().map(OsString::from).collect::<Vec<_>>();reference.extend(suffix.clone());candidate.extend(suffix);
-            let expected=pixels(CommandSpec {executable:ffmpeg.clone(),args:reference,cwd:None},cancel,&original.path).await?;
-            let observed=pixels(CommandSpec {executable:ffmpeg.clone(),args:candidate,cwd:None},cancel,&temporary.path).await?;
-            if expected.0==0 || expected!=observed {return Err(invalid(&temporary.path,"The lossless canonical source does not contain exactly the independently decoded transformed source pixels."));}
-            let mut expected_document=document.clone();
-            if let Some(format)=&mut expected_document.format {format.start_time=Some("0".into());format.duration=normalized_end(document,recipe.origin).map(|duration|duration.to_string());}
-            expected_document.chapters.retain(|chapter|number(Some(&chapter.end_time)).is_some_and(|end|end>recipe.origin));
-            for chapter in &mut expected_document.chapters {chapter.start_time=(number(Some(&chapter.start_time)).unwrap_or(0.0)-recipe.origin).max(0.0).to_string();chapter.end_time=(number(Some(&chapter.end_time)).unwrap_or(0.0)-recipe.origin).max(0.0).to_string();}
-            let normalized_end=expected_document.duration().map(|duration|duration.to_string());
-            for stream in &mut expected_document.streams {
-                let end=stream_end(stream).map(|end|(end-recipe.origin).max(0.0).to_string());
-                stream.tags.retain(|key,_| !((stream.index==settings.video_stream_index && metadata::is_derived_stream_tag(key)) || (recipe.origin!=0.0 && key.to_ascii_lowercase().starts_with("duration"))));
-                stream.packet_start_time=stream.packet_start_time.map(|time|time-recipe.origin);stream.start_time=number(stream.start_time.as_deref()).map(|time|(time-recipe.origin).to_string());
-                stream.duration=end;
-                if stream.index==settings.video_stream_index {stream.duration=normalized_end.clone();stream.tags.retain(|key,_|!key.eq_ignore_ascii_case("rotate"));stream.start_time=Some("0".into());stream.packet_start_time=Some(0.0);}
-            }
-            metadata::verify_encoded(&expected_document,&expected_document.streams.iter().collect::<Vec<_>>(),&actual,settings.video_stream_index,"ffv1",(selected_video.width.unwrap_or(0),selected_video.height.unwrap_or(0)),&[])?;
-            for stream in document.streams.iter().filter(|stream|stream.index!=settings.video_stream_index && matches!(stream.codec_type.as_deref(),Some("video"|"audio"|"subtitle"))) {
-                if aac::needed(document,stream){
-                    let actual_stream=actual.streams.iter().find(|actual|actual.index==stream.index).expect("canonical AAC stream");
-                    let evidence=aac::verify(&ffmpeg,&ffprobe,&original.path,stream,&temporary.path,actual_stream,-recipe.origin,cancel).await?;
-                    manager.change(id,|snapshot|append_log(snapshot,evidence)).await;
-                }else{mux::verify_shifted_packets(&ffprobe,&original.path,stream.index,&temporary.path,stream.index,-recipe.origin,cancel).await?;}
-            }
-            Some(observed)
-            } else {
-                None
-            };
             original.verify()?;workspace.verify_layout()?;check_cancel(cancel)?;
             temporary.publish(&source_path)?;drop(temporary);
-            let stamp = if recovery { Some(recovery_stamp(&Source::open(&source_path)?, cancel, thorough).await?) } else { None };
-            let (decoded_bytes, decoded_sha256) = decoded.map_or((None, None), |(bytes, sha256)| (Some(bytes), Some(sha256)));
-            let complete=Complete {source:stamp,decoded_bytes,decoded_sha256};
+            let source = if recovery { Some(stamp(&Source::open(&source_path)?, cancel).await?) } else { None };
+            let complete=Complete {source};
             complete_file.write_all(&serde_json::to_vec(&complete).map_err(|e|invalid(&root,e.to_string()))?).and_then(|_|complete_file.sync_all()).map_err(|e|invalid(&root,e.to_string()))?;
             let summary = if let Some(frames) = retime_frames.filter(|_| retimed) {
                 format!("Prepared the compressed source clock for {frames} AV1 frames without decoding or re-encoding them.")
-            } else if let (Some(bytes), Some(sha256)) = (complete.decoded_bytes, complete.decoded_sha256) {
-                format!("Verified lossless canonical source: {bytes} decoded bytes, SHA-256 {sha256}. Original source bytes and copied track packet timing were checked.")
             } else {
                 "Verified lossless canonical source headers.".into()
             };

@@ -3,13 +3,12 @@ import type { JobSnapshot } from '$lib/ipc/generated';
 export const terminalJob = (state: string): boolean =>
   ['succeeded', 'failed', 'canceled', 'interrupted', 'stopped'].includes(state);
 
-export const canKeepProgress = (job: JobSnapshot): boolean =>
-  !!job.encodeSettings && ['preparing', 'running', 'paused', 'finalizing'].includes(job.state);
+export const hasSavedProgress = (job: JobSnapshot): boolean =>
+  (job.encodeSettings?.backend === 'av1an' && !!job.recovery) ||
+  (job.encodeSettings?.backend === 'standalone' && !!job.standaloneRecovery);
 
 export const canResumeJob = (job: JobSnapshot): boolean =>
-  ((job.encodeSettings?.backend === 'av1an' && !!job.recovery) ||
-    (job.encodeSettings?.backend === 'standalone' && !!job.standaloneRecovery)) &&
-  ['stopped', 'interrupted', 'failed', 'canceled'].includes(job.state);
+  hasSavedProgress(job) && ['stopped', 'interrupted', 'failed', 'canceled'].includes(job.state);
 
 export function savedProgressSummary(job: JobSnapshot): string {
   const standalone = job.standaloneRecovery;

@@ -13,7 +13,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use media_core::{AppError, RecoveryPhase, StandaloneRecoveryPhase, ToolInfo};
+use media_core::{AppError, RecoveryPhase, ToolInfo};
 use media_runtime::{
     EncodeBackend, EncodeRequest, EncodeSettings, JobManager, JobSnapshot, JobState, RemuxRequest,
     VideoEncoder, get_capabilities,
@@ -684,13 +684,6 @@ async fn final_publication_collision_preserves_destination_and_recovery() {
             VideoEncoder::SvtAv1 => 12,
             _ => unreachable!("bounded output-safety workflow matrix"),
         };
-        // The standalone case checks its recovery workspace, which only
-        // thorough runs keep.
-        encode.settings.encoding_preferences = Some(media_core::EncodingPreferences {
-            keyframe_interval_seconds: 10,
-            mp4_faststart: true,
-            full_output_verification: true,
-        });
         let submitted = manager.start_encode(encode).await.unwrap();
         let owned_matroska = wait_for_owned_matroska(&manager, &submitted.id).await;
         assert!(
@@ -706,29 +699,29 @@ async fn final_publication_collision_preserves_destination_and_recovery() {
         assert_eq!(error.code, "OUTPUT_EXISTS", "{failed:#?}");
         assert!(error.message.contains("never replaced"));
         assert!(failed.logs.iter().any(|line| line.starts_with("Mux log: ")));
-        assert!(failed.logs.iter().any(|line| {
-            line.contains("Decoding the completed output to verify exact frame count")
-        }));
+        assert!(
+            failed
+                .logs
+                .iter()
+                .any(|line| line.starts_with("Output check:"))
+        );
+        assert!(failed.standalone_recovery.is_none(), "{failed:#?}");
 
         let recovery_workspace = match workflow.backend {
             EncodeBackend::Standalone => {
                 assert!(failed.recovery.is_none(), "{failed:#?}");
-                let recovery = failed.standalone_recovery.as_ref().unwrap();
-                assert_eq!(recovery.phase, StandaloneRecoveryPhase::Finalizing);
-                assert_eq!(recovery.completed_frames, 120);
-                assert_eq!(recovery.total_frames, 120);
-                PathBuf::from(&recovery.workspace)
+                None
             }
             EncodeBackend::Av1an => {
-                assert!(failed.standalone_recovery.is_none(), "{failed:#?}");
                 let recovery = failed.recovery.as_ref().unwrap();
                 assert_eq!(recovery.phase, RecoveryPhase::Finalizing);
                 assert_eq!(recovery.completed_frames, 120);
                 assert_eq!(recovery.total_frames, 120);
-                PathBuf::from(&recovery.workspace)
+                let workspace = PathBuf::from(&recovery.workspace);
+                assert!(workspace.join("manifest.json").is_file());
+                Some(workspace)
             }
         };
-        assert!(recovery_workspace.join("manifest.json").is_file());
         manager.shutdown().await;
         assert_no_owned_workers().await;
 
@@ -737,16 +730,20 @@ async fn final_publication_collision_preserves_destination_and_recovery() {
             !owned_matroska.exists(),
             "Failed publication left its scratch Matroska behind"
         );
-        assert!(
-            recovery_workspace.is_dir(),
-            "Verified finalizing recovery must remain resumable"
-        );
+        if let Some(workspace) = &recovery_workspace {
+            assert!(
+                workspace.is_dir(),
+                "AV1AN finalizing recovery must remain resumable"
+            );
+        }
         seal.assert_unchanged(&source);
         eprintln!(
             "ACCEPTED {} final publication collision | code={} | recovery={} | source-sha256={}",
             workflow.name,
             error.code,
-            recovery_workspace.display(),
+            recovery_workspace
+                .as_ref()
+                .map_or_else(|| "none".into(), |path| path.display().to_string()),
             seal.sha256
         );
         remove_after_shutdown(&case);

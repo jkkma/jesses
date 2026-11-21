@@ -395,7 +395,7 @@ async fn opaque_16bit_gbr_source_encodes_to_verified_10bit_yuv_without_source_ch
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 10,
                     mp4_faststart: true,
-                    full_output_verification: true,
+                    retired_verification: (),
                 }),
                 ..Default::default()
             },
@@ -425,12 +425,6 @@ async fn opaque_16bit_gbr_source_encodes_to_verified_10bit_yuv_without_source_ch
     assert_eq!(encoded["streams"][0]["color_space"], "bt709");
     assert_eq!(encoded["streams"][0]["color_range"], "pc");
     assert_eq!(encoded["frames"].as_array().unwrap().len(), 4);
-    assert!(
-        completed
-            .logs
-            .iter()
-            .any(|line| line.contains("Verified lossless decoded pixel SHA-256"))
-    );
 }
 
 #[tokio::test]

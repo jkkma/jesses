@@ -851,16 +851,14 @@
       terminalJob(entry.state) ? entry : (snapshots.find((job) => job.id === entry.id) ?? entry),
     );
   }
-  // The footer's Stop keeps a started encode's verified progress for Resume,
-  // as closing the window does. Discarding saved work stays explicit: Abort
-  // in the encoding window, or Delete in the AV1AN Resume dialog.
+  // Stop started encodes before releasing the batch wait or canceling its queue.
   let stopping = $state(false);
   async function stopRun() {
     if (stopping) return;
     stopping = true;
     try {
-      // Only a real video encode has progress worth keeping; copy and
-      // audio-only jobs are simply canceled, as before.
+      // Started video encodes get a Stopped result. Copy and audio-only jobs
+      // are canceled along with queued work.
       for (const job of jobs.filter(
         (entry) =>
           entry.encodeSettings &&
@@ -871,7 +869,7 @@
           const snapshot = await stopJob(job.id);
           jobs = jobs.map((entry) => (entry.id === snapshot.id ? snapshot : entry));
         } catch (error) {
-          addLog(`Could not stop with progress kept: ${errorMessage(error)}`, 'error');
+          addLog(`Could not stop the encode: ${errorMessage(error)}`, 'error');
         }
       }
       if (displayAction?.active) displayAction.stop?.();
@@ -1862,7 +1860,7 @@
         onclick={() => displayAction?.pause?.()}>{displayAction.paused ? 'Resume' : 'Pause'}</button
       ><button
         type="button"
-        title="Stop and keep finished work so the encode can be resumed"
+        title="Stop the current work and keep any saved encoder progress"
         disabled={!displayAction.stop || stopping}
         onclick={stopRun}>Stop</button
       >
@@ -1872,7 +1870,7 @@
         >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
       ><button
         type="button"
-        title="Stop and keep finished work so the encode can be resumed"
+        title="Stop the current job and keep any saved encoder progress"
         disabled={stopping}
         onclick={stopRun}>Stop</button
       >{/if}
@@ -1956,7 +1954,7 @@
 >
   <p>
     {activeJobCount === 1 ? '1 job is' : `${activeJobCount} jobs are`} running or queued. Closing stops
-    {activeJobCount === 1 ? 'it' : 'them'}; only encodes with saved progress can be resumed later.
+    {activeJobCount === 1 ? 'it' : 'them'}. Encodes can resume later if they have saved progress.
   </p>
   <div class="import-actions">
     <button type="button" data-dialog-initial-focus onclick={() => (closePrompt = false)}

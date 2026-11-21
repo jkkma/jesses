@@ -4,6 +4,8 @@
     chooseUtilityDestination,
     inspectSavedJob,
     exportSavedJob,
+    discardJobProgress,
+    resumeJob,
     isDesktop,
   } from '$lib/ipc/client';
   import type {
@@ -13,6 +15,7 @@
     VideoEncoder,
   } from '$lib/ipc/generated';
   import { errorMessage, fileName } from '$lib/components/shared/format';
+  import { canResumeJob, savedProgressSummary } from '$lib/components/shared/job-state';
   let {
     jobs,
     onqueue,
@@ -24,6 +27,7 @@
   let error = $state<string | null>(null);
   let message = $state<string | null>(null);
   const encodes = $derived(jobs.filter((j) => j.encodeSettings));
+  const selectedJob = $derived(encodes.find((job) => job.id === selected));
   async function inspect() {
     pending = true;
     error = null;
@@ -41,7 +45,7 @@
     }
   }
   async function save() {
-    const job = encodes.find((j) => j.id === selected);
+    const job = selectedJob;
     if (!job?.encodeSettings) return;
     pending = true;
     error = null;
@@ -76,6 +80,24 @@
       await onqueue(request);
       message =
         'Queued a new encode with the saved settings. It starts from the source; existing recovery files remain unchanged.';
+    } catch (e) {
+      error = errorMessage(e);
+    } finally {
+      pending = false;
+    }
+  }
+  async function useProgress(job: JobSnapshot, action: 'resume' | 'discard') {
+    pending = true;
+    error = null;
+    message = null;
+    try {
+      if (action === 'resume') {
+        await resumeJob(job.id);
+        message = 'Queued the saved encode for resume.';
+      } else {
+        await discardJobProgress(job.id);
+        message = 'Discarded the saved encoder progress.';
+      }
     } catch (e) {
       error = errorMessage(e);
     } finally {
@@ -123,6 +145,19 @@
         </select>
       </label>
     </div>
+    {#if selectedJob?.encodeSettings?.backend === 'standalone' && canResumeJob(selectedJob)}
+      <p>{savedProgressSummary(selectedJob)}</p>
+      <div class="actions">
+        <button type="button" onclick={() => useProgress(selectedJob!, 'resume')} disabled={pending}
+          >Resume saved job</button
+        >
+        <button
+          type="button"
+          onclick={() => useProgress(selectedJob!, 'discard')}
+          disabled={pending}>Discard saved progress</button
+        >
+      </div>
+    {/if}
     {#if inspection}<div class="inspection" role="status">
         <p>{inspection.message}</p>
         {#if inspection.request}<dl>

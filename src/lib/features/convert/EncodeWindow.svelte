@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { canKeepProgress, canResumeJob, terminalJob } from '$lib/components/shared/job-state';
+  import { canResumeJob, hasSavedProgress, terminalJob } from '$lib/components/shared/job-state';
   import { displayPaths, errorMessage, fileName, formatBytes } from '$lib/components/shared/format';
   import {
     isEncoderProgressLine,
@@ -16,6 +16,7 @@
   import {
     subscribeJobs,
     cancelJob,
+    discardJobProgress,
     stopJob,
     resumeJob,
     setJobPaused,
@@ -114,7 +115,10 @@
     }
   }
 
-  async function act(job: JobSnapshot, action: 'pause' | 'cancel' | 'keep' | 'resume' | 'folder') {
+  async function act(
+    job: JobSnapshot,
+    action: 'pause' | 'cancel' | 'stop' | 'resume' | 'discard' | 'folder',
+  ) {
     if (busy) return;
     busy = true;
     actionError = null;
@@ -128,9 +132,11 @@
           ? setJobPaused(job.id, job.state !== 'paused')
           : action === 'cancel'
             ? cancelJob(job.id)
-            : action === 'keep'
+            : action === 'stop'
               ? stopJob(job.id)
-              : resumeJob(job.id));
+              : action === 'discard'
+                ? discardJobProgress(job.id)
+                : resumeJob(job.id));
         // A subscription may beat the command reply; retain any newer snapshot.
         jobs = jobs.map((entry) => (entry === job ? result : entry));
       }
@@ -194,7 +200,10 @@
         {#if current.state === 'succeeded'}
           <span>Output verified and saved.</span>
           {#if current.outputSizeBytes}<span>{formatBytes(current.outputSizeBytes)}</span>{/if}
-        {:else if !finished}<span aria-label="Encoder statistics">{progress.text}</span>{/if}
+        {:else if !finished}<span aria-label="Encoder statistics">{progress.text}</span>
+        {:else if current.state === 'stopped' && !hasSavedProgress(current)}
+          <span>Start a new job to encode this source.</span>
+        {/if}
       </div>
       {#if current.state === 'succeeded'}<progress aria-label="Encode progress" value="1" max="1"
         ></progress>
@@ -222,25 +231,32 @@
             onclick={() => act(current!, 'pause')}
             disabled={busy}>{current.state === 'paused' ? 'Resume' : 'Pause'}</button
           >
-        {/if}
-        {#if canKeepProgress(current)}
           <button
             type="button"
-            title="Save completed phases. The interrupted phase restarts when resumed."
-            onclick={() => act(current!, 'keep')}
-            disabled={busy}>Stop and keep progress</button
+            title={hasSavedProgress(current)
+              ? 'Keep the saved checkpoint. Resume restarts the interrupted phase.'
+              : 'Stop this job. A new run starts from the source.'}
+            onclick={() =>
+              act(
+                current!,
+                (current!.encodeSettings?.videoMode ?? 'encode') === 'encode' ? 'stop' : 'cancel',
+              )}
+            disabled={busy}>{hasSavedProgress(current) ? 'Stop and keep progress' : 'Stop'}</button
           >
         {:else if canResumeJob(current)}
           <button type="button" onclick={() => act(current!, 'resume')} disabled={busy}
             >Resume saved job</button
           >
-        {/if}
-        {#if !finished}<button
+          <button
             type="button"
-            class="abort"
-            aria-label="Cancel job"
+            class="discard"
+            onclick={() => act(current!, 'discard')}
+            disabled={busy}>Discard saved progress</button
+          >
+        {:else if current.state === 'queued'}<button
+            type="button"
             onclick={() => act(current!, 'cancel')}
-            disabled={busy || ['canceling', 'stopping'].includes(current.state)}>Abort</button
+            disabled={busy}>Cancel job</button
           >{/if}
       {/if}
     </div>
@@ -429,7 +445,7 @@
   .folder {
     margin-right: auto;
   }
-  .abort {
+  .discard {
     color: var(--destructive);
   }
   .close-note {

@@ -385,6 +385,15 @@ export async function installSourceEncodeFixture(page: Page) {
           emitJobs();
           return state.__testJobs.find((entry: any) => entry.id === payload.id);
         }
+        if (command === 'discard_job_progress') {
+          state.__testJobs = state.__testJobs.map((entry: any) =>
+            entry.id === payload.id
+              ? { ...entry, standaloneRecovery: null, recovery: null }
+              : entry,
+          );
+          emitJobs();
+          return state.__testJobs.find((entry: any) => entry.id === payload.id);
+        }
         if (command === 'cancel_all_jobs') {
           state.__testJobs = state.__testJobs.map((entry: any) =>
             ['succeeded', 'failed', 'canceled', 'interrupted', 'stopped'].includes(entry.state)

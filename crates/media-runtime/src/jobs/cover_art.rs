@@ -5,10 +5,7 @@
 //! such an attachment as the file's cover, and the MP4 conversion turns the
 //! same attachment into the MP4 cover. MOV and WebM cannot keep it, so the
 //! app leaves it out there and says so.
-use super::{
-    files::Temporary,
-    metadata::{Document, Stream},
-};
+use super::{files::Temporary, metadata::Stream};
 use crate::supervisor::{self, CommandSpec};
 use media_core::{AppError, ContainerFormat, EncodeSettings};
 use std::{ffi::OsString, io::Write, path::Path, time::Duration};
@@ -43,12 +40,6 @@ impl Picture {
         match self {
             Self::Jpeg => "image/jpeg",
             Self::Png => "image/png",
-        }
-    }
-    fn codec(self) -> &'static str {
-        match self {
-            Self::Jpeg => "mjpeg",
-            Self::Png => "png",
         }
     }
 }
@@ -95,13 +86,6 @@ impl CoverArt {
         if !supported(container) {
             return Err(left_out(
                 "Cover art was left out: only MKV and MP4 destinations can store it.",
-            ));
-        }
-        if container == ContainerFormat::Mp4 && super::encode::thorough_verification(settings) {
-            // An MP4 cover needs iTunes-style metadata, which cannot hold every
-            // container tag that full verification compares.
-            return Err(left_out(
-                "Cover art was left out: with full output verification on, MP4 keeps every container tag instead. Choose MKV to keep both.",
             ));
         }
         if !matroska_stage {
@@ -184,22 +168,6 @@ impl CoverArt {
         ]);
         args.push(output);
     }
-
-    /// The cover is the last stream of a Matroska stage once any settings
-    /// attachment is removed; readers list it as an attached picture.
-    pub fn verify_and_remove(&self, artifact: &mut Document) -> Result<(), AppError> {
-        if !artifact.streams.last().is_some_and(|stream| {
-            is_cover(stream) && stream.codec_name.as_deref() == Some(self.picture.codec())
-        }) {
-            return Err(AppError::new(
-                "OUTPUT_VALIDATION_FAILED",
-                "The output cover image is missing or changed.",
-                None,
-            ));
-        }
-        artifact.streams.pop();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -229,47 +197,5 @@ mod tests {
         ] {
             assert!(!supported(container));
         }
-    }
-
-    #[test]
-    fn the_attached_cover_is_named_and_typed_after_its_picture() {
-        let dir = std::env::temp_dir().join(format!(
-            "jesses-cover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let cover = CoverArt {
-            file: Temporary::create_extension(&dir.join("out.mkv"), "test-cover", "img").unwrap(),
-            picture: Picture::Png,
-        };
-        let mut args: Vec<OsString> = vec!["-i".into(), "in.mkv".into(), "out.mkv".into()];
-        cover.apply(&mut args, 2);
-        let text: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
-        assert_eq!(text.last().map(|arg| arg.as_ref()), Some("out.mkv"));
-        assert!(
-            text.windows(2)
-                .any(|pair| pair[0] == "-metadata:s:t:2" && pair[1] == "filename=cover.png")
-        );
-        assert!(
-            text.windows(2)
-                .any(|pair| pair[0] == "-metadata:s:t:2" && pair[1] == "mimetype=image/png")
-        );
-        let mut artifact: Document = serde_json::from_value(serde_json::json!({"streams":[
-            {"index":0,"codec_type":"video","codec_name":"av1"},
-            {"index":1,"codec_type":"video","codec_name":"png","disposition":{"attached_pic":1}}
-        ]}))
-        .unwrap();
-        let mut wrong = artifact.clone();
-        wrong.streams[1].codec_name = Some("mjpeg".into());
-        assert!(cover.verify_and_remove(&mut wrong).is_err());
-        cover.verify_and_remove(&mut artifact).unwrap();
-        assert_eq!(artifact.streams.len(), 1);
-        drop(cover);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        std::fs::remove_dir(dir).unwrap();
     }
 }

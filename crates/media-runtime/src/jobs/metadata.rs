@@ -323,29 +323,6 @@ pub(super) fn verify_container(
     verify_inner(source, selected, output, &[], &[], converted_subtitles)
 }
 
-pub(super) fn verify_encoded(
-    source: &Document,
-    selected: &[&Stream],
-    output: &Document,
-    video_index: u32,
-    expected_codec: &str,
-    expected_dimensions: (u32, u32),
-    audio: &[media_core::AudioTrackSettings],
-) -> Result<(), AppError> {
-    verify_inner(
-        source,
-        selected,
-        output,
-        &[EncodedVideo {
-            index: video_index,
-            codec: expected_codec,
-            dimensions: expected_dimensions,
-        }],
-        audio,
-        &[],
-    )
-}
-
 pub(super) fn verify_audio_conversion(
     source: &Document,
     selected: &[&Stream],
@@ -366,42 +343,6 @@ pub(super) fn verify_audio_conversion_with_subtitles(
         return verify_audio_conversion(source, selected, output, audio);
     }
     verify_inner(source, selected, output, &[], audio, converted_subtitles)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn verify_encoded_with_subtitles(
-    source: &Document,
-    selected: &[&Stream],
-    output: &Document,
-    video_index: u32,
-    expected_codec: &str,
-    expected_dimensions: (u32, u32),
-    audio: &[media_core::AudioTrackSettings],
-    converted_subtitles: &[u32],
-) -> Result<(), AppError> {
-    if converted_subtitles.is_empty() {
-        return verify_encoded(
-            source,
-            selected,
-            output,
-            video_index,
-            expected_codec,
-            expected_dimensions,
-            audio,
-        );
-    }
-    verify_inner(
-        source,
-        selected,
-        output,
-        &[EncodedVideo {
-            index: video_index,
-            codec: expected_codec,
-            dimensions: expected_dimensions,
-        }],
-        audio,
-        converted_subtitles,
-    )
 }
 
 pub(super) struct EncodedVideo<'a> {
@@ -801,39 +742,6 @@ mod tests {
     }
 
     #[test]
-    fn encoded_codec_is_checked_without_relaxing_copied_tracks() {
-        let source = fixture();
-        let selected = source.selected(&[2, 0, 5]).unwrap();
-        let mut output = fixture();
-        output.streams.swap(0, 1);
-        verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &[]).unwrap();
-        assert!(verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).is_err());
-        output.streams[1].codec_name = Some("av1".into());
-        verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).unwrap();
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &[]).is_err());
-        output.streams[0].codec_name = Some("aac".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "av1", (64, 64), &[]).is_err());
-    }
-
-    #[test]
-    fn framing_uses_planned_dimensions_only_for_the_encoded_video() {
-        let mut source = fixture();
-        let mut copied_video = source.streams[0].clone();
-        copied_video.index = 9;
-        source.streams.insert(2, copied_video);
-        let selected = source.selected(&[2, 0, 9, 5]).unwrap();
-        let mut output = source.clone();
-        output.streams.swap(0, 1);
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).is_err());
-        output.streams[1].width = Some(96);
-        output.streams[1].height = Some(128);
-        verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).unwrap();
-        assert!(verify(&source, &selected, &output).is_err());
-        output.streams[2].width = Some(96);
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (96, 128), &[]).is_err());
-    }
-
-    #[test]
     fn audio_conversion_leaves_copied_packets_and_video_timestamps_strict() {
         let mut source = fixture();
         source.streams[0].start_time = Some("0".into());
@@ -854,12 +762,12 @@ mod tests {
             channels: media_core::AudioChannels::Preserve,
             gain: None,
         }];
-        verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).unwrap();
+        verify_audio_conversion(&source, &selected, &output, &tracks).unwrap();
         output.streams[1].start_time = Some("0.006".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).is_err());
+        assert!(verify_audio_conversion(&source, &selected, &output, &tracks).is_err());
         output.streams[1].start_time = Some("0".into());
         output.streams[2].nb_read_packets = Some("1".into());
-        assert!(verify_encoded(&source, &selected, &output, 0, "h264", (64, 64), &tracks).is_err());
+        assert!(verify_audio_conversion(&source, &selected, &output, &tracks).is_err());
     }
 
     #[test]

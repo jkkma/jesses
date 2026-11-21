@@ -141,7 +141,7 @@ test('a grain table that clearly ends before the video is refused in the form', 
   expect(grainTableIssue('svtAv1Hdr', 'av1an', table('980000000'), draft, true, 100)).toBeNull();
   const short = grainTableIssue('svtAv1Hdr', 'av1an', table('979999999'), draft, true, 100);
   expect(short).toContain('ends at 98.000 s but the video needs about 100.000 s');
-  expect(short).toContain('Thorough verification');
+  expect(short).toContain('based on the file headers');
   // Short clips keep a margin of one second.
   expect(grainTableIssue('svtAv1', 'standalone', table('10000000'), draft, true, 2)).toBeNull();
   expect(grainTableIssue('svtAv1', 'standalone', table('10000000'), draft, true, 2.1)).toContain(

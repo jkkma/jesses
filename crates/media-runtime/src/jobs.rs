@@ -1,16 +1,6 @@
 //! Sequential media jobs with immutable requests and optional durable history.
 //! Interrupted jobs are reported after restart and never automatically resumed.
 
-/// Inputs for verified dynamic-HDR publication after the encoded checkpoint.
-type DynamicHdrPublication<'a> = (
-    &'a dynamic_hdr::Resources,
-    &'a Path,
-    &'a Path,
-    usize,
-    (u32, u32),
-);
-
-mod alpha;
 pub(crate) mod sequence;
 pub use sequence::{import_image_sequence, release_image_sequence};
 mod attachments;
@@ -21,7 +11,6 @@ mod av1an_preprocess;
 #[cfg(test)]
 mod batch_tests;
 mod cadence;
-mod codec_config;
 pub(crate) mod command_edit;
 mod container;
 mod conversion;
@@ -92,12 +81,10 @@ pub(crate) mod images;
 pub use images::run_image_job;
 mod dynamic_hdr;
 mod log_retention;
-mod lossless;
 mod metadata;
 mod mux;
 mod output_counts;
 mod output_metadata;
-mod packet_clock;
 pub(crate) mod parameters;
 pub(crate) mod qtgmc;
 mod rate_control;
@@ -1302,10 +1289,24 @@ impl JobManager {
         {
             entry.cancel.send_replace(true);
             entry.snapshot.state = JobState::Stopping;
+            let can_keep_progress = entry.snapshot.recovery.is_some()
+                || entry.snapshot.standalone_recovery.is_some()
+                || entry
+                    .snapshot
+                    .encode_settings
+                    .as_ref()
+                    .is_some_and(|settings| {
+                        settings.backend == media_core::EncodeBackend::Av1an
+                            && settings.video_mode == media_core::VideoMode::Encode
+                    });
             append_log(
                 &mut entry.snapshot,
-                "Stop requested; waiting for owned processes to exit and keeping the latest verified phase boundary."
-                    .into(),
+                if can_keep_progress {
+                    "Stop requested; waiting for owned processes to exit and keeping saved encoder progress."
+                } else {
+                    "Stop requested; waiting for owned processes and temporary output cleanup."
+                }
+                .into(),
             );
         }
         let snapshot = entry.snapshot.clone();
@@ -1501,14 +1502,14 @@ impl JobManager {
         let snapshot = entry.snapshot.clone();
         let eligible = matches!(
             snapshot.state,
-            JobState::Stopped | JobState::Failed | JobState::Interrupted
+            JobState::Stopped | JobState::Failed | JobState::Interrupted | JobState::Canceled
         ) && snapshot.encode_settings.is_some()
             && (snapshot.recovery.is_some() || snapshot.standalone_recovery.is_some())
             && entry.task.as_ref().is_none_or(|task| task.is_finished());
         if !eligible {
             return Err(AppError::new(
                 "JOB_DISCARD_UNAVAILABLE",
-                "Only a stopped, failed or interrupted encoder job with saved progress can discard owned recovery after its worker exits.",
+                "Saved encoder progress can be discarded after the unfinished job's worker exits.",
                 None,
             ));
         }
@@ -1591,8 +1592,13 @@ impl JobManager {
                         // A started encode ends as Stopped, so its card says
                         // whether verified progress was kept for Resume.
                         // Queued work and copy jobs are canceled.
-                        let started_encode = e.snapshot.encode_settings.is_some()
-                            && !matches!(e.snapshot.state, JobState::Queued | JobState::Canceling);
+                        let started_encode =
+                            e.snapshot.encode_settings.as_ref().is_some_and(|settings| {
+                                settings.video_mode == media_core::VideoMode::Encode
+                            }) && !matches!(
+                                e.snapshot.state,
+                                JobState::Queued | JobState::Canceling
+                            );
                         if started_encode {
                             if e.snapshot.state != JobState::Stopping {
                                 append_log(
@@ -1995,10 +2001,8 @@ impl JobManager {
         )?;
         source.verify()?;
         check_cancel(cancel)?;
-        self.finalize(
-            id, cancel, &source, None, temp, &output, None, None, scratch,
-        )
-        .await
+        self.finalize(id, cancel, &source, None, temp, &output, None, scratch)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2011,48 +2015,16 @@ impl JobManager {
         temporary: &Temporary,
         output: &Path,
         cadence: Option<container::Cadence<'_>>,
-        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
-        self.finalize_verified(
-            id, cancel, source, external, temporary, output, cadence, alpha, None, scratch,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn finalize_verified(
-        &self,
-        id: &str,
-        cancel: &watch::Receiver<bool>,
-        source: &Source,
-        external: Option<&external_tracks::ExternalTracks>,
-        temporary: &Temporary,
-        output: &Path,
-        cadence: Option<container::Cadence<'_>>,
-        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
-        dynamic_hdr: Option<DynamicHdrPublication<'_>>,
-        scratch: &mut Vec<Temporary>,
-    ) -> Result<(), AppError> {
-        // A source verified beside its encoder must pass before publication.
-        source_timing::settle(cancel).await?;
-        Box::pin(self.finalize_verified_inner(
-            id,
-            cancel,
-            source,
-            external,
-            temporary,
-            output,
-            cadence,
-            alpha,
-            dynamic_hdr,
-            scratch,
+        Box::pin(self.finalize_inner(
+            id, cancel, source, external, temporary, output, cadence, scratch,
         ))
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn finalize_verified_inner(
+    async fn finalize_inner(
         &self,
         id: &str,
         cancel: &watch::Receiver<bool>,
@@ -2061,8 +2033,6 @@ impl JobManager {
         temporary: &Temporary,
         output: &Path,
         cadence: Option<container::Cadence<'_>>,
-        alpha: Option<(&encode_plan::Plan, &Path, usize, usize, bool)>,
-        dynamic_hdr: Option<DynamicHdrPublication<'_>>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
@@ -2087,12 +2057,9 @@ impl JobManager {
         .await?;
         let repacked = converted.is_some();
         let temporary = converted.unwrap_or(temporary);
-        if let Some(clock) = cadence.filter(|clock| !clock.full_verification) {
+        if let Some(clock) = cadence {
             let ffprobe = discover("ffprobe", cancel).await?;
-            let mut kinds = clock
-                .expected_kinds
-                .expect("default encode stream plan")
-                .to_vec();
+            let mut kinds = clock.expected_kinds.to_vec();
             if repacked && timecode.is_some() {
                 kinds.push("data");
             }
@@ -2117,70 +2084,12 @@ impl JobManager {
                 );
                 if let Some(declared) = declared.filter(|count| *count != clock.frames) {
                     append_log(snapshot, format!(
-                        "Warning: the container declares {declared} video frames; encoding prepared {}. Turn on Thorough verification to check the actual frames.",
+                        "Warning: the container declares {declared} video frames; encoding prepared {}.",
                         clock.frames,
                     ));
                 }
             })
             .await;
-        }
-        if repacked && let Some((plan, ffmpeg, video_position, frame_count, lossless)) = alpha {
-            let ffprobe = discover("ffprobe", cancel).await?;
-            let document = probe(&ffprobe, &temporary.path, cancel, None).await?;
-            let video = document.streams.get(video_position).ok_or_else(|| {
-                AppError::new(
-                    "ENCODE_ALPHA_VALIDATION_FAILED",
-                    "The final container has no planned VP9 alpha stream.",
-                    None,
-                )
-            })?;
-            if !video
-                .tags
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode") && value == "1")
-            {
-                return Err(AppError::new(
-                    "ENCODE_ALPHA_VALIDATION_FAILED",
-                    "The final container lost VP9 alpha_mode metadata.",
-                    None,
-                ));
-            }
-            let reference = CommandSpec {
-                executable: ffmpeg.to_owned(),
-                args: encode::decoder_args(&source.path, plan),
-                cwd: None,
-            };
-            let mut candidate_args = encode::decoder_args_preprocessed(&temporary.path, plan);
-            let map = candidate_args
-                .iter()
-                .position(|argument| argument == "-map")
-                .expect("decoder stream map");
-            candidate_args[map + 1] = format!("0:{video_position}").into();
-            let candidate = CommandSpec {
-                executable: ffmpeg.to_owned(),
-                args: candidate_args,
-                cwd: None,
-            };
-            let evidence = alpha::verify(
-                &reference,
-                &candidate,
-                plan.width,
-                plan.height,
-                frame_count,
-                lossless,
-                &temporary.path,
-                cancel,
-            )
-            .await?;
-            self.change(id, |snapshot| {
-                append_log(snapshot, format!("Final container: {evidence}"))
-            })
-            .await;
-        }
-        if let Some((resources, ffmpeg, ffprobe, video_index, fps)) = dynamic_hdr {
-            resources
-                .verify_output(ffmpeg, ffprobe, &temporary.path, video_index, fps, cancel)
-                .await?;
         }
         if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
             receipt.verify(temporary, cancel).await?;
@@ -2884,7 +2793,6 @@ mod tests {
                     &temporary,
                     &output,
                     None,
-                    None,
                     &mut Vec::new()
                 )
                 .await
@@ -2903,7 +2811,6 @@ mod tests {
                     None,
                     &temporary,
                     &mp4,
-                    None,
                     None,
                     &mut Vec::new()
                 )

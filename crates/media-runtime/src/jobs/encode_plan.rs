@@ -79,9 +79,6 @@ pub(super) fn direct_source_clock(video: &Stream, settings: &EncodeSettings) -> 
         });
     settings.backend == EncodeBackend::Standalone
         && settings.video_mode == media_core::VideoMode::Encode
-        && !settings
-            .encoding_preferences
-            .is_some_and(|preferences| preferences.full_output_verification)
         && settings.trim.is_none()
         && !settings.source_trim
         && !settings.source_filters
@@ -1257,12 +1254,18 @@ impl Plan {
             ));
         }
         let source_coded_size = (width, height);
-        let (width, height) = if source_rotation.rem_euclid(180) == 90 {
+        let quarter_turn = source_rotation.rem_euclid(180) == 90;
+        let (width, height) = if quarter_turn {
             (height, width)
         } else {
             (width, height)
         };
         let (sar_n, sar_d) = source_sar.split_once(':').expect("validated SAR");
+        let (sar_n, sar_d) = if quarter_turn {
+            (sar_d, sar_n)
+        } else {
+            (sar_n, sar_d)
+        };
         let mut geometry = framing::Geometry::build_with_sar(
             width,
             height,
@@ -1285,7 +1288,7 @@ impl Plan {
                 if settings.framing.resize.is_some() || settings.framing.resize_width.is_some() {
                     "1:1".into()
                 } else {
-                    source_sar.clone()
+                    format!("{sar_n}:{sar_d}")
                 }
             },
             aspect::Transform::sar,
@@ -1491,6 +1494,18 @@ impl Plan {
     pub fn output_sar(&self) -> &str {
         &self.output_sar
     }
+    pub(super) fn standalone_requires_container_sar(&self) -> bool {
+        self.encoder.is_svt()
+            || matches!(
+                self.encoder,
+                VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone
+            )
+    }
+
+    pub(super) fn observe_producer_sar(&mut self, sar: &str) -> Result<(), AppError> {
+        self.output_sar = aspect::parse_source(Some(sar))?;
+        Ok(())
+    }
     pub fn encoded_mux_origin(&self) -> f64 {
         if self.source_dolby_clock && !self.source_dolby_render && self.trim.is_none() {
             self.source_origin
@@ -1591,39 +1606,6 @@ impl Plan {
         (!self.custom_filters.is_empty()).then(|| self.custom_filters.join(","))
     }
 
-    pub fn source_filter_document(&self, mut document: Document, frames: usize) -> Document {
-        if (self.source_filters || self.source_queue.is_some() || self.source_av1an_base_clock)
-            && let Some(video) = document
-                .streams
-                .iter_mut()
-                .find(|stream| stream.index == self.video_index)
-        {
-            // Raw source filters can change frame count or nominal Y4M rate.
-            // Count/geometry/clock have already been proved against the actual
-            // coded checkpoint; copied non-video tracks retain their own ends.
-            video.duration = Some(
-                self.source_queue
-                    .as_ref()
-                    .and_then(|regions| regions.reference_duration())
-                    .unwrap_or(frames as f64 * self.frame_seconds())
-                    .to_string(),
-            );
-            video.avg_frame_rate = Some(format!("{}/{}", self.fps_num, self.fps_den));
-            video.r_frame_rate = video.avg_frame_rate.clone();
-            video.sample_aspect_ratio = Some(self.output_sar.clone());
-            if (self.source_dolby_render && self.trim.is_none()) || self.source_av1an_base_clock {
-                // Source Y4M's default CFR pads a positive first-frame gap;
-                // the separately wrapped coded track consequently starts at0.
-                // Copied audio/subtitle clocks retain their original authority.
-                video.start_time = Some("0".into());
-                video.packet_start_time = Some(0.0);
-            }
-            video
-                .tags
-                .retain(|key, _| !super::metadata::is_derived_stream_tag(key));
-        }
-        document
-    }
     pub fn source_filter_contract(&self, frames: usize) -> super::source_filters::OutputContract {
         super::source_filters::OutputContract {
             width: self.width,
@@ -2599,196 +2581,6 @@ impl Plan {
         }
         Ok(frames.frames.len())
     }
-
-    pub fn validate_encoded_stream(
-        &self,
-        source: &Stream,
-        output: &Stream,
-    ) -> Result<(), AppError> {
-        self.validate_encoded_stream_fields(source, output, false)
-    }
-
-    /// ISO VP9 does not carry Matroska's chroma-siting declaration. This is
-    /// usable only after the caller proves every copied video packet against
-    /// the fully validated encoder checkpoint. All explicit declarations and
-    /// all remaining planned fields must still match.
-    pub fn validate_packet_copied_iso_vp9(
-        &self,
-        source: &Stream,
-        checkpoint: &Stream,
-        output: &Stream,
-        format: media_core::ContainerFormat,
-    ) -> Result<(), AppError> {
-        if self.output_codec() != "vp9"
-            || !matches!(
-                format,
-                media_core::ContainerFormat::Mp4 | media_core::ContainerFormat::Mov
-            )
-        {
-            return self.validate_encoded_stream(source, output);
-        }
-        self.validate_elementary_checkpoint(source, checkpoint)?;
-        let mut declared = output.clone();
-        if declared.chroma_location.is_none() {
-            declared.chroma_location = Some(self.chroma.into());
-        }
-        self.validate_encoded_stream(source, &declared)
-    }
-
-    /// An elementary VP9/IVF checkpoint cannot represent display aspect,
-    /// chroma location, color primaries, or transfer characteristics. The
-    /// final Matroska stage writes and strictly validates those plan fields.
-    /// At this phase, absent container-level values are accepted while an
-    /// explicitly wrong value still rejects the checkpoint.
-    pub fn validate_elementary_checkpoint(
-        &self,
-        source: &Stream,
-        output: &Stream,
-    ) -> Result<(), AppError> {
-        if self.encoder == VideoEncoder::X264 && self.output_sar != "1:1" {
-            // x264's native Matroska writer truncates display dimensions to
-            // integral pixels. The common mux restores the exact rational
-            // aspect; only this owned intermediate admits that known value.
-            let (n, d) = self.output_sar.split_once(':').expect("validated SAR");
-            let (n, d) = (
-                n.parse::<u64>().expect("SAR numerator"),
-                d.parse::<u64>().expect("SAR denominator"),
-            );
-            let (mut numerator, mut denominator) = if n >= d {
-                (u64::from(self.width) * n / d, u64::from(self.width))
-            } else {
-                (u64::from(self.height), u64::from(self.height) * d / n)
-            };
-            let (mut a, mut b) = (numerator, denominator);
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            numerator /= a;
-            denominator /= a;
-            let mut intermediate = self.clone();
-            intermediate.output_sar = format!("{numerator}:{denominator}");
-            if output.sample_aspect_ratio.as_deref() == Some(intermediate.output_sar.as_str()) {
-                return intermediate.validate_encoded_stream_fields(source, output, false);
-            }
-        }
-        self.validate_encoded_stream_fields(source, output, self.output_codec() == "vp9")
-    }
-
-    fn validate_encoded_stream_fields(
-        &self,
-        _source: &Stream,
-        output: &Stream,
-        allow_absent_vp9_container_fields: bool,
-    ) -> Result<(), AppError> {
-        if let Some(regions) = &self.source_queue {
-            return regions.verify_header(output, allow_absent_vp9_container_fields);
-        }
-        let expected_primaries = Some(color_name(self.primaries));
-        let expected_transfer = Some(color_name(self.transfer));
-        let optional_container_field_matches = |actual: Option<&str>, expected: Option<&str>| {
-            actual == expected || (allow_absent_vp9_container_fields && actual.is_none())
-        };
-        let chroma_matches = if self.high_chroma_output() && output.chroma_location.is_none() {
-            // HEVC and some other high-chroma bitstreams do not expose a
-            // chroma-location field through FFprobe. The producer's explicit
-            // conversion and decoded pixel format remain independently checked.
-            true
-        } else {
-            match self.chroma {
-                "left" => optional_container_field_matches(
-                    output.chroma_location.as_deref(),
-                    Some("left"),
-                ),
-                "topleft" => optional_container_field_matches(
-                    output.chroma_location.as_deref(),
-                    Some("topleft"),
-                ),
-                "center" => optional_container_field_matches(
-                    output.chroma_location.as_deref(),
-                    Some("center"),
-                ),
-                _ => matches!(
-                    output.chroma_location.as_deref(),
-                    None | Some("unspecified" | "unknown")
-                ),
-            }
-        };
-        if (self.output_pixel_format == "yuva420p"
-            && !allow_absent_vp9_container_fields
-            && !output
-                .tags
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode") && value == "1"))
-            || output.codec_name.as_deref() != Some(self.output_codec())
-            || !self.matches_output_format(output.pix_fmt.as_deref())
-            || output.width != Some(self.width)
-            || output.height != Some(self.height)
-            || !optional_container_field_matches(
-                output.sample_aspect_ratio.as_deref(),
-                Some(self.output_sar.as_str()),
-            )
-            || if self.is_tone_mapped() {
-                output.color_space.as_deref() != Some("bt709")
-                    || !optional_container_field_matches(
-                        output.color_transfer.as_deref(),
-                        expected_transfer,
-                    )
-                    || !optional_container_field_matches(
-                        output.color_primaries.as_deref(),
-                        expected_primaries,
-                    )
-                    || output.color_range.as_deref() != Some("tv")
-            } else {
-                (if rgb_source_format(self.source_pixel_format) {
-                    output.color_space.as_deref() != Some("bt709")
-                } else {
-                    output.color_space.as_deref() != Some(matrix_name(self.matrix))
-                }) || !optional_container_field_matches(
-                    output.color_transfer.as_deref(),
-                    expected_transfer,
-                ) || !optional_container_field_matches(
-                    output.color_primaries.as_deref(),
-                    expected_primaries,
-                ) || output.color_range.as_deref()
-                    != Some(if self.full_range { "pc" } else { "tv" })
-            }
-            || !chroma_matches
-        {
-            return Err(AppError::new(
-                "ENCODE_VALIDATION_FAILED",
-                format!(
-                    "The encoded output codec, dimensions, bit depth, aspect ratio, or color metadata differ from the plan. Observed codec {:?}, format {:?}, size {:?}x{:?}, SAR {:?}, primaries {:?}, transfer {:?}, matrix {:?}, range {:?}, chroma {:?}; expected {}, {}, {}x{}, SAR {}, primaries {}, transfer {}, matrix {}, range {}, chroma {}.",
-                    output.codec_name,
-                    output.pix_fmt,
-                    output.width,
-                    output.height,
-                    output.sample_aspect_ratio,
-                    output.color_primaries,
-                    output.color_transfer,
-                    output.color_space,
-                    output.color_range,
-                    output.chroma_location,
-                    self.output_codec(),
-                    self.output_pixel_format,
-                    self.width,
-                    self.height,
-                    self.output_sar,
-                    color_name(self.primaries),
-                    color_name(self.transfer),
-                    matrix_name(self.matrix),
-                    if self.full_range { "pc" } else { "tv" },
-                    self.chroma
-                ),
-                None,
-            ));
-        }
-        validate_side_data(&output.side_data_list, self.validation_hdr(true), true)?;
-        if let Some(hdr) = self.validation_hdr(true) {
-            hdr.metadata
-                .validate_present(&StaticMetadata::parse(&output.side_data_list)?, true)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2985,7 +2777,7 @@ mod tests {
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 1,
                     mp4_faststart: true,
-                    full_output_verification: true,
+                    retired_verification: (),
                 }),
                 ..Default::default()
             };
@@ -3031,7 +2823,7 @@ mod tests {
             encoding_preferences: Some(media_core::EncodingPreferences {
                 keyframe_interval_seconds: 1,
                 mp4_faststart: false,
-                full_output_verification: true,
+                retired_verification: (),
             }),
             ..Default::default()
         };
@@ -3265,103 +3057,6 @@ mod tests {
     }
 
     #[test]
-    fn vp9_elementary_checkpoint_allows_only_absent_container_color_fields() {
-        let mut source = source();
-        source.streams[0].chroma_location = Some("left".into());
-        let settings = EncodeSettings {
-            encoder: VideoEncoder::VpxStandalone,
-            ..Default::default()
-        };
-        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
-        let mut checkpoint = source.streams[0].clone();
-        checkpoint.codec_name = Some("vp9".into());
-        checkpoint.sample_aspect_ratio = None;
-        checkpoint.chroma_location = None;
-        checkpoint.color_primaries = None;
-        checkpoint.color_transfer = None;
-
-        plan.validate_elementary_checkpoint(&source.streams[0], &checkpoint)
-            .unwrap();
-        assert!(
-            plan.validate_encoded_stream(&source.streams[0], &checkpoint)
-                .is_err()
-        );
-
-        checkpoint.color_primaries = Some("bt470bg".into());
-        assert!(
-            plan.validate_elementary_checkpoint(&source.streams[0], &checkpoint)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn copied_iso_vp9_allows_only_missing_chroma_after_verified_checkpoint() {
-        use media_core::ContainerFormat;
-        let mut source = source();
-        source.streams[0].chroma_location = Some("left".into());
-        let settings = EncodeSettings {
-            encoder: VideoEncoder::Vp9,
-            ..Default::default()
-        };
-        let plan = Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).unwrap();
-        let mut checkpoint = source.streams[0].clone();
-        checkpoint.codec_name = Some("vp9".into());
-        let mut output = checkpoint.clone();
-        output.chroma_location = None;
-        assert!(
-            plan.validate_encoded_stream(&source.streams[0], &output)
-                .is_err()
-        );
-        plan.validate_packet_copied_iso_vp9(
-            &source.streams[0],
-            &checkpoint,
-            &output,
-            ContainerFormat::Mp4,
-        )
-        .unwrap();
-        assert!(
-            plan.validate_packet_copied_iso_vp9(
-                &source.streams[0],
-                &checkpoint,
-                &output,
-                ContainerFormat::Matroska
-            )
-            .is_err()
-        );
-        for field in ["chroma", "pixel", "primaries", "codec", "sar"] {
-            let mut changed = output.clone();
-            match field {
-                "chroma" => changed.chroma_location = Some("center".into()),
-                "pixel" => changed.pix_fmt = Some("yuv420p10le".into()),
-                "primaries" => changed.color_primaries = Some("bt470bg".into()),
-                "codec" => changed.codec_name = Some("h264".into()),
-                "sar" => changed.sample_aspect_ratio = Some("4:3".into()),
-                _ => unreachable!(),
-            }
-            assert!(
-                plan.validate_packet_copied_iso_vp9(
-                    &source.streams[0],
-                    &checkpoint,
-                    &changed,
-                    ContainerFormat::Mp4
-                )
-                .is_err(),
-                "accepted {field}"
-            );
-        }
-        checkpoint.chroma_location = Some("center".into());
-        assert!(
-            plan.validate_packet_copied_iso_vp9(
-                &source.streams[0],
-                &checkpoint,
-                &output,
-                ContainerFormat::Mp4
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn framing_validates_original_source_frames_and_transformed_output_frames_separately() {
         for hdr in [false, true] {
             let (source, decoded) = if hdr {
@@ -3406,20 +3101,8 @@ mod tests {
             let mut encoded = source.streams[0].clone();
             encoded.codec_name = Some("av1".into());
             encoded.pix_fmt = Some("yuv420p10le".into());
-            assert!(
-                plan.validate_encoded_stream(&source.streams[0], &encoded)
-                    .is_err()
-            );
-            encoded.width = Some(64);
-            encoded.height = Some(64);
-            assert!(
-                plan.validate_encoded_stream(&source.streams[0], &encoded)
-                    .is_err()
-            );
             encoded.width = Some(120);
             encoded.height = Some(88);
-            plan.validate_encoded_stream(&source.streams[0], &encoded)
-                .unwrap();
             let mut output = Frames {
                 frames: decoded.frames.clone(),
             };
@@ -3507,10 +3190,6 @@ mod tests {
         );
         let mut encoded = source.streams[0].clone();
         encoded.codec_name = Some("av1".into());
-        assert!(
-            plan.validate_encoded_stream(&source.streams[0], &encoded)
-                .is_ok()
-        );
         // AV1 stores coordinates /65536, peak luminance /256, minimum /16384.
         decoded.frames[0].side_data_list[0]["red_x"] = "44564/65536".into();
         decoded.frames[0].side_data_list[0]["min_luminance"] = "2/16384".into();
@@ -3843,6 +3522,55 @@ mod tests {
     }
     fn source() -> Document {
         serde_json::from_str(r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":128,"height":96,"pix_fmt":"yuv420p","field_order":"progressive","sample_aspect_ratio":"1:1","avg_frame_rate":"24000/1001","time_base":"1/1000","start_time":"0","color_space":"bt709","color_primaries":"bt709","color_transfer":"bt709","color_range":"tv"}],"format":{"start_time":"0","duration":"1"}}"#).unwrap()
+    }
+
+    #[test]
+    fn dolby_tone_map_rotates_display_sar_and_keeps_coded_sar() {
+        let (mut document, _) = hdr_source_and_frames();
+        let video = &mut document.streams[0];
+        video.sample_aspect_ratio = Some("4:3".into());
+        video.side_data_list = vec![serde_json::json!({
+            "side_data_type": "DOVI configuration record",
+            "dv_profile": 8,
+            "dv_bl_signal_compatibility_id": 1,
+            "rpu_present_flag": 1,
+            "bl_present_flag": 1,
+            "el_present_flag": 0
+        })];
+        let settings = EncodeSettings {
+            tone_map: Some(
+                serde_json::from_value(serde_json::json!({
+                    "algorithm": "hable",
+                    "backend": "cpu",
+                    "peakMode": "manual",
+                    "sourcePeakNits": 1000,
+                    "sourceWorkflow": true
+                }))
+                .unwrap(),
+            ),
+            ..x264_settings()
+        };
+        for (rotation, display_size, sar) in [
+            (90, (96, 128), "3:4"),
+            (180, (128, 96), "4:3"),
+            (270, (96, 128), "3:4"),
+        ] {
+            document.streams[0].side_data_list.truncate(1);
+            document.streams[0]
+                .side_data_list
+                .push(serde_json::json!({"side_data_type":"Display Matrix","rotation":rotation}));
+            let plan =
+                Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap();
+            assert_eq!(plan.frame_dimensions(false), (128, 96));
+            assert_eq!(plan.frame_dimensions(true), display_size);
+            assert_eq!(plan.frame_sar(false), "4:3");
+            assert_eq!(plan.output_sar(), sar);
+            assert!(
+                plan.decoder_filter()
+                    .unwrap()
+                    .contains(&format!("setsar={}:max=65535", sar.replace(':', "/")))
+            );
+        }
     }
 
     #[test]
@@ -4245,19 +3973,12 @@ mod tests {
                             .unwrap(),
                         4
                     );
-                    plan.validate_encoded_stream(&source.streams[0], &source.streams[0])
-                        .unwrap();
                     assert_eq!(
                         plan.validate_frames(&decoded, &source.streams[0], true)
                             .unwrap(),
                         4
                     );
-                    let mut wrong_codec = source.streams[0].clone();
-                    wrong_codec.codec_name = Some("av1".into());
-                    assert!(
-                        plan.validate_encoded_stream(&source.streams[0], &wrong_codec)
-                            .is_err()
-                    );
+
                     decoded.frames[1].pix_fmt = Some(
                         if depth == 10 {
                             "yuv420p"
@@ -4360,15 +4081,6 @@ mod tests {
                     .unwrap(),
                 2
             );
-            let mut encoded = source.streams[0].clone();
-            encoded.codec_name = Some("h264".into());
-            encoded.pix_fmt = Some("yuv420p".into());
-            encoded.color_space = Some("bt709".into());
-            encoded.chroma_location = Some("left".into());
-            assert!(
-                plan.validate_encoded_stream(&source.streams[0], &encoded)
-                    .is_ok()
-            );
             source.streams[0].pix_fmt = Some("rgba".into());
             assert!(
                 Plan::build(&source, &source.selected(&[0]).unwrap(), &x264_settings()).is_err()
@@ -4401,16 +4113,6 @@ mod tests {
             plan.decoder_filter()
                 .unwrap()
                 .contains("in_range=full:out_range=limited")
-        );
-        let mut output = source.streams[0].clone();
-        output.codec_name = Some("av1".into());
-        output.pix_fmt = Some("yuv420p10le".into());
-        output.color_range = Some("tv".into());
-        output.color_space = Some("bt709".into());
-        output.chroma_location = Some("left".into());
-        assert!(
-            plan.validate_encoded_stream(&source.streams[0], &output)
-                .is_ok()
         );
         source.streams[0].pix_fmt = Some("yuvj420p".into());
         assert!(Plan::build(&source, &source.selected(&[0]).unwrap(), &settings).is_err());

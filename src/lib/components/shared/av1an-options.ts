@@ -79,7 +79,7 @@ function grainTableCoverageIssue(
   if (videoSeconds == null || !Number.isFinite(videoSeconds) || videoSeconds <= 0) return null;
   const endSeconds = Number(end) / 10_000_000;
   if (endSeconds + Math.max(videoSeconds / 50, 1) >= videoSeconds) return null;
-  return `The grain table ends at ${endSeconds.toFixed(3)} s but the video needs about ${videoSeconds.toFixed(3)} s. Use a grain table with one segment covering the whole video. The video length was read from the file headers; if it is wrong, turn on Thorough verification to count the frames first.`;
+  return `The grain table ends at ${endSeconds.toFixed(3)} s but the video needs about ${videoSeconds.toFixed(3)} s based on the file headers. Use a grain table with one segment covering the whole video.`;
 }
 /**
  * Checks the table properties available in the form. Pass `videoSeconds`, the

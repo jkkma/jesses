@@ -7,7 +7,7 @@ labels, so upgrading Jesses never changes which tool an old job runs.
 
 | Choice        | Executable path     | Elementary output | Exact timing step                                                          |
 | ------------- | ------------------- | ----------------- | -------------------------------------------------------------------------- |
-| AOM AV1       | `aomenc`            | IVF AV1           | encoder header validated against the plan                                  |
+| AOM AV1       | `aomenc`            | IVF AV1           | IVF carries the encoder clock                                              |
 | VPX VP9       | `vpxenc`            | IVF VP9           | mkvmerge applies the exact rational cadence                                |
 | x265 HEVC     | `x265`              | raw HEVC          | mkvmerge applies the exact rational cadence and B-frame presentation order |
 | x265 · FFmpeg | FFmpeg `libx265`    | timed Matroska    | retained legacy route                                                      |
@@ -33,21 +33,17 @@ converted to the selected encoder output format. Tagged packed YUYV/UYVY
 4:2:2 is also accepted. Full-range opaque RGB24/BGR24, planar GBR at 8, 10,
 12 or 16 bits, and RGB48 input require BT.709 primaries/transfer and GBR
 identity signaling. They are explicitly converted to BT.709 YUV at a supported
-8- or 10-bit output depth; SVT output uses limited range. Every decoded source
-frame and encoded frame is checked against its own pixel-format and color plan.
+8- or 10-bit output depth. SVT output uses limited range.
 
 For video with transparency, 8-bit RGBA or YUVA420P input can use the FFmpeg
 VP9 route with explicit **YUVA420P** output to a new `.mkv` or `.webm` file.
-The same route accepts a tagged VP9 alpha video as input. It uses the libvpx
-decoder for alpha, checks every output frame's alpha coverage and opacity,
-and checks the final container's alpha flag; lossless output also requires
-byte-exact decoded alpha. Temporal and custom pixel filters, subtitle burn-in,
-and other alpha formats are not supported on this route. Other encoders require
-an opaque source or deliberate compositing before encoding.
+The same route accepts a tagged VP9 alpha video as input and uses the libvpx
+decoder to read its alpha plane. Temporal and custom pixel filters, subtitle
+burn-in, and other alpha formats are unavailable on this route. Other encoders
+require an opaque source or deliberate compositing before encoding.
 
-The installed executable must advertise every requested input depth, rate-control
-mode, pass-statistics switch and lossless setting. x265 boolean switches such as
-`--[no-]lossless` are recognized from its full help. Tagged limited-range 10-bit
+Encoder identity and rate-control compatibility are checked before execution.
+Unsupported command options are reported by the encoder. Tagged limited-range 10-bit
 BT.2020/PQ HDR10 input with verified static metadata can be preserved by AOM and
 x265; other non-SVT HDR input requires explicit HDR/HLG-to-SDR tone mapping.
 Dynamic HDR is never silently discarded.
@@ -56,14 +52,10 @@ Dynamic HDR is never silently discarded.
 
 Constant quality remains the default. Bitrate and target-size jobs start a fresh
 decoder and encoder for every pass and retain only complete pass statistics.
-Dedicated **Lossless** mode uses the encoder's explicit lossless switch rather
-than treating a quality value as a promise. Before publication, Jesses decodes the
-entire result and compares its pixel SHA-256 with the exact frames supplied to the
-encoder after trim, temporal processing, tone mapping and framing. An encoder that
-claims lossless but changes one decoded sample fails with
-`LOSSLESS_VALIDATION_FAILED` and publishes no output.
+Dedicated **Lossless** mode selects the encoder's explicit lossless controls for
+the frames it receives after trim, temporal processing, tone mapping and framing.
 
-Extended SVT controls are build-gated in the same capability phase. Quarter-step
+Extended SVT controls are build-gated. Quarter-step
 CRF values through 70 and research presets down to -3 are submitted only when the
 selected mainline or HDR build advertises them. The installed 5fish build used for
 Windows qualification correctly rejects values it does not advertise.
@@ -80,34 +72,23 @@ supported. Earlier provider evidence is historical, not pending qualification.
 
 Some `vpxenc` builds coerce a fractional IVF rate even when both the Y4M header and
 `--fps` carry the requested rational value. Jesses therefore wraps direct VP9 with
-mkvmerge `--default-duration` and scans every decoded timestamp before committing
-the timing phase. Direct x265 uses the same wrapper because raw HEVC has no
-container clock and may reorder B-frames. The final selected-track output is scanned
-again for zero start, exact planned count and complete rational cadence.
+mkvmerge `--default-duration`. Direct x265 uses the same wrapper because raw HEVC
+has no container clock and may reorder B-frames. Before publication, Jesses
+checks the final file for readable video and its planned streams.
 
 ## Stop, restart and resume
 
-Standalone recovery resumes whole verified phases, never a partially written
-frame. Durable phase receipts cover first-pass statistics, encoded video, the
-timing wrapper and final mux validation. The manifest binds the canonical
-job/output directory, original source fingerprint, encoder and helper binaries,
-settings, resolved filter/timing plan, frame count and artifact identities and
-hashes.
+New standalone jobs restart from the beginning after **Stop**. AV1AN can keep
+completed chunks for **Resume**.
 
-**Stop and keep progress** waits for the owned process tree and keeps the newest
-complete phase. After relaunch, **Resume** rechecks every binding before reuse and
-continues with the next phase. If a crash commits a manifest before job history is
-updated, restore may adopt that newer complete manifest only from the exact
-job-bound directory after an exclusive lock and strict request/settings/layout
-check; execution still performs the full source, tool, plan and artifact checks.
-Unknown, replaced or modified workspace entries are preserved and reject cleanup.
+Existing standalone workspaces can still resume from the last committed whole
+phase. The manifest binds the job and output directory, source contents, tool
+binaries, settings, resolved filter and timing plan, and retained artifacts.
+Resume rechecks these bindings before reuse. Restore can adopt a newer manifest
+from the exact job directory after an exclusive lock and request, settings, and
+layout checks. Unknown, replaced or modified workspace entries prevent cleanup.
 
-**Cancel job** and **Stop queue** also retain completed phase checkpoints for
-explicit **Resume**. They remove partial output and transient pass statistics;
-canceling before the first checkpoint leaves no saved progress. A retained
-checkpoint is bound to the job and must pass the same validation before reuse.
-
-The Windows real-media qualification stopped a two-pass direct x265 job after
+Before the standalone changes, Windows real-media qualification stopped a two-pass direct x265 job after
 `PassOneComplete`, reopened persisted history in a separate process, resumed pass
 two, and produced 48 decoded HEVC frames at exactly 2997/125 fps. The recovery
 workspace was removed only after successful publication. See the

@@ -83,6 +83,7 @@
     "allow-cancel-all-jobs",
     "allow-cancel-job",
     "allow-stop-job",
+    "allow-discard-job-progress",
     "allow-resume-job",
     "allow-list-jobs",
     "allow-open-encode-window",

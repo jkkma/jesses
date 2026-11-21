@@ -100,7 +100,8 @@ pub(in crate::jobs) async fn verify_source_join(
     let Some(join) = recovery.source_join_inputs(cancel).await? else {
         return Ok(None);
     };
-    let (header, clock) = super::encode::boxed(|| {
+    let mut concat_warnings = Vec::new();
+    let result = super::encode::boxed(|| {
         source_queue_concat::verify_with_clock(
             ffmpeg,
             ffprobe,
@@ -111,9 +112,20 @@ pub(in crate::jobs) async fn verify_source_join(
             join.source_rate,
             join.force_rate,
             cancel,
+            &mut concat_warnings,
         )
     })
-    .await?;
+    .await;
+    if !concat_warnings.is_empty() {
+        manager
+            .change(id, |snapshot| {
+                for warning in concat_warnings {
+                    append_log(snapshot, warning);
+                }
+            })
+            .await;
+    }
+    let (header, clock) = result?;
     if plan.has_source_filters() {
         plan.observe_source_filter_stream(&header, None)?;
     }
@@ -375,17 +387,6 @@ impl JobManager {
         } else {
             None
         };
-        if super::encode::thorough_verification(settings) {
-            options::capabilities(
-                &launch.executable,
-                ffmpeg,
-                &launch.environment,
-                &work,
-                settings,
-                cancel,
-            )
-            .await?;
-        }
         let _grain_table = grain::stage(&work, settings)?;
         let _hdr_resources = dynamic_hdr.stage_av1an(&work)?;
         let version = version_text
@@ -404,10 +405,6 @@ impl JobManager {
                 |sha256| recovery::version_with_vship(&version_text, sha256),
             );
         recovery.version(recovery_version).await?;
-        let thorough = super::encode::thorough_verification(settings);
-        if thorough {
-            recovery.verify_segments(ffmpeg, input, cancel).await?;
-        }
         let fresh_prepass_supported =
             !recovery.resume_chunks && scenes::supports_preload(&version_text);
         // The prepass replaces av1an's own single-process detection and builds
@@ -740,24 +737,6 @@ impl JobManager {
         if edited {
             return Ok(true);
         }
-        // Decoding the joined segments against the source only re-checks
-        // av1an's result; the finished file's frame count is checked anyway.
-        if super::encode::thorough_verification(settings) {
-            if matches!(
-                configured.chunk_method,
-                media_core::Av1anChunkMethod::Hybrid | media_core::Av1anChunkMethod::Segment
-            ) {
-                self.change(id, |snapshot| {
-                    append_log(
-                        snapshot,
-                        "Verifying the complete decoded segment sequence against the original source."
-                            .into(),
-                    )
-                })
-                .await;
-            }
-            recovery.verify_segments(ffmpeg, input, cancel).await?;
-        }
         video.flush_nonempty_async().await?;
         if settings
             .av1an_options
@@ -1083,14 +1062,14 @@ pub(super) mod tests {
             String::from_utf8_lossy(&source.stderr)
         );
         let manager = JobManager::new(root.join("logs"));
-        for (thorough, resample) in [(false, false), (true, false), (false, true)] {
+        for resample in [false, true] {
             CHUNK_PROOF_CALLS.set(0);
             REFERENCE_JOIN_CALLS.set(0);
             let request = EncodeRequest {
                 source: RemuxRequest {
                     input_path: input.to_string_lossy().into_owned(),
                     output_path: root
-                        .join(format!("{thorough}-{resample}.mkv"))
+                        .join(format!("{resample}.mkv"))
                         .to_string_lossy()
                         .into_owned(),
                     stream_indices: vec![0],
@@ -1119,7 +1098,7 @@ pub(super) mod tests {
                     encoding_preferences: Some(media_core::EncodingPreferences {
                         keyframe_interval_seconds: 10,
                         mp4_faststart: true,
-                        full_output_verification: thorough,
+                        retired_verification: (),
                     }),
                     ..Default::default()
                 },
@@ -1143,10 +1122,8 @@ pub(super) mod tests {
             .unwrap();
             assert_eq!(finished.state, JobState::Succeeded, "{finished:#?}");
             let calls = (CHUNK_PROOF_CALLS.get(), REFERENCE_JOIN_CALLS.get());
-            eprintln!(
-                "thorough={thorough} resample={resample}: chunk/reference proof calls {calls:?}"
-            );
-            assert_eq!(calls, if thorough || resample { (1, 1) } else { (0, 0) });
+            eprintln!("resample={resample}: chunk/reference proof calls {calls:?}");
+            assert_eq!(calls, if resample { (1, 1) } else { (0, 0) });
         }
         manager.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
@@ -1339,7 +1316,7 @@ pub(super) mod tests {
             encoding_preferences: Some(media_core::EncodingPreferences {
                 keyframe_interval_seconds: 2,
                 mp4_faststart: true,
-                full_output_verification: true,
+                retired_verification: (),
             }),
             av1an_options: Some(media_core::Av1anOptions {
                 source_workflow: true,

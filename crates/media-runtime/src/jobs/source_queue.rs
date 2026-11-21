@@ -56,9 +56,6 @@ struct Header {
     rate: Option<(u32, u32)>,
     duration: Option<String>,
 }
-fn normalized(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !matches!(*value, "unknown" | "unspecified" | "N/A"))
-}
 pub(super) fn stream_rate(stream: &Stream) -> Option<(u32, u32)> {
     stream
         .avg_frame_rate
@@ -98,49 +95,6 @@ impl Header {
                     .map(|(_, value)| value.clone())
             }),
         }
-    }
-    fn verify(&self, stream: &Stream, allow_absent_vp9: bool) -> Result<(), AppError> {
-        let actual = Self::from_stream(stream);
-        let optional = |actual: &Option<String>, expected: &Option<String>| {
-            normalized(actual.as_deref()) == normalized(expected.as_deref())
-                || (allow_absent_vp9 && actual.is_none())
-        };
-        if actual.codec != self.codec
-            || actual.width != self.width
-            || actual.height != self.height
-            || actual.pixel != self.pixel
-            || actual.sar != self.sar
-            || !optional(&actual.primaries, &self.primaries)
-            || !optional(&actual.transfer, &self.transfer)
-            || !optional(&actual.matrix, &self.matrix)
-            || !optional(&actual.range, &self.range)
-            || !optional(&actual.chroma, &self.chroma)
-        {
-            return Err(invalid(
-                Path::new(""),
-                "The video container header differs from the first sealed source chunk.",
-            ));
-        }
-        for expected in self.side_data.iter().filter(|value| {
-            matches!(
-                value
-                    .get("side_data_type")
-                    .and_then(serde_json::Value::as_str),
-                Some(
-                    "Mastering display metadata"
-                        | "Content light level metadata"
-                        | "DOVI configuration record"
-                )
-            )
-        }) {
-            if !actual.side_data.contains(expected) {
-                return Err(invalid(
-                    Path::new(""),
-                    "The video header lost or changed sealed source HDR metadata.",
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -205,19 +159,6 @@ impl Regions {
             .as_ref()
             .and_then(|header| header.rate)
     }
-    pub(in crate::jobs) fn reference_duration(&self) -> Option<f64> {
-        let value = self.reference_header.as_ref()?.duration.as_deref()?;
-        let seconds = value.parse::<f64>().ok().or_else(|| {
-            let mut parts = value.split(':');
-            let (h, m, s) = (
-                parts.next()?.parse::<f64>().ok()?,
-                parts.next()?.parse::<f64>().ok()?,
-                parts.next()?.parse::<f64>().ok()?,
-            );
-            parts.next().is_none().then_some(h * 3600.0 + m * 60.0 + s)
-        })?;
-        (seconds.is_finite() && seconds > 0.0).then_some(seconds)
-    }
     pub(in crate::jobs) fn with_reference_header(
         mut self: Arc<Self>,
         stream: &Stream,
@@ -246,16 +187,6 @@ impl Regions {
         regions.reference_header = Some(Header::from_stream(stream));
         regions.reference_clock = Some(clock);
         Ok(self)
-    }
-    pub(in crate::jobs) fn verify_header(
-        &self,
-        stream: &Stream,
-        allow_absent_vp9: bool,
-    ) -> Result<(), AppError> {
-        self.reference_header
-            .as_ref()
-            .unwrap_or(&self.chunks[0].header)
-            .verify(stream, allow_absent_vp9)
     }
     pub(in crate::jobs) fn cursor(self: &Arc<Self>, origin_shift: f64) -> Cursor {
         Cursor {

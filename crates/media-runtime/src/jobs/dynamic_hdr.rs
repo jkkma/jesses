@@ -1,13 +1,10 @@
-//! External metadata remains a separately guarded source. Only complete,
-//! unchanged frames are admitted; the encoded ITU-T T.35 payload is checked at
-//! its presentation timestamp before any output can be published.
+//! Validate per-frame HDR inputs and stage guarded copies for the encoders.
 use super::*;
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use hdr10plus::{
     metadata::{Hdr10PlusMetadata, Hdr10PlusMetadataEncOpts},
     metadata_json::MetadataJsonRoot,
 };
-use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
 const LIMIT: u64 = 256 * 1024 * 1024;
@@ -17,48 +14,9 @@ pub(super) const HDR10_NAME: &str = "jesses-hdr10plus.json";
 fn invalid(path: &Path, message: impl Into<String>) -> AppError {
     files::error("HDR_METADATA_INVALID", message, path)
 }
-fn hash(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-fn rpu_identity(rpu: &DoviRpu) -> Result<[u8; 32], String> {
-    let mut value = serde_json::to_value(rpu).map_err(|e| e.to_string())?;
-    value
-        .as_object_mut()
-        .expect("RPU object")
-        .remove("rpu_data_crc32");
-    fn canonical(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    canonical(value);
-                    if key == "ext_metadata_blocks"
-                        && let Some(blocks) = value.as_array_mut()
-                    {
-                        blocks.sort_by_cached_key(serde_json::Value::to_string);
-                    }
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    canonical(value)
-                }
-            }
-            _ => {}
-        }
-    }
-    // The Dolby writer and FFmpeg can order same-level extension records
-    // differently. Their complete fields remain authoritative; CRC is already
-    // verified by the native parser and reflects that representation order.
-    canonical(&mut value);
-    Ok(hash(
-        &serde_json::to_vec(&value).map_err(|e| e.to_string())?,
-    ))
-}
-
 struct Resource {
     source: Source,
     bytes: Vec<u8>,
-    expected: Vec<[u8; 32]>,
     name: &'static str,
     option: &'static str,
 }
@@ -67,7 +25,7 @@ pub(super) struct Resources {
     values: Vec<Resource>,
 }
 
-fn rpu_hashes(bytes: &[u8], frames: usize) -> Result<Vec<[u8; 32]>, String> {
+fn validate_rpu(bytes: &[u8], frames: usize) -> Result<(), String> {
     let mut starts = Vec::new();
     let mut index = 0;
     while index + 3 <= bytes.len() {
@@ -88,7 +46,6 @@ fn rpu_hashes(bytes: &[u8], frames: usize) -> Result<Vec<[u8; 32]>, String> {
             starts.len()
         ));
     }
-    let mut hashes = Vec::with_capacity(frames);
     for (index, (_, start)) in starts.iter().enumerate() {
         let end = starts
             .get(index + 1)
@@ -120,11 +77,10 @@ fn rpu_hashes(bytes: &[u8], frames: usize) -> Result<Vec<[u8; 32]>, String> {
                 "RPU frame {index} is not a complete profile 8.1 HDR10-compatible RPU. Convert profile 7 to 8.1 first."
             ));
         }
-        hashes.push(rpu_identity(&rpu)?);
     }
-    Ok(hashes)
+    Ok(())
 }
-fn json_hashes(bytes: &[u8], frames: usize) -> Result<Vec<[u8; 32]>, String> {
+fn validate_json(bytes: &[u8], frames: usize) -> Result<(), String> {
     let root: MetadataJsonRoot =
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if root.scene_info.len() != frames {
@@ -133,13 +89,21 @@ fn json_hashes(bytes: &[u8], frames: usize) -> Result<Vec<[u8; 32]>, String> {
             root.scene_info.len()
         ));
     }
-    root.scene_info.iter().enumerate().map(|(index, frame)| {
+    for (index, frame) in root.scene_info.iter().enumerate() {
         if frame.sequence_frame_index != index || frame.number_of_windows != 1 {
-            return Err(format!("HDR10+ frame {index} has an invalid SequenceFrameIndex or unsupported processing windows."));
+            return Err(format!(
+                "HDR10+ frame {index} has an invalid SequenceFrameIndex or unsupported processing windows."
+            ));
         }
         let metadata = Hdr10PlusMetadata::try_from(frame).map_err(|e| e.to_string())?;
-        metadata.encode_with_opts(&Hdr10PlusMetadataEncOpts { validate: true, with_country_code: true }).map(|data| hash(&data)).map_err(|e| format!("HDR10+ frame {index}: {e}"))
-    }).collect()
+        metadata
+            .encode_with_opts(&Hdr10PlusMetadataEncOpts {
+                validate: true,
+                with_country_code: true,
+            })
+            .map_err(|e| format!("HDR10+ frame {index}: {e}"))?;
+    }
+    Ok(())
 }
 
 impl Resources {
@@ -194,10 +158,10 @@ impl Resources {
                             "An HDR metadata resource exceeds 256 MiB.",
                         ));
                     }
-                    let expected = if dovi {
-                        rpu_hashes(&bytes, frames)
+                    if dovi {
+                        validate_rpu(&bytes, frames)
                     } else {
-                        json_hashes(&bytes, frames)
+                        validate_json(&bytes, frames)
                     }
                     .map_err(|error| invalid(&source.path, error))?;
                     source.verify()?;
@@ -205,7 +169,6 @@ impl Resources {
                     values.push(Resource {
                         source,
                         bytes,
-                        expected,
                         name,
                         option,
                     });
@@ -286,100 +249,6 @@ impl Resources {
         }
         Ok(staged)
     }
-    pub(super) fn verify_sources(&self) -> Result<(), AppError> {
-        for value in &self.values {
-            value.source.verify()?;
-        }
-        Ok(())
-    }
-    pub(super) async fn verify_output(
-        &self,
-        ffmpeg: &Path,
-        ffprobe: &Path,
-        input: &Path,
-        video_index: usize,
-        fps: (u32, u32),
-        cancel: &watch::Receiver<bool>,
-    ) -> Result<(), AppError> {
-        if self.values.is_empty() {
-            return Ok(());
-        }
-        self.verify_sources()?;
-        if self.values.iter().any(|value| value.name == DOVI_NAME) {
-            let document = probe(ffprobe, input, cancel, Some(&[video_index as u32])).await?;
-            let configurations = document
-                .streams
-                .iter()
-                .find(|stream| stream.index == video_index as u32)
-                .into_iter()
-                .flat_map(|stream| &stream.side_data_list)
-                .filter(|value| value["side_data_type"] == "DOVI configuration record")
-                .collect::<Vec<_>>();
-            if configurations.len() != 1
-                || !configurations.iter().all(|value| {
-                    let n = |key| value.get(key).and_then(serde_json::Value::as_u64);
-                    n("dv_version_major") == Some(1)
-                        && n("dv_version_minor") == Some(0)
-                        && n("dv_profile") == Some(10)
-                        && n("dv_level").is_some_and(|level| (1..=13).contains(&level))
-                        && n("rpu_present_flag") == Some(1)
-                        && n("el_present_flag") == Some(0)
-                        && n("bl_present_flag") == Some(1)
-                        && n("dv_bl_signal_compatibility_id") == Some(1)
-                        && value
-                            .get("dv_md_compression")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("none")
-                })
-            {
-                return Err(invalid(
-                    input,
-                    "The final container lacks the expected AV1 Dolby Vision profile10/HDR10-compatible configuration with an uncompressed RPU, base layer and no enhancement layer.",
-                ));
-            }
-        }
-        let expected = self
-            .values
-            .iter()
-            .map(|r| (r.name == DOVI_NAME, r.expected.clone()))
-            .collect::<Vec<_>>();
-        let output = supervisor::run_streaming_stdout(
-            &CommandSpec {
-                executable: ffmpeg.to_owned(),
-                args: vec![
-                    "-v".into(),
-                    "error".into(),
-                    "-nostdin".into(),
-                    "-i".into(),
-                    input.as_os_str().to_owned(),
-                    "-map".into(),
-                    format!("0:{video_index}").into(),
-                    "-c:v".into(),
-                    "copy".into(),
-                    "-f".into(),
-                    "ivf".into(),
-                    "pipe:1".into(),
-                ],
-                cwd: None,
-            },
-            cancel.clone(),
-            64 * 1024,
-            Duration::from_secs(24 * 60 * 60),
-            move |reader| verify_ivf(reader, &expected, fps),
-        )
-        .await
-        .map_err(|error| process_error(error, input))?;
-        if !output.status.success() || !output.stderr.is_empty() {
-            return Err(invalid(
-                input,
-                format!(
-                    "The encoded dynamic HDR payload could not be verified: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
-        }
-        self.verify_sources()
-    }
 }
 
 pub(super) struct Staged {
@@ -448,134 +317,6 @@ pub(super) async fn copy_encoded(
     .map_err(|error| AppError::new("OUTPUT_WRITE_FAILED", error.to_string(), None))?
 }
 
-fn leb(reader: &mut dyn Read, remaining: &mut u64) -> Result<u64, String> {
-    let mut value = 0;
-    for shift in (0..56).step_by(7) {
-        if *remaining == 0 {
-            return Err("Truncated AV1 OBU size.".into());
-        }
-        let mut byte = [0];
-        reader.read_exact(&mut byte).map_err(|e| e.to_string())?;
-        *remaining -= 1;
-        value |= u64::from(byte[0] & 127) << shift;
-        if byte[0] & 128 == 0 {
-            return Ok(value);
-        }
-    }
-    Err("Invalid AV1 OBU size.".into())
-}
-fn verify_ivf(
-    reader: &mut dyn Read,
-    expected: &[(bool, Vec<[u8; 32]>)],
-    fps: (u32, u32),
-) -> Result<(), String> {
-    let mut header = [0u8; 32];
-    reader.read_exact(&mut header).map_err(|e| e.to_string())?;
-    if &header[..4] != b"DKIF"
-        || &header[8..12] != b"AV01"
-        || u16::from_le_bytes(header[6..8].try_into().unwrap()) != 32
-    {
-        return Err("Invalid AV1 IVF header.".into());
-    }
-    let rate = u32::from_le_bytes(header[16..20].try_into().unwrap());
-    let scale = u32::from_le_bytes(header[20..24].try_into().unwrap());
-    if rate == 0 || scale == 0 {
-        return Err("Invalid IVF time base.".into());
-    }
-    let mut observed: Vec<Vec<bool>> = expected.iter().map(|(_, v)| vec![false; v.len()]).collect();
-    loop {
-        let mut packet = [0u8; 12];
-        if reader.read(&mut packet[..1]).map_err(|e| e.to_string())? == 0 {
-            break;
-        }
-        reader
-            .read_exact(&mut packet[1..])
-            .map_err(|e| e.to_string())?;
-        let mut remaining = u64::from(u32::from_le_bytes(packet[..4].try_into().unwrap()));
-        let pts = u64::from_le_bytes(packet[4..].try_into().unwrap());
-        let numerator = u128::from(pts) * u128::from(scale) * u128::from(fps.0);
-        let denominator = u128::from(rate) * u128::from(fps.1);
-        let index = usize::try_from((numerator + denominator / 2) / denominator)
-            .map_err(|e| e.to_string())?;
-        while remaining > 0 {
-            let mut byte = [0u8];
-            reader.read_exact(&mut byte).map_err(|e| e.to_string())?;
-            remaining -= 1;
-            let header = byte[0];
-            if header & 0x83 != 2 {
-                return Err("Invalid or unbounded AV1 OBU header.".into());
-            }
-            if header & 4 != 0 {
-                if remaining == 0 {
-                    return Err("Truncated AV1 extension.".into());
-                }
-                reader.read_exact(&mut byte).map_err(|e| e.to_string())?;
-                remaining -= 1;
-            }
-            let size = leb(reader, &mut remaining)?;
-            if size > remaining {
-                return Err("Truncated AV1 OBU payload.".into());
-            }
-            remaining -= size;
-            if (header >> 3) & 15 == 5 {
-                if size > 1024 * 1024 {
-                    return Err("An AV1 metadata OBU exceeds1MiB.".into());
-                }
-                let mut data = vec![0u8; size as usize];
-                reader.read_exact(&mut data).map_err(|e| e.to_string())?;
-                if data.first() != Some(&4) {
-                    continue;
-                } // metadata_type ITU-T T.35
-                let mut payload = &data[1..];
-                if payload.last() == Some(&0x80) {
-                    payload = &payload[..payload.len() - 1];
-                }
-                let dovi = payload.starts_with(&[0xB5, 0, 0x3B]);
-                let hdr10 = payload.starts_with(&[0xB5, 0, 0x3C, 0, 1, 4]);
-                if !dovi && !hdr10 {
-                    continue;
-                }
-                let Some(kind) = expected.iter().position(|(kind, _)| *kind == dovi) else {
-                    return Err("Unexpected dynamic HDR metadata in encoded video.".into());
-                };
-                let actual = if dovi {
-                    rpu_identity(
-                        &DoviRpu::parse_itu_t35_dovi_metadata_obu(payload)
-                            .map_err(|error| error.to_string())?,
-                    )?
-                } else {
-                    hash(payload)
-                };
-                if expected[kind].1.get(index) != Some(&actual) {
-                    return Err(format!(
-                        "Encoded {} payload differs from imported frame {index} (IVF PTS{pts}).",
-                        if dovi { "Dolby Vision" } else { "HDR10+" }
-                    ));
-                }
-                if observed[kind][index] {
-                    return Err(format!(
-                        "Duplicate dynamic HDR payload for source frame {index}."
-                    ));
-                }
-                observed[kind][index] = true;
-            } else {
-                let copied = std::io::copy(&mut reader.take(size), &mut std::io::sink())
-                    .map_err(|e| e.to_string())?;
-                if copied != size {
-                    return Err("Truncated AV1 frame.".into());
-                }
-            }
-        }
-    }
-    if observed
-        .iter()
-        .any(|frames| frames.iter().any(|present| !*present))
-    {
-        return Err("The encoder omitted dynamic HDR metadata from one or more source frames. This build may lack the required metadata library.".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,12 +337,12 @@ mod tests {
     #[test]
     fn resources_require_exact_complete_valid_frame_records() {
         let bytes = rpu(Default::default(), 81);
-        assert_eq!(rpu_hashes(&bytes, 1).unwrap().len(), 1);
-        assert!(rpu_hashes(&bytes, 2).is_err());
-        assert!(rpu_hashes(&bytes[..bytes.len() - 5], 1).is_err());
-        assert!(rpu_hashes(&rpu(Default::default(), 5), 1).is_err());
-        assert!(rpu_hashes(&rpu(Default::default(), 84), 1).is_err());
-        assert!(json_hashes(br#"{}"#, 1).is_err());
+        validate_rpu(&bytes, 1).unwrap();
+        assert!(validate_rpu(&bytes, 2).is_err());
+        assert!(validate_rpu(&bytes[..bytes.len() - 5], 1).is_err());
+        assert!(validate_rpu(&rpu(Default::default(), 5), 1).is_err());
+        assert!(validate_rpu(&rpu(Default::default(), 84), 1).is_err());
+        assert!(validate_json(br#"{}"#, 1).is_err());
         let frame = Hdr10PlusMetadata {
             profile: "A".into(),
             itu_t_t35_country_code: 0xB5,
@@ -624,68 +365,9 @@ mod tests {
             ..Default::default()
         };
         let mut json = hdr10plus::metadata_json::generate_json(&[&frame], "Jesses", "1");
-        json_hashes(&serde_json::to_vec(&json).unwrap(), 1).unwrap();
-        assert!(json_hashes(&serde_json::to_vec(&json).unwrap(), 2).is_err());
+        validate_json(&serde_json::to_vec(&json).unwrap(), 1).unwrap();
+        assert!(validate_json(&serde_json::to_vec(&json).unwrap(), 2).is_err());
         json["SceneInfo"][0]["SequenceFrameIndex"] = 1.into();
-        assert!(json_hashes(&serde_json::to_vec(&json).unwrap(), 1).is_err());
-    }
-    #[test]
-    fn rpu_identity_only_normalizes_extension_block_order_and_derived_crc() {
-        use dolby_vision::rpu::extension_metadata::{DmData, WithExtMetadataBlocks};
-        let a = DoviRpu::profile81_config(&GenerateConfig::default()).unwrap();
-        let mut b = a.clone();
-        b.rpu_data_crc32 = a.rpu_data_crc32.wrapping_add(1);
-        if let Some(DmData::V29(data)) = &mut b.vdr_dm_data.as_mut().unwrap().cmv29_metadata {
-            data.blocks_mut().reverse();
-        }
-        if let Some(DmData::V40(data)) = &mut b.vdr_dm_data.as_mut().unwrap().cmv40_metadata {
-            data.blocks_mut().reverse();
-        }
-        assert_eq!(rpu_identity(&a).unwrap(), rpu_identity(&b).unwrap());
-        b.vdr_dm_data.as_mut().unwrap().source_max_pq += 1;
-        assert_ne!(rpu_identity(&a).unwrap(), rpu_identity(&b).unwrap());
-        let mut b = a.clone();
-        b.header.vdr_rpu_level += 1;
-        assert_ne!(rpu_identity(&a).unwrap(), rpu_identity(&b).unwrap());
-    }
-    fn ivf(payloads: &[(u64, Vec<u8>)]) -> Vec<u8> {
-        let mut bytes = b"DKIF\0\0\x20\0AV01\x80\0\x60\0".to_vec();
-        bytes.extend(24u32.to_le_bytes());
-        bytes.extend(1u32.to_le_bytes());
-        bytes.extend([0; 8]);
-        for (pts, payload) in payloads {
-            let mut obu = vec![0x2a, (payload.len() + 2) as u8, 4];
-            obu.extend(payload);
-            obu.push(0x80);
-            bytes.extend((obu.len() as u32).to_le_bytes());
-            bytes.extend(pts.to_le_bytes());
-            bytes.extend(obu);
-        }
-        bytes
-    }
-    #[test]
-    fn encoded_t35_must_match_source_presentation_order_without_omission_or_duplicates() {
-        let a = vec![0xb5, 0, 0x3c, 0, 1, 4, 0x10];
-        let b = vec![0xb5, 0, 0x3c, 0, 1, 4, 0x20];
-        let expected = vec![(false, vec![hash(&a), hash(&b)])];
-        // Coded packet order can differ. Its exact PTS identifies the source.
-        assert!(
-            verify_ivf(
-                &mut ivf(&[(1, b.clone()), (0, a.clone())]).as_slice(),
-                &expected,
-                (24, 1)
-            )
-            .is_ok()
-        );
-        for packets in [
-            vec![(0, a.clone())],
-            vec![(0, a.clone()), (0, a.clone()), (1, b.clone())],
-            vec![(0, b.clone()), (1, a.clone())],
-        ] {
-            assert!(verify_ivf(&mut ivf(&packets).as_slice(), &expected, (24, 1)).is_err());
-        }
-        let mut bytes = ivf(&[(0, a), (1, b)]);
-        bytes.pop();
-        assert!(verify_ivf(&mut bytes.as_slice(), &expected, (24, 1)).is_err());
+        assert!(validate_json(&serde_json::to_vec(&json).unwrap(), 1).is_err());
     }
 }

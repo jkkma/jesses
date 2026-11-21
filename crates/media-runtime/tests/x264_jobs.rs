@@ -43,7 +43,7 @@ async fn lossless_ultrafast_preserves_pixels_when_the_video_start_header_is_abse
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 10,
                     mp4_faststart: true,
-                    full_output_verification: true,
+                    retired_verification: (),
                 }),
                 ..Default::default()
             },
@@ -67,12 +67,6 @@ async fn lossless_ultrafast_preserves_pixels_when_the_video_start_header_is_abse
     .await
     .unwrap();
     assert_eq!(completed.state, JobState::Succeeded, "{completed:?}");
-    assert!(
-        completed
-            .logs
-            .iter()
-            .any(|line| line.contains("Verified lossless decoded pixel"))
-    );
     let mut hashes = Vec::new();
     for path in [&input, &destination] {
         hashes.push(

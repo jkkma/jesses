@@ -7,6 +7,7 @@
     "allow-subscribe-jobs",
     "allow-cancel-job",
     "allow-stop-job",
+    "allow-discard-job-progress",
     "allow-resume-job",
     "allow-set-job-paused",
     "allow-open-directory"

@@ -799,6 +799,44 @@ fn effective_rate(stream: &serde_json::Value) -> f64 {
     panic!("No valid nominal rate: {stream}")
 }
 #[tokio::test]
+#[ignore = "requires qualified FFmpeg/FFprobe, mkvmerge and standalone SVT HDR, AOM and VPX"]
+async fn standalone_ivf_keeps_the_sample_aspect_and_geometry_from_the_filtered_pipe() {
+    let fixture = Fixture::new();
+    let input = source(&fixture.0, false).await;
+    let original = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (encoder, preset) in [
+        (VideoEncoder::SvtAv1Hdr, 12),
+        (VideoEncoder::AomAv1, 8),
+        (VideoEncoder::VpxStandalone, 4),
+    ] {
+        let destination = fixture.0.join(format!("{encoder:?}.mkv"));
+        let mut settings = settings(EncodeBackend::Standalone);
+        settings.encoder = encoder;
+        settings.preset = preset;
+        settings.source_filters = true;
+        settings.av1an_filters = vec!["scale=128:96,setsar=3/4".into()];
+        let job = manager
+            .start_encode(request(&input, &destination, settings))
+            .await
+            .unwrap();
+        let result = finish(&manager, &job.id).await;
+        assert_eq!(
+            result.state,
+            JobState::Succeeded,
+            "{encoder:?}: {result:#?}"
+        );
+        let stream = video_summary(&destination).await;
+        assert_eq!(stream["width"], 128, "{encoder:?}");
+        assert_eq!(stream["height"], 96, "{encoder:?}");
+        assert_eq!(stream["sample_aspect_ratio"], "3:4", "{encoder:?}");
+        assert_eq!(stream["nb_read_frames"], "4", "{encoder:?}");
+    }
+    manager.shutdown().await;
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
+#[tokio::test]
 #[ignore = "requires qualified CPU FFmpeg and pinned SVT HDR provider"]
 async fn source_cpu_svt_raw_geometry_fps_and_pts_match_the_actual_fork_pipe() {
     for (name, graph) in [

@@ -1091,11 +1091,10 @@ async fn qualify_options(
     let source_bytes = std::fs::read(&input).unwrap();
     let mut original_request = request(&input, &destination, encoder);
     original_request.settings.av1an_options = options;
-    // The decoded audio evidence checked below comes only from thorough runs.
     original_request.settings.encoding_preferences = Some(media_core::EncodingPreferences {
         keyframe_interval_seconds: 10,
         mp4_faststart: true,
-        full_output_verification: true,
+        retired_verification: (),
     });
     if options
         .and_then(|options| options.target_quality)
@@ -1355,13 +1354,6 @@ async fn qualify_options(
     );
     if transformed {
         assert_eq!(streams[0]["channels"], 2);
-        assert!(
-            finished
-                .logs
-                .iter()
-                .any(|line| line.contains("Validated audio:")),
-            "Converted audio must pass decoded timeline verification"
-        );
     }
     assert_eq!(streams[0]["tags"]["language"], "jpn");
     assert_eq!(streams[1]["codec_name"], "av1");
@@ -1462,7 +1454,7 @@ async fn qualify_options(
 
 #[tokio::test]
 #[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
-async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verification() {
+async fn source_queue_resume_rejects_changed_source_and_reuses_exact_chunks() {
     let fixture = Fixture::new();
     let input = fixture.0.join("source.mkv");
     let destination = fixture.0.join("resumed.mkv");
@@ -1482,7 +1474,7 @@ async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verificat
     original.settings.encoding_preferences = Some(media_core::EncodingPreferences {
         keyframe_interval_seconds: 1,
         mp4_faststart: true,
-        full_output_verification: false,
+        retired_verification: (),
     });
 
     let manager = JobManager::open(logs.clone(), history.clone()).await;
@@ -1519,6 +1511,10 @@ async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verificat
         .collect();
     assert!(!retained.is_empty());
     assert_eq!(manifest["source_chunk_history_needs_proof"], false);
+    assert_eq!(
+        manifest["source"]["sha256"],
+        format!("{:x}", Sha256::digest(&source_bytes))
+    );
 
     let manager = JobManager::open(logs, history).await;
     manager.ready().await.unwrap();
@@ -1527,6 +1523,34 @@ async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verificat
     assert_eq!(saved.recovery.as_ref(), Some(recovery));
     assert_eq!(saved.request, original.source);
     assert_eq!(saved.encode_settings.as_ref(), Some(&original.settings));
+    let source_time = std::fs::metadata(&input).unwrap().modified().unwrap();
+    let write_preserving_time = |bytes: &[u8]| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&input)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(source_time))
+            .unwrap();
+    };
+    let mut edited = source_bytes.clone();
+    *edited.last_mut().unwrap() ^= 1;
+    write_preserving_time(&edited);
+    assert_eq!(
+        std::fs::metadata(&input).unwrap().modified().unwrap(),
+        source_time
+    );
+    let rejected = rejected_resume(&manager, &saved.id).await;
+    assert_eq!(rejected.code, "RECOVERY_INVALID");
+    assert!(
+        rejected.message.contains("original source changed"),
+        "{rejected:?}"
+    );
+    for file in &retained {
+        file.assert_unchanged();
+    }
+    write_preserving_time(&source_bytes);
     manager.resume_job(saved.id.clone()).await.unwrap();
     let reuse = format!("encoding resumed with {}/", retained.len());
     let resumed = wait_for(&manager, &saved.id, |job| {
@@ -1594,7 +1618,7 @@ async fn exact_source_queue_stops_reopens_and_reuses_chunks_with_basic_verificat
     assert_eq!(streams[1]["codec_name"], "av1");
     assert_eq!(streams[1]["nb_read_frames"], FRAMES.to_string());
     eprintln!(
-        "Basic Saved output decoded all {FRAMES} frames, kept four streams, and preserved the source."
+        "Resumed output decoded all {FRAMES} frames, kept four streams, and preserved the source."
     );
 }
 

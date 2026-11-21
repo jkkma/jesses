@@ -43,6 +43,74 @@ impl Tools {
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(Into::into).collect()
 }
+
+#[test]
+#[ignore = "subprocess fixture invoked by concat exit-status tests"]
+fn concat_status_fixture() {
+    let path = fs::read_to_string("fixture-output-path.txt").unwrap();
+    let code = fs::read_to_string("fixture-exit-code.txt")
+        .unwrap()
+        .parse()
+        .unwrap();
+    fs::write(path, b"data from reference tool").unwrap();
+    println!("Warning: fixture diagnostic on stdout");
+    eprintln!("fixture diagnostic on stderr");
+    std::process::exit(code);
+}
+
+#[tokio::test]
+async fn mkvmerge_warning_retains_diagnostics_and_strict_tool_still_fails() {
+    let (_owner, cancel) = watch::channel(false);
+    for (status, mkvmerge) in [(0, true), (1, true), (1, false), (2, true)] {
+        let fixture = Fixture::new();
+        let args = args(&[
+            "--exact",
+            "jobs::av1an::source_queue_concat::tests::concat_status_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        let spec = CommandSpec {
+            executable: std::env::current_exe().unwrap(),
+            args,
+            cwd: Some(fixture.0.clone()),
+        };
+        let mut output = Temporary::create(&fixture.0.join("reference.mkv"), "check").unwrap();
+        fs::write(
+            fixture.0.join("fixture-output-path.txt"),
+            output.path.to_str().unwrap(),
+        )
+        .unwrap();
+        fs::write(fixture.0.join("fixture-exit-code.txt"), status.to_string()).unwrap();
+        let mut warnings = Vec::new();
+        let result = copy(
+            &spec,
+            &mut output,
+            &cancel,
+            mkvmerge.then_some(&mut warnings),
+        )
+        .await;
+        match (status, mkvmerge) {
+            (0, true) => {
+                result.unwrap();
+                assert!(warnings.is_empty());
+            }
+            (1, true) => {
+                result.unwrap();
+                assert_eq!(warnings.len(), 1);
+                let warning = &warnings[0];
+                assert!(warning.contains("exit 1") && warning.contains("diagnostic on stdout"));
+                assert!(warning.contains("diagnostic on stderr"));
+                assert_eq!(fs::read(&output.path).unwrap(), b"data from reference tool");
+            }
+            _ => {
+                let error = result.unwrap_err();
+                assert!(warnings.is_empty());
+                assert!(error.message.contains("diagnostic on stderr"), "{error:?}");
+            }
+        }
+    }
+}
+
 async fn run(
     executable: &Path,
     args: Vec<OsString>,
@@ -340,6 +408,7 @@ async fn sealed_chunks_match_source_selected_concat_methods_and_reference_clocks
             rate,
             force,
             &cancel,
+            &mut Vec::new(),
         )
         .await
         .unwrap_or_else(|cause| panic!("{codec} {method:?}: {cause:?}"));
@@ -533,6 +602,7 @@ async fn concat_proof_rejects_changed_payload_missing_reordered_clock_header_and
         (123, 1),
         false,
         &cancel,
+        &mut Vec::new(),
     )
     .await
     .unwrap_err();

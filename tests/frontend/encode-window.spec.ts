@@ -203,7 +203,7 @@ test('dedicated monitor follows job progress and keeps the final result and log'
   await expect(page.getByLabel('Job log', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Job log', { exact: true })).toContainText('Encoding a test video.');
   await expect(page.getByRole('button', { name: 'Pause encoding', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Cancel job', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Job queue and history' })).toHaveCount(0);
   await page.getByRole('button', { name: 'Pause encoding', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Continue encoding', exact: true })).toBeVisible();
@@ -222,6 +222,86 @@ test('dedicated monitor follows job progress and keeps the final result and log'
       (globalThis as any).__sourceCalls.some((c: any) => c.command === 'plugin:window|close'),
     ),
   ).toBe(false);
+});
+
+for (const state of ['preparing', 'running', 'paused', 'finalizing']) {
+  test(`fresh Quick Convert can stop while ${state} without offering resume`, async ({ page }) => {
+    await page.addInitScript(
+      (entry) => sessionStorage.setItem('test-initial-jobs', JSON.stringify([entry])),
+      { ...job, state },
+    );
+    await installSourceEncodeFixture(page);
+    await page.goto('/?window=quick-convert');
+    await expect(page.getByRole('button', { name: 'Stop and keep progress' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Stopped' })).toBeVisible();
+    await expect(page.getByText('Start a new job to encode this source.')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Resume saved job' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Discard saved progress' })).toHaveCount(0);
+  });
+}
+
+for (const state of ['running', 'canceled']) {
+  test(`Quick Convert exposes the saved checkpoint for a ${state} job`, async ({ page }) => {
+    await page.addInitScript(
+      (entry) => sessionStorage.setItem('test-initial-jobs', JSON.stringify([entry])),
+      {
+        ...job,
+        state,
+        standaloneRecovery: {
+          workspace: '/media/.jesses-quick-job.standalone',
+          phase: 'passOneComplete',
+          completedFrames: 0,
+          totalFrames: 120,
+        },
+      },
+    );
+    await installSourceEncodeFixture(page);
+    await page.goto('/?window=quick-convert');
+    if (state === 'running') {
+      await page.getByRole('button', { name: 'Stop and keep progress' }).click();
+      await expect(page.getByRole('status').filter({ hasText: 'Stopped' })).toBeVisible();
+    }
+    const resume = page.getByRole('button', { name: 'Resume saved job' });
+    await expect(resume).toBeVisible();
+    await page.getByRole('button', { name: 'Discard saved progress' }).click();
+    await expect(resume).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Discard saved progress' })).toHaveCount(0);
+    expect(
+      await page.evaluate(() =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'discard_job_progress'),
+      ),
+    ).toMatchObject([{ payload: { id: job.id } }]);
+  });
+}
+
+test('a canceled checkpoint remains accessible from Settings when a newer job exists', async ({
+  page,
+}) => {
+  await page.addInitScript(
+    (entries) => sessionStorage.setItem('test-initial-jobs', JSON.stringify(entries)),
+    [
+      { ...job, id: 'newer', state: 'succeeded' },
+      {
+        ...job,
+        state: 'canceled',
+        standaloneRecovery: {
+          workspace: '/media/.jesses-quick-job.standalone',
+          phase: 'videoComplete',
+          completedFrames: 120,
+          totalFrames: 120,
+        },
+      },
+    ],
+  );
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByText('Saved requests and resume compatibility', { exact: true }).click();
+  await page.getByLabel('Encode from history').selectOption(job.id);
+  await expect(page.getByRole('button', { name: 'Resume saved job' })).toBeVisible();
+  await page.getByRole('button', { name: 'Discard saved progress' }).click();
+  await expect(page.getByText('Discarded the saved encoder progress.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Resume saved job' })).toHaveCount(0);
 });
 
 test('a confirmed Quick Convert opens the monitor even if the job finishes immediately', async ({
@@ -280,7 +360,7 @@ test('window creation failure reports an error without failing or resubmitting t
   ).toHaveLength(1);
 });
 
-test('monitor cancellation targets only the displayed Quick Convert job', async ({ page }) => {
+test('monitor stop targets only the displayed Quick Convert job', async ({ page }) => {
   await page.addInitScript(
     (entry) =>
       sessionStorage.setItem(
@@ -294,8 +374,8 @@ test('monitor cancellation targets only the displayed Quick Convert job', async 
   );
   await installSourceEncodeFixture(page);
   await page.goto('/?window=quick-convert');
-  await page.getByRole('button', { name: 'Cancel job', exact: true }).click();
-  await expect(page.getByRole('status', { exact: true })).toHaveText('Canceled');
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await expect(page.getByRole('status', { exact: true })).toHaveText('Stopped');
   expect(
     await page.evaluate(
       () => (globalThis as any).__testJobs.find((entry: any) => entry.id === 'other').state,
@@ -367,7 +447,7 @@ for (const viewport of [
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
       viewport.width + 1,
     );
-    for (const name of ['Pause encoding', 'Stop and keep progress', 'Cancel job']) {
+    for (const name of ['Pause encoding', 'Stop']) {
       const control = page.getByRole('button', { name, exact: true });
       await control.scrollIntoViewIfNeeded();
       const bounds = await control.boundingBox();

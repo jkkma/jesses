@@ -676,15 +676,13 @@ impl JobManager {
                     .await;
             }
             return self
-                .finalize_verified(
+                .finalize(
                     id,
                     cancel,
                     &source,
                     Some(&external),
                     temp,
                     &output,
-                    None,
-                    None,
                     None,
                     scratch,
                 )
@@ -975,7 +973,6 @@ impl JobManager {
             Some(&external),
             temp,
             &output,
-            None,
             None,
             scratch,
         )

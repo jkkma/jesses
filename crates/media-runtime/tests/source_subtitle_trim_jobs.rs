@@ -274,7 +274,7 @@ async fn source_trim_subtitle_formats_and_no_audio_keep_source_mux_clocks() {
             req.settings.encoding_preferences = Some(EncodingPreferences {
                 mp4_faststart: true,
                 keyframe_interval_seconds: 10,
-                full_output_verification: true,
+                retired_verification: (),
             });
         }
         let manager = JobManager::new(f.0.join("logs"));

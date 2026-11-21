@@ -66,7 +66,7 @@ async fn aom_10bit_left_chroma_raw_input_preserves_four_lossless_frames() {
                 encoding_preferences: Some(media_core::EncodingPreferences {
                     keyframe_interval_seconds: 10,
                     mp4_faststart: true,
-                    full_output_verification: true,
+                    retired_verification: (),
                 }),
                 ..Default::default()
             },
@@ -91,12 +91,6 @@ async fn aom_10bit_left_chroma_raw_input_preserves_four_lossless_frames() {
     .unwrap();
     assert_eq!(completed.state, JobState::Succeeded, "{completed:?}");
     assert!(completed.logs.iter().any(|line| line.contains("raw I420")));
-    assert!(
-        completed
-            .logs
-            .iter()
-            .any(|line| line.contains("Verified lossless decoded pixel"))
-    );
     assert_eq!(std::fs::read(&input).unwrap(), source_before);
     let frames = output(
         command("ffprobe")

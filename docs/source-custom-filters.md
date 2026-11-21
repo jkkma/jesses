@@ -41,7 +41,7 @@ All paths below were exercised with the CPU-only FFmpeg9+Vulkan delivery. They d
 
 The directly affected default2MiB-thread matrix passes without a stack override. GDB shows the production `encode_video_mode` reserved poll frame reduced from1,157,648 to349792bytes after the complete held-program and QTGMC preparation phases were isolated behind non-inlined boxed-construction boundaries, together with the console owner's heap-constructed process-profile scopes. Parent assets and finalization remain outside that phase. Exact frame addresses and normal debugger exit are in `source-filter-stack-frame.json`, `source-filter-stack-debug.log` and `source-filter-stack-after.log`.
 
-The test-only actual-argv/fault wrapper is checked in at `tests/fixtures/source-filter-ffmpeg-wrapper.py`. It forwards to `JESSES_TEST_REAL_FFMPEG`, appends argv to a dedicated `JESSES_TEST_FILTER_INVOCATIONS` JSONL file and optionally consumes `JESSES_TEST_FAIL_MUX` containing the exact native job ID for a single final-mux failure after the video checkpoint.
+The test-only FFmpeg wrapper at `tests/fixtures/source-filter-ffmpeg-wrapper.py` records argv to `JESSES_TEST_FILTER_INVOCATIONS` and forwards the command to `JESSES_TEST_REAL_FFMPEG`.
 
 An earlier two-frame x265 reference assertion was not reproducibly diagnosed as a provider failure. An independent exact replay returned producer0/consumer0; `short-x265-provider-status.json` and logs record that result. The eight-frame conformance fixture is retained without claiming a provider-crash limitation.
 

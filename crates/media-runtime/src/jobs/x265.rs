@@ -85,49 +85,6 @@ pub(super) fn arguments(plan: &Plan, settings: &EncodeSettings) -> Vec<OsString>
     args
 }
 
-pub(super) fn validate_help(help: &str, depth: u8, lossless: bool) -> Result<(), String> {
-    let mut required = vec![
-        "--input",
-        "--output",
-        "--fps",
-        "--output-depth",
-        "--preset",
-        "--sar",
-        "--range",
-        "--colorprim",
-        "--transfer",
-        "--colormatrix",
-        "--chromaloc",
-        "--crf",
-        "--bitrate",
-        "--pass",
-        "--stats",
-    ];
-    if lossless {
-        required.push("--lossless");
-    }
-    let advertises = |option: &str| {
-        help.split_whitespace().any(|word| {
-            word == option || word.ends_with(option) || word.replace("[no-]", "") == option
-        })
-    };
-    if required.iter().any(|option| !advertises(option))
-        || !help.lines().any(|line| {
-            line.split_whitespace()
-                .any(|word| word.ends_with("--output-depth"))
-                && line.split_whitespace().any(|word| {
-                    word.split('|')
-                        .any(|value| value.parse::<u8>() == Ok(depth))
-                })
-        })
-    {
-        return Err(format!(
-            "The installed x265 CLI must advertise Y4M stdin, raw stdout, {depth}-bit output, color metadata, pass statistics, and the selected lossless capability."
-        ));
-    }
-    Ok(())
-}
-
 pub(super) fn mkvmerge_arguments(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -141,17 +98,4 @@ pub(super) fn mkvmerge_arguments(
         format!("0:{}/{}p", plan.fps_num, plan.fps_den).into(),
         input.as_os_str().to_owned(),
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_x265_bracketed_boolean_lossless_switch() {
-        let help = "--input --output --fps -D/--output-depth 8|10|12 --preset --sar --range \
-                    --colorprim --transfer --colormatrix --chromaloc --crf --bitrate --pass \
-                    --stats --[no-]lossless";
-        assert!(validate_help(help, 10, true).is_ok());
-    }
 }
