@@ -34,14 +34,14 @@ fn error(code: &str, message: impl Into<String>, path: &Path) -> AppError {
 
 pub(crate) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<(), AppError> {
     if *cancel.borrow() || cancel.has_changed().is_err() {
-        Err(AppError::new(
-            "ANALYSIS_CANCELLED",
-            "Source analysis was canceled.",
-            None,
-        ))
+        Err(cancellation_error())
     } else {
         Ok(())
     }
+}
+
+fn cancellation_error() -> AppError {
+    AppError::new("ANALYSIS_CANCELLED", "Source analysis was canceled.", None)
 }
 
 async fn cancelled(mut cancel: watch::Receiver<bool>) {
@@ -58,16 +58,20 @@ pub(crate) async fn permit(
     check_cancel(cancel)?;
     tokio::select! {
         biased;
-        _ = cancelled(cancel.clone()) => Err(AppError::new("ANALYSIS_CANCELLED", "Source analysis was canceled.", None)),
+        _ = cancelled(cancel.clone()) => Err(cancellation_error()),
         result = ANALYSES.acquire() => Ok(result.expect("analysis semaphore stays open")),
     }
 }
 
 pub(crate) async fn tool(name: &str, cancel: &watch::Receiver<bool>) -> Result<PathBuf, AppError> {
     check_cancel(cancel)?;
-    let found = find_executable(&[name])
-        .await
-        .map_err(|detail| AppError::new("TOOL_DISCOVERY_FAILED", detail, None))?;
+    let names = [name];
+    let found = tokio::select! {
+        biased;
+        _ = cancelled(cancel.clone()) => return Err(cancellation_error()),
+        result = find_executable(&names) => result,
+    }
+    .map_err(|detail| AppError::new("TOOL_DISCOVERY_FAILED", detail, None))?;
     check_cancel(cancel)?;
     found.ok_or_else(|| {
         AppError::new(

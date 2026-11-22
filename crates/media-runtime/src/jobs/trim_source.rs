@@ -43,6 +43,7 @@ impl SourceTrim {
         interval: Interval,
         source: &Document,
         selected: &[&Stream],
+        staged_indices: &[u32],
         external: &ExternalTracks,
         ffmpeg: &Path,
         input: &Path,
@@ -56,7 +57,10 @@ impl SourceTrim {
         }
         let (seek, duration) = window(settings, interval, source)?;
         let mut tracks = Vec::new();
-        for stream in selected {
+        for stream in selected
+            .iter()
+            .filter(|stream| !staged_indices.contains(&stream.index))
+        {
             let mode = settings
                 .subtitles
                 .iter()

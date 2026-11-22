@@ -667,20 +667,7 @@ pub(super) async fn inspect(
     }
     // Missing encoders are a discovery failure before any media subprocess is
     // started, including this lightweight normalization inspection.
-    if crate::discovery::find_video_encoder(settings.encoder)
-        .await
-        .map_err(|message| AppError::new("TOOL_DISCOVERY_FAILED", message, None))?
-        .is_none()
-    {
-        return Err(AppError::new(
-            "TOOL_MISSING",
-            format!(
-                "{} was not found. Check its separate entry in Tools.",
-                settings.encoder.name()
-            ),
-            None,
-        ));
-    }
+    super::discover_video_encoder(settings.encoder, cancel).await?;
     let ffprobe = discover("ffprobe", cancel).await?;
     let document = probe_headers(
         &ffprobe,

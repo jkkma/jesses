@@ -27,6 +27,10 @@ export function isSvtEncoder(encoder: VideoEncoder): boolean {
   return encoder === 'svtAv1' || encoder === 'svtAv1FiveFish' || encoder === 'svtAv1Hdr';
 }
 
+export function encoderSupportsHdr10(encoder: VideoEncoder): boolean {
+  return isSvtEncoder(encoder) || ['aomAv1', 'x265Standalone', 'x265'].includes(encoder);
+}
+
 export function isAv1anEncoder(encoder: VideoEncoder): boolean {
   return (
     isSvtEncoder(encoder) || ['x264', 'x265Standalone', 'aomAv1', 'vpxStandalone'].includes(encoder)

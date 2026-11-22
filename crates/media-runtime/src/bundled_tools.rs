@@ -5,7 +5,11 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -14,6 +18,7 @@ use sha2::{Digest, Sha256};
 static RESOURCE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const TOOL_LIMIT: u64 = 512 * 1024 * 1024;
+const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Set the package resource root once during desktop startup. This does not
 /// modify PATH, per-user tool installs, or any application data.
@@ -71,7 +76,38 @@ pub(crate) fn find(id: &str) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     };
     let root = checked_resource_root(resource_dir)?;
-    find_at(&root, id)
+    find_at(&root, id, &|| false)
+}
+
+/// A package integrity check reads full executables and dependencies. Keep its
+/// budget separate from PATH discovery and the eventual version subprocess.
+pub(crate) async fn find_verified(id: &'static str) -> Result<Option<PathBuf>, String> {
+    let Some(resource_dir) = RESOURCE_DIRECTORY.get() else {
+        return Ok(None);
+    };
+    let cancel = CancelVerification(Arc::new(AtomicBool::new(false)));
+    let cancelled = cancel.0.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let cancelled = || cancelled.load(Ordering::Relaxed);
+        check_cancelled(id, &cancelled)?;
+        let root = checked_resource_root(resource_dir)?;
+        find_at(&root, id, &cancelled)
+    });
+    match tokio::time::timeout(VERIFICATION_TIMEOUT, worker).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!(
+            "Bundled {id} verification could not finish: {error}"
+        )),
+        Err(_) => Err(format!("Bundled {id} verification timed out.")),
+    }
+}
+
+struct CancelVerification(Arc<AtomicBool>);
+
+impl Drop for CancelVerification {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 fn checked_resource_root(resource_dir: &Path) -> Result<PathBuf, String> {
@@ -87,8 +123,12 @@ fn checked_resource_root(resource_dir: &Path) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-fn find_at(root: &Path, id: &str) -> Result<Option<PathBuf>, String> {
-    Ok(find_tool_at(root, id)?.map(|tool| tool.executable))
+fn find_at(
+    root: &Path,
+    id: &str,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<PathBuf>, String> {
+    Ok(find_tool_at(root, id, cancelled)?.map(|tool| tool.executable))
 }
 
 struct VerifiedTool {
@@ -120,7 +160,8 @@ fn av1an_runtime_at(root: &Path, executable: &Path) -> Result<Option<PathBuf>, S
     if executable.canonicalize().ok().as_ref() != Some(&expected) {
         return Ok(None);
     }
-    let verified = find_tool_at(root, "av1an")?.ok_or("The bundled av1an record is missing.")?;
+    let verified =
+        find_tool_at(root, "av1an", &|| false)?.ok_or("The bundled av1an record is missing.")?;
     if verified.executable != expected {
         return Err("The bundled av1an record changed its executable path.".into());
     }
@@ -234,7 +275,19 @@ fn runtime_inventory(
     Ok(())
 }
 
-fn find_tool_at(root: &Path, id: &str) -> Result<Option<VerifiedTool>, String> {
+fn check_cancelled(id: &str, cancelled: &impl Fn() -> bool) -> Result<(), String> {
+    if cancelled() {
+        return Err(format!("Bundled {id} verification was canceled."));
+    }
+    Ok(())
+}
+
+fn find_tool_at(
+    root: &Path,
+    id: &str,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<VerifiedTool>, String> {
+    check_cancelled(id, cancelled)?;
     let root_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -289,7 +342,7 @@ fn find_tool_at(root: &Path, id: &str) -> Result<Option<VerifiedTool>, String> {
     if tool.support_files.len() > 256 {
         return Err(format!("Bundled {id} has too many runtime dependencies."));
     }
-    let executable = verify_payload(root, &tool.path, &tool.sha256, id, true)?;
+    let executable = verify_payload(root, &tool.path, &tool.sha256, id, true, cancelled)?;
     let mut paths = HashSet::new();
     let mut verified_support = HashSet::new();
     paths.insert(&tool.path);
@@ -303,6 +356,7 @@ fn find_tool_at(root: &Path, id: &str) -> Result<Option<VerifiedTool>, String> {
             &support.sha256,
             id,
             false,
+            cancelled,
         )?);
     }
     Ok(Some(VerifiedTool {
@@ -317,7 +371,9 @@ fn verify_payload(
     checksum: &str,
     id: &str,
     executable: bool,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<PathBuf, String> {
+    check_cancelled(id, cancelled)?;
     let relative = Path::new(name);
     if name.is_empty()
         || name.contains(['\\', ':'])
@@ -374,6 +430,7 @@ fn verify_payload(
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        check_cancelled(id, cancelled)?;
         let read = file
             .read(&mut buffer)
             .map_err(|error| format!("Cannot verify bundled {id}: {error}"))?;
@@ -382,6 +439,7 @@ fn verify_payload(
         }
         hash.update(&buffer[..read]);
     }
+    check_cancelled(id, cancelled)?;
     if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(checksum) {
         return Err(format!(
             "Bundled {id} failed its SHA-256 integrity check. Restore the package or choose an explicit tool override."
@@ -393,6 +451,10 @@ fn verify_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_at(root: &Path, id: &str) -> Result<Option<PathBuf>, String> {
+        super::find_at(root, id, &|| false)
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {
@@ -465,6 +527,63 @@ mod tests {
         assert!(find_at(&fixture.0, "ffmpeg").is_err());
         fs::write(fixture.0.join("manifest.json"), b"broken manifest").unwrap();
         assert!(find_at(&fixture.0, "ffmpeg").is_err());
+    }
+
+    #[test]
+    fn repeat_discovery_rejects_corruption_even_with_restored_file_metadata() {
+        let fixture = Fixture::new();
+        fixture.stage();
+        let path = fixture.0.join(fixture.executable());
+        assert!(find_at(&fixture.0, "ffmpeg").unwrap().is_some());
+
+        let original = fs::metadata(&path).unwrap();
+        fs::write(&path, vec![0; original.len() as usize]).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original.modified().unwrap()))
+            .unwrap();
+        let changed = fs::metadata(&path).unwrap();
+        assert_eq!(changed.len(), original.len());
+        assert_eq!(changed.modified().unwrap(), original.modified().unwrap());
+        assert!(
+            find_at(&fixture.0, "ffmpeg")
+                .unwrap_err()
+                .contains("integrity")
+        );
+    }
+
+    #[test]
+    fn canceling_one_verification_does_not_cancel_concurrent_discovery_or_retries() {
+        let fixture = Fixture::new();
+        fixture.stage();
+        let cancel = CancelVerification(Arc::new(AtomicBool::new(false)));
+        let state = cancel.0.clone();
+        let (reached_hash, reached) = std::sync::mpsc::channel();
+        let (proceed, resume_hash) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = &fixture.0;
+            let worker = scope.spawn(move || {
+                let checks = std::cell::Cell::new(0);
+                super::find_at(root, "ffmpeg", &|| {
+                    checks.set(checks.get() + 1);
+                    // The second hash checkpoint comes after the first file read.
+                    if checks.get() == 4 {
+                        reached_hash.send(()).unwrap();
+                        resume_hash.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    state.load(Ordering::Relaxed)
+                })
+            });
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let other = find_at(&fixture.0, "ffmpeg");
+            drop(cancel);
+            proceed.send(()).unwrap();
+            assert!(worker.join().unwrap().unwrap_err().contains("canceled"));
+            assert!(other.unwrap().is_some());
+        });
+        assert!(find_at(&fixture.0, "ffmpeg").unwrap().is_some());
     }
 
     #[test]

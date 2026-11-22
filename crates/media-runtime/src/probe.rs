@@ -438,16 +438,18 @@ pub async fn probe_media_cancellable(
             )
         })?
         .to_owned();
-    let executable = find_executable(&["ffprobe"])
-        .await
-        .map_err(|detail| fail("TOOL_DISCOVERY_FAILED", detail))?
-        .ok_or_else(|| {
-            fail(
-                "TOOL_MISSING",
-                "FFprobe was not found on PATH. Install FFmpeg with FFprobe and restart jesses."
-                    .into(),
-            )
-        })?;
+    let executable = tokio::select! {
+        biased;
+        _ = crate::supervisor::cancelled(cancel.clone()) => return Err(cancelled()),
+        result = find_executable(&["ffprobe"]) => result,
+    }
+    .map_err(|detail| fail("TOOL_DISCOVERY_FAILED", detail))?
+    .ok_or_else(|| {
+        fail(
+            "TOOL_MISSING",
+            "FFprobe was not found on PATH. Install FFmpeg with FFprobe and restart jesses.".into(),
+        )
+    })?;
     let output = run_tool_cancellable(
         &executable,
         &probe_arguments(&canonical),

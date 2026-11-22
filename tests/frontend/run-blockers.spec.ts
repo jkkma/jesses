@@ -1,5 +1,143 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { installSourceEncodeFixture, source } from './helpers/source-encode-fixture';
+
+function hdrSource(transfer: 'smpte2084' | 'arib-std-b67') {
+  return {
+    ...source,
+    id: transfer,
+    path: `/media/${transfer}.mkv`,
+    name: `${transfer}.mkv`,
+    streams: source.streams.map((stream) =>
+      stream.kind === 'video'
+        ? {
+            ...stream,
+            codec: 'hevc',
+            fieldOrder: 'progressive',
+            pixelFormat: 'yuv420p10le',
+            colorPrimaries: 'bt2020',
+            colorTransfer: transfer,
+            colorSpace: 'bt2020nc',
+            colorRange: 'tv',
+            ...(transfer === 'smpte2084' ? { dynamicHdrFormats: ['HDR10+'] } : {}),
+          }
+        : stream,
+    ),
+  };
+}
+
+async function openHdrQuickConvert(page: Page, transfer: 'smpte2084' | 'arib-std-b67') {
+  await installSourceEncodeFixture(page);
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), hdrSource(transfer));
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  return page.getByRole('region', { name: 'Quick Convert', exact: true });
+}
+
+test('Quick Convert blocks 8-bit preserved HDR10 and submits 10-bit fallback', async ({ page }) => {
+  const quick = await openHdrQuickConvert(page, 'smpte2084');
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  const color = quick.getByLabel('Color Format', { exact: true });
+  const tone = quick.getByLabel('Tone Mapping', { exact: true });
+  await tone.selectOption('off');
+  await quick.getByLabel('HDR10 fallback (discard DV / HDR10+)').check();
+  await color.selectOption('yuv420p');
+  await expect(run).toBeDisabled();
+  await expect(page.locator('#run-blocked-reason')).toContainText(
+    'HDR10 output requires 10-bit 4:2:0',
+  );
+
+  await tone.selectOption('spline');
+  await expect(run).toBeEnabled();
+  await tone.selectOption('off');
+  await expect(run).toBeDisabled();
+  await color.selectOption('yuv420p10le');
+  await quick.getByLabel('HDR10 fallback (discard DV / HDR10+)').check();
+  await run.click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const settings = (globalThis as any).__sourceCalls.find(
+          (call: any) => call.command === 'mock_start_encode',
+        )?.payload.request.settings;
+        return (
+          settings && [
+            settings.encoder,
+            settings.outputPixelFormat,
+            settings.hdr10Fallback,
+            !!settings.toneMap,
+          ]
+        );
+      }),
+    )
+    .toEqual(['svtAv1Hdr', 'yuv420p10le', true, false]);
+});
+
+test('Quick Convert requires Tone Mapping to encode HLG', async ({ page }) => {
+  const quick = await openHdrQuickConvert(page, 'arib-std-b67');
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  const tone = quick.getByLabel('Tone Mapping', { exact: true });
+  await expect(tone).toHaveValue('spline');
+  await tone.selectOption('off');
+  await expect(run).toBeDisabled();
+  await expect(page.locator('#run-blocked-reason')).toHaveText(
+    'Choose a Tone Mapping curve to convert HLG to SDR.',
+  );
+  await expect(quick.getByLabel('HDR10 fallback (discard DV / HDR10+)')).toHaveCount(0);
+  await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
+  await page.locator('#run-blocked-reason').click();
+  await tone.selectOption('reinhard');
+  await run.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (call: any) => call.command === 'mock_start_encode',
+          )?.payload.request.settings.toneMap?.algorithm,
+      ),
+    )
+    .toBe('reinhard');
+});
+
+for (const hdrFirst of [true, false])
+  test(`Quick Convert batch skips an HLG item when Tone Mapping is off and ${hdrFirst ? 'HLG' : 'SDR'} is first`, async ({
+    page,
+  }) => {
+    await installSourceEncodeFixture(page);
+    const sdr = {
+      ...source,
+      streams: source.streams.map((stream) =>
+        stream.kind === 'video' ? { ...stream, fieldOrder: 'progressive' } : stream,
+      ),
+    };
+    const hlg = hdrSource('arib-std-b67');
+    await page.evaluate(
+      (inputs) => {
+        const mock = globalThis as any;
+        mock.__pickerPaths = inputs.map((item) => item.path);
+        mock.__mediaByPath = Object.fromEntries(inputs.map((item) => [item.path, item]));
+      },
+      hdrFirst ? [hlg, sdr] : [sdr, hlg],
+    );
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+    await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+    const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+    if (hdrFirst) await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+    await quick.getByLabel('Color Format', { exact: true }).selectOption('yuv420p');
+    await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
+    await page.getByRole('button', { name: 'File List', exact: true }).click();
+    await expect(page.getByRole('option', { name: /arib-std-b67.mkv/ })).toContainText('Failed');
+    const requests = await page.evaluate(() =>
+      (globalThis as any).__sourceCalls
+        .filter((call: any) => call.command === 'mock_start_encode')
+        .map((call: any) => call.payload.request),
+    );
+    expect(requests).toHaveLength(1);
+    expect(requests[0].source.inputPath).toBe(sdr.path);
+    expect(requests[0].settings.outputPixelFormat).toBe('yuv420p');
+  });
 
 // Matroska cannot store MP4 timed text. With the default copy mode, those
 // tracks become SubRip instead of blocking Run, and the Subtitles tab says so.

@@ -183,7 +183,7 @@ impl SupervisorError {
     }
 }
 
-async fn cancelled(mut cancel: watch::Receiver<bool>) {
+pub(crate) async fn cancelled(mut cancel: watch::Receiver<bool>) {
     loop {
         if *cancel.borrow_and_update() {
             return;

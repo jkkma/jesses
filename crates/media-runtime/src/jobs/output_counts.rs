@@ -119,9 +119,7 @@ pub(super) async fn verify(
     ffprobe: &Path,
     output: &Path,
     kinds: &[&str],
-    video_position: usize,
-    frames: usize,
-    video_check: Option<VideoCheck>,
+    clock: super::container::Cadence<'_>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<usize, AppError> {
     let mut args: Vec<OsString> = [
@@ -130,7 +128,7 @@ pub(super) async fn verify(
         "-protocol_whitelist",
         "file",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,width,height,sample_aspect_ratio,start_time,duration:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,sample_aspect_ratio,time_base,start_time,duration:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -168,10 +166,10 @@ pub(super) async fn verify(
             output,
         )
     })?;
-    let video = check(&document, kinds, video_position)
+    let video = check(&document, kinds, clock.index as usize)
         .and_then(|video| {
-            if let Some(check) = video_check {
-                check.verify(video, frames)?;
+            if let Some(check) = clock.basic_video_check {
+                check.verify(video, clock.frames)?;
             }
             Ok(video)
         })
@@ -179,11 +177,26 @@ pub(super) async fn verify(
             path: Some(output.to_string_lossy().into_owned()),
             ..error
         })?;
+    if !clock.mov_text.is_empty() {
+        let selected = check_streams(&document, kinds)?;
+        super::trim_subtitle_verify::verify_output(
+            ffprobe,
+            output,
+            video,
+            &selected,
+            clock.mov_text,
+            cancel,
+        )
+        .await?;
+    }
     let decoded = count_video_frames(ffprobe, output, video.index, cancel).await?;
-    if decoded != frames {
+    if decoded != clock.frames {
         return Err(files::error(
             "OUTPUT_VALIDATION_FAILED",
-            format!("The finished video decodes to {decoded} frames; encoding prepared {frames}."),
+            format!(
+                "The finished video decodes to {decoded} frames; encoding prepared {}.",
+                clock.frames
+            ),
             output,
         ));
     }
@@ -338,46 +351,33 @@ mod tests {
             sample_aspect_ratio: Some((1, 1)),
             frame_seconds: Some(0.1),
         });
-        let decoded = verify(
-            &ffprobe,
-            &valid,
-            &["video", "audio"],
-            0,
-            12,
-            expectation,
-            &cancel,
-        )
-        .await
-        .unwrap();
+        let cadence = |frames| super::super::container::Cadence {
+            index: 0,
+            numerator: 10,
+            denominator: 1,
+            frames,
+            source_iso: None,
+            basic_video_check: expectation,
+            mp4_aspect_override: None,
+            mov_text: &[],
+            expected_kinds: &["video", "audio"],
+        };
+        let decoded = verify(&ffprobe, &valid, &["video", "audio"], cadence(12), &cancel)
+            .await
+            .unwrap();
         assert_eq!(decoded, 12);
-        let mismatch = verify(
-            &ffprobe,
-            &valid,
-            &["video", "audio"],
-            0,
-            13,
-            expectation,
-            &cancel,
-        )
-        .await
-        .unwrap_err();
+        let mismatch = verify(&ffprobe, &valid, &["video", "audio"], cadence(13), &cancel)
+            .await
+            .unwrap_err();
         assert_eq!(mismatch.code, "OUTPUT_VALIDATION_FAILED");
         assert!(
             mismatch.message.contains("decodes to 12 frames"),
             "{mismatch:?}"
         );
         for output in [no_audio, corrupt] {
-            let failure = verify(
-                &ffprobe,
-                &output,
-                &["video", "audio"],
-                0,
-                12,
-                expectation,
-                &cancel,
-            )
-            .await
-            .unwrap_err();
+            let failure = verify(&ffprobe, &output, &["video", "audio"], cadence(12), &cancel)
+                .await
+                .unwrap_err();
             assert_eq!(failure.code, "OUTPUT_VALIDATION_FAILED", "{failure:?}");
         }
 
@@ -427,6 +427,8 @@ mod tests {
                         frames: 12,
                         source_iso: None,
                         basic_video_check: expectation,
+                        mp4_aspect_override: None,
+                        mov_text: &[],
                         expected_kinds: &["video", "audio"],
                     }),
                     &mut Vec::new(),

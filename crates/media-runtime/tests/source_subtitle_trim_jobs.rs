@@ -91,6 +91,159 @@ fn assert_packets(actual: &Value, reference: &Value, index: u64) {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires qualified FFmpeg9 libx264/libopus and SVT-AV1-HDR"]
+async fn quick_convert_clips_styled_mov_text_on_the_picture_clock() {
+    let f = Fixture::new();
+    let source = f.0.join("styled.mp4");
+    let dialogue = f.0.join("dialogue.srt");
+    let outside = f.0.join("outside.srt");
+    std::fs::write(
+        &dialogue,
+        concat!(
+            "1\n00:00:00,800 --> 00:00:01,300\n<i>Left boundary</i>\n\n",
+            "2\n00:00:01,650 --> 00:00:02,300\n<b>Right boundary</b>\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &outside,
+        concat!(
+            "1\n00:00:00,100 --> 00:00:01,001\nEnds at cut\n\n",
+            "2\n00:00:02,002 --> 00:00:02,700\nStarts at end\n",
+        ),
+    )
+    .unwrap();
+    let mut generate = args(&[
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=96x64:r=24000/1001:d=3.003",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=3.003",
+        "-i",
+    ]);
+    generate.extend([
+        dialogue.into_os_string(),
+        "-i".into(),
+        outside.into_os_string(),
+    ]);
+    generate.extend(args(&[
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:s",
+        "-map",
+        "3:s",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-chroma_sample_location",
+        "left",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "mov_text",
+        "-disposition:s:0",
+        "default+forced",
+        "-disposition:s:1",
+        "0",
+        "-metadata:s:s:0",
+        "language=eng",
+        "-metadata:s:s:0",
+        "handler_name=Styled dialogue",
+        "-metadata:s:s:1",
+        "language=spa",
+        "-metadata:s:s:1",
+        "handler_name=Outside clip",
+    ]));
+    generate.push(source.clone().into());
+    run("ffmpeg", generate);
+    let original = probe(&source);
+    let style_packets = |document: &Value, index| -> Vec<Value> {
+        packets(document, index)
+            .into_iter()
+            .filter(|packet| packet["size"].as_str().unwrap().parse::<usize>().unwrap() > 2)
+            .cloned()
+            .collect()
+    };
+    let original_text = style_packets(&original, 2);
+    assert_eq!(original_text.len(), 2);
+    assert!(
+        original_text.iter().all(|packet| packet["size"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            > 24)
+    );
+
+    let manager = JobManager::new(f.0.join("logs"));
+    for (name, subtitle_mode) in [
+        ("copy", SubtitleMode::Copy),
+        ("explicit", SubtitleMode::MovText),
+    ] {
+        let output = f.0.join(format!("{name}.mp4"));
+        let trim = serde_json::from_value(json!({"startFrame":24,"endFrameExclusive":48})).unwrap();
+        let mut req = request(&source, &output, trim);
+        req.source.stream_indices = vec![0, 1, 2, 3];
+        req.settings.encoder = VideoEncoder::SvtAv1Hdr;
+        req.settings.preset = 12;
+        req.settings.audio = serde_json::from_value(json!([
+            {"streamIndex":1,"codec":"opus","channels":"preserve","bitrateKbps":128}
+        ]))
+        .unwrap();
+        req.settings.subtitles = vec![SubtitleTrackSettings {
+            stream_index: 2,
+            mode: subtitle_mode,
+            burn_in: false,
+        }];
+        let job = manager.start_encode(req).await.unwrap();
+        let done = terminal(&manager, &job.id).await;
+        assert_eq!(done.state, JobState::Succeeded, "{name}: {done:#?}");
+        let actual = probe(&output);
+        let streams = actual["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 4);
+        assert_eq!(streams[0]["nb_frames"], "24");
+        assert_eq!(streams[0]["time_base"], "1/24000000");
+        assert_eq!(streams[0]["duration"], "1.001000");
+        assert_eq!(streams[1]["duration"], "1.001000");
+        assert_eq!(streams[2]["codec_name"], "mov_text");
+        assert_eq!(streams[2]["tags"]["language"], "eng");
+        assert_eq!(streams[2]["tags"]["handler_name"], "Styled dialogue");
+        assert_eq!(streams[2]["disposition"]["forced"], 1);
+        assert_eq!(streams[3]["tags"]["language"], "spa");
+        assert_eq!(streams[3]["tags"]["handler_name"], "Outside clip");
+        let trimmed = style_packets(&actual, 2);
+        assert_eq!(trimmed.len(), 2);
+        for (at, start, duration) in [(0, "0.000000", "0.299000"), (1, "0.649000", "0.352000")] {
+            assert_eq!(trimmed[at]["pts_time"], start);
+            assert_eq!(trimmed[at]["duration_time"], duration);
+            assert_eq!(trimmed[at]["data_hash"], original_text[at]["data_hash"]);
+        }
+        assert!(style_packets(&actual, 3).is_empty());
+        assert!(packets(&actual, 3).iter().any(|packet| {
+            packet["pts_time"] == "0.000000" && packet["duration_time"] == "1.001000"
+        }));
+    }
+    manager.shutdown().await;
+}
+
 /// External subtitles are a separate source reader, preserving intact events.
 #[tokio::test]
 #[ignore = "requires qualified CPU FFmpeg9 libx264/libvpx-vp9/libass"]

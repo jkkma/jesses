@@ -2018,8 +2018,32 @@ impl Plan {
         self.source_dolby_render || (self.source_trim && self.source_filters)
     }
 
+    fn source_ordinal_trim(&self) -> Option<media_core::VideoTrim> {
+        // A Dolby source's entire prefix feeds peak detection. Select the
+        // requested pictures after rendering when the graph retains their
+        // ordinals, avoiding the output seek's rounding to the video clock.
+        self.trim.filter(|trim| {
+            self.source_dolby_render
+                && self.custom_filters.is_empty()
+                && trim.time.is_none()
+                && self
+                    .temporal
+                    .as_ref()
+                    .is_none_or(|temporal| temporal.settings.frame_rate.is_none())
+        })
+    }
+
+    pub(super) fn source_ordinal_trim_filter(&self) -> Option<String> {
+        self.source_ordinal_trim().map(|trim| {
+            format!(
+                "trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS",
+                trim.start_frame, trim.end_frame_exclusive
+            )
+        })
+    }
+
     pub(super) fn source_output_trim(&self) -> Vec<std::ffi::OsString> {
-        if !self.uses_source_output_trim() {
+        if !self.uses_source_output_trim() || self.source_ordinal_trim().is_some() {
             return Vec::new();
         }
         source_trim_arguments(
@@ -2217,6 +2241,32 @@ impl Plan {
             self.source_hdr10.as_ref()
         }
     }
+
+    pub(super) fn has_source_hdr(&self) -> bool {
+        self.source_hdr10.is_some()
+    }
+
+    pub(super) fn validate_frame_side_data(
+        &self,
+        values: &[serde_json::Value],
+        encoded: bool,
+    ) -> Result<StaticMetadata, AppError> {
+        self.validate_video_side_data(values, encoded)?;
+        if !encoded && let Some(hdr) = self.source_hdr10.as_ref() {
+            hdr.require_profile5_rpu(values)?;
+            if self.tone_map.as_ref().is_some_and(|tone| tone.dolby_rpu) {
+                hdr.require_gpu_rpu(values)?;
+            }
+        }
+        if let Some(hdr) = self.validation_hdr(encoded) {
+            let actual = StaticMetadata::parse(values)?;
+            hdr.metadata.validate_present(&actual, encoded)?;
+            Ok(actual)
+        } else {
+            Ok(StaticMetadata::default())
+        }
+    }
+
     fn absorb_source_metadata(&mut self, first: &Frame) -> Result<(), AppError> {
         let required = self.needs_mastering_metadata();
         let imported_dolby = self.hdr10.as_ref().is_some_and(|hdr| hdr.imported_dolby);

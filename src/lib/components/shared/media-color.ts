@@ -1,4 +1,4 @@
-import type { MediaStream } from '$lib/ipc/generated';
+import type { Av1anPixelFormat, MediaStream } from '$lib/ipc/generated';
 
 export function knownHdr(stream: MediaStream | undefined): boolean {
   return (
@@ -16,4 +16,23 @@ export function preservableHdr10(stream: MediaStream | undefined): boolean {
     stream.colorTransfer === 'smpte2084' &&
     stream.colorSpace === 'bt2020nc'
   );
+}
+
+export function hdrOutputError(
+  stream: MediaStream | undefined,
+  supportsHdr10: boolean,
+  pixelFormat: Av1anPixelFormat | undefined,
+): string | null {
+  if (!knownHdr(stream)) return null;
+  if (stream?.colorTransfer === 'arib-std-b67')
+    return 'Choose a Tone Mapping curve to convert HLG to SDR.';
+  if (stream?.dolbyVisionProfile === 5)
+    return 'Enable GPU Tone Mapping to render Dolby Vision profile 5 to SDR.';
+  if (!supportsHdr10)
+    return 'The selected encoder supports SDR output only. Enable Tone Mapping or choose an HDR10 encoder.';
+  if (!preservableHdr10(stream))
+    return 'Keeping HDR requires a limited-range 10-bit 4:2:0 BT.2020/PQ source. Enable Tone Mapping if this source supports it.';
+  if (pixelFormat !== undefined && pixelFormat !== 'yuv420p10le')
+    return 'HDR10 output requires 10-bit 4:2:0. Choose a 10-bit Color Format or enable Tone Mapping.';
+  return null;
 }

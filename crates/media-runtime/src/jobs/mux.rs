@@ -577,6 +577,33 @@ pub(in crate::jobs) fn packets(
     reader: &mut dyn Read,
     mut accept: impl FnMut(Packet) -> Result<(), String>,
 ) -> Result<u64, String> {
+    packet_records(reader, |fields| {
+        let timestamp = |key| -> Result<Option<f64>, String> {
+            match fields.get(key).copied() {
+                None | Some("N/A") => Ok(None),
+                Some(text) => text
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(Some)
+                    .ok_or_else(|| "A packet timestamp is invalid.".into()),
+            }
+        };
+        let (size, hash) = packet_content(fields)?;
+        accept(Packet {
+            pts: timestamp("pts_time")?,
+            dts: timestamp("dts_time")?,
+            duration: timestamp("duration_time")?,
+            size,
+            hash: hash.to_owned(),
+        })
+    })
+}
+
+fn packet_records(
+    reader: &mut dyn Read,
+    mut accept: impl FnMut(&BTreeMap<&str, &str>) -> Result<(), String>,
+) -> Result<u64, String> {
     let mut reader = BufReader::new(reader);
     let mut record = Vec::new();
     let mut count = 0;
@@ -603,42 +630,73 @@ pub(in crate::jobs) fn packets(
             .split('|')
             .filter_map(|field| field.split_once('='))
             .collect::<BTreeMap<_, _>>();
-        let timestamp = |key| -> Result<Option<f64>, String> {
-            match fields.get(key).copied() {
-                None | Some("N/A") => Ok(None),
-                Some(text) => text
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|value| value.is_finite())
-                    .map(Some)
-                    .ok_or_else(|| "A packet timestamp is invalid.".into()),
-            }
-        };
-        let size = fields
-            .get("size")
-            .and_then(|text| text.parse().ok())
-            .ok_or("A packet size is missing.")?;
-        let hash = fields
-            .get("data_hash")
-            .filter(|hash| {
-                hash.starts_with("SHA256:")
-                    && hash.len() == 71
-                    && hash[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            .ok_or("A packet content hash is missing.")?
-            .to_string();
-        accept(Packet {
-            pts: timestamp("pts_time")?,
-            dts: timestamp("dts_time")?,
-            duration: timestamp("duration_time")?,
-            size,
-            hash,
-        })?;
+        accept(&fields)?;
         count += 1;
     }
 }
 
+fn packet_content<'a>(fields: &BTreeMap<&str, &'a str>) -> Result<(u64, &'a str), String> {
+    let size = fields
+        .get("size")
+        .and_then(|text| text.parse().ok())
+        .ok_or("A packet size is missing.")?;
+    let hash = fields
+        .get("data_hash")
+        .copied()
+        .filter(|hash| {
+            hash.starts_with("SHA256:")
+                && hash.len() == 71
+                && hash[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or("A packet content hash is missing.")?;
+    Ok((size, hash))
+}
+
+pub(super) fn tick_packets(
+    reader: &mut dyn Read,
+    mut accept: impl FnMut(i64, Option<i64>, u64, &str) -> Result<(), String>,
+) -> Result<u64, String> {
+    packet_records(reader, |fields| {
+        let pts = fields
+            .get("pts")
+            .and_then(|text| text.parse::<i64>().ok())
+            .ok_or("A packet presentation timestamp is missing or invalid.")?;
+        let duration = match fields.get("duration").copied() {
+            None | Some("N/A") => None,
+            Some(text) => Some(
+                text.parse::<i64>()
+                    .map_err(|_| "A packet's duration is invalid.")?,
+            ),
+        };
+        let (size, hash) = packet_content(fields)?;
+        accept(pts, duration, size, hash)
+    })
+}
+
 pub(in crate::jobs) fn packet_spec(ffprobe: &Path, input: &Path, index: u32) -> CommandSpec {
+    packet_spec_with_entries(
+        ffprobe,
+        input,
+        index,
+        "packet=pts_time,dts_time,duration_time,size,data_hash:packet_side_data=",
+    )
+}
+
+pub(super) fn tick_packet_spec(ffprobe: &Path, input: &Path, index: u32) -> CommandSpec {
+    packet_spec_with_entries(
+        ffprobe,
+        input,
+        index,
+        "packet=pts,duration,size,data_hash:packet_side_data=",
+    )
+}
+
+fn packet_spec_with_entries(
+    ffprobe: &Path,
+    input: &Path,
+    index: u32,
+    entries: &str,
+) -> CommandSpec {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -656,7 +714,7 @@ pub(in crate::jobs) fn packet_spec(ffprobe: &Path, input: &Path, index: u32) -> 
             "-show_data_hash",
             "sha256",
             "-show_entries",
-            "packet=pts_time,dts_time,duration_time,size,data_hash:packet_side_data=",
+            entries,
             "-of",
             "compact=p=0:nk=0",
             "-i",

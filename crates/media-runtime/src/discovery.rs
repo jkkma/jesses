@@ -18,6 +18,8 @@ struct ToolSpec {
 
 const HDR_PROVIDER_NAME: &str = "SVT-AV1-HDR";
 const HDR_MANAGED_DIRECTORY: &str = "svt-av1-hdr";
+const LOCATION_TIMEOUT: Duration = Duration::from_secs(5);
+const PATH_TIMEOUT_DETAIL: &str = "Tool discovery timed out while checking PATH. Check for inaccessible tool directories and try again.";
 
 const TOOLS: [ToolSpec; 12] = [
     ToolSpec {
@@ -163,71 +165,61 @@ pub(crate) async fn find_video_encoder(encoder: VideoEncoder) -> Result<Option<P
     if encoder.is_hardware() {
         return Ok(None);
     }
+    let Some((variable, _, alias)) = fork_config(encoder) else {
+        let names: &[&str] = match encoder {
+            VideoEncoder::X264 => &["x264"],
+            VideoEncoder::AomAv1 => &["aomenc"],
+            VideoEncoder::X265Standalone => &["x265"],
+            VideoEncoder::VpxStandalone => &["vpxenc"],
+            encoder if encoder.is_ffmpeg() => &["ffmpeg"],
+            _ => unreachable!("forks handled separately"),
+        };
+        return find_executable(names).await;
+    };
     let legacy_override =
         encoder == VideoEncoder::SvtAv1 && env::var_os("JESSES_SVT_AV1").is_some();
     let search = tokio::task::spawn_blocking(move || {
-        if let Some((variable, _, alias)) = fork_config(encoder) {
-            let variable = if encoder == VideoEncoder::SvtAv1
-                && env::var_os(variable).is_none()
-                && env::var_os("JESSES_SVT_AV1_HDR").is_some()
-            {
-                "JESSES_SVT_AV1_HDR"
-            } else {
-                variable
-            };
-            let override_path = env::var_os(variable)
-                .or_else(|| {
-                    (encoder == VideoEncoder::SvtAv1)
-                        .then(|| env::var_os("JESSES_SVT_AV1_HDR"))
-                        .flatten()
-                })
-                .map(PathBuf::from);
-            resolve_encoder_fork_location(
-                encoder,
-                override_path.as_deref(),
-                || managed_encoder_path(encoder),
-                || crate::bundled_tools::find(encoder_tool_id(encoder)),
-                || {
-                    if encoder == VideoEncoder::SvtAv1 {
-                        find_executable_blocking(&[
-                            "SvtAv1EncApp-HDR".to_owned(),
-                            alias.to_owned(),
-                            "svtav1encapp".to_owned(),
-                        ])
-                    } else {
-                        find_executable_blocking(&[alias.to_owned()])
-                    }
-                },
-            )
-            .map_err(|error| {
-                if override_path.is_some() {
-                    format!("{variable}: {error}")
-                } else {
-                    error
-                }
-            })
+        let variable = if encoder == VideoEncoder::SvtAv1
+            && env::var_os(variable).is_none()
+            && env::var_os("JESSES_SVT_AV1_HDR").is_some()
+        {
+            "JESSES_SVT_AV1_HDR"
         } else {
-            let names = match encoder {
-                VideoEncoder::SvtAv1 => ["SvtAv1EncApp", "svtav1encapp"].as_slice(),
-                VideoEncoder::X264 => ["x264"].as_slice(),
-                VideoEncoder::X265
-                | VideoEncoder::Vp9
-                | VideoEncoder::H264Nvenc
-                | VideoEncoder::HevcNvenc => ["ffmpeg"].as_slice(),
-                VideoEncoder::AomAv1 => ["aomenc"].as_slice(),
-                VideoEncoder::X265Standalone => ["x265"].as_slice(),
-                VideoEncoder::VpxStandalone => ["vpxenc"].as_slice(),
-                _ => unreachable!("forks handled above"),
-            };
-            find_configured_executable(
-                &names
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect::<Vec<_>>(),
-            )
-        }
+            variable
+        };
+        let override_path = env::var_os(variable)
+            .or_else(|| {
+                (encoder == VideoEncoder::SvtAv1)
+                    .then(|| env::var_os("JESSES_SVT_AV1_HDR"))
+                    .flatten()
+            })
+            .map(PathBuf::from);
+        resolve_encoder_fork_location(
+            encoder,
+            override_path.as_deref(),
+            || managed_encoder_path(encoder),
+            || crate::bundled_tools::find(encoder_tool_id(encoder)),
+            || {
+                if encoder == VideoEncoder::SvtAv1 {
+                    find_executable_blocking(&[
+                        "SvtAv1EncApp-HDR".to_owned(),
+                        alias.to_owned(),
+                        "svtav1encapp".to_owned(),
+                    ])
+                } else {
+                    find_executable_blocking(&[alias.to_owned()])
+                }
+            },
+        )
+        .map_err(|error| {
+            if override_path.is_some() {
+                format!("{variable}: {error}")
+            } else {
+                error
+            }
+        })
     });
-    let found = match tokio::time::timeout(Duration::from_secs(5), search).await {
+    let found = match tokio::time::timeout(LOCATION_TIMEOUT, search).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(format!("Encoder discovery could not finish: {error}")),
         Err(_) => {
@@ -465,32 +457,62 @@ pub(crate) fn validate_video_encoder_version(
 /// A timeout cannot cancel an OS metadata call already running in the blocking
 /// pool, but a disconnected PATH directory cannot hold up the UI response.
 pub(crate) async fn find_executable(names: &[&str]) -> Result<Option<PathBuf>, String> {
-    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    let search = tokio::task::spawn_blocking(move || find_configured_executable(&names));
-    match tokio::time::timeout(Duration::from_secs(5), search).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("Tool discovery could not finish: {error}")),
-        Err(_) => Err("Tool discovery timed out while checking PATH. Check for inaccessible tool directories and try again.".into()),
+    let spec = TOOLS
+        .iter()
+        .find(|spec| names.iter().any(|name| spec.executables.contains(name)));
+    if let Some(spec) = spec {
+        let variable = format!("JESSES_{}", spec.id.replace('-', "_").to_ascii_uppercase());
+        if let Some(override_path) = env::var_os(&variable) {
+            let search = tokio::task::spawn_blocking(move || {
+                resolve_video_candidate(&PathBuf::from(override_path))
+                    .map(Some)
+                    .map_err(|error| format!("{variable}: {error}"))
+            });
+            return location_result(
+                search,
+                LOCATION_TIMEOUT,
+                "Tool discovery timed out while inspecting its explicit override.",
+            )
+            .await;
+        }
+    }
+    resolve_bundle_or_path(
+        async {
+            match spec {
+                Some(spec) => crate::bundled_tools::find_verified(spec.id).await,
+                None => Ok(None),
+            }
+        },
+        || {
+            let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+            tokio::task::spawn_blocking(move || find_executable_blocking(&names))
+        },
+        LOCATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn resolve_bundle_or_path(
+    bundle: impl std::future::Future<Output = Result<Option<PathBuf>, String>>,
+    find_path: impl FnOnce() -> tokio::task::JoinHandle<Result<Option<PathBuf>, String>>,
+    location_timeout: Duration,
+) -> Result<Option<PathBuf>, String> {
+    match bundle.await? {
+        Some(path) => Ok(Some(path)),
+        None => location_result(find_path(), location_timeout, PATH_TIMEOUT_DETAIL).await,
     }
 }
 
-fn find_configured_executable(names: &[String]) -> Result<Option<PathBuf>, String> {
-    if let Some(spec) = TOOLS.iter().find(|spec| {
-        names
-            .iter()
-            .any(|name| spec.executables.contains(&name.as_str()))
-    }) {
-        let variable = format!("JESSES_{}", spec.id.replace('-', "_").to_ascii_uppercase());
-        if let Some(override_path) = env::var_os(&variable) {
-            return resolve_video_candidate(&PathBuf::from(override_path))
-                .map(Some)
-                .map_err(|error| format!("{variable}: {error}"));
-        }
-        if let Some(path) = crate::bundled_tools::find(spec.id)? {
-            return Ok(Some(path));
-        }
+async fn location_result(
+    search: tokio::task::JoinHandle<Result<Option<PathBuf>, String>>,
+    timeout: Duration,
+    timeout_detail: &str,
+) -> Result<Option<PathBuf>, String> {
+    match tokio::time::timeout(timeout, search).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("Tool discovery could not finish: {error}")),
+        Err(_) => Err(timeout_detail.into()),
     }
-    find_executable_blocking(names)
 }
 
 fn find_executable_blocking(names: &[String]) -> Result<Option<PathBuf>, String> {
@@ -749,6 +771,45 @@ pub async fn get_capabilities() -> Vec<ToolInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slow_bundle_verification_does_not_consume_the_bounded_path_search_budget() {
+        let bundled = PathBuf::from("verified-ffmpeg");
+        let resolved = resolve_bundle_or_path(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(Some(bundled.clone()))
+            },
+            || panic!("a verified bundle must not search PATH"),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(resolved.unwrap(), Some(bundled));
+
+        let failure = resolve_bundle_or_path(
+            async { Err("corrupt bundle".into()) },
+            || panic!("a corrupt bundle must not search PATH"),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(failure.unwrap_err(), "corrupt bundle");
+
+        let (release, blocked) = std::sync::mpsc::channel();
+        let fallback = resolve_bundle_or_path(
+            async { Ok(None) },
+            || {
+                tokio::task::spawn_blocking(move || {
+                    // Hold a slow location lookup until its caller observes the deadline.
+                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(None)
+                })
+            },
+            Duration::ZERO,
+        )
+        .await;
+        release.send(()).unwrap();
+        assert_eq!(fallback.unwrap_err(), PATH_TIMEOUT_DETAIL);
+    }
 
     #[test]
     fn fingerprints_distinguish_each_implementation_and_reject_other_known_forks() {

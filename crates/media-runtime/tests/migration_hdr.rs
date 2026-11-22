@@ -276,6 +276,221 @@ fn dynamic_resources(directory: &std::path::Path, frames: usize) -> (PathBuf, Pa
     (rpu, json)
 }
 
+/// Insert one HEVC prefix SEI into a stream with one slice per picture.
+fn insert_hdr10plus(source: &[u8], picture: usize, payload: &[u8]) -> Vec<u8> {
+    let offset = source
+        .windows(4)
+        .enumerate()
+        .filter(|(_, bytes)| bytes[..3] == [0, 0, 1] && ((bytes[3] >> 1) & 63) < 32)
+        .nth(picture)
+        .unwrap()
+        .0;
+    let offset = offset - usize::from(offset != 0 && source[offset - 1] == 0);
+    let mut result = source[..offset].to_vec();
+    result.extend([0, 0, 0, 1, 0x4e, 1]);
+    // Payload type 4 is registered ITU-T T.35. Escape Annex B start codes.
+    let mut zeros = 0;
+    for byte in [4, payload.len().try_into().unwrap()]
+        .into_iter()
+        .chain(payload.iter().copied())
+        .chain([0x80])
+    {
+        if zeros == 2 && byte <= 3 {
+            result.push(3);
+            zeros = 0;
+        }
+        result.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    result.extend_from_slice(&source[offset..]);
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with libx265 and zscale, FFprobe, and SVT-AV1-HDR"]
+async fn quick_convert_checks_late_hdr10plus_before_publishing() {
+    use hdr10plus::{
+        metadata::{Hdr10PlusMetadata, Hdr10PlusMetadataEncOpts},
+        metadata_json::MetadataJsonRoot,
+    };
+    use std::{ffi::OsString, path::Path};
+
+    async fn run(tool: &Path, args: Vec<OsString>) -> Vec<u8> {
+        let (_owner, cancel) = watch::channel(false);
+        let result = supervisor::run_capture(
+            &CommandSpec {
+                executable: tool.to_owned(),
+                args,
+                cwd: None,
+            },
+            cancel,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    }
+
+    let fixture = Fixture::new();
+    let ffmpeg = tool_path("ffmpeg").await;
+    let ffprobe = tool_path("ffprobe").await;
+    let raw = fixture.0.join("base.hevc");
+    let input = fixture.0.join("late-hdr10plus.mkv");
+    let injected = fixture.0.join("injected.hevc");
+    let (_, json) = dynamic_resources(&fixture.0, 1);
+    let metadata: MetadataJsonRoot = serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+    let payload = Hdr10PlusMetadata::try_from(&metadata.scene_info[0])
+        .unwrap()
+        .encode_with_opts(&Hdr10PlusMetadataEncOpts {
+            validate: true,
+            with_country_code: true,
+        })
+        .unwrap();
+    let mut args: Vec<OsString> = [
+        "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=24:duration=8",
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "log-level=error:pools=none:frame-threads=1:bframes=0:slices=1:hdr10=1:range=limited:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:chromaloc=2:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400",
+    ].into_iter().map(Into::into).collect();
+    args.push(raw.as_os_str().to_owned());
+    run(&ffmpeg, args).await;
+    std::fs::write(
+        &injected,
+        insert_hdr10plus(&std::fs::read(raw).unwrap(), 150, &payload),
+    )
+    .unwrap();
+    let mut args: Vec<OsString> = ["-v", "error", "-r", "24", "-fflags", "+genpts", "-i"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    args.push(injected.into_os_string());
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-c".into(),
+        "copy".into(),
+        input.as_os_str().to_owned(),
+    ]);
+    run(&ffmpeg, args).await;
+
+    let mut args: Vec<OsString> = [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time:frame_side_data=side_data_type",
+        "-of",
+        "json",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(input.as_os_str().to_owned());
+    let source_bytes = std::fs::read(&input).unwrap();
+    let probe: serde_json::Value = serde_json::from_slice(&run(&ffprobe, args).await).unwrap();
+    let frames = probe["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 192);
+    assert_eq!(
+        frames.iter().position(|frame| {
+            frame["side_data_list"].as_array().is_some_and(|data| {
+                data.iter().any(|data| {
+                    data["side_data_type"] == "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+                })
+            })
+        }),
+        Some(150)
+    );
+
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let tone_map = serde_json::from_value(serde_json::json!({
+        "sourcePeakNits": 1000,
+        "hdr10BaseLayer": true,
+    }))
+    .unwrap();
+    let head_trim = serde_json::from_value(serde_json::json!({
+        "startFrame": 0,
+        "endFrameExclusive": 24,
+    }))
+    .unwrap();
+    let adjacent_trim = serde_json::from_value(serde_json::json!({
+        "startFrame": 126,
+        "endFrameExclusive": 150,
+    }))
+    .unwrap();
+    let crossing_trim = serde_json::from_value(serde_json::json!({
+        "startFrame": 144,
+        "endFrameExclusive": 168,
+    }))
+    .unwrap();
+    for (name, fallback, tone_map, trim, expected) in [
+        ("preserve", false, None, None, JobState::Failed),
+        ("fallback", true, None, None, JobState::Succeeded),
+        ("tone-map", false, Some(tone_map), None, JobState::Succeeded),
+        (
+            "trim-before-hdr10plus",
+            false,
+            None,
+            Some(head_trim),
+            JobState::Succeeded,
+        ),
+        (
+            "trim-ending-at-hdr10plus",
+            false,
+            None,
+            Some(adjacent_trim),
+            JobState::Succeeded,
+        ),
+        (
+            "trim-into-hdr10plus",
+            false,
+            None,
+            Some(crossing_trim),
+            JobState::Failed,
+        ),
+    ] {
+        let output = fixture.0.join(format!("{name}.mp4"));
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    encoder: VideoEncoder::SvtAv1Hdr,
+                    crf: 20,
+                    trim,
+                    tone_map,
+                    hdr10_fallback: fallback,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let completed = finish(&manager, &job.id).await;
+        assert_eq!(completed.state, expected, "{name}: {completed:#?}");
+        assert_eq!(output.exists(), expected == JobState::Succeeded);
+        if expected == JobState::Failed {
+            let error = completed.error.unwrap();
+            assert_eq!(error.code, "ENCODE_INPUT_UNSUPPORTED");
+            assert!(
+                error
+                    .message
+                    .contains("HDR10+ requires explicit HDR10 fallback")
+            );
+        }
+    }
+    manager.shutdown().await;
+    assert_eq!(std::fs::read(input).unwrap(), source_bytes);
+}
+
 #[tokio::test]
 #[ignore = "requires metadata-linked SVT5fish/HDR and qualified FFmpeg/FFprobe; AV1AN Select optional via JESSES_AV1AN"]
 async fn dynamic_imports_match_every_frame_and_reject_wrong_lengths() {

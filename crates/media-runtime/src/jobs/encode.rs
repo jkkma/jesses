@@ -57,22 +57,35 @@ impl JobManager {
         temporary: &mut Option<Temporary>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
+        let hdr_checks = super::source_timing::HdrChecks::new(cancel);
+        let job_cancel = hdr_checks.cancel();
         let execution = self.encode_mode(
-            id, request, settings, cancel, log_path, temporary, scratch, None,
+            id,
+            request,
+            settings,
+            &job_cancel,
+            log_path,
+            temporary,
+            scratch,
+            None,
         );
-        if can_observe_standalone_producer(settings)
-            && (settings.source_filters
-                || settings.tone_map.is_some_and(|tone| tone.source_workflow)
-                || header_planning_allowed(settings))
-        {
-            super::source_filters::with_observer(
-                super::source_filters::Observation::new(Path::new(&request.output_path)),
-                execution,
-            )
+        hdr_checks
+            .run(cancel, async {
+                if can_observe_standalone_producer(settings)
+                    && (settings.source_filters
+                        || settings.tone_map.is_some_and(|tone| tone.source_workflow)
+                        || header_planning_allowed(settings))
+                {
+                    super::source_filters::with_observer(
+                        super::source_filters::Observation::new(Path::new(&request.output_path)),
+                        execution,
+                    )
+                    .await
+                } else {
+                    execution.await
+                }
+            })
             .await
-        } else {
-            execution.await
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -466,19 +479,7 @@ impl JobManager {
         check_cancel(cancel)?;
         let ffmpeg = discover("ffmpeg", cancel).await?;
         let ffprobe = discover("ffprobe", cancel).await?;
-        let encoder = crate::discovery::find_video_encoder(settings.encoder)
-            .await
-            .map_err(|e| AppError::new("TOOL_DISCOVERY_FAILED", e, None))?
-            .ok_or_else(|| {
-                AppError::new(
-                    "TOOL_MISSING",
-                    format!(
-                        "{} was not found. Check its separate entry in Tools.",
-                        settings.encoder.name()
-                    ),
-                    None,
-                )
-            })?;
+        let encoder = discover_video_encoder(settings.encoder, cancel).await?;
         let mkvmerge = if matches!(
             settings.encoder,
             VideoEncoder::X265Standalone | VideoEncoder::VpxStandalone
@@ -836,7 +837,7 @@ impl JobManager {
             && !self.state.lock().await.entries.iter().any(|entry| {
                 entry.snapshot.id == id && entry.snapshot.standalone_recovery.is_some()
             });
-        let frame_count = self
+        let (frame_count, scanned_source_frames) = self
             .source_frames(
                 id,
                 &ffprobe,
@@ -923,6 +924,24 @@ impl JobManager {
             .trim
             .map(|trim| super::trim::Interval::build(trim, frame_count, plan.fps_num, plan.fps_den))
             .transpose()?;
+        let trim_picture_clock = super::trim::PictureClock {
+            origin: plan.source_origin,
+            rate: (plan.fps_num, plan.fps_den),
+        };
+        let compare_hdr_scan_to_producer = plan.source_frames_estimated && !settings.source_filters;
+        let source_hdr_check = (!scanned_source_frames
+            && preview.is_none()
+            && settings.backend == media_core::EncodeBackend::Standalone
+            && plan.has_source_hdr())
+        .then(|| {
+            super::source_timing::HdrCheck::start(
+                &ffprobe,
+                &source.path,
+                &plan,
+                interval.map(|interval| interval.source_start_frame..interval.source_end_frame),
+                (!plan.source_frames_estimated).then_some(frame_count),
+            )
+        });
         let mut audio_filters = std::collections::BTreeMap::new();
         if let Some(interval) = interval {
             for (track, timeline) in &mut audio_timelines {
@@ -1017,10 +1036,12 @@ impl JobManager {
                 super::trim::Prepared::build(
                     &mux_settings,
                     interval,
+                    Some(trim_picture_clock),
                     &output_document,
                     &combined_selected,
                     &external,
                     &ffmpeg,
+                    &ffprobe,
                     &source.path,
                     &output,
                     &attempt_id,
@@ -1592,6 +1613,9 @@ impl JobManager {
                 format!("decoder={:?}", plan.decoder_filter()),
                 format!("post-qtgmc={:?}", plan.post_qtgmc_filter_with_text(None)),
             ]);
+            if let Some(trim) = plan.source_ordinal_trim_filter() {
+                signature.push(format!("source-ordinal-trim={trim}"));
+            }
             let mut tools = vec![ffmpeg.clone(), ffprobe.clone(), encoder.clone()];
             if let Some(mkvmerge) = &mkvmerge {
                 tools.push(mkvmerge.clone());
@@ -1854,6 +1878,9 @@ impl JobManager {
                 Ok::<bool,AppError>(false)
             }).await?;
             if edited {
+                if let Some(check) = source_hdr_check {
+                    check.finish(None).await?;
+                }
                 self.finalize(
                     id,
                     cancel,
@@ -2682,6 +2709,12 @@ impl JobManager {
             )
             .await;
             if let Some(format) = source_final_iso {
+                if format == media_core::ContainerFormat::Mp4
+                    && let Some(sar) = standalone_svt_sar(&plan, settings)
+                    && !ffmpeg_accepts_sar(sar)
+                {
+                    container::restore_mp4_aspect(temp, video_position as u32, sar, cancel).await?;
+                }
                 source_iso_receipt = Some(container::seal_source_iso(temp, format, cancel).await?);
             }
             source.verify()?;
@@ -2716,6 +2749,11 @@ impl JobManager {
             staged.finish()?;
         }
         grain_coverage.verify(frame_count, (plan.fps_num, plan.fps_den))?;
+        if let Some(check) = source_hdr_check {
+            check
+                .finish(compare_hdr_scan_to_producer.then_some(frame_count))
+                .await?;
+        }
         let expected_kinds = output_selected
             .iter()
             .map(|stream| stream.codec_type.as_deref().unwrap_or_default())
@@ -2728,6 +2766,30 @@ impl JobManager {
                     .map(|_| "attachment"),
             )
             .collect::<Vec<_>>();
+        let mp4_svt_sar = if container::format(&output)? == media_core::ContainerFormat::Mp4 {
+            standalone_svt_sar(&plan, settings)
+        } else {
+            None
+        };
+        let mov_text = prepared_trim
+            .as_ref()
+            .map(|trim| trim.copied_mov_text_proof())
+            .unwrap_or_default()
+            .iter()
+            .map(|(index, proof)| {
+                let position = output_selected
+                    .iter()
+                    .position(|stream| stream.index == *index)
+                    .ok_or_else(|| {
+                        files::error(
+                            "TRIM_VALIDATION_FAILED",
+                            "A planned copied MOV_TEXT track was omitted from the output mapping.",
+                            &output,
+                        )
+                    })?;
+                Ok((position, proof))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
         self.finalize(
             id,
             cancel,
@@ -2746,7 +2808,17 @@ impl JobManager {
                 } else {
                     None
                 },
-                basic_video_check: plan.source_queue_video_check(),
+                basic_video_check: plan.source_queue_video_check().or_else(|| {
+                    mp4_svt_sar.map(|sar| super::output_counts::VideoCheck {
+                        codec: plan.output_codec(),
+                        dimensions: (plan.width, plan.height),
+                        sample_aspect_ratio: Some(sar),
+                        frame_seconds: None,
+                    })
+                }),
+                mp4_aspect_override: mp4_svt_sar
+                    .filter(|&sar| resume_finalizing || !ffmpeg_accepts_sar(sar)),
+                mov_text: &mov_text,
                 expected_kinds: &expected_kinds,
             }),
             scratch,
@@ -2876,10 +2948,8 @@ impl JobManager {
 
     /// Ordinary jobs plan from headers and learn their exact count during the
     /// encode. When exact boundaries are required, packet timestamps can
-    /// stand in for decoded frames, plan from them and the first decoded frames
-    /// and verify the decoded frames beside the encoder (see `source_timing`):
-    /// every frame, or for a trim every frame through its end plus look-ahead.
-    /// Otherwise decode the complete source first, as before.
+    /// stand in for decoded frames. Report whether a complete decoded scan
+    /// already checked HDR.
     #[allow(clippy::too_many_arguments)]
     async fn source_frames(
         &self,
@@ -2893,7 +2963,7 @@ impl JobManager {
         check_discard: bool,
         fast_start: bool,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<usize, AppError> {
+    ) -> Result<(usize, bool), AppError> {
         if fast_start
             && !check_discard
             && let Some((planned, count)) = super::source_timing::plan_from_headers(
@@ -2905,7 +2975,7 @@ impl JobManager {
             self.change(id, |snapshot| append_log(snapshot, format!(
                 "Planning approximately {count} frames from source headers; the actual encode will establish the exact count."
             ))).await;
-            return Ok(count);
+            return Ok((count, false));
         }
         self.change(id, |snapshot| {
             append_log(
@@ -2936,7 +3006,7 @@ impl JobManager {
                     .await;
                 }
                 *plan = planned;
-                return Ok(count);
+                return Ok((count, false));
             }
             Err(reason) => {
                 self.change(id, |snapshot| {
@@ -2948,7 +3018,7 @@ impl JobManager {
                         .scan_frames(id, ffprobe, input, plan, stream, false, cancel)
                         .await?;
                     plan.av1an_presented_rate = Some((plan.fps_num, plan.fps_den));
-                    return Ok(count);
+                    return Ok((count, true));
                 }
             }
         }
@@ -2960,6 +3030,7 @@ impl JobManager {
         .await;
         self.scan_frames(id, ffprobe, input, plan, stream, false, cancel)
             .await
+            .map(|count| (count, true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3368,6 +3439,20 @@ pub(in crate::jobs) fn source_scan_args(
 }
 
 pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize) -> Vec<OsString> {
+    frame_scan_arguments(
+        input,
+        index,
+        threads,
+        "best_effort_timestamp_time,interlaced_frame,top_field_first,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range",
+    )
+}
+
+pub(super) fn hdr_scan_args(input: &Path, index: u32) -> Vec<OsString> {
+    frame_scan_arguments(input, index, scan_threads(), "best_effort_timestamp_time")
+}
+
+fn frame_scan_arguments(input: &Path, index: u32, threads: usize, fields: &str) -> Vec<OsString> {
+    const SIDE_DATA_FIELDS: &str = "side_data_type,displaymatrix,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag,disable_residual_flag";
     let mut args: Vec<OsString> = [
         "-v",
         "error",
@@ -3385,7 +3470,14 @@ pub(in crate::jobs) fn frame_scan_args(input: &Path, index: u32, threads: usize)
         format!("-threads:{}", index).into(),
         threads.to_string().into(),
     ]);
-    args.extend(["-show_frames","-show_entries","frame=best_effort_timestamp_time,interlaced_frame,top_field_first,width,height,pix_fmt,sample_aspect_ratio,chroma_location,color_space,color_transfer,color_primaries,color_range:frame_side_data=side_data_type,displaymatrix,rotation,red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,max_luminance,min_luminance,max_content,max_average,dv_profile,dv_bl_signal_compatibility_id,bl_present_flag,rpu_present_flag,el_present_flag,bl_bit_depth,bl_video_full_range_flag,disable_residual_flag","-of","json","-i"].into_iter().map(OsString::from));
+    args.extend([
+        "-show_frames".into(),
+        "-show_entries".into(),
+        format!("frame={fields}:frame_side_data={SIDE_DATA_FIELDS}").into(),
+        "-of".into(),
+        "json".into(),
+        "-i".into(),
+    ]);
     args.push(input.as_os_str().to_owned());
     args
 }
@@ -3663,6 +3755,9 @@ fn decoder_args_with_subtitles(
     // delivers such files from zero, and trims inside the graph are unaffected.
     let zero_timeline =
         !plan.cadence_reconciled && !plan.has_source_filters() && !plan.uses_source_output_trim();
+    let timeline = plan
+        .source_ordinal_trim_filter()
+        .or_else(|| zero_timeline.then(|| "setpts=PTS-STARTPTS".to_owned()));
     let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
@@ -3766,9 +3861,9 @@ fn decoder_args_with_subtitles(
                 bitmap,
             )
         };
-        let (filter, label) = if zero_timeline {
+        let (filter, label) = if let Some(timeline) = timeline {
             (
-                format!("{filter};[jesses_video]setpts=PTS-STARTPTS[jesses_timeline]"),
+                format!("{filter};[jesses_video]{timeline}[jesses_timeline]"),
                 "[jesses_timeline]",
             )
         } else {
@@ -3787,11 +3882,8 @@ fn decoder_args_with_subtitles(
         } else {
             plan.decoder_filter_with_text(text)
         };
-        let filter = if zero_timeline {
-            Some(filter.map_or_else(
-                || "setpts=PTS-STARTPTS".to_owned(),
-                |filter| format!("{filter},setpts=PTS-STARTPTS"),
-            ))
+        let filter = if let Some(timeline) = timeline {
+            Some(filter.map_or_else(|| timeline.clone(), |filter| format!("{filter},{timeline}")))
         } else {
             filter
         };
@@ -4051,6 +4143,20 @@ fn append_attachments(
     }
 }
 
+fn standalone_svt_sar(plan: &Plan, settings: &EncodeSettings) -> Option<(u32, u32)> {
+    (settings.backend == media_core::EncodeBackend::Standalone && settings.encoder.is_svt()).then(
+        || {
+            super::encode_plan::sample_aspect_ratio(Some(plan.output_sar()))
+                .expect("validated output SAR")
+        },
+    )
+}
+
+fn ffmpeg_accepts_sar((numerator, denominator): (u32, u32)) -> bool {
+    // FFmpeg's stream-copy codec option accepts SARs up to 10:1.
+    numerator <= denominator.saturating_mul(10)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mux_args(
     input: &Path,
@@ -4188,20 +4294,6 @@ fn mux_args(
             }
         }
         if stream.index == plan.video_index {
-            let (sar_num, sar_den) = plan
-                .output_sar()
-                .split_once(':')
-                .and_then(|(num, den)| Some((num.parse::<u64>().ok()?, den.parse::<u64>().ok()?)))
-                .expect("validated output SAR");
-            let mut display_num = u64::from(plan.width) * sar_num;
-            let mut display_den = u64::from(plan.height) * sar_den;
-            let mut a = display_num;
-            let mut b = display_den;
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            display_num /= a;
-            display_den /= a;
             if ((!settings.source_filters
                 || (settings.backend == media_core::EncodeBackend::Standalone
                     && plan.standalone_requires_container_sar()))
@@ -4209,10 +4301,30 @@ fn mux_args(
                 && !plan.has_basic_source_queue())
                 || plan.source_queue_needs_mux_aspect()
             {
-                args.extend([
-                    format!("-aspect:{index}").into(),
-                    format!("{display_num}:{display_den}").into(),
-                ]);
+                if let Some((numerator, denominator)) =
+                    standalone_svt_sar(plan, settings).filter(|&sar| ffmpeg_accepts_sar(sar))
+                {
+                    // IVF has no sample aspect ratio to copy. Use the sample
+                    // ratio directly because -aspect rounds the display ratio.
+                    args.extend([
+                        format!("-sar:{index}").into(),
+                        format!("{numerator}/{denominator}").into(),
+                    ]);
+                } else {
+                    let (sar_num, sar_den) =
+                        super::encode_plan::sample_aspect_ratio(Some(plan.output_sar()))
+                            .expect("validated output SAR");
+                    let display_num = u64::from(plan.width) * u64::from(sar_num);
+                    let display_den = u64::from(plan.height) * u64::from(sar_den);
+                    let (mut a, mut b) = (display_num, display_den);
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    args.extend([
+                        format!("-aspect:{index}").into(),
+                        format!("{}:{}", display_num / a, display_den / a).into(),
+                    ]);
+                }
             }
             args.extend([
                 format!("-color_primaries:{index}").into(),
@@ -4755,6 +4867,109 @@ mod tests {
     fn argument_after<'a>(args: &'a [OsString], flag: &str) -> &'a str {
         let position = args.iter().position(|arg| arg == flag).expect(flag);
         args[position + 1].to_str().unwrap()
+    }
+
+    fn quick_convert_dolby_plan(rate: &str, time: Option<media_core::VideoTimeTrim>) -> Plan {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "format":{"start_time":"1.5"},
+            "streams":[{
+                "index":0,"codec_type":"video","codec_name":"hevc","width":128,"height":96,
+                "pix_fmt":"yuv420p10le","field_order":"progressive","sample_aspect_ratio":"1:1",
+                "avg_frame_rate":rate,"time_base":"1/120000","start_time":"1.5",
+                "color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc",
+                "color_range":"tv","chroma_location":"topleft","side_data_list":[{
+                    "side_data_type":"DOVI configuration record","dv_profile":8,
+                    "dv_bl_signal_compatibility_id":1,"rpu_present_flag":1,"bl_present_flag":1,
+                    "el_present_flag":0
+                }]
+            }]
+        }))
+        .unwrap();
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            trim: Some(media_core::VideoTrim {
+                start_frame: 2480,
+                end_frame_exclusive: 3552,
+                time,
+            }),
+            source_trim: true,
+            // Intact Dolby execution enables observation even with no custom rows.
+            source_filters: true,
+            temporal: Some(
+                serde_json::from_value(serde_json::json!({"resizeFilter":"bicubic"})).unwrap(),
+            ),
+            tone_map: Some(media_core::ToneMapSettings {
+                source_workflow: true,
+                algorithm: Some(media_core::ToneMapAlgorithm::Spline),
+                backend: media_core::ToneMapBackend::Auto,
+                peak_mode: media_core::ToneMapPeakMode::Measured,
+                source_peak_nits: 1000,
+                hdr10_base_layer: false,
+            }),
+            ..Default::default()
+        };
+        Plan::build(&document, &document.selected(&[0]).unwrap(), &settings).unwrap()
+    }
+
+    #[test]
+    fn quick_convert_dolby_frame_trim_uses_picture_ordinals_after_rendering() {
+        let input = Path::new("input.mp4");
+        let trim = "trim=start_frame=2480:end_frame=3552,setpts=PTS-STARTPTS";
+        for rate in ["24/1", "24000/1001", "30000/1001"] {
+            let plan = quick_convert_dolby_plan(rate, None);
+            assert_eq!(plan.source_origin, 1.5);
+            for bitmap in [None, Some((input, 1, 0.0))] {
+                let args = decoder_args_with_subtitles(input, &plan, None, bitmap);
+                let filter = argument_after(
+                    &args,
+                    if bitmap.is_some() {
+                        "-filter_complex"
+                    } else {
+                        "-vf"
+                    },
+                );
+                assert!(filter.contains("tonemapping=spline:peak_detect=1:apply_dolbyvision=1"));
+                assert!(filter.find("libplacebo=").unwrap() < filter.find(trim).unwrap());
+                assert_eq!(filter.matches("trim=").count(), 1, "{filter}");
+                if bitmap.is_some() {
+                    assert!(filter.ends_with(&format!("[jesses_video]{trim}[jesses_timeline]")));
+                    assert_eq!(argument_after(&args, "-map"), "[jesses_timeline]");
+                } else {
+                    assert!(filter.ends_with(trim), "{filter}");
+                }
+                assert_eq!(argument_after(&args, "-init_hw_device"), "vulkan");
+                assert!(!args.iter().any(|arg| arg == "-fps_mode"));
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| matches!(arg.to_str(), Some("-ss" | "-t" | "-frames:v")))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quick_convert_dolby_time_trim_keeps_the_requested_seek_strategy() {
+        use media_core::VideoSeekStrategy::{DecodeFromStart, InputSeek};
+
+        for strategy in [DecodeFromStart, InputSeek] {
+            let plan = quick_convert_dolby_plan(
+                "24000/1001",
+                Some(media_core::VideoTimeTrim {
+                    start_milliseconds: 103_437,
+                    end_milliseconds: 148_148,
+                    seek_strategy: strategy,
+                }),
+            );
+            let args = decoder_args(Path::new("input.mp4"), &plan);
+            assert_eq!(args.iter().filter(|arg| *arg == "-ss").count(), 1);
+            assert_eq!(argument_after(&args, "-ss"), "103.437");
+            assert_eq!(argument_after(&args, "-t"), "44.711");
+            let seek = args.iter().position(|arg| arg == "-ss").unwrap();
+            let input = args.iter().position(|arg| arg == "-i").unwrap();
+            assert_eq!(seek < input, strategy == InputSeek);
+            assert!(!argument_after(&args, "-vf").contains("trim="));
+        }
     }
 
     /// FFmpeg 6.x shifts every stream by the file's start time, which an AAC
@@ -5900,6 +6115,49 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires qualified FFmpeg, FFprobe, and standalone SVT-AV1-HDR"]
+    async fn standalone_svt_mp4_preserves_exact_sample_aspect_ratio() {
+        let ffprobe = find_executable(&["ffprobe"]).await.unwrap().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        // The square-pixel case has a DAR numerator above FFmpeg's -aspect
+        // limit. Also exercise a non-square ratio above the -sar value limit.
+        for (input_sar, expected) in [
+            ("1/1", "1:1"),
+            ("1001/1000", "1001:1000"),
+            ("101/9", "101:9"),
+        ] {
+            let filter =
+                format!("scale=642:256,setsar={input_sar}:max=65535,setparams=field_mode=prog");
+            let (fixture, output, job, frames) = encode_with_audio_filter(
+                VideoEncoder::SvtAv1Hdr,
+                12,
+                "mp4",
+                "aac",
+                |_| {},
+                &filter,
+            )
+            .await;
+            assert_eq!(job.state, JobState::Succeeded, "{input_sar}: {job:#?}");
+            let source =
+                probe_headers(&ffprobe, &fixture.0.join("source.mkv"), &cancel, Some(&[0]))
+                    .await
+                    .unwrap();
+            let encoded = probe_headers(&ffprobe, &output, &cancel, Some(&[0]))
+                .await
+                .unwrap();
+            assert_eq!(
+                source.streams[0].sample_aspect_ratio.as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                encoded.streams[0].sample_aspect_ratio.as_deref(),
+                Some(expected)
+            );
+            assert_encoded(&output, "av1", frames).await;
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires packaged FFmpeg, FFprobe and SVT-AV1-HDR"]
     async fn quick_convert_reports_actual_svt_quality_and_depth() {

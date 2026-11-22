@@ -3,6 +3,10 @@
 //! inspect packet timestamps and the first decoded frames. Missing timestamps,
 //! discarded packets, or ambiguous field coding require a decoded scan.
 
+mod hdr_check;
+
+pub(super) use hdr_check::{HdrCheck, HdrChecks};
+
 use super::encode_plan::{Frame, Plan, Validation};
 use super::*;
 /// Packets decoded for the first-frame checks. References precede dependents

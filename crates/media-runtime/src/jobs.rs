@@ -103,6 +103,7 @@ pub use reports::export_analysis;
 mod source_picture_metadata;
 mod source_timing;
 mod trim;
+mod trim_subtitle_verify;
 
 use std::{
     collections::HashSet,
@@ -2070,16 +2071,8 @@ impl JobManager {
             if repacked && timecode.is_some() {
                 kinds.push("data");
             }
-            let decoded = output_counts::verify(
-                &ffprobe,
-                &temporary.path,
-                &kinds,
-                clock.index as usize,
-                clock.frames,
-                clock.basic_video_check,
-                cancel,
-            )
-            .await?;
+            let decoded =
+                output_counts::verify(&ffprobe, &temporary.path, &kinds, clock, cancel).await?;
             self.change(id, |snapshot| {
                 append_log(
                     snapshot,
@@ -2185,15 +2178,41 @@ fn append_log(snapshot: &mut JobSnapshot, line: String) {
 
 async fn discover(name: &str, cancel: &watch::Receiver<bool>) -> Result<PathBuf, AppError> {
     check_cancel(cancel)?;
-    let result = find_executable(&[name])
-        .await
-        .map_err(|e| AppError::new("TOOL_DISCOVERY_FAILED", e, None))?;
+    let names = [name];
+    let result = tokio::select! {
+        biased;
+        _ = supervisor::cancelled(cancel.clone()) => return Err(canceled()),
+        result = find_executable(&names) => result,
+    }
+    .map_err(|e| AppError::new("TOOL_DISCOVERY_FAILED", e, None))?;
     check_cancel(cancel)?;
     result.ok_or_else(|| {
         AppError::new(
             "TOOL_MISSING",
             format!(
                 "{name} was not found on PATH. Install FFmpeg with FFprobe and restart jesses."
+            ),
+            None,
+        )
+    })
+}
+
+async fn discover_video_encoder(
+    encoder: media_core::VideoEncoder,
+    cancel: &watch::Receiver<bool>,
+) -> Result<PathBuf, AppError> {
+    let found = tokio::select! {
+        biased;
+        _ = supervisor::cancelled(cancel.clone()) => return Err(canceled()),
+        result = crate::discovery::find_video_encoder(encoder) => result,
+    }
+    .map_err(|error| AppError::new("TOOL_DISCOVERY_FAILED", error, None))?;
+    found.ok_or_else(|| {
+        AppError::new(
+            "TOOL_MISSING",
+            format!(
+                "{} was not found. Check its separate entry in Tools.",
+                encoder.name()
             ),
             None,
         )

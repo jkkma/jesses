@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::sync::watch;
+#[path = "trim_mov_text.rs"]
+mod mov_text;
 #[path = "trim_source.rs"]
 mod source;
 #[path = "trim_subtitles.rs"]
@@ -94,6 +96,12 @@ pub(super) struct Interval {
     pub source_end_frame: usize,
     pub start: f64,
     pub end: f64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PictureClock {
+    pub origin: f64,
+    pub rate: (u32, u32),
 }
 
 impl Interval {
@@ -220,6 +228,7 @@ pub(super) struct Prepared {
     chapters: PathBuf,
     source: Option<source::SourceTrim>,
     iso_subtitles: bool,
+    copied_mov_text: mov_text::PreparedTracks,
 }
 
 async fn write_asset(
@@ -244,6 +253,12 @@ async fn write_asset(
 }
 
 impl Prepared {
+    pub(super) fn copied_mov_text_proof(
+        &self,
+    ) -> &[(u32, super::trim_subtitle_verify::TrackProof)] {
+        &self.copied_mov_text.proof
+    }
+
     pub fn subtitle_indices(&self) -> Vec<u32> {
         self.subtitles
             .iter()
@@ -260,10 +275,12 @@ impl Prepared {
     pub async fn build(
         settings: &EncodeSettings,
         interval: Interval,
+        picture_clock: Option<PictureClock>,
         source: &Document,
         selected: &[&Stream],
         external: &super::external_tracks::ExternalTracks,
         ffmpeg: &Path,
+        ffprobe: &Path,
         input: &Path,
         output: &Path,
         id: &str,
@@ -271,8 +288,32 @@ impl Prepared {
         cancel: &watch::Receiver<bool>,
     ) -> Result<Self, AppError> {
         let mut expected = interval.expected_document(source)?;
+        let copied_mov_text = if let Some(picture) = picture_clock {
+            mov_text::prepare(
+                settings, interval, picture, selected, external, ffmpeg, ffprobe, input, output,
+                id, scratch, cancel,
+            )
+            .await?
+        } else {
+            mov_text::PreparedTracks::default()
+        };
+        let staged_indices = copied_mov_text
+            .assets
+            .iter()
+            .map(|track| track.0)
+            .collect::<Vec<_>>();
         let source_trim = Box::pin(source::SourceTrim::build(
-            settings, interval, source, selected, external, ffmpeg, input, output, id, scratch,
+            settings,
+            interval,
+            source,
+            selected,
+            &staged_indices,
+            external,
+            ffmpeg,
+            input,
+            output,
+            id,
+            scratch,
             cancel,
         ))
         .await?;
@@ -359,6 +400,7 @@ impl Prepared {
             subtitles,
             chapters,
             source: source_trim,
+            copied_mov_text,
             iso_subtitles: matches!(
                 super::container::staging_format(selected, Some(settings)),
                 media_core::ContainerFormat::Mov | media_core::ContainerFormat::Mp4
@@ -382,6 +424,14 @@ impl Prepared {
                 subtitle.path.as_os_str().to_owned(),
             ]);
         }
+        for (_, path) in &self.copied_mov_text.assets {
+            inputs.extend([
+                "-protocol_whitelist".into(),
+                "file".into(),
+                "-i".into(),
+                path.as_os_str().to_owned(),
+            ]);
+        }
         inputs.extend([
             "-f".into(),
             "ffmetadata".into(),
@@ -402,10 +452,22 @@ impl Prepared {
                         .is_some_and(|stream| stream.index == subtitle.source_index)
                 }) {
                     args[index + 1] = format!("{}:0", position + first_input).into();
+                } else if let Some(position) =
+                    self.copied_mov_text.assets.iter().position(|(id, _)| {
+                        selected
+                            .get(output_position)
+                            .is_some_and(|stream| stream.index == *id)
+                    })
+                {
+                    args[index + 1] =
+                        format!("{}:0", first_input + self.subtitles.len() + position).into();
                 }
                 output_position += 1;
             } else if args[index] == "-map_chapters" {
-                args[index + 1] = (first_input + self.subtitles.len()).to_string().into();
+                args[index + 1] =
+                    (first_input + self.subtitles.len() + self.copied_mov_text.assets.len())
+                        .to_string()
+                        .into();
             }
         }
         for (stream_index, prefix) in audio_filters {

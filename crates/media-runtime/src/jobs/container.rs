@@ -19,6 +19,7 @@ use super::{
 };
 use crate::supervisor::{self, CommandSpec};
 
+mod mp4_aspect;
 mod tx3g;
 
 #[derive(Clone, Copy)]
@@ -29,8 +30,31 @@ pub(super) struct Cadence<'a> {
     pub frames: usize,
     pub source_iso: Option<SourceIsoReceipt>,
     pub basic_video_check: Option<super::output_counts::VideoCheck>,
+    pub mp4_aspect_override: Option<(u32, u32)>,
+    /// Final stream positions and the independently read original cue plans.
+    pub mov_text: &'a [(usize, &'a super::trim_subtitle_verify::TrackProof)],
     /// Planned output stream kinds, independent of the staging header.
     pub expected_kinds: &'a [&'a str],
+}
+
+pub(super) async fn restore_mp4_aspect(
+    artifact: &Temporary,
+    video_index: u32,
+    sar: (u32, u32),
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    super::check_cancel(cancel)?;
+    let mut file = artifact.clone_file()?;
+    tokio::task::spawn_blocking(move || mp4_aspect::restore(&mut file, video_index, sar))
+        .await
+        .map_err(|error| invalid(error.to_string()))?
+        .map_err(|error| {
+            invalid(format!(
+                "Could not restore the exact MP4 aspect ratio: {error}"
+            ))
+        })?;
+    artifact.flush_nonempty_async().await?;
+    super::check_cancel(cancel)
 }
 
 /// Internal only. Sealed before/after full source proof, bound to this owned
@@ -1075,7 +1099,14 @@ pub(super) async fn prepare<'a>(
             String::from_utf8_lossy(&result.stderr)
         )));
     }
-    artifact.flush_nonempty_async().await?;
+    if container == ContainerFormat::Mp4
+        && let Some(clock) = cadence
+        && let Some(sar) = clock.mp4_aspect_override
+    {
+        restore_mp4_aspect(artifact, clock.index, sar, cancel).await?;
+    } else {
+        artifact.flush_nonempty_async().await?;
+    }
     if cadence.is_some() {
         input.flush_nonempty_async().await?;
         super::check_cancel(cancel)?;
@@ -1580,6 +1611,8 @@ mod tests {
             frames: 60,
             source_iso: None,
             basic_video_check: None,
+            mp4_aspect_override: None,
+            mov_text: &[],
             expected_kinds: &[],
         };
         let args = arguments(

@@ -1055,6 +1055,7 @@ test('Quick batch freezes source HDR metadata grid in both per-file requests', a
   const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await quick.getByLabel('Codec', { exact: true }).selectOption('x265Standalone');
   await quick.getByLabel('Tone Mapping').selectOption('off');
+  await quick.getByLabel('Color Format', { exact: true }).selectOption('yuv420p10le');
   await quick.getByRole('tab', { name: 'Advanced' }).click();
   await quick.getByRole('tab', { name: 'HDR Metadata' }).click();
   await quick.getByLabel('max-cll value').fill('1000,400');

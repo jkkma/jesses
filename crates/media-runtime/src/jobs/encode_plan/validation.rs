@@ -238,30 +238,14 @@ impl Cadence {
                 "The decoded bit depth, pixel format, or frame side data changed unexpectedly.",
             ));
         }
-        self.plan
-            .validate_video_side_data(&frame.side_data_list, self.encoded)?;
-        if !self.encoded
-            && let Some(hdr) = self.plan.hdr10.as_ref()
-        {
-            hdr.require_profile5_rpu(&frame.side_data_list)?;
-            if self
-                .plan
-                .tone_map
-                .as_ref()
-                .is_some_and(|tone| tone.dolby_rpu)
-            {
-                hdr.require_gpu_rpu(&frame.side_data_list)?;
-            }
+        let actual = self
+            .plan
+            .validate_frame_side_data(&frame.side_data_list, self.encoded)?;
+        if actual.mastering.is_some() {
+            self.observed_hdr.mastering = actual.mastering;
         }
-        if let Some(hdr) = self.plan.validation_hdr(self.encoded) {
-            let actual = StaticMetadata::parse(&frame.side_data_list)?;
-            hdr.metadata.validate_present(&actual, self.encoded)?;
-            if actual.mastering.is_some() {
-                self.observed_hdr.mastering = actual.mastering;
-            }
-            if actual.light.is_some() {
-                self.observed_hdr.light = actual.light;
-            }
+        if actual.light.is_some() {
+            self.observed_hdr.light = actual.light;
         }
         for (actual, expected) in [
             (&frame.color_space, &self.stream.color_space),

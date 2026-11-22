@@ -138,6 +138,7 @@
   } from './audio-options';
   import {
     encoderOptions,
+    encoderSupportsHdr10,
     requiredEncoderTools,
     sourceBitDepth,
     knownHdr,
@@ -147,6 +148,7 @@
     validForkSettings,
     type HdrTune,
   } from './encoder-options';
+  import { hdrOutputError } from './media-color';
   import type {
     EncodeBackend,
     EncodeRequest,
@@ -1217,7 +1219,9 @@
       canRun: enabled,
       blockedReason: enabled ? undefined : (runBlockedReason ?? undefined),
       openBlockedSetting:
-        !enabled && runBlockedReason === videoSettingsIssue && videoSettingsIssue
+        !enabled &&
+        runBlockedReason &&
+        [videoSettingsIssue, hdrOutputIssue].includes(runBlockedReason)
           ? () => (settingsTab = 'video')
           : undefined,
       batchNaming: naming,
@@ -1737,9 +1741,7 @@
     validFramingDraft(activeFraming, selectedVideo) &&
       (cropMode !== 'manual' || cropFits(framing, selectedVideo)),
   );
-  const supportsHdr10Output = $derived(
-    isSvtEncoder(encoder) || ['aomAv1', 'x265Standalone', 'x265'].includes(encoder),
-  );
+  const supportsHdr10Output = $derived(encoderSupportsHdr10(encoder));
   const toneMapIssue = $derived(
     toneMapError(toneMap, backend, selectedVideo, supportsHdr10Output && hdr10Fallback),
   );
@@ -1783,14 +1785,6 @@
     ),
   );
   const rateIssue = $derived(rateEncoderError(rate, encoder));
-  const hdrUnsupported = $derived(
-    !isSvtEncoder(encoder) &&
-      !(
-        ['x265', 'x265Standalone', 'aomAv1'].includes(encoder) && preservableHdr10(selectedVideo)
-      ) &&
-      knownHdr(selectedVideo) &&
-      !toneMap.enabled,
-  );
   const depthLabel = $derived(
     toneMap.enabled
       ? '10-bit SDR output'
@@ -1807,6 +1801,24 @@
       parameters.some((value) => value.name === 'hbd-mds' && ['1', '2'].includes(value.value)),
   );
   const chosenPixelFormat = $derived(chunked ? av1an.pixelFormat : outputPixelFormat);
+  const encodePixelFormat = $derived(
+    highBitDepthDecision && chosenPixelFormat === 'yuv420p' ? 'yuv420p10le' : chosenPixelFormat,
+  );
+  const hdrOutputIssue = $derived.by(() => {
+    if (toneMap.enabled) return null;
+    if (fileMode !== 'batch')
+      return hdrOutputError(selectedVideo, supportsHdr10Output, encodePixelFormat);
+    let firstIssue: string | null = null;
+    for (const entry of files) {
+      if (chunked && entry.source?.kind === 'imageSequence') continue;
+      const video = entry.streams.find(batchVideo);
+      if (!video && chunked) continue;
+      const issue = hdrOutputError(video, supportsHdr10Output, encodePixelFormat);
+      if (!issue) return null;
+      firstIssue ??= issue;
+    }
+    return firstIssue;
+  });
   $effect(() => {
     if (!highBitDepthDecision) return;
     untrack(() => {
@@ -2178,9 +2190,7 @@
           (!selectedVideoSupported && fileMode !== 'batch'
             ? 'AV1AN currently encodes the first video track. Choose that track or use Quick Convert.'
             : null) ??
-          (hdrUnsupported
-            ? 'The selected encoder supports SDR output only. Enable Tone Mapping or choose an HDR10 encoder.'
-            : null) ??
+          hdrOutputIssue ??
           toneMapIssue ??
           temporalError(temporal, backend) ??
           grainConflict ??
@@ -2226,7 +2236,7 @@
               )
             : toolsReady) &&
           selectedVideoSupported &&
-          (!encodingVideo || !hdrUnsupported) &&
+          (!encodingVideo || !hdrOutputIssue) &&
           validSettings &&
           !dynamicHdrIssue &&
           !gridGrainIssue &&
@@ -3013,6 +3023,8 @@
   }
   async function runBatch(base: EncodeRequest, options: RunOptions, controller: AbortController) {
     const { source: _source, settings } = structuredClone($state.snapshot(base));
+    const hdrPixelFormat = encodePixelFormat;
+    const batchSupportsHdr10 = encoderSupportsHdr10(settings.encoder);
     const burnOrdinal =
       mainFile?.streams
         .filter((stream) => stream.kind === 'subtitle')
@@ -3148,6 +3160,10 @@
         let detected: Awaited<ReturnType<typeof detectCrop>> | null = null,
           resolvedTemporal = picture ? settings.temporal : undefined;
         try {
+          if (picture && !settings.toneMap) {
+            const issue = hdrOutputError(vid, batchSupportsHdr10, hdrPixelFormat);
+            if (issue) throw new Error(issue);
+          }
           if (
             picture &&
             vid &&
@@ -4533,7 +4549,7 @@
                 ><option value="off">No tone mapping</option><option value="hable">Hable</option
                 ><option value="mobius">Mobius</option><option value="reinhard">Reinhard</option
                 >{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}</select
-              >{#if !toneMap.enabled && supportsHdr10Output}<label
+              >{#if !toneMap.enabled && supportsHdr10Output && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label
                   ><input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
                   fallback (discard DV / HDR10+)</label
                 >{/if}

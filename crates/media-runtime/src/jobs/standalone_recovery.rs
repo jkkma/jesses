@@ -1719,6 +1719,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinal_trim_plan_change_preserves_the_legacy_video_checkpoint() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let (_owner, cancel) = watch::channel(false);
+        let mut recovery = fixture.recovery(false, "ivf");
+        let locator = recovery
+            .checkpoint_video(
+                &fixture.video("before-ordinal-trim"),
+                StandaloneRecoveryPhase::VideoComplete,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let manifest = recovery.root.join("manifest.json");
+        let original_manifest = fs::read(&manifest).unwrap();
+        let artifact = recovery
+            .manifest
+            .as_ref()
+            .unwrap()
+            .video
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        drop(recovery);
+
+        let resumed = Recovery::resume(
+            "job-1",
+            &request,
+            &EncodeSettings::default(),
+            &fixture.source,
+            vec![fixture.tool.clone()],
+            vec![
+                "verified plan".into(),
+                "source-ordinal-trim=trim=start_frame=1:end_frame=49,setpts=PTS-STARTPTS".into(),
+            ],
+            48,
+            false,
+            "ivf",
+            locator,
+            &cancel,
+        )
+        .await;
+        assert!(
+            resumed
+                .err()
+                .is_some_and(|error| error.message.contains("processing plan"))
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), original_manifest);
+        assert_eq!(fs::read(&artifact).unwrap(), b"complete encoded artifact");
+    }
+
+    #[tokio::test]
     async fn resumes_legacy_standalone_checkpoint_with_retired_preference() {
         let fixture = Fixture::new();
         let request = fixture.request();
