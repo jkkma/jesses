@@ -119,12 +119,6 @@ impl JobManager {
             ));
         }
         // Acquire every ownership guard before clear-all changes any workspace.
-        if next_settings.is_some() {
-            let (_owner, cancel) = watch::channel(false);
-            for (_, recovery) in &mut owned {
-                encode::boxed(|| recovery.seal_source_chunks(&cancel)).await?;
-            }
-        }
         let mut canonical = Vec::new();
         let mut source_cuts = Vec::new();
         if !delete_chunks {
@@ -136,6 +130,9 @@ impl JobManager {
                     recovery.settings(),
                 )?;
                 if resume && let Some(cleanup) = &cleanup {
+                    if let Some(settings) = &next_settings {
+                        cleanup.validate_rebind(settings)?;
+                    }
                     cleanup.verify_source()?;
                 }
                 let cut = source_normalization::av1an_trim::prepare_recovery_action(
@@ -159,6 +156,12 @@ impl JobManager {
                         snapshot.encode_settings.clone().expect("saved settings")
                     }),
                 ));
+            }
+        }
+        if next_settings.is_some() {
+            let (_owner, cancel) = watch::channel(false);
+            for (_, recovery) in &mut owned {
+                encode::boxed(|| recovery.seal_source_chunks(&cancel)).await?;
             }
         }
         let mut updated = Vec::new();

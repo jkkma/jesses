@@ -928,20 +928,61 @@ impl JobManager {
             origin: plan.source_origin,
             rate: (plan.fps_num, plan.fps_den),
         };
-        let compare_hdr_scan_to_producer = plan.source_frames_estimated && !settings.source_filters;
-        let source_hdr_check = (!scanned_source_frames
-            && preview.is_none()
-            && settings.backend == media_core::EncodeBackend::Standalone
-            && plan.has_source_hdr())
-        .then(|| {
-            super::source_timing::HdrCheck::start(
-                &ffprobe,
-                &source.path,
-                &plan,
-                interval.map(|interval| interval.source_start_frame..interval.source_end_frame),
-                (!plan.source_frames_estimated).then_some(frame_count),
-            )
-        });
+        let compare_hdr_scan_to_producer = settings.backend
+            == media_core::EncodeBackend::Standalone
+            && plan.source_frames_estimated
+            && !settings.source_filters;
+        let source_hdr_check =
+            if !scanned_source_frames && preview.is_none() && plan.has_source_hdr() {
+                let exact_frames = (!plan.source_frames_estimated).then_some(frame_count);
+                let selection =
+                    interval.map(|interval| interval.source_start_frame..interval.source_end_frame);
+                if settings.backend == media_core::EncodeBackend::Standalone {
+                    Some(super::source_timing::HdrCheck::start(
+                        &ffprobe,
+                        &source.path,
+                        &plan,
+                        selection,
+                        exact_frames,
+                    ))
+                } else if plan.is_hdr10() && !settings.hdr10_fallback {
+                    let packet_source = super::source_timing::PacketHdrSource::new(
+                        video.codec_name.as_deref(),
+                        document
+                            .format
+                            .as_ref()
+                            .and_then(|format| format.format_name.as_deref()),
+                    );
+                    match packet_source {
+                        Some(packets) if !packets.needs_inspection() => None,
+                        Some(packets) if selection.is_none() => {
+                            Some(super::source_timing::HdrCheck::start_packets(
+                                &ffmpeg,
+                                &ffprobe,
+                                &source.path,
+                                &plan,
+                                packets,
+                                exact_frames,
+                            ))
+                        }
+                        _ => {
+                            // Filtered packets omit PTS and can be in decode order.
+                            // An ordinal trim needs the decoded selection.
+                            Some(super::source_timing::HdrCheck::start(
+                                &ffprobe,
+                                &source.path,
+                                &plan,
+                                selection,
+                                exact_frames,
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         let mut audio_filters = std::collections::BTreeMap::new();
         if let Some(interval) = interval {
             for (track, timeline) in &mut audio_timelines {
@@ -2106,6 +2147,9 @@ impl JobManager {
                         .await;
                     }
                     if edited {
+                        if let Some(check) = source_hdr_check {
+                            check.finish(None).await?;
+                        }
                         let actual = super::command_edit::verify_actual_output(
                             &ffmpeg, &ffprobe, temp, cancel,
                         )

@@ -2,6 +2,7 @@
 //! Original requests remain immutable. An owned receipt binds both complete files
 //! so native/av1an recovery can safely reuse a stable source across attempts.
 use super::*;
+use encode_plan::hdr::{self, Hdr10, StaticMetadata};
 #[path = "source_aac.rs"]
 pub(super) mod aac;
 #[path = "source_av1an_trim.rs"]
@@ -177,11 +178,18 @@ pub(super) struct Recipe {
     trim_end_seconds: Option<f64>,
 }
 impl Recipe {
-    fn filter(&self) -> String {
-        format!(
+    fn filter(&self, discard_dynamic_hdr: bool) -> String {
+        let fps = format!(
             "fps=fps={}/{}:start_time=0:round=near:eof_action=pass",
             self.numerator, self.denominator
-        )
+        );
+        if discard_dynamic_hdr {
+            format!(
+                "sidedata=mode=delete:type=DOVI_RPU_BUFFER,sidedata=mode=delete:type=DOVI_METADATA,sidedata=mode=delete:type=DYNAMIC_HDR_PLUS,{fps}"
+            )
+        } else {
+            fps
+        }
     }
 }
 fn number(text: Option<&str>) -> Option<f64> {
@@ -286,6 +294,55 @@ pub(super) fn direct_rotation(video: &metadata::Stream, settings: &EncodeSetting
     };
     (transform == expected).then_some(rotation)
 }
+
+fn is_dynamic_hdr(value: &serde_json::Value) -> bool {
+    let kind = value["side_data_type"].as_str().unwrap_or_default();
+    kind.contains("DOVI")
+        || kind.contains("Dolby")
+        || kind.contains("Dynamic")
+        || kind.contains("HDR10+")
+        || kind == "HEVC enhancement-layer decoder configuration"
+}
+
+fn uses_hdr10_fallback(video: &metadata::Stream, settings: &EncodeSettings) -> bool {
+    can_discard_dynamic_hdr(settings) && encode_plan::is_hdr10_source(video)
+}
+
+fn can_discard_dynamic_hdr(settings: &EncodeSettings) -> bool {
+    settings.hdr10_fallback && settings.encoder.is_svt() && settings.tone_map.is_none()
+}
+
+fn validate_fallback_base(video: &metadata::Stream) -> Result<Hdr10, AppError> {
+    let dynamic: Vec<_> = video
+        .side_data_list
+        .iter()
+        .filter(|value| is_dynamic_hdr(value))
+        .cloned()
+        .collect();
+    let hdr = Hdr10::build(&dynamic, true, false)?;
+    hdr.validate_dolby_base_codec(video.codec_name.as_deref())?;
+    Ok(hdr)
+}
+
+fn validate_dynamic_hdr(
+    values: &[serde_json::Value],
+    fallback: Option<&Hdr10>,
+) -> Result<bool, AppError> {
+    let mut found = false;
+    for value in values.iter().filter(|value| is_dynamic_hdr(value)) {
+        let Some(hdr) = fallback else {
+            return Err(AppError::new(
+                "ENCODE_INPUT_UNSUPPORTED",
+                "Per-frame dynamic HDR cannot be duplicated or dropped during clock normalization.",
+                None,
+            ));
+        };
+        hdr::validate_side_data(std::slice::from_ref(value), Some(hdr), false)?;
+        found = true;
+    }
+    Ok(found)
+}
+
 fn recipe(
     document: &Document,
     settings: &EncodeSettings,
@@ -338,22 +395,15 @@ fn recipe(
             None,
         ));
     }
-    if video.side_data_list.iter().any(|value| {
-        value
-            .get("side_data_type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| {
-                kind.contains("DOVI")
-                    || kind.contains("Dolby")
-                    || kind.contains("Dynamic")
-                    || kind.contains("HDR10+")
-            })
-    }) {
-        return Err(AppError::new(
-            "ENCODE_INPUT_UNSUPPORTED",
-            "Display/timestamp canonicalization cannot transform per-frame Dolby Vision or HDR10+ rendering metadata. Use the explicit HDR10 fallback/rendering route before changing its frame correspondence.",
-            None,
-        ));
+    if video.side_data_list.iter().any(is_dynamic_hdr) {
+        if !uses_hdr10_fallback(video, settings) {
+            return Err(AppError::new(
+                "ENCODE_INPUT_UNSUPPORTED",
+                "Display/timestamp canonicalization cannot transform per-frame Dolby Vision or HDR10+ rendering metadata. Use explicit HDR10 fallback with a compatible HDR10 base layer or render the source before changing its frame correspondence.",
+                None,
+            ));
+        }
+        validate_fallback_base(video)?;
     }
     if settings.temporal.is_some_and(|value| {
         value.deinterlace.is_some() || value.qtgmc.is_some() || value.cadence_repair.is_some()
@@ -435,6 +485,8 @@ struct Owner {
 struct Complete {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    discarded_dynamic_hdr: bool,
 }
 struct Workspace {
     root: PathBuf,
@@ -745,10 +797,7 @@ impl Cleanup {
         }
         self.0.verify_layout()
     }
-    /// Settings do not change this complete original-clock/rotation source.
-    /// The recovery action separately invalidates encoded and processed stages.
-    pub(super) fn rebind(mut self, settings: &EncodeSettings) -> Result<(), AppError> {
-        self.verify_source()?;
+    pub(super) fn validate_rebind(&self, settings: &EncodeSettings) -> Result<(), AppError> {
         if self.0.owner.settings == *settings {
             return Ok(());
         }
@@ -765,6 +814,33 @@ impl Cleanup {
                 &self.0.root,
                 "New-settings resume cannot change trim bounds on a trim-bounded canonical source.",
             ));
+        }
+        if settings.hdr_metadata.as_ref().is_some_and(|metadata| {
+            metadata.dolby_vision_rpu_path.is_some() || metadata.hdr10_plus_json_path.is_some()
+        }) {
+            return Err(invalid(
+                &self.0.root,
+                "The saved canonical source has a changed clock or orientation. Start a new encode from the original before importing per-frame HDR metadata.",
+            ));
+        }
+        if !can_discard_dynamic_hdr(settings)
+            && read_json::<Complete>(&self.0.root.join("complete.json"))?.discarded_dynamic_hdr
+        {
+            return Err(invalid(
+                &self.0.root,
+                "The saved canonical source discarded Dolby Vision or HDR10+ metadata with HDR10 fallback. Keep HDR10 fallback enabled to resume this job, or start a new encode from the original to change HDR processing.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compatible edits change the encoder receipt while retaining the verified
+    /// canonical source. The recovery action updates the encoded stages.
+    pub(super) fn rebind(mut self, settings: &EncodeSettings) -> Result<(), AppError> {
+        self.verify_source()?;
+        self.validate_rebind(settings)?;
+        if self.0.owner.settings == *settings {
+            return Ok(());
         }
         self.0.owner.settings = settings.clone();
         let path = self.0.root.join("owner.json");
@@ -1065,6 +1141,7 @@ async fn stage_source(
     recipe: &Recipe,
     chapter_file: &Path,
     compressed: bool,
+    discard_dynamic_hdr: bool,
     temporary: &mut Temporary,
     cancel: &watch::Receiver<bool>,
 ) -> Result<supervisor::CapturedOutput, AppError> {
@@ -1104,7 +1181,7 @@ async fn stage_source(
             format!("-slicecrc:{index}").into(),
             "1".into(),
             format!("-filter:{index}").into(),
-            recipe.filter().into(),
+            recipe.filter(discard_dynamic_hdr).into(),
             format!("-fps_mode:{index}").into(),
             "cfr".into(),
         ]);
@@ -1169,8 +1246,9 @@ async fn static_hdr_metadata(
     index: u32,
     header: &[serde_json::Value],
     scan_all: bool,
+    fallback: Option<&Hdr10>,
     cancel: &watch::Receiver<bool>,
-) -> Result<encode_plan::hdr::StaticMetadata, AppError> {
+) -> Result<HdrScan, AppError> {
     let limits: &[Option<u32>] = if scan_all {
         &[None]
     } else {
@@ -1178,7 +1256,7 @@ async fn static_hdr_metadata(
     };
     for &limit in limits {
         if let Some(metadata) =
-            scan_static_hdr_metadata(ffprobe, input, index, header, limit, cancel).await?
+            scan_static_hdr_metadata(ffprobe, input, index, header, limit, fallback, cancel).await?
         {
             return Ok(metadata);
         }
@@ -1189,14 +1267,20 @@ async fn static_hdr_metadata(
     ))
 }
 
+struct HdrScan {
+    metadata: StaticMetadata,
+    has_dynamic: bool,
+}
+
 async fn scan_static_hdr_metadata(
     ffprobe: &Path,
     input: &Path,
     index: u32,
     header: &[serde_json::Value],
     packets: Option<u32>,
+    fallback: Option<&Hdr10>,
     cancel: &watch::Receiver<bool>,
-) -> Result<Option<encode_plan::hdr::StaticMetadata>, AppError> {
+) -> Result<Option<HdrScan>, AppError> {
     #[derive(Deserialize)]
     struct Frame {
         #[serde(default)]
@@ -1204,7 +1288,9 @@ async fn scan_static_hdr_metadata(
         #[serde(default)]
         interlaced_frame: u8,
     }
-    let mut metadata = encode_plan::hdr::StaticMetadata::parse(header)?;
+    let mut metadata = StaticMetadata::parse(header)?;
+    let mut has_dynamic = header.iter().any(is_dynamic_hdr);
+    let fallback = fallback.cloned();
     let mut args = vec![
         "-v".into(),
         "error".into(),
@@ -1226,21 +1312,59 @@ async fn scan_static_hdr_metadata(
         .map(OsString::from),
     );
     args.push(input.as_os_str().to_owned());
-    let result=supervisor::run_streaming_stdout(&CommandSpec {executable:ffprobe.to_owned(),args,cwd:None},cancel.clone(),64*1024,TIME,move |reader| {
-        let mut first=true;let mut failure=None;
-        super::encode::frame_scan::parse(reader,|frame:Frame| {
-            if failure.is_some(){return}
-            let checked=(|| {
-                if frame.interlaced_frame!=0 {return Err("HDR canonicalization requires progressive source frames.".to_owned())}
-                if frame.side_data_list.iter().any(|value|value.get("side_data_type").and_then(serde_json::Value::as_str).is_some_and(|kind|kind.contains("DOVI")||kind.contains("Dolby")||kind.contains("Dynamic")||kind.contains("HDR10+"))) {return Err("Per-frame dynamic HDR cannot be duplicated or dropped during clock normalization.".to_owned())}
-                let actual=encode_plan::hdr::StaticMetadata::parse(&frame.side_data_list).map_err(|e|e.message)?;
-                if first {metadata.absorb_first_frame(&actual).map_err(|e|e.message)?;first=false;}else{metadata.validate_present(&actual,false).map_err(|e|e.message)?;}
-                Ok(())
-            })();if let Err(error)=checked{failure=Some(error)}
-        })?;
-        if let Some(error)=failure{return Err(error)}
-        Ok((!first).then_some(metadata))
-    }).await.map_err(|e|process_error(e,input))?;
+    let result = supervisor::run_streaming_stdout(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        64 * 1024,
+        TIME,
+        move |reader| {
+            let mut first = true;
+            let mut failure = None;
+            super::encode::frame_scan::parse(reader, |frame: Frame| {
+                if failure.is_some() {
+                    return;
+                }
+                let checked = (|| {
+                    if frame.interlaced_frame != 0 {
+                        return Err(
+                            "HDR canonicalization requires progressive source frames.".to_owned()
+                        );
+                    }
+                    has_dynamic |= validate_dynamic_hdr(&frame.side_data_list, fallback.as_ref())
+                        .map_err(|error| error.message)?;
+                    let actual =
+                        StaticMetadata::parse(&frame.side_data_list).map_err(|e| e.message)?;
+                    if first {
+                        metadata
+                            .absorb_first_frame(&actual)
+                            .map_err(|e| e.message)?;
+                        first = false;
+                    } else {
+                        metadata
+                            .validate_present(&actual, false)
+                            .map_err(|e| e.message)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = checked {
+                    failure = Some(error)
+                }
+            })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            Ok((!first).then_some(HdrScan {
+                metadata,
+                has_dynamic,
+            }))
+        },
+    )
+    .await
+    .map_err(|e| process_error(e, input))?;
     if !result.status.success() || !result.stderr.is_empty() {
         return Err(invalid(
             input,
@@ -1345,6 +1469,9 @@ impl Prepared {
             .iter()
             .find(|stream| stream.index == settings.video_stream_index)
             .expect("selected video");
+        let fallback = uses_hdr10_fallback(metadata_video, settings)
+            .then(|| validate_fallback_base(metadata_video))
+            .transpose()?;
         let retime_frames = if recipe.rotation == 0
             && recipe.origin == 0.0
             && super::encode::header_planning_allowed(settings)
@@ -1460,7 +1587,7 @@ impl Prepared {
             let mut compressed = None;
             if let Some(frames) = retime_frames {
                 manager.phase(id, JobState::Preparing, &format!("Adjusting the timestamps of {frames} compressed AV1 frames to {}/{} fps.", recipe.numerator, recipe.denominator)).await;
-                let staged = stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, true, &mut temporary, cancel).await?;
+                let staged = stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, true, false, &mut temporary, cancel).await?;
                 if retime::completed(&staged, frames) {
                     compressed = Some(staged);
                 } else {
@@ -1474,16 +1601,15 @@ impl Prepared {
             let original_hdr = if retimed {
                 None
             } else {
-                // The transform cannot preserve arbitrary dynamic HDR. A
-                // declared HDR source needs complete eligibility evidence
-                // before rendering.
-                Some(static_hdr_metadata(&ffprobe, &original.path, metadata_video.index, &metadata_video.side_data_list, hdr_video.is_some(), cancel).await?)
+                // Verify every frame of declared HDR before changing its clock.
+                // Allow only dynamic metadata covered by explicit HDR10 fallback.
+                Some(static_hdr_metadata(&ffprobe, &original.path, metadata_video.index, &metadata_video.side_data_list, hdr_video.is_some(), fallback.as_ref(), cancel).await?)
             };
             let prepared = if let Some(prepared) = compressed {
                 prepared
             } else {
                 manager.phase(id,JobState::Preparing,&format!("Preparing a lossless canonical source: display rotation {}°, timestamp origin {:.6}s, CFR {}/{}. Variable input intervals retain duration through explicit frame duplication/drop.",recipe.rotation,recipe.origin,recipe.numerator,recipe.denominator)).await;
-                stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, false, &mut temporary, cancel).await?
+                stage_source(&ffmpeg, &original.path, document, settings.video_stream_index, &recipe, &chapter_file, false, fallback.is_some(), &mut temporary, cancel).await?
             };
             let diagnostic=format!("Canonical source preparation:\n{}",String::from_utf8_lossy(&prepared.stderr));
             if let Some(parent)=log.parent() {tokio::fs::create_dir_all(parent).await.map_err(|e|invalid(log,e.to_string()))?;}
@@ -1503,16 +1629,21 @@ impl Prepared {
             {
                 return Err(invalid(&temporary.path, "The canonical video header does not match the planned codec and display dimensions."));
             }
+            let discarded_dynamic_hdr = fallback.is_some()
+                && original_hdr.as_ref().is_some_and(|scan| scan.has_dynamic);
             if let Some(original_hdr) = original_hdr {
-                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,false,cancel).await?;
-                original_hdr.validate_present(&observed,false)?;observed.validate_present(&original_hdr,false)?;
+                if fallback.is_some() {
+                    validate_dynamic_hdr(&selected_video.side_data_list, None)?;
+                }
+                let observed=static_hdr_metadata(&ffprobe,&temporary.path,settings.video_stream_index,&selected_video.side_data_list,false,None,cancel).await?;
+                original_hdr.metadata.validate_present(&observed.metadata,false)?;observed.metadata.validate_present(&original_hdr.metadata,false)?;
                 if let Some(original_video)=hdr_video
                     && (selected_video.color_primaries!=original_video.color_primaries||selected_video.color_transfer!=original_video.color_transfer||selected_video.color_space!=original_video.color_space||selected_video.color_range!=original_video.color_range||selected_video.pix_fmt!=original_video.pix_fmt) {return Err(invalid(&temporary.path,"Lossless canonicalization changed HDR color interpretation or sample format."));}
             }
             original.verify()?;workspace.verify_layout()?;check_cancel(cancel)?;
             temporary.publish(&source_path)?;drop(temporary);
             let source = if recovery { Some(stamp(&Source::open(&source_path)?, cancel).await?) } else { None };
-            let complete=Complete {source};
+            let complete=Complete {source,discarded_dynamic_hdr};
             complete_file.write_all(&serde_json::to_vec(&complete).map_err(|e|invalid(&root,e.to_string()))?).and_then(|_|complete_file.sync_all()).map_err(|e|invalid(&root,e.to_string()))?;
             let summary = if let Some(frames) = retime_frames.filter(|_| retimed) {
                 format!("Prepared the compressed source clock for {frames} AV1 frames without decoding or re-encoding them.")
@@ -1642,6 +1773,9 @@ pub(super) fn preview_document(
     video.start_time = Some("0".into());
     video.packet_start_time = Some(0.0);
     display_oriented(video, recipe.rotation);
+    if uses_hdr10_fallback(video, settings) {
+        video.side_data_list.retain(|value| !is_dynamic_hdr(value));
+    }
     video.avg_frame_rate = Some(format!("{}/{}", recipe.numerator, recipe.denominator));
     video.r_frame_rate = video.avg_frame_rate.clone();
     if let Some(format) = &mut document.format {
@@ -1755,6 +1889,94 @@ mod orientation_tests {
             "sample_aspect_ratio":"4:3","r_frame_rate":"24/1","side_data_list":side_data
         }]}))
         .unwrap()
+    }
+
+    fn normalization_hdr10(side_data: serde_json::Value) -> Document {
+        serde_json::from_value(serde_json::json!({"streams":[{
+            "index":0,"codec_type":"video","codec_name":"hevc","width":128,"height":96,
+            "start_time":"0","r_frame_rate":"24/1","pix_fmt":"yuv420p10le",
+            "color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc",
+            "color_range":"tv","side_data_list":side_data
+        }]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn canonicalization_requires_explicit_hdr10_fallback_and_a_compatible_dolby_base() {
+        let hdr10plus =
+            serde_json::json!({"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"});
+        let dolby = serde_json::json!({
+            "side_data_type":"DOVI configuration record", "dv_profile":8,
+            "dv_bl_signal_compatibility_id":1,"bl_present_flag":1,"rpu_present_flag":1,
+            "el_present_flag":0
+        });
+        let source = normalization_hdr10(serde_json::json!([hdr10plus, dolby]));
+        let fallback = EncodeSettings {
+            backend: media_core::EncodeBackend::Av1an,
+            hdr10_fallback: true,
+            ..Default::default()
+        };
+        assert!(needs(&source, &fallback, true).unwrap());
+        assert!(!needs(&source, &fallback, false).unwrap());
+        let without_fallback = EncodeSettings {
+            hdr10_fallback: false,
+            ..fallback.clone()
+        };
+        assert!(needs(&source, &without_fallback, true).is_err());
+
+        let mut wrong_profile = source.clone();
+        wrong_profile.streams[0].side_data_list[1]["dv_profile"] = 5.into();
+        wrong_profile.streams[0].side_data_list[1]["dv_bl_signal_compatibility_id"] = 0.into();
+        assert!(needs(&wrong_profile, &fallback, true).is_err());
+
+        let mut wrong_codec = source.clone();
+        wrong_codec.streams[0].codec_name = Some("av1".into());
+        assert!(needs(&wrong_codec, &fallback, true).is_err());
+
+        let mut wrong_signal = source.clone();
+        wrong_signal.streams[0].color_transfer = Some("bt709".into());
+        assert!(needs(&wrong_signal, &fallback, true).is_err());
+
+        let imported = EncodeSettings {
+            hdr_metadata: Some(media_core::HdrMetadataSettings {
+                hdr10_plus_json_path: Some("external.json".into()),
+                ..Default::default()
+            }),
+            ..fallback
+        };
+        assert!(
+            needs(&source, &imported, true)
+                .unwrap_err()
+                .message
+                .contains("External per-frame HDR imports")
+        );
+    }
+
+    #[test]
+    fn canonicalization_checks_late_frame_metadata_against_the_hdr10_base() {
+        let hdr10plus =
+            serde_json::json!({"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"});
+        let unrecognized = serde_json::json!({"side_data_type":"Dynamic HDR Vivid"});
+        let rpu = serde_json::json!({"side_data_type":"Dolby Vision RPU Data"});
+        let source = normalization_hdr10(serde_json::json!([]));
+        let fallback = validate_fallback_base(&source.streams[0]).unwrap();
+        assert!(validate_dynamic_hdr(std::slice::from_ref(&hdr10plus), None).is_err());
+        assert!(validate_dynamic_hdr(&[hdr10plus], Some(&fallback)).is_ok());
+        assert!(validate_dynamic_hdr(&[unrecognized], Some(&fallback)).is_err());
+        assert!(validate_dynamic_hdr(&[rpu], Some(&fallback)).is_err());
+
+        let source = normalization_hdr10(serde_json::json!([{
+            "side_data_type":"DOVI configuration record", "dv_profile":8,
+            "dv_bl_signal_compatibility_id":1,"bl_present_flag":1,"rpu_present_flag":1,
+            "el_present_flag":0
+        }]));
+        let fallback = validate_fallback_base(&source.streams[0]).unwrap();
+        let mut frame = serde_json::json!({
+            "side_data_type":"Dolby Vision Metadata","bl_bit_depth":10,"bl_video_full_range_flag":0
+        });
+        assert!(validate_dynamic_hdr(std::slice::from_ref(&frame), Some(&fallback)).is_ok());
+        frame["bl_video_full_range_flag"] = 1.into();
+        assert!(validate_dynamic_hdr(&[frame], Some(&fallback)).is_err());
     }
 
     #[test]

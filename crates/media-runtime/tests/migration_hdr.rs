@@ -306,9 +306,7 @@ fn insert_hdr10plus(source: &[u8], picture: usize, payload: &[u8]) -> Vec<u8> {
     result
 }
 
-#[tokio::test]
-#[ignore = "requires FFmpeg with libx265 and zscale, FFprobe, and SVT-AV1-HDR"]
-async fn quick_convert_checks_late_hdr10plus_before_publishing() {
+async fn late_hdr10plus_source(fixture: &Fixture) -> PathBuf {
     use hdr10plus::{
         metadata::{Hdr10PlusMetadata, Hdr10PlusMetadataEncOpts},
         metadata_json::MetadataJsonRoot,
@@ -337,7 +335,6 @@ async fn quick_convert_checks_late_hdr10plus_before_publishing() {
         result.stdout
     }
 
-    let fixture = Fixture::new();
     let ffmpeg = tool_path("ffmpeg").await;
     let ffprobe = tool_path("ffprobe").await;
     let raw = fixture.0.join("base.hevc");
@@ -393,7 +390,6 @@ async fn quick_convert_checks_late_hdr10plus_before_publishing() {
     .map(Into::into)
     .collect();
     args.push(input.as_os_str().to_owned());
-    let source_bytes = std::fs::read(&input).unwrap();
     let probe: serde_json::Value = serde_json::from_slice(&run(&ffprobe, args).await).unwrap();
     let frames = probe["frames"].as_array().unwrap();
     assert_eq!(frames.len(), 192);
@@ -407,6 +403,15 @@ async fn quick_convert_checks_late_hdr10plus_before_publishing() {
         }),
         Some(150)
     );
+    input
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with libx265 and zscale, FFprobe, and SVT-AV1-HDR"]
+async fn quick_convert_checks_late_hdr10plus_before_publishing() {
+    let fixture = Fixture::new();
+    let input = late_hdr10plus_source(&fixture).await;
+    let source_bytes = std::fs::read(&input).unwrap();
 
     let manager = JobManager::new(fixture.0.join("logs"));
     let tone_map = serde_json::from_value(serde_json::json!({
@@ -469,6 +474,84 @@ async fn quick_convert_checks_late_hdr10plus_before_publishing() {
                     trim,
                     tone_map,
                     hdr10_fallback: fallback,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let completed = finish(&manager, &job.id).await;
+        assert_eq!(completed.state, expected, "{name}: {completed:#?}");
+        assert_eq!(output.exists(), expected == JobState::Succeeded);
+        if expected == JobState::Failed {
+            let error = completed.error.unwrap();
+            assert_eq!(error.code, "ENCODE_INPUT_UNSUPPORTED");
+            assert!(
+                error
+                    .message
+                    .contains("HDR10+ requires explicit HDR10 fallback")
+            );
+        }
+    }
+    manager.shutdown().await;
+    assert_eq!(std::fs::read(input).unwrap(), source_bytes);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with libx265, FFprobe, AV1AN and SVT-AV1-HDR"]
+async fn av1an_checks_late_hdr10plus_before_publishing() {
+    use media_core::{Av1anOptions, EncodeBackend};
+
+    media_runtime::configure_av1an_encoder_helper(PathBuf::from(env!(
+        "CARGO_BIN_EXE_av1an_encoder_helper"
+    )))
+    .unwrap();
+    let fixture = Fixture::new();
+    let input = late_hdr10plus_source(&fixture).await;
+    let source_bytes = std::fs::read(&input).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let trim = |start, end| {
+        serde_json::from_value(serde_json::json!({
+            "startFrame": start,
+            "endFrameExclusive": end,
+        }))
+        .unwrap()
+    };
+    for (name, fallback, trim, expected) in [
+        ("preserve", false, None, JobState::Failed),
+        ("fallback", true, None, JobState::Succeeded),
+        (
+            "trim-before-hdr10plus",
+            false,
+            Some(trim(0, 24)),
+            JobState::Succeeded,
+        ),
+        (
+            "trim-into-hdr10plus",
+            false,
+            Some(trim(144, 168)),
+            JobState::Failed,
+        ),
+    ] {
+        let output = fixture.0.join(format!("{name}.mkv"));
+        let job = manager
+            .start_encode(EncodeRequest {
+                source: RemuxRequest {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_path: output.to_string_lossy().into_owned(),
+                    stream_indices: vec![0],
+                },
+                settings: EncodeSettings {
+                    backend: EncodeBackend::Av1an,
+                    encoder: VideoEncoder::SvtAv1Hdr,
+                    workers: 1,
+                    preset: 10,
+                    svt_preset: Some(10),
+                    hdr10_fallback: fallback,
+                    trim,
+                    av1an_options: Some(Av1anOptions {
+                        source_workflow: true,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             })

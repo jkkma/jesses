@@ -148,7 +148,7 @@
     validForkSettings,
     type HdrTune,
   } from './encoder-options';
-  import { hdrOutputError } from './media-color';
+  import { av1anDynamicHdrError, hdrOutputError } from './media-color';
   import type {
     EncodeBackend,
     EncodeRequest,
@@ -1742,8 +1742,11 @@
       (cropMode !== 'manual' || cropFits(framing, selectedVideo)),
   );
   const supportsHdr10Output = $derived(encoderSupportsHdr10(encoder));
+  const supportsHdr10Fallback = $derived(
+    supportsHdr10Output && (!chunked || isSvtEncoder(encoder)),
+  );
   const toneMapIssue = $derived(
-    toneMapError(toneMap, backend, selectedVideo, supportsHdr10Output && hdr10Fallback),
+    toneMapError(toneMap, backend, selectedVideo, supportsHdr10Fallback && hdr10Fallback),
   );
   const trimIssue = $derived(
     trimError(
@@ -1807,13 +1810,18 @@
   const hdrOutputIssue = $derived.by(() => {
     if (toneMap.enabled) return null;
     if (fileMode !== 'batch')
-      return hdrOutputError(selectedVideo, supportsHdr10Output, encodePixelFormat);
+      return (
+        hdrOutputError(selectedVideo, supportsHdr10Output, encodePixelFormat) ??
+        (chunked ? av1anDynamicHdrError(selectedVideo, isSvtEncoder(encoder), hdr10Fallback) : null)
+      );
     let firstIssue: string | null = null;
     for (const entry of files) {
       if (chunked && entry.source?.kind === 'imageSequence') continue;
       const video = entry.streams.find(batchVideo);
       if (!video && chunked) continue;
-      const issue = hdrOutputError(video, supportsHdr10Output, encodePixelFormat);
+      const issue =
+        hdrOutputError(video, supportsHdr10Output, encodePixelFormat) ??
+        (chunked ? av1anDynamicHdrError(video, isSvtEncoder(encoder), hdr10Fallback) : null);
       if (!issue) return null;
       firstIssue ??= issue;
     }
@@ -2856,7 +2864,7 @@
             ? filmGrain!
             : 0,
         hdr10Fallback:
-          pictureEnabled && supportsHdr10Output && !toneMap.enabled ? hdr10Fallback : false,
+          pictureEnabled && supportsHdr10Fallback && !toneMap.enabled ? hdr10Fallback : false,
         lineartPsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
         texturePsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
         hdrTune: pictureEnabled && encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
@@ -3161,7 +3169,11 @@
           resolvedTemporal = picture ? settings.temporal : undefined;
         try {
           if (picture && !settings.toneMap) {
-            const issue = hdrOutputError(vid, batchSupportsHdr10, hdrPixelFormat);
+            const issue =
+              hdrOutputError(vid, batchSupportsHdr10, hdrPixelFormat) ??
+              (chunked
+                ? av1anDynamicHdrError(vid, isSvtEncoder(settings.encoder), settings.hdr10Fallback)
+                : null);
             if (issue) throw new Error(issue);
           }
           if (
@@ -4549,7 +4561,7 @@
                 ><option value="off">No tone mapping</option><option value="hable">Hable</option
                 ><option value="mobius">Mobius</option><option value="reinhard">Reinhard</option
                 >{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}</select
-              >{#if !toneMap.enabled && supportsHdr10Output && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label
+              >{#if !toneMap.enabled && supportsHdr10Fallback && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label
                   ><input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
                   fallback (discard DV / HDR10+)</label
                 >{/if}

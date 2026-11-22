@@ -325,20 +325,16 @@ impl DolbyVision {
         })
     }
 
-    pub(super) fn profile(&self) -> u64 {
-        self.profile
-    }
-
     fn is_profile5(&self) -> bool {
         self.profile == 5
     }
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Hdr10 {
+pub(in crate::jobs) struct Hdr10 {
     pub metadata: StaticMetadata,
     pub discard_dynamic: bool,
-    pub dolby: Option<DolbyVision>,
+    dolby: Option<DolbyVision>,
     pub allow_profile5: bool,
     pub imported_dolby: bool,
     pub imported_hdr10plus: bool,
@@ -374,6 +370,20 @@ impl Hdr10 {
         };
         validate_side_data(values, Some(&hdr), false)?;
         Ok(hdr)
+    }
+
+    pub fn validate_dolby_base_codec(&self, codec: Option<&str>) -> Result<(), AppError> {
+        let valid = match self.dolby.as_ref().map(|dolby| dolby.profile) {
+            Some(7 | 8) => codec == Some("hevc"),
+            Some(10) => codec == Some("av1"),
+            _ => true,
+        };
+        if !valid {
+            return Err(unsupported(
+                "Dolby Vision HDR10 fallback supports HEVC profile 7/8 and AV1 profile 10.1 base layers only.",
+            ));
+        }
+        Ok(())
     }
 
     pub fn require_profile5_rpu(&self, values: &[Value]) -> Result<(), AppError> {
@@ -428,7 +438,7 @@ impl Hdr10 {
 }
 
 /// Explicit allowlist: do not silently discard unrecognized rendering metadata.
-pub(super) fn validate_side_data(
+pub(in crate::jobs) fn validate_side_data(
     values: &[Value],
     hdr: Option<&Hdr10>,
     encoded: bool,

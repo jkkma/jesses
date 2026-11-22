@@ -36,3 +36,17 @@ export function hdrOutputError(
     return 'HDR10 output requires 10-bit 4:2:0. Choose a 10-bit Color Format or enable Tone Mapping.';
   return null;
 }
+
+export function av1anDynamicHdrError(
+  stream: MediaStream | undefined,
+  supportsFallback: boolean,
+  hdr10Fallback: boolean,
+): string | null {
+  const dynamic = stream?.dolbyVisionProfile != null || !!stream?.dynamicHdrFormats?.length;
+  if (!dynamic) return null;
+  if (!supportsFallback)
+    return 'Choose an SVT-AV1 encoder and enable HDR10 fallback to discard Dolby Vision / HDR10+, or enable Tone Mapping.';
+  if (!hdr10Fallback)
+    return 'Enable HDR10 fallback to discard Dolby Vision / HDR10+, or enable Tone Mapping.';
+  return null;
+}

@@ -779,6 +779,16 @@ fn sdr_color(text: Option<&str>) -> Result<u8, AppError> {
 fn unspecified(text: Option<&str>) -> bool {
     matches!(text, None | Some("unknown" | "unspecified"))
 }
+
+pub(super) fn is_hdr10_source(video: &Stream) -> bool {
+    let range = video.color_range.as_deref();
+    video.color_primaries.as_deref() == Some("bt2020")
+        && video.color_transfer.as_deref() == Some("smpte2084")
+        && video.color_space.as_deref() == Some("bt2020nc")
+        && video.pix_fmt.as_deref() == Some("yuv420p10le")
+        && (range == Some("tv") || unspecified(range))
+}
+
 fn source_sdr_color(text: Option<&str>, fallback: u8) -> Result<u8, AppError> {
     if unspecified(text) {
         Ok(fallback)
@@ -1060,11 +1070,7 @@ impl Plan {
             ));
         }
         let source_sar = aspect::parse_source(video.sample_aspect_ratio.as_deref())?;
-        let is_hdr10 = video.color_primaries.as_deref() == Some("bt2020")
-            && video.color_transfer.as_deref() == Some("smpte2084")
-            && video.color_space.as_deref() == Some("bt2020nc")
-            && video.pix_fmt.as_deref() == Some("yuv420p10le")
-            && !source_full_range;
+        let is_hdr10 = is_hdr10_source(video);
         if !is_hdr10
             && tone_map.is_none()
             && video.side_data_list.iter().any(|value| {
@@ -1184,18 +1190,8 @@ impl Plan {
         if let (Some(hdr), Some(authored)) = (&mut hdr10, &authored_hdr) {
             hdr.metadata.apply_authored(authored);
         }
-        if let Some(dolby) = hdr10.as_ref().and_then(|hdr| hdr.dolby.as_ref()) {
-            let codec = video.codec_name.as_deref();
-            let valid_base = match dolby.profile() {
-                7 | 8 => codec == Some("hevc"),
-                10 => codec == Some("av1"),
-                _ => true,
-            };
-            if !valid_base {
-                return Err(unsupported(
-                    "Dolby Vision HDR10 fallback supports HEVC profile 7/8 and AV1 profile 10.1 base layers only.",
-                ));
-            }
+        if let Some(hdr) = &hdr10 {
+            hdr.validate_dolby_base_codec(video.codec_name.as_deref())?;
         }
         let validation_side_data = video
             .side_data_list

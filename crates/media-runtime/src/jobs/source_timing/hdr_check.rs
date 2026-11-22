@@ -1,8 +1,9 @@
 //! Packet clocks and the first decoded frame say nothing about later HDR
-//! side data. Read it alongside standalone encoding and before publication.
+//! side data. Read it alongside encoding and before publication.
 
 use super::*;
 use std::{
+    future::Future,
     ops::Range,
     sync::{Arc, Mutex},
 };
@@ -29,7 +30,7 @@ impl HdrChecks {
         self.cancel.subscribe()
     }
 
-    fn reject(&self, error: AppError) {
+    pub(super) fn reject(&self, error: AppError) {
         self.failure
             .lock()
             .expect("HDR failure lock")
@@ -65,7 +66,7 @@ impl HdrChecks {
     }
 }
 
-pub(in crate::jobs) struct HdrCheck(JoinHandle<Result<usize, AppError>>);
+pub(in crate::jobs) struct HdrCheck(JoinHandle<Result<Option<usize>, AppError>>);
 
 impl HdrCheck {
     pub(in crate::jobs) fn start(
@@ -75,22 +76,74 @@ impl HdrCheck {
         selection: Option<Range<usize>>,
         exact_source_frames: Option<usize>,
     ) -> Self {
-        let checks = HDR_CHECKS.with(Arc::clone);
-        let pause = supervisor::scoped_pause();
         let ffprobe = ffprobe.to_owned();
         let input = input.to_owned();
         let plan = plan.clone();
-        Self(tokio::spawn(async move {
-            let cancel = checks.cancel();
-            let scan = inspect(
+        Self::spawn(move |checks, cancel| async move {
+            inspect(
                 &ffprobe,
                 &input,
                 plan,
                 selection,
                 exact_source_frames,
+                checks,
+                &cancel,
+            )
+            .await
+            .map(Some)
+        })
+    }
+
+    pub(in crate::jobs) fn start_packets(
+        ffmpeg: &Path,
+        ffprobe: &Path,
+        input: &Path,
+        plan: &Plan,
+        source: PacketHdrSource,
+        exact_source_frames: Option<usize>,
+    ) -> Self {
+        let ffmpeg = ffmpeg.to_owned();
+        let ffprobe = ffprobe.to_owned();
+        let input = input.to_owned();
+        let plan = plan.clone();
+        Self::spawn(move |checks, cancel| async move {
+            if packet_hdr::inspect(
+                &ffmpeg,
+                &ffprobe,
+                &input,
+                plan.video_index,
+                source,
                 checks.clone(),
                 &cancel,
-            );
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            inspect(
+                &ffprobe,
+                &input,
+                plan,
+                None,
+                exact_source_frames,
+                checks,
+                &cancel,
+            )
+            .await
+            .map(Some)
+        })
+    }
+
+    fn spawn<F, Fut>(scan: F) -> Self
+    where
+        F: FnOnce(Arc<HdrChecks>, watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<usize>, AppError>> + Send + 'static,
+    {
+        let checks = HDR_CHECKS.with(Arc::clone);
+        let pause = supervisor::scoped_pause();
+        Self(tokio::spawn(async move {
+            let cancel = checks.cancel();
+            let scan = scan(checks.clone(), cancel.clone());
             let result = match pause {
                 Some(control) => supervisor::with_pause(control, scan).await,
                 None => scan.await,
@@ -115,7 +168,7 @@ impl HdrCheck {
                 None,
             )
         })??;
-        if let Some(expected) = producer_frames
+        if let (Some(scanned), Some(expected)) = (scanned, producer_frames)
             && scanned != expected
         {
             return Err(count_mismatch(scanned, expected));

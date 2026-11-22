@@ -4,8 +4,10 @@
 //! discarded packets, or ambiguous field coding require a decoded scan.
 
 mod hdr_check;
+mod packet_hdr;
 
 pub(super) use hdr_check::{HdrCheck, HdrChecks};
+pub(super) use packet_hdr::PacketHdrSource;
 
 use super::encode_plan::{Frame, Plan, Validation};
 use super::*;
