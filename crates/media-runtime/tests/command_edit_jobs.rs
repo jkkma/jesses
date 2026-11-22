@@ -12,6 +12,9 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
+            media_runtime::configure_bundled_tools(resources.into()).unwrap();
+        }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-artifacts/source-command-edit");
         fs::create_dir_all(&root).unwrap();
@@ -92,8 +95,14 @@ async fn terminal(manager: &JobManager, id: &str) -> JobSnapshot {
 }
 async fn prepare(manager: &JobManager, request: EncodeRequest) -> CommandEditReview {
     let (_owner, cancel) = tokio::sync::watch::channel(false);
+    // A cold AV1AN workspace fingerprints the packaged tools before command review.
+    let timeout = if request.settings.backend == EncodeBackend::Av1an {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    };
     tokio::time::timeout(
-        Duration::from_secs(10),
+        timeout,
         manager.prepare_command_edit(
             CommandEditRequest::Encode {
                 request: Box::new(request),
@@ -351,6 +360,89 @@ async fn standalone_review_holds_real_pipeline_and_multipass_and_edited_quality_
 }
 
 #[tokio::test]
+#[ignore = "requires FFmpeg, FFprobe and standalone x264"]
+async fn edited_standalone_checks_actual_video_or_audio_and_rejects_empty_media() {
+    let fixture = Fixture::new();
+    fixture.source();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let path_argument = |path: &std::path::Path| {
+        let path = dunce::simplified(path).to_string_lossy();
+        if cfg!(windows) {
+            format!("\"{}\"", path.replace('%', "%%"))
+        } else {
+            quote(&path)
+        }
+    };
+
+    for (name, program, frames) in [
+        (
+            "video",
+            format!(
+                "-i {} -map 0:v:0 -frames:v 2 -c:v mpeg4",
+                path_argument(&fixture.0.join("source ' quoted.mkv")),
+            ),
+            Some(2),
+        ),
+        (
+            "audio",
+            "-f lavfi -i sine=frequency=800:duration=0.5 -c:a aac".into(),
+            None,
+        ),
+        (
+            "empty",
+            "-f lavfi -i sine=frequency=800:duration=0.5 -t 0 -c:a aac -f mp4".into(),
+            None,
+        ),
+    ] {
+        let extension = if name == "empty" { "mkv" } else { "mp4" };
+        let output = format!("edited-{name}.{extension}");
+        let mut request = fixture.request(&output);
+        request.settings.video_mode = VideoMode::Encode;
+        request.settings.encoder = VideoEncoder::X264;
+        let review = prepare(&manager, request).await;
+        let id = review.job.as_ref().unwrap().id.clone();
+        let stage = fixture.0.join(format!(".jesses-{id}.partial.mkv"));
+        manager
+            .confirm_command_edit(
+                CommandEditConfirmation {
+                    id: review.id,
+                    arguments: format!(
+                        "ffmpeg -v error -nostdin -y {program} {}",
+                        path_argument(&stage),
+                    ),
+                },
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let finished = terminal(&manager, &id).await;
+        if name == "empty" {
+            assert_eq!(finished.state, JobState::Failed, "{finished:?}");
+            assert_eq!(
+                finished.error.unwrap().code,
+                "EDITED_COMMAND_OUTPUT_INVALID"
+            );
+            assert!(!fixture.0.join(output).exists());
+        } else {
+            assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+            let expected = frames.map_or_else(
+                || "Output check: readable edited stream headers and media packet.".into(),
+                |frames| {
+                    format!(
+                        "Output check: readable edited media with {frames} declared video frames."
+                    )
+                },
+            );
+            assert!(finished.logs.contains(&expected), "{finished:?}");
+            assert!((0.45..0.6).contains(&finished.duration_seconds.unwrap()));
+            assert!(fixture.0.join(output).is_file());
+        }
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg/FFprobe"]
 async fn cancel_before_review_id_is_returned_stops_queued_preparation_and_leaves_queue_usable() {
     let fixture = Fixture::new();
@@ -430,7 +522,8 @@ async fn av1an_holds_actual_late_program_and_confirmed_encoder_changes_reach_the
     fixture.source();
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
     for (index, changed) in [false, true].into_iter().enumerate() {
-        let mut request = fixture.request(&format!("av1an-{index}.mkv"));
+        let extension = if changed { "mp4" } else { "mkv" };
+        let mut request = fixture.request(&format!("av1an-{index}.{extension}"));
         request.settings.video_mode = VideoMode::Encode;
         request.settings.encoder = VideoEncoder::X264;
         request.settings.backend = EncodeBackend::Av1an;
@@ -473,6 +566,13 @@ async fn av1an_holds_actual_late_program_and_confirmed_encoder_changes_reach_the
             .unwrap();
         let finished = terminal(&manager, &id).await;
         assert_eq!(finished.state, JobState::Succeeded, "{finished:?}");
+        if changed {
+            assert!(
+                finished.logs.iter().any(|line| line
+                    == "Output check: readable edited media with 4 declared video frames."),
+                "{finished:?}"
+            );
+        }
         assert_eq!(
             finished
                 .edited_command

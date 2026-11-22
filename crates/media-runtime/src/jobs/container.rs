@@ -28,6 +28,8 @@ pub(super) struct Cadence<'a> {
     pub numerator: u32,
     pub denominator: u32,
     pub frames: usize,
+    pub mux_video_packets: Option<usize>,
+    pub count_duration_frame_seconds: Option<f64>,
     pub source_iso: Option<SourceIsoReceipt>,
     pub basic_video_check: Option<super::output_counts::VideoCheck>,
     pub mp4_aspect_override: Option<(u32, u32)>,
@@ -35,6 +37,27 @@ pub(super) struct Cadence<'a> {
     pub mov_text: &'a [(usize, &'a super::trim_subtitle_verify::TrackProof)],
     /// Planned output stream kinds, independent of the staging header.
     pub expected_kinds: &'a [&'a str],
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Verification<'a> {
+    Remux,
+    Encode(Cadence<'a>),
+    EditedEncode,
+}
+
+impl<'a> Verification<'a> {
+    pub(super) fn cadence(self) -> Option<Cadence<'a>> {
+        match self {
+            Self::Encode(clock) => Some(clock),
+            Self::Remux | Self::EditedEncode => None,
+        }
+    }
+}
+
+pub(super) struct PreparedContainer<'a> {
+    pub artifact: &'a Temporary,
+    pub mux_video_packets: Option<usize>,
 }
 
 pub(super) async fn restore_mp4_aspect(
@@ -170,13 +193,62 @@ pub(super) fn format(path: &Path) -> Result<ContainerFormat, AppError> {
         .ok_or_else(|| invalid("Choose a .mkv, .mp4, .mov, .webm, .m4a or .ogg destination."))
 }
 
-/// Header probes carry no packet counts. Only a selected subtitle bound for a
-/// container other than Matroska needs one: `preflight` rejects it when empty.
+/// An ISO/WebM destination requires evidence that selected subtitle tracks
+/// contain cues. A first packet can establish that without a packet count.
 pub(super) fn needs_cue_counts(output: &Path, document: &Document, selected: &[u32]) -> bool {
     format(output).is_ok_and(|container| container != ContainerFormat::Matroska)
         && document.streams.iter().any(|stream| {
             selected.contains(&stream.index) && stream.codec_type.as_deref() == Some("subtitle")
         })
+}
+
+pub(super) async fn probe_cues(
+    ffprobe: &Path,
+    input: &Path,
+    mut document: Document,
+    selected: &[u32],
+    cancel: &watch::Receiver<bool>,
+) -> Result<Document, AppError> {
+    let mut tracks: Vec<_> = document
+        .streams
+        .iter_mut()
+        .filter(|stream| {
+            selected.contains(&stream.index) && stream.codec_type.as_deref() == Some("subtitle")
+        })
+        .collect();
+    if tracks.len() > 1 {
+        // Try a short interleaved read for all first cues. Share a scan if
+        // several tracks have late cues or no packets at all.
+        let packets = super::probe_first_packets(ffprobe, input, None, 1024, cancel).await?;
+        for track in &mut tracks {
+            if let Some(packet) = packets
+                .iter()
+                .find(|packet| packet.stream_index == track.index)
+            {
+                track.packet_start_time = Some(
+                    packet
+                        .start()
+                        .ok_or_else(|| super::invalid_first_packet(input))?,
+                );
+            }
+        }
+        tracks.retain(|track| track.packet_start_time.is_none());
+        if tracks.len() > 1 {
+            return super::probe(ffprobe, input, cancel, Some(selected)).await;
+        }
+    }
+    if let Some(track) = tracks.pop() {
+        let packets =
+            super::probe_first_packets(ffprobe, input, Some(track.index), 1, cancel).await?;
+        if let Some(packet) = packets.first() {
+            track.packet_start_time = Some(
+                packet
+                    .start()
+                    .ok_or_else(|| super::invalid_first_packet(input))?,
+            );
+        }
+    }
+    Ok(document)
 }
 
 /// FFmpeg writes MP4/MOV chapters as a text track that reads back as a
@@ -338,7 +410,10 @@ fn preflight_with_staging(
                 .nb_read_packets
                 .as_deref()
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|value| value > 0)
+                .map_or_else(
+                    || stream.packet_start_time.is_some_and(f64::is_finite),
+                    |value| value > 0,
+                )
         {
             return Err(invalid(format!(
                 "Subtitle stream {} has no cues. Deselect this empty track or use Matroska to retain it.",
@@ -1001,11 +1076,12 @@ pub(super) async fn prepare<'a>(
     output: &Path,
     id: &str,
     cancel: &watch::Receiver<bool>,
-    cadence: Option<Cadence<'_>>,
+    verification: Verification<'_>,
     timecode: Option<&TimecodeTrack>,
     faststart: bool,
     scratch: &'a mut Vec<Temporary>,
-) -> Result<Option<&'a Temporary>, AppError> {
+) -> Result<Option<PreparedContainer<'a>>, AppError> {
+    let cadence = verification.cadence();
     let container = format(output)?;
     if timecode.is_some() && container != ContainerFormat::Mov {
         return Err(invalid("QuickTime timecode can be copied only into MOV."));
@@ -1026,18 +1102,24 @@ pub(super) async fn prepare<'a>(
         super::check_cancel(cancel)?;
         return Ok(None);
     }
-    let mut document = if let Some(clock) = cadence {
-        let kinds = clock.expected_kinds;
-        // Subtitle compatibility can require cue counts from the staging file.
-        let headers = if kinds.contains(&"subtitle") {
-            super::probe(&ffprobe, &input.path, cancel, None).await?
-        } else {
-            super::probe_headers(&ffprobe, &input.path, cancel, None).await?
-        };
-        super::output_counts::check_streams(&headers, kinds)?;
-        headers
-    } else {
+    let mut document = if matches!(verification, Verification::Remux) {
         super::probe(&ffprobe, &input.path, cancel, None).await?
+    } else {
+        let headers = super::probe_headers(&ffprobe, &input.path, cancel, None).await?;
+        if let Some(clock) = cadence {
+            super::output_counts::check_streams(&headers, clock.expected_kinds)?;
+        }
+        let subtitles = headers
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        if subtitles.is_empty() {
+            headers
+        } else {
+            probe_cues(&ffprobe, &input.path, headers, &subtitles, cancel).await?
+        }
     };
     if let Some(position) = chapter_track_position(&document) {
         document.streams.remove(position);
@@ -1073,18 +1155,28 @@ pub(super) async fn prepare<'a>(
         container.extension(),
     )?);
     let artifact = scratch.last().expect("owned final container");
+    let mut args = arguments(
+        &input.path,
+        &artifact.path,
+        &document,
+        container,
+        cadence,
+        timecode,
+        faststart,
+    )?;
+    let observe_movie = cadence.is_some_and(|clock| {
+        super::output_counts::movie_is_first_video(clock.expected_kinds, clock.index as usize)
+    });
+    if observe_movie {
+        args.splice(
+            ..0,
+            super::output_counts::MUX_PROGRESS_ARGS.map(OsString::from),
+        );
+    }
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: ffmpeg.clone(),
-            args: arguments(
-                &input.path,
-                &artifact.path,
-                &document,
-                container,
-                cadence,
-                timecode,
-                faststart,
-            )?,
+            args,
             cwd: None,
         },
         cancel.clone(),
@@ -1107,10 +1199,19 @@ pub(super) async fn prepare<'a>(
     } else {
         artifact.flush_nonempty_async().await?;
     }
-    if cadence.is_some() {
+    if !matches!(verification, Verification::Remux) {
         input.flush_nonempty_async().await?;
         super::check_cancel(cancel)?;
-        return Ok(Some(artifact));
+        let mut progress = super::output_counts::MuxProgress::default();
+        if observe_movie {
+            for line in String::from_utf8_lossy(&result.stdout).lines() {
+                progress.observe(line);
+            }
+        }
+        return Ok(Some(PreparedContainer {
+            artifact,
+            mux_video_packets: progress.completed(),
+        }));
     }
     let mut actual = super::probe(&ffprobe, &artifact.path, cancel, None).await?;
     let mut expected = document.clone();
@@ -1265,7 +1366,10 @@ pub(super) async fn prepare<'a>(
     super::encode::boxed(|| verify_final_media(&ffmpeg, &artifact.path, &actual, cancel)).await?;
     input.flush_nonempty_async().await?;
     super::check_cancel(cancel)?;
-    Ok(Some(artifact))
+    Ok(Some(PreparedContainer {
+        artifact,
+        mux_video_packets: None,
+    }))
 }
 
 /// Decode all video and audio streams in a repacked remux output.
@@ -1609,6 +1713,8 @@ mod tests {
             numerator: 134_790_000,
             denominator: 2_245_573,
             frames: 60,
+            mux_video_packets: None,
+            count_duration_frame_seconds: None,
             source_iso: None,
             basic_video_check: None,
             mp4_aspect_override: None,

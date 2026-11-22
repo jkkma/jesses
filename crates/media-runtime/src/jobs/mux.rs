@@ -466,10 +466,18 @@ impl JobManager {
             )
             .await?;
         }
-        let converted =
-            super::container::prepare(temporary, &output, id, cancel, None, None, false, scratch)
-                .await?;
-        let temporary = converted.unwrap_or(temporary);
+        let converted = super::container::prepare(
+            temporary,
+            &output,
+            id,
+            cancel,
+            super::container::Verification::Remux,
+            None,
+            false,
+            scratch,
+        )
+        .await?;
+        let temporary = converted.map_or(temporary, |prepared| prepared.artifact);
         let mut state = self.state.lock().await;
         check_cancel(cancel)?;
         for input in &inputs {

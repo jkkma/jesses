@@ -244,11 +244,13 @@ impl JobManager {
             // and destination against stream headers before that pass.
             let ffprobe = discover("ffprobe", cancel).await?;
             let output = files::output_path(request, &original)?;
-            let headers = probe(
+            let headers = probe_encode_source(
                 &ffprobe,
                 &original.path,
+                &output,
+                &request.stream_indices,
+                settings,
                 cancel,
-                Some(&request.stream_indices),
             )
             .await?;
             preflight_streams(
@@ -563,26 +565,15 @@ impl JobManager {
             })
             .await;
         }
-        // Stream headers are enough to plan. Count packets when subtitle cue
-        // presence or the MOV timecode contract depends on them.
-        let mut document = probe_headers(
+        let mut document = probe_encode_source(
             &ffprobe,
             &source.path,
+            &output,
+            &request.stream_indices,
+            settings,
             cancel,
-            Some(&request.stream_indices),
         )
         .await?;
-        if settings.mov_timecode_track.is_some()
-            || container::needs_cue_counts(&output, &document, &request.stream_indices)
-        {
-            document = probe(
-                &ffprobe,
-                &source.path,
-                cancel,
-                Some(&request.stream_indices),
-            )
-            .await?;
-        }
         // Run every header-only check before any decode pass, so an impossible
         // destination fails in seconds rather than after a frame-by-frame scan.
         // The checks repeat below against the final decoded-color metadata.
@@ -1829,6 +1820,7 @@ impl JobManager {
             // The held program owns many asynchronous construction temporaries.
             // Isolate that complete phase so its debug poll frame is not also
             // reserved while the normal QTGMC/encoder process tree is polled.
+            #[rustfmt::skip]
             let edited=boxed(||async {
             let two_pass = rate.as_ref().is_some_and(|rate| rate.two_pass);
             if two_pass && standalone_stats.is_none() {
@@ -1911,9 +1903,7 @@ impl JobManager {
                 if defer_source_qtgmc && let Some(prepared)=&mut qtgmc {prepared.video.reopen_after_path_writer()?;}
                 for temporary in &mut path_outputs { if temporary.path.exists() { temporary.reopen_after_path_writer()?; } }
                 result?;
-                let actual = super::command_edit::verify_actual_output(&ffmpeg, &ffprobe, temp, cancel).await?;
                 source.verify()?; external.verify()?; if let Some(original) = original_guard { original.verify()?; }
-                self.change(id, |snapshot| { snapshot.duration_seconds = actual.duration(); append_log(snapshot, "The complete edited program produced fully decodable media; original typed picture expectations were replaced by the confirmed program.".into()); }).await;
                 return Ok::<bool,AppError>(true);
             }
                 Ok::<bool,AppError>(false)
@@ -1922,17 +1912,8 @@ impl JobManager {
                 if let Some(check) = source_hdr_check {
                     check.finish(None).await?;
                 }
-                self.finalize(
-                    id,
-                    cancel,
-                    &source,
-                    Some(&external),
-                    temp,
-                    &output,
-                    None,
-                    scratch,
-                )
-                .await?;
+                self.finalize_edited_encode(id, cancel, &source, &external, temp, &output, scratch)
+                    .await?;
                 drop(standalone_stats);
                 drop(standalone_timed);
                 drop(standalone_final);
@@ -1983,6 +1964,7 @@ impl JobManager {
         let resume_finalizing = standalone_recovery.as_ref().is_some_and(|recovery| {
             recovery.phase() == Some(media_core::StandaloneRecoveryPhase::Finalizing)
         });
+        let mut mux_video_packets = None;
         if settings.source_filters
             && let Some(contract) = standalone_recovery
                 .as_ref()
@@ -2150,25 +2132,13 @@ impl JobManager {
                         if let Some(check) = source_hdr_check {
                             check.finish(None).await?;
                         }
-                        let actual = super::command_edit::verify_actual_output(
-                            &ffmpeg, &ffprobe, temp, cancel,
-                        )
-                        .await?;
                         source.verify()?;
                         external.verify()?;
                         if let Some(original) = original_guard {
                             original.verify()?;
                         }
-                        self.change(id, |snapshot| { snapshot.duration_seconds = actual.duration(); append_log(snapshot, "The confirmed AV1AN program and selected-track mux produced fully decodable media.".into()); }).await;
-                        self.finalize(
-                            id,
-                            cancel,
-                            &source,
-                            Some(&external),
-                            temp,
-                            &output,
-                            None,
-                            scratch,
+                        self.finalize_edited_encode(
+                            id, cancel, &source, &external, temp, &output, scratch,
                         )
                         .await?;
                         drop(durable);
@@ -2711,6 +2681,18 @@ impl JobManager {
                 cover_art.as_ref(),
                 settings_attachment.as_ref(),
             );
+            let observe_movie = container::format(&output)?
+                == media_core::ContainerFormat::Matroska
+                && output_selected
+                    .iter()
+                    .position(|stream| stream.codec_type.as_deref() == Some("video"))
+                    == Some(video_position);
+            if observe_movie {
+                mux_arguments.splice(
+                    ..0,
+                    super::output_counts::MUX_PROGRESS_ARGS.map(OsString::from),
+                );
+            }
             let (sender, events) = mpsc::channel(256);
             let observer = self.observe_encode(id, events, None);
             let result = supervisor::run(
@@ -2725,7 +2707,7 @@ impl JobManager {
                 Duration::from_secs(60 * 60),
             )
             .await;
-            let _ = observer.await;
+            let completed = observer.await.ok().flatten();
             let result = result.map_err(|e| process_error(e, &source.path))?;
             if !result.status.success() {
                 return Err(files::error(
@@ -2733,6 +2715,9 @@ impl JobManager {
                     "The encoded video could not be muxed with the selected source tracks.",
                     &temp.path,
                 ));
+            }
+            if observe_movie {
+                mux_video_packets = completed;
             }
             self.change(id, |snapshot| {
                 append_log(snapshot, format!("Mux log: {}", mux_log.display()))
@@ -2846,6 +2831,13 @@ impl JobManager {
                 numerator: plan.fps_num,
                 denominator: plan.fps_den,
                 frames: frame_count,
+                mux_video_packets,
+                count_duration_frame_seconds: (settings.backend
+                    == media_core::EncodeBackend::Standalone
+                    && !settings.source_filters
+                    && !plan.restores_source_dolby_clock()
+                    && settings.mov_timecode_track.is_none())
+                .then(|| plan.frame_seconds()),
                 source_iso: if let Some(receipt) = source_iso_receipt {
                     receipt.verify(temp, cancel).await?;
                     Some(receipt)
@@ -3122,7 +3114,7 @@ impl JobManager {
         id: &str,
         events: mpsc::Receiver<ProcessEvent>,
         frame_seconds: Option<f64>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<Option<usize>> {
         self.observe_encode_with_estimate(id, events, frame_seconds, false)
     }
 
@@ -3132,13 +3124,18 @@ impl JobManager {
         mut events: mpsc::Receiver<ProcessEvent>,
         frame_seconds: Option<f64>,
         estimated: bool,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<Option<usize>> {
         let manager = self.clone();
         let id = id.to_owned();
         tokio::spawn(async move {
+            let mut progress = super::output_counts::MuxProgress::default();
             while let Some(event) = events.recv().await {
                 let line = match event {
-                    ProcessEvent::Stdout(line) | ProcessEvent::Stderr(line) => line,
+                    ProcessEvent::Stdout(line) => {
+                        progress.observe(&line);
+                        line
+                    }
+                    ProcessEvent::Stderr(line) => line,
                 };
                 manager
                     .change(&id, |snapshot| {
@@ -3178,6 +3175,7 @@ impl JobManager {
                     })
                     .await;
             }
+            progress.completed()
         })
     }
 }
@@ -3333,7 +3331,34 @@ fn keep_last_codec_options(args: &mut Vec<OsString>) {
     });
 }
 
-/// Container, stream and settings checks that need only stream headers.
+async fn probe_encode_source(
+    ffprobe: &Path,
+    input: &Path,
+    output: &Path,
+    selected: &[u32],
+    settings: &EncodeSettings,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Document, AppError> {
+    if settings.mov_timecode_track.is_some() {
+        return probe(ffprobe, input, cancel, Some(selected)).await;
+    }
+    let document = probe_headers(ffprobe, input, cancel, Some(selected)).await?;
+    if !container::needs_cue_counts(output, &document, selected) {
+        return Ok(document);
+    }
+    let keep: Vec<_> = selected
+        .iter()
+        .copied()
+        .filter(|index| {
+            !settings.subtitles.iter().any(|track| {
+                track.stream_index == *index && track.mode == media_core::SubtitleMode::BurnIn
+            })
+        })
+        .collect();
+    container::probe_cues(ffprobe, input, document, &keep, cancel).await
+}
+
+/// Validate the selected streams and settings before starting the encoder.
 async fn preflight_streams(
     source: &Source,
     request: &RemuxRequest,

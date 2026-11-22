@@ -633,6 +633,149 @@ impl JobManager {
         }
         check_cancel(cancel)
     }
+    pub(super) async fn verify_edited_encode_output(
+        &self,
+        id: &str,
+        ffprobe: &Path,
+        temporary: &Temporary,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), AppError> {
+        self.phase(
+            id,
+            JobState::Finalizing,
+            "Checking the edited output's stream headers and first media packet.",
+        )
+        .await;
+        temporary.flush_nonempty_async().await?;
+        // A confirmed program can change the output duration, geometry and tracks.
+        let output = probe_edited_encode_output(ffprobe, &temporary.path, None, cancel).await?;
+        let movie = output.document.streams.iter().find(|stream| {
+            stream.codec_type.as_deref() == Some("video") && !cover_art::is_cover(stream)
+        });
+        let declared_frames = movie
+            .and_then(|stream| stream.nb_frames.as_deref())
+            .and_then(|value| value.parse::<u64>().ok());
+        let has_packet = if let Some(movie) = movie {
+            declared_frames != Some(0)
+                && (output.has_packet(Some(movie.index))
+                    || probe_edited_encode_output(
+                        ffprobe,
+                        &temporary.path,
+                        Some(movie.index),
+                        cancel,
+                    )
+                    .await?
+                    .has_packet(Some(movie.index)))
+        } else {
+            output.has_packet(None)
+        };
+        if !has_packet {
+            return Err(files::error(
+                "EDITED_COMMAND_OUTPUT_INVALID",
+                "The edited command did not produce a readable media packet in its held output.",
+                &temporary.path,
+            ));
+        }
+        self.change(id, |snapshot| {
+            snapshot.duration_seconds = output.document.duration();
+            append_log(
+                snapshot,
+                declared_frames.map_or_else(
+                    || "Output check: readable edited stream headers and media packet.".into(),
+                    |frames| format!("Output check: readable edited media with {frames} declared video frames."),
+                ),
+            );
+        })
+        .await;
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EditedPacket {
+    stream_index: u32,
+    size: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EditedOutput {
+    #[serde(flatten)]
+    document: Document,
+    #[serde(default)]
+    packets: Vec<EditedPacket>,
+}
+
+impl EditedOutput {
+    fn has_packet(&self, stream: Option<u32>) -> bool {
+        self.packets.iter().any(|packet| {
+            stream.is_none_or(|index| packet.stream_index == index)
+                && packet.size.parse::<u64>().is_ok_and(|size| size > 0)
+                && self
+                    .document
+                    .streams
+                    .iter()
+                    .any(|track| track.index == packet.stream_index)
+        })
+    }
+}
+
+async fn probe_edited_encode_output(
+    ffprobe: &Path,
+    path: &Path,
+    stream: Option<u32>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<EditedOutput, AppError> {
+    check_cancel(cancel)?;
+    let mut args: Vec<OsString> = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-read_intervals",
+        "%+#1",
+        "-show_packets",
+        "-show_entries",
+        "packet=stream_index,size:stream=index,codec_type,nb_frames:stream_disposition=attached_pic:format=duration",
+        "-of",
+        "json",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    if let Some(index) = stream {
+        args.extend(["-select_streams".into(), index.to_string().into()]);
+    }
+    args.extend(["-i".into(), path.as_os_str().to_owned()]);
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        1024 * 1024,
+        Duration::from_secs(5 * 60),
+    )
+    .await
+    .map_err(|cause| process_error(cause, path))?;
+    check_cancel(cancel)?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(files::error(
+            "EDITED_COMMAND_OUTPUT_INVALID",
+            format!(
+                "FFprobe could not read the edited output: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ),
+            path,
+        ));
+    }
+    serde_json::from_slice(&result.stdout).map_err(|_| {
+        files::error(
+            "PROBE_INVALID_RESPONSE",
+            "FFprobe returned unreadable metadata for the edited output.",
+            path,
+        )
+    })
 }
 
 pub(super) async fn verify_actual_output(

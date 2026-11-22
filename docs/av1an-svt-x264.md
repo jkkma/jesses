@@ -6,8 +6,10 @@ when the configured executable has the wrong identity. x264 and x265 write raw
 chunks and require mkvmerge to make a timed video intermediate. vpxenc also
 uses mkvmerge to assign exact rational timing to its VP9 chunks. SVT and AOM
 use IVF with FFmpeg concatenation by default. Before publication, Jesses checks
-the planned streams and verifies that the final movie track decodes to the
-expected frame count.
+the planned streams and uses the movie track's declared frame count when
+available. Otherwise it uses the final muxer's packet count or counts the movie
+track's packets directly. AV1 and VP9 can store hidden frames in different
+packets, so a packet count by itself can leave the exact frame count unconfirmed.
 
 Normal AV1AN startup uses stream headers and a bounded first-frame inspection,
 without a separate whole-video packet or decoded-frame scan. Header frame counts
@@ -17,9 +19,11 @@ count for recovery, progress and final output checks. Exact-boundary operations
 planning they need. Missing duration/count metadata also falls back to packet
 planning.
 
-Resumable AV1AN jobs bind the source and completed chunks to SHA-256 content
-receipts. The actual encode reports unsupported options or missing runtime
-dependencies.
+Resumable AV1AN jobs bind ordinary sources to their file identity, size,
+modification and change times, and SHA-256 samples. Completed chunks and copied
+cuts retain full SHA-256 receipts. Jesses also keeps full hashes for older
+receipts and uses them when the file change time is unavailable or too recent.
+The actual encode reports unsupported options or missing runtime dependencies.
 
 The av1an controls include encoder threads (0 asks the encoder to choose),
 1–10 chunk attempts, FFmpeg or mkvmerge concatenation where supported, and

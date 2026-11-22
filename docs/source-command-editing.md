@@ -21,9 +21,11 @@ reference/palette and final encoding as one program.
 `confirm_command_edit` consumes a review ID once. Exactly unchanged text uses
 the original native argv route and its original typed validation. Changed text
 runs the deliberately edited shell program with process-tree cancellation,
-logs and progress. Shell execution is not sandboxed. Changed output is fully
-decoded and checked as actual media; pre-edit codec/geometry/trim assumptions
-are not reapplied. The original known-source/tool identities and owned-resource
+logs and progress. Shell execution is not sandboxed. Edited Quick Convert and
+AV1AN encodes check the actual output's stream headers and first movie packet
+or a media packet for audio-only and other outputs. They report the movie
+track's frame count when the output declares it. Edited remux output is still
+decoded. The original known-source/tool identities and owned-resource
 checks remain, and atomic publication still cannot replace a later destination
 owner. A malformed, failed, missing-output, canceled or cleared program cannot
 report success or publish an unchecked output. Image edits retain the selected

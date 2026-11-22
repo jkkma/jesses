@@ -10,12 +10,18 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     sync::Mutex as StdMutex,
 };
 
 const LIMIT: usize = 16 * 1024 * 1024;
+const SOURCE_SAMPLE_SIZE: usize = 64 * 1024;
+const SOURCE_FINGERPRINT_PREFIX: &str = "source-v2:";
+// A rapid write can share the prior timestamp even on NTFS. Only reuse
+// metadata observed well after the last change, without waiting for a clock tick.
+const FILE_CHANGE_MARGIN_NS: i128 = 2_000_000_000;
 static WRITE_ID: AtomicU64 = AtomicU64::new(1);
+static TOOL_DIGESTS: StdMutex<Vec<(FileSnapshot, String)>> = StdMutex::new(Vec::new());
 #[cfg(test)]
 type DigestReadHook = Box<dyn FnMut(&Path)>;
 #[cfg(test)]
@@ -238,9 +244,190 @@ fn source_stamp(path: &Path, cancel: Option<&watch::Receiver<bool>>) -> Result<S
     Ok(stamp)
 }
 
+#[derive(PartialEq, Eq)]
+struct FileSnapshot {
+    identity: Identity,
+    length: u64,
+    modified: SystemTime,
+    change_time: i128,
+}
+
+impl FileSnapshot {
+    fn is_stable_at(&self, now: i128) -> bool {
+        now - self.change_time > FILE_CHANGE_MARGIN_NS
+    }
+}
+
+fn unix_nanos(time: SystemTime) -> i128 {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after_epoch) => after_epoch.as_nanos() as i128,
+        Err(before_epoch) => -(before_epoch.duration().as_nanos() as i128),
+    }
+}
+
+#[cfg(windows)]
+fn change_time(file: &File, _: &fs::Metadata) -> Option<i128> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+    let mut info = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: file owns a live handle and info is a correctly sized output buffer.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return None;
+    }
+    // SAFETY: the successful call initialized the entire structure.
+    let ticks = unsafe { info.assume_init() }.ChangeTime;
+    // NT timestamps are in 100 ns ticks since 1601.
+    (ticks > 0).then_some((i128::from(ticks) - 116_444_736_000_000_000) * 100)
+}
+
+#[cfg(unix)]
+fn change_time(_: &File, metadata: &fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
+fn file_snapshot(path: &Path, file: &File) -> Result<Option<FileSnapshot>, AppError> {
+    let metadata = file.metadata().map_err(|e| error(path, e.to_string()))?;
+    let Some(change_time) = change_time(file, &metadata) else {
+        return Ok(None);
+    };
+    let handle_identity = file_identity(file).map_err(|e| error(path, e.to_string()))?;
+    if identity(path)? != handle_identity {
+        return Err(error(path, "The recovery file was replaced."));
+    }
+    Ok(Some(FileSnapshot {
+        identity: handle_identity,
+        length: metadata.len(),
+        modified: metadata
+            .modified()
+            .map_err(|e| error(path, e.to_string()))?,
+        change_time,
+    }))
+}
+
+fn original_fingerprint(
+    path: &Path,
+    guard: &Source,
+    previously_sampled: bool,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Stamp, AppError> {
+    if let Some(cancel) = cancel {
+        check_cancel(cancel)?;
+    }
+    let now = unix_nanos(SystemTime::now());
+    let Some(snapshot) = file_snapshot(path, guard.file())?
+        .filter(|snapshot| previously_sampled || snapshot.is_stable_at(now))
+    else {
+        return digest(path, cancel);
+    };
+    let mut file = guard
+        .file()
+        .try_clone()
+        .map_err(|e| error(path, e.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = vec![0u8; SOURCE_SAMPLE_SIZE];
+    let end = snapshot.length.saturating_sub(SOURCE_SAMPLE_SIZE as u64);
+    let offsets = if end <= 2 * SOURCE_SAMPLE_SIZE as u64 {
+        &[0][..]
+    } else {
+        &[0, end / 2, end]
+    };
+    if offsets.len() == 1 {
+        bytes.resize(snapshot.length as usize, 0);
+    }
+    for &offset in offsets {
+        if let Some(cancel) = cancel {
+            check_cancel(cancel)?;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| error(path, e.to_string()))?;
+        hasher.update(&bytes);
+    }
+    guard.verify()?;
+    if file_snapshot(path, guard.file())?.as_ref() != Some(&snapshot) {
+        return Err(error(
+            path,
+            "The source changed during recovery fingerprinting.",
+        ));
+    }
+    Ok(Stamp {
+        path: path.to_owned(),
+        identity: snapshot.identity,
+        length: snapshot.length,
+        sha256: format!(
+            "{SOURCE_FINGERPRINT_PREFIX}{}:{}:{:x}",
+            unix_nanos(snapshot.modified),
+            snapshot.change_time,
+            hasher.finalize()
+        ),
+    })
+}
+
+fn tool_stamp(
+    path: &Path,
+    guard: &Source,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Result<Stamp, AppError> {
+    if let Some(cancel) = cancel {
+        check_cancel(cancel)?;
+    }
+    let now = unix_nanos(SystemTime::now());
+    let Some(snapshot) =
+        file_snapshot(path, guard.file())?.filter(|snapshot| snapshot.is_stable_at(now))
+    else {
+        return digest(path, cancel);
+    };
+    let cached = TOOL_DIGESTS
+        .lock()
+        .expect("tool digests lock")
+        .iter()
+        .find(|(key, _)| key == &snapshot)
+        .map(|(_, sha256)| sha256.clone());
+    let sha256 = if let Some(cached) = cached {
+        cached
+    } else {
+        digest(path, cancel)?.sha256
+    };
+    guard.verify()?;
+    if file_snapshot(path, guard.file())?.as_ref() != Some(&snapshot) {
+        return Err(error(path, "A selected recovery tool changed."));
+    }
+    let stamp = Stamp {
+        path: path.to_owned(),
+        length: snapshot.length,
+        identity: snapshot.identity.clone(),
+        sha256,
+    };
+    let mut cache = TOOL_DIGESTS.lock().expect("tool digests lock");
+    if !cache.iter().any(|(key, _)| key == &snapshot) {
+        if cache.len() == 32 {
+            cache.remove(0);
+        }
+        cache.push((snapshot, stamp.sha256.clone()));
+    }
+    Ok(stamp)
+}
+
+fn restamp_tool(stamp: &Stamp, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
+    tool_stamp(&stamp.path, &Source::open(&stamp.path)?, cancel)
+}
+
 fn restamp(stamp: &Stamp, cancel: Option<&watch::Receiver<bool>>) -> Result<Stamp, AppError> {
     if stamp.sha256.starts_with("metadata-v1:") {
         source_stamp(&stamp.path, cancel)
+    } else if stamp.sha256.starts_with(SOURCE_FINGERPRINT_PREFIX) {
+        original_fingerprint(&stamp.path, &Source::open(&stamp.path)?, true, cancel)
     } else {
         digest(&stamp.path, cancel)
     }
@@ -1957,7 +2144,7 @@ impl Workspace {
         }
         if let Some(recipe) = &self.manifest.queue_recipe {
             for stamp in &recipe.tools {
-                if digest(&stamp.path, cancel)? != *stamp {
+                if restamp_tool(stamp, cancel)? != *stamp {
                     return Err(error(
                         &stamp.path,
                         "An immutable source queue resource changed.",
@@ -2014,7 +2201,7 @@ impl Workspace {
         if let Some(recipe) = &self.manifest.queue_recipe {
             let expected = recipe.original_source.as_ref().unwrap_or(&recipe.source);
             expected.require_contents()?;
-            if Some(expected) != checked && digest(&expected.path, cancel)? != *expected {
+            if Some(expected) != checked && restamp(expected, cancel)? != *expected {
                 return Err(error(
                     &expected.path,
                     "The frozen source queue input changed.",
@@ -2030,7 +2217,7 @@ impl Workspace {
         self.verify_saved(Some(cancel))?;
         if self.manifest.queue_recipe.is_none() {
             for tool in &self.manifest.tools {
-                if digest(&tool.path, Some(cancel))? != *tool {
+                if restamp_tool(tool, Some(cancel))? != *tool {
                     return Err(error(&tool.path, "A frozen source queue tool changed."));
                 }
             }
@@ -3008,7 +3195,7 @@ impl OwnedRecovery {
                 .original_source
                 .as_ref()
                 .unwrap_or(&workspace.manifest.source);
-            if digest(&original.path, None)? != *original {
+            if restamp(original, None)? != *original {
                 return Err(error(
                     &original.path,
                     "The original source changed; resume is unavailable.",
@@ -3692,13 +3879,22 @@ impl Recovery {
                 require_resumable_sources(manifest)?;
             }
             let original_guard = Source::open(&source)?;
-            let original_source = digest(&source, Some(&cancel))?;
-            original_guard.verify()?;
-            if let Some((_, manifest)) = &previous {
+            let saved_original = previous.as_ref().and_then(|(_, manifest)| {
                 let saved = manifest.original_source.as_ref().unwrap_or(&manifest.source);
-                if saved.path == source && saved != &original_source {
-                    return Err(error(&source, "The original source changed; resume is unavailable."));
-                }
+                (saved.path == source).then_some(saved)
+            });
+            let original_source = if let Some(saved) = saved_original {
+                restamp(saved, Some(&cancel))?
+            } else if is_source_cut(&settings) {
+                // A cut's original and decoder variant are also bound to
+                // byte-for-byte receipts owned by the source-cut workflow.
+                digest(&source, Some(&cancel))?
+            } else {
+                original_fingerprint(&source, &original_guard, false, Some(&cancel))?
+            };
+            original_guard.verify()?;
+            if saved_original.is_some_and(|saved| saved != &original_source) {
+                return Err(error(&source, "The original source changed; resume is unavailable."));
             }
             let source_cut_original = if is_source_cut(&settings)
                 && !super::super::source_normalization::exists(&id, &request)?
@@ -3715,7 +3911,7 @@ impl Recovery {
                 .collect::<Result<Vec<_>, _>>()?;
             let tool_stamps = tool_guards
                 .iter()
-                .map(|tool| digest(&tool.path, Some(&cancel)))
+                .map(|tool| tool_stamp(&tool.path, tool, Some(&cancel)))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut preparation_lock=None;
             let mut legacy_svt_parameters = false;
@@ -3726,7 +3922,13 @@ impl Recovery {
                     let owned=lock_workspace(&root)?;let(_,current)=load(&id,&request,&settings,&locator)?;
                     if current!=manifest{return Err(error(&root,"The source queue changed while acquiring its preparation lock."));}preparation_lock=Some(owned);
                     if let Some(recipe)=&manifest.queue_recipe {
-                        for tool in &recipe.tools {if digest(&tool.path,Some(&cancel))?!=*tool{return Err(error(&tool.path,"A frozen source queue tool changed."));}tool_guards.push(Source::open(&tool.path)?);}
+                        for tool in &recipe.tools {
+                            let guard = Source::open(&tool.path)?;
+                            if tool_stamp(&tool.path, &guard, Some(&cancel))? != *tool {
+                                return Err(error(&tool.path, "A frozen source queue tool changed."));
+                            }
+                            tool_guards.push(guard);
+                        }
                     }
                 }
                 if manifest.restart_pending&&source_workflow(&settings)&&manifest.queue_recipe.is_some() {
@@ -3791,7 +3993,7 @@ impl Recovery {
                         if saved.path == original_source.path {
                             Ok(saved == &original_source)
                         } else {
-                            Ok(digest(&saved.path, Some(&cancel))? == *saved)
+                            Ok(restamp(saved, Some(&cancel))? == *saved)
                         }
                     };
                     same_source(&manifest.source)? && manifest.original_source.as_ref().map_or(Ok(true), same_source)?
@@ -4946,6 +5148,102 @@ mod tests {
         assert!(cause.message.contains("original source changed"));
         assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
         OwnedRecovery::open(&snapshot, false).unwrap();
+    }
+
+    #[test]
+    fn recent_source_uses_an_exact_fingerprint_and_rejects_mid_file_edits() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("large-source.mkv");
+        fs::write(&source, vec![0u8; SOURCE_SAMPLE_SIZE * 12]).unwrap();
+        let original = Source::open(&source).unwrap();
+        let stamp = original_fingerprint(&source, &original, false, None).unwrap();
+        assert_eq!(restamp(&stamp, None).unwrap(), stamp);
+        let modified = original.file().metadata().unwrap().modified().unwrap();
+        drop(original);
+
+        let mut writer = OpenOptions::new().write(true).open(&source).unwrap();
+        writer
+            .seek(SeekFrom::Start((SOURCE_SAMPLE_SIZE * 3) as u64))
+            .unwrap();
+        writer.write_all(b"changed").unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(writer);
+        let changed = restamp(&stamp, None).unwrap();
+        assert_eq!(stamp.identity, changed.identity);
+        assert_eq!(stamp.length, changed.length);
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+        assert_ne!(stamp, changed);
+    }
+
+    #[test]
+    fn a_sampled_original_source_roundtrips_in_recovery() {
+        let fixture = Fixture::new();
+        let (mut workspace, intermediate) = fixture.workspace();
+        let path = workspace.manifest.source.path.clone();
+        let source = workspace._source.as_ref().unwrap();
+        let Some(snapshot) = file_snapshot(&path, source.file()).unwrap() else {
+            return;
+        };
+        assert!(!snapshot.is_stable_at(snapshot.change_time));
+        assert!(snapshot.is_stable_at(snapshot.change_time + FILE_CHANGE_MARGIN_NS + 1));
+        COUNT_SOURCE_HASHES.with(|counter| *counter.borrow_mut() = Some((path.clone(), 0)));
+        let stamp = original_fingerprint(&path, source, true, None).unwrap();
+        assert!(stamp.sha256.starts_with(SOURCE_FINGERPRINT_PREFIX));
+        workspace.manifest.source = stamp;
+        workspace.save().unwrap();
+        let snapshot = saved_snapshot(
+            &workspace.manifest.request,
+            &workspace.manifest.settings,
+            &workspace.summary(),
+        );
+        drop(intermediate);
+        drop(workspace);
+
+        OwnedRecovery::open(&snapshot, true).unwrap();
+        let (_, full_reads) =
+            COUNT_SOURCE_HASHES.with(|counter| counter.borrow_mut().take().unwrap());
+        assert_eq!(full_reads, 0);
+
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut writer = OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"changed").unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(writer);
+        let Err(cause) = OwnedRecovery::open(&snapshot, true) else {
+            panic!("a sampled source change must prevent resume");
+        };
+        assert!(cause.message.contains("original source changed"));
+    }
+
+    #[test]
+    fn a_recent_tool_digest_detects_same_size_edits_with_restored_mtime() {
+        let fixture = Fixture::new();
+        let tool_path = fixture.0.join("tool.exe");
+        fs::write(&tool_path, b"version one").unwrap();
+        COUNT_SOURCE_HASHES.with(|counter| *counter.borrow_mut() = Some((tool_path.clone(), 0)));
+        let tool = Source::open(&tool_path).unwrap();
+        let before = tool_stamp(&tool_path, &tool, None).unwrap();
+        assert_eq!(before, restamp_tool(&before, None).unwrap());
+        let (_, full_reads) =
+            COUNT_SOURCE_HASHES.with(|counter| counter.borrow_mut().take().unwrap());
+        assert!(matches!(full_reads, 1 | 2));
+        let modified = tool.file().metadata().unwrap().modified().unwrap();
+        drop(tool);
+
+        let mut writer = OpenOptions::new().write(true).open(&tool_path).unwrap();
+        writer.write_all(b"version two").unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(writer);
+        let after = restamp_tool(&before, None).unwrap();
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.length, after.length);
+        assert_ne!(before.sha256, after.sha256);
     }
 
     #[test]

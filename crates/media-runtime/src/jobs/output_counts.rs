@@ -1,4 +1,4 @@
-//! Verify the final encode's planned streams and complete decoded video before publication.
+//! Check the final encode's planned streams and available frame-count evidence.
 use super::{
     files,
     metadata::{Document, Stream, track_duration},
@@ -43,25 +43,34 @@ impl VideoCheck {
                 video.sample_aspect_ratio, expected.0, expected.1,
             )));
         }
-        // Matroska's track duration can include its start offset. Compare a
-        // declared track duration only when the video starts at zero, and
-        // allow the container's end-of-last-frame rounding.
-        if let Some(frame_seconds) = self.frame_seconds
-            && video
-                .start_time
-                .as_deref()
-                .and_then(|value| value.parse::<f64>().ok())
-                .is_some_and(|start| start.abs() <= 0.001)
-            && let Some(duration) = track_duration(video)
-            && (duration - frames as f64 * frame_seconds).abs() > frame_seconds + 0.001
-        {
-            return Err(failed(format!(
-                "The finished video declares a {duration:.3}s duration; {frames} frames at the joined rate require {:.3}s.",
-                frames as f64 * frame_seconds,
-            )));
+        if let Some(frame_seconds) = self.frame_seconds {
+            verify_track_duration(video, frames, frame_seconds)?;
         }
         Ok(())
     }
+}
+
+fn verify_track_duration(
+    video: &Stream,
+    frames: usize,
+    frame_seconds: f64,
+) -> Result<(), AppError> {
+    // A Matroska track duration can include the track's start offset. Use the
+    // selected zero-origin track only, with room for end-of-frame rounding.
+    let expected = frames as f64 * frame_seconds;
+    if video
+        .start_time
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .is_some_and(|start| start.abs() <= 0.001)
+        && let Some(duration) = track_duration(video).filter(|duration| *duration > 0.0)
+        && (duration - expected).abs() > frame_seconds + 0.001
+    {
+        return Err(failed(format!(
+            "The finished video declares a {duration:.3}s duration. The planned duration for {frames} frames is {expected:.3}s."
+        )));
+    }
+    Ok(())
 }
 
 /// `kinds` lists the planned streams' codec types in output order.
@@ -114,21 +123,128 @@ fn check<'a>(
         })
 }
 
-/// Return the movie track's decoded frame count after verifying the final file.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Count {
+    Declared(usize),
+    MuxedPackets(usize),
+    ReadPackets(usize),
+}
+
+impl Count {
+    pub(super) fn summary(&self, expected: usize) -> String {
+        match *self {
+            Self::Declared(frames) => format!("{frames} video frames declared by the container"),
+            Self::MuxedPackets(packets) if packets == expected => {
+                format!("{packets} video packets reported by the muxer")
+            }
+            Self::ReadPackets(packets) if packets == expected => {
+                format!("{packets} video packets read from the finished file")
+            }
+            Self::MuxedPackets(packets) => format!(
+                "{packets} video packets reported by the muxer for {expected} planned frames (frame count unconfirmed)"
+            ),
+            Self::ReadPackets(packets) => format!(
+                "{packets} video packets read for {expected} planned video frames (frame count unconfirmed)"
+            ),
+        }
+    }
+
+    fn verify(
+        &self,
+        video: &Stream,
+        expected: usize,
+        frame_seconds: Option<f64>,
+    ) -> Result<(), AppError> {
+        let message = match *self {
+            Self::Declared(frames) if frames != expected => {
+                format!(
+                    "The finished video declares {frames} frames. Encoding prepared {expected}."
+                )
+            }
+            Self::MuxedPackets(0) | Self::ReadPackets(0) => {
+                "The finished video has no readable packets.".into()
+            }
+            Self::MuxedPackets(packets) | Self::ReadPackets(packets)
+                if packets != expected
+                    && matches!(video.codec_name.as_deref(), Some("h264" | "hevc")) =>
+            {
+                format!(
+                    "The finished video has {packets} video packets. Encoding prepared {expected} frames."
+                )
+            }
+            // AV1 and VP9 can package hidden frames differently from displayed
+            // frames. Corroborate a packet discrepancy with a track duration
+            // only where the encode established a constant frame clock.
+            Self::MuxedPackets(packets) | Self::ReadPackets(packets) if packets != expected => {
+                return frame_seconds.map_or(Ok(()), |seconds| {
+                    verify_track_duration(video, expected, seconds)
+                });
+            }
+            _ => return Ok(()),
+        };
+        Err(failed(message))
+    }
+}
+
+fn declared_frames(video: &Stream) -> Option<usize> {
+    let count = |value: &str| value.parse().ok().filter(|&count| count > 0);
+    video.nb_frames.as_deref().and_then(count).or_else(|| {
+        video
+            .tags
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("NUMBER_OF_FRAMES"))
+            .and_then(|(_, value)| count(value))
+    })
+}
+
+// One final report is enough. A long reporting interval keeps capture bounded.
+pub(super) const MUX_PROGRESS_ARGS: [&str; 4] = ["-stats_period", "86400", "-progress", "pipe:1"];
+
+/// Reads FFmpeg's final progress block. The frame field counts the first video
+/// output stream, so callers must bind it to the selected movie before use.
+#[derive(Default)]
+pub(super) struct MuxProgress {
+    frames: Option<usize>,
+    completed: Option<usize>,
+}
+
+impl MuxProgress {
+    pub(super) fn observe(&mut self, line: &str) {
+        if let Some(frames) = line.strip_prefix("frame=") {
+            self.frames = frames.trim().parse().ok();
+        } else if let Some(progress) = line.strip_prefix("progress=") {
+            if progress == "end" {
+                self.completed = self.frames;
+            }
+            self.frames = None;
+        }
+    }
+
+    pub(super) fn completed(&self) -> Option<usize> {
+        self.completed
+    }
+}
+
+pub(super) fn movie_is_first_video(kinds: &[&str], movie_position: usize) -> bool {
+    kinds.iter().position(|kind| *kind == "video") == Some(movie_position)
+}
+
+/// Return the strongest available final video count, without decoding the movie.
 pub(super) async fn verify(
     ffprobe: &Path,
     output: &Path,
     kinds: &[&str],
     clock: super::container::Cadence<'_>,
+    mux_packets: Option<usize>,
     cancel: &watch::Receiver<bool>,
-) -> Result<usize, AppError> {
+) -> Result<Count, AppError> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
         "-protocol_whitelist",
         "file",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,width,height,sample_aspect_ratio,time_base,start_time,duration:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,sample_aspect_ratio,time_base,start_time,duration,nb_frames:stream_disposition=attached_pic:stream_tags=handler_name,DURATION,NUMBER_OF_FRAMES:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -189,44 +305,41 @@ pub(super) async fn verify(
         )
         .await?;
     }
-    let decoded = count_video_frames(ffprobe, output, video.index, cancel).await?;
-    if decoded != clock.frames {
-        return Err(files::error(
-            "OUTPUT_VALIDATION_FAILED",
-            format!(
-                "The finished video decodes to {decoded} frames; encoding prepared {}.",
-                clock.frames
-            ),
-            output,
-        ));
-    }
-    Ok(decoded)
+    let count = if let Some(frames) = declared_frames(video) {
+        Count::Declared(frames)
+    } else if let Some(packets) = mux_packets {
+        Count::MuxedPackets(packets)
+    } else {
+        Count::ReadPackets(count_video_packets(ffprobe, output, video.index, cancel).await?)
+    };
+    count
+        .verify(video, clock.frames, clock.count_duration_frame_seconds)
+        .map_err(|error| AppError {
+            path: Some(output.to_string_lossy().into_owned()),
+            ..error
+        })?;
+    Ok(count)
 }
 
-async fn count_video_frames(
+async fn count_video_packets(
     ffprobe: &Path,
     output: &Path,
     stream_index: u32,
     cancel: &watch::Receiver<bool>,
 ) -> Result<usize, AppError> {
-    // A container's declared count and packet count do not establish the
-    // number of displayable frames. Decode only the encoded movie track and
-    // keep subprocess output independent of the number of frames.
+    // Resume and containers without written count evidence can still report
+    // the selected track's packet count with bounded subprocess output.
     let index = stream_index.to_string();
     let mut args: Vec<OsString> = [
         "-v",
         "error",
         "-protocol_whitelist",
         "file",
-        "-threads",
-        "0",
-        "-err_detect",
-        "explode",
         "-select_streams",
         &index,
-        "-count_frames",
+        "-count_packets",
         "-show_entries",
-        "stream=nb_read_frames",
+        "stream=nb_read_packets",
         "-of",
         "default=nokey=1:noprint_wrappers=1",
         "-i",
@@ -251,7 +364,7 @@ async fn count_video_frames(
         return Err(files::error(
             "OUTPUT_VALIDATION_FAILED",
             format!(
-                "FFprobe could not decode the complete finished video: {}",
+                "FFprobe could not read the finished video's packets: {}",
                 String::from_utf8_lossy(&result.stderr).trim(),
             ),
             output,
@@ -263,7 +376,7 @@ async fn count_video_frames(
         .map_err(|_| {
             files::error(
                 "OUTPUT_VALIDATION_FAILED",
-                "FFprobe did not report a decoded frame count for the finished video.",
+                "FFprobe did not report a packet count for the finished video.",
                 output,
             )
         })
@@ -276,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
-    async fn verifies_decoded_video_and_planned_streams_before_publication() {
+    async fn verifies_video_count_and_planned_streams_before_publication() {
         let (_sender, cancel) = watch::channel(false);
         let ffmpeg = super::super::discover("ffmpeg", &cancel).await.unwrap();
         let ffprobe = super::super::discover("ffprobe", &cancel).await.unwrap();
@@ -356,28 +469,51 @@ mod tests {
             numerator: 10,
             denominator: 1,
             frames,
+            mux_video_packets: None,
+            count_duration_frame_seconds: None,
             source_iso: None,
             basic_video_check: expectation,
             mp4_aspect_override: None,
             mov_text: &[],
             expected_kinds: &["video", "audio"],
         };
-        let decoded = verify(&ffprobe, &valid, &["video", "audio"], cadence(12), &cancel)
-            .await
-            .unwrap();
-        assert_eq!(decoded, 12);
-        let mismatch = verify(&ffprobe, &valid, &["video", "audio"], cadence(13), &cancel)
-            .await
-            .unwrap_err();
+        let count = verify(
+            &ffprobe,
+            &valid,
+            &["video", "audio"],
+            cadence(12),
+            Some(1),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, Count::Declared(12));
+        let mismatch = verify(
+            &ffprobe,
+            &valid,
+            &["video", "audio"],
+            cadence(13),
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(mismatch.code, "OUTPUT_VALIDATION_FAILED");
         assert!(
-            mismatch.message.contains("decodes to 12 frames"),
+            mismatch.message.contains("declares 12 frames"),
             "{mismatch:?}"
         );
         for output in [no_audio, corrupt] {
-            let failure = verify(&ffprobe, &output, &["video", "audio"], cadence(12), &cancel)
-                .await
-                .unwrap_err();
+            let failure = verify(
+                &ffprobe,
+                &output,
+                &["video", "audio"],
+                cadence(12),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(failure.code, "OUTPUT_VALIDATION_FAILED", "{failure:?}");
         }
 
@@ -399,6 +535,22 @@ mod tests {
         .await
         .unwrap();
         assert!(result.status.success(), "{:?}", result.stderr);
+        for (mux_packets, evidence) in [
+            (Some(12), Count::MuxedPackets(12)),
+            (None, Count::ReadPackets(12)),
+        ] {
+            let count = verify(
+                &ffprobe,
+                &matroska,
+                &["video", "audio"],
+                cadence(12),
+                mux_packets,
+                &cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(count, evidence);
+        }
 
         let manager = super::super::JobManager::new(fixture.0.join("logs"));
         let source = files::Source::open(&valid).unwrap();
@@ -425,6 +577,8 @@ mod tests {
                         numerator: 10,
                         denominator: 1,
                         frames: 12,
+                        mux_video_packets: None,
+                        count_duration_frame_seconds: None,
                         source_iso: None,
                         basic_video_check: expectation,
                         mp4_aspect_override: None,
@@ -461,6 +615,58 @@ mod tests {
         let document = picture_and_sound();
         let video = check(&document, &["video", "audio"], 0).unwrap();
         assert!(video.nb_frames.is_none());
+    }
+
+    #[test]
+    fn declared_count_prefers_the_native_field_to_the_track_tag() {
+        let mut movie = picture_and_sound().streams.remove(0);
+        movie.tags.insert("number_of_frames".into(), "96".into());
+        assert_eq!(declared_frames(&movie), Some(96));
+        movie.nb_frames = Some("48".into());
+        assert_eq!(declared_frames(&movie), Some(48));
+        movie.nb_frames = Some("N/A".into());
+        assert_eq!(declared_frames(&movie), Some(96));
+        movie.tags.insert("number_of_frames".into(), "0".into());
+        assert_eq!(declared_frames(&movie), None);
+    }
+
+    #[test]
+    fn packet_mismatches_only_fail_when_packet_cardinality_is_known() {
+        let mut movie = picture_and_sound().streams.remove(0);
+        assert!(Count::ReadPackets(11).verify(&movie, 12, None).is_err());
+        movie.codec_name = Some("av1".into());
+        assert!(Count::ReadPackets(11).verify(&movie, 12, None).is_ok());
+        assert!(Count::MuxedPackets(0).verify(&movie, 12, None).is_err());
+        assert!(Count::Declared(11).verify(&movie, 12, None).is_err());
+    }
+
+    #[test]
+    fn a_short_zero_origin_track_corroborates_an_ambiguous_packet_count() {
+        let mut movie = picture_and_sound().streams.remove(0);
+        movie.codec_name = Some("av1".into());
+        movie.start_time = Some("0".into());
+        movie.duration = Some("0.8".into());
+        assert!(Count::ReadPackets(8).verify(&movie, 12, None).is_ok());
+        assert!(Count::ReadPackets(8).verify(&movie, 12, Some(0.1)).is_err());
+        assert!(Count::ReadPackets(12).verify(&movie, 12, Some(0.1)).is_ok());
+        movie.start_time = Some("0.4".into());
+        assert!(Count::ReadPackets(8).verify(&movie, 12, Some(0.1)).is_ok());
+    }
+
+    #[test]
+    fn mux_count_needs_a_complete_final_report_for_the_movie() {
+        assert!(movie_is_first_video(&["audio", "video", "video"], 1));
+        assert!(!movie_is_first_video(&["video", "audio", "video"], 2));
+
+        let mut progress = MuxProgress::default();
+        progress.observe("frame=24");
+        progress.observe("progress=continue");
+        assert_eq!(progress.completed(), None);
+        progress.observe("progress=end");
+        assert_eq!(progress.completed(), None);
+        progress.observe("frame= 48");
+        progress.observe("progress=end");
+        assert_eq!(progress.completed(), Some(48));
     }
 
     #[test]

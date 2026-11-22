@@ -31,11 +31,18 @@ pub(crate) async fn prepare_utility_container<'a>(
     cancel: &watch::Receiver<bool>,
     scratch: &'a mut Vec<Temporary>,
 ) -> Result<&'a Temporary, AppError> {
-    Ok(
-        container::prepare(input, output, id, cancel, None, None, false, scratch)
-            .await?
-            .unwrap_or(input),
+    Ok(container::prepare(
+        input,
+        output,
+        id,
+        cancel,
+        container::Verification::Remux,
+        None,
+        false,
+        scratch,
     )
+    .await?
+    .map_or(input, |prepared| prepared.artifact))
 }
 pub(crate) async fn verify_utility_packets(
     ffprobe: &Path,
@@ -2020,7 +2027,41 @@ impl JobManager {
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         Box::pin(self.finalize_inner(
-            id, cancel, source, external, temporary, output, cadence, scratch,
+            id,
+            cancel,
+            source,
+            external,
+            temporary,
+            output,
+            cadence.map_or(
+                container::Verification::Remux,
+                container::Verification::Encode,
+            ),
+            scratch,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_edited_encode(
+        &self,
+        id: &str,
+        cancel: &watch::Receiver<bool>,
+        source: &Source,
+        external: &external_tracks::ExternalTracks,
+        temporary: &Temporary,
+        output: &Path,
+        scratch: &mut Vec<Temporary>,
+    ) -> Result<(), AppError> {
+        Box::pin(self.finalize_inner(
+            id,
+            cancel,
+            source,
+            Some(external),
+            temporary,
+            output,
+            container::Verification::EditedEncode,
+            scratch,
         ))
         .await
     }
@@ -2034,7 +2075,7 @@ impl JobManager {
         external: Option<&external_tracks::ExternalTracks>,
         temporary: &Temporary,
         output: &Path,
-        cadence: Option<container::Cadence<'_>>,
+        verification: container::Verification<'_>,
         scratch: &mut Vec<Temporary>,
     ) -> Result<(), AppError> {
         // Cancellation and publication share a single commit lock: a cancel
@@ -2053,17 +2094,26 @@ impl JobManager {
         let timecode = external.and_then(external_tracks::ExternalTracks::timecode);
         let converted = encode::boxed(|| {
             container::prepare(
-                temporary, output, id, cancel, cadence, timecode, faststart, scratch,
+                temporary,
+                output,
+                id,
+                cancel,
+                verification,
+                timecode,
+                faststart,
+                scratch,
             )
         })
         .await?;
         let repacked = converted.is_some();
-        let temporary = converted.unwrap_or(temporary);
-        if let Some(clock) = cadence {
+        let temporary = converted
+            .as_ref()
+            .map_or(temporary, |prepared| prepared.artifact);
+        if let Some(clock) = verification.cadence() {
             self.phase(
                 id,
                 JobState::Finalizing,
-                "Checking the complete encoded video and planned streams.",
+                "Checking the finished video count and planned streams.",
             )
             .await;
             let ffprobe = discover("ffprobe", cancel).await?;
@@ -2071,13 +2121,26 @@ impl JobManager {
             if repacked && timecode.is_some() {
                 kinds.push("data");
             }
-            let decoded =
-                output_counts::verify(&ffprobe, &temporary.path, &kinds, clock, cancel).await?;
+            let mux_video_packets = converted
+                .as_ref()
+                .map_or(clock.mux_video_packets, |prepared| {
+                    prepared.mux_video_packets
+                });
+            let count = output_counts::verify(
+                &ffprobe,
+                &temporary.path,
+                &kinds,
+                clock,
+                mux_video_packets,
+                cancel,
+            )
+            .await?;
             self.change(id, |snapshot| {
                 append_log(
                     snapshot,
                     format!(
-                        "Output check: {decoded} decoded video frames and {} planned {}.",
+                        "Output check: {} and {} planned {}.",
+                        count.summary(clock.frames),
                         kinds.len(),
                         if kinds.len() == 1 {
                             "stream"
@@ -2088,9 +2151,13 @@ impl JobManager {
                 );
             })
             .await;
-        }
-        if let Some(receipt) = cadence.and_then(|clock| clock.source_iso) {
-            receipt.verify(temporary, cancel).await?;
+            if let Some(receipt) = clock.source_iso {
+                receipt.verify(temporary, cancel).await?;
+            }
+        } else if matches!(verification, container::Verification::EditedEncode) {
+            let ffprobe = discover("ffprobe", cancel).await?;
+            self.verify_edited_encode_output(id, &ffprobe, temporary, cancel)
+                .await?;
         }
         self.publish_verified(id, cancel, source, external, temporary, output)
             .await
@@ -2520,27 +2587,65 @@ async fn first_packet_start(
     index: u32,
     cancel: &watch::Receiver<bool>,
 ) -> Result<f64, AppError> {
+    let packets = probe_first_packets(executable, path, Some(index), 1, cancel).await?;
+    packets
+        .first()
+        .and_then(|packet| packet.start())
+        .ok_or_else(|| invalid_first_packet(path))
+}
+
+#[derive(serde::Deserialize)]
+struct FirstPacket {
+    stream_index: u32,
+    pts_time: Option<String>,
+}
+
+impl FirstPacket {
+    fn start(&self) -> Option<f64> {
+        self.pts_time
+            .as_deref()?
+            .parse::<f64>()
+            .ok()
+            .filter(|pts| pts.is_finite())
+    }
+}
+
+fn invalid_first_packet(path: &Path) -> AppError {
+    files::error(
+        "PROBE_INVALID_RESPONSE",
+        "The first selected packet timestamp could not be validated.",
+        path,
+    )
+}
+
+async fn probe_first_packets(
+    executable: &Path,
+    path: &Path,
+    index: Option<u32>,
+    limit: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Vec<FirstPacket>, AppError> {
     check_cancel(cancel)?;
-    let args = [
-        "-v",
-        "error",
-        "-protocol_whitelist",
-        "file",
-        "-select_streams",
-        &index.to_string(),
-        "-read_intervals",
-        "%+#1",
-        "-show_packets",
-        "-show_entries",
-        "packet=pts_time",
-        "-of",
-        "json",
-        "-i",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .chain(std::iter::once(path.as_os_str().to_owned()))
-    .collect();
+    let mut args = ["-v", "error", "-protocol_whitelist", "file"]
+        .map(OsString::from)
+        .to_vec();
+    if let Some(index) = index {
+        args.extend(["-select_streams".into(), index.to_string().into()]);
+    }
+    args.extend(
+        [
+            "-read_intervals",
+            &format!("%+#{limit}"),
+            "-show_packets",
+            "-show_entries",
+            "packet=stream_index,pts_time:packet_side_data=",
+            "-of",
+            "json",
+            "-i",
+        ]
+        .map(OsString::from),
+    );
+    args.push(path.as_os_str().to_owned());
     let result = supervisor::run_capture(
         &CommandSpec {
             executable: executable.to_owned(),
@@ -2548,7 +2653,7 @@ async fn first_packet_start(
             cwd: None,
         },
         cancel.clone(),
-        64 * 1024,
+        limit as usize * 224 + 4096,
         Duration::from_secs(5 * 60),
     )
     .await
@@ -2556,33 +2661,19 @@ async fn first_packet_start(
     check_cancel(cancel)?;
     #[derive(serde::Deserialize)]
     struct Packets {
-        packets: Vec<Packet>,
+        packets: Vec<FirstPacket>,
     }
-    #[derive(serde::Deserialize)]
-    struct Packet {
-        pts_time: String,
+    let packets = serde_json::from_slice::<Packets>(&result.stdout)
+        .map_err(|_| invalid_first_packet(path))?
+        .packets;
+    if !result.status.success()
+        || !result.stderr.is_empty()
+        || packets.len() > limit as usize
+        || index.is_some_and(|index| packets.iter().any(|packet| packet.stream_index != index))
+    {
+        return Err(invalid_first_packet(path));
     }
-    let start = serde_json::from_slice::<Packets>(&result.stdout)
-        .ok()
-        .and_then(|packets| {
-            if packets.packets.len() == 1 {
-                packets.packets[0]
-                    .pts_time
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|pts| pts.is_finite())
-            } else {
-                None
-            }
-        });
-    if !result.status.success() || !result.stderr.is_empty() || start.is_none() {
-        return Err(files::error(
-            "PROBE_INVALID_RESPONSE",
-            "The first selected packet timestamp could not be validated.",
-            path,
-        ));
-    }
-    Ok(start.expect("validated packet timestamp"))
+    Ok(packets)
 }
 
 fn remux_arguments(input: &Path, output: &Path, selected: &[&metadata::Stream]) -> Vec<OsString> {
@@ -2695,7 +2786,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let input = dir.join("delayed subtitle.mkv");
         let subtitles = dir.join("cues.srt");
+        let late = dir.join("late.srt");
         std::fs::write(&subtitles, b"1\n00:00:00,740 --> 00:00:01,900\nLater cue\n").unwrap();
+        std::fs::write(&late, b"1\n00:00:10,500 --> 00:00:11,000\nVery late cue\n").unwrap();
         let (_sender, cancel) = watch::channel(false);
         let ffmpeg = discover("ffmpeg", &cancel).await.unwrap();
         let ffprobe = discover("ffprobe", &cancel).await.unwrap();
@@ -2707,21 +2800,22 @@ mod tests {
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=128x72:rate=24:duration=2",
+            "testsrc2=size=32x24:rate=120:duration=12",
             "-f",
             "lavfi",
             "-i",
-            "sine=sample_rate=48000:duration=2",
+            "sine=sample_rate=48000:duration=12",
             "-i",
         ]
         .into_iter()
         .map(OsString::from)
         .collect();
         args.push(subtitles.as_os_str().to_owned());
+        args.extend(["-i".into(), late.as_os_str().to_owned()]);
         args.extend(
             [
-                "-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:v", "ffv1", "-c:a", "flac",
-                "-c:s", "ass",
+                "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map", "3:s", "-c:v", "ffv1", "-c:a",
+                "flac", "-c:s", "ass",
             ]
             .into_iter()
             .map(OsString::from),
@@ -2750,6 +2844,19 @@ mod tests {
         assert_eq!(document.streams[2].packet_start_time, Some(0.740));
         assert_eq!(document.streams[2].nb_read_packets.as_deref(), Some("1"));
         assert!(document.streams[0].packet_start_time.is_none());
+        let headers = probe_headers(&ffprobe, &input, &cancel, Some(&[0, 1, 2, 3]))
+            .await
+            .unwrap();
+        let cues = container::probe_cues(&ffprobe, &input, headers, &[2, 3], &cancel)
+            .await
+            .unwrap();
+        assert_eq!(cues.streams[2].packet_start_time, Some(0.740));
+        assert_eq!(cues.streams[3].packet_start_time, Some(10.500));
+        assert!(
+            cues.streams
+                .iter()
+                .all(|stream| stream.nb_read_packets.is_none())
+        );
         let without_subtitles = probe(&ffprobe, &input, &cancel, Some(&[0, 1]))
             .await
             .unwrap();

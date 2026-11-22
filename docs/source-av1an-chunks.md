@@ -73,15 +73,18 @@ verified completed chunks or repartition their original scene queue.
 
 Ordinary exact-count encodes and Saved resumes with an unchanged source
 recipe use the frozen chunk count and a joined-video header check. The muxed
-output is checked for its planned streams, decoded video frame count, codec
-and dimensions. For a queue with one source recipe and no raw filter rows,
-the final mux preserves and checks the planned sample aspect ratio. Raw
-filters run after typed aspect processing. For SVT, AOM and VPX, an internal
+output is checked for its planned streams, codec and dimensions. Jesses checks
+the final movie track's declared frame count when available and uses muxed or
+read packets as evidence otherwise. For a queue with one source recipe and no
+raw filter rows, the final mux preserves and checks the planned sample aspect
+ratio. Raw filters run after typed aspect processing. For SVT, AOM and VPX, an internal
 encoder bridge records each chunk's actual Y4M sample aspect ratio and ties the
 observation to the completed chunk. The final mux carries that ratio when the
 chunks agree, and publication checks it. Declared video duration is checked for
 a known cadence starting at zero.
-Saved chunks and original sources have identity, size and SHA-256 receipts.
+Saved chunks and copied cuts have identity, size and full SHA-256 receipts.
+Ordinary original sources use identity, size, modification and change times,
+and sampled SHA-256. Older originals with full receipts keep those checks.
 
 New Settings obtains decoded property/count receipts for retained chunks when
 the user selects that action. Mixed-source or resampled queues and the Dolby
