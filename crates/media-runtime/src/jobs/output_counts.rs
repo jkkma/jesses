@@ -1,5 +1,4 @@
-//! Check that the default encode's finished file has readable video and the
-//! planned stream headers without scanning its packets.
+//! Verify the final encode's planned streams and complete decoded video before publication.
 use super::{
     files,
     metadata::{Document, Stream, track_duration},
@@ -18,6 +17,7 @@ fn failed(message: String) -> AppError {
 pub(super) struct VideoCheck {
     pub codec: &'static str,
     pub dimensions: (u32, u32),
+    pub sample_aspect_ratio: Option<(u32, u32)>,
     pub frame_seconds: Option<f64>,
 }
 
@@ -32,6 +32,15 @@ impl VideoCheck {
                 video.width.zip(video.height),
                 self.codec,
                 self.dimensions,
+            )));
+        }
+        if let Some(expected) = self.sample_aspect_ratio
+            && super::encode_plan::sample_aspect_ratio(video.sample_aspect_ratio.as_deref()).ok()
+                != Some(expected)
+        {
+            return Err(failed(format!(
+                "The finished video has sample aspect ratio {:?}; expected {}:{}.",
+                video.sample_aspect_ratio, expected.0, expected.1,
             )));
         }
         // Matroska's track duration can include its start offset. Compare a
@@ -92,6 +101,7 @@ fn check<'a>(
         .copied()
         .filter(|stream| {
             stream.codec_type.as_deref() == Some("video")
+                && !super::cover_art::is_cover(stream)
                 && stream
                     .codec_name
                     .as_deref()
@@ -104,7 +114,7 @@ fn check<'a>(
         })
 }
 
-/// Returns any declared frame count for the log. It can be absent or inaccurate.
+/// Return the movie track's decoded frame count after verifying the final file.
 pub(super) async fn verify(
     ffprobe: &Path,
     output: &Path,
@@ -113,14 +123,14 @@ pub(super) async fn verify(
     frames: usize,
     video_check: Option<VideoCheck>,
     cancel: &watch::Receiver<bool>,
-) -> Result<Option<usize>, AppError> {
+) -> Result<usize, AppError> {
     let mut args: Vec<OsString> = [
         "-v",
         "error",
         "-protocol_whitelist",
         "file",
         "-show_entries",
-        "stream=index,codec_type,codec_name,codec_tag_string,width,height,start_time,duration,nb_frames:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,sample_aspect_ratio,start_time,duration:stream_disposition=attached_pic:stream_tags=handler_name,DURATION:chapter=start_time,end_time",
         "-of",
         "json",
         "-i",
@@ -158,19 +168,91 @@ pub(super) async fn verify(
             output,
         )
     })?;
-    check(&document, kinds, video_position)
+    let video = check(&document, kinds, video_position)
         .and_then(|video| {
             if let Some(check) = video_check {
                 check.verify(video, frames)?;
             }
-            Ok(video
-                .nb_frames
-                .as_deref()
-                .and_then(|count| count.parse().ok()))
+            Ok(video)
         })
         .map_err(|error| AppError {
             path: Some(output.to_string_lossy().into_owned()),
             ..error
+        })?;
+    let decoded = count_video_frames(ffprobe, output, video.index, cancel).await?;
+    if decoded != frames {
+        return Err(files::error(
+            "OUTPUT_VALIDATION_FAILED",
+            format!("The finished video decodes to {decoded} frames; encoding prepared {frames}."),
+            output,
+        ));
+    }
+    Ok(decoded)
+}
+
+async fn count_video_frames(
+    ffprobe: &Path,
+    output: &Path,
+    stream_index: u32,
+    cancel: &watch::Receiver<bool>,
+) -> Result<usize, AppError> {
+    // A container's declared count and packet count do not establish the
+    // number of displayable frames. Decode only the encoded movie track and
+    // keep subprocess output independent of the number of frames.
+    let index = stream_index.to_string();
+    let mut args: Vec<OsString> = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-threads",
+        "0",
+        "-err_detect",
+        "explode",
+        "-select_streams",
+        &index,
+        "-count_frames",
+        "-show_entries",
+        "stream=nb_read_frames",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        "-i",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(output.as_os_str().to_owned());
+    let result = supervisor::run_capture(
+        &CommandSpec {
+            executable: ffprobe.to_owned(),
+            args,
+            cwd: None,
+        },
+        cancel.clone(),
+        64 * 1024,
+        Duration::from_secs(24 * 60 * 60),
+    )
+    .await
+    .map_err(|cause| process_error(cause, output))?;
+    if !result.status.success() || !result.stderr.is_empty() {
+        return Err(files::error(
+            "OUTPUT_VALIDATION_FAILED",
+            format!(
+                "FFprobe could not decode the complete finished video: {}",
+                String::from_utf8_lossy(&result.stderr).trim(),
+            ),
+            output,
+        ));
+    }
+    String::from_utf8_lossy(&result.stdout)
+        .trim()
+        .parse()
+        .map_err(|_| {
+            files::error(
+                "OUTPUT_VALIDATION_FAILED",
+                "FFprobe did not report a decoded frame count for the finished video.",
+                output,
+            )
         })
 }
 
@@ -181,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a qualified FFmpeg/FFprobe pair with libx264"]
-    async fn lean_probe_checks_readable_headers_and_planned_streams_without_exact_counts() {
+    async fn verifies_decoded_video_and_planned_streams_before_publication() {
         let (_sender, cancel) = watch::channel(false);
         let ffmpeg = super::super::discover("ffmpeg", &cancel).await.unwrap();
         let ffprobe = super::super::discover("ffprobe", &cancel).await.unwrap();
@@ -253,9 +335,22 @@ mod tests {
         let expectation = Some(VideoCheck {
             codec: "h264",
             dimensions: (64, 64),
+            sample_aspect_ratio: Some((1, 1)),
             frame_seconds: Some(0.1),
         });
-        let declared = verify(
+        let decoded = verify(
+            &ffprobe,
+            &valid,
+            &["video", "audio"],
+            0,
+            12,
+            expectation,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded, 12);
+        let mismatch = verify(
             &ffprobe,
             &valid,
             &["video", "audio"],
@@ -265,8 +360,12 @@ mod tests {
             &cancel,
         )
         .await
-        .unwrap();
-        assert_eq!(declared, Some(12));
+        .unwrap_err();
+        assert_eq!(mismatch.code, "OUTPUT_VALIDATION_FAILED");
+        assert!(
+            mismatch.message.contains("decodes to 12 frames"),
+            "{mismatch:?}"
+        );
         for output in [no_audio, corrupt] {
             let failure = verify(
                 &ffprobe,
@@ -281,6 +380,67 @@ mod tests {
             .unwrap_err();
             assert_eq!(failure.code, "OUTPUT_VALIDATION_FAILED", "{failure:?}");
         }
+
+        let matroska = fixture.0.join("complete.mkv");
+        let mut args = ["-v", "error", "-i"].map(OsString::from).to_vec();
+        args.push(valid.as_os_str().to_owned());
+        args.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+        args.push(matroska.as_os_str().to_owned());
+        let result = supervisor::run_capture(
+            &CommandSpec {
+                executable: ffmpeg,
+                args,
+                cwd: None,
+            },
+            cancel.clone(),
+            64 * 1024,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert!(result.status.success(), "{:?}", result.stderr);
+
+        let manager = super::super::JobManager::new(fixture.0.join("logs"));
+        let source = files::Source::open(&valid).unwrap();
+        let contents = std::fs::read(matroska).unwrap();
+        for (label, bytes, succeeds) in [
+            ("complete", contents.as_slice(), true),
+            ("truncated", &contents[..contents.len() / 2], false),
+        ] {
+            use std::io::Write;
+
+            let destination = fixture.0.join(format!("published-{label}.mkv"));
+            let stage = files::Temporary::create(&destination, label).unwrap();
+            stage.clone_file().unwrap().write_all(bytes).unwrap();
+            let result = manager
+                .finalize(
+                    label,
+                    &cancel,
+                    &source,
+                    None,
+                    &stage,
+                    &destination,
+                    Some(super::super::container::Cadence {
+                        index: 0,
+                        numerator: 10,
+                        denominator: 1,
+                        frames: 12,
+                        source_iso: None,
+                        basic_video_check: expectation,
+                        expected_kinds: &["video", "audio"],
+                    }),
+                    &mut Vec::new(),
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{label}: {result:?}");
+            assert_eq!(destination.exists(), succeeds, "{label}");
+            if succeeds {
+                assert_eq!(std::fs::read(destination).unwrap(), bytes);
+            } else {
+                assert_eq!(result.unwrap_err().code, "OUTPUT_VALIDATION_FAILED");
+            }
+        }
+        manager.shutdown().await;
     }
 
     fn document(streams: serde_json::Value) -> Document {

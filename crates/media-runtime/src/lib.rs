@@ -45,6 +45,7 @@ pub use bitrate::analyze_bitrate;
 pub use bundled_tools::configure_bundled_tools;
 pub use discovery::get_capabilities;
 pub use jobs::{JobManager, get_encoder_parameters, preview_encode_plan};
+pub use jobs::{av1an_encoder_helper_main, configure_av1an_encoder_helper};
 pub use jobs::{import_image_sequence, release_image_sequence};
 pub use media_core::{AppError, MediaFile, MediaStream, ToolInfo};
 pub use media_core::{

@@ -1585,7 +1585,7 @@ async fn source_queue_resume_rejects_changed_source_and_reuses_exact_chunks() {
         finished
             .logs
             .iter()
-            .any(|line| line == "Output check: readable video and 4 planned streams.")
+            .any(|line| line.starts_with("Output check: ") && line.ends_with("4 planned streams."))
     );
     assert!(
         !finished

@@ -7,6 +7,7 @@ mod attachments;
 pub use attachments::extract_attachment;
 mod audio;
 mod av1an;
+pub use av1an::{av1an_encoder_helper_main, configure_av1an_encoder_helper};
 mod av1an_preprocess;
 #[cfg(test)]
 mod batch_tests;
@@ -2058,12 +2059,18 @@ impl JobManager {
         let repacked = converted.is_some();
         let temporary = converted.unwrap_or(temporary);
         if let Some(clock) = cadence {
+            self.phase(
+                id,
+                JobState::Finalizing,
+                "Checking the complete encoded video and planned streams.",
+            )
+            .await;
             let ffprobe = discover("ffprobe", cancel).await?;
             let mut kinds = clock.expected_kinds.to_vec();
             if repacked && timecode.is_some() {
                 kinds.push("data");
             }
-            let declared = output_counts::verify(
+            let decoded = output_counts::verify(
                 &ffprobe,
                 &temporary.path,
                 &kinds,
@@ -2077,17 +2084,15 @@ impl JobManager {
                 append_log(
                     snapshot,
                     format!(
-                        "Output check: readable video and {} planned {}.",
+                        "Output check: {decoded} decoded video frames and {} planned {}.",
                         kinds.len(),
-                        if kinds.len() == 1 { "stream" } else { "streams" },
+                        if kinds.len() == 1 {
+                            "stream"
+                        } else {
+                            "streams"
+                        },
                     ),
                 );
-                if let Some(declared) = declared.filter(|count| *count != clock.frames) {
-                    append_log(snapshot, format!(
-                        "Warning: the container declares {declared} video frames; encoding prepared {}.",
-                        clock.frames,
-                    ));
-                }
             })
             .await;
         }

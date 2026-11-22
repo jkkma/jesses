@@ -1,6 +1,35 @@
 //! av1an names each encoder internally. Route every child to the chosen binary.
 use super::*;
 use media_core::VideoEncoder;
+use std::sync::OnceLock;
+
+static ENCODER_HELPER_HOST: OnceLock<PathBuf> = OnceLock::new();
+
+/// Register the executable that dispatches the internal AV1AN encoder bridge.
+pub fn configure_av1an_encoder_helper(executable: PathBuf) -> Result<(), String> {
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err("The AV1AN encoder helper must be an absolute executable path.".into());
+    }
+    let path = executable
+        .canonicalize()
+        .map_err(|cause| format!("Cannot resolve the AV1AN encoder helper: {cause}"))?;
+    if let Err(path) = ENCODER_HELPER_HOST.set(path)
+        && ENCODER_HELPER_HOST.get() != Some(&path)
+    {
+        return Err("The AV1AN encoder helper was already configured.".into());
+    }
+    Ok(())
+}
+
+pub(super) fn encoder_helper_host() -> Result<&'static Path, AppError> {
+    ENCODER_HELPER_HOST.get().map(PathBuf::as_path).ok_or_else(|| {
+        AppError::new(
+            "AV1AN_FILTER_GEOMETRY_UNAVAILABLE",
+            "The application has no AV1AN encoder helper for observing filtered sample aspect ratio.",
+            None,
+        )
+    })
+}
 
 pub(super) fn validate_encoder_path(encoder: &Path, family: VideoEncoder) -> Result<(), AppError> {
     let expected = super::encoder::binary(family);
@@ -26,6 +55,7 @@ pub(super) struct Launch {
     pub(super) executable: PathBuf,
     pub(super) environment: supervisor::ChildEnvironment,
     _directory: std::fs::File,
+    _encoder_helper: Option<recovery::EncoderHelperFiles>,
     #[cfg(windows)]
     image: Option<std::fs::File>,
     #[cfg(windows)]
@@ -144,6 +174,7 @@ impl Launch {
                 executable,
                 environment,
                 _directory: directory,
+                _encoder_helper: None,
                 image: Some(output),
                 identity,
                 staged: true,
@@ -194,8 +225,43 @@ impl Launch {
                 executable: av1an.to_owned(),
                 environment,
                 _directory: directory,
+                _encoder_helper: None,
             })
         }
+    }
+
+    pub(super) fn use_encoder_helper(
+        &mut self,
+        helper: recovery::EncoderHelperFiles,
+        encoder: &Path,
+        family: VideoEncoder,
+        chunk_directory: PathBuf,
+    ) -> Result<(), AppError> {
+        let parent = helper
+            .executable
+            .path
+            .parent()
+            .expect("staged helper parent");
+        let mut path = std::env::join_paths([parent])
+            .map_err(|cause| files::error("AV1AN_STAGE_FAILED", cause.to_string(), parent))?;
+        if let Some(existing) = &self.environment.path {
+            path.push(if cfg!(windows) { ";" } else { ":" });
+            path.push(existing);
+        }
+        let config = super::encoder_helper::Config {
+            encoder: encoder.to_owned(),
+            chunk_directory,
+            receipts: helper.receipts.clone(),
+            family,
+        };
+        let encoded = serde_json::to_string(&config)
+            .map_err(|cause| files::error("AV1AN_STAGE_FAILED", cause.to_string(), parent))?;
+        self.environment.path = Some(path);
+        self.environment
+            .variables
+            .push((super::encoder_helper::CONFIG_ENV, Some(encoded.into())));
+        self._encoder_helper = Some(helper);
+        Ok(())
     }
 
     pub(super) fn cleanup(&mut self) -> Result<(), AppError> {

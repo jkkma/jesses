@@ -5,8 +5,9 @@ x264, aomenc, vpxenc for VP9, or x265. It does not substitute another build
 when the configured executable has the wrong identity. x264 and x265 write raw
 chunks and require mkvmerge to make a timed video intermediate. vpxenc also
 uses mkvmerge to assign exact rational timing to its VP9 chunks. SVT and AOM
-use IVF with FFmpeg concatenation by default. The final mux retains selected
-tracks and checks the finished file for readable video and the planned streams.
+use IVF with FFmpeg concatenation by default. Before publication, Jesses checks
+the planned streams and verifies that the final movie track decodes to the
+expected frame count.
 
 Normal AV1AN startup uses stream headers and a bounded first-frame inspection,
 without a separate whole-video packet or decoded-frame scan. Header frame counts

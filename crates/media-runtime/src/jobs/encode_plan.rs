@@ -4,6 +4,7 @@ use serde::Deserialize;
 use super::metadata::{Document, Stream};
 
 mod aspect;
+pub(super) use aspect::sample_aspect_ratio;
 mod framing;
 pub(super) mod hdr;
 mod temporal;
@@ -406,6 +407,12 @@ fn source_trim_arguments(
     args
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedQueueAspect {
+    sar: (u32, u32),
+    needs_mux_override: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Plan {
     /// Progress estimate only; the AV1AN queue supplies the final frame count.
@@ -467,6 +474,7 @@ pub(super) struct Plan {
     source_av1an_workflow: bool,
     source_queue: Option<std::sync::Arc<super::source_queue::Regions>>,
     basic_source_queue: bool,
+    planned_queue_aspect: Option<PlannedQueueAspect>,
     pub cadence_reconciled: bool,
     pub tolerance: f64,
     pub primaries: u8,
@@ -1403,6 +1411,7 @@ impl Plan {
                     .is_some_and(|options| options.source_workflow),
             source_queue: None,
             basic_source_queue: false,
+            planned_queue_aspect: None,
             cadence_reconciled: false,
             tolerance,
             primaries: if tone_map.is_some() {
@@ -1544,11 +1553,18 @@ impl Plan {
         &mut self,
         regions: std::sync::Arc<super::source_queue::Regions>,
         rate: (u32, u32),
-    ) {
+        joined: &Stream,
+        may_mix_recipes: bool,
+    ) -> Result<(), AppError> {
         (self.width, self.height) = regions.first_dimensions();
-        self.output_sar = regions.first_sar().into();
+        if may_mix_recipes || self.source_filters {
+            self.output_sar = regions.first_sar().into();
+        } else {
+            self.preserve_source_queue_aspect(joined)?;
+        }
         (self.fps_num, self.fps_den) = regions.reference_rate().unwrap_or(rate);
         self.source_queue = Some(regions);
+        Ok(())
     }
     pub(in crate::jobs) fn source_queue_frame_count(&self) -> Option<usize> {
         self.source_queue
@@ -1561,13 +1577,49 @@ impl Plan {
     pub(super) fn has_basic_source_queue(&self) -> bool {
         self.basic_source_queue
     }
-    pub(super) fn basic_source_video_check(&self) -> Option<super::output_counts::VideoCheck> {
-        self.basic_source_queue
-            .then(|| super::output_counts::VideoCheck {
+    pub(super) fn source_queue_video_check(&self) -> Option<super::output_counts::VideoCheck> {
+        (self.basic_source_queue || self.planned_queue_aspect.is_some()).then(|| {
+            super::output_counts::VideoCheck {
                 codec: self.output_codec(),
                 dimensions: (self.width, self.height),
-                frame_seconds: (!self.source_filters).then(|| self.frame_seconds()),
-            })
+                frame_seconds: (self.basic_source_queue && !self.source_filters)
+                    .then(|| self.frame_seconds()),
+                sample_aspect_ratio: self.planned_queue_aspect.map(|aspect| aspect.sar),
+            }
+        })
+    }
+    pub(super) fn source_queue_needs_mux_aspect(&self) -> bool {
+        self.planned_queue_aspect
+            .is_some_and(|aspect| aspect.needs_mux_override)
+    }
+
+    fn preserve_source_queue_aspect(&mut self, stream: &Stream) -> Result<(), AppError> {
+        // The coded join can lose SAR, especially when its chunks are IVF.
+        // Use the planned geometry for the final container and check its SAR.
+        let sar = sample_aspect_ratio(Some(&self.output_sar))?;
+        let joined = sample_aspect_ratio(stream.sample_aspect_ratio.as_deref())?;
+        self.planned_queue_aspect = Some(PlannedQueueAspect {
+            sar,
+            needs_mux_override: sar != joined,
+        });
+        Ok(())
+    }
+
+    pub(super) fn observe_filtered_source_queue_aspect(
+        &mut self,
+        joined: &Stream,
+        dimensions: (u32, u32),
+        sar: (u32, u32),
+    ) -> Result<(), AppError> {
+        if joined.width.zip(joined.height) != Some(dimensions) {
+            return Err(AppError::new(
+                "ENCODE_VALIDATION_FAILED",
+                "The joined AV1AN picture dimensions differ from the observed encoder input.",
+                None,
+            ));
+        }
+        self.output_sar = format!("{}:{}", sar.0, sar.1);
+        self.preserve_source_queue_aspect(joined)
     }
     pub(super) fn requires_source_queue_clock_proof(&self) -> bool {
         self.source_av1an_base_clock
@@ -1590,7 +1642,7 @@ impl Plan {
                     None,
                 ));
             }
-            self.output_sar = aspect::parse_source(stream.sample_aspect_ratio.as_deref())?;
+            self.preserve_source_queue_aspect(stream)?;
         }
         (self.fps_num, self.fps_den) =
             super::source_queue::stream_rate(stream).unwrap_or(queue_rate);

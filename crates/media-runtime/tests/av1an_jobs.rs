@@ -19,6 +19,10 @@ const GRAIN_TABLE: &str = "filmgrn1\nE 0 9223372036854775807 1 10956 1\n\tp 0 6 
 
 impl Fixture {
     fn new() -> Self {
+        media_runtime::configure_av1an_encoder_helper(PathBuf::from(env!(
+            "CARGO_BIN_EXE_av1an_encoder_helper"
+        )))
+        .unwrap();
         if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
             media_runtime::configure_bundled_tools(PathBuf::from(resources))
                 .expect("the package gate uses one absolute verified resource root");
@@ -393,7 +397,7 @@ async fn av1an_aac_mp4_checks_the_audio_prefix_before_encoding() {
         finished
             .logs
             .iter()
-            .any(|line| line == "Output check: readable video and 2 planned streams.")
+            .any(|line| line.starts_with("Output check: ") && line.ends_with("2 planned streams."))
     );
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert_no_partial_output(&fixture.0);
@@ -1563,6 +1567,204 @@ async fn av1an_filtered_non_vmaf_targets_score_the_verified_processed_source() {
     }
 }
 
+async fn source_aspect_fixtures(root: &Path) -> (PathBuf, PathBuf) {
+    let square = root.join("square.mkv");
+    synthesize(&square, "160x120", 48).await;
+    let anamorphic = root.join("anamorphic.mkv");
+    let tagged = output(
+        command("ffmpeg")
+            .await
+            .args(["-v", "error", "-nostdin", "-n", "-i"])
+            .arg(&square)
+            .args(["-map", "0", "-c", "copy", "-aspect:v", "8:3"])
+            .arg(&anamorphic),
+    )
+    .await;
+    assert!(tagged.status.success());
+    assert_eq!(
+        probe(&square).await["streams"][0]["sample_aspect_ratio"],
+        "1:1"
+    );
+    assert_eq!(
+        probe(&anamorphic).await["streams"][0]["sample_aspect_ratio"],
+        "2:1"
+    );
+    (square, anamorphic)
+}
+
+#[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR, VapourSynth, L-SMASH, and mkvmerge"]
+async fn source_queue_preserves_planned_sample_aspect_ratio() {
+    use media_core::{AspectRatioKind, AspectRatioSettings, Av1anConcatMethod, TemporalSettings};
+
+    let fixture = Fixture::new();
+    let (square, anamorphic) = source_aspect_fixtures(&fixture.0).await;
+
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (name, input, concat, override_sar, expected_sar, expected_dar) in [
+        (
+            "requested",
+            &square,
+            Av1anConcatMethod::Mkvmerge,
+            Some(2),
+            "2:1",
+            "8:3",
+        ),
+        (
+            "inherited",
+            &anamorphic,
+            Av1anConcatMethod::Mkvmerge,
+            None,
+            "2:1",
+            "8:3",
+        ),
+        (
+            "ffmpeg",
+            &square,
+            Av1anConcatMethod::Ffmpeg,
+            Some(2),
+            "2:1",
+            "8:3",
+        ),
+        (
+            "reset",
+            &anamorphic,
+            Av1anConcatMethod::Mkvmerge,
+            Some(1),
+            "1:1",
+            "4:3",
+        ),
+    ] {
+        let output_path = fixture.0.join(format!("{name}.mkv"));
+        let mut encode = request(input, &output_path, 12);
+        encode.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+        encode.settings.av1an_options = Some(media_core::Av1anOptions {
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            encoder_threads: Some(1),
+            concat_method: concat,
+            source_workflow: true,
+            ..Default::default()
+        });
+        encode.settings.temporal = override_sar.map(|numerator| TemporalSettings {
+            aspect_ratio: Some(AspectRatioSettings {
+                kind: AspectRatioKind::Sample,
+                numerator,
+                denominator: 1,
+            }),
+            ..Default::default()
+        });
+        let started = manager.start_encode(encode).await.unwrap();
+        let job = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+        assert_eq!(job.state, JobState::Succeeded, "{name}: {job:#?}");
+        let inspected = probe(&output_path).await;
+        let video = inspected["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["nb_read_frames"], "48", "{name}");
+        assert_eq!(video["sample_aspect_ratio"], expected_sar, "{name}");
+        assert_eq!(video["display_aspect_ratio"], expected_dar, "{name}");
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR, VapourSynth, L-SMASH, and mkvmerge"]
+async fn source_queue_preserves_sample_aspect_ratio_after_raw_filters() {
+    use media_core::{AspectRatioKind, AspectRatioSettings, Av1anConcatMethod, TemporalSettings};
+
+    let fixture = Fixture::new();
+    let (square, anamorphic) = source_aspect_fixtures(&fixture.0).await;
+    let square_bytes = std::fs::read(&square).unwrap();
+    let anamorphic_bytes = std::fs::read(&anamorphic).unwrap();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    for (name, input, filters, typed, dimensions, sar, dar) in [
+        (
+            "raw-setsar",
+            &square,
+            &["setsar=2/1"][..],
+            None,
+            (160, 120),
+            "2:1",
+            "8:3",
+        ),
+        (
+            "raw-hflip",
+            &anamorphic,
+            &["hflip"][..],
+            None,
+            (160, 120),
+            "2:1",
+            "8:3",
+        ),
+        (
+            "raw-square",
+            &anamorphic,
+            &["setsar=1/1"][..],
+            None,
+            (160, 120),
+            "1:1",
+            "4:3",
+        ),
+        (
+            "ordered-raw-filters",
+            &square,
+            &["setsar=1/1", "crop=144:96", "setsar=2/1"][..],
+            Some(3),
+            (144, 96),
+            "2:1",
+            "3:1",
+        ),
+    ] {
+        let output_path = fixture.0.join(format!("{name}.mkv"));
+        let mut encode = request(input, &output_path, 12);
+        encode.settings.encoder = media_core::VideoEncoder::SvtAv1Hdr;
+        encode.settings.source_filters = true;
+        encode.settings.av1an_filters = filters.iter().map(|filter| (*filter).into()).collect();
+        encode.settings.encoding_preferences = Some(media_core::EncodingPreferences {
+            keyframe_interval_seconds: 1,
+            mp4_faststart: true,
+            retired_verification: (),
+        });
+        encode.settings.av1an_options = Some(media_core::Av1anOptions {
+            split_method: media_core::Av1anSplitMethod::FixedChunks,
+            encoder_threads: Some(1),
+            concat_method: Av1anConcatMethod::Mkvmerge,
+            source_workflow: true,
+            ..Default::default()
+        });
+        encode.settings.temporal = typed.map(|numerator| TemporalSettings {
+            aspect_ratio: Some(AspectRatioSettings {
+                kind: AspectRatioKind::Sample,
+                numerator,
+                denominator: 2,
+            }),
+            ..Default::default()
+        });
+        let started = manager.start_encode(encode).await.unwrap();
+        let job = wait_for(&manager, &started.id, |job| job.state.is_terminal()).await;
+        assert_eq!(job.state, JobState::Succeeded, "{name}: {job:#?}");
+
+        let inspected = probe(&output_path).await;
+        let streams = inspected["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 2, "{name}");
+        assert_eq!(streams[0]["codec_type"], "audio", "{name}");
+        let video = &streams[1];
+        assert_eq!(video["codec_name"], "av1", "{name}");
+        assert_eq!(video["nb_read_frames"], "48", "{name}");
+        assert_eq!(video["width"], dimensions.0, "{name}");
+        assert_eq!(video["height"], dimensions.1, "{name}");
+        assert_eq!(video["sample_aspect_ratio"], sar, "{name}");
+        assert_eq!(video["display_aspect_ratio"], dar, "{name}");
+    }
+    assert_eq!(std::fs::read(square).unwrap(), square_bytes);
+    assert_eq!(std::fs::read(anamorphic).unwrap(), anamorphic_bytes);
+    manager.shutdown().await;
+    assert_no_partial_output(&fixture.0);
+}
+
 #[tokio::test]
 #[ignore = "requires packaged av1an, FFmpeg, FFprobe, SVT-AV1-HDR and mkvmerge"]
 async fn source_queue_runs_decoded_proof_when_resampling_frames() {
@@ -1570,8 +1772,9 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
     let input = fixture.0.join("source.mkv");
     let fixture_input = fixture.0.join("fixture.mkv");
     synthesize(&fixture_input, "160x120", 48).await;
-    // A stale container count may guide initial progress, but must never
-    // truncate the encode or override the engine's actual 48-frame queue.
+    // The planner accepts a 50-frame tag as provisional because it is within
+    // two frames of the duration estimate. AV1AN must still use the actual
+    // 48-frame queue for encoding and output verification.
     let tagged = output(
         command("ffmpeg")
             .await
@@ -1583,7 +1786,7 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
                 "-c",
                 "copy",
                 "-metadata:s:v:0",
-                "NUMBER_OF_FRAMES=73",
+                "NUMBER_OF_FRAMES=50",
             ])
             .arg(&input),
     )
@@ -1617,7 +1820,15 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
         });
         if raw_filter {
             encode.settings.source_filters = true;
-            encode.settings.av1an_filters = vec!["crop=144:112".into()];
+            encode.settings.av1an_filters = vec!["crop=144:112,setsar=1/1".into()];
+            encode.settings.temporal = Some(media_core::TemporalSettings {
+                aspect_ratio: Some(media_core::AspectRatioSettings {
+                    kind: media_core::AspectRatioKind::Sample,
+                    numerator: 2,
+                    denominator: 1,
+                }),
+                ..Default::default()
+            });
             encode.settings.audio.push(media_core::AudioTrackSettings {
                 stream_index: 1,
                 codec: media_core::AudioCodec::Opus,
@@ -1631,6 +1842,11 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
             encode.settings.temporal = Some(media_core::TemporalSettings {
                 frame_rate: Some(media_core::FrameRate {
                     numerator: 30,
+                    denominator: 1,
+                }),
+                aspect_ratio: Some(media_core::AspectRatioSettings {
+                    kind: media_core::AspectRatioKind::Sample,
+                    numerator: 2,
                     denominator: 1,
                 }),
                 ..Default::default()
@@ -1648,7 +1864,7 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
             assert!(
                 job.logs
                     .iter()
-                    .any(|line| line.contains("approximately 73 frames")),
+                    .any(|line| line.contains("approximately 50 frames")),
                 "{job:#?}"
             );
             assert!(
@@ -1688,6 +1904,7 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
         );
         if resample {
             assert_eq!(streams[1]["r_frame_rate"], "30/1");
+            assert_eq!(streams[1]["sample_aspect_ratio"], "2:1");
             assert!(
                 job.logs
                     .iter()
@@ -1696,10 +1913,12 @@ async fn source_queue_runs_decoded_proof_when_resampling_frames() {
         }
         if raw_filter {
             assert_eq!(streams[0]["codec_name"], "opus");
+            assert_eq!(streams[1]["sample_aspect_ratio"], "1:1");
             assert!(
                 job.logs
                     .iter()
-                    .any(|line| line == "Output check: readable video and 2 planned streams.")
+                    .any(|line| line.starts_with("Output check: ")
+                        && line.ends_with("2 planned streams."))
             );
         }
     }

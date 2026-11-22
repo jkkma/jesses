@@ -73,9 +73,14 @@ verified completed chunks or repartition their original scene queue.
 
 Ordinary exact-count encodes and Saved resumes with an unchanged source
 recipe use the frozen chunk count and a joined-video header check. The muxed
-output is checked for its planned streams, video packet count, codec and
-dimensions. Declared video duration is checked for a known cadence starting
-at zero.
+output is checked for its planned streams, decoded video frame count, codec
+and dimensions. For a queue with one source recipe and no raw filter rows,
+the final mux preserves and checks the planned sample aspect ratio. Raw
+filters run after typed aspect processing. For SVT, AOM and VPX, an internal
+encoder bridge records each chunk's actual Y4M sample aspect ratio and ties the
+observation to the completed chunk. The final mux carries that ratio when the
+chunks agree, and publication checks it. Declared video duration is checked for
+a known cadence starting at zero.
 Saved chunks and original sources have identity, size and SHA-256 receipts.
 
 New Settings obtains decoded property/count receipts for retained chunks when
@@ -87,6 +92,12 @@ decoded clock establish the actual per-region geometry and frame count. With
 mkvmerge, warnings are logged and the reference must still pass these checks.
 Older workspaces with decoded contracts and no mixed-chunk provenance use
 this detailed join check conservatively.
+
+Saved chunks retain their observed filter geometry or the trusted plan for an
+unfiltered recipe. If an older workspace lacks that evidence, reset its chunks
+before resuming a job that requires it. If retained and newly encoded chunks
+need incompatible display geometry that the container cannot represent,
+Jesses stops before publication.
 
 For source copied cuts, a stable owned decoder slot preserves the original
 queue's source path while immutable cut variants preserve rollback authority.

@@ -1,5 +1,6 @@
 //! Durable receipts for an explicitly resumed av1an job. A history locator is
 //! never sufficient authority to run saved commands or remove a directory.
+use super::encoder_helper::{MAX_RECEIPT_BYTES, Observation, RECEIPTS_NAME};
 use super::*;
 use crate::jobs::files::WorkspaceLock;
 use crate::jobs::source_queue::{self, ChunkContract, Regions};
@@ -31,9 +32,9 @@ fn error(path: &Path, message: impl Into<String>) -> AppError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Identity(Vec<u64>);
+pub(super) struct Identity(Vec<u64>);
 
-fn file_identity(file: &File) -> std::io::Result<Identity> {
+pub(super) fn file_identity(file: &File) -> std::io::Result<Identity> {
     #[cfg(windows)]
     {
         let (a, b, c) = files::windows_file_id(file)?;
@@ -104,6 +105,31 @@ struct LaunchArtifact {
     identity: Identity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoder_support: Option<EncoderSupport>,
+}
+
+const ENCODER_SUPPORT_NAME: &str = "encoder-support";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EncoderSupport {
+    identity: Identity,
+    executable: Stamp,
+    receipts: Identity,
+}
+
+pub(super) struct EncoderHelperFiles {
+    pub(super) executable: Source,
+    pub(super) receipts: PathBuf,
+    _directory_guard: File,
+    _receipt_guard: File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct FilteredGeometry {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) sar: (u32, u32),
 }
 
 fn tool_contents_match(saved: &[Stamp], current: &[Stamp]) -> bool {
@@ -421,6 +447,16 @@ struct Chunk {
     file: Stamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decoded_contract: Option<super::super::source_queue::ChunkContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filtered_geometry: Option<FilteredGeometry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planned_geometry: Option<FilteredGeometry>,
+}
+
+impl Chunk {
+    fn geometry(&self) -> Option<FilteredGeometry> {
+        self.filtered_geometry.or(self.planned_geometry)
+    }
 }
 
 struct SourceSealBatch {
@@ -498,6 +534,7 @@ pub(super) enum SourceJoinMode {
     },
     Detailed {
         reason: &'static str,
+        may_mix_recipes: bool,
     },
 }
 
@@ -630,6 +667,98 @@ fn source_workflow(settings: &EncodeSettings) -> bool {
         && settings
             .av1an_options
             .is_some_and(|options| options.source_workflow)
+}
+
+fn encoder_helper_name(encoder: media_core::VideoEncoder) -> String {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    format!("{}{suffix}", super::encoder::binary(encoder))
+}
+
+fn needs_filtered_geometry(manifest: &Manifest) -> bool {
+    let settings = &manifest.settings;
+    manifest.edited_command.is_none()
+        && source_workflow(settings)
+        && container_geometry_encoder(settings.encoder)
+        && (settings.source_filters
+            || queue_settings(manifest).source_filters
+            || manifest
+                .completed
+                .values()
+                .any(|chunk| chunk.filtered_geometry.is_some()))
+}
+
+fn container_geometry_encoder(encoder: VideoEncoder) -> bool {
+    encoder.is_svt() || matches!(encoder, VideoEncoder::AomAv1 | VideoEncoder::VpxStandalone)
+}
+
+fn geometry_unavailable(path: &Path) -> AppError {
+    files::error(
+        "AV1AN_FILTER_GEOMETRY_UNAVAILABLE",
+        "The encoded chunks lack verified filter geometry. Reset the saved chunks or start a new encode to capture it.",
+        path,
+    )
+}
+
+fn read_aspect_receipts(
+    launch: &LaunchArtifact,
+) -> Result<BTreeMap<String, Observation>, AppError> {
+    let _directory = verified_launch_guard(launch)?;
+    let (stage, support, _stage_guard) = encoder_support_guard(launch)?;
+    let path = stage.join(RECEIPTS_NAME);
+    let expected = &support.receipts;
+    if verify_single_link_file(&path)? != *expected {
+        return Err(error(&path, "The filter geometry log was replaced."));
+    }
+    let mut file = File::open(&path).map_err(|cause| error(&path, cause.to_string()))?;
+    if file_identity(&file).map_err(|cause| error(&path, cause.to_string()))? != *expected {
+        return Err(error(&path, "The filter geometry log was replaced."));
+    }
+    file.lock_shared()
+        .map_err(|cause| error(&path, cause.to_string()))?;
+    let mut data = Vec::new();
+    (&mut file)
+        .take(LIMIT as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|cause| error(&path, cause.to_string()))?;
+    drop(file);
+    if data.len() > LIMIT {
+        return Err(error(
+            &path,
+            "The filter geometry log exceeds its size limit.",
+        ));
+    }
+    let mut receipts = BTreeMap::new();
+    for line in data.split_inclusive(|byte| *byte == b'\n') {
+        if line.len() > MAX_RECEIPT_BYTES {
+            return Err(error(
+                &path,
+                "A filter geometry observation exceeds its size limit.",
+            ));
+        }
+        let Some(payload) = line.strip_suffix(b"\n") else {
+            // A stopped or crashed child can leave an incomplete last write.
+            break;
+        };
+        let observation: Observation =
+            serde_json::from_slice(payload).map_err(|cause| error(&path, cause.to_string()))?;
+        if observation.name.len() != 5
+            || !observation.name.bytes().all(|byte| byte.is_ascii_digit())
+            || observation.width == 0
+            || observation.height == 0
+            || observation.sar.0 == 0
+            || observation.sar.1 == 0
+            || observation.bytes == 0
+            || observation.sha256.len() != 64
+            || !observation
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(error(&path, "Invalid filter geometry observation."));
+        }
+        receipts.insert(observation.name.clone(), observation);
+    }
+    Ok(receipts)
 }
 fn queue_settings(manifest: &Manifest) -> &EncodeSettings {
     manifest
@@ -1291,6 +1420,7 @@ struct Workspace {
     // durable manifest use the cadence independently proven by every timestamp.
     // Recompute this declaration from the immutable source on every attempt.
     source_rate: (u32, u32),
+    planned_geometry: Option<FilteredGeometry>,
     // Protect tools from modification during the resumed job on Windows.
     _tools: Vec<Source>,
     // Keep the exact source admitted into av1an immutable for the whole run.
@@ -1717,10 +1847,22 @@ impl Workspace {
         if !receipts.completed.is_empty() {
             identity(&encode)?;
         }
-        for chunk in receipts.completed {
-            if self.manifest.completed.contains_key(&chunk.name) {
-                continue;
-            }
+        let completed: Vec<_> = receipts
+            .completed
+            .into_iter()
+            .filter(|chunk| !self.manifest.completed.contains_key(&chunk.name))
+            .collect();
+        let observations = if !completed.is_empty() && needs_filtered_geometry(&self.manifest) {
+            let attempt = self
+                .manifest
+                .launch_artifacts
+                .last()
+                .ok_or_else(|| geometry_unavailable(&self.root))?;
+            Some(read_aspect_receipts(attempt)?)
+        } else {
+            None
+        };
+        for chunk in completed {
             let path = encode.join(format!(
                 "{}.{}",
                 chunk.name,
@@ -1736,11 +1878,34 @@ impl Workspace {
                     "Completed chunk length differs from its receipt.",
                 ));
             }
+            let filtered_geometry = if let Some(observations) = &observations {
+                let observed = observations
+                    .get(&chunk.name)
+                    .filter(|observed| {
+                        observed.bytes == stamp.length && observed.sha256 == stamp.sha256
+                    })
+                    .ok_or_else(|| geometry_unavailable(&path))?;
+                Some(FilteredGeometry {
+                    width: observed.width,
+                    height: observed.height,
+                    sar: observed.sar,
+                })
+            } else {
+                None
+            };
             record_source_chunk_provenance(&mut self.manifest);
             self.manifest.completed.insert(
                 chunk.name,
                 Chunk {
                     decoded_contract: None,
+                    filtered_geometry,
+                    planned_geometry: if filtered_geometry.is_none()
+                        && self.manifest.edited_command.is_none()
+                    {
+                        self.planned_geometry
+                    } else {
+                        None
+                    },
                     frames: chunk.frames,
                     file: stamp,
                 },
@@ -2292,6 +2457,25 @@ fn validate_launch_layout(root: &Path, manifest: &Manifest) -> Result<(), AppErr
                 "The staged launch image lacks its selected tool authority.",
             ));
         }
+        if launch.encoder_support.as_ref().is_some_and(|support| {
+            let stage = launch.path.join(ENCODER_SUPPORT_NAME);
+            let identity_length = manifest.directory.0.len();
+            support.identity.0.len() != identity_length
+                || support.receipts.0.len() != identity_length
+                || support.executable.identity.0.len() != identity_length
+                || ![
+                    VideoEncoder::SvtAv1,
+                    VideoEncoder::AomAv1,
+                    VideoEncoder::VpxStandalone,
+                ]
+                .into_iter()
+                .any(|encoder| support.executable.path == stage.join(encoder_helper_name(encoder)))
+        }) {
+            return Err(error(
+                &launch.path,
+                "Invalid filtered encoder launch artifacts.",
+            ));
+        }
     }
     Ok(())
 }
@@ -2315,7 +2499,44 @@ fn verified_launch_guard(launch: &LaunchArtifact) -> Result<File, AppError> {
     Ok(guard)
 }
 
-fn verify_single_link_file(path: &Path) -> Result<Identity, AppError> {
+fn encoder_support_guard(
+    launch: &LaunchArtifact,
+) -> Result<(PathBuf, &EncoderSupport, File), AppError> {
+    let stage = launch.path.join(ENCODER_SUPPORT_NAME);
+    let support = launch
+        .encoder_support
+        .as_ref()
+        .ok_or_else(|| geometry_unavailable(&stage))?;
+    let guard = launch_directory_guard(&stage)?;
+    if file_identity(&guard).map_err(|cause| error(&stage, cause.to_string()))? != support.identity
+    {
+        return Err(error(&stage, "The encoder helper directory was replaced."));
+    }
+    Ok((stage, support, guard))
+}
+
+fn verify_encoder_support(launch: &LaunchArtifact) -> Result<(), AppError> {
+    let (stage, support, _guard) = encoder_support_guard(launch)?;
+    for entry in fs::read_dir(&stage).map_err(|cause| error(&stage, cause.to_string()))? {
+        let path = entry
+            .map_err(|cause| error(&stage, cause.to_string()))?
+            .path();
+        let actual = verify_single_link_file(&path)?;
+        if path == support.executable.path {
+            if actual != support.executable.identity || digest(&path, None)? != support.executable {
+                return Err(error(&path, "The sealed encoder helper changed."));
+            }
+        } else if path != stage.join(RECEIPTS_NAME) || actual != support.receipts {
+            return Err(error(
+                &path,
+                "Unexpected or replaced encoder helper artifact.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_single_link_file(path: &Path) -> Result<Identity, AppError> {
     let expected = identity(path)?;
     let metadata = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
     if !metadata.is_file() {
@@ -2393,6 +2614,9 @@ fn verify_launch_contents(launch: &LaunchArtifact) -> Result<(), AppError> {
                 if Some(&digest(&path, None)?) != launch.image.as_ref() {
                     return Err(error(&path, "The sealed staged launch image changed."));
                 }
+            }
+            Some(ENCODER_SUPPORT_NAME) if launch.encoder_support.is_some() => {
+                verify_encoder_support(launch)?
             }
             _ => {
                 return Err(error(
@@ -2758,6 +2982,7 @@ impl OwnedRecovery {
         let workspace = Workspace {
             root,
             source_rate: (manifest.fps_num, manifest.fps_den),
+            planned_geometry: None,
             manifest,
             _tools: vec![],
             _source: None,
@@ -3159,25 +3384,25 @@ impl Recovery {
                     "The completed chunk receipts do not cover the frozen source queue.",
                 ));
             }
+            let may_mix_recipes = source_recipe_changed(manifest, recipe)
+                || manifest.source_chunk_history_needs_proof.unwrap_or_else(|| {
+                    // Old workspaces with contracts do not record whether an
+                    // earlier New Settings attempt changed the retained video.
+                    manifest.completed.values().any(|chunk| chunk.decoded_contract.is_some())
+                });
             let reason = if requires_clock {
                 Some("The original Dolby Vision base-layer clock needs decoded timing verification.")
             } else if recipe.ignore_frame_mismatch
                 || super::options::source_resamples(&manifest.settings, workspace.source_rate)
             {
                 Some("The source queue resamples frames and needs its actual decoded count and clock.")
-            } else if source_recipe_changed(manifest, recipe)
-                || manifest.source_chunk_history_needs_proof.unwrap_or_else(|| {
-                    // Old workspaces with contracts do not record whether an
-                    // earlier New Settings attempt changed the retained video.
-                    manifest.completed.values().any(|chunk| chunk.decoded_contract.is_some())
-                })
-            {
+            } else if may_mix_recipes {
                 Some("The saved queue may contain chunks from a changed source recipe or an edited command.")
             } else {
                 None
             };
             if let Some(reason) = reason {
-                return Ok(Some(SourceJoinMode::Detailed { reason }));
+                return Ok(Some(SourceJoinMode::Detailed { reason, may_mix_recipes }));
             }
             let frames = usize::try_from(recipe.total_frames).map_err(|_| {
                 error(&workspace.root, "The source queue frame count exceeds this platform.")
@@ -3437,6 +3662,19 @@ impl Recovery {
         let (fps_num, fps_den) = (plan.fps_num, plan.fps_den);
         let estimated_frames = plan.source_frames_estimated;
         let pixel_format = plan.output_pixel_format.to_owned();
+        let planned_geometry = (source_workflow(&settings)
+            && !settings.source_filters
+            && container_geometry_encoder(settings.encoder))
+        .then(|| {
+            super::super::encode_plan::sample_aspect_ratio(Some(plan.output_sar())).map(|sar| {
+                FilteredGeometry {
+                    width: plan.width,
+                    height: plan.height,
+                    sar,
+                }
+            })
+        })
+        .transpose()?;
         let presented_rate = plan
             .av1an_presented_rate
             .filter(|_| !plan.requires_av1an_preprocess() && !plan.requires_qtgmc());
@@ -3668,6 +3906,7 @@ impl Recovery {
             let mut workspace = Workspace {
                 root: root.clone(),
                 manifest,
+                planned_geometry,
                 source_rate: if let Some(rate) = presented_rate {
                     rate
                 } else if prepared.is_some() {
@@ -3745,6 +3984,7 @@ impl Recovery {
                 path: path.clone(),
                 identity: candidate.directory.clone(),
                 image: None,
+                encoder_support: None,
             });
             validate_launch_layout(&w.root, &candidate)?;
             fs::create_dir(&path).map_err(|e| error(&path, e.to_string()))?;
@@ -3755,6 +3995,7 @@ impl Recovery {
                     path: path.clone(),
                     identity: owned.clone(),
                     image: None,
+                    encoder_support: None,
                 });
                 verify_action_tree(&w.root, &w.manifest)
             });
@@ -3805,6 +4046,139 @@ impl Recovery {
         })
         .await
     }
+
+    pub(super) async fn stage_encoder_helper(
+        &self,
+        launch: &Path,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Option<EncoderHelperFiles>, AppError> {
+        let launch = launch.to_owned();
+        let cancel = cancel.clone();
+        self.with(move |w| {
+            if !needs_filtered_geometry(&w.manifest) {
+                return Ok(None);
+            }
+            if w.manifest
+                .completed
+                .values()
+                .any(|chunk| chunk.geometry().is_none())
+            {
+                return Err(geometry_unavailable(&w.root));
+            }
+            let _directory = w.guard_owned_launch(&launch)?;
+            let host = Source::open(super::launcher::encoder_helper_host()?)?;
+            let parent = w.root.parent().expect("recovery workspace parent");
+            // Build off-tree so a hard stop during a copy cannot strand an
+            // unsealed file in the recovery workspace. Record both identities
+            // before publishing the directory with a no-clobber rename.
+            let mut scratch = super::super::images::Directory::new(parent)?;
+            let helper_name = encoder_helper_name(w.manifest.settings.encoder);
+            let helper = scratch.path.join(&helper_name);
+            let staged_receipts = scratch.path.join(RECEIPTS_NAME);
+            let mut copied = scratch.create_file(helper.clone())?;
+            check_cancel(&cancel)?;
+            std::io::copy(&mut host.file(), &mut copied)
+                .and_then(|_| copied.sync_all())
+                .map_err(|cause| error(&helper, cause.to_string()))?;
+            drop(copied);
+            host.verify()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))
+                    .map_err(|cause| error(&helper, cause.to_string()))?;
+            }
+            scratch
+                .create_file(staged_receipts.clone())?
+                .sync_all()
+                .map_err(|cause| error(&staged_receipts, cause.to_string()))?;
+            let stage = launch.join(ENCODER_SUPPORT_NAME);
+            let mut executable = digest(&helper, Some(&cancel))?;
+            executable.path = stage.join(helper_name);
+            let support = EncoderSupport {
+                identity: identity(&scratch.path)?,
+                executable,
+                receipts: verify_single_link_file(&staged_receipts)?,
+            };
+            let index = w
+                .manifest
+                .launch_artifacts
+                .iter()
+                .position(|artifact| artifact.path == launch)
+                .ok_or_else(|| {
+                    error(&launch, "The launch directory has no durable reservation.")
+                })?;
+            check_cancel(&cancel)?;
+            w.transaction(|w| {
+                w.manifest.launch_artifacts[index].encoder_support = Some(support);
+                validate_launch_layout(&w.root, &w.manifest)?;
+                verify_action_tree(&w.root, &w.manifest)
+            })?;
+            scratch
+                .publish(&stage)
+                .map_err(|cause| error(&stage, cause.message))?;
+            let artifact = &w.manifest.launch_artifacts[index];
+            let (stage, support, directory_guard) = encoder_support_guard(artifact)?;
+            let executable = open_launch_file(&support.executable.path)?;
+            if digest(&support.executable.path, Some(&cancel))? != support.executable {
+                return Err(error(
+                    &executable.path,
+                    "The staged encoder helper changed before launch.",
+                ));
+            }
+            verify_launch_file(&executable)?;
+            let receipts = stage.join(RECEIPTS_NAME);
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.share_mode(1 | 2);
+            }
+            let receipt_guard = options
+                .open(&receipts)
+                .map_err(|cause| error(&receipts, cause.to_string()))?;
+            if file_identity(&receipt_guard).map_err(|cause| error(&receipts, cause.to_string()))?
+                != support.receipts
+            {
+                return Err(error(
+                    &receipts,
+                    "The staged filter geometry log was replaced.",
+                ));
+            }
+            Ok(Some(EncoderHelperFiles {
+                executable,
+                receipts,
+                _directory_guard: directory_guard,
+                _receipt_guard: receipt_guard,
+            }))
+        })
+        .await
+    }
+
+    pub(super) async fn filtered_geometry(&self) -> Result<Option<FilteredGeometry>, AppError> {
+        self.with(|w| {
+            if !needs_filtered_geometry(&w.manifest) {
+                return Ok(None);
+            }
+            w.verify_owner()?;
+            let mut geometry = w.manifest.completed.values().map(Chunk::geometry);
+            let selected = geometry.next().flatten().ok_or_else(|| geometry_unavailable(&w.root))?;
+            for chunk in geometry {
+                let chunk = chunk.ok_or_else(|| geometry_unavailable(&w.root))?;
+                if chunk.sar != selected.sar || (selected.sar != (1, 1) && chunk != selected) {
+                    return Err(files::error(
+                        "AV1AN_FILTER_GEOMETRY_UNSUPPORTED",
+                        "The filtered chunks need incompatible sample aspect ratios or display sizes. This encoded output cannot use one container aspect ratio for them.",
+                        &w.root,
+                    ));
+                }
+            }
+            Ok(Some(selected))
+        })
+        .await
+    }
+
     pub(super) async fn retire_launch(&self, path: &Path) -> Result<(), AppError> {
         let path = path.to_owned();
         self.with(move |w| {
@@ -3815,13 +4189,18 @@ impl Recovery {
                 .launch_artifacts
                 .iter()
                 .find(|launch| launch.path == path)
-                .ok_or_else(|| error(&path, "The launch directory has no durable reservation."))?
-                .identity
-                .clone();
+                .ok_or_else(|| error(&path, "The launch directory has no durable reservation."))?;
             match fs::symlink_metadata(&path) {
                 Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
                 Err(cause) => return Err(error(&path, cause.to_string())),
-                Ok(_) => remove_empty_launch(&path, &owned)?,
+                Ok(_) if owned.encoder_support.is_some() => remove_tree_checked(
+                    &path,
+                    &owned.identity,
+                    None,
+                    Some(RemovalAuthority::Launch(owned)),
+                    true,
+                )?,
+                Ok(_) => remove_empty_launch(&path, &owned.identity)?,
             }
             w.transaction(|w| {
                 w.manifest
@@ -4519,6 +4898,7 @@ mod tests {
                 root,
                 manifest,
                 source_rate: (24, 1),
+                planned_geometry: None,
                 _tools: vec![],
                 _source: Some(Source::open(&source).unwrap()),
                 chunks: vec![],
@@ -4717,6 +5097,8 @@ mod tests {
                     frames: 2,
                     file: digest(&path, None).unwrap(),
                     decoded_contract: None,
+                    filtered_geometry: None,
+                    planned_geometry: None,
                 },
             );
         }
@@ -4765,7 +5147,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("changed source recipe"))
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason, may_mix_recipes: true }) if reason.contains("changed source recipe"))
         );
         recovery
             .with(|workspace| {
@@ -4780,7 +5162,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("changed source recipe"))
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason, may_mix_recipes: true }) if reason.contains("changed source recipe"))
         );
         recovery
             .with(|workspace| {
@@ -4800,7 +5182,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("edited command"))
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason, may_mix_recipes: true }) if reason.contains("edited command"))
         );
         recovery
             .with(|workspace| {
@@ -4816,7 +5198,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason }) if reason.contains("resamples frames"))
+            matches!(recovery.source_join_mode(false).await.unwrap(), Some(SourceJoinMode::Detailed { reason, may_mix_recipes: false }) if reason.contains("resamples frames"))
         );
         recovery
             .with(|workspace| {
@@ -4828,6 +5210,168 @@ mod tests {
         assert_eq!(
             recovery.source_join_mode(false).await.err().unwrap().code,
             "RECOVERY_INVALID"
+        );
+    }
+
+    #[test]
+    fn filter_geometry_log_keeps_complete_observations_and_rejects_replacement() {
+        let fixture = Fixture::new();
+        let launch_path = fixture.0.join("launch-filter-test");
+        let stage = launch_path.join(ENCODER_SUPPORT_NAME);
+        fs::create_dir_all(&stage).unwrap();
+        let receipts = stage.join(RECEIPTS_NAME);
+        let helper = stage.join(encoder_helper_name(VideoEncoder::SvtAv1));
+        fs::write(&helper, b"helper").unwrap();
+        let first = Observation {
+            name: "00000".into(),
+            width: 128,
+            height: 96,
+            sar: (2, 1),
+            bytes: 8192,
+            sha256: "a".repeat(64),
+        };
+        let second = Observation {
+            name: "00001".into(),
+            ..first.clone()
+        };
+        fs::write(
+            &receipts,
+            format!(
+                "{}\n{}\n{{\"name\":",
+                serde_json::to_string(&second).unwrap(),
+                serde_json::to_string(&first).unwrap()
+            ),
+        )
+        .unwrap();
+        let launch = LaunchArtifact {
+            path: launch_path.clone(),
+            identity: identity(&launch_path).unwrap(),
+            image: None,
+            encoder_support: Some(EncoderSupport {
+                identity: identity(&stage).unwrap(),
+                executable: digest(&helper, None).unwrap(),
+                receipts: identity(&receipts).unwrap(),
+            }),
+        };
+        assert_eq!(
+            read_aspect_receipts(&launch)
+                .unwrap()
+                .into_values()
+                .collect::<Vec<_>>(),
+            vec![first, second],
+        );
+        fs::rename(&receipts, receipts.with_extension("old")).unwrap();
+        fs::write(&receipts, b"").unwrap();
+        assert!(read_aspect_receipts(&launch).is_err());
+    }
+
+    #[test]
+    fn filter_geometry_launch_with_no_observations_can_be_recovered() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = fixture.workspace();
+        let launch = workspace.root.join("launch-100-1");
+        fs::create_dir(&launch).unwrap();
+        let stage = launch.join(ENCODER_SUPPORT_NAME);
+        let mut scratch = super::super::super::images::Directory::new(&fixture.0).unwrap();
+        let helper_name = encoder_helper_name(VideoEncoder::SvtAv1);
+        let helper = scratch.path.join(&helper_name);
+        let receipts = scratch.path.join(RECEIPTS_NAME);
+        scratch
+            .create_file(helper.clone())
+            .unwrap()
+            .write_all(b"staged helper")
+            .unwrap();
+        drop(scratch.create_file(receipts.clone()).unwrap());
+        let mut executable = digest(&helper, None).unwrap();
+        executable.path = stage.join(helper_name);
+        workspace.manifest.launch_artifacts.push(LaunchArtifact {
+            path: launch.clone(),
+            identity: identity(&launch).unwrap(),
+            image: None,
+            encoder_support: Some(EncoderSupport {
+                identity: identity(&scratch.path).unwrap(),
+                executable,
+                receipts: identity(&receipts).unwrap(),
+            }),
+        });
+        verify_action_tree(&workspace.root, &workspace.manifest).unwrap();
+        assert!(!stage.exists());
+        scratch.publish(&stage).unwrap();
+        assert!(
+            read_aspect_receipts(&workspace.manifest.launch_artifacts[0])
+                .unwrap()
+                .is_empty()
+        );
+        verify_action_tree(&workspace.root, &workspace.manifest).unwrap();
+        workspace.sweep_stale_launches().unwrap();
+        assert!(!launch.exists());
+        assert!(workspace.manifest.launch_artifacts.is_empty());
+        assert!(workspace.manifest.completed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_filter_geometry_requires_evidence_and_agreement_for_a_global_aspect() {
+        let fixture = Fixture::new();
+        let (mut workspace, _video) = source_seal_fixture(&fixture, 2, false);
+        workspace.manifest.settings.encoder = VideoEncoder::SvtAv1;
+        let shape = FilteredGeometry {
+            width: 128,
+            height: 96,
+            sar: (2, 1),
+        };
+        let first = workspace.manifest.completed.get_mut("00000").unwrap();
+        first.planned_geometry = Some(shape);
+        let recovery = Recovery {
+            root: workspace.root.clone(),
+            finalizing: true,
+            resume_chunks: true,
+            inner: Arc::new(StdMutex::new(workspace)),
+        };
+        assert!(recovery.filtered_geometry().await.unwrap().is_none());
+        recovery
+            .with(|w| {
+                w.manifest.settings.source_filters = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery.filtered_geometry().await.unwrap_err().code,
+            "AV1AN_FILTER_GEOMETRY_UNAVAILABLE"
+        );
+        recovery
+            .with(move |w| {
+                w.manifest
+                    .completed
+                    .get_mut("00001")
+                    .unwrap()
+                    .filtered_geometry = Some(shape);
+                w.save()?;
+                let path = w.root.join("manifest.json");
+                w.manifest = serde_json::from_slice(&bytes(&path)?)
+                    .map_err(|cause| error(&path, cause.to_string()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(recovery.filtered_geometry().await.unwrap(), Some(shape));
+        recovery
+            .with(move |w| {
+                w.manifest
+                    .completed
+                    .get_mut("00001")
+                    .unwrap()
+                    .filtered_geometry = Some(FilteredGeometry {
+                    sar: (1, 1),
+                    ..shape
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery.filtered_geometry().await.unwrap_err().code,
+            "AV1AN_FILTER_GEOMETRY_UNSUPPORTED"
         );
     }
 
@@ -6192,6 +6736,8 @@ mod tests {
             Chunk {
                 frames: 24,
                 decoded_contract: None,
+                filtered_geometry: None,
+                planned_geometry: None,
                 file: digest(&chunk, None).unwrap(),
             },
         );

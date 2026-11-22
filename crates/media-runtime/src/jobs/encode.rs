@@ -2746,7 +2746,7 @@ impl JobManager {
                 } else {
                     None
                 },
-                basic_video_check: plan.basic_source_video_check(),
+                basic_video_check: plan.source_queue_video_check(),
                 expected_kinds: &expected_kinds,
             }),
             scratch,
@@ -4202,11 +4202,12 @@ fn mux_args(
             }
             display_num /= a;
             display_den /= a;
-            if (!settings.source_filters
+            if ((!settings.source_filters
                 || (settings.backend == media_core::EncodeBackend::Standalone
                     && plan.standalone_requires_container_sar()))
                 && !plan.has_source_queue()
-                && !plan.has_basic_source_queue()
+                && !plan.has_basic_source_queue())
+                || plan.source_queue_needs_mux_aspect()
             {
                 args.extend([
                     format!("-aspect:{index}").into(),
@@ -5634,7 +5635,7 @@ mod tests {
         (fixture, output, job, source_frames)
     }
 
-    const OUTPUT_CHECKED: &str = "Output check: readable video and";
+    const OUTPUT_CHECKED: &str = "Output check: ";
 
     #[tokio::test]
     async fn producer_clock_without_an_observer_returns_an_error() {

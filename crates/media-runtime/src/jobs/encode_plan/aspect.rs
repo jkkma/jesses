@@ -72,8 +72,13 @@ impl Transform {
 }
 
 pub(super) fn parse_source(value: Option<&str>) -> Result<String, AppError> {
+    let (numerator, denominator) = sample_aspect_ratio(value)?;
+    Ok(format!("{numerator}:{denominator}"))
+}
+
+pub(in crate::jobs) fn sample_aspect_ratio(value: Option<&str>) -> Result<(u32, u32), AppError> {
     let value = match value {
-        None | Some("0:1" | "N/A" | "unknown") => return Ok("1:1".into()),
+        None | Some("0:1" | "N/A" | "unknown") => return Ok((1, 1)),
         Some(value) => value,
     };
     let (numerator, denominator) = value
@@ -85,8 +90,7 @@ pub(super) fn parse_source(value: Option<&str>) -> Result<String, AppError> {
     let denominator = denominator
         .parse::<u64>()
         .map_err(|_| invalid("The source sample aspect ratio is invalid."))?;
-    let (numerator, denominator) = ratio(numerator, denominator)?;
-    Ok(format!("{numerator}:{denominator}"))
+    ratio(numerator, denominator)
 }
 
 #[cfg(test)]

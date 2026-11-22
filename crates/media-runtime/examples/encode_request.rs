@@ -3,8 +3,17 @@
 use media_runtime::{EncodeRequest, JobManager, JobState};
 use std::{path::PathBuf, time::Duration};
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = media_runtime::av1an_encoder_helper_main() {
+        std::process::exit(code);
+    }
+    media_runtime::configure_av1an_encoder_helper(std::env::current_exe()?)
+        .map_err(std::io::Error::other)?;
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resources) = std::env::var_os("JESSES_TEST_TOOL_RESOURCES") {
         media_runtime::configure_bundled_tools(PathBuf::from(resources))
             .map_err(std::io::Error::other)?;

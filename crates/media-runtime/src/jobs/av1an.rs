@@ -13,6 +13,11 @@ pub(super) use grain::{
     aom_parameters as aom_grain_parameters, parameters as grain_parameters,
 };
 pub(super) mod encoder;
+mod encoder_helper;
+pub use launcher::configure_av1an_encoder_helper;
+pub fn av1an_encoder_helper_main() -> Option<i32> {
+    encoder_helper::run_from_environment()
+}
 mod metrics;
 mod options;
 mod scenes;
@@ -47,7 +52,8 @@ pub(in crate::jobs) async fn verify_source_join(
     else {
         return Ok(None);
     };
-    let reason = match mode {
+    let filtered_geometry = recovery.filtered_geometry().await?;
+    let (reason, may_mix_recipes) = match mode {
         recovery::SourceJoinMode::Basic {
             frames,
             rate,
@@ -64,9 +70,19 @@ pub(in crate::jobs) async fn verify_source_join(
             source_queue_concat::joined_format(&document, &video.path, method)?;
             let stream = source_queue_concat::only_video(&document, &video.path)?;
             plan.observe_source_queue_header(&stream, rate)?;
+            if let Some(geometry) = filtered_geometry {
+                plan.observe_filtered_source_queue_aspect(
+                    &stream,
+                    (geometry.width, geometry.height),
+                    geometry.sar,
+                )?;
+            }
             return Ok(Some(frames));
         }
-        recovery::SourceJoinMode::Detailed { reason } => reason,
+        recovery::SourceJoinMode::Detailed {
+            reason,
+            may_mix_recipes,
+        } => (reason, may_mix_recipes),
     };
     manager
         .change(id, |snapshot| append_log(snapshot, reason.into()))
@@ -130,7 +146,14 @@ pub(in crate::jobs) async fn verify_source_join(
         plan.observe_source_filter_stream(&header, None)?;
     }
     let regions = join.regions.with_reference_header(&header, clock)?;
-    plan.source_queue_regions(regions, join.rate);
+    plan.source_queue_regions(regions, join.rate, &header, may_mix_recipes)?;
+    if let Some(geometry) = filtered_geometry {
+        plan.observe_filtered_source_queue_aspect(
+            &header,
+            (geometry.width, geometry.height),
+            geometry.sar,
+        )?;
+    }
     Ok(plan.source_queue_frame_count())
 }
 
@@ -608,6 +631,19 @@ impl JobManager {
         if command.is_none() {
             recovery.commit_source_cut_recipe().await?;
         }
+        let chunk_directory = work.join("chunks/encode");
+        if !edited
+            && let Some(helper) = recovery
+                .stage_encoder_helper(&launch_directory, cancel)
+                .await?
+        {
+            launch.use_encoder_helper(
+                helper,
+                encoder,
+                settings.encoder,
+                chunk_directory.clone(),
+            )?;
+        }
         let shell = edited
             .then(|| {
                 super::command_edit::PreparedShell::new(
@@ -628,7 +664,6 @@ impl JobManager {
             prepared.verify()?;
         }
         let event_task = tokio::spawn(observe_events);
-        let chunk_directory = work.join("chunks/encode");
         // AV1AN starts a failed chunk again from an empty file. Tell the
         // watchdog how often, so a retry of a long chunk still counts as work.
         let chunk_restarts = command

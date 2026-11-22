@@ -74,7 +74,8 @@ Some `vpxenc` builds coerce a fractional IVF rate even when both the Y4M header 
 `--fps` carry the requested rational value. Jesses therefore wraps direct VP9 with
 mkvmerge `--default-duration`. Direct x265 uses the same wrapper because raw HEVC
 has no container clock and may reorder B-frames. Before publication, Jesses
-checks the final file for readable video and its planned streams.
+checks the planned streams and verifies that the final movie track decodes to
+the expected frame count.
 
 ## Stop, restart and resume
 
