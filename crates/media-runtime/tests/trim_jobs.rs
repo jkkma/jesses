@@ -601,16 +601,19 @@ async fn trim_batch_history_and_cancel_preserve_interval_and_cleanup_assets() {
     .unwrap();
     let manager = JobManager::new(fixture.0.join("cancel-logs"));
     let job = manager.start_encode(request).await.unwrap();
+    let intermediate = fixture
+        .0
+        .join(format!(".jesses-{}-video.partial.mkv", job.id));
+    // Wait for the video encoder to write to its reserved intermediate.
+    // FFmpeg's progress text varies across releases and output modes.
     let active = wait_for(&manager, &job.id, |job| {
         job.state == JobState::Running
-            && job
-                .logs
-                .iter()
-                .any(|line| line.contains("[consumer] frame="))
+            && std::fs::metadata(&intermediate).is_ok_and(|file| file.len() > 0)
     })
     .await;
     assert_eq!(active.state, JobState::Running, "{active:#?}");
-    manager.cancel_job(job.id.clone()).await.unwrap();
+    let canceling = manager.cancel_job(job.id.clone()).await.unwrap();
+    assert_eq!(canceling.state, JobState::Canceling, "{canceling:#?}");
     let result = wait_for(&manager, &job.id, |job| job.state.is_terminal()).await;
     manager.shutdown().await;
     assert_eq!(result.state, JobState::Canceled, "{result:#?}");
