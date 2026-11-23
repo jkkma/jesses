@@ -235,6 +235,7 @@
     "target-probe-filter-v1",
     "xpsnr-signed-stats-v1",
     "source-unfiltered-probes-v1",
-    "preload-scenes-v1"
+    "preload-scenes-v1",
+    "ffmpeg91-metric-input-v1"
   ]
 }

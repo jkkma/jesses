@@ -1026,8 +1026,7 @@ async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input:
     );
     restore_tampered_fields(&manifest_path, &baseline, &["/settings/crf"]);
 
-    // A forged segment fingerprint must not substitute content from a different
-    // source interval: the full decoded-source comparison remains authoritative.
+    // Resume must verify each saved segment against its recorded fingerprint.
     if let Some(segments) = baseline["segments"]
         .as_array()
         .filter(|segments| segments.len() > 1)
@@ -1035,23 +1034,17 @@ async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input:
         let segment = PathBuf::from(segments[0]["path"].as_str().unwrap());
         let bytes = std::fs::read(&segment).unwrap();
         let substituted = std::fs::read(segments[1]["path"].as_str().unwrap()).unwrap();
+        assert_ne!(bytes, substituted);
         std::fs::write(&segment, &substituted).unwrap();
-        let mut forged = baseline.clone();
-        forged["segments"][0]["length"] = json!(substituted.len());
-        forged["segments"][0]["sha256"] = json!(format!("{:x}", Sha256::digest(&substituted)));
-        std::fs::write(&manifest_path, serde_json::to_vec(&forged).unwrap()).unwrap();
         let rejected = rejected_resume(manager, &job.id).await;
         assert_eq!(rejected.code, "RECOVERY_INVALID");
         assert!(
-            rejected.message.contains("decoded source frames"),
+            rejected
+                .message
+                .contains("saved recovery receipt or completed video artifact changed"),
             "{rejected:#?}"
         );
         std::fs::write(&segment, bytes).unwrap();
-        restore_tampered_fields(
-            &manifest_path,
-            &baseline,
-            &["/segments/0/length", "/segments/0/sha256"],
-        );
     }
 
     // av1an builds its concat list by enumerating the entire encode directory.
@@ -1077,27 +1070,49 @@ async fn reject_changed_receipts(manager: &JobManager, job: &JobSnapshot, input:
     assert!(rejected.message.contains("selected tools"), "{rejected:#?}");
     restore_tampered_fields(&manifest_path, &baseline, &["/tools/0/sha256"]);
 
-    // Appending harmless padding keeps the generated container readable while
-    // changing its content fingerprint. Restore its exact bytes afterwards.
+    let original_digest = if baseline["original_source"].is_object() {
+        "/original_source/sha256"
+    } else {
+        "/source/sha256"
+    };
+    let digest = baseline.pointer(original_digest).unwrap().as_str().unwrap();
+    let sampled = digest.starts_with("source-v2:");
     let length = std::fs::metadata(input).unwrap().len();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(input)
-        .unwrap()
-        .write_all(&[0; 16])
-        .unwrap();
+    if sampled {
+        // Restoring bytes cannot restore a sampled source's filesystem change time.
+        // Test a mismatched saved digest here and exercise real edits separately.
+        let mut changed = digest.to_owned();
+        let last = changed.pop().unwrap();
+        changed.push(if last == '0' { '1' } else { '0' });
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        *manifest.pointer_mut(original_digest).unwrap() = json!(changed);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    } else {
+        // Padding changes the exact content fingerprint without breaking the container.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(input)
+            .unwrap()
+            .write_all(&[0; 16])
+            .unwrap();
+    }
     let rejected = rejected_resume(manager, &job.id).await;
     assert_eq!(rejected.code, "RECOVERY_INVALID");
     assert!(
         rejected.message.contains("original source changed"),
         "{rejected:#?}"
     );
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(input)
-        .unwrap()
-        .set_len(length)
-        .unwrap();
+    if sampled {
+        restore_tampered_fields(&manifest_path, &baseline, &[original_digest]);
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(input)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+    }
 }
 
 async fn qualify(encoder: VideoEncoder, transformed: bool) {

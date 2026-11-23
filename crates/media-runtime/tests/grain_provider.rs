@@ -17,60 +17,32 @@ fn configure_bundle() {
     });
 }
 
-fn parameter_digest(table: &str, expected: &serde_json::Value) -> String {
-    let mut segments = Vec::<(u64, u64, String)>::new();
-    for line in table.lines() {
+fn static_parameter_digest(table: &str) -> String {
+    let mut lines = table.lines();
+    assert_eq!(lines.next(), Some("filmgrn1"));
+    let mut header = lines.next().expect("one grain segment").split_whitespace();
+    assert_eq!(header.next(), Some("E"));
+    assert_eq!(header.next(), Some("0"));
+    assert_eq!(header.next().unwrap().parse::<i64>().unwrap(), i64::MAX);
+
+    let mut parameters = String::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        match fields.first().copied() {
-            None | Some("filmgrn1") => (),
-            Some("E") => segments.push((
-                fields[1].parse().unwrap(),
-                fields[2].parse().unwrap(),
-                String::new(),
-            )),
-            _ => {
-                let parameters = &mut segments.last_mut().expect("preceding segment").2;
-                parameters.push_str(&fields.join(" "));
-                parameters.push('\n');
-            }
-        }
-    }
-    assert_eq!(segments.first().unwrap().0, 0);
-    assert!(segments.last().unwrap().1 >= 864_000_000_000);
-    let hash = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
-    assert_eq!(
-        hash(&segments.first().unwrap().2),
-        expected["firstParametersSha256"]
-    );
-    assert_eq!(
-        hash(&segments.last().unwrap().2),
-        expected["tailParametersSha256"]
-    );
-    for (_, _, parameters) in &segments {
-        assert!(
-            expected["parameterStatesSha256"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some(&hash(parameters))),
-            "every actual parameter state comes from this exact embedded source stock"
+        assert_ne!(
+            fields.first(),
+            Some(&"E"),
+            "expected one static grain segment"
         );
+        parameters.push_str(&fields.join(" "));
+        parameters.push('\n');
     }
-    let mut digest = Sha256::new();
-    for frame in 0..360u64 {
-        let tick = (frame * 10_000_000).div_ceil(24);
-        let segment = segments
-            .iter()
-            .find(|(start, end, _)| *start <= tick && tick < *end)
-            .expect("complete15secondcoverage");
-        digest.update(segment.2.as_bytes());
-    }
-    format!("{:x}", digest.finalize())
+    assert!(!parameters.is_empty());
+    format!("{:x}", Sha256::digest(parameters.as_bytes()))
 }
 
 #[tokio::test]
 #[ignore = "requires the source-pinned grav1synth provider, FFmpeg and standalone SVT-AV1"]
-async fn all_fourteen_source_film_stocks_preserve_embedded_parameter_sequences() {
+async fn all_fourteen_source_film_stocks_make_distinct_static_encode_models() {
     configure_bundle();
     if let Some(resources) = std::env::var_os("JESSES_GRAIN_RESOURCES") {
         let root = std::path::PathBuf::from(resources).canonicalize().unwrap();
@@ -98,7 +70,10 @@ async fn all_fourteen_source_film_stocks_preserve_embedded_parameter_sequences()
             )
             .unwrap();
         }
-        let digest = parameter_digest(&table, preset);
+        // Encode presets extend the first source model across the full
+        // output. The utility_containers gate covers timed preset sequences.
+        let digest = static_parameter_digest(&table);
+        assert_eq!(digest, preset["firstParametersSha256"], "{name}");
         assert!(
             results.insert(digest),
             "each source stock must carry its own parameters"

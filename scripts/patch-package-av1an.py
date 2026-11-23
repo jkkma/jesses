@@ -20,7 +20,17 @@ MARKERS = (
     "xpsnr-signed-stats-v1",
     "source-unfiltered-probes-v1",
     "preload-scenes-v1",
+    "ffmpeg91-metric-input-v1",
 )
+
+
+def remove_metric_input_queue_override(source, expected):
+    override = '        "-thread_queue_size",\n        "1024",\n'
+    if source.count(override) != expected or source.count('"-thread_queue_size"') != expected:
+        raise ValueError("The pinned FFmpeg metric input queue options changed.")
+    # FFmpeg 9.1 configures input queues internally. Its remaining option
+    # applies to output muxers and must not appear before either input.
+    return source.replace(override, "")
 
 
 def patch_source(source, archive_path, patch_path):
@@ -189,7 +199,7 @@ def patch_source(source, archive_path, patch_path):
         raise ValueError("The pinned L-SMASH probe import changed.")
     after = '// Decode metric probes in software for deterministic portable operation.\n    arguments.set_int("prefer_hw", 0)?;'
     changed[paths[4]] = scorer[:start] + region.replace(before, after) + scorer[end:]
-    xpsnr = original[paths[5]]
+    xpsnr = remove_metric_input_queue_override(original[paths[5]], 1)
     for before, after in [
         ('[0:v]scale=', '[0:v]setparams=colorspace=unknown,scale='),
         ('[1:v]{filter}scale=', '[1:v]{filter}setparams=colorspace=unknown,scale='),
@@ -228,7 +238,7 @@ mod signed_stats_tests {
 }
 '''
     changed[paths[5]] = xpsnr
-    vmaf = original[paths[6]]
+    vmaf = remove_metric_input_queue_override(original[paths[6]], 2)
     start = vmaf.index("pub fn run_vmaf(")
     end = vmaf.index("pub fn run_vmaf_weighted(", start)
     region = vmaf[start:end]

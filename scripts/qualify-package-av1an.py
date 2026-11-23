@@ -38,7 +38,7 @@ def qualify_video_only(tools, scratch, log):
         return json.loads(run([ffprobe, "-v", "error", "-count_frames", "-show_entries",
                                "stream=codec_type,nb_read_frames", "-of", "json", output]).stdout)["streams"]
 
-    def encode(method, name, audio_params, *, work=None, resume=False):
+    def encode(method, name, audio_params, *, work=None, resume=False, metric_options=()):
         output = scratch / f"{name}.mkv"
         detail_log = scratch / f"{name}.log"
         args = [av1an, "-i", source, "-o", output, "--temp", work or scratch / name,
@@ -47,6 +47,7 @@ def qualify_video_only(tools, scratch, log):
                 "--workers", "1", "--pix-format", "yuv420p", "--keep", "--quiet", "--log-level", "info",
                 "--log-file", detail_log,
                 "--video-params", "--preset 12 --crf 45 --lp 1", "--audio-params", audio_params]
+        args.extend(metric_options)
         if resume:
             args.append("--resume")
         run(args)
@@ -85,6 +86,19 @@ def qualify_video_only(tools, scratch, log):
     _, details = encode("ffmpeg", "broken-audio", "-c:a no_such_audio_encoder -sn -dn -map -0:t?")
     if warning not in details or "no_such_audio_encoder" not in details:
         raise ValueError("A genuine audio failure must remain visible.")
+
+    # Select and an every-frame probe make Av1an use FFmpeg's metric readers.
+    for name, metric, target, options in (
+        ("vmaf", "vmaf", "90-94", ()),
+        ("weighted-vmaf", "vmaf", "90-94", ("--probing-vmaf-features", "weighted")),
+        ("xpsnr", "xpsnr", "35-45", ()),
+    ):
+        output, _ = encode("mkvmerge", name, video_only, metric_options=(
+            "--target-metric", metric, "--target-quality", target, "--probing-rate", "1",
+            "--qp-range", "30-55", "--probe-video-params", "copy", *options,
+        ))
+        if streams(output) != [{"codec_type": "video", "nb_read_frames": "8"}]:
+            raise ValueError(f"{name}: the FFmpeg metric probe must allow all eight frames to encode.")
 
 
 def main():
