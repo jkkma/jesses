@@ -581,9 +581,88 @@ fn packet_duration_matches(
             .is_some_and(|dts_delta| timing_matches(actual, Some(dts_delta)))
 }
 
+#[derive(Clone, Copy)]
+struct AacClock {
+    samples_per_second: u32,
+    source_tick: f64,
+}
+
+impl AacClock {
+    fn from_stream(stream: &Stream) -> Option<Self> {
+        if stream.codec_name.as_deref() != Some("aac") {
+            return None;
+        }
+        let rate = stream.sample_rate.as_deref()?.parse::<u32>().ok()?;
+        if rate == 0 {
+            return None;
+        }
+        let sample_tick = 1.0 / f64::from(rate);
+        let source_tick = stream
+            .time_base
+            .as_deref()
+            .and_then(|value| value.split_once('/'))
+            .and_then(|(a, b)| Some(a.parse::<f64>().ok()? / b.parse::<f64>().ok()?))
+            .filter(|tick| tick.is_finite() && *tick > 0.0)
+            .unwrap_or(sample_tick)
+            .clamp(sample_tick.min(0.002), 0.002);
+        Some(Self {
+            samples_per_second: rate,
+            source_tick,
+        })
+    }
+
+    fn matches_tail(
+        self,
+        expected: Option<f64>,
+        actual: Option<f64>,
+        source_padding: u32,
+        output_padding: u32,
+        previous_source_duration: Option<f64>,
+    ) -> bool {
+        let padding_duration = f64::from(output_padding) / f64::from(self.samples_per_second);
+        let tolerance = self.source_tick + 0.000001;
+        let raw_matches = expected.zip(actual).is_some_and(|(expected, actual)| {
+            expected > 0.0 && actual > 0.0 && (actual - expected).abs() <= tolerance
+        });
+        if source_padding != output_padding {
+            // Older Matroska writers can declare the trimmed tail by duration
+            // alone. Accept an added edit only when that shorter duration is
+            // unchanged and the edit accounts for the missing AAC samples.
+            return source_padding == 0
+                && raw_matches
+                && expected
+                    .zip(previous_source_duration)
+                    .is_some_and(|(tail, previous)| {
+                        tail > 0.0
+                            && tail < previous
+                            && (tail + padding_duration - previous).abs() <= tolerance
+                    });
+        }
+        if source_padding == 0 {
+            return packet_duration_matches(expected, actual, None, None, false);
+        }
+        // FFmpeg 9.1 writes the full AAC frame duration to the MP4 sample
+        // table, with the trimmed end represented by the edit list instead.
+        // The demuxed Skip Samples side data must retain the source padding.
+        expected.zip(actual).is_some_and(|(expected, actual)| {
+            expected > 0.0
+                && (raw_matches
+                    || (actual > expected
+                        && (actual - padding_duration - expected).abs() <= tolerance))
+        })
+    }
+}
+
 pub(in crate::jobs) fn packets(
     reader: &mut dyn Read,
     mut accept: impl FnMut(Packet) -> Result<(), String>,
+) -> Result<u64, String> {
+    packets_with_padding(reader, |packet, _| accept(packet))
+}
+
+fn packets_with_padding(
+    reader: &mut dyn Read,
+    mut accept: impl FnMut(Packet, u32) -> Result<(), String>,
 ) -> Result<u64, String> {
     packet_records(reader, |fields| {
         let timestamp = |key| -> Result<Option<f64>, String> {
@@ -598,13 +677,23 @@ pub(in crate::jobs) fn packets(
             }
         };
         let (size, hash) = packet_content(fields)?;
-        accept(Packet {
-            pts: timestamp("pts_time")?,
-            dts: timestamp("dts_time")?,
-            duration: timestamp("duration_time")?,
-            size,
-            hash: hash.to_owned(),
-        })
+        let discard_padding = fields
+            .get("side_datum/skip_samples:discard_padding")
+            .or_else(|| fields.get("discard_padding"))
+            .map(|value| value.parse::<u32>())
+            .transpose()
+            .map_err(|_| "A packet's discard padding is invalid.")?
+            .unwrap_or_default();
+        accept(
+            Packet {
+                pts: timestamp("pts_time")?,
+                dts: timestamp("dts_time")?,
+                duration: timestamp("duration_time")?,
+                size,
+                hash: hash.to_owned(),
+            },
+            discard_padding,
+        )
     })
 }
 
@@ -798,7 +887,7 @@ pub(super) async fn verify_packets(
         cancel,
         false,
         false,
-        false,
+        None,
         0.0,
     )
     .await
@@ -826,7 +915,7 @@ pub(super) async fn verify_shifted_packets(
         cancel,
         false,
         false,
-        false,
+        None,
         offset_seconds,
     )
     .await
@@ -857,7 +946,7 @@ pub(super) async fn verify_shifted_video_packets(
         cancel,
         true,
         matroska,
-        false,
+        None,
         offset_seconds,
     )
     .await
@@ -867,22 +956,21 @@ pub(super) async fn verify_shifted_video_packets(
 pub(super) async fn verify_container_packets(
     ffprobe: &Path,
     source: &Path,
-    source_index: u32,
+    source_stream: &Stream,
     output: &Path,
     output_index: u32,
-    allow_aac_duration_reshape: bool,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Option<f64>, AppError> {
     compare_packets(
         ffprobe,
         source,
-        source_index,
+        source_stream.index,
         output,
         output_index,
         cancel,
         true,
         false,
-        allow_aac_duration_reshape,
+        AacClock::from_stream(source_stream),
         0.0,
     )
     .await
@@ -997,7 +1085,7 @@ async fn compare_packets(
     cancel: &watch::Receiver<bool>,
     reconstruct_initial_dts: bool,
     omit_initial_dts: bool,
-    allow_aac_duration_reshape: bool,
+    aac_clock: Option<AacClock>,
     offset_seconds: f64,
 ) -> Result<Option<f64>, AppError> {
     let container_reference = Box::pin(av1_container_reference(
@@ -1012,8 +1100,30 @@ async fn compare_packets(
         .map_or((source, source_index), |reference| {
             (reference.path.as_path(), 0)
         });
-    let source_spec = packet_spec(ffprobe, source, source_index);
-    let output_spec = packet_spec(ffprobe, output, output_index);
+    let aac_tail = aac_clock.filter(|_| {
+        output
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| {
+                ["mp4", "mov", "m4a"]
+                    .iter()
+                    .any(|value| extension.eq_ignore_ascii_case(value))
+            })
+    });
+    let copy_spec = |path, index| {
+        if aac_tail.is_some() {
+            packet_spec_with_entries(
+                ffprobe,
+                path,
+                index,
+                "packet=pts_time,dts_time,duration_time,size,data_hash:packet_side_data=discard_padding",
+            )
+        } else {
+            packet_spec(ffprobe, path, index)
+        }
+    };
+    let source_spec = copy_spec(source, source_index);
+    let output_spec = copy_spec(output, output_index);
     let (sender, receiver) = blocking_channel::sync_channel(32);
     let original = supervisor::run_streaming_stdout(
         &source_spec,
@@ -1022,10 +1132,10 @@ async fn compare_packets(
         Duration::from_secs(86400),
         move |reader| {
             let mut last_duration = None;
-            let count = packets(reader, |packet| {
+            let count = packets_with_padding(reader, |packet, padding| {
                 last_duration = packet.duration;
                 sender
-                    .send(packet)
+                    .send((packet, padding))
                     .map_err(|_| "Output comparison stopped.".into())
             })?;
             Ok((count, last_duration))
@@ -1043,8 +1153,9 @@ async fn compare_packets(
             let mut previous_source_dts = None;
             let mut previous_dts = None;
             let mut pending_duration = None;
-            let count = packets(reader, |actual| {
-                let expected = receiver
+            let mut previous_source_duration = None;
+            let count = packets_with_padding(reader, |actual, output_padding| {
+                let (expected, source_padding) = receiver
                     .recv()
                     .map_err(|_| "The output contains extra packets.".to_string())?;
                 // Matroska omits leading decode timestamps for reordered video;
@@ -1081,32 +1192,48 @@ async fn compare_packets(
                 {
                     return Err("A copied packet's content or timing changed.".into());
                 }
-                if let Some((expected_duration, actual_duration, actual_dts)) =
+                if let Some((expected_duration, actual_duration, actual_dts, _, _)) =
                     pending_duration.take()
-                    && !packet_duration_matches(
+                {
+                    previous_source_duration = expected_duration;
+                    if !packet_duration_matches(
                         expected_duration,
                         actual_duration,
                         actual_dts,
                         actual.dts,
-                        allow_aac_duration_reshape,
-                    )
-                {
-                    return Err("A copied packet's duration changed unexpectedly.".into());
+                        aac_clock.is_some(),
+                    ) {
+                        return Err("A copied packet's duration changed unexpectedly.".into());
+                    }
                 }
-                pending_duration = Some((expected.duration, actual.duration, actual.dts));
+                pending_duration = Some((
+                    expected.duration,
+                    actual.duration,
+                    actual.dts,
+                    source_padding,
+                    output_padding,
+                ));
                 previous_dts = actual.dts;
                 Ok(())
             })?;
-            if let Some((expected_duration, actual_duration, actual_dts)) = pending_duration
-                && !packet_duration_matches(
-                    expected_duration,
-                    actual_duration,
-                    actual_dts,
-                    None,
-                    allow_aac_duration_reshape,
-                )
-            {
-                return Err("The final copied packet's duration changed.".into());
+            if let Some((expected, actual, _, source_padding, output_padding)) = pending_duration {
+                let tail_matches = aac_tail.map_or_else(
+                    || packet_duration_matches(expected, actual, None, None, false),
+                    |clock| {
+                        clock.matches_tail(
+                            expected,
+                            actual,
+                            source_padding,
+                            output_padding,
+                            previous_source_duration,
+                        )
+                    },
+                );
+                if !tail_matches {
+                    return Err(
+                        "The final copied packet's duration or discard padding changed.".into(),
+                    );
+                }
             }
             if receiver.recv().is_ok() {
                 return Err("The output is missing source packets.".into());
@@ -1282,6 +1409,26 @@ mod tests {
             None,
             true,
         ));
+    }
+
+    #[test]
+    fn iso_aac_tail_requires_the_same_discard_and_effective_duration() {
+        let clock = AacClock {
+            samples_per_second: 48_000,
+            source_tick: 0.001,
+        };
+        assert!(clock.matches_tail(Some(0.016), Some(0.021333), 256, 256, Some(0.021)));
+        assert!(clock.matches_tail(Some(0.019), Some(0.021333), 128, 128, Some(0.021)));
+        assert!(clock.matches_tail(Some(0.016), Some(0.016), 256, 256, Some(0.021)));
+        assert!(clock.matches_tail(Some(0.016), Some(0.016), 0, 256, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.016), None, 0, 256, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.016), None, 256, 256, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.021333), Some(0.021333), 0, 256, Some(0.021333)));
+        assert!(!clock.matches_tail(Some(0.021333), Some(0.021333), 256, 0, Some(0.021333)));
+        assert!(!clock.matches_tail(Some(0.016), Some(0.021333), 0, 0, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.016), Some(0.021333), 256, 255, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.016), Some(0.019), 256, 256, Some(0.021)));
+        assert!(!clock.matches_tail(Some(0.016), Some(0.013), 256, 256, Some(0.021)));
     }
 
     #[tokio::test]

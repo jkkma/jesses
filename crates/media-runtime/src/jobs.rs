@@ -64,16 +64,8 @@ pub(crate) async fn verify_utility_packets(
             left.codec_type.as_deref(),
             Some("video" | "audio" | "subtitle")
         ) {
-            mux::verify_container_packets(
-                ffprobe,
-                source,
-                left.index,
-                output,
-                right.index,
-                left.codec_name.as_deref() == Some("aac"),
-                cancel,
-            )
-            .await?;
+            mux::verify_container_packets(ffprobe, source, left, output, right.index, cancel)
+                .await?;
         }
     }
     Ok(())

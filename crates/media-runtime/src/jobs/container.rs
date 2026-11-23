@@ -715,6 +715,15 @@ fn arguments(
         container,
         ContainerFormat::Mp4 | ContainerFormat::Mov | ContainerFormat::M4a
     ) {
+        if document
+            .streams
+            .iter()
+            .any(|stream| stream.codec_name.as_deref() == Some("aac"))
+        {
+            // Keep AAC skip/discard edits precise enough for every supported
+            // audio sample rate, including when the muxer picks a coarse clock.
+            args.extend(["-movie_timescale".into(), "1000000".into()]);
+        }
         let mut flags: Vec<String> = iso_flags(&document.streams.iter().collect::<Vec<_>>())
             .split('+')
             .map(str::to_owned)
@@ -1261,10 +1270,9 @@ pub(super) async fn prepare<'a>(
                 Box::pin(super::mux::verify_container_packets(
                     &ffprobe,
                     &input.path,
-                    source.index,
+                    source,
                     &artifact.path,
                     target.index,
-                    false,
                     cancel,
                 ))
                 .await?;
@@ -1290,10 +1298,9 @@ pub(super) async fn prepare<'a>(
             let last_duration = Box::pin(super::mux::verify_container_packets(
                 &ffprobe,
                 &input.path,
-                source.index,
+                source,
                 &artifact.path,
                 target.index,
-                source.codec_name.as_deref() == Some("aac"),
                 cancel,
             ))
             .await?;
