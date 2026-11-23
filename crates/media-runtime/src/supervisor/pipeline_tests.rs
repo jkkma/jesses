@@ -284,6 +284,53 @@ async fn cancel_file_pipeline_while_diagnostic_log_write_is_pending() {
 }
 
 #[tokio::test]
+async fn cancel_pipe_pipeline_with_stdout_queued_during_log_rotation() {
+    let (producer, consumer) = fixtures("binary-producer", "rotation-stdout");
+    let log = producer.0.join("pipeline.log");
+    std::fs::File::create(&log)
+        .unwrap()
+        .set_len(LOG_BYTES - 4096)
+        .unwrap();
+    let (cancel, receiver) = watch::channel(false);
+    let (events, mut notifications) = mpsc::channel(64);
+    let producer_spec = producer.spec();
+    let consumer_spec = consumer.spec();
+    let rotation_started = Arc::new(tokio::sync::Notify::new());
+    let pipeline = BLOCK_PIPELINE_LOG_ROTATION.scope(
+        Arc::clone(&rotation_started),
+        run_pipeline(
+            &producer_spec,
+            &consumer_spec,
+            receiver,
+            events,
+            &log,
+            Duration::from_secs(30),
+        ),
+    );
+    let cancel_after_stdout_queues = async {
+        rotation_started.notified().await;
+        std::fs::write(consumer.0.join("emit-stdout"), b"").unwrap();
+        loop {
+            let event = notifications.recv().await.expect("consumer stdout event");
+            if matches!(event, ProcessEvent::Stdout(line) if line == "queued stdout during rotation")
+            {
+                break;
+            }
+        }
+        let pids = [producer.pid(0).await, consumer.pid(0).await];
+        cancel.send(true).unwrap();
+        pids
+    };
+    let (result, pids) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(pipeline, cancel_after_stdout_queues)
+    })
+    .await
+    .expect("cancellation must finish while a log rotation is suspended");
+    assert!(matches!(result, Err(SupervisorError::Cancelled)));
+    assert_dead(&pids).await;
+}
+
+#[tokio::test]
 async fn upstream_failure_cannot_be_masked_by_consumer_or_hang_at_eof() {
     let (producer, consumer) = fixtures("binary-fail", "read-then-hang");
     let (_cancel, receiver) = watch::channel(false);

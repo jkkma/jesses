@@ -47,6 +47,7 @@ tokio::task_local! { static CAPTURE_OBSERVER: CaptureObserver; }
 #[cfg(test)]
 tokio::task_local! {
     static BLOCK_PIPELINE_LOG_WRITE: std::sync::Arc<tokio::sync::Notify>;
+    static BLOCK_PIPELINE_LOG_ROTATION: std::sync::Arc<tokio::sync::Notify>;
 }
 pub(crate) async fn with_capture_observer<T>(
     observer: CaptureObserver,
@@ -1100,14 +1101,13 @@ async fn run_pipeline_execute(
     let delivered = AtomicBool::new(false);
     // File-output mode has no stdout pipe: the child owns a seekable duplicate,
     // and process-tree cleanup closes every inherited copy before returning.
-    let consumer_output = async {
+    let mut consumer_output = Box::pin(async {
         if let Some(consumer_stdout) = consumer_stdout {
             drain_stage(consumer_stdout, false, Some("consumer"), &events, &log).await
         } else {
             Ok::<_, SupervisorError>(())
         }
-    };
-    tokio::pin!(consumer_output);
+    });
     let mut consumer_output_done = false;
     let mut diagnostics = Box::pin(async {
         tokio::try_join!(
@@ -1187,24 +1187,36 @@ async fn run_pipeline_execute(
         tokio::join!(producer.terminate_and_wait(), consumer.terminate_and_wait(),);
     producer_cleanup.map_err(SupervisorError::Cleanup)?;
     consumer_cleanup.map_err(SupervisorError::Cleanup)?;
-    if !diagnostics_done
-        && result
-            .as_ref()
-            .is_err_and(|error| error.is_pipeline_stage_failure())
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is_pipeline_stage_failure())
     {
-        // A failed stage can exit before its stderr was polled. Read its
-        // remaining diagnostics after both process trees have closed the pipes.
-        let _ = tokio::time::timeout(Duration::from_secs(1), diagnostics.as_mut()).await;
+        // Both streams may have buffered output and share the log lock. Let
+        // unfinished drains make progress together after both trees close.
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                async {
+                    if diagnostics_done {
+                        Ok(())
+                    } else {
+                        diagnostics.as_mut().await
+                    }
+                },
+                async {
+                    if consumer_output_done {
+                        Ok(())
+                    } else {
+                        consumer_output.as_mut().await
+                    }
+                },
+            )
+        })
+        .await;
     }
-    // Cancellation can interrupt an async log write while the drain still
-    // holds the log mutex. Release it before draining stdout or flushing.
+    // Cancellation can interrupt a drain while it holds the log mutex or is
+    // rotating the file. Drop both drains before touching the log again.
     drop(diagnostics);
-    let output_result = if consumer_output_done {
-        Ok(())
-    } else {
-        consumer_output.await
-    };
-    output_result?;
+    drop(consumer_output);
     log.lock().await.flush().await?;
     result
 }
@@ -1529,6 +1541,14 @@ impl RotatingLog {
         if self.bytes + length > LOG_BYTES {
             self.flush().await?;
             self.file.take();
+            #[cfg(test)]
+            if stderr
+                && BLOCK_PIPELINE_LOG_ROTATION
+                    .try_with(|started| started.notify_one())
+                    .is_ok()
+            {
+                std::future::pending::<()>().await;
+            }
             let mut archived = self.path.as_os_str().to_owned();
             archived.push(".1");
             let archived = PathBuf::from(archived);

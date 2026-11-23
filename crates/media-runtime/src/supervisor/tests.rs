@@ -226,6 +226,14 @@ fn fake_tool() {
             stdout.flush().unwrap();
             std::process::exit(0);
         }
+        "rotation-stdout" => {
+            while !path.join("emit-stdout").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "queued stdout during rotation").unwrap();
+            stdout.flush().unwrap();
+        }
         "seekable-consumer" => {
             use std::io::{Seek, SeekFrom};
             let mut file = fixture_stdout_file();
