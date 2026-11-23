@@ -1,5 +1,6 @@
 //! Opt-in real av1an stop/reopen/resume gate. Run with `--ignored --test-threads=1`.
 //! Fixtures and changed receipts are test-owned; installed tools are never edited.
+//! Set `JESSES_ACTUAL_MEDIA_SOURCE` to exercise live pause with an eight-second excerpt.
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -37,7 +38,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() || std::env::var_os("JESSES_KEEP_TEST_FIXTURES").is_some() {
             eprintln!("Recovery fixture retained at {}", self.0.display());
         } else {
             // Every file belongs to this fresh fixture, including its job workspaces.
@@ -860,65 +861,88 @@ async fn windows_locked_attempt_retains_recovery_workspace_after_publication() {
     drop(lock);
 }
 
+async fn decoded_video_frames(path: &Path) -> u64 {
+    let count = output(
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path),
+    )
+    .await;
+    std::str::from_utf8(&count)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("a decoded video frame count")
+}
+
 #[tokio::test]
 #[ignore = "requires real av1an, VapourSynth/L-SMASH and 5fish"]
 async fn live_pause_continues_exact_output_and_cancels_while_frozen() {
     let fixture = Fixture::new();
     let input = fixture.0.join("pause-source.mkv");
-    synthesize(&input, false).await;
+    let destination = fixture.0.join("continued.mkv");
+    let mut encode = request(&input, &destination, VideoEncoder::SvtAv1FiveFish);
+    // Keep the rename/handle-release check confined to a test-owned file.
+    let expected_frames = if let Some(source) = std::env::var_os("JESSES_ACTUAL_MEDIA_SOURCE") {
+        output(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-n", "-i"])
+                .arg(&source)
+                .args(["-t", "8", "-map", "0:V:0", "-map", "0:a:0?", "-c", "copy"])
+                .arg(&input),
+        )
+        .await;
+        let media = media_runtime::probe_media(encode.source.input_path.clone())
+            .await
+            .unwrap();
+        encode.source.stream_indices = media.streams.iter().map(|stream| stream.index).collect();
+        decoded_video_frames(&input).await
+    } else {
+        synthesize(&input, false).await;
+        FRAMES
+    };
+    assert!(expected_frames > 0);
     let before = Sha256::digest(std::fs::read(&input).unwrap());
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;
-    let destination = fixture.0.join("continued.mkv");
-    let submitted = manager
-        .start_encode(request(&input, &destination, VideoEncoder::SvtAv1FiveFish))
-        .await
-        .unwrap();
+    let submitted = manager.start_encode(encode.clone()).await.unwrap();
     assert_eq!(
         pause_live(&manager, &submitted.id).await.state,
         JobState::Paused
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(manager.list_jobs().await[0].state, JobState::Paused);
-    assert_eq!(
-        manager
-            .set_job_paused(submitted.id.clone(), false)
-            .await
-            .unwrap()
-            .state,
-        JobState::Running
+    // The first live process may be the input probe, encoder, or output verifier.
+    let continued = manager
+        .set_job_paused(submitted.id.clone(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            continued.state,
+            JobState::Preparing | JobState::Running | JobState::Finalizing
+        ),
+        "unexpected state immediately after Continue: {:?}",
+        continued.state
     );
     let finished = wait_for(&manager, &submitted.id, |job| job.state.is_terminal()).await;
     assert_eq!(finished.state, JobState::Succeeded, "{:?}", finished.error);
-    let probed: Value = serde_json::from_slice(
-        &output(
-            Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-count_frames",
-                    "-show_entries",
-                    "stream=nb_read_frames",
-                    "-of",
-                    "json",
-                ])
-                .arg(&destination),
-        )
-        .await,
-    )
-    .unwrap();
-    assert_eq!(probed["streams"][0]["nb_read_frames"], FRAMES.to_string());
+    assert_eq!(decoded_video_frames(&destination).await, expected_frames);
     let canceled_output = fixture.0.join("cancel-paused.mkv");
-    let next = manager
-        .start_encode(request(
-            &input,
-            &canceled_output,
-            VideoEncoder::SvtAv1FiveFish,
-        ))
-        .await
-        .unwrap();
-    pause_live(&manager, &next.id).await;
+    encode.source.output_path = canceled_output.to_string_lossy().into_owned();
+    let next = manager.start_encode(encode).await.unwrap();
+    let running = wait_for(&manager, &next.id, |job| job.state == JobState::Running).await;
+    assert_eq!(running.state, JobState::Running, "{running:?}");
+    assert_eq!(pause_live(&manager, &next.id).await.state, JobState::Paused);
     manager.cancel_job(next.id.clone()).await.unwrap();
     let canceled = wait_for(&manager, &next.id, |job| job.state.is_terminal()).await;
     assert_eq!(canceled.state, JobState::Canceled, "{:?}", canceled.error);
@@ -929,6 +953,10 @@ async fn live_pause_continues_exact_output_and_cancels_while_frozen() {
     let moved = fixture.0.join("released-source.mkv");
     std::fs::rename(&input, &moved).unwrap();
     std::fs::rename(&moved, &input).unwrap();
+    eprintln!(
+        "Continued in {:?}, decoded {expected_frames} frames, and canceled the second paused job without publishing output.",
+        continued.state
+    );
 }
 
 struct RetainedFile {
