@@ -90,13 +90,13 @@ class VshipPackageTests(unittest.TestCase):
             recipe = record(extension, "build/build-package-vship.py", b"reviewed recipe")
             (extension / "build-provenance.json").write_bytes(b"receipt")
             receipt = {
-                "version": "5.1.1", "sourceRevision": "revision", "plugin": {"id": "com.lumen.vship", **plugin},
+                "version": "5.1.2", "sourceRevision": "revision", "plugin": {"id": "com.lumen.vship", **plugin},
                 "source": source, "licenses": [license_record], "buildInputs": [recipe],
             }
             destination = root / "merged"
             with (
                 mock.patch.object(merger, "checked_vship", return_value=receipt),
-                mock.patch.object(merger, "optional_imports", return_value=["kernel32.dll", "vulkan-1.dll"]),
+                mock.patch.object(merger, "optional_imports", return_value=["kernel32.dll", "msvcrt.dll", "vulkan-1.dll"]),
                 mock.patch.object(merger, "qualify_cpu"),
                 mock.patch.object(merger, "qualify_optional_gpu", return_value=False),
             ):

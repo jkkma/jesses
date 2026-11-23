@@ -28,6 +28,14 @@ vmaf = load("vmaf", "build-package-vmaf-windows.py")
 
 
 class PackageCompilerTests(unittest.TestCase):
+    def test_both_platforms_use_the_same_libunibreak_source(self):
+        windows = json.loads(builder.LOCK.read_text(encoding="utf-8"))
+        linux = json.loads((ROOT / "scripts/package-ffmpeg-linux-lock.json").read_text(encoding="utf-8"))
+        source = next(item for item in linux["libraries"] if item["id"] == "libunibreak")
+        linked = next(item for item in windows["linkedSources"] if item["base"] == "libunibreak")
+        self.assertEqual({key: linked[key] for key in source}, source)
+        self.assertFalse(any(item["name"].endswith("-libunibreak") for item in windows["packages"]))
+
     def test_vmaf_static_c_link_resolves_its_cpp_parser_runtime(self):
         with tempfile.TemporaryDirectory(prefix="jesses-vmaf-metadata-test-") as directory:
             metadata = Path(directory) / "libvmaf.pc"

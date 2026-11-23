@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "ffmpegVersion": "9.0.1",
+  "ffmpegVersion": "9.1",
   "scope": "CPU video encoders; GPU processing, Vulkan/libplacebo and metrics remain supported",
   "hardwareEncoderSuffixes": [
     "amf",
@@ -18,6 +18,7 @@
   "excludedEncoders": [
     "aac_mf",
     "ac3_mf",
+    "apv_vulkan",
     "av1_amf",
     "av1_mediacodec",
     "av1_mf",

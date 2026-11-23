@@ -251,22 +251,29 @@
         type="button"
         disabled={!catalog || disabled}
         title={preset.description}
-        onclick={() => applyPreset(preset.name)}>{preset.name}</button
-      >{/each}<button type="button" {disabled} onclick={() => applyPreset('')}>Clear</button>
+        onclick={() => applyPreset(preset.name)}
+      >
+        {preset.name}
+      </button>{/each}<button type="button" {disabled} onclick={() => applyPreset('')}>
+      Clear
+    </button>
   </div>{/if}
 {#if isDesktop()}<div class="preset-row" role="group" aria-label="Saved presets">
     <span>My presets</span><select
       aria-label="Saved preset"
       bind:value={savedChoice}
       disabled={disabled || !savedHere.length}
-      ><option value="">{savedHere.length ? 'Choose a saved preset' : 'None saved yet'}</option
-      >{#each savedHere as preset}<option value={preset.name}>{preset.name}</option>{/each}</select
-    ><button
+    >
+      <option value="">
+        {savedHere.length ? 'Choose a saved preset' : 'None saved yet'}
+      </option>{#each savedHere as preset}<option value={preset.name}>{preset.name}</option>{/each}
+    </select><button
       type="button"
       disabled={!catalog || disabled || !chosenSaved}
       onclick={() => chosenSaved && applyParameters(chosenSaved.name, chosenSaved.parameters)}
-      >Apply</button
-    ><button
+    >
+      Apply
+    </button><button
       type="button"
       disabled={disabled || !value.length}
       title="Save the arguments set in this grid under a name"
@@ -274,10 +281,16 @@
         saveName = chosenSaved?.name ?? '';
         saveError = '';
         saveOpen = true;
-      }}>Save as…</button
-    ><button type="button" disabled={disabled || !chosenSaved} onclick={() => void deletePreset()}
-      >Delete</button
+      }}
     >
+      Save as…
+    </button><button
+      type="button"
+      disabled={disabled || !chosenSaved}
+      onclick={() => void deletePreset()}
+    >
+      Delete
+    </button>
   </div>{/if}
 <div
   role="tablist"
@@ -293,8 +306,10 @@
       tabindex={activeCategory === group ? 0 : -1}
       class:active={activeCategory === group}
       onkeydown={(event) => handleCategoryKeys(event, index)}
-      onclick={() => (category = group)}>{group}</button
-    >{/each}
+      onclick={() => (category = group)}
+    >
+      {group}
+    </button>{/each}
 </div>
 <div
   class="grid"
@@ -312,39 +327,45 @@
     <tbody>
       {#each (catalog?.parameters ?? []).filter((p) => (p.group || 'Arguments') === activeCategory && !virtuals.some((managed) => managed.name === p.name)) as spec}<tr
           oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
-          ><td
-            ><div class="arg-cell">
+        >
+          <td>
+            <div class="arg-cell">
               <span class="mono">{spec.argument}</span><button
                 type="button"
                 class="arg-help"
                 aria-label={`Details for ${spec.argument}`}
                 title="Show argument details"
-                onclick={() => (help = spec.name)}>?</button
+                onclick={() => (help = spec.name)}
               >
-            </div></td
-          ><td
-            ><input
+                ?
+              </button>
+            </div>
+          </td><td>
+            <input
               aria-label={`${spec.label} value`}
               {disabled}
               value={value.find((item) => item.name === spec.name)?.value ?? ''}
               oninput={(event) => update(spec.name, event.currentTarget.value)}
-            /></td
-          ><td>{sourceRows[spec.name]?.summary ?? spec.description.split('\n\n')[0]}</td></tr
-        >{/each}
+            />
+          </td><td>{sourceRows[spec.name]?.summary ?? spec.description.split('\n\n')[0]}</td>
+        </tr>{/each}
       {#each virtuals.filter((p) => p.group === activeCategory) as spec}<tr
           oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
-          ><td
-            ><div class="arg-cell">
+        >
+          <td>
+            <div class="arg-cell">
               <span class="mono">{spec.name}</span><button
                 type="button"
                 class="arg-help"
                 aria-label={`Details for ${spec.name}`}
                 title="Show argument details"
-                onclick={() => (help = spec.name)}>?</button
+                onclick={() => (help = spec.name)}
               >
-            </div></td
-          ><td
-            ><input
+                ?
+              </button>
+            </div>
+          </td><td>
+            <input
               aria-label={`${spec.name} value`}
               {disabled}
               value={raw[spec.name] ?? ''}
@@ -352,9 +373,9 @@
               onblur={(event) => {
                 if (spec.name === 'fgs-table') onresource?.(spec.name, event.currentTarget.value);
               }}
-            /></td
-          ><td>{sourceRows[spec.name]?.summary ?? ''}</td></tr
-        >{/each}
+            />
+          </td><td>{sourceRows[spec.name]?.summary ?? ''}</td>
+        </tr>{/each}
     </tbody>
   </table>
 </div>
@@ -363,7 +384,8 @@
     open={true}
     onclose={() => (help = null)}
     width={720}
-    ><div class="help-content">
+  >
+    <div class="help-content">
       <strong>{spec?.argument ?? `--${help}`}</strong>
       <p>{helpRow?.summary ?? spec?.description.split('\n\n')[0] ?? ''}</p>
       <p class="details">
@@ -377,13 +399,14 @@
       <div class="help-actions">
         <button type="button" onclick={() => (help = null)}>Close</button>
       </div>
-    </div></SourceDialog
-  >{/if}
+    </div>
+  </SourceDialog>{/if}
 <SourceDialog
   title="Replace the arguments already set?"
   open={pendingPreset !== null}
   onclose={() => (pendingPreset = null)}
-  ><p>
+>
+  <p>
     {currentFilled().length} argument{currentFilled().length === 1 ? ' is' : 's are'} set, and {currentFilled()
       .length === 1
       ? 'it does'
@@ -400,29 +423,31 @@
       : 'Clearing empties them all. Continue?'}
   </p>
   <div class="help-actions">
-    <button type="button" data-dialog-initial-focus onclick={() => (pendingPreset = null)}
-      >No</button
-    ><button
+    <button type="button" data-dialog-initial-focus onclick={() => (pendingPreset = null)}>
+      No
+    </button><button
       type="button"
       onclick={() => {
         const choice = pendingPreset;
         pendingPreset = null;
         if (choice) applyParameters(choice.name, choice.parameters, true);
-      }}>Yes</button
+      }}
     >
-  </div></SourceDialog
->
-<SourceDialog title="Save preset" open={saveOpen} onclose={() => (saveOpen = false)} width={440}
-  ><label class="save-name"
-    >Preset name<input
+      Yes
+    </button>
+  </div>
+</SourceDialog>
+<SourceDialog title="Save preset" open={saveOpen} onclose={() => (saveOpen = false)} width={440}>
+  <label class="save-name">
+    Preset name<input
       data-dialog-initial-focus
       maxlength="64"
       bind:value={saveName}
       onkeydown={(event) => {
         if (event.key === 'Enter' && !event.isComposing) void savePreset();
       }}
-    /></label
-  >
+    />
+  </label>
   <p>
     Saves the {value.length} argument{value.length === 1 ? '' : 's'} set in this grid for this encoder
     and route. HDR and grain file fields are not saved.
@@ -435,10 +460,12 @@
     <button type="button" onclick={() => (saveOpen = false)}>Cancel</button><button
       type="button"
       disabled={!saveName.trim() || savingPreset}
-      onclick={() => void savePreset()}>Save</button
+      onclick={() => void savePreset()}
     >
-  </div></SourceDialog
->
+      Save
+    </button>
+  </div>
+</SourceDialog>
 
 <style>
   .preset-row {

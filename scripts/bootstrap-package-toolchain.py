@@ -55,11 +55,16 @@ def main():
     root = destination / "msys64"
     installed = {}
     for record, archive_path in zip(lock["packages"], downloads[1:], strict=True):
+        payload_root = record.get("payloadRoot")
+        if payload_root is not None and payload_root not in {"usr", "ucrt64"}:
+            raise ValueError("A compiler payload root must be usr or ucrt64.")
         with tarfile.open(archive_path) as archive:
             members = archive.getmembers()
             if len(members) > 100_000 or sum(member.size for member in members) > 2 * 1024**3:
                 raise ValueError("A compiler package exceeds its extraction limits.")
             for member in members:
+                if payload_root and member.name.partition("/")[0] != payload_root:
+                    continue  # Build-only packages may supply optional profile scripts outside the compiler.
                 if record.get("payloadPaths") and member.name not in record["payloadPaths"]:
                     continue
                 if member.name.startswith("."):

@@ -86,20 +86,22 @@
 <section class="settings" aria-label="Settings">
   <h2>GENERAL</h2>
   <div class="form">
-    <label
-      >Console window <select
+    <label>
+      Console window <select
         value={saved.consoleWindow ?? 'hidden'}
         disabled={!isDesktop()}
         onchange={(e) =>
           void savePatch({
             consoleWindow: e.currentTarget.value as GeneralPreferences['consoleWindow'],
           })}
-        ><option value="hidden">Hidden (Default)</option><option value="visible">Visible</option
-        ><option value="visibleStayOpen">Visible, stays open after finishing</option></select
-      ></label
-    >
-    <label
-      >Auto-crop samples <input
+      >
+        <option value="hidden">Hidden (Default)</option><option value="visible">
+          Visible
+        </option><option value="visibleStayOpen">Visible, stays open after finishing</option>
+      </select>
+    </label>
+    <label>
+      Auto-crop samples <input
         type="number"
         min="1"
         max="100"
@@ -109,10 +111,10 @@
           void savePatch({
             autoCropSamples: Math.max(1, Math.min(100, e.currentTarget.valueAsNumber || 10)),
           })}
-      /></label
-    >
-    <label
-      >Keyframe interval (s) <input
+      />
+    </label>
+    <label>
+      Keyframe interval (s) <input
         type="number"
         min="1"
         max="120"
@@ -125,11 +127,11 @@
               Math.min(120, e.currentTarget.valueAsNumber || 10),
             ),
           })}
-      /></label
-    >
-    <label
-      >Save encodes to <span class="folder"
-        ><input
+      />
+    </label>
+    <label>
+      Save encodes to <span class="folder">
+        <input
           value={folder}
           placeholder="Leave empty to save next to the source file"
           disabled={!isDesktop()}
@@ -143,37 +145,41 @@
           aria-label="Browse default output folder"
           title="Browse default output folder"
           onclick={browse}
-          disabled={!isDesktop()}>…</button
-        ><button
+          disabled={!isDesktop()}
+        >
+          …
+        </button><button
           type="button"
           onclick={() => {
             folder = '';
             dirty = true;
             void saveFolder();
           }}
-          disabled={!isDesktop()}>Clear</button
-        ></span
-      ></label
-    >
+          disabled={!isDesktop()}
+        >
+          Clear
+        </button>
+      </span>
+    </label>
   </div>
-  <label class="check"
-    ><input
+  <label class="check">
+    <input
       type="checkbox"
       checked={saved.zeroIndexedStreams ?? false}
       disabled={!isDesktop()}
       onchange={(e) => void savePatch({ zeroIndexedStreams: e.currentTarget.checked })}
-    /> Show stream numbers zero-indexed (like ffmpeg does)</label
-  >
-  <label class="check"
-    ><input
+    /> Show stream numbers zero-indexed (like ffmpeg does)
+  </label>
+  <label class="check">
+    <input
       type="checkbox"
       checked={saved.mp4Faststart ?? true}
       disabled={!isDesktop()}
       onchange={(e) => void savePatch({ mp4Faststart: e.currentTarget.checked })}
-    /> Web-optimize MP4 output (+faststart)</label
-  >
-  <label class="check"
-    ><input
+    /> Web-optimize MP4 output (+faststart)
+  </label>
+  <label class="check">
+    <input
       type="checkbox"
       checked={saved.av1anConsoleVisible ?? true}
       disabled={!isDesktop() || !isWindows}
@@ -181,19 +187,18 @@
     />
     {isWindows
       ? 'Show the av1an console window'
-      : "Show the av1an console window (Windows only - av1an's output goes to the log here)"}</label
-  >
+      : "Show the av1an console window (Windows only - av1an's output goes to the log here)"}
+  </label>
   <h2>RESET ON NEW FILE</h2>
   <div class="reset">
-    <span>Settings to reset</span><span
-      >{resetLabels
+    <span>Settings to reset</span><span>
+      {resetLabels
         .filter(([key]) => reset[key])
         .map(([, label]) => label)
-        .join(', ') || 'None'}</span
-    ><button type="button" onclick={openReset} disabled={!isDesktop()}>Configure…</button><button
-      type="button"
-      onclick={onreset}>Reset Now</button
-    >
+        .join(', ') || 'None'}
+    </span><button type="button" onclick={openReset} disabled={!isDesktop()}>
+      Configure…
+    </button><button type="button" onclick={onreset}>Reset Now</button>
   </div>
   {#if error}<p role="alert">{error}</p>{/if}
 </section>
@@ -203,17 +208,20 @@
   onclose={() => (resetOpen = false)}
 >
   <p>Select the settings to reset when a new file is loaded.</p>
-  {#each resetLabels as [key, label]}<label class="check"
-      ><input type="checkbox" bind:checked={draft[key]} /> {label}</label
-    >{/each}
+  {#each resetLabels as [key, label]}<label class="check">
+      <input type="checkbox" bind:checked={draft[key]} />
+      {label}
+    </label>{/each}
   <div class="reset">
     <button
       type="button"
       onclick={() => {
         void savePatch({ resetOnNewFile: { ...draft } });
         resetOpen = false;
-      }}>OK</button
+      }}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 

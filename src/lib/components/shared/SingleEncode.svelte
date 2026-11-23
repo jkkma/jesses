@@ -4145,15 +4145,20 @@
           tabindex={settingsTab === tab.id ? 0 : -1}
           class:active={settingsTab === tab.id}
           onkeydown={(event) => tabKeys(event, index)}
-          onclick={() => (settingsTab = tab.id)}>{tab.label}</button
-        >{/each}
+          onclick={() => (settingsTab = tab.id)}
+        >
+          {tab.label}
+        </button>{/each}
     </div>
     <!-- Several files can be loaded; say which one Run encodes. -->
     {#if fileMode === 'batch' && files.length}<span
         class="source-name"
         title={files.map((entry) => entry.name).join('\n')}
-        >Batch: {files.length} file{files.length === 1 ? '' : 's'}</span
-      >{:else if file}<span class="source-name" title={file.name}>Source: {file.name}</span>{/if}
+      >
+        Batch: {files.length} file{files.length === 1 ? '' : 's'}
+      </span>{:else if file}<span class="source-name" title={file.name}>
+        Source: {file.name}
+      </span>{/if}
   </div>
   <div class="tab-content" role="tabpanel" aria-labelledby={`${idPrefix}-tab-${settingsTab}`}>
     {#if settingsTab === 'video'}
@@ -4189,34 +4194,48 @@
             }}
           >
             {#if !chunked}<option value="copy">Copy Video Without Re-Encoding</option><option
-                value="drop">Disable (Strip Video)</option
-              ><option value="x264">H.264 / AVC (x264)</option><option value="x265Standalone"
-                >H.265 / HEVC (x265)</option
-              ><option value="vpxStandalone">VP9 (VPX)</option><option value="svtAv1"
-                >AV1 (SVT-AV1)</option
-              ><option value="svtAv1Hdr">AV1 (SVT-AV1-HDR)</option><option value="aomAv1"
-                >AV1 (AOM)</option
-              ><option value="gif">GIF [Animated GIF]</option><option value="png"
-                >PNG [Image Sequence]</option
-              ><option value="jpg">JPEG [Image Sequence]</option>{:else}<option value="aomAv1"
-                >AV1 (AOM)</option
-              ><option value="svtAv1">AV1 (SVT-AV1)</option><option value="svtAv1Hdr"
-                >AV1 (SVT-AV1-HDR)</option
-              ><option value="vpxStandalone">VP9 (VPX)</option><option value="x265Standalone"
-                >H.265 / HEVC (x265)</option
-              ><option value="x264">H.264 / AVC (x264)</option>{/if}
+                value="drop"
+              >
+                Disable (Strip Video)
+              </option><option value="x264">H.264 / AVC (x264)</option><option
+                value="x265Standalone"
+              >
+                H.265 / HEVC (x265)
+              </option><option value="vpxStandalone">VP9 (VPX)</option><option value="svtAv1">
+                AV1 (SVT-AV1)
+              </option><option value="svtAv1Hdr">AV1 (SVT-AV1-HDR)</option><option value="aomAv1">
+                AV1 (AOM)
+              </option><option value="gif">GIF [Animated GIF]</option><option value="png">
+                PNG [Image Sequence]
+              </option><option value="jpg">JPEG [Image Sequence]</option>{:else}<option
+                value="aomAv1"
+              >
+                AV1 (AOM)
+              </option><option value="svtAv1">AV1 (SVT-AV1)</option><option value="svtAv1Hdr">
+                AV1 (SVT-AV1-HDR)
+              </option><option value="vpxStandalone">VP9 (VPX)</option><option
+                value="x265Standalone"
+              >
+                H.265 / HEVC (x265)
+              </option><option value="x264">H.264 / AVC (x264)</option>{/if}
           </select>
           {#if !isImage}<label for={`${idPrefix}-container`}>Container</label><select
               id={`${idPrefix}-container`}
               bind:value={outputContainer}
               onchange={() => void validateDestination()}
-              >{#if chunked}<option value="matroska">MKV</option><option value="webm">WEBM</option
-                ><option value="mp4">MP4</option>{:else}<option value="mp4">MP4</option><option
-                  value="matroska">MKV</option
-                ><option value="webm">WEBM</option><option value="mov">MOV</option><option
-                  value="m4a">M4A</option
-                ><option value="ogg">OGG</option>{/if}</select
-            >{/if}
+            >
+              {#if chunked}<option value="matroska">MKV</option><option value="webm">
+                  WEBM
+                </option><option value="mp4">MP4</option>{:else}<option value="mp4">
+                  MP4
+                </option><option value="matroska">MKV</option><option value="webm">
+                  WEBM
+                </option><option value="mov">MOV</option><option value="m4a">M4A</option><option
+                  value="ogg"
+                >
+                  OGG
+                </option>{/if}
+            </select>{/if}
           <label for={`${idPrefix}-quality-mode`}>Quality Mode</label>
           {#if chunked}<select
               id={`${idPrefix}-quality-mode`}
@@ -4239,12 +4258,17 @@
                   },
                 };
               }}
-              ><option value="crf">CRF</option><option value="vmaf">Target VMAF</option><option
-                value="ssimulacra2">Target SSIMULACRA2</option
-              ><option value="butteraugli">Target Butteraugli</option><option value="xpsnrWeighted"
-                >Target XPSNR</option
-              ></select
             >
+              <option value="crf">CRF</option><option value="vmaf">Target VMAF</option><option
+                value="ssimulacra2"
+              >
+                Target SSIMULACRA2
+              </option><option value="butteraugli">Target Butteraugli</option><option
+                value="xpsnrWeighted"
+              >
+                Target XPSNR
+              </option>
+            </select>
           {:else}<select
               id={`${idPrefix}-quality-mode`}
               bind:value={rate.mode}
@@ -4254,10 +4278,11 @@
                 else crf = options.defaultCrf;
               }}
               disabled={!encodingVideo || isImage}
-              ><option value="quality">CRF</option><option value="bitrate"
-                >Target Bitrate (Kbps)</option
-              ><option value="targetSize">Target Filesize (MB)</option></select
-            >{/if}
+            >
+              <option value="quality">CRF</option><option value="bitrate">
+                Target Bitrate (Kbps)
+              </option><option value="targetSize">Target Filesize (MB)</option>
+            </select>{/if}
           <label for={`${idPrefix}-quality`}>Quality</label>
           {#if isImage}<input
               id={`${idPrefix}-quality`}
@@ -4327,10 +4352,13 @@
             aria-describedby={encodingVideo && !isImage && isSvtEncoder(encoder) && preset >= 10
               ? `${idPrefix}-svt-preset-hint`
               : undefined}
-            >{#each isImage || !encodingVideo ? [] : options.presets as choice}<option
-                value={choice.value}>{choice.label}</option
-              >{/each}</select
           >
+            {#each isImage || !encodingVideo ? [] : options.presets as choice}<option
+                value={choice.value}
+              >
+                {choice.label}
+              </option>{/each}
+          </select>
           {#if encodingVideo && !isImage && isSvtEncoder(encoder) && preset >= 10}
             <p class="field-hint" id={`${idPrefix}-svt-preset-hint`}>
               Preset 10 and above is intended for automated tooling; visual artifacts may occur.
@@ -4354,12 +4382,15 @@
                   parameters = parameters.filter((item) => item.name !== 'tune');
                 }
               }}
-              ><option value="visualQuality">VQ (Visual quality)</option><option value="filmGrain"
-                >Film grain</option
-              >{#if override !== undefined && override !== '0' && override !== '6'}<option
-                  value="advanced">Advanced tune ({override})</option
-                >{/if}</select
             >
+              <option value="visualQuality">VQ (Visual quality)</option><option value="filmGrain">
+                Film grain
+              </option>{#if override !== undefined && override !== '0' && override !== '6'}<option
+                  value="advanced"
+                >
+                  Advanced tune ({override})
+                </option>{/if}
+            </select>
           {/if}
         </div>
         <div class="form">
@@ -4367,15 +4398,21 @@
               id={`${idPrefix}-color`}
               bind:value={imagePixel}
               disabled={videoChoice === 'gif'}
-              >{#if videoChoice === 'png'}<option value="rgb24">RGB - 8 bit</option><option
-                  value="rgba">RGBA - 8 bit</option
-                ><option value="rgb48">RGB - 16 bit</option><option value="rgba64"
-                  >RGBA - 16 bit</option
-                >{:else if videoChoice === 'jpg'}<option value="yuv420p">YUV - 4:2:0 - 8 bit</option
-                ><option value="yuv422p">YUV - 4:2:2 - 8 bit</option><option value="yuv444p"
-                  >YUV - 4:4:4 - 8 bit</option
-                >{/if}</select
-            >{:else}<select
+            >
+              {#if videoChoice === 'png'}<option value="rgb24">RGB - 8 bit</option><option
+                  value="rgba"
+                >
+                  RGBA - 8 bit
+                </option><option value="rgb48">RGB - 16 bit</option><option value="rgba64">
+                  RGBA - 16 bit
+                </option>{:else if videoChoice === 'jpg'}<option value="yuv420p">
+                  YUV - 4:2:0 - 8 bit
+                </option><option value="yuv422p">YUV - 4:2:2 - 8 bit</option><option
+                  value="yuv444p"
+                >
+                  YUV - 4:4:4 - 8 bit
+                </option>{/if}
+            </select>{:else}<select
               id={`${idPrefix}-color`}
               value={chunked ? (av1an.pixelFormat ?? '') : (outputPixelFormat ?? '')}
               onchange={(event) => {
@@ -4386,10 +4423,14 @@
               }}
               disabled={!encodingVideo}
               title={colorFormatHint}
-              >{#each encodingVideo ? sourceColors : [] as format}<option value={format.value}
-                  >{format.label}</option
-                >{/each}</select
-            >{#if tenBitNote}<p class="geometry-readout subtitle-note" aria-label="Bit depth">
+            >
+              {#each encodingVideo ? sourceColors : [] as format}<option value={format.value}>
+                  {format.label}
+                </option>{/each}
+            </select>{#if tenBitNote}<p
+                class="geometry-readout subtitle-note"
+                aria-label="Bit depth"
+              >
                 {tenBitNote}
               </p>{/if}
           {/if}
@@ -4406,20 +4447,25 @@
               type="button"
               onclick={() => {
                 dialog = 'trim';
-              }}>Configure…</button
-            >{#if trim.enabled}<button type="button" onclick={() => (trim = defaultTrim())}
-                >Clear</button
-              ><span class="trim-range" aria-label="Trim range">{trimRange}</span>{/if}
+              }}
+            >
+              Configure…
+            </button>{#if trim.enabled}<button type="button" onclick={() => (trim = defaultTrim())}>
+                Clear
+              </button><span class="trim-range" aria-label="Trim range">{trimRange}</span>{/if}
           </div>
           <label for={`${idPrefix}-crop`}>Crop</label>
           <div class="inline">
-            <select id={`${idPrefix}-crop`} bind:value={cropMode} disabled={!encodingVideo}
-              ><option value="disabled">Disabled</option><option value="automatic"
-                >Automatic (detect black bars)</option
-              ><option value="manual">Manual</option></select
-            >{#if cropMode === 'manual'}<button type="button" onclick={() => openEdit('crop')}
-                >Configure…</button
-              >{/if}
+            <select id={`${idPrefix}-crop`} bind:value={cropMode} disabled={!encodingVideo}>
+              <option value="disabled">Disabled</option><option value="automatic">
+                Automatic (detect black bars)
+              </option><option value="manual">Manual</option>
+            </select>{#if cropMode === 'manual'}<button
+                type="button"
+                onclick={() => openEdit('crop')}
+              >
+                Configure…
+              </button>{/if}
           </div>
           <label for={`${idPrefix}-resize`}>Resize</label>
           <div class="inline">
@@ -4428,11 +4474,16 @@
               value={resizeChoice}
               disabled={!encodingVideo}
               onchange={(event) => setResize(event.currentTarget.value)}
-              >{#each resizeLabels as option}<option value={option.value}>{option.name}</option
-                >{/each}</select
-            >{#if resizeChoice === 'custom'}<button type="button" onclick={() => openEdit('resize')}
-                >Configure…</button
-              >{/if}
+            >
+              {#each resizeLabels as option}<option value={option.value}>
+                  {option.name}
+                </option>{/each}
+            </select>{#if resizeChoice === 'custom'}<button
+                type="button"
+                onclick={() => openEdit('resize')}
+              >
+                Configure…
+              </button>{/if}
           </div>
           <p class="geometry-readout" aria-label="Output dimensions" title={geometry.resize}>
             {geometry.resize}
@@ -4442,12 +4493,15 @@
             value={framing.borderRatio}
             disabled={!encodingVideo}
             onchange={(event) => setBorder(event.currentTarget.value)}
-            ><option value="">No borders</option><option value="16:9">16:9 (Widescreen)</option
-            ><option value="4:3">4:3 (Standard)</option><option value="1:1">1:1 (Square)</option
-            ><option value="9:16">9:16 (Vertical)</option><option value="21:9"
-              >21:9 (Ultrawide)</option
-            ></select
           >
+            <option value="">No borders</option><option value="16:9">
+              16:9 (Widescreen)
+            </option><option value="4:3">4:3 (Standard)</option><option value="1:1">
+              1:1 (Square)
+            </option><option value="9:16">9:16 (Vertical)</option><option value="21:9">
+              21:9 (Ultrawide)
+            </option>
+          </select>
           <p class="geometry-readout" aria-label="Padding outcome" title={geometry.border}>
             {geometry.border}
           </p>
@@ -4471,20 +4525,21 @@
                   if (grainMode === 'preset') void loadGrainPresets();
                 }
               }}
-              ><option value="disabled">No grain synthesis</option><option value="encoder"
-                >Encoder analysis</option
-              ><option value="table">Grain table file</option><option value="preset"
-                >Film stock preset</option
-              ></select
-            >{#if grainMode === 'encoder'}<input
+            >
+              <option value="disabled">No grain synthesis</option><option value="encoder">
+                Encoder analysis
+              </option><option value="table">Grain table file</option><option value="preset">
+                Film stock preset
+              </option>
+            </select>{#if grainMode === 'encoder'}<input
                 aria-label="Grain synthesis strength"
                 type="number"
                 min="0"
                 max="50"
                 bind:value={filmGrain}
-              /><label
-                ><input type="checkbox" bind:checked={grainDenoise} onchange={updateGrain} /> Denoise</label
-              >{:else if grainMode === 'table'}<input
+              /><label>
+                <input type="checkbox" bind:checked={grainDenoise} onchange={updateGrain} /> Denoise
+              </label>{:else if grainMode === 'table'}<input
                 aria-label="Grain table file"
                 placeholder="Path to a .tbl grain table"
                 bind:value={grainPath}
@@ -4492,16 +4547,18 @@
               /><button
                 type="button"
                 aria-label="Browse grain table"
-                onclick={() => void chooseGrainTable()}>…</button
-              >{:else if grainMode === 'preset'}<select
+                onclick={() => void chooseGrainTable()}
+              >
+                …
+              </button>{:else if grainMode === 'preset'}<select
                 aria-label="Film stock preset"
                 bind:value={grainPreset}
                 onchange={() => void generateGrainPreset()}
-                >{#each grainPresets as choice}<option value={choice}>{choice}</option
-                  >{/each}</select
-              >{/if}{#if grainMode === 'table' || grainMode === 'preset'}<label
-                ><input type="checkbox" bind:checked={grainDenoise} onchange={updateGrain} /> Denoise</label
-              >{#if grainDenoise}<input
+              >
+                {#each grainPresets as choice}<option value={choice}>{choice}</option>{/each}
+              </select>{/if}{#if grainMode === 'table' || grainMode === 'preset'}<label>
+                <input type="checkbox" bind:checked={grainDenoise} onchange={updateGrain} /> Denoise
+              </label>{#if grainDenoise}<input
                   aria-label="Denoise strength"
                   type="number"
                   min="1"
@@ -4511,35 +4568,43 @@
                 />{/if}{/if}
           </div>
           {#if selectedVideo && selectedVideo.fieldOrder && !['progressive', 'unknown'].includes(selectedVideo.fieldOrder)}<label
-              for={`${idPrefix}-deinterlace`}>Deinterlace</label
+              for={`${idPrefix}-deinterlace`}
             >
+              Deinterlace
+            </label>
             <div class="inline">
               <select
                 id={`${idPrefix}-deinterlace`}
                 bind:value={deinterlaceChoice}
                 disabled={!encodingVideo}
-                ><option value="automatic">Automatic</option><option value="disabled"
-                  >Disabled</option
-                >{#if !chunked}<option value="qtgmc">QTGMC (VapourSynth)</option>{/if}<option
-                  value="bwdif">Bwdif (FFmpeg)</option
-                ><option value="yadif">Yadif (FFmpeg)</option></select
-              >{#if !chunked && (deinterlaceChoice === 'qtgmc' || deinterlaceChoice === 'automatic')}<select
+              >
+                <option value="automatic">Automatic</option><option value="disabled">
+                  Disabled
+                </option>{#if !chunked}<option value="qtgmc">
+                    QTGMC (VapourSynth)
+                  </option>{/if}<option value="bwdif">Bwdif (FFmpeg)</option><option value="yadif">
+                  Yadif (FFmpeg)
+                </option>
+              </select>{#if !chunked && (deinterlaceChoice === 'qtgmc' || deinterlaceChoice === 'automatic')}<select
                   aria-label="QTGMC preset"
                   bind:value={temporal.qtgmcPreset}
-                  ><option value="placebo">Placebo</option><option value="verySlow"
-                    >Very Slow</option
-                  ><option value="slower">Slower</option><option value="slow">Slow</option><option
-                    value="medium">Medium</option
-                  ><option value="fast">Fast</option><option value="faster">Faster</option><option
-                    value="veryFast">Very Fast</option
-                  ></select
-                >{/if}{#if !chunked}<label
-                  ><input
+                >
+                  <option value="placebo">Placebo</option><option value="verySlow">
+                    Very Slow
+                  </option><option value="slower">Slower</option><option value="slow">
+                    Slow
+                  </option><option value="medium">Medium</option><option value="fast">
+                    Fast
+                  </option><option value="faster">Faster</option><option value="veryFast">
+                    Very Fast
+                  </option>
+                </select>{/if}{#if !chunked}<label>
+                  <input
                     type="checkbox"
                     bind:checked={deinterlaceDouble}
                     disabled={deinterlaceChoice === 'disabled'}
-                  /> One frame per field</label
-                >{/if}
+                  /> One frame per field
+                </label>{/if}
             </div>{/if}
           {#if knownHdr(selectedVideo)}<label for={`${idPrefix}-tone`}>Tone Mapping</label>
             <div class="inline">
@@ -4558,13 +4623,16 @@
                       : 'hable') as ToneMapDraft['algorithm'],
                   };
                 }}
-                ><option value="off">No tone mapping</option><option value="hable">Hable</option
-                ><option value="mobius">Mobius</option><option value="reinhard">Reinhard</option
-                >{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}</select
-              >{#if !toneMap.enabled && supportsHdr10Fallback && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label
-                  ><input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
-                  fallback (discard DV / HDR10+)</label
-                >{/if}
+              >
+                <option value="off">No tone mapping</option><option value="hable">
+                  Hable
+                </option><option value="mobius">Mobius</option><option value="reinhard">
+                  Reinhard
+                </option>{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}
+              </select>{#if !toneMap.enabled && supportsHdr10Fallback && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label>
+                  <input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
+                  fallback (discard DV / HDR10+)
+                </label>{/if}
             </div>{/if}
         </div>
       </div>
@@ -4583,16 +4651,17 @@
               }
             }
           }}
-          ><option value="copy">Copy Audio Without Re-Encoding</option><option value="strip"
-            >Disable (Strip Audio)</option
-          ><option value="aac">AAC (Advanced Audio Coding)</option><option value="opus"
-            >Opus (VBR)</option
-          ><option value="vorbis">Vorbis</option><option value="eac3"
-            >E-AC-3 (Dolby Digital Plus)</option
-          ><option value="mp3">MP3</option><option value="flac"
-            >FLAC (Free Lossless Audio Coding)</option
-          ></select
         >
+          <option value="copy">Copy Audio Without Re-Encoding</option><option value="strip">
+            Disable (Strip Audio)
+          </option><option value="aac">AAC (Advanced Audio Coding)</option><option value="opus">
+            Opus (VBR)
+          </option><option value="vorbis">Vorbis</option><option value="eac3">
+            E-AC-3 (Dolby Digital Plus)
+          </option><option value="mp3">MP3</option><option value="flac">
+            FLAC (Free Lossless Audio Coding)
+          </option>
+        </select>
         {#if !chunked}<label for={`${idPrefix}-audio-config`}>Configuration</label>
           <div class="inline">
             <select
@@ -4619,12 +4688,16 @@
                   } else openEdit('audio');
                 }
               }}
-              ><option value="same">Same settings for all tracks</option><option value="perTrack"
-                >Configure each track separately</option
-              ></select
-            >{#if audioConfig === 'perTrack'}<button type="button" onclick={() => openEdit('audio')}
-                >Configure…</button
-              >{/if}
+            >
+              <option value="same">Same settings for all tracks</option><option value="perTrack">
+                Configure each track separately
+              </option>
+            </select>{#if audioConfig === 'perTrack'}<button
+                type="button"
+                onclick={() => openEdit('audio')}
+              >
+                Configure…
+              </button>{/if}
           </div>{/if}
         <label for={`${idPrefix}-audio-bitrate`}>Bitrate (Kbps)</label><input
           id={`${idPrefix}-audio-bitrate`}
@@ -4642,17 +4715,20 @@
           id={`${idPrefix}-audio-channels`}
           bind:value={audioChannels}
           disabled={stripAudio || audioCodec === 'copy' || (!chunked && audioConfig === 'perTrack')}
-          ><option value="preserve">0 (Keep original)</option>{#if !chunked}<option value="mono"
-              >1 (Mono)</option
-            >{/if}<option value="stereo">2 (Stereo)</option><option value="surround51"
-            >6 (5.1 Surround)</option
-          ><option value="surround71">8 (7.1 Surround)</option></select
         >
+          <option value="preserve">0 (Keep original)</option>{#if !chunked}<option value="mono">
+              1 (Mono)
+            </option>{/if}<option value="stereo">2 (Stereo)</option><option value="surround51">
+            6 (5.1 Surround)
+          </option><option value="surround71">8 (7.1 Surround)</option>
+        </select>
         {#if chunked}<span>Copy</span>
           <div class="inline">
-            <label><input type="checkbox" bind:checked={copySubs} /> Subtitles</label><label
-              ><input type="checkbox" bind:checked={copyData} /> Data Tracks</label
-            ><label><input type="checkbox" bind:checked={copyAttachments} /> Attachments</label>
+            <label><input type="checkbox" bind:checked={copySubs} /> Subtitles</label><label>
+              <input type="checkbox" bind:checked={copyData} /> Data Tracks
+            </label><label>
+              <input type="checkbox" bind:checked={copyAttachments} /> Attachments
+            </label>
           </div>
           {#if flattenedStyledNote}<p class="geometry-readout subtitle-note">
               {flattenedStyledNote}
@@ -4665,12 +4741,13 @@
             id="loudness"
             bind:value={loudness}
             disabled={stripAudio || audioCodec === 'copy'}
-            ><option value="off">No normalization</option><option value="-14"
-              >-14 LUFS (YouTube, Spotify)</option
-            ><option value="-16">-16 LUFS (podcast, mobile)</option><option value="-23"
-              >-23 LUFS (EBU R128 broadcast)</option
-            ></select
-          >{/if}
+          >
+            <option value="off">No normalization</option><option value="-14">
+              -14 LUFS (YouTube, Spotify)
+            </option><option value="-16">-16 LUFS (podcast, mobile)</option><option value="-23">
+              -23 LUFS (EBU R128 broadcast)
+            </option>
+          </select>{/if}
       </div>
     {:else if settingsTab === 'subtitles'}
       <div class="form narrow">
@@ -4682,17 +4759,26 @@
             if (!stripSubs)
               subtitleMode = event.currentTarget.value as SubtitleTrackSettings['mode'];
           }}
-          ><option value="copy">Copy Subtitles Without Re-Encoding</option><option value="strip"
-            >Disable (Strip Subtitles)</option
-          ><option value="movText">Mov_Text (3GPP Timed Text) - For MP4/MOV</option><option
-            value="subRip">SRT (SubRip Text) - For MKV</option
-          ><option value="webVtt">WebVTT (Web Video Text Tracks) - For WEBM</option></select
-        ><label for="subtitle-burn">Burn In</label><select id="subtitle-burn" bind:value={burnIndex}
-          ><option value="">Disabled</option
-          >{#each mainFile?.streams.filter((s) => s.kind === 'subtitle') ?? [] as stream, index}<option
-              value={String(stream.index)}>{burnLabel(stream, index)}</option
-            >{/each}</select
-        >{#if convertedMovText}<p class="geometry-readout subtitle-note">
+        >
+          <option value="copy">Copy Subtitles Without Re-Encoding</option><option value="strip">
+            Disable (Strip Subtitles)
+          </option><option value="movText">Mov_Text (3GPP Timed Text) - For MP4/MOV</option><option
+            value="subRip"
+          >
+            SRT (SubRip Text) - For MKV
+          </option><option value="webVtt">WebVTT (Web Video Text Tracks) - For WEBM</option>
+        </select><label for="subtitle-burn">Burn In</label><select
+          id="subtitle-burn"
+          bind:value={burnIndex}
+        >
+          <option value="">
+            Disabled
+          </option>{#each mainFile?.streams.filter((s) => s.kind === 'subtitle') ?? [] as stream, index}<option
+              value={String(stream.index)}
+            >
+              {burnLabel(stream, index)}
+            </option>{/each}
+        </select>{#if convertedMovText}<p class="geometry-readout subtitle-note">
             {convertedMovText === 1
               ? 'The MP4 text subtitle is converted to SubRip, because MKV cannot store MP4 text.'
               : `${convertedMovText} MP4 text subtitles are converted to SubRip, because MKV cannot store MP4 text.`}
@@ -4707,94 +4793,100 @@
       </div>
     {:else if settingsTab === 'metadata'}
       <div class="metadata-head">
-        <label
-          >Copy Metadata From <select bind:value={metadataSource}
-            ><option value="">None</option>{#if fileMode === 'batch'}<option value="current"
-                >#1 - Current Input File</option
-              >{:else}{#each files as entry}<option value={entry.path}>{entry.name}</option
-                >{/each}{/if}</select
-          ></label
-        ><label
-          >Copy Chapters From <select bind:value={chapterSource}
-            ><option value="">None</option>{#if fileMode === 'batch'}<option value="current"
-                >#1 - Current Input File</option
-              >{:else}{#each files as entry}<option value={entry.path}>{entry.name}</option
-                >{/each}{/if}</select
-          ></label
-        >
+        <label>
+          Copy Metadata From <select bind:value={metadataSource}>
+            <option value="">None</option>{#if fileMode === 'batch'}<option value="current">
+                #1 - Current Input File
+              </option>{:else}{#each files as entry}<option value={entry.path}>
+                  {entry.name}
+                </option>{/each}{/if}
+          </select>
+        </label><label>
+          Copy Chapters From <select bind:value={chapterSource}>
+            <option value="">None</option>{#if fileMode === 'batch'}<option value="current">
+                #1 - Current Input File
+              </option>{:else}{#each files as entry}<option value={entry.path}>
+                  {entry.name}
+                </option>{/each}{/if}
+          </select>
+        </label>
       </div>
-      <label
-        ><input type="checkbox" bind:checked={applyMetadata} /> Apply the titles and languages below</label
-      >
+      <label>
+        <input type="checkbox" bind:checked={applyMetadata} /> Apply the titles and languages below
+      </label>
       <table class="metadata-table">
-        <thead><tr><th>Track</th><th>Title</th><th>Lang</th></tr></thead><tbody
-          >{#if mainFile && fileMode !== 'batch'}<tr
-              ><td>Output File</td><td
-                ><input
+        <thead><tr><th>Track</th><th>Title</th><th>Lang</th></tr></thead><tbody>
+          {#if mainFile && fileMode !== 'batch'}<tr>
+              <td>Output File</td><td>
+                <input
                   aria-label="Title for output file"
                   disabled={!applyMetadata}
                   value={outputMetadataValue(mainFile).title}
                   oninput={(event) =>
                     editOutputMetadata(mainFile!, { title: event.currentTarget.value })}
-                /></td
-              ><td
-                ><input
+                />
+              </td><td>
+                <input
                   aria-label="Language for output file"
                   disabled={!applyMetadata}
                   value={outputMetadataValue(mainFile).language}
                   oninput={(event) =>
                     editOutputMetadata(mainFile!, { language: event.currentTarget.value })}
-                /></td
-              ></tr
-            >{/if}{#each tracks.filter((t) => t.included) as row}<tr
-              ><td
+                />
+              </td>
+            </tr>{/if}{#each tracks.filter((t) => t.included) as row}<tr>
+              <td
                 title={`${files.find((f) => f.id === row.sourceId)?.name ?? ''} #${row.streamIndex + 1}`}
-                >{metadataTrackLabel(row)}</td
-              ><td
-                ><input
+              >
+                {metadataTrackLabel(row)}
+              </td><td>
+                <input
                   aria-label={`Title for track ${row.streamIndex}`}
                   disabled={!applyMetadata}
                   value={metadataValue(row).title}
                   oninput={(event) => editMetadata(row, { title: event.currentTarget.value })}
-                /></td
-              ><td
-                ><input
+                />
+              </td><td>
+                <input
                   aria-label={`Language for track ${row.streamIndex}`}
                   disabled={!applyMetadata}
                   value={metadataValue(row).language}
                   oninput={(event) => editMetadata(row, { language: event.currentTarget.value })}
-                /></td
-              ></tr
-            >{/each}</tbody
-        >
+                />
+              </td>
+            </tr>{/each}
+        </tbody>
       </table>
     {:else if settingsTab === 'av1an'}
       <div class="video-columns av1an-infrastructure">
         <div class="form">
-          <label for="split">Split Method</label><select id="split" bind:value={av1an.splitMethod}
-            ><option value="fixedChunks">Fixed chunks</option><option value="sceneDetection"
-              >Scene Change Detection</option
-            ></select
-          >
-          <label for="chunk">Chunk Method</label><select id="chunk" bind:value={av1an.chunkMethod}
-            ><option value="bestsource">BestSource</option><option value="lsmash">LSMASH</option
-            ><option value="ffms2">FFMS2</option><option value="segment">Segment</option><option
-              value="hybrid">Hybrid</option
-            ><option value="select">Select</option></select
-          >
+          <label for="split">Split Method</label><select id="split" bind:value={av1an.splitMethod}>
+            <option value="fixedChunks">Fixed chunks</option><option value="sceneDetection">
+              Scene Change Detection
+            </option>
+          </select>
+          <label for="chunk">Chunk Method</label><select id="chunk" bind:value={av1an.chunkMethod}>
+            <option value="bestsource">BestSource</option><option value="lsmash">
+              LSMASH
+            </option><option value="ffms2">FFMS2</option><option value="segment">
+              Segment
+            </option><option value="hybrid">Hybrid</option><option value="select">Select</option>
+          </select>
           <label for="concat">Concat Method</label><select
             id="concat"
             bind:value={av1an.concatMethod}
-            ><option value="mkvmerge">MKVMerge</option><option value="ffmpeg">FFmpeg</option
-            ></select
           >
-          <label for="order">Chunk Order</label><select id="order" bind:value={av1an.chunkOrder}
-            ><option value="longToShort">Long-to-Short (Best CPU utilization)</option><option
-              value="shortToLong">Short-to-Long (Not very useful)</option
-            ><option value="sequential">Sequential (Same order as input video)</option><option
-              value="random">Random (Most accurate filesize estimation)</option
-            ></select
-          >
+            <option value="mkvmerge">MKVMerge</option><option value="ffmpeg">FFmpeg</option>
+          </select>
+          <label for="order">Chunk Order</label><select id="order" bind:value={av1an.chunkOrder}>
+            <option value="longToShort">Long-to-Short (Best CPU utilization)</option><option
+              value="shortToLong"
+            >
+              Short-to-Long (Not very useful)
+            </option><option value="sequential">
+              Sequential (Same order as input video)
+            </option><option value="random">Random (Most accurate filesize estimation)</option>
+          </select>
           <label for="slices">Detection Slices</label><input
             id="slices"
             type="number"
@@ -4804,11 +4896,11 @@
             aria-describedby="slices-help"
             bind:value={av1an.sceneDetectionSlices}
           />
-          <span></span><small id="slices-help"
-            >Detects scenes in this many parallel parts before encoding. Requires scene detection
-            and L-SMASH. Skipped when resuming, for short sources, or if the AV1AN build does not
-            support it.</small
-          >
+          <span></span><small id="slices-help">
+            Detects scenes in this many parallel parts before encoding. Requires scene detection and
+            L-SMASH. Skipped when resuming, for short sources, or if the AV1AN build does not
+            support it.
+          </small>
         </div>
         <div class="form">
           <label for="workers">Workers</label><input
@@ -4859,21 +4951,25 @@
           onclick={() => {
             av1anFilters = [...av1anFilters, ''];
             selectedFilterIndex = av1anFilters.length - 1;
-          }}>Add</button
-        ><button
+          }}
+        >
+          Add
+        </button><button
           type="button"
           onclick={() => {
             const index = selectedFilterIndex ?? av1anFilters.length - 1;
             if (index >= 0) av1anFilters = av1anFilters.filter((_, i) => i !== index);
             selectedFilterIndex = null;
-          }}>Remove</button
+          }}
         >
+          Remove
+        </button>
       </div>
       <table>
-        <thead><tr><th scope="col">Filter</th></tr></thead><tbody
-          >{#each av1anFilters as filter, index}<tr
-              ><td
-                ><input
+        <thead><tr><th scope="col">Filter</th></tr></thead><tbody>
+          {#each av1anFilters as filter, index}<tr>
+              <td>
+                <input
                   aria-label={`Filter ${index + 1}`}
                   value={filter}
                   onfocus={() => (selectedFilterIndex = index)}
@@ -4882,10 +4978,10 @@
                       i === index ? event.currentTarget.value : row,
                     );
                   }}
-                /></td
-              ></tr
-            >{/each}</tbody
-        >
+                />
+              </td>
+            </tr>{/each}
+        </tbody>
       </table>
     {/if}
   </div>
@@ -4898,14 +4994,19 @@
         suggestionPending = false;
         suggestedStem = null;
       }}
-    />{#if !isImage}<span class="output-extension" title="Added from the chosen container"
-        >.{outputContainer === 'matroska' ? 'mkv' : outputContainer}</span
-      >{/if}<button type="button" onclick={chooseOutput} aria-label="Browse output path">…</button
-    >{#if chunked}<button type="button" onclick={() => void openRecoveries()}
-        >Resume…{recoveries.length ? ` (${recoveries.length})` : ''}</button
-      ><button type="button" disabled={!recoveries.length} onclick={() => void openClearTemp()}
-        >Clear Temp…</button
-      >{/if}
+    />{#if !isImage}<span class="output-extension" title="Added from the chosen container">
+        .{outputContainer === 'matroska' ? 'mkv' : outputContainer}
+      </span>{/if}<button type="button" onclick={chooseOutput} aria-label="Browse output path">
+      …
+    </button>{#if chunked}<button type="button" onclick={() => void openRecoveries()}>
+        Resume…{recoveries.length ? ` (${recoveries.length})` : ''}
+      </button><button
+        type="button"
+        disabled={!recoveries.length}
+        onclick={() => void openClearTemp()}
+      >
+        Clear Temp…
+      </button>{/if}
   </div>
   {#if error}<p role="alert">{error}</p>{/if}{#if grainTableError}<p role="alert">
       {grainTableError}
@@ -4959,30 +5060,38 @@
         tabindex={recoverySelected === entry.job.id ? 0 : -1}
         aria-selected={recoverySelected === entry.job.id}
         class:selected={recoverySelected === entry.job.id}
-        onclick={() => (recoverySelected = entry.job.id)}>{recoveryLabel(entry)}</button
-      >{/each}
+        onclick={() => (recoverySelected = entry.job.id)}
+      >
+        {recoveryLabel(entry)}
+      </button>{/each}
   </div>
   {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
   <div class="dialog-actions">
     <button
       type="button"
       disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('deleteEncode')}>Delete Encode</button
-    ><button
+      onclick={() => void recoveryAction('deleteEncode')}
+    >
+      Delete Encode
+    </button><button
       type="button"
       disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('deleteChunks')}>Delete Chunks</button
-    ><button
+      onclick={() => void recoveryAction('deleteChunks')}
+    >
+      Delete Chunks
+    </button><button
       type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={(event) => void recoveryAction('resumeNew', event.shiftKey)}
-      >Resume (New Settings)</button
-    ><button
+    >
+      Resume (New Settings)
+    </button><button
       type="button"
       disabled={recoveryBusy || !recoverySelected}
       onclick={(event) => void recoveryAction('resumeSaved', event.shiftKey)}
-      >Resume (Saved Settings)</button
     >
+      Resume (Saved Settings)
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -5006,10 +5115,16 @@
       type="button"
       data-dialog-initial-focus
       disabled={recoveryBusy}
-      onclick={() => (recoveryDialog = null)}>No</button
-    ><button type="button" disabled={recoveryBusy} onclick={() => void recoveryAction('clearAll')}
-      >Yes</button
+      onclick={() => (recoveryDialog = null)}
     >
+      No
+    </button><button
+      type="button"
+      disabled={recoveryBusy}
+      onclick={() => void recoveryAction('clearAll')}
+    >
+      Yes
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog title="Configure Crop" open={dialog === 'crop'} onclose={cancelEdit} width={460}>
@@ -5028,9 +5143,9 @@
     </p>{/if}
   <h3>PIXELS TO CROP OFF EACH SIDE</h3>
   <div class="form dialog-form">
-    {#each ['left', 'right', 'top', 'bottom'] as edge}<label for={`crop-${edge}`}
-        >{edge[0].toUpperCase() + edge.slice(1)}</label
-      ><input
+    {#each ['left', 'right', 'top', 'bottom'] as edge}<label for={`crop-${edge}`}>
+        {edge[0].toUpperCase() + edge.slice(1)}
+      </label><input
         id={`crop-${edge}`}
         type="number"
         min="0"
@@ -5058,8 +5173,10 @@
       onclick={() => {
         framing = { ...framing, crop: { top: 0, right: 0, bottom: 0, left: 0 } };
         cropReduced = false;
-      }}>Reset</button
-    ><button type="button" onclick={() => (dialog = null)}>OK</button>
+      }}
+    >
+      Reset
+    </button><button type="button" onclick={() => (dialog = null)}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog title="Configure Resize" open={dialog === 'resize'} onclose={cancelEdit}>
@@ -5067,16 +5184,16 @@
   <p>{resizeSourceDescription(activeFraming, geometryStream)}</p>
   <h3>TARGET</h3>
   <div class="form dialog-form">
-    <label for="resize-mode">Mode</label><select id="resize-mode" bind:value={framing.resizeMode}
-      ><option value="fit">Fit inside a box (keeps the aspect ratio)</option><option value="height"
-        >Set the height (width follows)</option
-      ><option value="width">Set the width (height follows)</option><option value="percent"
-        >Scale by a percentage</option
-      ><option value="exact">Exact size</option></select
-    >
-    {#if ['fit', 'width', 'exact'].includes(framing.resizeMode)}<label for="resize-width"
-        >Width</label
-      ><input
+    <label for="resize-mode">Mode</label><select id="resize-mode" bind:value={framing.resizeMode}>
+      <option value="fit">Fit inside a box (keeps the aspect ratio)</option><option value="height">
+        Set the height (width follows)
+      </option><option value="width">Set the width (height follows)</option><option value="percent">
+        Scale by a percentage
+      </option><option value="exact">Exact size</option>
+    </select>
+    {#if ['fit', 'width', 'exact'].includes(framing.resizeMode)}<label for="resize-width">
+        Width
+      </label><input
         id="resize-width"
         type="number"
         min="16"
@@ -5089,9 +5206,9 @@
             Math.max(16, Math.trunc(framing.resizeWidth || 16)),
           ))}
       />{/if}
-    {#if ['fit', 'height', 'exact'].includes(framing.resizeMode)}<label for="resize-height"
-        >Height</label
-      ><input
+    {#if ['fit', 'height', 'exact'].includes(framing.resizeMode)}<label for="resize-height">
+        Height
+      </label><input
         id="resize-height"
         type="number"
         min="16"
@@ -5120,44 +5237,49 @@
     {#if framing.resizeMode === 'exact'}<label for="resize-fill">If it doesn't fit</label><select
         id="resize-fill"
         bind:value={framing.resizeFill}
-        ><option value="pad">Letterbox with black bars</option><option value="crop"
-          >Crop off the overflow</option
-        ><option value="stretch">Stretch to fit</option></select
-      >{/if}
+      >
+        <option value="pad">Letterbox with black bars</option><option value="crop">
+          Crop off the overflow
+        </option><option value="stretch">Stretch to fit</option>
+      </select>{/if}
   </div>
   <h3>OPTIONS</h3>
   <div class="form dialog-form">
     <label for="resize-round">Round sizes to</label><select
       id="resize-round"
       bind:value={framing.resizeModulus}
-      ><option value={2}>2 (default)</option><option value={4}>4</option><option value={8}>8</option
-      ><option value={16}>16</option></select
-    ><label for="resize-filter">Resampler</label><select
+    >
+      <option value={2}>2 (default)</option><option value={4}>4</option><option value={8}>
+        8
+      </option><option value={16}>16</option>
+    </select><label for="resize-filter">Resampler</label><select
       id="resize-filter"
       bind:value={temporal.resizeFilter}
-      ><option value="bicubic">Bicubic (default)</option><option value="lanczos">Lanczos</option
-      ><option value="spline">Spline</option><option value="bilinear">Bilinear</option><option
-        value="area">Area</option
-      ><option value="nearest">Nearest neighbor</option></select
     >
+      <option value="bicubic">Bicubic (default)</option><option value="lanczos">
+        Lanczos
+      </option><option value="spline">Spline</option><option value="bilinear">
+        Bilinear
+      </option><option value="area">Area</option><option value="nearest">Nearest neighbor</option>
+    </select>
   </div>
-  <label
-    ><input
+  <label>
+    <input
       type="checkbox"
       bind:checked={framing.resizeAllowUpscale}
       disabled={framing.resizeMode === 'percent' ||
         (framing.resizeMode === 'exact' && framing.resizeFill !== 'pad')}
-    /> Allow upscaling past the source's own size</label
-  ><br /><label
-    ><input
+    /> Allow upscaling past the source's own size
+  </label><br /><label>
+    <input
       type="checkbox"
       bind:checked={framing.resizeCorrectAspect}
       disabled={(() => {
         const [n, d] = (selectedVideo?.sampleAspectRatio ?? '1:1').split(/[:/]/).map(Number);
         return !n || !d || n === d;
       })()}
-    /> Correct non-square pixels</label
-  >
+    /> Correct non-square pixels
+  </label>
   <h3>RESULT</h3>
   <p>
     {resizeDialogDescription(activeFraming, geometryStream)}
@@ -5178,8 +5300,10 @@
           resizeCorrectAspect: true,
         };
         temporal = { ...temporal, resizeFilter: 'bicubic' };
-      }}>Reset</button
-    ><button type="button" onclick={() => (dialog = null)}>OK</button>
+      }}
+    >
+      Reset
+    </button><button type="button" onclick={() => (dialog = null)}>OK</button>
   </div>
 </SourceDialog>
 <SharedCutDialog
@@ -5206,33 +5330,33 @@
         <th scope="col">Channels</th>
         <th scope="col">Bitrate (Kbps)</th>
       </tr>
-    </thead><tbody
-      >{#each perTrackRows as row, index}{@const source = files.find(
+    </thead><tbody>
+      {#each perTrackRows as row, index}{@const source = files.find(
           (f) => f.id === row.sourceId,
-        )}{@const stream = source?.streams.find((s) => s.index === row.streamIndex)}<tr
-          ><td>#{index + 1}</td><td>{stream?.title?.slice(0, 35) || 'None'}</td><td
-            >{stream?.language?.toUpperCase() ?? ''}</td
-          ><td
-            ><input
+        )}{@const stream = source?.streams.find((s) => s.index === row.streamIndex)}<tr>
+          <td>#{index + 1}</td><td>{stream?.title?.slice(0, 35) || 'None'}</td><td>
+            {stream?.language?.toUpperCase() ?? ''}
+          </td><td>
+            <input
               aria-label={`Channels for track ${index + 1}`}
               type="number"
               min="1"
               max="24"
               step="1"
               bind:value={row.channels}
-            /></td
-          ><td
-            ><input
+            />
+          </td><td>
+            <input
               aria-label={`Bitrate for track ${index + 1}`}
               type="number"
               min="8"
               max="8192"
               step="1"
               bind:value={row.bitrate}
-            /></td
-          ></tr
-        >{/each}</tbody
-    >
+            />
+          </td>
+        </tr>{/each}
+    </tbody>
   </table>
   <div class="dialog-actions">
     <button
@@ -5245,8 +5369,10 @@
         }));
         configuredAudioIdentity = audioIdentity();
         dialog = null;
-      }}>OK</button
+      }}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 

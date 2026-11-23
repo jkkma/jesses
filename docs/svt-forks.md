@@ -1,7 +1,7 @@
 # SVT provider identities
 
 The source Quick Convert, AV1AN and batch UI exposes one SVT-AV1 choice. Canonical
-`svtAv1` resolves upstream SVT-AV1-HDR 4.3.0. The Linux development recipe
+`svtAv1` resolves upstream SVT-AV1-HDR 4.3.1. The Linux development recipe
 pins the same release while Linux support is deferred. The provider supports
 the source's scalar and managed HDR/grain resource
 rows without a visible build selector. Source CRF0 is literal zero and carries

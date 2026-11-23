@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
-  "version": "5.1.1",
-  "revision": "256dc5a85e56e42a88a7a90d641037fdc148b91e",
+  "version": "5.1.2",
+  "revision": "5a627933274196219f782b3b74e13fad47cd6370",
   "binary": {
-    "url": "https://codeberg.org/Line-fr/Vship/releases/download/v5.1.1/libvship_VULKAN.dll",
-    "sha256": "3dc0d98db6372cf4a80a68861f1dda496bbfd9b543d10bb2714948e5494e8464",
-    "size": 1148928,
+    "url": "https://codeberg.org/Line-fr/Vship/releases/download/v5.1.2/libvship_VULKAN.dll",
+    "sha256": "3bcfe626c9c41cb16d18be1ed4a89c58977c54761c988bfe04de0dfca0a37558",
+    "size": 3325875,
     "path": "libvship_VULKAN.dll"
   },
   "source": {
-    "url": "https://codeberg.org/Line-fr/Vship/archive/v5.1.1.tar.gz",
-    "sha256": "5d3297220b95b123832972b5b63bc9765dec915a56c972a6604b873683e53036",
-    "path": "vship-v5.1.1.tar.gz"
+    "url": "https://codeberg.org/Line-fr/Vship/archive/v5.1.2.tar.gz",
+    "sha256": "e57326de09d0c211d6599d2f1d994bf9b58956798d094879d593bb27867e63af",
+    "path": "vship-v5.1.2.tar.gz"
   }
 }

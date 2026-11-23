@@ -35,9 +35,9 @@ def qtgmc_fixture(root):
     delivery.mkdir(parents=True)
     module_zip(delivery / "qtgmc-deps.zip")
     plugins = []
-    for name in sorted(MERGER.PLUGIN_FILES | MERGER.RUNTIME_FILES):
+    for name in sorted(MERGER.PLUGIN_FILES):
         filename = "MiscFilters.dll" if name == "miscfilters.dll" else name
-        relative = ("runtime" if name in MERGER.RUNTIME_FILES else "plugins") + "/" + filename
+        relative = "plugins/" + filename
         path = delivery / relative
         path.parent.mkdir(exist_ok=True)
         path.write_bytes(name.encode())
@@ -59,6 +59,8 @@ def qtgmc_fixture(root):
     recipe.write_bytes(b"recipe")
     lock_recipe = delivery / "build/qtgmc-windows-lock.json"
     lock_recipe.write_bytes(b"{}")
+    compiler_lock = delivery / "build/package-av1an-windows-lock.json"
+    compiler_lock.write_bytes(b"{}")
     static = []
     logs = []
     for relative, component in (("plugins/fft3dfilter.dll", "fft3dfilter"),
@@ -80,6 +82,7 @@ def qtgmc_fixture(root):
         "buildInputs": [
             {"path": "build/build-package-av1an-qtgmc.py", "sha256": MERGER.support.digest(recipe)},
             {"path": "build/qtgmc-windows-lock.json", "sha256": MERGER.support.digest(lock_recipe)},
+            {"path": "build/package-av1an-windows-lock.json", "sha256": MERGER.support.digest(compiler_lock)},
             *logs,
         ],
         "compiler": {"compilerSha256": "a" * 64, "msvcVersion": "14.44", "sdkVersion": "10.0"},
@@ -184,10 +187,11 @@ class QtgmcPackageTests(unittest.TestCase):
             base = root / "base"
             python = base / "python"
             python.mkdir(parents=True)
-            pth = python / "python314._pth"
-            pth.write_text("python314.zip\n.\nLib/site-packages\n", encoding="utf-8")
+            relative = f"python/{MERGER.runtime.PYTHON_ABI}._pth"
+            pth = base / relative
+            pth.write_text(MERGER.runtime.PYTHON_PATH_CONFIGURATION, encoding="utf-8")
             (python / "Lib/site-packages/vapoursynth/plugins").mkdir(parents=True)
-            original = {"supportFiles": [{"path": "python/python314._pth", "sha256": MERGER.support.digest(pth)}],
+            original = {"supportFiles": [{"path": relative, "sha256": MERGER.support.digest(pth)}],
                         "additionalSources": [], "licenses": [], "buildInputs": []}
             delivery, extension, _ = qtgmc_fixture(root)
             lock = root / "qtgmc-windows-lock.json"
@@ -196,12 +200,12 @@ class QtgmcPackageTests(unittest.TestCase):
                 MERGER.install_runtime(base, delivery, original, extension, root / "merged")
             merged = root / "merged"
             self.assertTrue((merged / MERGER.PYTHON_ZIP).is_file())
-            self.assertTrue((merged / MERGER.FRAMESERVER / "plugins/libfftw3f-3.dll").is_file())
+            self.assertTrue((merged / MERGER.FRAMESERVER / "plugins/fft3dfilter.dll").is_file())
             self.assertTrue((merged / MERGER.FRAMESERVER / "plugins/mvtools.dll").is_file())
-            self.assertIn("qtgmc-deps.zip", (merged / "python/python314._pth").read_text())
+            self.assertIn("qtgmc-deps.zip", (merged / relative).read_text())
             self.assertFalse((merged / "python/Lib/site-packages/havsfunc.py").exists())
             hashes = {item["path"]: item["sha256"] for item in original["supportFiles"]}
-            self.assertEqual(hashes["python/python314._pth"], MERGER.support.digest(merged / "python/python314._pth"))
+            self.assertEqual(hashes[relative], MERGER.support.digest(merged / relative))
 
     def test_probe_requires_all_presets_and_no_runtime_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:

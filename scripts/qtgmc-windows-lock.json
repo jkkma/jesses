@@ -4,11 +4,11 @@
   "sourceBuiltOutputs": ["plugins/fft3dfilter.dll", "plugins/MiscFilters.dll"],
   "inputs": {
     "vapoursynth": {
-      "revision": "acabf605b2205b32d65859bb2736405719d2fafd",
-      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
-      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
-      "sourceUrl": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
-      "sourceSha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7"
+      "revision": "e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "sha256": "d908d2c7a9278918658db0f2e3e46ac11c78cfb365d265616c41e648bc561900",
+      "sourceUrl": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "sourceSha256": "d908d2c7a9278918658db0f2e3e46ac11c78cfb365d265616c41e648bc561900"
     },
     "znedi3": {
       "revision": "r3.3",
@@ -28,15 +28,15 @@
       }
     },
     "eedi3": {
-      "revision": "r8",
-      "url": "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-EEDI3/releases/download/r8/EEDI3-r8.7z",
-      "sha256": "fa8515e0aa711ca979a87d812860c8582c7789fd805df2be10760748c0a9c486",
-      "sourceUrl": "https://api.github.com/repos/HomeOfVapourSynthEvolution/VapourSynth-EEDI3/zipball/r8",
-      "sourceSha256": "e821b3a7c8ff834ff2a39d09cb5120d3735642c569c50e792f4dabfa76356d5d",
+      "revision": "r10",
+      "url": "https://files.pythonhosted.org/packages/6a/9d/e4c27079e97008953fc79fccaccb2ca348edf9b158bee43aed9c5493ab5d/vapoursynth_eedi3-10.0-py3-none-win_amd64.whl",
+      "sha256": "b509f489badb3b5f10d95c9a8754a35b502a9de82b47f3521bfb6a1a3b2f6eb7",
+      "sourceUrl": "https://api.github.com/repos/HomeOfVapourSynthEvolution/VapourSynth-EEDI3/zipball/r10",
+      "sourceSha256": "a7bbc9da79b291eec79847a613ed7906297b80a4e6257313f5b71cbe74f85cd3",
       "members": {
         "plugins/EEDI3m.dll": {
-          "member": "EEDI3m.dll",
-          "sha256": "8fc1a433112707164c1a87d2c9e78709822b7ca89325f0d691d36337f6bf9051"
+          "member": "vapoursynth/plugins/eedi3m.dll",
+          "sha256": "1b61c5c56bcb8d3137a1dbe90d36689f3e8d621bd1e62d8a118e4fc5011092ef"
         }
       }
     },
@@ -54,28 +54,15 @@
       }
     },
     "fmtconv": {
-      "revision": "r30",
-      "url": "https://github.com/EleonoreMizo/fmtconv/releases/download/r30/fmtconv-r30.zip",
-      "sha256": "f35dba222f2a4d998cd5f777e14382d21337f86fec8ba38832d577ad5795f2e6",
-      "sourceUrl": "https://github.com/EleonoreMizo/fmtconv/releases/download/r30/fmtconv-r30.zip",
-      "sourceSha256": "f35dba222f2a4d998cd5f777e14382d21337f86fec8ba38832d577ad5795f2e6",
+      "revision": "r31",
+      "url": "https://files.pythonhosted.org/packages/c1/df/9698d8e2f0dfed016ddd1f1dbcb3c464c5e68a09b2aefb0e5287d415955c/vapoursynth_fmtconv-31-py3-none-win_amd64.whl",
+      "sha256": "9761744768e1ee1543acbf372092f95d37aeee985ef1bd6dc025cb1804a08293",
+      "sourceUrl": "https://gitlab.com/EleonoreMizo/fmtconv/-/archive/f841f5ff94fd701484041068bb7124f5f393f9e0/fmtconv-f841f5ff94fd701484041068bb7124f5f393f9e0.tar.gz",
+      "sourceSha256": "de7cb5287a148f3408eb94f0d1ab432b054a6aa2873d479a70e517bb88f68ba8",
       "members": {
         "plugins/fmtconv.dll": {
-          "member": "win64/fmtconv.dll",
-          "sha256": "ddbe77e0b09d745608202c9fbca2c70d0c26e0428b27b15b92dfd2cad87f1898"
-        }
-      }
-    },
-    "temporalsoften2": {
-      "revision": "v1",
-      "url": "https://github.com/dubhatervapoursynth/vapoursynth-temporalsoften2/releases/download/v1/vapoursynth-temporalsoften2-v1-win64.7z",
-      "sha256": "67d2826fbcf0dd62d7dcda6f07c28137f2ef075b6bad49aa36453ae2855f453f",
-      "sourceUrl": "https://api.github.com/repos/dubhatervapoursynth/vapoursynth-temporalsoften2/zipball/v1",
-      "sourceSha256": "9d178a608ba78f2067820531db48b4540cf890872fad903c7754202fc7897912",
-      "members": {
-        "plugins/libtemporalsoften2.dll": {
-          "member": "libtemporalsoften2.dll",
-          "sha256": "9a3dd72e9b91916ee23fbad8107a73f5e573cda2343f15a23195aa0b1c54a1b6"
+          "member": "vapoursynth/plugins/fmtconv.dll",
+          "sha256": "6e6e173553548607582c5eb3549718eec8f82141376f2377ff7ce643e419e07a"
         }
       }
     },
@@ -93,15 +80,15 @@
       }
     },
     "mvtools": {
-      "revision": "v24",
-      "url": "https://github.com/dubhatervapoursynth/vapoursynth-mvtools/releases/download/v24/vapoursynth-mvtools-v24-win64.7z",
-      "sha256": "b9883003eed100d4ffd44344b658554076b89da6d45041b378e675720426bc95",
-      "sourceUrl": "https://api.github.com/repos/dubhatervapoursynth/vapoursynth-mvtools/zipball/v24",
-      "sourceSha256": "ce31a9dd35db59199ee6a6934371ea042fea65763d883ba9afbc9c5e536655d3",
+      "revision": "v29_2",
+      "url": "https://files.pythonhosted.org/packages/28/f5/1697a4c7238f442a24982a3e5b7b4cbc54d411b40bf3f83b955ab0ed3cc2/vapoursynth_mvtools-29-py3-none-win_amd64.whl",
+      "sha256": "d64d6525d88ce52572f93e04598083c7cff2a92bf6bc269168130fd7a5227746",
+      "sourceUrl": "https://api.github.com/repos/dubhatervapoursynth/vapoursynth-mvtools/zipball/v29_2",
+      "sourceSha256": "f3154e9bc0196491a26ba2a9fc4873fb8282173a7fad93a11066538d2992578e",
       "members": {
         "plugins/mvtools.dll": {
-          "member": "libmvtools.dll",
-          "sha256": "530a2f003901a7c0749b0b3797c2a2d2c9b12a2b87c4ca4e9d4ec7937260f091"
+          "member": "vapoursynth/plugins/mvtools.dll",
+          "sha256": "8b012d77d0f897d4d586c81880749f81e11a2dbb6f3bd6b798d3ae15628340b3"
         }
       }
     },
@@ -144,27 +131,26 @@
       ]
     },
     "fftw": {
-      "revision": "3.3.5",
-      "url": "https://fftw.org/pub/fftw/fftw-3.3.5-dll64.zip",
-      "sha256": "cfd88dc0e8d7001115ea79e069a2c695d52c8947f5b4f3b7ac54a192756f439f",
-      "sourceUrl": "https://fftw.org/fftw-3.3.5.tar.gz",
-      "sourceSha256": "8ecfe1b04732ec3f5b7d279fdb8efcad536d555f9d1e8fabd027037d45ea8bcf",
-      "members": {
-        "runtime/libfftw3f-3.dll": {
-          "member": "libfftw3f-3.dll",
-          "sha256": "42ca18fff35dd12890e04478bc990005b3969cb744f6843976bd436ccd7f0a4c"
-        }
-      }
+      "revision": "3.3.11",
+      "url": "https://fftw.org/fftw-3.3.11.tar.gz",
+      "sha256": "5630c24cdeb33b131612f7eb4b1a9934234754f9f388ff8617458d0be6f239a1",
+      "sourceUrl": "https://fftw.org/fftw-3.3.11.tar.gz",
+      "sourceSha256": "5630c24cdeb33b131612f7eb4b1a9934234754f9f388ff8617458d0be6f239a1"
+    },
+    "mvtools-fftw": {
+      "revision": "3.3.11-1",
+      "url": "https://repo.msys2.org/mingw/sources/mingw-w64-fftw-3.3.11-1.src.tar.zst",
+      "sha256": "3d3f5489e62f1045aff687389500ffb65744c7e76970af879eccde1f887b3b58",
+      "sourceUrl": "https://repo.msys2.org/mingw/sources/mingw-w64-fftw-3.3.11-1.src.tar.zst",
+      "sourceSha256": "3d3f5489e62f1045aff687389500ffb65744c7e76970af879eccde1f887b3b58"
     }
   },
   "outputs": {
     "plugins/znedi3.dll": "5c1dd6cc681bb1a812b0285349179e185f2f5962e816810e963af8a3b018a9aa",
     "plugins/nnedi3_weights.bin": "27f382430435bb7613deb1c52f3c79c300c9869812cfe29079432a9c82251d42",
-    "plugins/EEDI3m.dll": "8fc1a433112707164c1a87d2c9e78709822b7ca89325f0d691d36337f6bf9051",
-    "runtime/libfftw3f-3.dll": "42ca18fff35dd12890e04478bc990005b3969cb744f6843976bd436ccd7f0a4c",
-    "plugins/fmtconv.dll": "ddbe77e0b09d745608202c9fbca2c70d0c26e0428b27b15b92dfd2cad87f1898",
-    "plugins/libtemporalsoften2.dll": "9a3dd72e9b91916ee23fbad8107a73f5e573cda2343f15a23195aa0b1c54a1b6",
-    "plugins/mvtools.dll": "530a2f003901a7c0749b0b3797c2a2d2c9b12a2b87c4ca4e9d4ec7937260f091",
+    "plugins/EEDI3m.dll": "1b61c5c56bcb8d3137a1dbe90d36689f3e8d621bd1e62d8a118e4fc5011092ef",
+    "plugins/fmtconv.dll": "6e6e173553548607582c5eb3549718eec8f82141376f2377ff7ce643e419e07a",
+    "plugins/mvtools.dll": "8b012d77d0f897d4d586c81880749f81e11a2dbb6f3bd6b798d3ae15628340b3",
     "plugins/RemoveGrainVS.dll": "eed537d5f0de88fc4d5acac1d3dde16b3c81524565fd1fe5e4322bd91117c3fe",
     "qtgmc-deps.zip": "96bd4b581b38e0ff4729c167fb438932e7b5382c1862e28eb47becdb1c827e12"
   }

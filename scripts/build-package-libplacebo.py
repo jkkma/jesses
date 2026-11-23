@@ -17,27 +17,12 @@ SUBMODULES = {
     "jinja": "jinja",
     "markupsafe": "markupsafe",
 }
-PYTHON314_FILE = "src/vulkan/utils_gen.py"
-PYTHON314_BEFORE = b"registry = VkXML(ET.parse(xmlfile))"
-PYTHON314_AFTER = b"registry = VkXML(ET.parse(xmlfile).getroot())"
-
-
-def compatible_source(relative, contents):
-    if relative == PYTHON314_FILE:
-        if contents.count(PYTHON314_BEFORE) != 1:
-            raise ValueError("The pinned libplacebo ElementTree call differs.")
-        return contents.replace(PYTHON314_BEFORE, PYTHON314_AFTER)
-    return contents
 
 
 def sources(builder, lock=None):
     lock = lock or json.loads(LOCK.read_text(encoding="utf-8"))
     if lock["schemaVersion"] != 1:
         raise ValueError("Unsupported Vulkan processing source lock.")
-    for patch in lock["compatibilityPatches"]:
-        path = LOCK.with_name(patch["path"])
-        if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
-            raise ValueError("The Vulkan processing compatibility patch changed.")
     records = {item["id"]: builder.source(item) for item in lock["libraries"]}
     if set(records) != {"libplacebo", "glslang", *SUBMODULES}:
         raise ValueError("The Vulkan processing source closure is incomplete.")
@@ -54,12 +39,6 @@ def build(builder, records, cmake="cmake", cmake_options=()):
     """Build with Builder.source/run/meson_build's guarded source contract."""
     placebo = records["libplacebo"]
     builder.env["PYTHONDONTWRITEBYTECODE"] = "1"
-    generator = placebo / PYTHON314_FILE
-    contents = generator.read_bytes()
-    if PYTHON314_BEFORE in contents:
-        generator.write_bytes(compatible_source(PYTHON314_FILE, contents))
-    elif contents.count(PYTHON314_AFTER) != 1:
-        raise ValueError("The libplacebo Python3.14 compatibility patch differs.")
     for identifier, name in SUBMODULES.items():
         target = placebo / "3rdparty" / name
         if target.exists():

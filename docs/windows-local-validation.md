@@ -58,7 +58,7 @@ when the required dependencies are already cached.
 ## Run the independent console qualification first
 
 Requirements: Windows 10/11, PowerShell 7 (`pwsh`), Git, Rustup, and MSVC C++
-Build Tools with a Windows SDK/linker. The repository pins Rust 1.98.1. This
+Build Tools with a Windows SDK/linker. The repository pins Rust 1.100.0. This
 fixture needs no FFmpeg, AV1AN, VapourSynth, media-provider package, Node or Tauri
 build: its media-process stand-ins are copies of the fixture executable, and its
 console helper is the same native helper mode used by the desktop app.
@@ -66,8 +66,8 @@ console helper is the same native helper mode used by the desktop app.
 From the checked-out repository in PowerShell:
 
 ```powershell
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
-rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1
+rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+rustup target add x86_64-pc-windows-msvc --toolchain 1.100.0
 pwsh -NoProfile -File .\scripts\qualify-windows-console.ps1
 ```
 
@@ -146,7 +146,7 @@ For a desktop settings check, use the repository's existing Node 24/pnpm
 11.19.0/Tauri setup:
 
 ```powershell
-npm install --global pnpm@11.19.0
+npm install --global pnpm@12.21.0
 pnpm install --frozen-lockfile
 pnpm desktop
 ```

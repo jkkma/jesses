@@ -48,8 +48,8 @@
   <div class="section-bar">
     <h2>INSTALLED TOOLS</h2>
     <div class="section-meta">
-      <span class="small-muted"
-        >{desktop && loading
+      <span class="small-muted">
+        {desktop && loading
           ? 'Checking local tools…'
           : desktop && !checked
             ? 'Tools not checked'
@@ -57,8 +57,8 @@
               ? `${available} / ${tools.length} available`
               : desktop
                 ? 'No tool results'
-                : 'Desktop required'}</span
-      >
+                : 'Desktop required'}
+      </span>
       <button type="button" onclick={onrefresh} disabled={!desktop || loading}>
         <RefreshCw size={13} class={loading ? 'spinning' : ''} aria-hidden="true" />Check again
       </button>

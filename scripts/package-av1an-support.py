@@ -102,7 +102,6 @@ def msvc_environment(compiler, python, msvc_root=None, sdk_root=None, sdk_versio
     env["PATH"] = os.pathsep.join(map(str, [python.parent, cl.parent, sdk_root / "bin" / sdk_version / "x64", compiler / "ucrt64/bin", compiler / "usr/bin", system32()]))
     env["INCLUDE"] = os.pathsep.join(map(str, [msvc_root / "include", *[sdk_root / "Include" / sdk_version / name for name in ("ucrt", "shared", "um", "winrt")]]))
     env["LIB"] = os.pathsep.join(map(str, [msvc_root / "lib/x64", sdk_root / "Lib" / sdk_version / "ucrt/x64", sdk_root / "Lib" / sdk_version / "um/x64"]))
-    env["PYTHONPATH"] = str(compiler / "ucrt64/lib/python3.14/site-packages")
     version = subprocess.run([str(cl)], env=env, capture_output=True, text=True, timeout=20)
     return env, cl, {"msvcVersion": msvc_root.name, "sdkVersion": sdk_version, "compilerSha256": digest(cl), "compilerBanner": (version.stdout + version.stderr).splitlines()[0]}
 

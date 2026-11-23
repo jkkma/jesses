@@ -68,7 +68,7 @@ def license_from_source(source):
 
 def build(destination, cache):
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
-    if lock.get("schemaVersion") != 1 or lock.get("version") != "5.1.1" or lock.get("revision") != "256dc5a85e56e42a88a7a90d641037fdc148b91e":
+    if lock.get("schemaVersion") != 1 or lock.get("version") != "5.1.2" or lock.get("revision") != "5a627933274196219f782b3b74e13fad47cd6370":
         raise ValueError("The Vship lock differs from the reviewed source revision.")
     binary = checked_input(lock["binary"], cache)
     source = checked_input(lock["source"], cache)

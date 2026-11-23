@@ -3,17 +3,20 @@
 The output is a small extension to the portable av1an/VapourSynth runtime.
 Two C++ plugins are built from pinned source with the static MSVC runtime so
 the portable frameserver does not depend on a machine-wide MSVCP140 install.
+FFT3DFilter links to a static library built from the pinned FFTW source.
 Other executable payloads come from identified upstream release archives.
 """
 
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 from urllib.request import Request, urlopen
 import zipfile
 
@@ -21,6 +24,7 @@ import zipfile
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent
 LOCK_PATH = ROOT / "qtgmc-windows-lock.json"
+COMPILER_LOCK = ROOT / "package-av1an-windows-lock.json"
 MAX_ARCHIVE = 250 * 1024 * 1024
 
 spec = importlib.util.spec_from_file_location("qtgmc_package_support", ROOT / "package-av1an-support.py")
@@ -92,6 +96,13 @@ def source_notice(component, source, destination):
             "The complete corresponding source is bundled in sources/mvtools-source.zip.\n",
             encoding="utf-8",
         )
+    elif component == "mvtools-fftw":
+        with tarfile.open(source) as archive:
+            nested = archive.extractfile("mingw-w64-fftw/fftw-3.3.11.tar.gz").read()
+        with tarfile.open(fileobj=io.BytesIO(nested)) as fftw:
+            (destination / "COPYING").write_bytes(
+                fftw.extractfile("fftw-3.3.11/COPYING").read()
+            )
     elif component == "removegrainvs":
         with zipfile.ZipFile(source) as archive:
             name = next(name for name in archive.namelist() if name.endswith("/src/clense.cpp"))
@@ -129,24 +140,29 @@ def deterministic_zip(path, entries):
             archive.writestr(member, payload)
 
 
-def build_static_plugins(destination, delivery, fetched_inputs):
+def build_static_plugins(destination, delivery, fetched_inputs, cmake_archive, ninja):
     workspace = destination / "source-build"
     workspace.mkdir()
     vs = support.unpack(fetched_inputs["vapoursynth"][1], workspace / "vapoursynth")
     fft = support.unpack(fetched_inputs["fft3dfilter"][1], workspace / "fft3dfilter")
     misc = support.unpack(fetched_inputs["miscfilters"][1], workspace / "miscfilters")
-    for member in ("fftw3.h", "libfftw3f-3.def"):
-        (workspace / member).write_bytes(
-            archive_member(fetched_inputs["fftw"][0], member, None)
-        )
-    # This recipe needs MSVC and the Windows SDK, not the media MSYS toolchain.
+    fftw = support.unpack(fetched_inputs["fftw"][1], workspace / "fftw")
+    cmake = support.unpack(cmake_archive, workspace / "cmake") / "bin/cmake.exe"
     env, cl, compiler = support.msvc_environment(destination, Path(sys.executable))
-    import_library = cl.parent / "lib.exe"
-    with (delivery / "build/fftw-import.log").open("x", encoding="utf-8") as log:
+    fftw_build = workspace / "fftw-build"
+    mapped = f'/experimental:deterministic "/pathmap:{workspace.as_posix()}=."'
+    with (delivery / "build/fftw-static.log").open("x", encoding="utf-8") as log:
         support.run(
-            [import_library, "/machine:x64", "/def:libfftw3f-3.def", "/out:libfftw3f-3.lib"],
-            workspace, env, log, 60,
+            [cmake, "-S", fftw, "-B", fftw_build, "-G", "Ninja",
+             f"-DCMAKE_MAKE_PROGRAM={ninja.as_posix()}", f"-DCMAKE_C_COMPILER={cl.as_posix()}",
+             f"-DCMAKE_C_FLAGS={mapped}",
+             "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+             "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+             "-DBUILD_TESTS=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DENABLE_FLOAT=ON",
+             "-DENABLE_SSE2=ON", "-DENABLE_THREADS=ON", "-DWITH_COMBINED_THREADS=ON"],
+            workspace, env, log, 240,
         )
+        support.run([cmake, "--build", fftw_build, "--parallel", "4"], workspace, env, log, 600)
     common = [
         cl, "/nologo", "/LD", "/MT", "/O2", "/EHsc", "/std:c++17",
         "/DWIN32", "/DNDEBUG", "/D_WINDOWS", "/D_USRDLL",
@@ -155,15 +171,15 @@ def build_static_plugins(destination, delivery, fetched_inputs):
     configurations = (
         (
             "plugins/fft3dfilter.dll", "fft3dfilter", fft,
-            ["/DFFT3DFILTER_EXPORTS", "/I" + str(workspace)],
+            ["/DFFT3DFILTER_EXPORTS", "/I" + str(fftw / "api")],
             [fft / name for name in (
                 "FFT3DFilter.cpp", "FFT3DFilterTransform.cpp", "fft3dfilter_c.cpp", "Plugin.cpp"
             )],
-            [workspace / "libfftw3f-3.lib"],
+            [fftw_build / "fftw3f.lib"],
         ),
         (
             "plugins/MiscFilters.dll", "miscfilters", misc,
-            ["/DNOMINMAX", "/DVS_TARGET_CPU_X86", "/DMISCFILTERS_EXPORTS",
+            ["/DNOMINMAX", "/DVS_TARGET_CPU_X86", "/DVS_USE_LATEST_API", "/DMISCFILTERS_EXPORTS",
              "/I" + str(vs / "src/core")],
             [misc / "src/miscfilters.cpp"],
             [],
@@ -189,7 +205,7 @@ def build_static_plugins(destination, delivery, fetched_inputs):
     return compiler, records
 
 
-def build(destination, cache):
+def build(destination, cache, ninja):
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     if lock.get("schemaVersion") != 1 or lock.get("target") != "x86_64-pc-windows-msvc":
         raise ValueError("The QTGMC lock does not target Windows x64.")
@@ -204,10 +220,12 @@ def build(destination, cache):
     destination.mkdir(parents=True)
     delivery = destination / "delivery"
     delivery.mkdir()
-    for subdirectory in ("plugins", "runtime", "sources", "licenses", "build"):
+    for subdirectory in ("plugins", "sources", "licenses", "build"):
         (delivery / subdirectory).mkdir()
 
     inputs = lock["inputs"]
+    cmake = json.loads(COMPILER_LOCK.read_text(encoding="utf-8"))["cmakeWindows"]
+    cmake_archive = fetched(cmake["url"], cmake["sha256"], cache)
     source_built = set(lock.get("sourceBuiltOutputs", []))
     if source_built != {"plugins/fft3dfilter.dll", "plugins/MiscFilters.dll"}:
         raise ValueError("The QTGMC source-built plugin set changed.")
@@ -225,7 +243,7 @@ def build(destination, cache):
             continue
         for relative, member in members.items():
             support.member_path(relative)
-            if not (relative.startswith("plugins/") or relative == "runtime/libfftw3f-3.dll"):
+            if not relative.startswith("plugins/"):
                 raise ValueError(f"A QTGMC native destination is outside its delivery: {relative}")
             payload = archive_member(fetched_inputs[component][0], member["member"], seven_zip)
             if digest_bytes(payload) != member["sha256"]:
@@ -235,7 +253,7 @@ def build(destination, cache):
             output = delivery / relative
             output.write_bytes(payload)
             plugins.append({"id": output.stem, "path": relative, "sha256": support.digest(output)})
-    compiler, source_builds = build_static_plugins(destination, delivery, fetched_inputs)
+    compiler, source_builds = build_static_plugins(destination, delivery, fetched_inputs, cmake_archive, ninja)
     plugins.extend({
         "id": Path(record["path"]).stem,
         "path": record["path"],
@@ -249,7 +267,10 @@ def build(destination, cache):
     additional_sources = []
     for component, pin in inputs.items():
         source = fetched_inputs[component][1]
-        suffix = ".zip" if zipfile.is_zipfile(source) else ".tar.gz"
+        if zipfile.is_zipfile(source):
+            suffix = ".zip"
+        else:
+            suffix = ".tar.zst" if pin["sourceUrl"].endswith(".tar.zst") else ".tar.gz"
         relative = f"sources/{component}-source{suffix}"
         shutil.copy2(source, delivery / relative)
         additional_sources.append({
@@ -271,6 +292,7 @@ def build(destination, cache):
         shutil.copy2(binary, delivery / "build" / f"{component}-release{suffix}")
     shutil.copy2(Path(__file__), delivery / "build" / Path(__file__).name)
     shutil.copy2(LOCK_PATH, delivery / "build" / LOCK_PATH.name)
+    shutil.copy2(COMPILER_LOCK, delivery / "build" / COMPILER_LOCK.name)
     receipt = {
         "schemaVersion": 1,
         "target": "x86_64-pc-windows-msvc",
@@ -287,7 +309,7 @@ def build(destination, cache):
         ],
         "compiler": compiler,
         "sourceBuild": source_builds,
-        "qualification": "Pinned QTGMC Python/native payloads; all six supported presets are frame-tested when merged into the av1an R79 runtime.",
+        "qualification": "Pinned QTGMC Python/native payloads; all six supported presets are frame-tested when merged into the portable Av1an runtime.",
     }
     (delivery / "build-provenance.json").write_text(
         json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
@@ -308,8 +330,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=Path("target/qtgmc-archive-cache"))
+    parser.add_argument("--ninja", type=Path, help="Path to the Ninja build executable")
     args = parser.parse_args()
-    build(args.destination.absolute(), args.cache.absolute())
+    ninja = args.ninja or shutil.which("ninja")
+    if not ninja:
+        parser.error("Ninja is required to build the pinned single-precision FFTW library.")
+    build(args.destination.absolute(), args.cache.absolute(), Path(ninja).resolve(strict=True))
 
 
 if __name__ == "__main__":

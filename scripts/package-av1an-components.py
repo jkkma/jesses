@@ -22,7 +22,8 @@ def frameserver(destination, archives, compiler, *, msvc_root=None, sdk_root=Non
     destination.mkdir()
     source = support.unpack(archives["vapoursynth"], destination / "source")
     cython = support.unpack(archives["cython"], destination / "cython")
-    for name in ("libp2p", "zimg"):
+    meson = support.unpack(archives["meson"], destination / "meson") / "meson.py"
+    for name in ("libp2p", "zimg", "glslang", "vulkan-headers"):
         library = support.unpack(archives[name], destination / (name + "-source"))
         if name == "zimg":
             graph = support.unpack(archives["graphengine"], destination / "graphengine-source")
@@ -39,8 +40,8 @@ def frameserver(destination, archives, compiler, *, msvc_root=None, sdk_root=Non
     mapped = repr(["/experimental:deterministic", "/pathmap:" + destination.as_posix() + "=."])
     flags = ["--native-file", str(native), "--wrap-mode=nodownload", "-Db_vscrt=mt", "-Db_lto=false", "-Dc_args=" + mapped, "-Dcpp_args=" + mapped]
     with (destination / "build.log").open("x", encoding="utf-8") as log:
-        support.run([python, "-m", "mesonbuild.mesonmain", "setup", destination / "build", source, *flags], destination, env, log)
-        support.run([python, "-m", "mesonbuild.mesonmain", "compile", "-C", destination / "build", "-j", str(jobs)], destination, env, log)
+        support.run([python, meson, "setup", destination / "build", source, *flags], destination, env, log)
+        support.run([python, meson, "compile", "-C", destination / "build", "-j", str(jobs)], destination, env, log)
     return {"source": source, "build": destination / "build", "compiler": compiler_receipt, "configure": [flag for flag in flags if not flag.startswith(("-Dc_args=", "-Dcpp_args=")) and flag != str(native)]}
 
 
@@ -86,9 +87,8 @@ def av1an(destination, archives, rust_directory, compiler, scripts, *, jobs=4):
     patcher = load("av1an_patch", scripts / "patch-package-av1an.py")
     patcher.patch_source(source, archives["av1an"], destination / "ffmpeg9-passthrough.patch")
     env, cl, _ = support.msvc_environment(compiler, rust_directory / "cargo.exe")
-    env.pop("PYTHONPATH", None)
     env["PATH"] = os.pathsep.join(map(str, [rust_directory, cl.parent, compiler / "usr/bin", support.system32()]))
-    env.update(CARGO_HOME=str(destination / "cargo-home"), CARGO_TARGET_DIR=str(destination / "target"), CARGO_BUILD_JOBS=str(jobs), CARGO_PROFILE_RELEASE_STRIP="symbols", VERGEN_GIT_SHA="805dad69143fa0a81cfe2fb89c0b9e90a828ea72", VERGEN_IDEMPOTENT="1", RUSTFLAGS="--remap-path-prefix=" + str(destination) + "=. -C target-feature=+crt-static")
+    env.update(CARGO_HOME=str(destination / "cargo-home"), CARGO_TARGET_DIR=str(destination / "target"), CARGO_BUILD_JOBS=str(jobs), CARGO_PROFILE_RELEASE_STRIP="symbols", VERGEN_GIT_SHA=patcher.SOURCE["commit"], VERGEN_IDEMPOTENT="1", RUSTFLAGS="--remap-path-prefix=" + str(destination) + "=. -C target-feature=+crt-static")
     (source / ".cargo").mkdir()
     with (destination / "vendor.log").open("x", encoding="utf-8") as log, (source / ".cargo/config.toml").open("x", encoding="utf-8") as config:
         import subprocess

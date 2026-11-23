@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -83,7 +83,7 @@ class PluginBuilderTests(unittest.TestCase):
 
     def test_runtime_uses_task_config_without_inherited_loader_hooks(self):
         with patch.dict(BUILD.os.environ, {"HOME": "/user/home", "PYTHONHOME": "injected", "LD_PRELOAD": "injected"}):
-            env = BUILD.runtime_environment(Path("/tools/venv/bin/python"), Path("/tools/vapoursynth"), Path("/task/config"), Path("/task/plugins"))
+            env = BUILD.runtime_environment(PurePosixPath("/tools/venv/bin/python"), PurePosixPath("/tools/vapoursynth"), PurePosixPath("/task/config"), PurePosixPath("/task/plugins"))
         self.assertEqual(env["HOME"], "/user/home")
         self.assertEqual(env["XDG_CONFIG_HOME"], "/task/config")
         self.assertNotIn("PYTHONHOME", env)

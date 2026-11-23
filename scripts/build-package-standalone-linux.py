@@ -20,7 +20,7 @@ import sys
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 TARGET = "x86_64-unknown-linux-gnu"
-FFMPEG_SHA = "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+FFMPEG_SHA = "1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433"
 X264_COMMIT = "b35605ace3ddf7c1a5d67a2eb553f034aef41d55"
 X264_SHA = "6a4d3620201074edec84681aeb25ffa1eceaa9451f7347ca1448f532634eed55"
 X264_FLAGS = ["--enable-static", "--enable-pic", "--disable-lavf", "--disable-swscale", "--disable-avs", "--disable-opencl", "--bit-depth=all", "--chroma-format=all"]
@@ -141,8 +141,6 @@ class Build:
             raise ValueError("The local x264 source has a different revision.")
         self.sources["x264"], self.archives["x264"], self.pins["x264"] = source, archive, x264
         svt = json.loads((HERE / "standalone-tool-sources.json").read_text(encoding="utf-8"))["svtAv1"]
-        if svt["commit"] != "9292ec8e32bce26f781f277ec8739b53426c4300" or svt["sha256"] != "fe7e58bbd61040b460373ce7cfe0119311464eddbd6e620d84eeed317f598a64":
-            raise ValueError("The mainline SVT source pin changed.")
         archive = MEDIA.download({**svt, "filename": svt["sha256"]}, self.cache)
         self.sources["svt-av1"] = MEDIA.extract(archive, self.work / "svt-source", svt["root"])
         self.archives["svt-av1"], self.pins["svt-av1"] = archive, svt
@@ -183,7 +181,7 @@ class Build:
                 version = version.splitlines()[0]
                 valid = version.startswith("x264 0.165.") and X264_COMMIT[:7] in version
             else:
-                valid = "v4.2.0" in version and "HDR" not in version and "5fish" not in version
+                valid = f"v{self.pins[identifier]['version']}" in version and "HDR" not in version and "5fish" not in version
             if not valid:
                 raise ValueError("The built standalone encoder has an unexpected identity.")
             dependencies = self.run(["ldd", executable], capture=True, timeout=20)

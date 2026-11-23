@@ -1,2 +1,2 @@
 minimumReleaseAgeExclude:
-  - '@lucide/svelte@1.44.0'
+  - '@lucide/svelte@1.78.0'

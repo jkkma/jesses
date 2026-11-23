@@ -114,23 +114,23 @@
       authorize running commands or reusing another application's chunks.
     </p>
     <div class="saved-job-controls">
-      <label
-        >Encode from history<select bind:value={selected} disabled={pending}
-          ><option value="">Choose an encode</option>{#each encodes as job}<option value={job.id}
-              >{fileName(job.request.outputPath)} · {job.state}</option
-            >{/each}</select
-        ></label
-      >
+      <label>
+        Encode from history<select bind:value={selected} disabled={pending}>
+          <option value="">Choose an encode</option>{#each encodes as job}<option value={job.id}>
+              {fileName(job.request.outputPath)} · {job.state}
+            </option>{/each}
+        </select>
+      </label>
       <div class="actions">
-        <button type="button" onclick={save} disabled={pending || !selected || !isDesktop()}
-          >Export encode request</button
-        >
-        <button type="button" onclick={inspect} disabled={pending || !isDesktop()}
-          >Inspect saved job</button
-        >
+        <button type="button" onclick={save} disabled={pending || !selected || !isDesktop()}>
+          Export encode request
+        </button>
+        <button type="button" onclick={inspect} disabled={pending || !isDesktop()}>
+          Inspect saved job
+        </button>
       </div>
-      <label
-        >Original SVT build for historical imports
+      <label>
+        Original SVT build for historical imports
         <select
           bind:value={svtBuild}
           disabled={pending}
@@ -148,14 +148,20 @@
     {#if selectedJob?.encodeSettings?.backend === 'standalone' && canResumeJob(selectedJob)}
       <p>{savedProgressSummary(selectedJob)}</p>
       <div class="actions">
-        <button type="button" onclick={() => useProgress(selectedJob!, 'resume')} disabled={pending}
-          >Resume saved job</button
+        <button
+          type="button"
+          onclick={() => useProgress(selectedJob!, 'resume')}
+          disabled={pending}
         >
+          Resume saved job
+        </button>
         <button
           type="button"
           onclick={() => useProgress(selectedJob!, 'discard')}
-          disabled={pending}>Discard saved progress</button
+          disabled={pending}
         >
+          Discard saved progress
+        </button>
       </div>
     {/if}
     {#if inspection}<div class="inspection" role="status">
@@ -166,9 +172,9 @@
             <dt>Encoder</dt>
             <dd>{inspection.request.settings.encoder}</dd>
           </dl>
-          <button type="button" onclick={queue} disabled={pending}
-            >Choose destination and queue a new encode</button
-          >{/if}
+          <button type="button" onclick={queue} disabled={pending}>
+            Choose destination and queue a new encode
+          </button>{/if}
       </div>{/if}
     {#if message}<p role="status">{message}</p>{/if}{#if error}<p role="alert">{error}</p>{/if}
   </div>

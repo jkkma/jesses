@@ -55,8 +55,10 @@
     type="button"
     aria-label="Minimize window"
     title="Minimize window"
-    onclick={() => control('minimize')}><Minus size={14} aria-hidden="true" /></button
+    onclick={() => control('minimize')}
   >
+    <Minus size={14} aria-hidden="true" />
+  </button>
   <button
     type="button"
     aria-label={maximized ? 'Restore window' : 'Maximize window'}
@@ -74,8 +76,10 @@
     type="button"
     aria-label="Close window"
     title="Close window"
-    onclick={() => control('close')}><X size={16} aria-hidden="true" /></button
+    onclick={() => control('close')}
   >
+    <X size={16} aria-hidden="true" />
+  </button>
 </div>
 
 <style>

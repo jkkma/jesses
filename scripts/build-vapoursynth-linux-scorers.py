@@ -1,4 +1,4 @@
-"""Build pinned Linux L-SMASH, vszip and Julek for an existing R79 runtime.
+"""Build pinned Linux L-SMASH, vszip and Julek for a native VapourSynth runtime.
 
 Requires Linux x64, Python3.12+ development headers, GCC/G++, CMake3.28+,
 Ninja, make, nasm, pkg-config and the complete FFmpeg package build prefix.
@@ -129,7 +129,7 @@ for path in json.loads(sys.argv[1]).values():
     if path.endswith('libvszip.so') and hasattr(c,'vszip'): continue
     if path.endswith('libjulek.so') and hasattr(c,'julek'): continue
     c.std.LoadPlugin(path=path)
-assert 'Core R79' in str(c), str(c)
+assert 'Core ' + sys.argv[3] in str(c), str(c)
 reader=c.lsmas.LWLibavSource(source=sys.argv[2], cache=0)
 assert reader.num_frames==4
 for n in range(4): reader.get_frame(n)
@@ -150,7 +150,7 @@ for name,clip,keys in [('SSIMULACRA2',s,['SSIMULACRA2','_SSIMULACRA2']),('Butter
     result[name]=values
 print('JESSES_PLUGIN_PROOF '+json.dumps(result))
 """
-        command = [str(python), "-c", code, json.dumps({name: str(path) for name, path in plugins.items()}), str(work / "reader.mkv")]
+        command = [str(python), "-c", code, json.dumps({name: str(path) for name, path in plugins.items()}), str(work / "reader.mkv"), inputs()["vapoursynth"]["version"]]
         log.write("COMMAND " + json.dumps(command) + "\n")
         log.flush()
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
@@ -222,7 +222,7 @@ class Build:
                 self.sources[name] = scorers.unpack_jxl(archive, destination) if name == "libjxl" else support.unpack(archive, destination)
         for header in ("VapourSynth4.h", "VSScript4.h", "VSHelper4.h", "VSConstants4.h"):
             if digest(self.runtime / "include" / header) != digest(self.sources["vapoursynth"] / "include" / header):
-                raise ValueError("The supplied runtime SDK differs from the pinned R79 source.")
+                raise ValueError("The supplied runtime SDK differs from the pinned VapourSynth source.")
 
     def zip(self):
         source = self.sources["vszip"]
@@ -311,7 +311,7 @@ def parser():
     mode.add_argument("--destination", type=Path)
     mode.add_argument("--verify-existing", type=Path)
     result.add_argument("--media-build", type=Path, required=True)
-    result.add_argument("--vapoursynth-root", type=Path, required=True, help="R79 Python package directory containing libvsscript.so and include/")
+    result.add_argument("--vapoursynth-root", type=Path, required=True, help="Pinned VapourSynth Python package directory containing libvsscript.so and include/")
     result.add_argument("--python", type=Path, default=Path(sys.executable))
     result.add_argument("--cache", type=Path, default=SCRIPTS.parent / "target/tool-download-cache")
     result.add_argument("--jobs", type=int, default=2)

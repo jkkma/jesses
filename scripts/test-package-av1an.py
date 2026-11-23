@@ -68,7 +68,10 @@ class StagingTests(unittest.TestCase):
         shared = [{"base": base, "path": f"sources/{base}.tar.zst", "sha256": "a" * 64} for base in sorted(delivery.SHARED_BASES)]
         media = self.tools / "ffmpeg/build-provenance.json"
         media.write_text(json.dumps({"additionalSources": shared, "licenses": [], "buildInputs": []}))
-        self.version = "av1an 0.5.2 [ffmpeg9-passthrough-v1] [segment-ffmpeg9-v1] [julek-butteraugli-v1] [target-probe-filter-v1] [xpsnr-signed-stats-v1] [source-unfiltered-probes-v1]"
+        self.version = (
+            f"av1an {delivery.SOURCE['version']} (rev {delivery.SOURCE['commit']}) (Release)"
+            + "".join(f" [{marker}]" for marker in delivery.LOCK["compatibilityMarkers"])
+        )
         def record(name):
             path = self.directory / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,9 +80,9 @@ class StagingTests(unittest.TestCase):
         source = record("sources/source.tar.gz")
         # This fixture mocks the reviewed upstream source identity only. Every
         # executable, dependency and build/notice payload uses its real digest.
-        source["sha256"] = "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2"
-        names = ["python/python.exe", "python/python314.dll", "python/python314.zip", "python/python314._pth", "python/Lib/site-packages/vapoursynth/__init__.pyc", "python/Lib/site-packages/vapoursynth/vsscript.dll", "python/Lib/site-packages/vapoursynth/vspipe.exe", "python/Lib/site-packages/vapoursynth/libvapoursynth.dll", "python/Lib/site-packages/vapoursynth/plugins/LSMASHSource.dll"]
-        self.receipt = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "tool": {"id": "av1an", "version": self.version, **record("av1an.exe")}, "sourceCommit": "805dad69143fa0a81cfe2fb89c0b9e90a828ea72", "source": source, "sharedMediaProvenanceSha256": support.digest(media), "sharedSources": shared, "additionalSources": [record("sources/decoder.tar.gz")], "licenses": [record("licenses/COPYING")], "buildInputs": [record("build/recipe.py")], "supportFiles": [record(name) for name in names]}
+        source["sha256"] = delivery.SOURCE["sha256"]
+        names = ["python/python.exe", *(f"python/{delivery.PYTHON_ABI}{suffix}" for suffix in (".dll", ".zip", "._pth")), "python/Lib/site-packages/vapoursynth/__init__.pyc", "python/Lib/site-packages/vapoursynth/vsscript.dll", "python/Lib/site-packages/vapoursynth/vspipe.exe", "python/Lib/site-packages/vapoursynth/libvapoursynth.dll", "python/Lib/site-packages/vapoursynth/plugins/LSMASHSource.dll"]
+        self.receipt = {"schemaVersion": 1, "target": "x86_64-pc-windows-msvc", "tool": {"id": "av1an", "version": self.version, **record("av1an.exe")}, "sourceCommit": delivery.SOURCE["commit"], "source": source, "sharedMediaProvenanceSha256": support.digest(media), "sharedSources": shared, "additionalSources": [record("sources/decoder.tar.gz")], "licenses": [record("licenses/COPYING")], "buildInputs": [record("build/recipe.py")], "supportFiles": [record(name) for name in names]}
         self.write_receipt()
 
     def write_receipt(self):
@@ -104,13 +107,22 @@ class StagingTests(unittest.TestCase):
         self.assertTrue((self.tools / "av1an/python/python.exe").is_file())
 
     def test_changed_dependency_is_rejected_before_native_execution(self):
-        (self.directory / "python/python314.dll").write_bytes(b"modified")
+        (self.directory / f"python/{delivery.PYTHON_ABI}.dll").write_bytes(b"modified")
         with patch.object(delivery.subprocess, "run") as execute, self.assertRaisesRegex(ValueError, "inventory"):
             self.stage()
         execute.assert_not_called()
 
     def test_engine_without_signed_xpsnr_fix_is_rejected(self):
         self.version = self.version.replace(" [xpsnr-signed-stats-v1]", "")
+        self.receipt["tool"]["version"] = self.version
+        self.write_receipt()
+        output = SimpleNamespace(stdout=self.version + "\nsystems.innocent.lsmas : Found\n", stderr="")
+        with patch.object(delivery, "runtime_environment", return_value={}), patch.object(delivery.subprocess, "run", return_value=output), self.assertRaisesRegex(ValueError, "identity or decoder"):
+            self.stage()
+        self.assertFalse((self.tools / "av1an").exists())
+
+    def test_old_engine_claiming_the_new_source_is_rejected(self):
+        self.version = "av1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) (Release)" + self.version.split(" (Release)", 1)[1]
         self.receipt["tool"]["version"] = self.version
         self.write_receipt()
         output = SimpleNamespace(stdout=self.version + "\nsystems.innocent.lsmas : Found\n", stderr="")

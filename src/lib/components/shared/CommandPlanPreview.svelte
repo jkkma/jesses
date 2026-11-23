@@ -54,9 +54,9 @@
 </script>
 
 <section class="command-preview" aria-label="Command plan preview">
-  <button type="button" onclick={preview} disabled={disabled || !request || busy}
-    >Preview command plan</button
-  >
+  <button type="button" onclick={preview} disabled={disabled || !request || busy}>
+    Preview command plan
+  </button>
   {#if busy}<button type="button" onclick={cancel}>Cancel command preview</button>
     <p role="status">Inspecting the source and preparing the encoder plan…</p>{/if}
   <details class="preview-help">

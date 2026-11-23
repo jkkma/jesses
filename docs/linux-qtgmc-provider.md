@@ -1,9 +1,9 @@
 # Native Linux QTGMC qualification provider
 
-`scripts/build-qtgmc-linux.py` reconstructs a task-local VapourSynth R79 provider
+`scripts/build-qtgmc-linux.py` reconstructs a task-local VapourSynth R82 provider
 with the QTGMC dependencies pinned by the Windows source bundle. This is a
 Linux x64 qualification toolchain, not a claim of a redistributable Linux
-portable application or Windows/macOS qualification. The restored provider at
+portable application or Windows/macOS qualification. The earlier R79 provider at
 `target/toolchains/qtgmc-linux-20261101` passes its eight-preset, real-reader gate;
 all six native caption tests, including the four QTGMC text/bitmap and frame/bob
 export paths, pass in 9.24 seconds. Its actual receipts are `qualification.json`
@@ -37,21 +37,23 @@ hashes from completed stages before reuse. Failed command logs and intermediates
 are retained; it does not silently replace an existing directory or remove
 someone else's files. A changed input requires a new destination.
 
-The recipe shares the R79, Cython, L-SMASH and codec pins in
+The recipe shares the VapourSynth R82, Cython, L-SMASH and codec pins in
 `package-av1an-windows-lock.json`, QTGMC module/plugin pins in
-`qtgmc-windows-lock.json`, and Meson 1.12.0 in the Linux FFmpeg lock. The extra
+`qtgmc-windows-lock.json`, and Meson 1.12.1 in the shared Av1an lock. The extra
 `qtgmc-linux-lock.json` records znedi3's previously unbundled graphengine and
 vsxx gitlinks at their exact source commits. The znedi3 source commit is checked
 against its checksum-bound GitHub ZIP comment. No moving Git branch or build-time
 dependency fetch is allowed. Unbuilt graphengine test dependencies are not used.
 
-The provider builds R79's native SDK/runtime, static single-precision FFTW and
-nine plugins: L-SMASH, znedi3, fmtconv, MVTools, Misc, RemoveGrain, EEDI3,
-FFT3DFilter and TemporalSoften2. Its L-SMASH compilation reuses the existing
+The provider builds R82's native SDK/runtime, static single-precision FFTW and
+eight plugins: L-SMASH, znedi3, fmtconv, MVTools, Misc, RemoveGrain, EEDI3,
+and FFT3DFilter. Its L-SMASH compilation reuses the existing
 pinned Linux reader recipe and statically links the exact dav1d/libvpx/zlib
 closure from the verified FFmpeg build. Source archives and source-derived
 notices are retained, including those shared codec sources. The final receipt
 records hashes of the runtime, Python modules, plugins and build provenance.
+VapourSynth R82 removed API3 plugin loading, so the provider drops the unused
+TemporalSoften2 plugin. The QTGMC presets do not call it.
 
 Before reporting readiness, it decodes eight real FFV1 frames through L-SMASH
 and renders every frame of QTGMC's eight source presets at `30000/1001`→

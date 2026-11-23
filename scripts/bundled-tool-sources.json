@@ -1,13 +1,13 @@
 {
   "schemaVersion": 2,
   "sources": {
-    "1c4fb91a06b0b14aafefe11835dafd91d337a3a4": {
-      "url": "https://codeload.github.com/5fish/SVT-AV1/tar.gz/1c4fb91a06b0b14aafefe11835dafd91d337a3a4",
-      "sha256": "172a6867239f2e7165829f338358e1a497d9867c2bf19728ebc678de91ee3b4f"
+    "573452c4910220a2f33e8afa2590ccb4e56880ce": {
+      "url": "https://codeload.github.com/5fish/SVT-AV1/tar.gz/573452c4910220a2f33e8afa2590ccb4e56880ce",
+      "sha256": "8fe60c418ff71227c99e6e0eef64d6b711c570d91f6bf9bbed826a1c163e2d50"
     },
-    "6d661b6b510eb30b568d5ffcbb121176e553c454": {
-      "url": "https://codeload.github.com/juliobbv-p/SVT-AV1-HDR/tar.gz/6d661b6b510eb30b568d5ffcbb121176e553c454",
-      "sha256": "f1019ce1ce3687a82ec57270325deb521f9c8e586b19b8197c7e046451ecccbe"
+    "421c65909eeb3703d5e8a7fda21a38374dc7565d": {
+      "url": "https://codeload.github.com/juliobbv-p/SVT-AV1-HDR/tar.gz/421c65909eeb3703d5e8a7fda21a38374dc7565d",
+      "sha256": "4e62abb25e2e75b59527edada0f58dca9c3c6b8eb24404ab92a27c935ce30d7b"
     }
   }
 }

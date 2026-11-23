@@ -53,9 +53,9 @@ impl Prepared {
 }
 
 pub(super) fn supports_preload(version: &str) -> bool {
-    // This revision (or any build advertising the preload capability tag) only
-    // clears --temp when --resume is absent. With no queue or completion
-    // marker, it then changes back to normal fresh mode.
+    // The compatibility marker identifies builds that preserve --temp when
+    // --resume is present and then switch to fresh mode if the queue is absent.
+    // The previously packaged 0.5.2 revision has this behavior without the tag.
     version.contains("[preload-scenes-v1]")
         || version.lines().any(|line| {
             line.starts_with("av1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) ")
@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn enables_preload_only_for_the_pinned_av1an_revision() {
+    fn enables_preload_for_the_legacy_packaged_av1an_revision() {
         assert!(supports_preload(
             "\nav1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) (Release)\n"
         ));
@@ -965,8 +965,8 @@ mod tests {
     #[test]
     fn supports_preload_accepts_capability_tag() {
         assert!(supports_preload(
-            "av1an 0.6.0 (Release) [preload-scenes-v1]"
+            "av1an 0.6.0 (rev 641ce62d70e34f438f3ee91ec50de77784a10705) (Release) [preload-scenes-v1]"
         ));
-        assert!(!supports_preload("av1an 0.5.0 (Release)"));
+        assert!(!supports_preload("av1an 0.6.0"));
     }
 }

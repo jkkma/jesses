@@ -12,7 +12,7 @@ jobs:
     if: github.event.deleted != true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Check tracked files and new commits
@@ -43,15 +43,15 @@ jobs:
   frontend:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version-file: .node-version
           cache: pnpm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: '3.14'
+          python-version: '3.15.2'
       - run: pnpm install --frozen-lockfile
       - run: python scripts/test-ipc-registration.py
       - run: python scripts/test-package-av1-codecs.py
@@ -65,20 +65,20 @@ jobs:
   desktop:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version-file: .node-version
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: '3.14'
-      - uses: Swatinem/rust-cache@v2
+          python-version: '3.15.2'
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo fmt --all --check

@@ -1,7 +1,7 @@
 """Build the Linux package FFmpeg pair and retain all linked library sources.
 
 Requires Linux x86-64, Python 3.14+, GCC/G++, make, nasm, cmake, ninja,
-autoconf, automake, libtool, pkg-config, patch, git, gperf and xxd. A pinned Meson
+autoconf, automake, libtool, pkg-config, patch, git, gperf, xxd and Perl. A pinned Meson
 source is included. --verify-only can validate
 the pinned archives, extracted licenses and local Git source on other hosts.
 No package manager is invoked and an existing build directory is never replaced.
@@ -442,11 +442,11 @@ class Builder:
         build = self.delivery / "build"
         shutil.copy2(__file__, build / Path(__file__).name)
         shutil.copy2(LOCK, build / LOCK.name)
-        for name in ("qualify-cpu-encoders.py", "cpu-encoding-policy.json", "qualify-libplacebo.py", "build-package-libplacebo.py", "package-libplacebo-lock.json", "libplacebo-python314.patch", "restore-libplacebo-ffmpeg-linux.py"):
+        for name in ("qualify-cpu-encoders.py", "cpu-encoding-policy.json", "qualify-libplacebo.py", "build-package-libplacebo.py", "package-libplacebo-lock.json", "restore-libplacebo-ffmpeg-linux.py"):
             shutil.copy2(ROOT / "scripts" / name, build / name)
         (build / "commands.json").write_text(json.dumps(self.commands, indent=2) + "\n", encoding="utf-8")
         versions = {}
-        for command in ("gcc", "g++", "ld", "ar", "make", "nasm", "cmake", "ninja", "autoconf", "automake", "libtoolize", "pkg-config", "git", "gperf"):
+        for command in ("gcc", "g++", "ld", "ar", "make", "nasm", "cmake", "ninja", "autoconf", "automake", "libtoolize", "pkg-config", "git", "gperf", "perl"):
             versions[command] = self.run([command, "--version"], capture=True, timeout=20)
         versions["meson"] = self.run([*self.meson, "--version"], capture=True, timeout=20)
         versions["xxd"] = self.run(["xxd", "-v"], capture=True, timeout=20)

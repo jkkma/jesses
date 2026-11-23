@@ -2,16 +2,16 @@
   "schemaVersion": 1,
   "inputs": {
     "vsbindings": {
-      "revision": "b87ff61ce680fa5a4cf7d44a9cb4b605c5037432",
-      "url": "https://codeload.github.com/dnjulek/vapoursynth-zig/tar.gz/b87ff61ce680fa5a4cf7d44a9cb4b605c5037432",
-      "sha256": "2d5c6104d9b11183eebc65298c36adff60f8dd82128bbcdc76611452d68c5c0c",
-      "path": "vsbindings-b87ff61ce680fa5a4cf7d44a9cb4b605c5037432.tar.gz"
+      "revision": "07137c2f5e336b9cedd9afd74af889ae2cff09d9",
+      "url": "https://codeload.github.com/dnjulek/vapoursynth-zig/tar.gz/07137c2f5e336b9cedd9afd74af889ae2cff09d9",
+      "sha256": "a9e53b516cc42e0b442fa0ab2271941eed9eccff5481961780cc45e40c3e2f15",
+      "path": "vsbindings-07137c2f5e336b9cedd9afd74af889ae2cff09d9.tar.gz"
     },
     "zigimg": {
-      "revision": "0bbe201a5591219177f2444371c2897746b47774",
-      "url": "https://codeload.github.com/zigimg/zigimg/tar.gz/0bbe201a5591219177f2444371c2897746b47774",
-      "sha256": "4f145109a4c4eab3deeb49b1847be9a5826c1c3967a586e879d40e6943c4009c",
-      "path": "zigimg-0bbe201a5591219177f2444371c2897746b47774.tar.gz"
+      "revision": "083d0304840a3f5fd547c2e2005148a18886c401",
+      "url": "https://codeload.github.com/zigimg/zigimg/tar.gz/083d0304840a3f5fd547c2e2005148a18886c401",
+      "sha256": "197fc0f69e7ab2fc7c6890f6407cd0f3525dc2b401a8d421f7c06bd4902a8a6b",
+      "path": "zigimg-083d0304840a3f5fd547c2e2005148a18886c401.tar.gz"
     },
     "libjxl": {
       "revision": "684aa6d030b460de153ffbeeb9c4d7936e514873",
@@ -36,11 +36,11 @@
       "path": "skcms.tar.gz"
     },
     "vszip": {
-      "version": "22.1.0",
-      "revision": "beb7a0ab0e4166580b76560ae3f7c7f5e376ac90",
-      "url": "https://codeload.github.com/dnjulek/vapoursynth-zip/tar.gz/beb7a0ab0e4166580b76560ae3f7c7f5e376ac90",
-      "sha256": "f1d0081de36858802795b2e78252654dbc48dd0478cf349fc53a6e7edb65f33c",
-      "path": "vszip-beb7a0ab0e4166580b76560ae3f7c7f5e376ac90.tar.gz"
+      "version": "24.0.0",
+      "revision": "f6a4c86ee086ad51897796da6e92e6c154e0539c",
+      "url": "https://codeload.github.com/dnjulek/vapoursynth-zip/tar.gz/f6a4c86ee086ad51897796da6e92e6c154e0539c",
+      "sha256": "862c4c3123193293347bf9383338cd4fbaa042f6a55c606ffcfa73d1c24b770f",
+      "path": "vszip-f6a4c86ee086ad51897796da6e92e6c154e0539c.tar.gz"
     },
     "julek": {
       "version": "r3",
@@ -50,30 +50,30 @@
       "path": "julek-3f2780d2a6fb02d1fb2f23730431c407905dcc32.tar.gz"
     },
     "zigSource": {
-      "url": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
-      "sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
-      "path": "zig-0.16.0.tar.xz",
-      "version": "0.16.0"
+      "url": "https://ziglang.org/download/0.17.1/zig-0.17.1.tar.xz",
+      "sha256": "1e89bf06610b769a8c77676c6c8d54b093a0db60f4891f2f91014829012f0e24",
+      "path": "zig-0.17.1.tar.xz",
+      "version": "0.17.1"
     },
     "zigBuild": {
-      "url": "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip",
-      "sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
-      "path": "zig-x86_64-windows-0.16.0.zip",
-      "version": "0.16.0"
+      "url": "https://ziglang.org/download/0.17.1/zig-x86_64-windows-0.17.1.zip",
+      "sha256": "b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e",
+      "path": "zig-x86_64-windows-0.17.1.zip",
+      "version": "0.17.1"
     },
     "vapoursynth": {
       "path": "vapoursynth-source.tar.gz",
-      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
-      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
-      "commit": "acabf605b2205b32d65859bb2736405719d2fafd",
-      "version": "R79"
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "sha256": "d908d2c7a9278918658db0f2e3e46ac11c78cfb365d265616c41e648bc561900",
+      "commit": "e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "version": "R82"
     },
     "cmakeBuild": {
-      "version": "4.4.3",
-      "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
-      "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
-      "root": "cmake-4.4.3-windows-x86_64",
-      "path": "cmake-4.4.3-windows-x86_64.zip"
+      "version": "4.5.1",
+      "url": "https://github.com/Kitware/CMake/releases/download/v4.5.1/cmake-4.5.1-windows-x86_64.zip",
+      "sha256": "bfe6eadb245dc8213e0d3feea316b520cb2aae92f5667ffd76059ba6b05c430c",
+      "root": "cmake-4.5.1-windows-x86_64",
+      "path": "cmake-4.5.1-windows-x86_64.zip"
     }
   }
 }

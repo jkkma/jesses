@@ -49,6 +49,26 @@ def main():
         path = retained / recipe.relative(item["path"])
         if path.is_symlink() or not path.is_file() or recipe.digest(path) != item["sha256"]:
             raise ValueError(f"A retained FFmpeg delivery input changed: {path}")
+    lock = json.loads(recipe.LOCK.read_text())
+    ffmpeg = lock["ffmpeg"]
+    ffmpeg_source = previous / "work/ffmpeg" / ffmpeg["sourceRoot"]
+    version_file = ffmpeg_source / "RELEASE"
+    if (provenance["source"]["sha256"] != ffmpeg["sha256"] or not version_file.is_file()
+            or version_file.read_text().strip() != ffmpeg["version"]):
+        raise ValueError("The retained FFmpeg build differs from the current source lock.")
+    locked_dependencies = [*lock["libraries"], *lock["buildTools"]]
+    retained_sources = {(item["url"], item["sha256"]): item for item in provenance["additionalSources"]}
+    reused_sources = [provenance["source"]]
+    for item in locked_dependencies:
+        key = item["url"], item["sha256"]
+        if key not in retained_sources:
+            raise ValueError(f"The retained static prefix lacks locked source provenance for {item['id']}.")
+        reused_sources.append(retained_sources[key])
+    locked_notices = {f"licenses/{item.get('id', 'ffmpeg')}/{name.replace('/', '-')}"
+                      for item in [ffmpeg, *locked_dependencies] for name in item["licenseFiles"]}
+    reused_licenses = [item for item in provenance["licenses"] if item["path"] in locked_notices]
+    if {item["path"] for item in reused_licenses} != locked_notices:
+        raise ValueError("The retained static prefix lacks locked FFmpeg or dependency notices.")
     if args.resume and not (args.build_directory / "delivery/build/reused-static-prefix.json").is_file():
         raise ValueError("The requested directory is not an owned retained-prefix build.")
     builder = recipe.Builder(args.build_directory, args.cache, args.jobs, resume=args.resume)
@@ -68,10 +88,13 @@ def main():
                                  **({"symlink": os.readlink(path)} if path.is_symlink() else {})})
     if not args.resume:
         (builder.delivery / "build/reused-static-prefix.json").write_text(json.dumps(prefix_files, indent=2) + "\n")
-    for name in ("sources", "licenses"):
-        shutil.copytree(retained / name, builder.delivery / name, dirs_exist_ok=True)
-    builder.sources = [provenance["source"], *provenance["additionalSources"]]
-    builder.licenses = provenance["licenses"].copy()
+    for item in [*reused_sources, *reused_licenses]:
+        relative = recipe.relative(item["path"])
+        target = builder.delivery / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(retained / relative, target)
+    builder.sources = reused_sources
+    builder.licenses = reused_licenses
     builder.env.update({
         "CPPFLAGS": f"-I{builder.prefix}/include", "LDFLAGS": f"-L{builder.prefix}/lib",
         "PKG_CONFIG_LIBDIR": f"{builder.prefix}/lib/pkgconfig:{builder.prefix}/share/pkgconfig",
@@ -95,8 +118,7 @@ def main():
                         raise ValueError(f"A retained processing source is absent or a symlink: {path}")
                     with bundle.extractfile(member) as original:
                         contents = original.read()
-                    compatible = vulkan.compatible_source(path.relative_to(source).as_posix(), contents) if item["id"] == "libplacebo" else contents
-                    if path.read_bytes() not in (contents, compatible):
+                    if path.read_bytes() != contents:
                         raise ValueError(f"A retained processing source changed: {path}")
             packaged = builder.delivery / "sources" / item["filename"]
             if packaged.is_symlink() or recipe.digest(packaged) != item["sha256"]:
@@ -111,16 +133,13 @@ def main():
     else:
         records = vulkan.sources(builder)
     vulkan.build(builder, records)
-    for name in ("restore-libplacebo-ffmpeg-linux.py", "build-package-libplacebo.py", "package-libplacebo-lock.json", "libplacebo-python314.patch"):
+    for name in ("restore-libplacebo-ffmpeg-linux.py", "build-package-libplacebo.py", "package-libplacebo-lock.json"):
         shutil.copy2(ROOT / "scripts" / name, builder.delivery / "build" / name)
     if args.dependencies_only:
         print(f"Static Vulkan processing dependencies built: {builder.prefix}", flush=True)
         return
-    sources = list((previous / "work/ffmpeg").glob("ffmpeg-*"))
-    if len(sources) != 1 or (sources[0] / "RELEASE").read_text().strip() != "9.0.1":
-        raise ValueError("The retained official FFmpeg9.0.1 source tree is absent.")
-    tools, flags = builder.ffmpeg(sources[0], "9.0.1")
-    builder.finish(json.loads(recipe.LOCK.read_text()), tools, flags)
+    tools, flags = builder.ffmpeg(ffmpeg_source, ffmpeg["version"])
+    builder.finish(lock, tools, flags)
 
 
 if __name__ == "__main__":

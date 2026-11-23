@@ -6,15 +6,16 @@ AppImage/DEB resources. Historical receipts remain evidence only for their named
 revisions; the newly changed artifacts require fresh native and clean-environment
 qualification. macOS uses a separate [lean external-tool app archive](macos.md).
 
-`scripts/build-package-ffmpeg-linux.py` builds FFmpeg and FFprobe 9.0.1 for Linux
+`scripts/build-package-ffmpeg-linux.py` builds FFmpeg and FFprobe 9.1 for Linux
 x86-64. It compiles the linked codec, display-conversion and compression libraries
 from the exact source archives in `scripts/package-ffmpeg-linux-lock.json`.
 Codec libraries are static; the Linux C/C++ runtimes remain ordinary system
 dependencies. This is an Ubuntu 24.04 build lane, not a universal Linux binary.
 
 The lock contains complete MSYS2 source bundles for bzip2, dav1d, LAME, libogg,
-libvorbis, libvpx, x264, Opus, x265, AOM 3.14.1, SVT-AV1 4.2.0, XZ, zimg, zlib, libass, VMAF, FreeType,
-HarfBuzz, FriBidi, fontconfig, Expat, libunibreak, Brotli and libpng. Meson 1.12.0
+libvorbis, libvpx, x264, Opus, x265, AOM 3.15.3, SVT-AV1 4.3.0, XZ, zimg, zlib, libass, VMAF 3.2.1, FreeType,
+HarfBuzz, FriBidi, fontconfig, Expat, Brotli and libpng. It also pins libunibreak
+8.0.1 from upstream. Meson 1.12.1
 also runs from a pinned complete source bundle; the host's older Meson is not used.
 The builder verifies both
 the outer bundle and each embedded upstream archive. For x264 it checks out the

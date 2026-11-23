@@ -223,11 +223,12 @@ def build_aom(destination, cache, lock, compiler, helper, stager, *, jobs=8):
              "-DCMAKE_EXE_LINKER_FLAGS=-static -static-libgcc -static-libstdc++",
              f"-DCMAKE_C_COMPILER={compiler / 'ucrt64/bin/gcc.exe'}",
              f"-DCMAKE_CXX_COMPILER={compiler / 'ucrt64/bin/g++.exe'}",
-             f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}"]
+             f"-DCMAKE_MAKE_PROGRAM={compiler / 'ucrt64/bin/ninja.exe'}",
+             f"-DPERL_EXECUTABLE={compiler / 'usr/bin/perl.exe'}"]
     run_logged([([str(cmake), "-S", str(source), "-B", str(build), *flags], destination),
                 ([str(cmake), "--build", str(build), "--target", "aomenc", "--parallel", str(jobs)], destination)],
                destination, env)
-    public_flags = [flag for flag in flags if not flag.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER=", "-DCMAKE_MAKE_PROGRAM="))]
+    public_flags = [flag for flag in flags if not flag.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER=", "-DCMAKE_MAKE_PROGRAM=", "-DPERL_EXECUTABLE="))]
     return build / "aomenc.exe", archive, [source / "LICENSE", source / "PATENTS"], public_flags
 
 
@@ -378,8 +379,11 @@ def finish(identifier, destination, media, provenance, runtime, compiler, source
     result = subprocess.run([str(target), identity_switch], env=env, capture_output=True,
                             text=True, timeout=20)
     full_output = (result.stdout + result.stderr).strip()
-    version = next((line.strip() for line in full_output.splitlines() if "3.14.1" in line), full_output) if identifier == "aom" else next((line.strip() for line in full_output.splitlines() if "VP9 Encoder v1.17.0" in line), full_output) if identifier == "vpx" else full_output
-    expected = {"aom": "3.14.1", "vpx": "1.17.0", "x265": "4.3"}[identifier]
+    expected = lock[identifier]["version"]
+    version = full_output
+    if identifier in {"aom", "vpx"}:
+        marker = f"VP9 Encoder v{expected}" if identifier == "vpx" else expected
+        version = next((line.strip() for line in full_output.splitlines() if marker in line), full_output)
     if expected not in version:
         raise ValueError(f"Unexpected {identifier} executable identity: {version}")
     tune_qualification, qualification_files = verify_aom_tunes(target, destination, env) if identifier == "aom" else ([], [])

@@ -376,17 +376,19 @@
             role="option"
             class="track-option"
             aria-selected={selected === key(row)}
-            onclick={() => (selected = key(row))}>{display(row)}</button
+            onclick={() => (selected = key(row))}
           >
+            {display(row)}
+          </button>
         </div>
       {:else}<p class="empty">Load tracks from the File List.</p>{/each}
     </div>
     <SourceThumbnail file={mainFile} />
   </div>
   <div class="actions">
-    <button type="button" popovertarget={selectMenuId} disabled={blocked} bind:this={selectTrigger}
-      >Select…</button
-    >
+    <button type="button" popovertarget={selectMenuId} disabled={blocked} bind:this={selectTrigger}>
+      Select…
+    </button>
     <div
       id={selectMenuId}
       popover="auto"
@@ -405,12 +407,14 @@
           onclick={() => {
             selectAll(value);
             selectPopover?.hidePopover();
-          }}>{label}</button
-        >{/each}
+          }}
+        >
+          {label}
+        </button>{/each}
     </div>
-    <button type="button" popovertarget={sortMenuId} disabled={blocked} bind:this={sortTrigger}
-      >Sort…</button
-    >
+    <button type="button" popovertarget={sortMenuId} disabled={blocked} bind:this={sortTrigger}>
+      Sort…
+    </button>
     <div
       id={sortMenuId}
       popover="auto"
@@ -429,22 +433,33 @@
           onclick={() => {
             sortBy(value);
             sortPopover?.hidePopover();
-          }}>{label}</button
-        >{/each}
+          }}
+        >
+          {label}
+        </button>{/each}
     </div>
     {#if selectedRow && selectedStream?.kind === 'attachment'}<button
         type="button"
         disabled={blocked || extracting}
-        onclick={() => extract(selectedRow)}>Extract</button
-      >{/if}
+        onclick={() => extract(selectedRow)}
+      >
+        Extract
+      </button>{/if}
     {#if selectedRow}<button
         type="button"
         disabled={blocked}
         aria-label="Move track up"
-        onclick={() => move(-1)}>▲</button
-      ><button type="button" disabled={blocked} aria-label="Move track down" onclick={() => move(1)}
-        >▼</button
-      >{/if}
+        onclick={() => move(-1)}
+      >
+        ▲
+      </button><button
+        type="button"
+        disabled={blocked}
+        aria-label="Move track down"
+        onclick={() => move(1)}
+      >
+        ▼
+      </button>{/if}
   </div>
   {#if extractError}<p role="alert">{extractError}</p>{/if}
   {#if selectedStream && selectedRow}<pre>{details(selectedStream, selectedRow)}</pre>{/if}
@@ -455,10 +470,13 @@
         disabled={blocked || !audio.length}
         value={audio.length ? key(audio.find((row) => row.defaultFlag === true) ?? audio[0]) : ''}
         onchange={(event) => setDefault('audio', event.currentTarget.value)}
-        >{#if !audio.length}<option value="">None</option>{/if}{#each audio as row}<option
-            value={key(row)}>{defaultDisplay(row, false)}</option
-          >{/each}</select
       >
+        {#if !audio.length}<option value="">None</option>{/if}{#each audio as row}<option
+            value={key(row)}
+          >
+            {defaultDisplay(row, false)}
+          </option>{/each}
+      </select>
     </div>
     <div class="default-field">
       <label for={defaultSubtitlesId}>Default Subtitles</label><select
@@ -468,10 +486,11 @@
           ? key(subtitles.find((row) => row.defaultFlag === true)!)
           : ''}
         onchange={(event) => setDefault('subtitle', event.currentTarget.value)}
-        ><option value="">None</option>{#each subtitles as row}<option value={key(row)}
-            >{defaultDisplay(row, true)}</option
-          >{/each}</select
       >
+        <option value="">None</option>{#each subtitles as row}<option value={key(row)}>
+            {defaultDisplay(row, true)}
+          </option>{/each}
+      </select>
     </div>
   </div>
 </section>

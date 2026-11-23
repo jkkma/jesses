@@ -2,7 +2,7 @@
 
 The user's CPU-only encoding instruction excludes hardware encoders. It preserves Vulkan processing, libplacebo Spline tone mapping and GPU quality scorers. These are separate capabilities.
 
-Both production FFmpeg 9.0.1 recipes now explicitly enable `--enable-vulkan --enable-libplacebo` under `--disable-autodetect`. They retain the 46 hardware-encoder exclusions in `scripts/cpu-encoding-policy.json`, including Vulkan encoders. No Vulkan processing API or filter is disabled to enforce that policy.
+The Windows and Linux FFmpeg 9.1 recipes explicitly enable `--enable-vulkan --enable-libplacebo` under `--disable-autodetect`. The CPU-only policy in `scripts/cpu-encoding-policy.json` excludes hardware encoders, including the new APV Vulkan and HEVC MediaCodec encoders.
 
 ## Reproducible dependency closure
 
@@ -10,30 +10,30 @@ Both production FFmpeg 9.0.1 recipes now explicitly enable `--enable-vulkan --en
 
 | Dependency     | Pin                                                      | Purpose                                                                                                            |
 | -------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| libplacebo     | v7.351.0                                                 | FFmpeg 9's minimum supported libplacebo; Vulkan renderer, Spline, peak detection and Dolby Vision reshaping        |
-| Vulkan-Headers | cacef3039d277c448c89336290ec3937270b0996, header 1.4.310 | Exact libplacebo submodule; public headers and matched XML registry                                                |
-| glslang        | 15.1.0                                                   | Statically linked runtime shader compiler; optimizer/tests disabled, so no external SPIRV-Tools/shaderc dependency |
-| fast_float     | 1bf70101536d37fa9954cc4f03fd0903d045a9f3                 | Exact libplacebo submodule                                                                                         |
+| libplacebo     | v7.387.0                                                 | Vulkan renderer, Spline, peak detection and Dolby Vision reshaping                                                 |
+| Vulkan-Headers | 74d8a6cb930c68ef617b202c3ff3c59d919e086b, header 1.4.345 | Exact libplacebo submodule; public headers and matched XML registry                                                |
+| glslang        | 16.6.0                                                   | Statically linked runtime shader compiler; optimizer/tests disabled, so no external SPIRV-Tools/shaderc dependency |
+| fast_float     | 97b54ca9e75f5303507699d27c6b4f4efe4641a1                 | Exact libplacebo submodule                                                                                         |
 | Jinja          | 15206881c006c79667fe5154fe80c01c65410679                 | Exact source generator submodule                                                                                   |
-| MarkupSafe     | 28ace20b140d15c083e1cbc163ee6b7778ba098c                 | Exact source generator submodule                                                                                   |
+| MarkupSafe     | 297fc8e356e6836a62087949245d09a28e9f1b13                 | Exact source generator submodule                                                                                   |
 
 `build-package-libplacebo.py` is the shared static-library recipe. Linux uses its existing isolated builder; `build-package-libplacebo-windows.py` adapts the same source verification/build commands to the pinned UCRT64 compiler. Meson wraps and CMake source downloads are disabled. GLSL libraries are explicitly resolved from the owned prefix. The libplacebo `.pc` repair preserves static library order using `-l` entries rather than absolute archives that FFmpeg misclassifies as compiler flags; its C++ runtime is explicit.
 
 libplacebo enables Vulkan, glslang and Dolby reshaping, and disables unused OpenGL/D3D11, libdovi, ICC, unwind, xxhash, demos and tests. FFmpeg supplies the dynamically loaded platform Vulkan entry point; the operating system must supply its Vulkan loader and device driver. No Vulkan loader or driver is represented as a statically bundled codec library.
 
-The exact upstream archive remains unchanged. `libplacebo-python314.patch` changes only `VkXML(ET.parse(xmlfile))` to `VkXML(ET.parse(xmlfile).getroot())`, required by Python 3.14's ElementTree constructor. Its SHA is in the processing lock and its bytes are shipped with the recipe. Pristine upstream Python 3.12 and patched Python 3.14 generate byte-identical 382,797-byte C source, SHA256 `5f82d2d56a541f2442477fae4a7964c01d2f04f62f3d2014314778c6da97f618`.
+libplacebo v7.387.0 passes the XML root element to the Vulkan generator upstream, so the recipe builds the original source with Python 3.14.
 
 Fresh builds use the normal platform build recipes. The checked incremental Linux restoration driver preserves the prior delivery, records every reused static-prefix file, rechecks original source archive bytes before resume, and reuses the explicitly named existing FFmpeg object tree:
 
 ```sh
 ~/.local/bin/python3.14 scripts/restore-libplacebo-ffmpeg-linux.py \
-  --previous-build target/toolchains/ffmpeg-full-20261101 \
-  --build-directory target/toolchains/ffmpeg-vulkan-20261101 \
+  --previous-build target/toolchains/ffmpeg-9.1 \
+  --build-directory target/toolchains/ffmpeg-vulkan-9.1 \
   --cache target/tool-source-cache --jobs 2
 # If this owned build was interrupted, use the same command with --resume.
 ```
 
-The source-complete Linux delivery is `target/toolchains/ffmpeg-vulkan-20261101/delivery`. Original CPU and historical NVENC delivery bytes were preserved. Final new FFmpeg SHA256 is `f18d560789ae2ba38aaaf665e49730a5c99a44e847e78e6e5c02bb28441fd3a1`; FFprobe SHA256 is `84a4a7934a52d0646517254a6c74a2c6ceab2860c2f116b428b910be03aa19cc`.
+The November 1 FFmpeg 9.0.1 qualification used `target/toolchains/ffmpeg-vulkan-20261101/delivery`. Its FFmpeg SHA-256 is `f18d560789ae2ba38aaaf665e49730a5c99a44e847e78e6e5c02bb28441fd3a1` and its FFprobe SHA-256 is `84a4a7934a52d0646517254a6c74a2c6ceab2860c2f116b428b910be03aa19cc`.
 
 ## Admission and execution
 

@@ -259,9 +259,9 @@
   width={720}
 >
   <div class="preview">
-    {#if preview}<img src={preview.imageDataUrl} alt="Video preview" />{:else}<span
-        >{loading ? 'Reading preview…' : file ? 'No preview available' : 'No file loaded'}</span
-      >{/if}
+    {#if preview}<img src={preview.imageDataUrl} alt="Video preview" />{:else}<span>
+        {loading ? 'Reading preview…' : file ? 'No preview available' : 'No file loaded'}
+      </span>{/if}
   </div>
   <input
     aria-label="Position"
@@ -295,16 +295,22 @@
         type="button"
         aria-label="Jump to start point"
         title="Jump to the start point"
-        onclick={() => seek((fromText(startText) ?? 0) / 1000)}>⏮</button
-      >{#each [{ l: '-10s', n: -10 }, { l: '-1s', n: -1 }, { l: '-1f', n: -frameDuration / 1000 }, { l: '+1f', n: frameDuration / 1000 }, { l: '+1s', n: 1 }, { l: '+10s', n: 10 }] as item}<button
+        onclick={() => seek((fromText(startText) ?? 0) / 1000)}
+      >
+        ⏮
+      </button>{#each [{ l: '-10s', n: -10 }, { l: '-1s', n: -1 }, { l: '-1f', n: -frameDuration / 1000 }, { l: '+1f', n: frameDuration / 1000 }, { l: '+1s', n: 1 }, { l: '+10s', n: 10 }] as item}<button
           type="button"
-          onclick={() => seek(position + item.n)}>{item.l}</button
-        >{/each}<button
+          onclick={() => seek(position + item.n)}
+        >
+          {item.l}
+        </button>{/each}<button
         type="button"
         aria-label="Jump to end point"
         title="Jump to the end point"
-        onclick={() => seek((fromText(endText) ?? 0) / 1000)}>⏭</button
+        onclick={() => seek((fromText(endText) ?? 0) / 1000)}
       >
+        ⏭
+      </button>
     </div>
   </div>
   <div class="form">
@@ -316,11 +322,15 @@
             ? 'slow'
             : 'fast'}
         onchange={(event) => changeMode(event.currentTarget.value)}
-        ><option value="fast">Time (exact - seeks straight to the point)</option><option
-          value="slow">Time (exact - decodes from the start, much slower)</option
-        ><option value="frames">Frame numbers (exact - decodes from the start, much slower)</option
-        ></select
-      ><span></span>{/if}
+      >
+        <option value="fast">Time (exact - seeks straight to the point)</option><option
+          value="slow"
+        >
+          Time (exact - decodes from the start, much slower)
+        </option><option value="frames">
+          Frame numbers (exact - decodes from the start, much slower)
+        </option>
+      </select><span></span>{/if}
     <label for="cut-start">Start</label><input
       id="cut-start"
       bind:value={startText}
@@ -346,8 +356,10 @@
       onclick={() => {
         invalidateSnap();
         endText = textValue(position * 1000);
-      }}>Set end to playhead</button
+      }}
     >
+      Set end to playhead
+    </button>
     <label for="cut-duration">Duration</label><input
       id="cut-duration"
       readonly
@@ -368,8 +380,10 @@
               .catch((cause) => {
                 if (!aborted(cause)) error = String(cause);
               });
-        }}>Snap start to keyframe</button
-      >{:else}<span></span>{/if}
+        }}
+      >
+        Snap start to keyframe
+      </button>{:else}<span></span>{/if}
   </div>
   {#if copied}<p>The start is moved to the preceding keyframe.</p>{/if}{#if error}<p role="alert">
       {error}
@@ -377,8 +391,10 @@
   <div class="actions">
     <button type="button" onclick={reset}>Reset</button><button
       type="button"
-      onclick={() => void confirm()}>OK</button
+      onclick={() => void confirm()}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 

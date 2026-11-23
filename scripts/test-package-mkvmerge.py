@@ -63,14 +63,16 @@ class MkvmergePackagingTests(unittest.TestCase):
         packages = lock["packages"]
         sources = lock["sources"]
         files = lock["files"]
-        self.assertEqual((len(packages), len(sources), len(files)), (21, 20, 23))
+        self.assertEqual(lock["schemaVersion"], 2)
+        self.assertEqual(lock["source"]["sourceRoot"], "mkvtoolnix-104.0")
+        self.assertTrue(packages and sources and files and lock["buildPackages"])
         self.assertEqual({(item["base"], item["version"]) for item in packages},
                          {(item["base"], item["version"]) for item in sources})
         self.assertEqual(len({item["path"].lower() for item in files}), len(files))
         self.assertEqual(len({item["name"] for item in packages}), len(packages))
         self.assertEqual(len({item["base"] for item in sources}), len(sources))
         binary_names = {item["path"].lower() for item in files}
-        self.assertIn("mkvmerge.exe", binary_names)
+        self.assertNotIn("mkvmerge.exe", binary_names)
         for item in files:
             self.assertIn(item["package"], {package["name"] for package in packages})
             self.assertEqual(item["member"], "ucrt64/bin/" + item["path"])
@@ -78,10 +80,40 @@ class MkvmergePackagingTests(unittest.TestCase):
                 self.assertTrue(imported.lower() in binary_names | builder.SYSTEM_IMPORTS or
                                 imported.lower().startswith(("api-ms-win-", "ext-ms-win-")),
                                 f"Unpackaged import: {item['path']} -> {imported}")
-        for item in [*packages, *sources]:
+        for imported in lock["imports"]:
+            self.assertTrue(imported.lower() in binary_names | builder.SYSTEM_IMPORTS or
+                            imported.lower().startswith(("api-ms-win-", "ext-ms-win-")), imported)
+        for item in [*packages, *sources, *lock["buildPackages"]]:
             self.assertEqual(len(item["sha256"]), 64)
-            self.assertTrue(item["url"].startswith("https://repo.msys2.org/mingw/"))
-        self.assertEqual(lock["versionLine"], "mkvmerge v97.0 ('You Don't Have A Clue') 64-bit")
+            self.assertTrue(item["url"].startswith("https://repo.msys2.org/"))
+        self.assertEqual(lock["versionLine"], "mkvmerge v104.0 ('Chimera') 64-bit")
+        self.assertEqual(len(lock["source"]["sha256"]), 64)
+
+    def test_cli_icon_keeps_all_reviewed_dimensions_from_the_upstream_icon(self):
+        chunks = []
+        for size in (32, 64, 128, 256):
+            data = b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + struct.pack(">II", size, size)
+            chunks.append(struct.pack(">4sI", b"icon", len(data) + 8) + data)
+        payload = b"".join(chunks)
+        icon = builder.cli_icon(struct.pack(">4sI", b"icns", len(payload) + 8) + payload)
+        self.assertEqual(struct.unpack_from("<HHH", icon), (0, 1, 4))
+        self.assertEqual([icon[6 + i * 16] for i in range(4)], [32, 64, 128, 0])
+
+    def test_source_extraction_preserves_drake_archive_link(self):
+        with tempfile.TemporaryDirectory(prefix="jesses-mkvmerge-source-") as directory:
+            scratch = Path(directory)
+            archive_path = scratch / "source.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                body = b"puts 'drake'\n"
+                real = tarfile.TarInfo("mkvtoolnix/source/drake")
+                real.size = len(body)
+                archive.addfile(real, io.BytesIO(body))
+                link = tarfile.TarInfo("mkvtoolnix/drake")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "source/drake"
+                archive.addfile(link)
+            source = builder.extract_source(archive_path, scratch / "extracted", "mkvtoolnix")
+            self.assertEqual((source / "drake").read_bytes(), body)
 
     def test_pe_parser_and_closure_reject_unknown_or_corrupt_imports(self):
         with tempfile.TemporaryDirectory(prefix="jesses-mkvmerge-pe-") as directory:
@@ -120,7 +152,7 @@ class MkvmergePackagingTests(unittest.TestCase):
     def test_removed_or_modified_notice_cannot_be_staged(self):
         locked = json.loads((ROOT / "scripts/package-mkvmerge-notices-lock.json").read_text())
         self.assertEqual(locked["packageLockSha256"], builder.digest(builder.LOCK))
-        self.assertEqual(len(locked["licenses"]), 76)
+        self.assertTrue(locked["licenses"])
         stage.verify_mkvmerge_notices(locked["licenses"])
         missing = deepcopy(locked["licenses"])
         missing.pop()

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "packageLockSha256": "06a5decdac765d01ccb085d3044ff01d3ea3bd15aee74ea81b8b54b89a201861",
+  "packageLockSha256": "9c0084cf25cc1044a40b4dd559502d00be51e79aef88ccc1852e0a49e92f36f1",
   "licenses": [
     {
       "path": "licenses/boost-libs/LICENSE",
@@ -35,10 +35,6 @@
       "sha256": "6a1ee543e5282cd9061881edf462e6fdab181f328da71fc2c9a6950a80e94d01"
     },
     {
-      "path": "licenses/libebml/LICENSE.LGPL",
-      "sha256": "a8746534d481c0d1046a1c6c02acc034231ad45b56f04ca35212e1f23e3f2712"
-    },
-    {
       "path": "licenses/libgcc/COPYING.RUNTIME",
       "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74"
     },
@@ -56,15 +52,11 @@
     },
     {
       "path": "licenses/libiconv/README",
-      "sha256": "4ae66e61d1c6593c84c47105b368d579bcee1af566dbb959ec63a0c48425dcf4"
+      "sha256": "ff0400ffb0c3dace1a64012f4125f292a3fef58c5b8486c7f9ba0c01a0637f3c"
     },
     {
       "path": "licenses/libiconv/libcharset/COPYING.LIB",
       "sha256": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95"
-    },
-    {
-      "path": "licenses/libmatroska/LICENSE.LGPL",
-      "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
     },
     {
       "path": "licenses/libogg/COPYING",
@@ -279,31 +271,31 @@
       "sha256": "ec1815db59fcd302846df949d7424876cb2e2dc5ed1606c5fb0b36787b1cf43a"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/COPYING",
+      "path": "licenses/mkvtoolnix/COPYING",
       "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/Boost-1.0.txt",
+      "path": "licenses/mkvtoolnix/Boost-1.0.txt",
       "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/LGPL-2.1.txt",
+      "path": "licenses/mkvtoolnix/LGPL-2.1.txt",
       "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/LGPL-3.0.txt",
+      "path": "licenses/mkvtoolnix/LGPL-3.0.txt",
       "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/fmt-BSD.rst",
+      "path": "licenses/mkvtoolnix/fmt-BSD.rst",
       "sha256": "825c9324e70f8c839c8ba910543dd4a7daee243b86ef960594c11381a19980b8"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/nlohmann-json-MIT.txt",
+      "path": "licenses/mkvtoolnix/nlohmann-json-MIT.txt",
       "sha256": "50be9457e5c9faaba5e60d9c73f8eabe9e0737a2d9c3e58357d856661862c18e"
     },
     {
-      "path": "licenses/mingw-w64-mkvtoolnix/pugixml-MIT.txt",
+      "path": "licenses/mkvtoolnix/pugixml-MIT.txt",
       "sha256": "ee495f34aeff0c578a99f3350a2050d4e5860d27b2004c03c384a594fa2b0a7a"
     }
   ]

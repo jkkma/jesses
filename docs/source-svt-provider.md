@@ -2,8 +2,8 @@
 
 The source UI has one SVT choice. New canonical `svtAv1` requests use the qualified
 HDR provider for the host. Windows uses the x86-64-v3 asset of the upstream
-[SVT-AV1-HDR 2026-11-04 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-11-04-6d661b6),
-which is v4.3.0 at commit `6d661b6b510eb30b568d5ffcbb121176e553c454`, with
+[SVT-AV1-HDR v4.3.1 build](https://github.com/juliobbv-p/svt-av1-hdr/releases/tag/pgo-build-2026-11-04-421c659),
+at commit `421c65909eeb3703d5e8a7fda21a38374dc7565d`, with
 HDR10+ and Dolby Vision integration. Linux support is deferred. Its retained
 development recipe pins the same release. Version markers and binary hashes are
 in `scripts/svt-forks.json`, and source hashes are in
@@ -100,11 +100,11 @@ raw-filter/per-chunk consumer and recovery proofs are in
 
 ## Intentional engine correction and recovery
 
-The exact upstream engine pin is commit
-`805dad69143fa0a81cfe2fb89c0b9e90a828ea72` (source SHA-256
-`7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2`).
-Its unsigned XPSNR stats regex rejected valid negative average scores and silently
-skipped negative frame scores. `scripts/patch-package-av1an.py` now accepts signed
+The current Windows package pins Av1an v0.6.0 at commit
+`641ce62d70e34f438f3ee91ec50de77784a10705` (source SHA-256
+`0a86ae7c44b611661a6614cd8d0c48265712e9cfc65098253e62b0e0bce8007d`).
+Upstream's unsigned XPSNR stats regex rejects valid negative average scores and
+silently skips negative frame scores. `scripts/patch-package-av1an.py` accepts signed
 values and adds a deterministic negative-frame/negative-average regression and
 `xpsnr-signed-stats-v1` version marker. The marker is locked in the package recipe
 and retained in build provenance. This is an intentional engine bug correction,

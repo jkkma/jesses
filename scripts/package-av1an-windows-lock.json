@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "rustVersion": "1.98.1",
+  "rustVersion": "1.100.0",
   "inputs": {
     "diffutilsBuild": {
       "path": "diffutils-3.12-1-x86_64.pkg.tar.zst",
@@ -8,44 +8,44 @@
       "sha256": "7902c8ce3d4dd69a0f5e98dc9d5c83c17b23314ba486169db57ef6e2835ce3b6"
     },
     "av1an": {
-      "path": "av1an-modern-source.tar.gz",
-      "url": "https://codeload.github.com/rust-av/Av1an/tar.gz/805dad69143fa0a81cfe2fb89c0b9e90a828ea72",
-      "sha256": "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2",
-      "commit": "805dad69143fa0a81cfe2fb89c0b9e90a828ea72",
-      "version": "0.5.2"
+      "path": "av1an-0.6.0-source.tar.gz",
+      "url": "https://codeload.github.com/rust-av/Av1an/tar.gz/641ce62d70e34f438f3ee91ec50de77784a10705",
+      "sha256": "0a86ae7c44b611661a6614cd8d0c48265712e9cfc65098253e62b0e0bce8007d",
+      "commit": "641ce62d70e34f438f3ee91ec50de77784a10705",
+      "version": "0.6.0"
     },
     "vapoursynth": {
       "path": "vapoursynth-source.tar.gz",
-      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/acabf605b2205b32d65859bb2736405719d2fafd",
-      "sha256": "042ce026e552a31c5c4b89f637fcb5841f69f807babc7e11f11f863a194d9da7",
-      "commit": "acabf605b2205b32d65859bb2736405719d2fafd",
-      "version": "R79"
+      "url": "https://codeload.github.com/vapoursynth/vapoursynth/tar.gz/e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "sha256": "d908d2c7a9278918658db0f2e3e46ac11c78cfb365d265616c41e648bc561900",
+      "commit": "e0fadcc1c8977e99b11ce2e478996a867a939874",
+      "version": "R82"
     },
     "pythonRuntime": {
-      "path": "python-3.14.7-embed-amd64.zip",
-      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip",
-      "sha256": "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15",
-      "version": "3.14.7"
+      "path": "python-3.15.2-embed-amd64.zip",
+      "url": "https://www.python.org/ftp/python/3.15.2/python-3.15.2-embed-amd64.zip",
+      "sha256": "d012f3aa29cf07436dae8aea1fec0fd195c2612a0b059b1f915ae0afb9ad1f62",
+      "version": "3.15.2"
     },
     "pythonSbom": {
-      "path": "python-3.14.7-embed-amd64.zip.spdx.json",
-      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip.spdx.json",
-      "sha256": "29c6982ade4b118ee371eb6060d24cb3c0da3f24578f7f1a67e82cca9b007ceb"
+      "path": "python-3.15.2-embed-amd64.zip.spdx.json",
+      "url": "https://www.python.org/ftp/python/3.15.2/python-3.15.2-embed-amd64.zip.spdx.json",
+      "sha256": "6ecf86d05cc9c35cb8f938eb53716ed9939c0f329c03f3fb389e3839dec339e9"
     },
     "pythonBuild": {
-      "path": "python.3.14.7.nupkg",
-      "url": "https://api.nuget.org/v3-flatcontainer/python/3.14.7/python.3.14.7.nupkg",
-      "sha256": "46a4da5529a92d18ff894911f6e6033a8253198d705b8161bf28c9123c87d46b"
+      "path": "python.3.15.2.nupkg",
+      "url": "https://api.nuget.org/v3-flatcontainer/python/3.15.2/python.3.15.2.nupkg",
+      "sha256": "294f5ed7ab97148fcbb57b8c06ba428f6d282c2bbaa266dbe3137284497998f0"
     },
     "pythonSource": {
-      "path": "Python-3.14.7.tar.xz",
-      "url": "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tar.xz",
-      "sha256": "3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81"
+      "path": "Python-3.15.2.tar.xz",
+      "url": "https://www.python.org/ftp/python/3.15.2/Python-3.15.2.tar.xz",
+      "sha256": "8b5536d280142ecf6cdfe15d12a21ba1c65e300bbf7b28a8d0cdb849575797de"
     },
     "cython": {
-      "path": "cython-3.3.0.tar.gz",
-      "url": "https://files.pythonhosted.org/packages/a9/d8/4981ef716ad0e3ff0d3ef383aefc6b03c4a88dee33b272bf8e0d833001ca/cython-3.3.0.tar.gz",
-      "sha256": "eed0d93fbca7087f143b42c34b05a825849bdf17f101572c2105acfa49aa88b8"
+      "path": "cython-3.3.1.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/99/ca/18e324972e5cac914816fdd7bb03e19a455b90039c277a538f7781b50c85/cython-3.3.1.tar.gz",
+      "sha256": "e0e45989e821bef6aa9ae15c7d583ab5e055f7406c4b3624e49e06d24e90375a"
     },
     "lsmash": {
       "path": "lsmash-works-source.tar.gz",
@@ -59,18 +59,18 @@
       "commit": "869fa993041f9f3af7d9ac8b10158920c6ddce66"
     },
     "zimg": {
-      "repo": "sekrit-twc/zimg",
-      "commit": "67e0603271c080e22c8429856dd4a8a56587e61e",
       "path": "zimg-vs-source.tar.gz",
-      "sha256": "539495d51fcd8c7ef9b89a611454e0c1173d18e8d4e743efdef67c4aa7e40d4f",
-      "url": "https://codeload.github.com/sekrit-twc/zimg/tar.gz/67e0603271c080e22c8429856dd4a8a56587e61e"
+      "url": "https://codeload.github.com/sekrit-twc/zimg/tar.gz/9806db428022893543121c94c7069263cd92a71a",
+      "sha256": "ffcb58f826c5b7e50a8879c30295da0857dd270ba727503895838519cbce87dc",
+      "commit": "9806db428022893543121c94c7069263cd92a71a",
+      "repo": "sekrit-twc/zimg"
     },
     "graphengine": {
-      "repo": "sekrit-twc/graphengine",
-      "commit": "cb5b2ce13384ec2491f0c37256ea210034799f69",
       "path": "graphengine-source.tar.gz",
-      "sha256": "663bc958094280e3dabfa76a408296a51f5222f56115fd7782eae737edeaa179",
-      "url": "https://codeload.github.com/sekrit-twc/graphengine/tar.gz/cb5b2ce13384ec2491f0c37256ea210034799f69"
+      "url": "https://codeload.github.com/sekrit-twc/graphengine/tar.gz/308d3735b05d99a1d792b82351be71b8ffc9a46b",
+      "sha256": "eef6cf7ac33b2aa1454d5b1dc229cd0b28c90e970868a87c36b679f0c8d98dab",
+      "commit": "308d3735b05d99a1d792b82351be71b8ffc9a46b",
+      "repo": "sekrit-twc/graphengine"
     },
     "xxhash": {
       "repo": "Cyan4973/xxHash",
@@ -98,6 +98,26 @@
       "commit": "39c24f36247f370864ce86ebdf2aa936151f4bfc",
       "path": "lsmash-ffmpeg-source.tar.gz",
       "sha256": "e3298a272e0adc1bde78f703a1f7916e7cb25d05b6239931af95db1b4cbcf4d1"
+    },
+    "glslang": {
+      "path": "glslang-source.tar.gz",
+      "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/168d452a4f460d24b588fed08477a81c44ee27a1",
+      "sha256": "c167b2474af06cbab93abae8249efaf88fb79a09f30488e2a24d399e4258ce7a",
+      "commit": "168d452a4f460d24b588fed08477a81c44ee27a1",
+      "version": "vulkan-sdk-1.4.357.0"
+    },
+    "vulkan-headers": {
+      "path": "vulkan-headers-source.tar.gz",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/e3b1eec08173d6b825cd3ac88c885a63b621504a",
+      "sha256": "f492279345cbc10708b64fcd432b3ff6c8246a5837c4db2b649abba00cf82208",
+      "commit": "e3b1eec08173d6b825cd3ac88c885a63b621504a",
+      "version": "vulkan-sdk-1.4.357.0"
+    },
+    "meson": {
+      "path": "meson-1.12.1.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/f9/c9/8c9983f4f3d9c4e22fd76bcf8cd053e4472aefae45fd044669b6daa34b53/meson-1.12.1.tar.gz",
+      "sha256": "ab0a6ca09f8ef70c564c8241fb5a23957886a0b53fb58412b5e07eaf07dba743",
+      "version": "1.12.1"
     }
   },
   "pythonSources": [
@@ -110,10 +130,10 @@
     },
     {
       "name": "expat",
-      "version": "2.8.2",
-      "url": "https://github.com/libexpat/libexpat/releases/download/R_2_8_2/expat-2.8.2.tar.gz",
-      "path": "expat-2.8.2.tar.gz",
-      "sha256": "ef7d1994f533c9e7343d6c19f31064fc8ebbcbcaa144be3812b4f43052a05f4c"
+      "version": "2.9.0",
+      "url": "https://github.com/libexpat/libexpat/releases/download/R_2_9_0/expat-2.9.0.tar.gz",
+      "path": "expat-2.9.0.tar.gz",
+      "sha256": "16afbb9cefead2aa278105cf27d9f597bde7fbf3dbb85015857ca7ca6a4e89ba"
     },
     {
       "name": "hacl-star",
@@ -152,17 +172,17 @@
     },
     {
       "name": "openssl",
-      "version": "3.5.7",
-      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/openssl-3.5.7.tar.gz",
+      "version": "3.5.9",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/openssl-3.5.9.tar.gz",
       "path": "openssl.tar.gz",
-      "sha256": "ca94e7c6c223d9caf77bb51aac5949186379608ea2a0cad3aa8bdf31856912e9"
+      "sha256": "d6cf0d9a651f25fe506f6b3dc133a80b9b79a0bc565f570dcf8fdbd597551485"
     },
     {
       "name": "sqlite",
-      "version": "3.50.4.0",
-      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/sqlite-3.50.4.0.tar.gz",
+      "version": "3.53.4.0",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/sqlite-3.53.4.0.tar.gz",
       "path": "sqlite.tar.gz",
-      "sha256": "fb5ab81f27612b0a7b4861ba655906c76dc85ee969e7a4905d2075aff931e8d0"
+      "sha256": "acc27a72ca7745781bb902269370303e778736a090585cc13acd2ea9ab785666"
     },
     {
       "name": "tcl",
@@ -180,10 +200,10 @@
     },
     {
       "name": "xz",
-      "version": "5.2.5",
-      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/xz-5.2.5.tar.gz",
+      "version": "5.8.1.1",
+      "url": "https://github.com/python/cpython-source-deps/archive/refs/tags/xz-5.8.1.1.tar.gz",
       "path": "xz.tar.gz",
-      "sha256": "a15c168e39e87d750c3dc766edc7f19bdda57dacf01e509678467eace91ad282"
+      "sha256": "1bfaba0ccacc6681d3ba85335cc7f49c24cf6f9d16f848cbd153b896d8a7d631"
     },
     {
       "name": "zlib-ng",
@@ -201,10 +221,10 @@
     }
   ],
   "cmakeWindows": {
-    "version": "4.4.3",
-    "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
-    "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
-    "root": "cmake-4.4.3-windows-x86_64"
+    "version": "4.5.1",
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.5.1/cmake-4.5.1-windows-x86_64.zip",
+    "sha256": "bfe6eadb245dc8213e0d3feea316b520cb2aae92f5667ffd76059ba6b05c430c",
+    "root": "cmake-4.5.1-windows-x86_64"
   },
   "compatibilityMarkers": [
     "ffmpeg9-passthrough-v1",
@@ -214,6 +234,7 @@
     "ffmpeg-metric-matrix-v1",
     "target-probe-filter-v1",
     "xpsnr-signed-stats-v1",
-    "source-unfiltered-probes-v1"
+    "source-unfiltered-probes-v1",
+    "preload-scenes-v1"
   ]
 }

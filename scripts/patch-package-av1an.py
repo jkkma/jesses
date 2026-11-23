@@ -3,21 +3,29 @@
 import argparse
 import difflib
 import hashlib
+import json
 from pathlib import Path
 import tarfile
 
-SOURCE_SHA256 = "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2"
-SOURCE_ROOT = "Av1an-805dad69143fa0a81cfe2fb89c0b9e90a828ea72"
-MARKER = "ffmpeg9-passthrough-v1"
-PROBE_FILTER_MARKER = "target-probe-filter-v1"
-SEGMENT_MARKER = "segment-ffmpeg9-v1"
-SIGNED_XPSNR_MARKER = "xpsnr-signed-stats-v1"
-SOURCE_PROBE_MARKER = "source-unfiltered-probes-v1"
+LOCK = json.loads(Path(__file__).with_name("package-av1an-windows-lock.json").read_text(encoding="utf-8"))
+SOURCE = LOCK["inputs"]["av1an"]
+SOURCE_ROOT = "Av1an-" + SOURCE["commit"]
+MARKERS = (
+    "ffmpeg9-passthrough-v1",
+    "segment-ffmpeg9-v1",
+    "julek-butteraugli-v1",
+    "lsmash-software-probes-v1",
+    "ffmpeg-metric-matrix-v1",
+    "target-probe-filter-v1",
+    "xpsnr-signed-stats-v1",
+    "source-unfiltered-probes-v1",
+    "preload-scenes-v1",
+)
 
 
 def patch_source(source, archive_path, patch_path):
     with archive_path.open("rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != SOURCE_SHA256:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != SOURCE["sha256"]:
             raise ValueError("The av1an patch requires the exact pinned upstream archive.")
     concat_path = "av1an-core/src/concat/mod.rs"
     paths = ["av1an-core/src/context.rs", "av1an/src/main.rs", "av1an-core/src/encoder/mod.rs", "av1an-core/src/encoder/tests.rs", "av1an-core/src/vapoursynth.rs", "av1an-core/src/metrics/xpsnr.rs", "av1an-core/src/metrics/vmaf.rs", "av1an-core/src/target_quality.rs", "av1an-core/src/settings.rs", "av1an-core/src/split/mod.rs", concat_path]
@@ -32,6 +40,12 @@ def patch_source(source, archive_path, patch_path):
     if '"-vsync"' in original[paths[2]] or '"-fps_mode".to_string(),\n                "passthrough".to_string(),' not in original[paths[2]]:
         raise ValueError("The pinned sampled-probe timestamp behavior is absent.")
     context = original[paths[0]]
+    initialize = context[context.index("    fn initialize("):context.index("        if self.args.resume && done_json_exists {")]
+    # The fresh encode receives --resume to preserve the preloaded scene list.
+    # Upstream must then switch back to fresh mode before creating a new queue.
+    if ('if !self.args.resume && Path::new(&self.args.temp).is_dir() {' not in initialize
+            or 'self.args.resume = false;' not in initialize[initialize.index("(false, false) => {"):]):
+        raise ValueError("The pinned scene preload behavior is absent.")
     start = context.index("    fn create_select_chunk(")
     end = context.index("        let output_ext", start)
     region = context[start:end]
@@ -45,7 +59,8 @@ def patch_source(source, archive_path, patch_path):
     before = '"{}-unstable (rev {}) ({})\n'
     if version.count(before) != 1:
         raise ValueError("The pinned av1an version banner changed.")
-    version = version.replace(before, '"{}-unstable (rev {}) ({}) [' + MARKER + '] [' + SEGMENT_MARKER + '] [julek-butteraugli-v1] [lsmash-software-probes-v1] [ffmpeg-metric-matrix-v1] [' + PROBE_FILTER_MARKER + '] [' + SIGNED_XPSNR_MARKER + '] [' + SOURCE_PROBE_MARKER + ']\n')
+    markers = "".join(f" [{marker}]" for marker in MARKERS)
+    version = version.replace(before, '"{} (rev {}) ({})' + markers + "\n")
     before = "    pub vmaf_filter: Option<String>,\n"
     after = before + '''
     /// Preserve source-app target probes and references before final filters.
@@ -349,8 +364,8 @@ mod source_probe_filter_tests {
             let audio_thread = (include_audio_sidecar
                 && self.args.input.is_video()
 """),
-        ("""            // TODO add explicit parameter to concatenation functions to control whether
-            // audio is also muxed in
+        ("""            // TODO add explicit parameter to concatenation functions to control
+            // whether audio is also muxed in
 """, ""),
         ("""                        self.args.encoder,
                         total_chunks,

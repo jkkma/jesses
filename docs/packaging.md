@@ -16,25 +16,26 @@ Use `package-desktop.py collect --tool-resources` to assemble the new executable
 with those verified tools, then verify the new archive and generate its Scoop
 manifest. Retain the tool sources, licenses, and provenance alongside the binaries.
 
-The workflow includes pinned SVT-AV1 5fish and upstream SVT-AV1-HDR 4.3.0,
+The workflow includes pinned SVT-AV1 5fish and upstream SVT-AV1-HDR 4.3.1,
 with matching source archives and license and patent notices. Both builds
 require an x86-64-v3 CPU. The HDR build requires the x64 Microsoft Visual C++
 v14 Redistributable. Each native packaging run checks their versions
 before bundling them. Binary and source downloads have pinned SHA-256 hashes.
 
-Windows package builds also compile the official FFmpeg/FFprobe 9.0.1 source
+Windows package builds also compile the official FFmpeg/FFprobe 9.1 source
 release with explicit x264, x265, VP9, AOM AV1, SVT-AV1, Opus, MP3, Vorbis, dav1d, zimg, libass
 subtitle rendering and VMAF support.
+The libass dependency uses the source-built libunibreak 8.0.1 archive shared with Linux.
 All codec libraries are linked statically; native qualification checks that the
 executables import only Windows system DLLs. The isolated compiler is assembled
 from SHA-256 pinned official MSYS2 payloads without changing the user's tools,
 executing package hooks or consulting a moving package index. The package retains
 the exact codec/runtime sources, notices, input lock and build scripts.
-The AV1 wrappers are source-built from pinned complete AOM 3.14.1/SVT-AV1 4.2.0
+The AV1 wrappers are source-built from pinned complete AOM 3.15.3 and SVT-AV1 4.3.0
 archives, with both outer and upstream archive hashes checked. Their original
 license and patent notices accompany the source closure. Actual 8-bit and 10-bit
 encodes run through the final FFmpeg binary before delivery.
-VMAF is built with its default, NEG and 4K models embedded. The build requires the pinned
+VMAF 3.2.1 is built with its default, NEG and 4K models embedded. The build requires the pinned
 model generator and rejects a library that silently omits those models. Windows
 subtitle rendering uses the operating system's DirectWrite font provider.
 
@@ -50,12 +51,12 @@ complete Git source already retained with FFmpeg. The standalone command support
 8-bit and 10-bit encoding and imports only Windows system libraries. Its receipt
 references the shared source and compiler-runtime notices by exact hashes.
 
-Windows packages also compile mainline SVT-AV1 4.2.0 from its pinned complete
+Windows packages also compile mainline SVT-AV1 4.3.0 from its pinned complete
 upstream source archive. Its source, BSD and patent notices, pinned CMake input
 and build recipe accompany the executable, with the shared compiler-runtime sources.
 
 Windows builds include a [portable av1an frameserver](windows-av1an-package.md):
-the pinned engine, VapourSynth R79, L-SMASH and private CPython runtime, with
+the pinned engine, VapourSynth R82, L-SMASH and private CPython 3.15.2 runtime, with
 complete sources, license notices, build receipts and per-child environment
 selection. The workflow adds source-built vszip and Julek CPU scorers in a
 separate verified merge. The Julek recipe trims checkout paths from MSVC
@@ -72,9 +73,11 @@ The retained Linux development recipes include standalone x264 and mainline
 SVT. They use external av1an/VapourSynth where the private Windows frameserver
 bundle is unavailable, with capabilities checked per job.
 
-Windows x64 also includes `mkvmerge` for Matroska muxing, chunk timing and metadata
-transfer, with its pinned sources, dependency notices and verified delivery.
-No separate MKVToolNix installation is needed for these packaged workflows.
+Windows x64 builds `mkvmerge` 104.0 for Matroska muxing, chunk timing and
+metadata transfer. The build uses the pinned MKVToolNix release source and an
+isolated MSYS2 compiler. The delivery retains the upstream source, build
+inputs, dependency sources and notices. Use `JESSES_MKVMERGE` to select an
+external executable by absolute path. [MKVToolNix 104.0 release](https://mkvtoolnix.download/windows/releases/104.0/)
 
 Windows x64 also has pinned standalone `aomenc`, `vpxenc` and `x265` deliveries.
 With a verified media delivery and isolated compiler, build each encoder into

@@ -9,12 +9,10 @@ stock text files are embedded by `src/presets.rs` at compile time. Crates.io
 `--replace` and the IVF stream-clock fixes. Version text alone cannot identify a
 usable provider.
 
-Jesses builds the exact source with private static FFmpeg 8.1 and dav1d 1.5.4.
-That source locks `ffmpeg-the-third` and `ffmpeg-sys-the-third` to
-`5.0.0+ffmpeg-8.1`; the recipe pins the matching private FFmpeg 8.1 source.
-It does not use the separate packaged FFmpeg 9 pair. Compatibility with FFmpeg 9
-has not been established by this qualification. The private build enables native
-decoders plus dav1d, so grain measurement retains actual FFV1/AV1 decoding. Optional library
+Jesses builds upstream commit `b3022cffeb24498e6a58f14d4b3114e9976b22a9` with
+private static FFmpeg 9.1 and dav1d 1.5.5. That commit locks `ffmpeg-the-third`
+and `ffmpeg-sys-the-third` to `6.0.0+ffmpeg-9.0`. The private build enables native
+decoders plus dav1d for grain measurement from FFV1 and AV1. Optional library
 auto-detection, encoders, network access and standalone FFmpeg programs are
 disabled. The application's main FFmpeg/FFprobe selection remains independent.
 No grav1synth processing code or embedded stock algorithm is patched. The build
@@ -24,7 +22,7 @@ working manifests, exact patch and hashes are retained in the delivery.
 
 ## Build and package
 
-Use Python 3.14, native Rust 1.98.1, a C compiler, make, meson, ninja, nasm,
+Use Python 3.14, native Rust 1.100.0, a C compiler, make, meson, ninja, nasm,
 pkg-config and libclang. Build into a new destination:
 
 ```sh
@@ -33,7 +31,7 @@ python3 scripts/build-package-grav1synth.py \
 ```
 
 On Windows, first assemble the repository's isolated media compiler, install
-the `1.98.1-x86_64-pc-windows-gnu` Rust toolchain into the selected isolated
+the `1.100.0-x86_64-pc-windows-gnu` Rust toolchain into the selected isolated
 `RUSTUP_HOME`/`CARGO_HOME`, and pass `--msys-root` to that compiler. The recipe
 selects that exact GNU host for Cargo build scripts and the final GNU target;
 adding only a GNU standard-library target to an MSVC host is insufficient.

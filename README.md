@@ -19,12 +19,16 @@ deferred. See [platform status](#platform-status) for development and
 qualification details.
 To run the desktop app from a checkout, install:
 
-- Node.js 24 or newer and pnpm 11.19.0, as specified in `package.json`.
-- Rust 1.98.1, pinned by `rust-toolchain.toml`, and the platform's
+- Node.js 26.13.1 or newer and pnpm 12.21.0, as specified in `package.json` and
+  `.node-version`.
+- Rust 1.100.0, pinned by `rust-toolchain.toml`, and the platform's
   [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 - FFmpeg and FFprobe for media inspection, plus the CPU encoder and other tools
   needed for the chosen workflow. AV1AN additionally needs a compatible
   VapourSynth frameserver and source reader. Some utilities need extra tools.
+
+The frontend uses TypeScript 6.0.3 because `svelte-check` still calls
+`typescript.sys`, which TypeScript 7.0.2 does not expose.
 
 From the repository root:
 
@@ -39,7 +43,7 @@ and permitted PATH fallbacks. Provider-specific rules also apply. See
 [packaging and tool discovery](docs/packaging.md),
 [SVT provider setup](docs/svt-forks.md), and
 [utility dependencies](docs/media-utilities.md#dependencies). The source-style
-SVT-AV1 choice resolves upstream SVT-AV1-HDR 4.3.0 in the Windows bundle. The
+SVT-AV1 choice resolves upstream SVT-AV1-HDR 4.3.1 in the Windows bundle. The
 bundled encoder requires the x64 Microsoft Visual C++ v14 Redistributable.
 [Download it from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).
 Older jobs retain their saved encoder identifiers.

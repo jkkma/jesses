@@ -1,4 +1,4 @@
-"""Build a task-local, pinned Linux R79/QTGMC qualification provider.
+"""Build a task-local, pinned Linux VapourSynth/QTGMC qualification provider.
 
 Requires Python3.14+ to read the locked source bundles, Python3.12+ development
 headers for --python, GCC/G++, make, Ninja, CMake3.28+, nasm, pkg-config,
@@ -24,8 +24,8 @@ import zipfile
 sys.dont_write_bytecode = True
 SCRIPTS = Path(__file__).resolve().parent
 LOCK_NAMES = ("qtgmc-linux-lock.json", "qtgmc-windows-lock.json", "package-av1an-windows-lock.json", "package-ffmpeg-linux-lock.json")
-COMMON = ("vapoursynth", "cython", "zimg", "graphengine", "lsmash", "decoderFfmpeg", "xxhash", "obuparse", "liblsmash")
-PLUGINS = {"znedi3": "vsznedi3.so", "fmtconv": "libfmtconv.so", "mvtools": "libmvtools.so", "miscfilters": "libmiscfilters.so", "removegrainvs": "libremovegrain.so", "eedi3": "libeedi3m.so", "fft3dfilter": "libfft3dfilter.so", "temporalsoften2": "libtemporalsoften2.so", "lsmash": "liblsmashsource.so"}
+COMMON = ("vapoursynth", "cython", "meson", "libp2p", "zimg", "graphengine", "glslang", "vulkan-headers", "lsmash", "decoderFfmpeg", "xxhash", "obuparse", "liblsmash")
+PLUGINS = {"znedi3": "vsznedi3.so", "fmtconv": "libfmtconv.so", "mvtools": "libmvtools.so", "miscfilters": "libmiscfilters.so", "removegrainvs": "libremovegrain.so", "eedi3": "libeedi3m.so", "fft3dfilter": "libfft3dfilter.so", "lsmash": "liblsmashsource.so"}
 
 
 def module(name, filename):
@@ -37,7 +37,6 @@ def module(name, filename):
 
 SUPPORT = module("qtgmc_linux_support", "package-av1an-support.py")
 DOWNLOADS = module("qtgmc_linux_downloads", "stage-bundled-tools.py")
-MEDIA = module("qtgmc_linux_media", "build-package-ffmpeg-linux.py")
 SCORERS = module("qtgmc_linux_readers", "build-vapoursynth-linux-scorers.py")
 
 
@@ -53,7 +52,7 @@ def source_inputs():
     if linux["schemaVersion"] != 1 or linux["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Unsupported Linux QTGMC source lock.")
     result = {name: dict(common[name]) for name in COMMON}
-    result.update({name: {"url": row["sourceUrl"], "sha256": row["sourceSha256"], "revision": row["revision"]} for name, row in qtgmc.items() if name != "vapoursynth"})
+    result.update({name: {"url": row["sourceUrl"], "sha256": row["sourceSha256"], "revision": row["revision"]} for name, row in qtgmc.items() if name not in {"vapoursynth", "mvtools-fftw"}})
     result.update({row["id"]: dict(row) for row in linux["submodules"]})
     return result
 
@@ -136,7 +135,7 @@ class Build:
                 if not self.sources[name].is_dir():
                     raise ValueError("A prepared source tree is missing.")
             else:
-                path = SUPPORT.unpack(archive, self.root / "work" / name, single_root=name != "fmtconv")
+                path = SUPPORT.unpack(archive, self.root / "work" / name)
                 self.sources[name] = path
                 self.state["sources"][name] = path.relative_to(self.root).as_posix()
                 self.save()
@@ -144,28 +143,16 @@ class Build:
         with zipfile.ZipFile(self.archives["znedi3"]) as archive:
             if archive.comment.decode() != linux["znedi3SourceCommit"]:
                 raise ValueError("The pinned znedi3 archive has a different source commit.")
-        meson = next(row for row in json.loads((SCRIPTS / LOCK_NAMES[3]).read_text())["buildTools"] if row["id"] == "meson")
-        self.archives["meson"] = MEDIA.download(meson, self.cache)
-        self.rows["meson"] = meson
-        if "meson" not in self.state["sources"]:
-            archive = self.archives["meson"]
-            bundle = MEDIA.extract(archive, self.root / "work/meson-bundle", meson["bundleRoot"])
-            embedded = bundle.parent / meson["embeddedArchive"]
-            if digest(embedded) != meson["embeddedSha256"]:
-                raise ValueError("The pinned Meson inner source differs.")
-            path = MEDIA.extract(embedded, self.root / "work/meson", meson["sourceRoot"])
-            self.state["sources"]["meson"] = path.relative_to(self.root).as_posix()
-            self.save()
-        self.meson = [sys.executable, str(safe_child(self.root, self.state["sources"]["meson"]) / "meson.py")]
-        self.sources["meson"] = safe_child(self.root, self.state["sources"]["meson"])
+        self.meson = [sys.executable, self.sources["meson"] / "meson.py"]
 
     def runtime_build(self):
         source = self.sources["vapoursynth"]
-        zimg = source / "subprojects/zimg"
-        if not zimg.exists():
-            shutil.copytree(self.sources["zimg"], zimg)
-            shutil.copytree(self.sources["graphengine"], zimg / "graphengine", dirs_exist_ok=True)
-            shutil.copytree(source / "subprojects/packagefiles/zimg", zimg, dirs_exist_ok=True)
+        for name in ("libp2p", "zimg", "glslang", "vulkan-headers"):
+            path = source / "subprojects" / name
+            shutil.copytree(self.sources[name], path, dirs_exist_ok=True)
+            if name == "zimg":
+                shutil.copytree(self.sources["graphengine"], path / "graphengine", dirs_exist_ok=True)
+            shutil.copytree(source / "subprojects/packagefiles" / name, path, dirs_exist_ok=True)
         native = self.root / "native.ini"
         native.write_text("[binaries]\npython = " + repr(str(self.python)) + "\ncython = " + repr([str(self.python), str(self.sources["cython"] / "cython.py")]) + "\n")
         build = self.root / "runtime-build"
@@ -178,26 +165,23 @@ class Build:
     def runtime_paths(self):
         matches = list(self.install.rglob("vapoursynth.abi3.so"))
         if len(matches) != 1:
-            raise ValueError("The built R79 Python extension is missing or ambiguous.")
+            raise ValueError("The built VapourSynth Python extension is missing or ambiguous.")
         self.runtime = matches[0].parent
-        # R79 retains its API3 compatibility layer, while Meson intentionally
-        # installs only API4 headers. The pinned MVTools/TemporalSoften sources
-        # still compile against API3; use the same R79 source's legacy headers.
-        for name in ("VapourSynth.h", "VSHelper.h"):
-            shutil.copy2(self.sources["vapoursynth"] / "include" / name, self.runtime / "include" / name)
-        # The old plugin Meson files also request libdir, which R79's current
+        # The old plugin Meson files also request libdir, which the current
         # headers-only pc file no longer declares. Keep the original installed
         # file intact and provide this explicit, task-local SDK compatibility pc.
         compatibility = self.root / "compat-pkgconfig"
         compatibility.mkdir(exist_ok=True)
-        (compatibility / "vapoursynth.pc").write_text(f"prefix={self.runtime}\nincludedir=${{prefix}}/include\nlibdir=${{prefix}}\nName: vapoursynth\nDescription: Pinned R79 SDK with legacy plugin libdir\nVersion: 79\nCflags: -I${{includedir}}\n")
+        revision = self.rows["vapoursynth"]["version"].removeprefix("R")
+        (compatibility / "vapoursynth.pc").write_text(f"prefix={self.runtime}\nincludedir=${{prefix}}/include\nlibdir=${{prefix}}\nName: vapoursynth\nDescription: VapourSynth SDK with legacy plugin libdir\nVersion: {revision}\nCflags: -I${{includedir}}\n")
         self.env["PKG_CONFIG_PATH"] = str(compatibility)
+        self.env["PYTHONPATH"] = str(self.runtime.parent)
         self.env["CPPFLAGS"] += " -I" + str(self.runtime / "include")
 
     def meson_plugin(self, name):
         build = self.root / (name + "-build")
         if not (build / "build.ninja").exists():
-            self.run(name, [*self.meson, "setup", build, self.sources[name], "--prefix", self.install, "--libdir", "lib", "--wrap-mode=nodownload", "-Db_lto=false"])
+            self.run(name, [*self.meson, "setup", build, self.sources[name], "--native-file", self.root / "native.ini", "--prefix", self.install, "--libdir", "lib", "--wrap-mode=nodownload", "-Db_lto=false"])
         self.run(name, [*self.meson, "compile", "-C", build, "-j", self.args.jobs])
         candidates = list(build.glob("*.so"))
         if len(candidates) != 1:
@@ -218,8 +202,8 @@ class Build:
         shutil.copy2(znedi3 / "nnedi3_weights.bin", self.plugins / "nnedi3_weights.bin")
         for name in ("miscfilters", "removegrainvs"):
             sources = sorted((self.sources[name] / "src").glob("*.cpp"))
-            self.run(name, ["g++", "-std=c++17", "-O2", "-fPIC", "-shared", "-fvisibility=hidden", "-DVS_TARGET_CPU_X86", "-I" + str(self.runtime / "include"), "-I" + str(self.sources["vapoursynth"] / "src/core"), *sources, "-o", self.plugins / PLUGINS[name]])
-        for name in ("mvtools", "eedi3", "fft3dfilter", "temporalsoften2"):
+            self.run(name, ["g++", "-std=c++17", "-O2", "-fPIC", "-shared", "-fvisibility=hidden", "-DVS_TARGET_CPU_X86", "-DVS_USE_LATEST_API", "-I" + str(self.runtime / "include"), "-I" + str(self.sources["vapoursynth"] / "src/core"), *sources, "-o", self.plugins / PLUGINS[name]])
+        for name in ("mvtools", "eedi3", "fft3dfilter"):
             self.meson_plugin(name)
         fmtconv = self.sources["fmtconv"] / "build/unix"
         if not (fmtconv / "configure").exists():
@@ -257,8 +241,8 @@ class Build:
         code = """import vapoursynth as vs, havsfunc, json, sys
 core=vs.core
 core.num_threads=2
-assert 'Core R79' in str(core), str(core)
-names={'znedi3':'znedi3','fmtconv':'fmtc','mvtools':'mv','miscfilters':'misc','removegrainvs':'rgvs','eedi3':'eedi3m','fft3dfilter':'fft3dfilter','temporalsoften2':'focus2','lsmash':'lsmas'}
+assert 'Core ' + sys.argv[4] in str(core), str(core)
+names={'znedi3':'znedi3','fmtconv':'fmtc','mvtools':'mv','miscfilters':'misc','removegrainvs':'rgvs','eedi3':'eedi3m','fft3dfilter':'fft3dfilter','lsmash':'lsmas'}
 for name,path in json.loads(sys.argv[1]).items():
     if not hasattr(core,names[name]): core.std.LoadPlugin(path=path)
 reader=core.lsmas.LWLibavSource(source=sys.argv[2],cache=0)
@@ -275,7 +259,7 @@ for preset in json.loads(sys.argv[3]):
 print('JESSES_QTGMC_PROVIDER '+json.dumps(proof))
 """
         presets = json.loads((SCRIPTS / LOCK_NAMES[0]).read_text())["presets"]
-        self.run("qualification", [self.python, "-c", code, json.dumps({name: str(self.plugins / filename) for name, filename in PLUGINS.items()}), source, json.dumps(presets)], env=env)
+        self.run("qualification", [self.python, "-c", code, json.dumps({name: str(self.plugins / filename) for name, filename in PLUGINS.items()}), source, json.dumps(presets), self.rows["vapoursynth"]["version"]], env=env)
         log = (self.root / "qualification.log").read_text()
         proof = json.loads(next(line.removeprefix("JESSES_QTGMC_PROVIDER ") for line in reversed(log.splitlines()) if line.startswith("JESSES_QTGMC_PROVIDER ")))
         (self.root / "qualification.json").write_text(json.dumps({"schemaVersion": 1, "presets": proof, "readerFrames": 8}, indent=2) + "\n")
@@ -362,7 +346,7 @@ def main():
     build.stage("reader", build.reader_build)
     build.stage("qualification", build.qualify)
     build.provenance()
-    print("Verified native R79/QTGMC provider: " + str(build.root), flush=True)
+    print("Verified native VapourSynth/QTGMC provider: " + str(build.root), flush=True)
 
 
 if __name__ == "__main__":

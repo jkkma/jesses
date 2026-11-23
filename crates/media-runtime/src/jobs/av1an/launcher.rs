@@ -300,23 +300,7 @@ fn verify_child_tool(directories: &[&Path], name: &str, selected: &Path) -> Resu
     let resolved = directories
         .iter()
         .map(|directory| directory.join(&name))
-        .find(|path| {
-            let Ok(metadata) = path.metadata() else {
-                return false;
-            };
-            if !metadata.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        });
+        .find(|path| crate::discovery::executable_file(path));
     if resolved
         .as_ref()
         .and_then(|path| path.canonicalize().ok())

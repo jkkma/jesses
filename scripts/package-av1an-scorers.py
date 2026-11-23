@@ -216,7 +216,7 @@ def main():
     sources = unpack_sources(archives, destination)
     supplied_headers = args.vapoursynth_source.resolve(strict=True) / "include"
     if support.inventory(supplied_headers) != support.inventory(sources["vapoursynth"] / "include"):
-        raise ValueError("The supplied VapourSynth headers differ from the pinned R79 source.")
+        raise ValueError("The supplied VapourSynth headers differ from the pinned source.")
     zig = support.unpack(archives["zigBuild"], destination / "zig") / "zig.exe"
     cmake = support.unpack(archives["cmakeBuild"], destination / "cmake") / "bin/cmake.exe"
     env, cl, compiler_receipt = support.msvc_environment(compiler, args.python.resolve(strict=True))

@@ -60,7 +60,7 @@ def optional_imports(binary, compiler):
     output = subprocess.check_output([str(objdump), "-p", str(binary)], text=True, timeout=30)
     imports = sorted({line.split("DLL Name:", 1)[1].strip().lower()
                       for line in output.splitlines() if "DLL Name:" in line})
-    if imports != ["kernel32.dll", "vulkan-1.dll"]:
+    if imports != ["kernel32.dll", "msvcrt.dll", "vulkan-1.dll"]:
         raise ValueError(f"Vship acquired an unreviewed native dependency: {imports}")
     return imports
 

@@ -628,21 +628,19 @@ fn resolve_executable(candidate: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn executable_file(path: &std::path::Path) -> bool {
+pub(crate) fn executable_file(path: &std::path::Path) -> bool {
     let Ok(metadata) = path.metadata() else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return false;
-        }
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
-    true
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 async fn discover(spec: ToolSpec) -> ToolInfo {
@@ -846,7 +844,7 @@ mod tests {
 
     #[test]
     fn source_svt_identity_requires_qualified_hdr_and_retains_explicit_legacy_mainline() {
-        let qualified = "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)\nHDR Release: N/A";
+        let qualified = "SVT-AV1-HDR v4.3.1-g421c65909 (release)\nHDR Release: N/A";
         let patman =
             "SVT-AV1-HDR v4.1.0+77+85-e4b6c4ff5 [Mod by Patman] (release)\nHDR Release: N/A";
         assert!(source_svt_identity_matches(qualified).unwrap());

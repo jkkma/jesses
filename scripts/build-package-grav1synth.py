@@ -1,6 +1,6 @@
-"""Build the fork's exact grav1synth with private compatible FFmpeg/dav1d.
+"""Build source-pinned grav1synth with private compatible FFmpeg/dav1d.
 
-Python3.14+, native Rust1.98.1, C compiler, make, meson, ninja, nasm,
+Python3.14+, native Rust1.100.0, C compiler, make, meson, ninja, nasm,
 pkg-config and libclang are required. Windows uses the verified isolated UCRT64
 compiler plus the Rust x86_64-pc-windows-gnu target. No system tool is installed,
 no existing build directory is reused, and no FFmpeg9 runtime is substituted.
@@ -22,7 +22,7 @@ import tarfile
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 LOCK = HERE / "grav1synth-lock.json"
-MANIFEST_SHA256 = "434378bf50e9ec3663f7826c75e92a7bde15a32eef508a477dec9cd13eccccd5"
+MANIFEST_SHA256 = "1fb1646777f649b9c15c309a8f06070325d42ccf2737ef88e0d51414bca44702"
 CONFIGURE = ["--disable-autodetect", "--disable-programs", "--disable-doc", "--disable-debug", "--disable-network", "--disable-encoders", "--disable-avdevice", "--disable-avfilter", "--disable-swscale", "--disable-swresample", "--disable-shared", "--enable-static", "--enable-pic", "--enable-libdav1d", "--disable-x86asm"]
 
 def module(path):
@@ -222,7 +222,7 @@ class Build:
         embedded = self.root / "dav1d.tar.xz"
         embedded.write_bytes(payload)
         decoder = MEDIA.extract(embedded, self.root / "dav1d-source", self.lock["dav1d"]["sourceRoot"])
-        prefix = self.root / "private-ffmpeg8"
+        prefix = self.root / "private-ffmpeg"
         self.run([*self.meson, "setup", self.root / "dav1d-build", decoder, f"--prefix={prefix.as_posix()}", "--libdir=lib", "--default-library=static", "--buildtype=release", "--wrap-mode=nodownload", "-Db_staticpic=true", "-Denable_tools=false", "-Denable_tests=false"])
         self.run([*self.meson, "compile", "-C", self.root / "dav1d-build", "-j", self.jobs])
         self.run([*self.meson, "install", "-C", self.root / "dav1d-build", "--no-rebuild"])

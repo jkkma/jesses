@@ -1,4 +1,4 @@
-use super::super::parameters::WINDOWS_HDR_RELEASE;
+use super::super::parameters::{WINDOWS_HDR_RELEASE, WINDOWS_LEGACY_HDR_RELEASE};
 use super::{AppError, Temporary, files};
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -16,8 +16,11 @@ pub(super) fn rewrites_count(identity: &str) -> bool {
             matches!(
                 line,
                 "SVT-AV1 v4.2.0 (release)"
+                    | "SVT-AV1 v4.3.0 (release)"
                     | "SVT-AV1 [5fish] v2.3.260827 (release)"
+                    | "SVT-AV1 [5fish] v2.3.261118 (release)"
                     | WINDOWS_HDR_RELEASE
+                    | WINDOWS_LEGACY_HDR_RELEASE
             )
         })
 }
@@ -110,12 +113,18 @@ mod tests {
             rewrites_count("SVT-AV1 v4.2.0 (release)\r\n"),
             cfg!(windows)
         );
+        assert_eq!(rewrites_count("SVT-AV1 v4.3.0 (release)"), cfg!(windows));
         assert_eq!(
             rewrites_count("\nSVT-AV1 [5fish] v2.3.260827 (release)"),
             cfg!(windows)
         );
         assert_eq!(
             rewrites_count("SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)\nHDR Release: N/A"),
+            cfg!(windows)
+        );
+        assert_eq!(rewrites_count(WINDOWS_HDR_RELEASE), cfg!(windows));
+        assert_eq!(
+            rewrites_count("SVT-AV1 [5fish] v2.3.261118 (release)"),
             cfg!(windows)
         );
         for unknown in [

@@ -67,14 +67,14 @@
       void load();
     }}
   >
-    {#if result}<img src={result.imageDataUrl} alt={`Thumbnail of ${file?.name}`} />{:else}<span
-        >{busy ? 'Loading thumbnail…' : 'No thumbnail'}</span
-      >{/if}
+    {#if result}<img src={result.imageDataUrl} alt={`Thumbnail of ${file?.name}`} />{:else}<span>
+        {busy ? 'Loading thumbnail…' : 'No thumbnail'}
+      </span>{/if}
   </button>
-  {#if result}<small
-      >Showing thumbnail {index + 1}/4 ({result.positionSeconds.toFixed(1)}s). Click for next
-      thumbnail.</small
-    >{/if}
+  {#if result}<small>
+      Showing thumbnail {index + 1}/4 ({result.positionSeconds.toFixed(1)}s). Click for next
+      thumbnail.
+    </small>{/if}
 </div>
 
 <style>

@@ -105,7 +105,7 @@ class GrainProviderTests(unittest.TestCase):
 
     def test_source_matches_fork_pin_and_complete_stock_matrix(self):
         lock = json.loads(BUILD.LOCK.read_text())
-        self.assertEqual(lock["source"]["commit"], "1044228cd411672b565e5762a9b3597f4dd163b0")
+        self.assertEqual(lock["source"]["commit"], "b3022cffeb24498e6a58f14d4b3114e9976b22a9")
         expected = ["Super8", "MaxMid"] + [base+suffix for base in ["16mm", "Classic35", "Modern35"] for suffix in ["", "-1", "-2", "-3"]]
         self.assertEqual(lock["presets"], expected)
         fixture = json.loads((BUILD.HERE.parent / "crates/media-runtime/tests/fixtures/grav1synth-presets.json").read_text())

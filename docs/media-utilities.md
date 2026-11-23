@@ -48,40 +48,15 @@ On Windows, Subtitle Edit `seconv` and Tesseract are discovered first in these s
 
 The runtime rejects a managed executable that is a link, reparse point, directory, or a path that resolves outside the managed root. It supplies the managed Tesseract directory and model directory only to the owned OCR child process. The desktop therefore needs no persistent `PATH` or `TESSDATA_PREFIX` change. If a managed executable is absent, discovery falls back to absolute `PATH` entries.
 
-The following PowerShell recipe installs the Windows x64 builds used by the real fixture. It requires `7z`, refuses to merge with an existing managed directory, checks each downloaded artifact, and does not run an installer or change machine settings:
+The Windows x64 setup script checks and stages [SeConv 5.4.0](https://github.com/SubtitleEdit/subtitleedit/releases/tag/v5.4.0), [Tesseract 5.5.4](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-tesseract-ocr), its DLLs, and the English model. Run it from the repository with Python 3.14 or later:
 
 ```powershell
-$ErrorActionPreference = 'Stop'
-$root = Join-Path $env:LOCALAPPDATA 'jesses\tools\subtitle-ocr'
-if (Test-Path -LiteralPath $root) { throw "Managed OCR directory already exists: $root" }
-
-$download = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "jesses-ocr-download-$PID")
-$seconvZip = Join-Path $download 'SeConv-Windows-x64.zip'
-$tesseractInstaller = Join-Path $download 'tesseract-ocr-w64-setup-5.5.3.20260724.exe'
-
-Invoke-WebRequest 'https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.2.0/SeConv-Windows-x64.zip' -OutFile $seconvZip
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $seconvZip).Hash -ne '14C8B467815DD04847E0E7B1E633D222D9C14C6A307ACADC03E21112803780B7') { throw 'SeConv download hash mismatch' }
-
-Invoke-WebRequest 'https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.5.3.20260724.exe' -OutFile $tesseractInstaller
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $tesseractInstaller).Hash -ne 'BEE9E3434BD94FD65387D9BE28CD467A41F61B1275383B55B0F59A1331270AE4') { throw 'Tesseract download hash mismatch' }
-
-[System.IO.Directory]::CreateDirectory($root) | Out-Null
-$seconv = New-Item -ItemType Directory -Path (Join-Path $root 'seconv')
-$tesseract = New-Item -ItemType Directory -Path (Join-Path $root 'tesseract')
-Expand-Archive -LiteralPath $seconvZip -DestinationPath $seconv
-& 7z x $tesseractInstaller "-o$tesseract" -y | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
-
-$tessdata = New-Item -ItemType Directory -Path (Join-Path $tesseract 'tessdata')
-$english = Join-Path $tessdata 'eng.traineddata'
-Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/87416418657359cb625c412a48b6e1d6d41c29bd/eng.traineddata' -OutFile $english
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $english).Hash -ne '7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2') { throw 'English model download hash mismatch' }
-
-& (Join-Path $seconv 'seconv.exe') --version
-& (Join-Path $tesseract 'tesseract.exe') --list-langs
+python scripts/install-subtitle-ocr.py
 ```
 
-Additional language models use their Tesseract codes as filenames, for example `spa.traineddata`. Download a compatible model family from the official [`tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast), [`tessdata`](https://github.com/tesseract-ocr/tessdata), or [`tessdata_best`](https://github.com/tesseract-ocr/tessdata_best) repository into the managed `tessdata` directory, then run **Check utility tools** again. The verified English model above is pinned to the displayed `tessdata_fast` commit.
+The script uses the managed directory above. To stage an update beside an existing installation, pass `--destination` with a fresh path. After the script verifies the tools, move the existing installation aside and move the new directory into place.
+
+Additional language models use their Tesseract codes as filenames, for example `spa.traineddata`. Download a compatible model family from the official [`tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast), [`tessdata`](https://github.com/tesseract-ocr/tessdata), or [`tessdata_best`](https://github.com/tesseract-ocr/tessdata_best) repository into the managed `tessdata` directory, then run **Check utility tools** again. See the [OCR source lock](../scripts/subtitle-ocr-windows-lock.json) for the English model's exact revision.
 
 ## Lossless keyframe cut
 

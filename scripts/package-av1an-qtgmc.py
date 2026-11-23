@@ -17,11 +17,10 @@ LOCK = SCRIPTS / "qtgmc-windows-lock.json"
 FRAMESERVER = Path("python/Lib/site-packages/vapoursynth")
 PYTHON_ZIP = Path("python/qtgmc-deps.zip")
 PLUGIN_FILES = {
-    "eedi3m.dll", "fft3dfilter.dll", "fmtconv.dll", "libtemporalsoften2.dll",
+    "eedi3m.dll", "fft3dfilter.dll", "fmtconv.dll",
     "miscfilters.dll", "mvtools.dll", "nnedi3_weights.bin",
     "removegrainvs.dll", "znedi3.dll",
 }
-RUNTIME_FILES = {"libfftw3f-3.dll"}
 SOURCE_BUILT_OUTPUTS = {"plugins/fft3dfilter.dll", "plugins/MiscFilters.dll"}
 REQUIRED_MODULES = {"havsfunc.py", "vsutil/__init__.py"}
 PRESETS = ("Faster", "Fast", "Medium", "Slow", "Slower", "Very Slow")
@@ -73,15 +72,13 @@ def checked_qtgmc_delivery(directory, lock):
     checked_python_zip(directory / receipt["pythonModules"][0]["path"])
     names = {Path(record["path"]).name.casefold() for record in receipt["plugins"]}
     ids = {record["id"] for record in receipt["plugins"]}
-    if (names != PLUGIN_FILES | RUNTIME_FILES or len(receipt["plugins"]) != len(names)
+    if (names != PLUGIN_FILES or len(receipt["plugins"]) != len(names)
             or len(ids) != len(names)):
         raise ValueError("The QTGMC native plugin closure differs from the reviewed set.")
     for record in receipt["plugins"]:
         path = Path(record["path"])
-        if path.name.casefold() in PLUGIN_FILES and path.parent.as_posix() != "plugins":
+        if path.parent.as_posix() != "plugins":
             raise ValueError("A QTGMC plugin is outside its source delivery plugin directory.")
-        if path.name.casefold() in RUNTIME_FILES and path.parent.as_posix() != "runtime":
-            raise ValueError("A QTGMC runtime library is outside its source delivery runtime directory.")
         payload = (directory / record["path"]).read_bytes().lower()
         # Official release DLLs can retain their upstream builder's source
         # path. Reject this checkout and host's paths without mistaking that
@@ -102,7 +99,7 @@ def checked_qtgmc_delivery(directory, lock):
     if any(not any(path.startswith(f"licenses/{name}/") for path in notices) for name in pins):
         raise ValueError("The QTGMC source notices are incomplete.")
     build_names = {Path(record["path"]).name for record in receipt["buildInputs"]}
-    if not {"build-package-av1an-qtgmc.py", LOCK.name}.issubset(build_names):
+    if not {"build-package-av1an-qtgmc.py", LOCK.name, "package-av1an-windows-lock.json"}.issubset(build_names):
         raise ValueError("The QTGMC source delivery omitted its pinned build recipe.")
     outputs = {
         record["path"]: record["sha256"]
@@ -148,7 +145,7 @@ def checked_qtgmc_delivery(directory, lock):
 
 
 def checked_local_recipe(receipt):
-    for name in ("build-package-av1an-qtgmc.py", LOCK.name):
+    for name in ("build-package-av1an-qtgmc.py", LOCK.name, "package-av1an-windows-lock.json"):
         records = [record for record in receipt["buildInputs"] if Path(record["path"]).name == name]
         if len(records) != 1 or records[0]["sha256"] != support.digest(SCRIPTS / name):
             raise ValueError(f"The QTGMC source delivery has a different build input: {name}")
@@ -168,16 +165,15 @@ def install_runtime(base, qtgmc, receipt, extension, result):
         raise ValueError("The av1an runtime already contains QTGMC Python modules.")
     shutil.copy2(qtgmc / extension["pythonModules"][0]["path"], destination_zip)
     receipt["supportFiles"].append({"path": PYTHON_ZIP.as_posix(), "sha256": support.digest(destination_zip)})
-    pth = result / "python/python314._pth"
-    if pth.read_text(encoding="utf-8").splitlines() != ["python314.zip", ".", "Lib/site-packages"]:
+    relative = f"python/{runtime.PYTHON_ABI}._pth"
+    pth = result / relative
+    if pth.read_text(encoding="utf-8") != runtime.PYTHON_PATH_CONFIGURATION:
         raise ValueError("The pinned embedded Python search path changed.")
-    pth.write_text("python314.zip\n.\nLib/site-packages\nqtgmc-deps.zip\n", encoding="utf-8")
-    replace_support_hash(receipt, "python/python314._pth", support.digest(pth))
+    pth.write_text(runtime.PYTHON_PATH_CONFIGURATION + "qtgmc-deps.zip\n", encoding="utf-8")
+    replace_support_hash(receipt, relative, support.digest(pth))
     mapping = []
     for record in extension["plugins"]:
         name = Path(record["path"]).name
-        # VapourSynth autoloads plugin DLLs with Windows LoadLibrary semantics;
-        # FFTW must sit beside FFT3DFilter for its dependent import to resolve.
         relative = FRAMESERVER / "plugins" / name
         output = result / relative
         if output.exists():

@@ -1,30 +1,30 @@
 {
   "schemaVersion": 1,
   "source": {
-    "commit": "1044228cd411672b565e5762a9b3597f4dd163b0",
-    "url": "https://codeload.github.com/rust-av/grav1synth/tar.gz/1044228cd411672b565e5762a9b3597f4dd163b0",
-    "sha256": "af08ddd74813867cc47ef86484472870d587280ec64661a7b62fbcf907637701",
-    "filename": "grav1synth-1044228.tar.gz",
-    "sourceRoot": "grav1synth-1044228cd411672b565e5762a9b3597f4dd163b0"
+    "commit": "b3022cffeb24498e6a58f14d4b3114e9976b22a9",
+    "url": "https://codeload.github.com/rust-av/grav1synth/tar.gz/b3022cffeb24498e6a58f14d4b3114e9976b22a9",
+    "sha256": "0d9d5d39f33915a989343957de82610f5377e0804a2232a4b459963ed5325e0b",
+    "filename": "grav1synth-b3022cf.tar.gz",
+    "sourceRoot": "grav1synth-b3022cffeb24498e6a58f14d4b3114e9976b22a9"
   },
   "ffmpeg": {
-    "version": "8.1",
-    "url": "https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz",
-    "sha256": "b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a",
-    "filename": "ffmpeg-8.1.tar.xz",
-    "sourceRoot": "ffmpeg-8.1"
+    "version": "9.1",
+    "url": "https://ffmpeg.org/releases/ffmpeg-9.1.tar.xz",
+    "sha256": "1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433",
+    "filename": "ffmpeg-9.1.tar.xz",
+    "sourceRoot": "ffmpeg-9.1"
   },
   "dav1d": {
     "id": "dav1d",
-    "version": "1.5.4-1",
-    "url": "https://repo.msys2.org/mingw/sources/mingw-w64-dav1d-1.5.4-1.src.tar.zst",
-    "sha256": "dd7bdbd140996eb26e857c2cfe80d0952641c997a5826c15d5bb204571d2518e",
-    "filename": "mingw-w64-dav1d-1.5.4-1.src.tar.zst",
+    "version": "1.5.5-1",
+    "url": "https://repo.msys2.org/mingw/sources/mingw-w64-dav1d-1.5.5-1.src.tar.zst",
+    "sha256": "6d1b95af045758d4266ed0accd97a1822b12dd98ed9df1fb5ae19f07c0fb18e5",
+    "filename": "mingw-w64-dav1d-1.5.5-1.src.tar.zst",
     "bundleRoot": "mingw-w64-dav1d",
     "upstream": "https://code.videolan.org/videolan/dav1d",
-    "embeddedArchive": "mingw-w64-dav1d/dav1d-1.5.4.tar.xz",
-    "embeddedSha256": "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5",
-    "sourceRoot": "dav1d-1.5.4",
+    "embeddedArchive": "mingw-w64-dav1d/dav1d-1.5.5.tar.xz",
+    "embeddedSha256": "ca96b1d0ba3f01f55de7231d775892b64994ba061aaeeaaa4f662a390b3abf9e",
+    "sourceRoot": "dav1d-1.5.5",
     "licenseFiles": [
       "COPYING",
       "doc/PATENTS"
@@ -46,5 +46,5 @@
     "Modern35-2",
     "Modern35-3"
   ],
-  "rustVersion": "1.98.1"
+  "rustVersion": "1.100.0"
 }

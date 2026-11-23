@@ -1,23 +1,23 @@
 {
   "schemaVersion": 1,
   "svtAv1": {
-    "version": "4.2.0",
-    "commit": "9292ec8e32bce26f781f277ec8739b53426c4300",
-    "url": "https://gitlab.com/api/v4/projects/AOMediaCodec%2FSVT-AV1/repository/archive.tar.gz?sha=9292ec8e32bce26f781f277ec8739b53426c4300",
-    "sha256": "fe7e58bbd61040b460373ce7cfe0119311464eddbd6e620d84eeed317f598a64",
-    "root": "SVT-AV1-9292ec8e32bce26f781f277ec8739b53426c4300-9292ec8e32bce26f781f277ec8739b53426c4300"
+    "version": "4.3.0",
+    "commit": "e3d63405f9ba8219913a7276c2c47d10e5d022fe",
+    "url": "https://gitlab.com/api/v4/projects/AOMediaCodec%2FSVT-AV1/repository/archive.tar.gz?sha=e3d63405f9ba8219913a7276c2c47d10e5d022fe",
+    "sha256": "85ebf749af8dcb014816ca999cf2902ab9716cb16f2f8ef116fcd31786d8b4e1",
+    "root": "SVT-AV1-e3d63405f9ba8219913a7276c2c47d10e5d022fe-e3d63405f9ba8219913a7276c2c47d10e5d022fe"
   },
   "cmakeWindows": {
-    "version": "4.4.3",
-    "url": "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip",
-    "sha256": "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab",
-    "root": "cmake-4.4.3-windows-x86_64"
+    "version": "4.5.1",
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.5.1/cmake-4.5.1-windows-x86_64.zip",
+    "sha256": "bfe6eadb245dc8213e0d3feea316b520cb2aae92f5667ffd76059ba6b05c430c",
+    "root": "cmake-4.5.1-windows-x86_64"
   },
   "aom": {
-    "version": "3.14.1",
-    "commit": "03087864cf4bea6abb0d28f95cf7843511413d8f",
-    "url": "https://aomedia.googlesource.com/aom/+archive/03087864cf4bea6abb0d28f95cf7843511413d8f.tar.gz",
-    "treeSha256": "98ca413d03098099b02893c26e5c45f297f46b70a6f437b2bd84619dcd167e2c",
+    "version": "3.15.3",
+    "commit": "b141d9c45db236335351c8a4b2a14b3ade27c937",
+    "url": "https://aomedia.googlesource.com/aom/+archive/b141d9c45db236335351c8a4b2a14b3ade27c937.tar.gz",
+    "treeSha256": "24f06b3651ce94bdb6c47b0e34946f93dc4effcd24c2b72478df1c4f7d0798ac",
     "patch": "aom-v3.14.1-y4m-vertical-420.patch",
     "patchSha256": "7e597ec1ba5a7923440a8c465ecf3aa6ab72136773f90f21ca594a30fe520ed3"
   },

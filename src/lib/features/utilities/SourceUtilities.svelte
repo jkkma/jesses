@@ -1319,8 +1319,10 @@
               aria-label={label === 'Configure…'
                 ? `Configure… (${card.label})`
                 : `${label} — Configure ${card.label}`}
-              onclick={() => choose(card.id, true)}>{label}</button
+              onclick={() => choose(card.id, true)}
             >
+              {label}
+            </button>
           {/if}
         </div>
         <small>{card.description}</small>
@@ -1344,40 +1346,48 @@
     <label for="metric-encoded">Encoded (Low Quality)</label><select
       id="metric-encoded"
       bind:value={dialogMetricsEncoded}
-      >{#each files as item}<option value={item.path}>{item.name}</option>{/each}</select
-    ><label for="metric-reference">Reference (Source)</label><select
+    >
+      {#each files as item}<option value={item.path}>{item.name}</option>{/each}
+    </select><label for="metric-reference">Reference (Source)</label><select
       id="metric-reference"
       bind:value={dialogMetricsReference}
-      >{#each files as item}<option value={item.path}>{item.name}</option>{/each}</select
     >
+      {#each files as item}<option value={item.path}>{item.name}</option>{/each}
+    </select>
   </div>
   <h3>METRICS</h3>
   <div class="inline">
-    <label><input type="checkbox" bind:checked={dialogVmaf} /> VMAF</label><label
-      ><input type="checkbox" bind:checked={dialogSsim} /> SSIM</label
-    ><label><input type="checkbox" bind:checked={dialogPsnr} /> PSNR</label>
+    <label><input type="checkbox" bind:checked={dialogVmaf} /> VMAF</label><label>
+      <input type="checkbox" bind:checked={dialogSsim} /> SSIM
+    </label><label><input type="checkbox" bind:checked={dialogPsnr} /> PSNR</label>
   </div>
   <div class="form">
     <label for="metric-align">Alignment</label><select
       id="metric-align"
       bind:value={dialogAlignment}
-      ><option value="none">None</option><option value="cropReference">Auto-Crop reference</option
-      ><option value="resizeReference">Resize reference</option><option
-        value="cropAndResizeReference">Auto-Crop and resize reference</option
-      ></select
-    ><label for="metric-subsample">Subsampling</label><select
+    >
+      <option value="none">None</option><option value="cropReference">
+        Auto-Crop reference
+      </option><option value="resizeReference">Resize reference</option><option
+        value="cropAndResizeReference"
+      >
+        Auto-Crop and resize reference
+      </option>
+    </select><label for="metric-subsample">Subsampling</label><select
       id="metric-subsample"
       bind:value={dialogSubsample}
-      >{#each Array.from({ length: 32 }, (_, i) => i + 1) as n}<option value={n}
-          >{n} (Every {n === 1 ? 'frame' : `${n}th frame`})</option
-        >{/each}</select
-    ><label for="metric-model">VMAF Model</label><select
+    >
+      {#each Array.from({ length: 32 }, (_, i) => i + 1) as n}<option value={n}>
+          {n} (Every {n === 1 ? 'frame' : `${n}th frame`})
+        </option>{/each}
+    </select><label for="metric-model">VMAF Model</label><select
       id="metric-model"
       bind:value={dialogVmafModel}
-      ><option value="standard">vmaf_v0.6.1 (Default)</option><option value="negative"
-        >vmaf_v0.6.1neg (No Enhancement Gain)</option
-      ><option value="fourK">vmaf_4k_v0.6.1 (4K)</option></select
     >
+      <option value="standard">vmaf_v0.6.1 (Default)</option><option value="negative">
+        vmaf_v0.6.1neg (No Enhancement Gain)
+      </option><option value="fourK">vmaf_4k_v0.6.1 (4K)</option>
+    </select>
   </div>
   <div class="actions">
     <button
@@ -1392,8 +1402,10 @@
         subsample = dialogSubsample;
         vmafModel = dialogVmafModel;
         dialog = null;
-      }}>OK</button
+      }}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1405,28 +1417,33 @@
     <label for="color-source">Source Video</label><select
       id="color-source"
       bind:value={dialogColorSource}
-      >{#each fileMode === 'batch' && file ? [file] : files as item}<option value={item.path}
-          >{item.name}</option
-        >{/each}</select
-    ><label for="color-target">Target Video</label><select
+    >
+      {#each fileMode === 'batch' && file ? [file] : files as item}<option value={item.path}>
+          {item.name}
+        </option>{/each}
+    </select><label for="color-target">Target Video</label><select
       id="color-target"
       bind:value={dialogColorTarget}
       disabled={fileMode === 'batch'}
-      ><option value="">(none - only read the source's metadata)</option
-      >{#each files as item}<option value={item.path}>{item.name}</option>{/each}</select
     >
+      <option value="">(none - only read the source's metadata)</option>{#each files as item}<option
+          value={item.path}
+        >
+          {item.name}
+        </option>{/each}
+    </select>
   </div>
   {#if fileMode !== 'batch'}<p>
       With no target picked, this utility only prints the source's metadata. Picking one rewrites
       that file in place.
     </p>{/if}
   <h3>DATA TO TRANSFER</h3>
-  <label
-    ><input type="checkbox" bind:checked={dialogCopyColor} /> Color space (transfer, primaries, matrix,
-    range)</label
-  ><br /><label
-    ><input type="checkbox" bind:checked={dialogCopyHdr} /> HDR metadata (mastering display, MaxCLL/MaxFALL)</label
-  >{#if fileMode === 'batch'}<p>
+  <label>
+    <input type="checkbox" bind:checked={dialogCopyColor} /> Color space (transfer, primaries, matrix,
+    range)
+  </label><br /><label>
+    <input type="checkbox" bind:checked={dialogCopyHdr} /> HDR metadata (mastering display, MaxCLL/MaxFALL)
+  </label>{#if fileMode === 'batch'}<p>
       In Batch Processing Mode this utility can only read metadata. Switch to Muxing Mode to
       transfer it.
     </p>{/if}
@@ -1439,8 +1456,10 @@
         copyColor = dialogCopyColor;
         copyHdr = dialogCopyHdr;
         dialog = null;
-      }}>OK</button
+      }}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1455,24 +1474,34 @@
     <label for="deinterlace-method">Deinterlacer</label><select
       id="deinterlace-method"
       bind:value={deinterlace}
-      ><option value="automatic">Automatic</option><option value="disabled">Disabled</option><option
-        value="qtgmc">QTGMC (VapourSynth)</option
-      ><option value="bwdif">Bwdif (FFmpeg)</option><option value="yadif">Yadif (FFmpeg)</option
-      ></select
-    >{#if deinterlace === 'qtgmc' || deinterlace === 'automatic'}<label for="deinterlace-preset"
-        >QTGMC preset</label
-      ><select id="deinterlace-preset" bind:value={qtgmcPreset}
-        ><option value="placebo">Placebo</option><option value="verySlow">Very Slow</option><option
-          value="slower">Slower</option
-        ><option value="slow">Slow</option><option value="medium">Medium</option><option
-          value="fast">Fast</option
-        ><option value="faster">Faster</option><option value="veryFast">Very Fast</option></select
-      >{/if}
+    >
+      <option value="automatic">Automatic</option><option value="disabled">Disabled</option><option
+        value="qtgmc"
+      >
+        QTGMC (VapourSynth)
+      </option><option value="bwdif">Bwdif (FFmpeg)</option><option value="yadif">
+        Yadif (FFmpeg)
+      </option>
+    </select>{#if deinterlace === 'qtgmc' || deinterlace === 'automatic'}<label
+        for="deinterlace-preset"
+      >
+        QTGMC preset
+      </label><select id="deinterlace-preset" bind:value={qtgmcPreset}>
+        <option value="placebo">Placebo</option><option value="verySlow">Very Slow</option><option
+          value="slower"
+        >
+          Slower
+        </option><option value="slow">Slow</option><option value="medium">Medium</option><option
+          value="fast"
+        >
+          Fast
+        </option><option value="faster">Faster</option><option value="veryFast">Very Fast</option>
+      </select>{/if}
   </div>
-  <label
-    ><input type="checkbox" bind:checked={doubleRate} disabled={deinterlace === 'disabled'} /> One frame
-    per field</label
-  >
+  <label>
+    <input type="checkbox" bind:checked={doubleRate} disabled={deinterlace === 'disabled'} /> One frame
+    per field
+  </label>
   <h3>RESULT</h3>
   <p>
     Written beside the source as a near-lossless x264 MKV, with audio and subtitles copied across.
@@ -1484,8 +1513,10 @@
         deinterlace = 'qtgmc';
         qtgmcPreset = 'verySlow';
         doubleRate = true;
-      }}>Reset</button
-    ><button type="button" onclick={() => saveUtilitySettings('deinterlace')}>OK</button>
+      }}
+    >
+      Reset
+    </button><button type="button" onclick={() => saveUtilitySettings('deinterlace')}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1497,13 +1528,15 @@
   <p>{file?.name ?? 'No input file is loaded.'}</p>
   <h3>OPERATION</h3>
   <div class="form">
-    <label for="grain-operation">Do</label><select id="grain-operation" bind:value={grainOp}
-      ><option value="measureSource">Measure a grain table from this file</option><option
-        value="extract">Extract the grain table it already has</option
-      ><option value="apply">Apply grain to this file</option><option value="remove"
-        >Remove all grain from this file</option
-      ></select
-    >{#if grainOp === 'measureSource'}<label for="grain-denoise">Denoise strength</label>
+    <label for="grain-operation">Do</label><select id="grain-operation" bind:value={grainOp}>
+      <option value="measureSource">Measure a grain table from this file</option><option
+        value="extract"
+      >
+        Extract the grain table it already has
+      </option><option value="apply">Apply grain to this file</option><option value="remove">
+        Remove all grain from this file
+      </option>
+    </select>{#if grainOp === 'measureSource'}<label for="grain-denoise">Denoise strength</label>
       <div class="inline">
         <input
           id="grain-denoise"
@@ -1512,16 +1545,17 @@
           max="16"
           bind:value={denoise}
           onblur={() => (denoise = Math.max(1, Math.min(16, Math.trunc(denoise || 4))))}
-        /><label
-          ><input type="checkbox" bind:checked={keepDenoised} /> Keep the denoised video too</label
-        >
+        /><label>
+          <input type="checkbox" bind:checked={keepDenoised} /> Keep the denoised video too
+        </label>
       </div>{:else if grainOp === 'apply'}<label for="grain-source">Grain from</label><select
         id="grain-source"
         bind:value={grainSource}
-        ><option value="table">Grain table file</option><option value="preset"
-          >Film stock preset</option
-        ><option value="photonNoise">Photon noise (ISO)</option></select
-      >{#if grainSource === 'table'}<span></span>
+      >
+        <option value="table">Grain table file</option><option value="preset">
+          Film stock preset
+        </option><option value="photonNoise">Photon noise (ISO)</option>
+      </select>{#if grainSource === 'table'}<span></span>
         <div class="inline">
           <input
             aria-label="Grain table file"
@@ -1534,13 +1568,16 @@
             onclick={async () => {
               const path = await chooseUtilityFile('Pick a film grain table', ['tbl']);
               if (path) grainTable = path;
-            }}>…</button
+            }}
           >
+            …
+          </button>
         </div>{:else if grainSource === 'preset'}<span></span><select
           aria-label="Film stock preset"
           bind:value={grainPreset}
-          >{#each grainPresets as item}<option value={item}>{item}</option>{/each}</select
-        >{:else}<span></span>
+        >
+          {#each grainPresets as item}<option value={item}>{item}</option>{/each}
+        </select>{:else}<span></span>
         <div class="inline">
           <input
             aria-label="ISO"
@@ -1577,8 +1614,10 @@
         keepDenoised = false;
         iso = 400;
         chroma = false;
-      }}>Reset</button
-    ><button type="button" onclick={() => saveUtilitySettings('grain')}>OK</button>
+      }}
+    >
+      Reset
+    </button><button type="button" onclick={() => saveUtilitySettings('grain')}>OK</button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1594,24 +1633,32 @@
       id="ladder-encoder"
       bind:value={ladderEncoder}
       onchange={resetLadderEncoder}
-      ><option value="av1">AV1 (SVT-AV1)</option><option value="aomAv1">AV1 (AOM-AV1)</option
-      ><option value="hevc">H.265 / HEVC (x265)</option><option value="h264"
-        >H.264 / AVC (x264)</option
-      ><option value="vp9">VP9 (VPX)</option></select
-    ><label for="ladder-preset">Preset</label><select id="ladder-preset" bind:value={ladderPreset}
-      >{#each ladderSpeeds as speed}<option value={speed}>{speed}</option>{/each}</select
-    ><label for="ladder-format">Color Format</label><select
+    >
+      <option value="av1">AV1 (SVT-AV1)</option><option value="aomAv1">AV1 (AOM-AV1)</option><option
+        value="hevc"
+      >
+        H.265 / HEVC (x265)
+      </option><option value="h264">H.264 / AVC (x264)</option><option value="vp9">
+        VP9 (VPX)
+      </option>
+    </select><label for="ladder-preset">Preset</label><select
+      id="ladder-preset"
+      bind:value={ladderPreset}
+    >
+      {#each ladderSpeeds as speed}<option value={speed}>{speed}</option>{/each}
+    </select><label for="ladder-format">Color Format</label><select
       id="ladder-format"
       bind:value={ladderPixel}
-      >{#each ladderFormats as format}<option value={format}>{pixelLabel(format)}</option
-        >{/each}</select
-    >{#if presets.length}<label for="ladder-content">Content preset</label><select
+    >
+      {#each ladderFormats as format}<option value={format}>{pixelLabel(format)}</option>{/each}
+    </select>{#if presets.length}<label for="ladder-content">Content preset</label><select
         id="ladder-content"
         bind:value={ladderContent}
-        ><option value="">None</option>{#each presets as preset}<option value={preset.name}
-            >{preset.name}</option
-          >{/each}</select
-      >{/if}
+      >
+        <option value="">None</option>{#each presets as preset}<option value={preset.name}>
+            {preset.name}
+          </option>{/each}
+      </select>{/if}
   </div>
   <h3>LADDER</h3>
   <div class="form">
@@ -1641,29 +1688,37 @@
     </div>
     <label for="ladder-metric">Score with</label>
     <div class="inline">
-      <select id="ladder-metric" bind:value={ladderMetric}
-        ><option value="vmaf">VMAF</option><option value="ssimulacra2">SSIMULACRA2</option><option
-          value="butteraugliInf">Butteraugli</option
-        ><option value="xpsnrWeighted">XPSNR</option><option value="none"
-          >Nothing (size only)</option
-        ></select
-      ><select aria-label="VMAF Model" bind:value={ladderModel} disabled={ladderMetric !== 'vmaf'}
-        ><option value="standard">vmaf_v0.6.1 (Default)</option><option value="negative"
-          >vmaf_v0.6.1neg (No Enhancement Gain)</option
-        ><option value="fourK">vmaf_4k_v0.6.1 (4K)</option></select
+      <select id="ladder-metric" bind:value={ladderMetric}>
+        <option value="vmaf">VMAF</option><option value="ssimulacra2">SSIMULACRA2</option><option
+          value="butteraugliInf"
+        >
+          Butteraugli
+        </option><option value="xpsnrWeighted">XPSNR</option><option value="none">
+          Nothing (size only)
+        </option>
+      </select><select
+        aria-label="VMAF Model"
+        bind:value={ladderModel}
+        disabled={ladderMetric !== 'vmaf'}
       >
+        <option value="standard">vmaf_v0.6.1 (Default)</option><option value="negative">
+          vmaf_v0.6.1neg (No Enhancement Gain)
+        </option><option value="fourK">vmaf_4k_v0.6.1 (4K)</option>
+      </select>
     </div>
   </div>
-  <label
-    ><input type="checkbox" bind:checked={keepSamples} /> Keep the sample encodes beside the source</label
-  >
+  <label>
+    <input type="checkbox" bind:checked={keepSamples} /> Keep the sample encodes beside the source
+  </label>
   <h3>RESULT</h3>
   <p>{ladderDescription()}</p>
   <div class="actions">
     <button type="button" onclick={resetLadder}>Reset</button><button
       type="button"
-      onclick={() => saveUtilitySettings('ladder')}>OK</button
+      onclick={() => saveUtilitySettings('ladder')}
     >
+      OK
+    </button>
   </div>
 </SourceDialog>
 <SharedCutDialog
@@ -1698,24 +1753,27 @@
           {#if ladderResult.result.metric !== 'none'}<th scope="col">Score</th>{/if}
           <th scope="col">Encode time</th>
         </tr>
-      </thead><tbody
-        >{#each ladderResult.result.rungs as row}<tr
-            ><td>{row.crf}</td><td>{row.bitrateKbps.toFixed(1)} kb/s</td><td
-              >{formatBytes(row.bytesPerMinute)}</td
-            ><td>{formatBytes(row.projectedSizeBytes)}</td><td
-              >{Number(ladderResult.result.sourceSizeBytes) > 0
+      </thead><tbody>
+        {#each ladderResult.result.rungs as row}<tr>
+            <td>{row.crf}</td><td>{row.bitrateKbps.toFixed(1)} kb/s</td><td>
+              {formatBytes(row.bytesPerMinute)}
+            </td><td>{formatBytes(row.projectedSizeBytes)}</td><td>
+              {Number(ladderResult.result.sourceSizeBytes) > 0
                 ? `${((Number(row.projectedSizeBytes) / Number(ladderResult.result.sourceSizeBytes)) * 100).toFixed(1)}%`
-                : '—'}</td
-            >{#if ladderResult.result.metric !== 'none'}<td>{row.score?.toFixed(3) ?? '—'}</td
-              >{/if}<td>{row.encodeSeconds.toFixed(1)}s</td></tr
-          >{/each}</tbody
-      >
+                : '—'}
+            </td>{#if ladderResult.result.metric !== 'none'}<td>
+                {row.score?.toFixed(3) ?? '—'}
+              </td>{/if}<td>{row.encodeSeconds.toFixed(1)}s</td>
+          </tr>{/each}
+      </tbody>
     </table>{/if}
   <div class="actions">
     <button type="button" onclick={copyLadder}>Copy</button><button
       type="button"
-      onclick={() => (dialog = null)}>Close</button
+      onclick={() => (dialog = null)}
     >
+      Close
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog title="Bitrate Chart" open={dialog === 'chartResult'} onclose={() => (dialog = null)}>
@@ -1774,8 +1832,8 @@
         }
       }}
     >
-      <svg viewBox="0 0 600 240" aria-hidden="true"
-        >{#if chartStart !== null && chartEnd !== null}<rect
+      <svg viewBox="0 0 600 240" aria-hidden="true">
+        {#if chartStart !== null && chartEnd !== null}<rect
             x={(Math.min(chartStart, chartEnd) * 600) / Math.max(1, chartResult.points.length - 1)}
             y="0"
             width={Math.max(
@@ -1794,8 +1852,8 @@
                 `${(i * 600) / Math.max(1, chartResult!.points.length - 1)},${230 - (p.megabitsPerSecond * 210) / Math.max(1, chartResult!.peakWindowMegabitsPerSecond)}`,
             )
             .join(' ')}
-        /></svg
-      >
+        />
+      </svg>
     </div>{/if}
   <div class="actions">
     <button type="button" onclick={() => (dialog = null)}>Close</button>

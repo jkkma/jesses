@@ -1604,8 +1604,10 @@
             if (tab.id === 'convert' || tab.id === 'av1an') lastTaskTab = tab.id;
             else if (tab.id === 'utilities' && workspaceActions.utilities?.label !== 'Run')
               lastTaskTab = 'utilities';
-          }}>{tab.label}</button
+          }}
         >
+          {tab.label}
+        </button>
       {/each}
     </nav>
     <main>
@@ -1783,9 +1785,14 @@
         <button type="button" onclick={copyActivityLog} disabled={!logs.length}>Copy</button><button
           type="button"
           onclick={exportActivityLog}
-          disabled={!logs.length || logActionBusy}>Save…</button
-        ><button type="button" onclick={openLogFolder} disabled={logActionBusy}>Log Folder</button
-        ><button type="button" onclick={() => (logs = [])} disabled={!logs.length}>Clear</button>
+          disabled={!logs.length || logActionBusy}
+        >
+          Save…
+        </button><button type="button" onclick={openLogFolder} disabled={logActionBusy}>
+          Log Folder
+        </button><button type="button" onclick={() => (logs = [])} disabled={!logs.length}>
+          Clear
+        </button>
       </div>
     </div>
     <div
@@ -1841,8 +1848,8 @@
           value={statusProgress.value}
         ></progress>{/if}
     </div>
-    <label
-      ><input
+    <label>
+      <input
         type="checkbox"
         checked={shutdownWhenDone}
         disabled={!desktop || updatingShutdown}
@@ -1852,40 +1859,51 @@
             input.checked = shutdownWhenDone;
           });
         }}
-      /> Shutdown when done</label
-    >
+      /> Shutdown when done
+    </label>
     {#if displayAction?.active}<button
         type="button"
         disabled={!displayAction.pause}
-        onclick={() => displayAction?.pause?.()}>{displayAction.paused ? 'Resume' : 'Pause'}</button
-      ><button
+        onclick={() => displayAction?.pause?.()}
+      >
+        {displayAction.paused ? 'Resume' : 'Pause'}
+      </button><button
         type="button"
         title="Stop the current work and keep any saved encoder progress"
         disabled={!displayAction.stop || stopping}
-        onclick={stopRun}>Stop</button
+        onclick={stopRun}
       >
+        Stop
+      </button>
     {:else if currentJob && ['preparing', 'running', 'paused', 'finalizing'].includes(currentJob.state)}<button
         type="button"
         onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
-        >{currentJob.state === 'paused' ? 'Resume' : 'Pause'}</button
-      ><button
+      >
+        {currentJob.state === 'paused' ? 'Resume' : 'Pause'}
+      </button><button
         type="button"
         title="Stop the current job and keep any saved encoder progress"
         disabled={stopping}
-        onclick={stopRun}>Stop</button
-      >{/if}
+        onclick={stopRun}
+      >
+        Stop
+      </button>{/if}
     {#if runBlockedReason && action?.openBlockedSetting}<button
         type="button"
         id="run-blocked-reason"
         class="run-blocked"
         title={runBlockedReason}
-        onclick={action.openBlockedSetting}>{runBlockedReason}</button
-      >{:else if runBlockedReason}<span
+        onclick={action.openBlockedSetting}
+      >
+        {runBlockedReason}
+      </button>{:else if runBlockedReason}<span
         id="run-blocked-reason"
         class="run-blocked"
         role="alert"
-        title={runBlockedReason}>{runBlockedReason}</span
-      >{/if}
+        title={runBlockedReason}
+      >
+        {runBlockedReason}
+      </span>{/if}
     <button
       type="button"
       class="run-button"
@@ -1893,8 +1911,9 @@
       disabled={!action?.canRun || !!runningAction || !desktop}
       onclick={(event) =>
         action?.run({ editCommand: event.shiftKey, isShiftHeld: () => shiftHeld })}
-      >{action?.label ?? 'Run'}</button
     >
+      {action?.label ?? 'Run'}
+    </button>
   </footer>
   {#if shutdownError || completionStatus?.error}<p role="alert">
       {shutdownError || completionStatus?.error}
@@ -1916,8 +1935,10 @@
   <div class="import-actions">
     <button type="button" onclick={() => finishImportDialog(true)}>Replace file list</button><button
       type="button"
-      onclick={() => finishImportDialog(false)}>Add to file list</button
+      onclick={() => finishImportDialog(false)}
     >
+      Add to file list
+    </button>
   </div>
 </SourceDialog>
 <SourceDialog
@@ -1957,9 +1978,9 @@
     {activeJobCount === 1 ? 'it' : 'them'}. Encodes can resume later if they have saved progress.
   </p>
   <div class="import-actions">
-    <button type="button" data-dialog-initial-focus onclick={() => (closePrompt = false)}
-      >Keep running</button
-    ><button type="button" onclick={() => void finishClose()}>Close anyway</button>
+    <button type="button" data-dialog-initial-focus onclick={() => (closePrompt = false)}>
+      Keep running
+    </button><button type="button" onclick={() => void finishClose()}>Close anyway</button>
   </div>
 </SourceDialog>
 {#if closing}

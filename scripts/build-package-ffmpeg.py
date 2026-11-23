@@ -22,9 +22,9 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "scripts/package-ffmpeg-windows-lock.json"
 
-VERSION = "9.0.1"
+VERSION = "9.1"
 URL = f"https://ffmpeg.org/releases/ffmpeg-{VERSION}.tar.xz"
-SHA256 = "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+SHA256 = "1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433"
 CPU_POLICY=json.loads(Path(__file__).with_name("cpu-encoding-policy.json").read_text(encoding="utf-8"))
 CONFIGURE = [
     "--disable-encoder="+",".join(CPU_POLICY["excludedEncoders"]),
@@ -36,6 +36,8 @@ CONFIGURE = [
     "--enable-libass", "--enable-libvmaf", "--enable-libaom", "--enable-libsvtav1",
     "--enable-vulkan", "--enable-libplacebo",
     "--enable-lzma", "--pkg-config-flags=--static --dont-define-prefix",
+    # The static LAME 4.0 MSYS2 build needs its MPEG audio decoder and path APIs.
+    "--extra-libs=-lmpg123 -lshlwapi",
     "--extra-cflags=-I../static-vmaf/include -I../static-av1/include -I../static-libplacebo/include",
     "--extra-ldflags=-L../static-vmaf/lib -L../static-av1/lib -L../static-libplacebo/lib -static -static-libgcc -static-libstdc++",
 ]
@@ -79,7 +81,7 @@ def write_notices(bundle, directory, prefix=""):
     count = 0
     for member in bundle.getmembers():
         name = Path(member.name).name
-        if member.isfile() and member.size <= 1024 * 1024 and len(Path(member.name).parts) <= 4 and name.upper().startswith(("COPYING", "LICENSE", "PATENTS", "COPYRIGHT")):
+        if member.isfile() and member.size <= 1024 * 1024 and len(Path(member.name).parts) <= 4 and name.upper().startswith(("COPYING", "LICENCE", "LICENSE", "PATENTS", "COPYRIGHT")):
             target = directory / (prefix + member.name.replace("/", "__"))
             with bundle.extractfile(member) as source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
@@ -97,6 +99,25 @@ def verify_vmaf_model(executable):
     for codec, options in [("libaom-av1", ["-cpu-used", "8", "-threads", "2"]), ("libsvtav1", ["-preset", "12", "-svtav1-params", "lp=2"])]:
         for pixel_format in ("yuv420p", "yuv420p10le"):
             subprocess.run([str(executable), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "testsrc2=s=128x128:r=4:d=1", "-vf", f"format={pixel_format}", "-c:v", codec, *options, "-f", "null", "-"], env=env, capture_output=True, text=True, check=True, timeout=90)
+
+
+def build_libunibreak(destination, compiler, archive, source_record, pkgconfig, run, *, jobs):
+    recipe = destination / "build-inputs/build-package-ffmpeg-linux.py"
+    spec = importlib.util.spec_from_file_location("guarded_unicode_source", recipe)
+    source_reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source_reader)
+    source = source_reader.extract(archive, destination / "libunibreak-source", source_record["sourceRoot"])
+    run([str(compiler / "usr/bin/make.exe"), f"-j{jobs}", "-f", "Makefile.gcc", "CFG=Release", "ReleaseDir/libunibreak.a"], source / "src")
+    if not (source / "src/ReleaseDir/libunibreak.a").is_file():
+        raise ValueError("The static libunibreak build did not produce its library.")
+    metadata = (source / "libunibreak.pc.in").read_text(encoding="utf-8")
+    for placeholder, value in {
+        "@prefix@": source.as_posix(), "@exec_prefix@": "${prefix}",
+        "@libdir@": "${prefix}/src/ReleaseDir", "@includedir@": "${prefix}/src",
+        "@VERSION@": source_record["version"],
+    }.items():
+        metadata = metadata.replace(placeholder, value)
+    (pkgconfig / "libunibreak.pc").write_text(metadata, encoding="utf-8", newline="\n")
 
 
 def deliver(destination, source_dir, root, versions, imports, input_lock):
@@ -192,7 +213,7 @@ def main():
     destination.mkdir(parents=True, exist_ok=False)
     recipe_inputs = destination / "build-inputs"
     recipe_inputs.mkdir()
-    for name in ("build-package-ffmpeg.py", "build-package-vmaf-windows.py", "build-package-av1-codecs.py", "standalone-tool-sources.json", "bootstrap-package-toolchain.py", "stage-bundled-tools.py", "package-ffmpeg-windows-lock.json", "qualify-cpu-encoders.py", "cpu-encoding-policy.json", "qualify-libplacebo.py", "build-package-libplacebo.py", "build-package-libplacebo-windows.py", "package-libplacebo-lock.json", "libplacebo-python314.patch", "build-package-ffmpeg-linux.py"):
+    for name in ("build-package-ffmpeg.py", "build-package-vmaf-windows.py", "build-package-av1-codecs.py", "standalone-tool-sources.json", "bootstrap-package-toolchain.py", "stage-bundled-tools.py", "package-ffmpeg-windows-lock.json", "qualify-cpu-encoders.py", "cpu-encoding-policy.json", "qualify-libplacebo.py", "build-package-libplacebo.py", "build-package-libplacebo-windows.py", "package-libplacebo-lock.json", "build-package-ffmpeg-linux.py"):
         shutil.copy2(ROOT / "scripts" / name, recipe_inputs / name)
     input_lock = json.loads((recipe_inputs / "package-ffmpeg-windows-lock.json").read_text(encoding="utf-8"))
     archive = destination / f"ffmpeg-{VERSION}.tar.xz"
@@ -240,6 +261,9 @@ def main():
         download_spec.loader.exec_module(stager)
         cache = ROOT / "target/tool-download-cache"
         cache.mkdir(parents=True, exist_ok=True)
+        unibreak_source = next(record for record in input_lock["linkedSources"] if record["base"] == "libunibreak")
+        unibreak_archive = stager.download(unibreak_source["url"], unibreak_source["sha256"], cache)
+        build_libunibreak(destination, root, unibreak_archive, unibreak_source, pkgconfig, run_native, jobs=args.jobs)
         vmaf_source = next(record for record in input_lock["linkedSources"] if record["base"] == "mingw-w64-vmaf")
         vmaf_archive = stager.download(vmaf_source["url"], vmaf_source["sha256"], cache)
         vmaf_spec = importlib.util.spec_from_file_location("vmaf_builder", recipe_inputs / "build-package-vmaf-windows.py")

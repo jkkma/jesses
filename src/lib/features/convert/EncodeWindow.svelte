@@ -156,21 +156,21 @@
   });
 </script>
 
-<svelte:head
-  ><title
+<svelte:head>
+  <title
     >{current ? `Processing: ${fileName(current.request.outputPath)} — ` : ''}Quick Convert — jesses</title
-  ></svelte:head
->
+  >
+</svelte:head>
 
 <main class="encode-window">
   <header>
     <h1>Quick Convert</h1>
-    <span class="filename" title={current?.request.outputPath}
-      >{current ? fileName(current.request.outputPath) : 'Processing'}</span
-    >
-    <span class="queue-count"
-      >{quickJobs.filter((job) => job.state === 'queued').length} queued</span
-    >
+    <span class="filename" title={current?.request.outputPath}>
+      {current ? fileName(current.request.outputPath) : 'Processing'}
+    </span>
+    <span class="queue-count">
+      {quickJobs.filter((job) => job.state === 'queued').length} queued
+    </span>
   </header>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable log needs keyboard access.) -->
   <pre
@@ -221,16 +221,23 @@
   <footer>
     <div class="controls">
       {#if current}
-        <button type="button" class="folder" onclick={() => act(current!, 'folder')} disabled={busy}
-          >Open output folder</button
+        <button
+          type="button"
+          class="folder"
+          onclick={() => act(current!, 'folder')}
+          disabled={busy}
         >
+          Open output folder
+        </button>
         {#if ['preparing', 'running', 'paused', 'finalizing'].includes(current.state)}
           <button
             type="button"
             aria-label={current.state === 'paused' ? 'Continue encoding' : 'Pause encoding'}
             onclick={() => act(current!, 'pause')}
-            disabled={busy}>{current.state === 'paused' ? 'Resume' : 'Pause'}</button
+            disabled={busy}
           >
+            {current.state === 'paused' ? 'Resume' : 'Pause'}
+          </button>
           <button
             type="button"
             title={hasSavedProgress(current)
@@ -241,23 +248,29 @@
                 current!,
                 (current!.encodeSettings?.videoMode ?? 'encode') === 'encode' ? 'stop' : 'cancel',
               )}
-            disabled={busy}>{hasSavedProgress(current) ? 'Stop and keep progress' : 'Stop'}</button
+            disabled={busy}
           >
+            {hasSavedProgress(current) ? 'Stop and keep progress' : 'Stop'}
+          </button>
         {:else if canResumeJob(current)}
-          <button type="button" onclick={() => act(current!, 'resume')} disabled={busy}
-            >Resume saved job</button
-          >
+          <button type="button" onclick={() => act(current!, 'resume')} disabled={busy}>
+            Resume saved job
+          </button>
           <button
             type="button"
             class="discard"
             onclick={() => act(current!, 'discard')}
-            disabled={busy}>Discard saved progress</button
+            disabled={busy}
           >
+            Discard saved progress
+          </button>
         {:else if current.state === 'queued'}<button
             type="button"
             onclick={() => act(current!, 'cancel')}
-            disabled={busy}>Cancel job</button
-          >{/if}
+            disabled={busy}
+          >
+            Cancel job
+          </button>{/if}
       {/if}
     </div>
     <p class="close-note">

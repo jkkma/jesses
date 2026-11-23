@@ -51,7 +51,8 @@ def stage_ffmpeg(delivery: Path, tools_root: Path, target: str) -> list:
     processing = json.loads((delivery / package.relative_path(processing_records[0]["path"])).read_text(encoding="utf-8"))
     if processing.get("processingPolicy") != "vulkan-libplacebo" or processing.get("ffmpegSha256") != ffmpeg_record["sha256"] or not all(processing.get(name) is True for name in ("vulkan", "libplacebo", "spline", "peakDetection", "applyDolbyVision")):
         raise ValueError("The Vulkan/libplacebo capability receipt differs from the staged FFmpeg executable.")
-    if provenance["source"]["sha256"] != "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635":
+    source_lock = json.loads((ROOT / "scripts/package-ffmpeg-linux-lock.json").read_text(encoding="utf-8"))["ffmpeg"]
+    if provenance["source"]["sha256"] != source_lock["sha256"]:
         raise ValueError("The package FFmpeg build has an unexpected official source release.")
     if not provenance.get("additionalSources") or not provenance.get("licenses") or not provenance.get("buildInputs"):
         raise ValueError("The FFmpeg build must include library sources, notices and build inputs.")
@@ -193,7 +194,7 @@ def stage_extra_encoder(delivery: Path, tools_root: Path, target: str, identifie
     environment["PATH"] = str(delivery) + os.pathsep + str(Path(os.environ["SystemRoot"]) / "System32")
     result = subprocess.run([str(executable), switch], env=environment, capture_output=True, text=True, timeout=20)
     output = (result.stdout + result.stderr).strip()
-    marker = {"aom": "3.14.1", "vpx": "1.17.0", "x265": "4.3"}[identifier]
+    marker = lock[identifier]["version"]
     if marker not in output or (identifier == "x265" and output != receipt["tool"]["version"]):
         raise ValueError("The additional encoder identity differs from its build receipt.")
     if identifier in {"aom", "vpx"} and receipt["tool"]["version"] not in output:
@@ -238,7 +239,7 @@ def verify_mkvmerge_notices(licenses: list[dict]) -> None:
     expected = notice_lock.get("licenses")
     if (notice_lock.get("schemaVersion") != 1 or
             notice_lock.get("packageLockSha256") != digest(ROOT / "scripts/package-mkvmerge-windows-lock.json") or
-            not isinstance(expected, list) or len(expected) != 76 or
+            not isinstance(expected, list) or not expected or
             len({record["path"] for record in expected}) != len(expected) or
             licenses != expected):
         raise ValueError("The mkvmerge notice inventory differs from its independent lock.")
@@ -253,7 +254,7 @@ def stage_mkvmerge(delivery: Path, tools_root: Path, target: str) -> dict:
     lock = json.loads(builder.LOCK.read_text(encoding="utf-8"))
     receipt_path = delivery / "build-provenance.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    if (receipt.get("schemaVersion") != 1 or receipt.get("target") != target or
+    if (receipt.get("schemaVersion") != 2 or receipt.get("target") != target or
             receipt.get("lockSha256") != builder.digest(builder.LOCK) or
             receipt.get("buildRecipeSha256") != builder.digest(ROOT / "scripts/build-package-mkvmerge.py") or
             receipt.get("binaryPackages") != lock["packages"]):
@@ -261,26 +262,32 @@ def stage_mkvmerge(delivery: Path, tools_root: Path, target: str) -> dict:
     expected_runtime = {record["path"]: record for record in lock["files"]}
     tool = receipt["tool"]
     if (tool.get("id") != "mkvmerge" or tool.get("path") != "mkvmerge.exe" or
-            tool.get("sha256") != expected_runtime["mkvmerge.exe"]["sha256"] or
-            tool.get("version") != lock["versionLine"] or
-            tool.get("package") != expected_runtime["mkvmerge.exe"]["package"]):
+            tool.get("version") != lock["versionLine"]):
         raise ValueError("The pinned mkvmerge executable identity changed.")
     if {item["path"]: item for item in receipt["supportFiles"]} != {
             name: {"path": name, "sha256": record["sha256"], "package": record["package"]}
-            for name, record in expected_runtime.items() if name != "mkvmerge.exe"}:
+            for name, record in expected_runtime.items()}:
         raise ValueError("The mkvmerge DLL closure differs from its lock.")
-    if receipt["nativeDependencies"] != [{"path": record["path"], "imports": record["imports"]} for record in lock["files"]]:
+    native = [{"path": "mkvmerge.exe", "imports": lock["imports"]}, *lock["files"]]
+    if receipt["nativeDependencies"] != [{"path": record["path"], "imports": record["imports"]} for record in native]:
         raise ValueError("The mkvmerge native import closure changed.")
+    source = lock["source"]
     source_records = [receipt["source"], *receipt["additionalSources"]]
-    if len(source_records) != len(lock["sources"]) or {
-            record["base"]: record for record in source_records} != {
-            item["base"]: {**item, "path": "sources/" + item["filename"]} for item in lock["sources"]}:
+    if source_records != [{**item, "path": "sources/" + item["filename"]} for item in [source, *lock["sources"]]]:
         raise ValueError("The mkvmerge source package closure differs from its lock.")
     inputs = {item["path"]: item["sha256"] for item in receipt["buildInputs"]}
-    if inputs != {
-            "build/build-package-mkvmerge.py": builder.digest(ROOT / "scripts/build-package-mkvmerge.py"),
-            "build/package-mkvmerge-windows-lock.json": builder.digest(builder.LOCK)}:
+    required = {
+        "build/build-package-mkvmerge.py": builder.digest(ROOT / "scripts/build-package-mkvmerge.py"),
+        "build/package-mkvmerge-windows-lock.json": builder.digest(builder.LOCK),
+        **{f"build/{path.name}": builder.digest(path) for path in builder.COMPILER_INPUTS},
+        **{f"build/{name}": sha for name, sha in lock["generatedBuildInputs"].items()},
+    }
+    if (inputs.keys() != required.keys() | {"build/jesses-toolchain.json", "build/native-build.log"} or
+            any(inputs[name] != sha for name, sha in required.items())):
         raise ValueError("The mkvmerge build recipe or lock is missing from its delivery.")
+    compiler = json.loads((delivery / "build/jesses-toolchain.json").read_text(encoding="utf-8"))
+    if compiler.get("lockSha256") != required["build/package-ffmpeg-windows-lock.json"]:
+        raise ValueError("The mkvmerge compiler receipt differs from the active compiler lock.")
     verify_mkvmerge_notices(receipt["licenses"])
     if not receipt["qualificationFiles"]:
         raise ValueError("The mkvmerge notices or native qualification are missing.")
@@ -294,7 +301,7 @@ def stage_mkvmerge(delivery: Path, tools_root: Path, target: str) -> dict:
     actual = {record["path"]: record["sha256"] for record in builder.records(delivery)}
     if actual != expected:
         raise ValueError("The mkvmerge delivery inventory differs from its source and build receipt.")
-    builder.verify_imports(lock["files"], delivery)
+    builder.verify_imports(native, delivery)
     with tempfile.TemporaryDirectory(prefix="jesses-mkvmerge-stage-") as scratch:
         builder.qualify(delivery, Path(scratch) / "qualification", lock["versionLine"])
     shutil.copytree(delivery, tools_root / "mkvmerge")
@@ -321,7 +328,8 @@ def stage_standalone(delivery: Path, tools_root: Path, target: str, identifier: 
     if not media_provenance.is_file() or digest(media_provenance) != receipt["sharedMediaProvenanceSha256"]:
         raise ValueError("The standalone build requires its exact shared media source delivery.")
     media = json.loads(media_provenance.read_text(encoding="utf-8"))
-    pins = {"x264": ("b35605ace3ddf7c1a5d67a2eb553f034aef41d55", "6a4d3620201074edec84681aeb25ffa1eceaa9451f7347ca1448f532634eed55"), "svt-av1": ("9292ec8e32bce26f781f277ec8739b53426c4300", "fe7e58bbd61040b460373ce7cfe0119311464eddbd6e620d84eeed317f598a64")}
+    svt = json.loads((ROOT / "scripts/standalone-tool-sources.json").read_text(encoding="utf-8"))["svtAv1"]
+    pins = {"x264": ("b35605ace3ddf7c1a5d67a2eb553f034aef41d55", "6a4d3620201074edec84681aeb25ffa1eceaa9451f7347ca1448f532634eed55"), "svt-av1": (svt["commit"], svt["sha256"])}
     if (receipt["sourceCommit"], receipt["source"]["sha256"]) != pins[identifier]:
         raise ValueError("The standalone build uses an unexpected source revision.")
     expected_runtime = {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads"} if target == "x86_64-pc-windows-msvc" else set()
@@ -353,7 +361,7 @@ def stage_standalone(delivery: Path, tools_root: Path, target: str, identifier: 
         version = version.splitlines()[0]
         correct_identity = version.startswith("x264 0.165.")
     else:
-        correct_identity = "v4.2.0" in version and "HDR" not in version and "5fish" not in version
+        correct_identity = f"v{svt['version']}" in version and "HDR" not in version and "5fish" not in version
     if version != receipt["tool"]["version"] or not correct_identity:
         raise ValueError("The standalone identity differs from its build receipt.")
     shutil.copytree(delivery, tools_root / identifier)

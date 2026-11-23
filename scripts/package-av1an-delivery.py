@@ -13,6 +13,10 @@ spec = importlib.util.spec_from_file_location("av1an_support", Path(__file__).wi
 support = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(support)
 
+LOCK = json.loads(Path(__file__).with_name("package-av1an-windows-lock.json").read_text(encoding="utf-8"))
+SOURCE = LOCK["inputs"]["av1an"]
+PYTHON_ABI = "python" + "".join(LOCK["inputs"]["pythonRuntime"]["version"].split(".")[:2])
+PYTHON_PATH_CONFIGURATION = f"{PYTHON_ABI}.zip\n.\nLib/site-packages\n"
 SHARED_BASES = {"mingw-w64-gcc", "mingw-w64-crt", "mingw-w64-headers", "mingw-w64-winpthreads", "mingw-w64-dav1d", "mingw-w64-libvpx", "mingw-w64-zlib"}
 SYSTEM_DLLS = {"advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "comctl32.dll", "crypt32.dll", "dbghelp.dll", "gdi32.dll", "imagehlp.dll", "imm32.dll", "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ncrypt.dll", "netapi32.dll", "normaliz.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "powrprof.dll", "psapi.dll", "rpcrt4.dll", "secur32.dll", "setupapi.dll", "shell32.dll", "shlwapi.dll", "user32.dll", "userenv.dll", "ucrtbase.dll", "version.dll", "winhttp.dll", "winmm.dll", "wintrust.dll", "ws2_32.dll", "wtsapi32.dll"}
 SYSTEM_DLLS.update(("pdh.dll", "propsys.dll"))
@@ -39,12 +43,22 @@ def runtime_environment(directory):
     return env
 
 
+def runtime_version(output):
+    banner = next(iter(output.splitlines()), "")
+    expected = f"av1an {SOURCE['version']} (rev {SOURCE['commit']}) "
+    if (not banner.startswith(expected)
+            or any(f"[{marker}]" not in banner for marker in LOCK["compatibilityMarkers"])
+            or "systems.innocent.lsmas : Found" not in output):
+        raise ValueError("The portable av1an identity or decoder availability changed.")
+    return banner
+
+
 def stage(directory, tools_root, target, inventory):
     provenance_path = directory / "build-provenance.json"
     receipt = json.loads(provenance_path.read_text(encoding="utf-8"))
     if target != "x86_64-pc-windows-msvc" or receipt.get("schemaVersion") != 1 or receipt.get("target") != target or receipt["tool"]["id"] != "av1an":
         raise ValueError("The portable av1an delivery has an unsupported identity or platform.")
-    if (receipt["sourceCommit"], receipt["source"]["sha256"]) != ("805dad69143fa0a81cfe2fb89c0b9e90a828ea72", "7f570da8fe0ba5970cbf04d882b48e442e04d1df5ec180e12d9ff974450dfca2"):
+    if (receipt["sourceCommit"], receipt["source"]["sha256"]) != (SOURCE["commit"], SOURCE["sha256"]):
         raise ValueError("The portable av1an source differs from the reviewed revision.")
     media_path = tools_root / "ffmpeg/build-provenance.json"
     if not media_path.is_file() or support.digest(media_path) != receipt["sharedMediaProvenanceSha256"]:
@@ -62,12 +76,11 @@ def stage(directory, tools_root, target, inventory):
         expected[record["path"]] = record["sha256"]
     if not receipt["licenses"] or not receipt["buildInputs"] or not receipt["additionalSources"] or actual != expected:
         raise ValueError("The portable av1an inventory differs from its source/build receipt.")
-    required = {"python/python.exe", "python/python314.dll", "python/python314.zip", "python/python314._pth", "python/Lib/site-packages/vapoursynth/__init__.pyc", "python/Lib/site-packages/vapoursynth/vsscript.dll", "python/Lib/site-packages/vapoursynth/vspipe.exe", "python/Lib/site-packages/vapoursynth/libvapoursynth.dll", "python/Lib/site-packages/vapoursynth/plugins/LSMASHSource.dll"}
+    required = {"python/python.exe", *(f"python/{PYTHON_ABI}{suffix}" for suffix in (".dll", ".zip", "._pth")), "python/Lib/site-packages/vapoursynth/__init__.pyc", "python/Lib/site-packages/vapoursynth/vsscript.dll", "python/Lib/site-packages/vapoursynth/vspipe.exe", "python/Lib/site-packages/vapoursynth/libvapoursynth.dll", "python/Lib/site-packages/vapoursynth/plugins/LSMASHSource.dll"}
     if not required.issubset({record["path"] for record in receipt["supportFiles"]}):
         raise ValueError("The portable frameserver's required runtime files are missing.")
     result = subprocess.run([str(directory / receipt["tool"]["path"]), "--version"], env=runtime_environment(directory), capture_output=True, text=True, check=True, timeout=30)
-    version = result.stdout + result.stderr
-    if version.splitlines()[0] != receipt["tool"]["version"] or "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "[xpsnr-signed-stats-v1]" not in version or "[source-unfiltered-probes-v1]" not in version or "systems.innocent.lsmas : Found" not in version:
+    if runtime_version(result.stdout + result.stderr) != receipt["tool"]["version"]:
         raise ValueError("The portable av1an identity or decoder availability changed.")
     if actual != {record["path"]: record["sha256"] for record in inventory(directory)}:
         raise ValueError("Av1an execution changed its delivery payload.")
@@ -90,11 +103,10 @@ def qualify(directory, scratch, ffmpeg):
         result = subprocess.run([str(directory / "av1an.exe"), "--version"], cwd=scratch, env=env, capture_output=True, text=True, check=True, timeout=30)
         version = result.stdout + result.stderr
         log.write(version)
-        if "[ffmpeg9-passthrough-v1]" not in version or "[segment-ffmpeg9-v1]" not in version or "[target-probe-filter-v1]" not in version or "[xpsnr-signed-stats-v1]" not in version or "[source-unfiltered-probes-v1]" not in version or "systems.innocent.lsmas : Not found" in version or "systems.innocent.lsmas" not in version:
-            raise ValueError("The final av1an runtime lacks its compatibility patch or decoder plugin.")
+        banner = runtime_version(version)
     if before != support.inventory(directory):
         raise ValueError("Running the portable frameserver changed its installed payload.")
-    return version.splitlines()[0]
+    return banner
 
 
 def shared_media_sources(provenance):
@@ -109,7 +121,7 @@ def finish(destination, media, compiler, provenance, lock, archives, python_sour
     directory.mkdir()
     shutil.copy2(engine["binary"], directory / "av1an.exe")
     python = support.unpack(archives["pythonRuntime"], directory / "python", single_root=False)
-    (python / "python314._pth").write_text("python314.zip\n.\nLib/site-packages\n", encoding="utf-8")
+    (python / f"{PYTHON_ABI}._pth").write_text(PYTHON_PATH_CONFIGURATION, encoding="utf-8")
     package = python / "Lib/site-packages/vapoursynth"
     package.mkdir(parents=True)
     for name in ["libvapoursynth.dll", "libvapoursynthfilters.dll", "libvapoursynthfilters_avx2.dll", "libvapoursynthfilters_zn4.dll", "vsscript.dll", "vspipe.exe", "vapoursynth.pyd"]:

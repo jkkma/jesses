@@ -141,7 +141,7 @@ function validNativeFallback(encoder: VideoEncoder, name: string, value: string)
         (!parts.includes('all') && !parts.includes('none')))
     );
   }
-  // SVT-AV1-HDR 4.3.0 numbers film grain as tune 6, after VMAF.
+  // The packaged SVT-AV1-HDR numbers film grain as tune 6, after VMAF.
   const range: [number, number] | undefined = x264
     ? x264Ranges[name]
     : name === 'tune' && encoder === 'svtAv1Hdr'

@@ -23,20 +23,20 @@ jobs:
       PACKAGE_PROFILE: ${{ inputs.profile }}
       PACKAGE_TARGET: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version-file: .node-version
           cache: pnpm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: '3.14'
-      - uses: dtolnay/rust-toolchain@1.98.1
+          python-version: '3.15.2'
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: . -> target/package-build
       - run: pnpm install --frozen-lockfile
@@ -66,7 +66,7 @@ jobs:
       - name: Build the exact source grain provider with private compatible libraries
         shell: bash
         run: |
-          rustup toolchain install 1.98.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          rustup toolchain install 1.100.0-x86_64-pc-windows-gnu --profile minimal --no-self-update
           python scripts/build-package-grav1synth.py --destination "$RUNNER_TEMP/jesses-grav1synth" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
       - name: Build standalone Windows x264 using the same pinned sources
         shell: bash
@@ -86,16 +86,17 @@ jobs:
       - name: Build source-complete Windows CPU quality scorers
         shell: bash
         run: |
-          python scripts/package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-scorers" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64" --vapoursynth-source "$RUNNER_TEMP/jesses-av1an/frameserver/source/vapoursynth-acabf605b2205b32d65859bb2736405719d2fafd" --python "$RUNNER_TEMP/jesses-av1an/frameserver/python-input/tools/python.exe"
+          vapoursynth_revision=$(python -c 'import json; print(json.load(open("scripts/package-av1an-windows-lock.json"))["inputs"]["vapoursynth"]["commit"])')
+          python scripts/package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-scorers" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64" --vapoursynth-source "$RUNNER_TEMP/jesses-av1an/frameserver/source/vapoursynth-$vapoursynth_revision" --python "$RUNNER_TEMP/jesses-av1an/frameserver/python-input/tools/python.exe"
           python scripts/add-package-av1an-scorers.py --destination "$RUNNER_TEMP/jesses-av1an-scorers" --av1an-build "$RUNNER_TEMP/jesses-av1an/delivery" --scorers-build "$RUNNER_TEMP/jesses-scorers/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
       - name: Build and qualify source-complete Windows QTGMC dependencies
         shell: bash
         run: |
-          python scripts/build-package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-qtgmc" --cache "$RUNNER_TEMP/jesses-qtgmc-cache"
+          python scripts/build-package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-qtgmc" --cache "$RUNNER_TEMP/jesses-qtgmc-cache" --ninja "$RUNNER_TEMP/jesses-media-compiler/msys64/ucrt64/bin/ninja.exe"
           python scripts/package-av1an-qtgmc.py --destination "$RUNNER_TEMP/jesses-av1an-qtgmc" --av1an-build "$RUNNER_TEMP/jesses-av1an-scorers/delivery" --qtgmc-build "$RUNNER_TEMP/jesses-qtgmc/delivery" --ffmpeg-build "$RUNNER_TEMP/jesses-ffmpeg/delivery" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
       - name: Package pinned Windows mkvmerge
         shell: bash
-        run: python scripts/build-package-mkvmerge.py --destination "$RUNNER_TEMP/jesses-mkvmerge"
+        run: python scripts/build-package-mkvmerge.py --destination "$RUNNER_TEMP/jesses-mkvmerge" --msys-root "$RUNNER_TEMP/jesses-media-compiler/msys64"
       - name: Verify native parallel scene detection with pinned Windows AV1AN and L-SMASH
         shell: pwsh
         run: |
@@ -182,7 +183,7 @@ jobs:
           python scripts/verify-bundle-resources.py --packages "$RUNNER_TEMP/jesses-packages" --probe "$CARGO_TARGET_DIR/debug/examples/package_tools.exe" --destination "$RUNNER_TEMP/jesses-extracted-bundles" --require-media "${standalone_args[@]}"
       - name: Retain native gate evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: jesses-x86_64-pc-windows-msvc-native-gate-evidence
           path: |
@@ -203,7 +204,7 @@ jobs:
             ${{ runner.temp }}/jesses-mkvmerge/**/qualification/*.json
           if-no-files-found: ignore
           retention-days: 14
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: jesses-x86_64-pc-windows-msvc-${{ inputs.profile }}-unsigned
           path: |

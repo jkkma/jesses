@@ -17,14 +17,14 @@ spec.loader.exec_module(recipe)
 class Recipe(unittest.TestCase):
     def test_complete_source_inputs_use_exact_inherited_and_gitlink_pins(self):
         sources = recipe.source_inputs()
-        self.assertEqual(sources["vapoursynth"]["version"], "R79")
+        self.assertEqual(sources["vapoursynth"]["version"], "R82")
         self.assertEqual(sources["havsfunc"]["revision"], "5baf9c2a1dac9da4de182cf3a4e12041c3e0d48b")
         self.assertEqual(sources["znedi3-graphengine"]["commit"], "7bb77a5c062c610e7f44df6a59155cc3ab3e452a")
         self.assertEqual(sources["znedi3-vsxx"]["commit"], "11eb026af5517d69e1d3d6258d1b2c2040c508e7")
         for source in sources.values():
             self.assertTrue(source["url"].startswith("https://"))
             self.assertRegex(source["sha256"], r"^[a-f0-9]{64}$")
-        self.assertEqual(len(recipe.PLUGINS), 9)
+        self.assertEqual(len(recipe.PLUGINS), 8)
 
     def test_retained_build_paths_cannot_escape_or_follow_redirected_parents(self):
         with tempfile.TemporaryDirectory() as temporary:

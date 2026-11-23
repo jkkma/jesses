@@ -23,20 +23,20 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       JESSES_MACOS_PACKAGE_DIR: jesses-macos-package-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version-file: .node-version
           cache: pnpm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: '3.14'
-      - uses: dtolnay/rust-toolchain@1.98.1
+          python-version: '3.15.2'
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Install explicit external media dependencies
         run: |
           brew install ffmpeg-full mkvtoolnix x264 x265 aom libvpx svt-av1 tesseract
@@ -61,7 +61,7 @@ jobs:
       - name: Verify exact app and create development archive
         # Keep the fresh archive destination outside the restored Cargo cache.
         run: python3 scripts/package-macos.py --app target/${{ matrix.target }}/release/bundle/macos/jesses.app --destination "$RUNNER_TEMP/$JESSES_MACOS_PACKAGE_DIR" --target ${{ matrix.target }} --native --launch-smoke
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: jesses-${{ matrix.target }}-development

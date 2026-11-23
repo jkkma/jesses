@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -44,16 +45,43 @@ class BuildJobTests(unittest.TestCase):
                         module.positive_jobs(value)
             self.assertEqual(module.positive_jobs("2"), 2)
 
+    def test_libunibreak_build_exposes_the_compiled_archive_in_pkgconfig(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build_inputs = root / "build-inputs"
+            build_inputs.mkdir()
+            for filename in ("build-package-ffmpeg-linux.py", "cpu-encoding-policy.json"):
+                shutil.copy2(SCRIPTS / filename, build_inputs / filename)
+            pkgconfig = root / "pkgconfig"
+            pkgconfig.mkdir()
+            source = root / "unicode.tar.gz"
+            with tarfile.open(source, "w:gz") as archive:
+                content = b"prefix=@prefix@\nlibdir=@libdir@\nVersion: @VERSION@\nLibs: -L${libdir} -lunibreak\n"
+                entry = tarfile.TarInfo("unicode/libunibreak.pc.in")
+                entry.size = len(content)
+                archive.addfile(entry, io.BytesIO(content))
+
+            def run(command, cwd):
+                self.assertEqual(command[1:3], ["-j2", "-f"])
+                library = cwd / "ReleaseDir/libunibreak.a"
+                library.parent.mkdir(parents=True)
+                library.touch()
+
+            ffmpeg.build_libunibreak(root, root / "compiler", source, {"sourceRoot": "unicode", "version": "8.0.1"}, pkgconfig, run, jobs=2)
+            metadata = (pkgconfig / "libunibreak.pc").read_text()
+            self.assertIn("Version: 8.0.1\n", metadata)
+            self.assertIn("libdir=${prefix}/src/ReleaseDir\n", metadata)
+
     def test_vmaf_ninja_receives_selected_limit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             payload = io.BytesIO()
             with tarfile.open(fileobj=payload, mode="w:gz") as archive:
-                archive.addfile(tarfile.TarInfo("vmaf-3.2.0"))
+                archive.addfile(tarfile.TarInfo(f"vmaf-{vmaf.VERSION}"))
             data = payload.getvalue()
             source = root / "source.tar"
             with tarfile.open(source, "w") as archive:
-                item = tarfile.TarInfo("mingw-w64-vmaf/vmaf-3.2.0.tar.gz")
+                item = tarfile.TarInfo(f"mingw-w64-vmaf/vmaf-{vmaf.VERSION}.tar.gz")
                 item.size = len(data)
                 archive.addfile(item, io.BytesIO(data))
             compiler = root / "compiler"

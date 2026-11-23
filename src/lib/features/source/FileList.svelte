@@ -119,29 +119,34 @@
 
 <section class="file-list" aria-label="File List">
   <div class="mode-line">
-    <label
-      >Mode <select
+    <label>
+      Mode <select
         value={mode}
         onchange={(event) => onmode(event.currentTarget.value as FileListMode)}
-        ><option value="mux">Muxing Mode - Merge all loaded files into one output</option><option
-          value="batch">Batch Processing Mode - Run the task on each file separately</option
-        ></select
-      ></label
-    >
-    {#if mode === 'batch'}<label
-        >Output Names <input
+      >
+        <option value="mux">Muxing Mode - Merge all loaded files into one output</option><option
+          value="batch"
+        >
+          Batch Processing Mode - Run the task on each file separately
+        </option>
+      </select>
+    </label>
+    {#if mode === 'batch'}<label>
+        Output Names <input
           value={batchNameTemplate}
           placeholder={'{name}'}
           oninput={(event) => onname(event.currentTarget.value)}
-        /></label
-      >
+        />
+      </label>
       <button
         type="button"
         class="help-trigger"
         aria-label="Batch naming help"
         popovertarget={helpId}
-        bind:this={helpTrigger}>?</button
+        bind:this={helpTrigger}
       >
+        ?
+      </button>
       <div
         id={helpId}
         popover="auto"
@@ -177,15 +182,17 @@
             onselect([file.id]);
             onload();
           }}
-          >{#if statuses[file.id]}<span class="batch-glyph" aria-hidden="true"
-              >{statuses[file.id].glyph}</span
-            >{/if}<span class="file-name">{file.name} ({formatBytes(file.sizeBytes)})</span
-          >{#if statuses[file.id]}<span class="batch-status"
-              >{statuses[file.id].text}{#if statuses[file.id].note}<span class="batch-note"
-                  >: {statuses[file.id].note}</span
-                >{/if}</span
-            >{/if}</button
         >
+          {#if statuses[file.id]}<span class="batch-glyph" aria-hidden="true">
+              {statuses[file.id].glyph}
+            </span>{/if}<span class="file-name">
+            {file.name} ({formatBytes(file.sizeBytes)})
+          </span>{#if statuses[file.id]}<span class="batch-status">
+              {statuses[file.id].text}{#if statuses[file.id].note}<span class="batch-note">
+                  : {statuses[file.id].note}
+                </span>{/if}
+            </span>{/if}
+        </button>
       {:else}<div class="empty">
           Drag &amp; drop media files anywhere in this window to load them.
         </div>{/each}
@@ -193,21 +200,25 @@
     <SourceThumbnail file={primary} />
   </div>
   <div class="file-actions">
-    <span class="file-count"
-      >{`${files.length} ${files.length === 1 ? 'file' : 'files'} loaded.${
+    <span class="file-count">
+      {`${files.length} ${files.length === 1 ? 'file' : 'files'} loaded.${
         files.length > 1 && mode === 'mux'
           ? ' Double click any of them or use the Load Tracks button to load their tracks.'
           : ''
-      }`}</span
-    >
-    <button type="button" onclick={onadd} disabled={!desktop || importing}>Add Files…</button
-    ><button type="button" onclick={onfolder} disabled={!desktop || importing}>Add Folder…</button
-    ><button
+      }`}
+    </span>
+    <button type="button" onclick={onadd} disabled={!desktop || importing}>
+      Add Files…
+    </button><button type="button" onclick={onfolder} disabled={!desktop || importing}>
+      Add Folder…
+    </button><button
       type="button"
       popovertarget={recentId}
       disabled={!recentPaths.length}
-      bind:this={recentTrigger}>Recent…</button
+      bind:this={recentTrigger}
     >
+      Recent…
+    </button>
     <div
       id={recentId}
       popover="auto"
@@ -228,18 +239,21 @@
             onrecent(path);
             recentPopover?.hidePopover();
           }}
-          ><span class="recent-name">{fileName(shown)}</span><span class="recent-folder"
-            >{shown
+        >
+          <span class="recent-name">{fileName(shown)}</span><span class="recent-folder">
+            {shown
               .slice(0, Math.max(0, shown.length - fileName(shown).length))
-              .replace(/[\\/]$/, '')}</span
-          ></button
-        >{:else}<span class="recent-empty">No recent files yet.</span>{/each}
+              .replace(/[\\/]$/, '')}
+          </span>
+        </button>{:else}<span class="recent-empty">No recent files yet.</span>{/each}
     </div>
     <button
       type="button"
       onclick={onload}
-      disabled={!selectedIds.length || importing || mode === 'batch'}>Load Tracks</button
-    ><button type="button" popovertarget={sortId} bind:this={sortTrigger}>Sort…</button>
+      disabled={!selectedIds.length || importing || mode === 'batch'}
+    >
+      Load Tracks
+    </button><button type="button" popovertarget={sortId} bind:this={sortTrigger}>Sort…</button>
     <div
       id={sortId}
       popover="auto"
@@ -257,22 +271,28 @@
           onclick={() => {
             onsort(value);
             sortPopover?.hidePopover();
-          }}>{label}</button
-        >{/each}
+          }}
+        >
+          {label}
+        </button>{/each}
     </div>
     <button
       type="button"
       aria-label="Move file up"
       onclick={() => onmove(-1)}
-      disabled={selectedIds.length !== 1}>▲</button
-    ><button
+      disabled={selectedIds.length !== 1}
+    >
+      ▲
+    </button><button
       type="button"
       aria-label="Move file down"
       onclick={() => onmove(1)}
-      disabled={selectedIds.length !== 1}>▼</button
-    ><button type="button" onclick={onremove} disabled={!selectedIds.length || importing}
-      >Remove</button
+      disabled={selectedIds.length !== 1}
     >
+      ▼
+    </button><button type="button" onclick={onremove} disabled={!selectedIds.length || importing}>
+      Remove
+    </button>
   </div>
 </section>
 

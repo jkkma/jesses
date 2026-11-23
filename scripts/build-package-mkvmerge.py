@@ -1,18 +1,16 @@
-"""Build a source-complete Windows mkvmerge delivery from pinned MSYS2 packages.
-
-The lock names every executable/DLL and the source-only package for each
-binary package. Nothing is installed into Windows or resolved from PATH.
-Only ordinary, explicitly selected archive members enter the delivery.
-"""
+"""Compile Windows mkvmerge from upstream sources and stage its pinned DLLs."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import difflib
 import hashlib
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import shlex
 import struct
 import subprocess
 import sys
@@ -24,6 +22,9 @@ from urllib.request import Request, urlopen
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "scripts/package-mkvmerge-windows-lock.json"
+COMPILER_LOCK = ROOT / "scripts/package-ffmpeg-windows-lock.json"
+COMPILER_VERIFIER = ROOT / "scripts/build-package-ffmpeg.py"
+COMPILER_INPUTS = (COMPILER_LOCK, COMPILER_VERIFIER, ROOT / "scripts/bootstrap-package-toolchain.py")
 MAX_DOWNLOAD = 512 * 1024 * 1024
 MAX_MEMBER = 128 * 1024 * 1024
 SYSTEM_IMPORTS = {
@@ -73,7 +74,11 @@ def ordinary_member(archive: tarfile.TarFile, members: dict, name: str, limit: i
 
 def download(record: dict, cache: Path) -> Path:
     filename = member_path(record["filename"])
-    if len(filename.parts) != 1 or not record["url"].startswith("https://repo.msys2.org/mingw/"):
+    if len(filename.parts) != 1 or not record["url"].startswith((
+        "https://repo.msys2.org/mingw/",
+        "https://repo.msys2.org/msys/",
+        "https://mkvtoolnix.download/sources/",
+    )):
         raise ValueError("An MKVToolNix input has an unexpected source URL or filename.")
     path = cache / filename
     if path.exists():
@@ -241,11 +246,112 @@ def records(directory: Path) -> list[dict]:
     return result
 
 
-def build(destination: Path, cache: Path) -> Path:
+def cli_icon(source: bytes) -> bytes:
+    if len(source) < 8 or struct.unpack_from(">4sI", source) != (b"icns", len(source)):
+        raise ValueError("The upstream icon container changed.")
+    images = {}
+    offset = 8
+    while offset < len(source):
+        _, size = struct.unpack_from(">4sI", source, offset)
+        if not 8 <= size <= len(source) - offset:
+            raise ValueError("The upstream icon has an invalid image entry.")
+        entry = source[offset + 8:offset + size]
+        if entry.startswith(b"\x89PNG\r\n\x1a\n") and len(entry) >= 24:
+            width, height = struct.unpack_from(">II", entry, 16)
+            if width == height and width in {32, 64, 128, 256}:
+                if width in images and images[width] != entry:
+                    raise ValueError("The upstream icon contains conflicting image sizes.")
+                images[width] = entry
+        offset += size
+    if set(images) != {32, 64, 128, 256}:
+        raise ValueError("The upstream icon is missing one or more PNG sizes.")
+    data_offset = 6 + 16 * len(images)
+    index = bytearray(struct.pack("<HHH", 0, 1, len(images)))
+    for pixels, entry in sorted(images.items()):
+        index.extend(struct.pack("<BBBBHHII", pixels % 256, pixels % 256, 0, 0, 1, 32, len(entry), data_offset))
+        data_offset += len(entry)
+    return bytes(index) + b"".join(entry for _, entry in sorted(images.items()))
+
+
+def extract_source(archive_path, directory, source_root):
+    directory.mkdir()
+    with tarfile.open(archive_path) as archive:
+        members = checked_members(archive)
+        if any(PurePosixPath(name).parts[0] != source_root for name in members):
+            raise ValueError("The MKVToolNix source archive has an unexpected root.")
+        archive.extractall(directory, filter="data")
+    return directory / source_root
+
+
+def source_build(lock, archive_path, compiler, build_inputs, destination, cache, jobs):
+    spec = importlib.util.spec_from_file_location("media_compiler", COMPILER_VERIFIER)
+    shared = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shared)
+    shared.verify_compiler(compiler)
+    isolated = destination / "msys64"
+    shutil.copytree(compiler, isolated)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        packages = list(pool.map(lambda item: download(item, cache), lock["buildPackages"]))
+    for package in packages:
+        with tarfile.open(package) as archive:
+            members = checked_members(archive)
+            archive.extractall(
+                isolated,
+                (member for member in members.values()
+                 if member.isfile() and member.name.startswith(("ucrt64/", "usr/"))),
+                filter="data",
+            )
+    # Keep the native compiler's zlib ABI when overlaying Qt's compatibility package.
+    shutil.copy2(compiler / "ucrt64/bin/libz-1.dll", isolated / "ucrt64/bin/libz-1.dll")
+
+    source = extract_source(archive_path, destination / "source", lock["source"]["sourceRoot"])
+    config = source / "configure"
+    pristine = config.read_text(encoding="utf-8")
+    before = 'if test "x$ac_cv_mingw32" = "xyes"; then\n  if test "x$ac_cv_path_INKSCAPE" = "x"; then'
+    after = before.replace("; then", ' && test "$enable_gui" = yes; then', 1)
+    if pristine.count(before) != 1:
+        raise ValueError("The Windows configure icon-tool check changed.")
+    patched = pristine.replace(before, after)
+    config.write_text(patched, encoding="utf-8", newline="\n")
+    patch = "".join(difflib.unified_diff(pristine.splitlines(keepends=True), patched.splitlines(keepends=True),
+                                         fromfile="a/configure", tofile="b/configure"))
+    write_bytes(build_inputs / "cli-configure.patch", patch.encode("utf-8"))
+    icon = cli_icon((source / "share/icons/macos/MKVToolNix.icns").read_bytes())
+    write_bytes(build_inputs / "mkvmerge.ico", icon)
+    write_bytes(source / "share/icons/windows/mkvmerge.ico", icon)
+    if any(digest(build_inputs / name) != lock["generatedBuildInputs"][name] for name in lock["generatedBuildInputs"]):
+        raise ValueError("The generated CLI build inputs differ from the lock.")
+
+    compile_source(lock, source, isolated, build_inputs / "native-build.log", jobs)
+    shutil.copy2(compiler / "jesses-toolchain.json", build_inputs)
+    for item in COMPILER_INPUTS:
+        shutil.copy2(item, build_inputs)
+    return source / "src/mkvmerge.exe"
+
+
+def compile_source(lock, source, isolated, logfile, jobs):
+    flags = lock["configure"]
+    shell = "export PATH=/ucrt64/bin:/ucrt64/share/qt6/bin:/usr/bin; "
+    shell += shlex.join(["./configure", *flags, "CXXFLAGS=-O2 -Wno-ignored-attributes -Wno-template-id-cdtor"])
+    shell += " && " + shlex.join(["ruby", "./drake", "-j", str(jobs), "src/mkvmerge.exe"])
+    env = runtime_environment(isolated / "ucrt64/bin")
+    env["MSYSTEM"] = "UCRT64"
+    env["MINGW_PREFIX"] = "/ucrt64"
+    env["RUBYSHELL"] = str(isolated / "usr/bin/sh.exe")
+    env["SOURCE_DATE_EPOCH"] = str(lock["sourceDateEpoch"])
+    system = Path(os.environ["SystemRoot"]) / "System32"
+    env["COMSPEC"] = str(system / "cmd.exe")
+    env["PATH"] = os.pathsep.join(map(str, [isolated / "ucrt64/bin", isolated / "usr/bin", system]))
+    with logfile.open("xb") as log:
+        subprocess.run([str(isolated / "usr/bin/bash.exe"), "--noprofile", "--norc", "-c", shell],
+                       cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600)
+
+
+def build(destination: Path, cache: Path, compiler: Path, jobs: int) -> Path:
     if sys.platform != "win32":
         raise ValueError("The mkvmerge delivery requires a matching Windows x64 host.")
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
-    if lock.get("schemaVersion") != 1 or lock.get("target") != "x86_64-pc-windows-msvc" or lock.get("version") != "97.0":
+    if lock.get("schemaVersion") != 2 or lock.get("target") != "x86_64-pc-windows-msvc":
         raise ValueError("Unsupported MKVToolNix lock.")
     packages = {item["name"]: item for item in lock["packages"]}
     sources = {item["base"]: item for item in lock["sources"]}
@@ -253,8 +359,6 @@ def build(destination: Path, cache: Path) -> Path:
         raise ValueError("Duplicate MKVToolNix package or source records.")
     if {(item["base"], item["version"]) for item in packages.values()} != {(item["base"], item["version"]) for item in sources.values()}:
         raise ValueError("Every runtime binary package must have its matching source-only package.")
-    if len(lock["files"]) != 23 or len(packages) != 21 or len(sources) != 20:
-        raise ValueError("The reviewed MKVToolNix dependency closure changed.")
     destination = destination.absolute()
     destination.mkdir(parents=True, exist_ok=False)
     cache = cache.absolute()
@@ -265,6 +369,16 @@ def build(destination: Path, cache: Path) -> Path:
 
     delivery = destination / "delivery"
     delivery.mkdir()
+    build_dir = delivery / "build"
+    build_dir.mkdir()
+    source_pin = lock["source"]
+    upstream_archive = download(source_pin, cache)
+    executable = source_build(lock, upstream_archive, compiler, build_dir, destination, cache, jobs)
+    shutil.copy2(executable, delivery / "mkvmerge.exe")
+    upstream_payload = delivery / "sources" / source_pin["filename"]
+    upstream_payload.parent.mkdir()
+    shutil.copy2(upstream_archive, upstream_payload)
+    source = {**source_pin, "path": upstream_payload.relative_to(delivery).as_posix()}
     licenses = []
     package_files = {}
     for name, record in packages.items():
@@ -291,24 +405,24 @@ def build(destination: Path, cache: Path) -> Path:
                     licenses.append({"path": output.relative_to(delivery).as_posix(), "sha256": digest(output)})
     if set(package_files) != {item["path"] for item in lock["files"]}:
         raise ValueError("A locked mkvmerge runtime file was not delivered.")
-    imports = verify_imports(lock["files"], delivery)
+    imports = verify_imports([{"path": "mkvmerge.exe", "imports": lock["imports"]}, *lock["files"]], delivery)
 
     source_records = []
     for base, record in sources.items():
-        source = source_paths[base]
-        with tarfile.open(source) as archive:
+        source_archive = source_paths[base]
+        with tarfile.open(source_archive) as archive:
             members = checked_members(archive)
             ordinary_member(archive, members, f"{base}/PKGBUILD", 2 * 1024 * 1024)
-            upstream = members.get(record["requiredSourceMember"])
-            if upstream is None or not upstream.isfile() or upstream.size < 20_000:
+            required_source = members.get(record["requiredSourceMember"])
+            if required_source is None or not required_source.isfile() or required_source.size < 20_000:
                 raise ValueError(f"The complete upstream source is missing from {base}.")
         output = delivery / "sources" / record["filename"]
         output.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, output)
+        shutil.copy2(source_archive, output)
         source_records.append({**record, "path": output.relative_to(delivery).as_posix()})
     for notice in lock["extraNotices"]:
-        source = source_paths[notice["base"]]
-        with tarfile.open(source) as package:
+        notice_archive = source_paths[notice["base"]]
+        with tarfile.open(notice_archive) as package:
             members = checked_members(package)
             inner_name = f"{notice['base']}/{notice['innerArchive']}"
             data = ordinary_member(package, members, inner_name)
@@ -319,27 +433,29 @@ def build(destination: Path, cache: Path) -> Path:
                 write_bytes(output, ordinary_member(archive, inner_members, name, 2 * 1024 * 1024))
                 licenses.append({"path": output.relative_to(delivery).as_posix(), "sha256": digest(output)})
 
-    build_dir = delivery / "build"
-    build_dir.mkdir()
+    with tarfile.open(upstream_archive) as archive:
+        members = checked_members(archive)
+        for name in lock["sourceNotices"]:
+            output = delivery / "licenses" / "mkvtoolnix" / PurePosixPath(name).name
+            write_bytes(output, ordinary_member(archive, members, name, 2 * 1024 * 1024))
+            licenses.append({"path": output.relative_to(delivery).as_posix(), "sha256": digest(output)})
+
     for path in (LOCK, Path(__file__)):
         shutil.copy2(path, build_dir / path.name)
     build_inputs = records(build_dir)
     build_inputs = [{**record, "path": "build/" + record["path"]} for record in build_inputs]
-    runtime = [{"path": item["path"], "sha256": item["sha256"], "package": item["package"]} for item in lock["files"]]
-    tool = next(item for item in runtime if item["path"] == "mkvmerge.exe")
-    tool = {**tool, "id": "mkvmerge", "version": lock["versionLine"]}
-    support_files = [item for item in runtime if item["path"] != "mkvmerge.exe"]
-    source = next(item for item in source_records if item["base"] == "mingw-w64-mkvtoolnix")
-    additional_sources = [item for item in source_records if item["base"] != "mingw-w64-mkvtoolnix"]
+    support_files = [{"path": item["path"], "sha256": item["sha256"], "package": item["package"]} for item in lock["files"]]
+    tool = {"id": "mkvmerge", "path": "mkvmerge.exe", "version": lock["versionLine"],
+            "sha256": digest(delivery / "mkvmerge.exe")}
     qualification_log = qualify(delivery, destination / "qualification", lock["versionLine"])
     write_bytes(delivery / "qualification/native-mux-and-identify.log", qualification_log.encode("utf-8"))
     qualification_files = [{"path": "qualification/native-mux-and-identify.log", "sha256": digest(delivery / "qualification/native-mux-and-identify.log")}]
-    receipt = {"schemaVersion": 1, "target": lock["target"], "tool": tool, "source": source,
-               "additionalSources": additional_sources, "licenses": licenses, "buildInputs": build_inputs,
+    receipt = {"schemaVersion": 2, "target": lock["target"], "tool": tool, "source": source,
+               "additionalSources": source_records, "licenses": licenses, "buildInputs": build_inputs,
                "supportFiles": support_files, "qualificationFiles": qualification_files,
                "binaryPackages": list(packages.values()), "nativeDependencies": imports,
                "lockSha256": digest(LOCK), "buildRecipeSha256": digest(Path(__file__)),
-               "sourcePolicy": "Each staged MSYS2 binary package has its exact-version source-only package, including upstream source and PKGBUILD. Only the locked CLI and recursive PE DLL closure are staged; no host DLL or tool is copied."}
+               "sourcePolicy": "The CLI is built from the pinned stable release archive. Each staged MSYS2 DLL has the exact-version source-only package, including upstream source and PKGBUILD."}
     write_bytes(delivery / "build-provenance.json", (json.dumps(receipt, indent=2) + "\n").encode("utf-8"))
     print(f"Verified source-complete mkvmerge delivery: {delivery}", flush=True)
     return delivery
@@ -348,9 +464,13 @@ def build(destination: Path, cache: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--msys-root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=ROOT / "target/tool-download-cache")
+    parser.add_argument("--jobs", type=int, default=6)
     args = parser.parse_args()
-    build(args.destination, args.cache)
+    if args.jobs < 1:
+        parser.error("--jobs must be positive.")
+    build(args.destination, args.cache, args.msys_root.resolve(strict=True), args.jobs)
 
 
 if __name__ == "__main__":

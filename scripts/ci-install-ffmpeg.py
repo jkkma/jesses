@@ -14,10 +14,10 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-VERSION = "9.0.1"
+VERSION = "9.1"
 ROOT = f"ffmpeg-{VERSION}"
 ARCHIVE = f"{ROOT}.tar.xz"
-SHA256 = "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+SHA256 = "1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433"
 URL = f"https://ffmpeg.org/releases/{ARCHIVE}"
 HERE = Path(__file__).resolve().parent
 CODEC_INPUTS = [HERE / "build-package-ffmpeg-linux.py", HERE / "package-ffmpeg-linux-lock.json", HERE / "qualify-cpu-encoders.py", HERE / "cpu-encoding-policy.json"]

@@ -10,16 +10,16 @@ jobs:
   build:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version-file: .node-version
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - name: Build production executable with embedded frontend
@@ -36,7 +36,7 @@ jobs:
             profile = 'release'
             sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
           } | ConvertTo-Json | Set-Content -LiteralPath 'target/release-build.json' -Encoding utf8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: jesses-windows-release-executable
           path: |

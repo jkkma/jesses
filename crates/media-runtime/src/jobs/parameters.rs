@@ -94,7 +94,7 @@ fn specs(encoder: VideoEncoder) -> Vec<Spec> {
             spec.description = description;
         }
         if encoder == VideoEncoder::SvtAv1Hdr && spec.name == "tune" {
-            // The pinned SVT-AV1-HDR 4.3.0 build inserted VMAF as tune 5 and
+            // The pinned SVT-AV1-HDR provider uses VMAF as tune 5 and
             // moved film grain to tune 6. The source catalog predates that.
             spec.max = 6;
             spec.description = HDR_TUNE_DESCRIPTION;
@@ -306,16 +306,21 @@ pub(in crate::jobs) fn high_bit_depth_decision(settings: &EncodeSettings) -> boo
             .any(|value| value.name == "hbd-mds" && matches!(value.value.as_str(), "1" | "2"))
 }
 
-pub(in crate::jobs) const WINDOWS_HDR_RELEASE: &str = "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)";
+pub(in crate::jobs) const WINDOWS_HDR_RELEASE: &str = "SVT-AV1-HDR v4.3.1-g421c65909 (release)";
+pub(in crate::jobs) const WINDOWS_LEGACY_HDR_RELEASE: &str =
+    "SVT-AV1-HDR v4.3.0-g6d661b6b5 (release)";
 
 pub(in crate::jobs) fn allows_parallel_svt(settings: &EncodeSettings, identity: &str) -> bool {
     // This exact build passed the paired-option short-clip reproducer at
     // default parallelism and repeated concurrent AV1AN-style processes.
     cfg!(windows)
         && settings.encoder == VideoEncoder::SvtAv1Hdr
-        && identity
-            .lines()
-            .any(|line| line.trim() == WINDOWS_HDR_RELEASE)
+        && identity.lines().any(|line| {
+            matches!(
+                line.trim(),
+                WINDOWS_HDR_RELEASE | WINDOWS_LEGACY_HDR_RELEASE
+            )
+        })
 }
 
 fn has_explicit_ten_bit_output(settings: &EncodeSettings) -> bool {
