@@ -240,6 +240,50 @@ async fn file_sink_write_failure_stops_pipeline_and_cancel_releases_owned_file()
 }
 
 #[tokio::test]
+async fn cancel_file_pipeline_while_diagnostic_log_write_is_pending() {
+    let (producer, consumer) = fixtures("binary-producer", "blocked-consumer-tree");
+    let output_path = consumer.0.join("canceled.bin");
+    let output = std::fs::File::create(&output_path).unwrap();
+    let (cancel, receiver) = watch::channel(false);
+    let (events, _unread) = mpsc::channel(1);
+    let producer_spec = producer.spec();
+    let consumer_spec = consumer.spec();
+    let log = producer.0.join("pipeline.log");
+    let write_started = Arc::new(tokio::sync::Notify::new());
+    let pipeline = BLOCK_PIPELINE_LOG_WRITE.scope(
+        Arc::clone(&write_started),
+        run_pipeline_to_file(
+            &producer_spec,
+            &consumer_spec,
+            receiver,
+            events,
+            &log,
+            Duration::from_secs(30),
+            output,
+        ),
+    );
+    let cancel_after_write_begins = async {
+        write_started.notified().await;
+        let pids = [
+            producer.pid(0).await,
+            consumer.pid(0).await,
+            consumer.pid(1).await,
+            consumer.pid(2).await,
+        ];
+        cancel.send(true).unwrap();
+        pids
+    };
+    let (result, pids) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(pipeline, cancel_after_write_begins)
+    })
+    .await
+    .expect("cancellation must release the suspended log write before flushing");
+    assert!(matches!(result, Err(SupervisorError::Cancelled)));
+    assert_dead(&pids).await;
+    std::fs::remove_file(output_path).expect("canceled pipeline released its sink handle");
+}
+
+#[tokio::test]
 async fn upstream_failure_cannot_be_masked_by_consumer_or_hang_at_eof() {
     let (producer, consumer) = fixtures("binary-fail", "read-then-hang");
     let (_cancel, receiver) = watch::channel(false);

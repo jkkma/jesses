@@ -44,6 +44,10 @@ pub use console::{
 
 type CaptureObserver = std::sync::Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
 tokio::task_local! { static CAPTURE_OBSERVER: CaptureObserver; }
+#[cfg(test)]
+tokio::task_local! {
+    static BLOCK_PIPELINE_LOG_WRITE: std::sync::Arc<tokio::sync::Notify>;
+}
 pub(crate) async fn with_capture_observer<T>(
     observer: CaptureObserver,
     future: impl std::future::Future<Output = T>,
@@ -1105,14 +1109,13 @@ async fn run_pipeline_execute(
     };
     tokio::pin!(consumer_output);
     let mut consumer_output_done = false;
-    let diagnostics = async {
+    let mut diagnostics = Box::pin(async {
         tokio::try_join!(
             drain_stage(producer_stderr, true, Some("producer"), &events, &log),
             drain_stage(consumer_stderr, true, Some("consumer"), &events, &log),
         )?;
         Ok::<_, SupervisorError>(())
-    };
-    tokio::pin!(diagnostics);
+    });
     let mut diagnostics_done = false;
     let execution = async {
         let producer_wait = producer.wait_and_terminate_descendants();
@@ -1191,8 +1194,11 @@ async fn run_pipeline_execute(
     {
         // A failed stage can exit before its stderr was polled. Read its
         // remaining diagnostics after both process trees have closed the pipes.
-        let _ = tokio::time::timeout(Duration::from_secs(1), diagnostics).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), diagnostics.as_mut()).await;
     }
+    // Cancellation can interrupt an async log write while the drain still
+    // holds the log mutex. Release it before draining stdout or flushing.
+    drop(diagnostics);
     let output_result = if consumer_output_done {
         Ok(())
     } else {
@@ -1440,11 +1446,17 @@ impl StageOutput<'_> {
     }
 
     async fn log(&self, bytes: &[u8]) -> io::Result<()> {
-        self.log
-            .lock()
-            .await
-            .write_record(&self.staged(bytes), self.stderr)
-            .await
+        let mut log = self.log.lock().await;
+        #[cfg(test)]
+        if self.stderr
+            && self.stage.is_some()
+            && BLOCK_PIPELINE_LOG_WRITE
+                .try_with(|started| started.notify_one())
+                .is_ok()
+        {
+            std::future::pending::<()>().await;
+        }
+        log.write_record(&self.staged(bytes), self.stderr).await
     }
 
     fn event(&self, bytes: &[u8]) {
