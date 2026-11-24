@@ -1,11 +1,12 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { preferences, updatePreferences } from '$lib/preferences.svelte';
+  import { loadPreferences, preferences, updatePreferences } from '$lib/preferences.svelte';
   import { chooseOutputFolder, isDesktop } from '$lib/ipc/client';
   import { errorMessage } from '$lib/components/shared/format';
   import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
   import type { GeneralPreferences, ResetOnNewFilePreferences } from '$lib/ipc/generated';
   const isWindows = /Windows/i.test(navigator.userAgent);
+  const desktop = isDesktop();
   let { onreset }: { onreset: () => void } = $props();
   const defaultReset: ResetOnNewFilePreferences = {
     trim: true,
@@ -35,6 +36,7 @@
   let dirty = false;
   let tail = Promise.resolve();
   const saved = $derived(preferences.value.general);
+  const ready = $derived(desktop && preferences.loaded && !preferences.loading);
   const reset = $derived(saved.resetOnNewFile ?? defaultReset);
   $effect(() => {
     const value = preferences.value.general.defaultOutputDirectory;
@@ -43,8 +45,8 @@
     });
   });
   function savePatch(patch: Partial<GeneralPreferences>) {
-    tail = tail.then(async () => {
-      if (!preferences.loaded) return;
+    const result = tail.then(async () => {
+      if (!preferences.loaded) return false;
       busy = true;
       error = '';
       try {
@@ -52,18 +54,42 @@
           general: { ...preferences.value.general, ...patch },
           recentPaths: null,
         });
+        return true;
       } catch (cause) {
         error = errorMessage(cause);
+        return false;
       } finally {
         busy = false;
       }
     });
-    return tail;
+    tail = result.then(() => {});
+    return result;
+  }
+  async function saveControl<K extends keyof GeneralPreferences>(
+    control: HTMLInputElement | HTMLSelectElement,
+    key: K,
+    value: GeneralPreferences[K],
+    defaultValue: GeneralPreferences[K],
+  ) {
+    const checkbox =
+      control instanceof HTMLInputElement && control.type === 'checkbox' ? control : null;
+    const changed = checkbox?.checked ?? control.value;
+    await savePatch({ [key]: value });
+    const authoritative = preferences.value.general[key] ?? defaultValue;
+    if (checkbox) {
+      if (checkbox.checked === changed) checkbox.checked = Boolean(authoritative);
+    } else if (control.value === changed) control.value = String(authoritative);
   }
   async function saveFolder() {
-    const value = folder.trim();
-    await savePatch({ defaultOutputDirectory: value });
-    dirty = false;
+    if (!dirty) return;
+    const draftFolder = folder;
+    if (
+      (await savePatch({ defaultOutputDirectory: draftFolder.trim() })) &&
+      folder === draftFolder
+    ) {
+      dirty = false;
+      folder = preferences.value.general.defaultOutputDirectory;
+    }
   }
   async function browse() {
     try {
@@ -85,15 +111,26 @@
 
 <section class="settings" aria-label="Settings">
   <h2>GENERAL</h2>
+  {#if preferences.loadError}
+    <p role="alert">Could not load preferences. {preferences.loadError}</p>
+    <div><button type="button" onclick={loadPreferences}>Retry loading preferences</button></div>
+  {:else if desktop && !ready}
+    <p role="status">Loading preferences…</p>
+  {:else if preferences.notice}
+    <p role="status">{preferences.notice}</p>
+  {/if}
   <div class="form">
     <label>
       Console window <select
         value={saved.consoleWindow ?? 'hidden'}
-        disabled={!isDesktop()}
+        disabled={!ready}
         onchange={(e) =>
-          void savePatch({
-            consoleWindow: e.currentTarget.value as GeneralPreferences['consoleWindow'],
-          })}
+          void saveControl(
+            e.currentTarget,
+            'consoleWindow',
+            e.currentTarget.value as GeneralPreferences['consoleWindow'],
+            'hidden',
+          )}
       >
         <option value="hidden">Hidden (Default)</option><option value="visible">
           Visible
@@ -106,11 +143,14 @@
         min="1"
         max="100"
         value={saved.autoCropSamples ?? 10}
-        disabled={!isDesktop()}
+        disabled={!ready}
         onchange={(e) =>
-          void savePatch({
-            autoCropSamples: Math.max(1, Math.min(100, e.currentTarget.valueAsNumber || 10)),
-          })}
+          void saveControl(
+            e.currentTarget,
+            'autoCropSamples',
+            Math.max(1, Math.min(100, e.currentTarget.valueAsNumber || 10)),
+            10,
+          )}
       />
     </label>
     <label>
@@ -119,33 +159,37 @@
         min="1"
         max="120"
         value={saved.keyframeIntervalSeconds ?? 10}
-        disabled={!isDesktop()}
+        disabled={!ready}
         onchange={(e) =>
-          void savePatch({
-            keyframeIntervalSeconds: Math.max(
-              1,
-              Math.min(120, e.currentTarget.valueAsNumber || 10),
-            ),
-          })}
+          void saveControl(
+            e.currentTarget,
+            'keyframeIntervalSeconds',
+            Math.max(1, Math.min(120, e.currentTarget.valueAsNumber || 10)),
+            10,
+          )}
       />
     </label>
     <label>
       Save encodes to <span class="folder">
         <input
+          id="default-output-folder"
           value={folder}
           placeholder="Leave empty to save next to the source file"
-          disabled={!isDesktop()}
+          disabled={!ready}
           oninput={(event) => {
             folder = event.currentTarget.value;
             dirty = true;
           }}
           onblur={saveFolder}
+          onkeydown={(event) => {
+            if (event.key === 'Enter' && !event.isComposing) void saveFolder();
+          }}
         /><button
           type="button"
           aria-label="Browse default output folder"
           title="Browse default output folder"
           onclick={browse}
-          disabled={!isDesktop()}
+          disabled={!ready}
         >
           …
         </button><button
@@ -155,7 +199,7 @@
             dirty = true;
             void saveFolder();
           }}
-          disabled={!isDesktop()}
+          disabled={!ready}
         >
           Clear
         </button>
@@ -166,24 +210,27 @@
     <input
       type="checkbox"
       checked={saved.zeroIndexedStreams ?? false}
-      disabled={!isDesktop()}
-      onchange={(e) => void savePatch({ zeroIndexedStreams: e.currentTarget.checked })}
+      disabled={!ready}
+      onchange={(e) =>
+        void saveControl(e.currentTarget, 'zeroIndexedStreams', e.currentTarget.checked, false)}
     /> Show stream numbers zero-indexed (like ffmpeg does)
   </label>
   <label class="check">
     <input
       type="checkbox"
       checked={saved.mp4Faststart ?? true}
-      disabled={!isDesktop()}
-      onchange={(e) => void savePatch({ mp4Faststart: e.currentTarget.checked })}
+      disabled={!ready}
+      onchange={(e) =>
+        void saveControl(e.currentTarget, 'mp4Faststart', e.currentTarget.checked, true)}
     /> Web-optimize MP4 output (+faststart)
   </label>
   <label class="check">
     <input
       type="checkbox"
       checked={saved.av1anConsoleVisible ?? true}
-      disabled={!isDesktop() || !isWindows}
-      onchange={(e) => void savePatch({ av1anConsoleVisible: e.currentTarget.checked })}
+      disabled={!ready || !isWindows}
+      onchange={(e) =>
+        void saveControl(e.currentTarget, 'av1anConsoleVisible', e.currentTarget.checked, true)}
     />
     {isWindows
       ? 'Show the av1an console window'
@@ -196,9 +243,12 @@
         .filter(([key]) => reset[key])
         .map(([, label]) => label)
         .join(', ') || 'None'}
-    </span><button type="button" onclick={openReset} disabled={!isDesktop()}>
-      Configure…
-    </button><button type="button" onclick={onreset}>Reset Now</button>
+    </span><button type="button" onclick={openReset} disabled={!ready}> Configure… </button><button
+      type="button"
+      onclick={onreset}
+    >
+      Reset Now
+    </button>
   </div>
   {#if error}<p role="alert">{error}</p>{/if}
 </section>
@@ -212,12 +262,13 @@
       <input type="checkbox" bind:checked={draft[key]} />
       {label}
     </label>{/each}
+  {#if error}<p role="alert">{error}</p>{/if}
   <div class="reset">
     <button
       type="button"
-      onclick={() => {
-        void savePatch({ resetOnNewFile: { ...draft } });
-        resetOpen = false;
+      disabled={busy}
+      onclick={async () => {
+        if (await savePatch({ resetOnNewFile: { ...draft } })) resetOpen = false;
       }}
     >
       OK

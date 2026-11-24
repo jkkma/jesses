@@ -595,6 +595,19 @@ async fn cancel_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, Ap
 }
 
 #[tauri::command]
+async fn cancel_queued_jobs(
+    ids: Vec<String>,
+    jobs: State<'_, Jobs>,
+) -> Result<Vec<JobSnapshot>, AppError> {
+    jobs.manager.cancel_queued_jobs(ids).await
+}
+
+#[tauri::command]
+async fn read_job_log(id: String, jobs: State<'_, Jobs>) -> Result<String, AppError> {
+    jobs.manager.read_job_log(id).await
+}
+
+#[tauri::command]
 async fn stop_job(id: String, jobs: State<'_, Jobs>) -> Result<JobSnapshot, AppError> {
     jobs.manager.stop_job(id).await
 }
@@ -858,6 +871,8 @@ fn invoke_jobs(invoke: tauri::ipc::Invoke) -> bool {
         enqueue_encode_batch,
         cancel_all_jobs,
         cancel_job,
+        cancel_queued_jobs,
+        read_job_log,
         stop_job,
         discard_job_progress,
         resume_job,
@@ -930,6 +945,8 @@ fn invoke_command(invoke: tauri::ipc::Invoke) -> bool {
         | "enqueue_encode_batch"
         | "cancel_all_jobs"
         | "cancel_job"
+        | "cancel_queued_jobs"
+        | "read_job_log"
         | "stop_job"
         | "discard_job_progress"
         | "resume_job"

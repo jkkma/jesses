@@ -6,6 +6,7 @@
     exportSavedJob,
     discardJobProgress,
     resumeJob,
+    readJobLog,
     isDesktop,
   } from '$lib/ipc/client';
   import type {
@@ -15,19 +16,42 @@
     VideoEncoder,
   } from '$lib/ipc/generated';
   import { errorMessage, fileName } from '$lib/components/shared/format';
+  import DiscardProgressDialog from '$lib/components/shared/DiscardProgressDialog.svelte';
+  import SourceDialog from '$lib/components/shared/SourceDialog.svelte';
   import { canResumeJob, savedProgressSummary } from '$lib/components/shared/job-state';
   let {
     jobs,
     onqueue,
-  }: { jobs: JobSnapshot[]; onqueue: (request: EncodeRequest) => Promise<void> } = $props();
+    open = $bindable(false),
+  }: {
+    jobs: JobSnapshot[];
+    onqueue: (request: EncodeRequest) => Promise<void>;
+    open?: boolean;
+  } = $props();
   let selected = $state('');
   let svtBuild = $state<VideoEncoder | ''>('');
   let inspection = $state<SavedJobInspection | null>(null);
   let pending = $state(false);
   let error = $state<string | null>(null);
   let message = $state<string | null>(null);
-  const encodes = $derived(jobs.filter((j) => j.encodeSettings));
-  const selectedJob = $derived(encodes.find((job) => job.id === selected));
+  const selectedJob = $derived(jobs.find((job) => job.id === selected));
+  let discardTargetId = $state<string>();
+  const discardTarget = $derived(
+    jobs.find((job) => job.id === discardTargetId && canResumeJob(job)),
+  );
+  let log = $state<{ name: string; result: Promise<{ text: string; notice?: string }> }>();
+  function viewLog(job: JobSnapshot) {
+    const summary = job.logs.join('\n');
+    log = {
+      name: fileName(job.request.outputPath),
+      result: job.logPath
+        ? readJobLog(job.id).then(
+            (text) => ({ text: text || summary }),
+            (cause) => ({ text: summary, notice: errorMessage(cause) }),
+          )
+        : Promise.resolve({ text: summary }),
+    };
+  }
   async function inspect() {
     pending = true;
     error = null;
@@ -106,23 +130,30 @@
   }
 </script>
 
-<details class="saved-jobs">
+<details class="saved-jobs" bind:open>
   <summary>Saved requests and resume compatibility</summary>
   <div class="saved-jobs-body">
     <p>
-      Resume verified work from job history. A saved request can start a new encode; it does not
-      authorize running commands or reusing another application's chunks.
+      Inspect a job's result or resume saved encoder progress. Export an encode request to run it
+      again later.
     </p>
     <div class="saved-job-controls">
       <label>
-        Encode from history<select bind:value={selected} disabled={pending}>
-          <option value="">Choose an encode</option>{#each encodes as job}<option value={job.id}>
+        Job from history<select bind:value={selected} disabled={pending}>
+          <option value="">Choose a job</option>{#each jobs as job}<option value={job.id}>
               {fileName(job.request.outputPath)} · {job.state}
             </option>{/each}
         </select>
       </label>
       <div class="actions">
-        <button type="button" onclick={save} disabled={pending || !selected || !isDesktop()}>
+        {#if selectedJob && (selectedJob.logPath || selectedJob.logs.length)}
+          <button type="button" onclick={() => viewLog(selectedJob!)}>View job log</button>
+        {/if}
+        <button
+          type="button"
+          onclick={save}
+          disabled={pending || !selectedJob?.encodeSettings || !isDesktop()}
+        >
           Export encode request
         </button>
         <button type="button" onclick={inspect} disabled={pending || !isDesktop()}>
@@ -145,6 +176,18 @@
         </select>
       </label>
     </div>
+    {#if selectedJob}
+      <dl class="job-details">
+        <dt>Source</dt>
+        <dd>{selectedJob.request.inputPath}</dd>
+        <dt>Output</dt>
+        <dd>{selectedJob.request.outputPath}</dd>
+        {#if selectedJob.error}
+          <dt>Error</dt>
+          <dd>{selectedJob.error.message}</dd>
+        {/if}
+      </dl>
+    {/if}
     {#if selectedJob?.encodeSettings?.backend === 'standalone' && canResumeJob(selectedJob)}
       <p>{savedProgressSummary(selectedJob)}</p>
       <div class="actions">
@@ -157,7 +200,7 @@
         </button>
         <button
           type="button"
-          onclick={() => useProgress(selectedJob!, 'discard')}
+          onclick={() => (discardTargetId = selectedJob!.id)}
           disabled={pending}
         >
           Discard saved progress
@@ -180,7 +223,54 @@
   </div>
 </details>
 
+<SourceDialog
+  title={log ? `Job log for ${log.name}` : 'Job log'}
+  open={!!log}
+  onclose={() => (log = undefined)}
+  width={820}
+>
+  {#if log}
+    {#await log.result}
+      <p role="status">Reading job log…</p>
+    {:then result}
+      {#if result.notice}
+        <p role="status">{result.notice}{result.text ? ' Showing saved diagnostic lines.' : ''}</p>
+      {/if}
+      {#if result.text}
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable job log needs keyboard access.) -->
+        <pre class="job-log" tabindex="0" aria-label="Job log contents">{result.text}</pre>
+      {:else if !result.notice}<p>No log entries were saved for this job.</p>{/if}
+    {/await}
+  {/if}
+</SourceDialog>
+
+<DiscardProgressDialog
+  job={discardTarget}
+  onclose={() => (discardTargetId = undefined)}
+  onconfirm={(job) => {
+    discardTargetId = undefined;
+    void useProgress(job, 'discard');
+  }}
+/>
+
 <style>
+  .job-details {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 0.25rem 0.75rem;
+  }
+  .job-details dt {
+    font-weight: 600;
+  }
+  .job-details dd {
+    overflow-wrap: anywhere;
+  }
+  .job-log {
+    max-height: 55vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
   .saved-jobs {
     max-width: 920px;
     margin: 4px 8px 12px;

@@ -265,6 +265,10 @@ for (const state of ['running', 'canceled']) {
     const resume = page.getByRole('button', { name: 'Resume saved job' });
     await expect(resume).toBeVisible();
     await page.getByRole('button', { name: 'Discard saved progress' }).click();
+    await page
+      .getByRole('dialog', { name: 'Discard saved progress?' })
+      .getByRole('button', { name: 'Discard saved progress', exact: true })
+      .click();
     await expect(resume).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Discard saved progress' })).toHaveCount(0);
     expect(
@@ -297,9 +301,13 @@ test('a canceled checkpoint remains accessible from Settings when a newer job ex
   await installSourceEncodeFixture(page);
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByText('Saved requests and resume compatibility', { exact: true }).click();
-  await page.getByLabel('Encode from history').selectOption(job.id);
+  await page.getByRole('combobox', { name: 'Job from history' }).selectOption(job.id);
   await expect(page.getByRole('button', { name: 'Resume saved job' })).toBeVisible();
   await page.getByRole('button', { name: 'Discard saved progress' }).click();
+  await page
+    .getByRole('dialog', { name: 'Discard saved progress?' })
+    .getByRole('button', { name: 'Discard saved progress', exact: true })
+    .click();
   await expect(page.getByText('Discarded the saved encoder progress.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Resume saved job' })).toHaveCount(0);
 });

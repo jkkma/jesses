@@ -5,9 +5,49 @@
 //! Every removal is best effort: a log that cannot be removed is left alone.
 use std::{
     collections::HashSet,
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom},
     path::Path,
     time::{Duration, SystemTime},
 };
+
+pub(super) fn read_tail(log_dir: &Path, id: &str, preferred: Option<&str>) -> io::Result<String> {
+    const MAX_VIEW_BYTES: u64 = 256 * 1024;
+    if !is_job_id(id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid job ID.",
+        ));
+    }
+    let dir = log_dir.canonicalize()?;
+    let file_name = preferred
+        .filter(|name| {
+            owner(name) == Some(id)
+                && Path::new(name)
+                    .file_name()
+                    .is_some_and(|leaf| leaf == *name)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{id}.log"));
+    let requested = dir.join(file_name);
+    if !fs::symlink_metadata(&requested)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The job log is not a regular file.",
+        ));
+    }
+    let mut file = File::open(&requested)?;
+    let offset = file.metadata()?.len().saturating_sub(MAX_VIEW_BYTES);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut contents = Vec::new();
+    file.take(MAX_VIEW_BYTES).read_to_end(&mut contents)?;
+    let text = String::from_utf8_lossy(&contents);
+    if offset == 0 {
+        Ok(text.into_owned())
+    } else {
+        Ok(format!("Showing the end of the job log.\n\n{text}"))
+    }
+}
 
 /// Logs without a history entry are kept this long before startup removes them.
 pub(super) const ORPHAN_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -111,6 +151,26 @@ mod tests {
         assert_eq!(owner("a-345-6.log"), None);
         assert_eq!(owner("app.log"), None);
         assert_eq!(owner("12-345-6"), None);
+    }
+
+    #[test]
+    fn read_tail_reads_only_the_named_job_and_keeps_final_diagnostics() {
+        let dir = fixture();
+        let mut log = vec![b'a'; 300_000];
+        log.extend_from_slice(b"\nThe last diagnostic.\n");
+        fs::write(dir.join("1-10-1.log"), log).unwrap();
+        fs::write(dir.join("1-10-2.log"), b"A different job").unwrap();
+        let text = read_tail(&dir, "1-10-1", Some("1-10-2.log")).unwrap();
+        assert!(text.starts_with("Showing the end of the job log."));
+        assert!(text.ends_with("The last diagnostic.\n"));
+        assert!(!text.contains("A different job"));
+        fs::write(dir.join("1-10-1.pass1.log"), b"A phase diagnostic").unwrap();
+        assert_eq!(
+            read_tail(&dir, "1-10-1", Some("1-10-1.pass1.log")).unwrap(),
+            "A phase diagnostic"
+        );
+        assert!(read_tail(&dir, "../notes", None).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

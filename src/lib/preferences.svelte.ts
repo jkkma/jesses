@@ -5,6 +5,8 @@ import type { SavePreferencesRequest, UserPreferences } from '$lib/ipc/generated
 export const preferences = $state<{
   value: UserPreferences;
   loaded: boolean;
+  loading: boolean;
+  loadError: string | null;
   error: string | null;
   /** How a damaged or newer preferences file was handled at startup. */
   notice: string | null;
@@ -15,6 +17,8 @@ export const preferences = $state<{
     revision: 0,
   },
   loaded: false,
+  loading: false,
+  loadError: null,
   error: null,
   notice: null,
 });
@@ -34,12 +38,17 @@ function receive(value: UserPreferences) {
   preferences.error = null;
 }
 export async function loadPreferences() {
+  if (preferences.loading) return;
+  preferences.loading = true;
+  preferences.loadError = null;
   try {
     const value = await getPreferences();
     preferences.notice = value.notice ?? null;
     receive(value);
   } catch (error) {
-    preferences.error = errorMessage(error);
+    preferences.loadError = errorMessage(error);
+  } finally {
+    preferences.loading = false;
   }
 }
 export async function updatePreferences(request: SavePreferencesRequest) {

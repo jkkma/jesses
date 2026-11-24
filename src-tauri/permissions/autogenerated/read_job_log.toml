@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-job-log"
+description = "Enables the read_job_log command without any pre-configured scope."
+commands.allow = ["read_job_log"]
+
+[[permission]]
+identifier = "deny-read-job-log"
+description = "Denies the read_job_log command without any pre-configured scope."
+commands.deny = ["read_job_log"]

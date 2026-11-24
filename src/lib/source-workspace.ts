@@ -101,12 +101,15 @@ export type WorkspaceAction = {
   progressDescription?: string;
   /** The batch's current job, or null while the batch prepares its next job. */
   progressJobId?: string | null;
+  waitingBatch?: { id: string; count: number; cancel: () => void };
   batchNaming?: { codec: string; quality: string; preset: string; extension: string };
   pause?: () => Promise<void>;
   stop?: () => void;
+  stopReview?: () => void;
   canRun: boolean;
   /** Why Run is unavailable, shown beside the Run button as an error. */
   blockedReason?: string;
+  blockedByMissingTools?: boolean;
   /** Open the setting responsible for the visible blocker, when available. */
   openBlockedSetting?: () => void;
   label: string;

@@ -502,9 +502,6 @@ test('image batch freezes naming and applies subtitle ordinal to each source', a
       host.__pickerPaths = [first.path, second.path];
       host.__mediaByPath = { [first.path]: first, [second.path]: second };
       host.__batchOutputPaths = ['/media/reserved (1).gif', '/other/reserved.gif'];
-      host.__holdBatchResolution = new Promise(
-        (resolve) => (host.__releaseBatchResolution = resolve),
-      );
     },
     { first: source, second },
   );
@@ -516,17 +513,28 @@ test('image batch freezes naming and applies subtitle ordinal to each source', a
   await q.getByLabel('Codec', { exact: true }).selectOption('gif');
   await q.getByRole('tab', { name: 'Subtitles' }).click();
   await q.getByLabel('Burn In').selectOption('2');
-  await q.getByLabel('Output Path', { exact: true }).fill('/ignored/custom');
+  await expect(q.getByLabel('Output Path', { exact: true })).toHaveCount(0);
+  await expect(q.getByRole('region', { name: 'Batch output' })).toContainText(
+    '/media/reserved (1).gif',
+  );
+  const baseline = await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdBatchResolution = new Promise(
+      (resolve) => (host.__releaseBatchResolution = resolve),
+    );
+    return host.__sourceCalls.filter((c: any) => c.command === 'resolve_batch_output_paths').length;
+  });
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
   await expect
     .poll(async () =>
-      page.evaluate(() =>
-        (globalThis as any).__sourceCalls.some(
-          (c: any) => c.command === 'resolve_batch_output_paths',
-        ),
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter(
+            (c: any) => c.command === 'resolve_batch_output_paths',
+          ).length,
       ),
     )
-    .toBe(true);
+    .toBeGreaterThan(baseline);
   await q.getByRole('tab', { name: 'Video', exact: true }).click();
   await q.getByLabel('Quality', { exact: true }).fill('64');
   await page.evaluate(() => (globalThis as any).__releaseBatchResolution());
@@ -540,7 +548,8 @@ test('image batch freezes naming and applies subtitle ordinal to each source', a
     )
     .toBe(2);
   const calls = await page.evaluate(() => (globalThis as any).__sourceCalls);
-  const naming = calls.find((c: any) => c.command === 'resolve_batch_output_paths').payload.request;
+  const naming = calls.filter((c: any) => c.command === 'resolve_batch_output_paths')[baseline]
+    .payload.request;
   expect(naming).toMatchObject({
     target: { kind: 'image', format: 'gif' },
     naming: { codec: 'gif', quality: '128', preset: '' },
@@ -631,7 +640,7 @@ test('encode batch sends source naming and per-file subtitle ordinal with native
   await page.getByLabel('Output Names').fill('{name}_{codec}_{preset}');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
-  await q.getByLabel('Output Path', { exact: true }).fill('/ignored/custom');
+  await expect(q.getByLabel('Output Path', { exact: true })).toHaveCount(0);
   await q.getByRole('tab', { name: 'Subtitles' }).click();
   await q.getByLabel('Burn In').selectOption('2');
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
@@ -1563,7 +1572,6 @@ test('image batch reports failures per file and continues', async ({ page }) => 
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await q.getByLabel('Codec', { exact: true }).selectOption('gif');
-  await q.getByLabel('Output Path', { exact: true }).fill('/media/out');
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
   await expect
     .poll(async () =>
@@ -1633,7 +1641,6 @@ test('stopping image batch marks its current file canceled and remaining files s
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await q.getByLabel('Codec', { exact: true }).selectOption('gif');
-  await q.getByLabel('Output Path', { exact: true }).fill('/media/out');
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
   await expect
     .poll(async () =>
@@ -1669,10 +1676,11 @@ test('late image completion cannot update a removed and reimported file', async 
   );
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByLabel('Output Names').fill('{name}_out');
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   const q = page.getByRole('region', { name: 'Quick Convert', exact: true });
   await q.getByLabel('Codec', { exact: true }).selectOption('gif');
-  await q.getByLabel('Output Path', { exact: true }).fill('/media/out');
+  await expect(q.getByRole('region', { name: 'Batch output' })).toContainText('{name}_out');
   await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
   await expect
     .poll(async () =>
@@ -2373,7 +2381,7 @@ test('batch samples live Shift per file and continues after a canceled review', 
   await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Failed');
 });
 
-test('stopping a batch terminal wait stops only its current job, keeping progress, and skips later files', async ({
+test('stopping a running batch file keeps its progress and proceeds to the next file', async ({
   page,
 }) => {
   const second = { ...source, id: 'source-2', path: '/other/second.mkv', name: 'second.mkv' };
@@ -2437,16 +2445,18 @@ test('stopping a batch terminal wait stops only its current job, keeping progres
       }),
     )
     .toBe(true);
-  expect(
-    await page.evaluate(
-      () =>
-        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'prepare_command_edit')
-          .length,
-    ),
-  ).toBe(1);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'prepare_command_edit')
+            .length,
+      ),
+    )
+    .toBe(2);
   await page.getByRole('button', { name: 'File List', exact: true }).click();
-  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Canceled');
-  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Skipped');
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Stopped');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Running…');
 });
 
 test('stopping a batch during preparation cannot open a late dialog or start another file', async ({
@@ -2499,7 +2509,9 @@ test('stopping a batch during preparation cannot open a late dialog or start ano
   ).toBe(false);
 });
 
-test('stopping during a held review cancels that session and skips the rest', async ({ page }) => {
+test('stopping during a held review cancels that session and runs the next file', async ({
+  page,
+}) => {
   const second = { ...source, id: 'source-2', path: '/other/second.mkv', name: 'second.mkv' };
   await page.evaluate(
     ({ first, second }) => {
@@ -2531,21 +2543,26 @@ test('stopping during a held review cancels that session and skips the rest', as
       ),
     )
     .toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'prepare_command_edit')
+            .length,
+      ),
+    )
+    .toBe(2);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Stopped');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Done');
   expect(
     await page.evaluate(
       () =>
-        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'prepare_command_edit')
-          .length,
+        (globalThis as any).__sourceCalls.filter(
+          (call: any) => call.command === 'confirm_command_edit',
+        ).length,
     ),
   ).toBe(1);
-  expect(
-    await page.evaluate(() =>
-      (globalThis as any).__sourceCalls.some((c: any) => c.command === 'confirm_command_edit'),
-    ),
-  ).toBe(false);
-  await page.getByRole('button', { name: 'File List', exact: true }).click();
-  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Canceled');
-  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Skipped');
 });
 
 test('batch crop preparation failure is isolated to that file and preserves naming positions', async ({

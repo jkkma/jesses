@@ -637,6 +637,16 @@ export async function cancelJob(id: string): Promise<JobSnapshot> {
   return invoke<JobSnapshot>('cancel_job', { id });
 }
 
+export async function cancelQueuedJobs(ids: string[]): Promise<JobSnapshot[]> {
+  requireDesktop();
+  return invoke<JobSnapshot[]>('cancel_queued_jobs', { ids });
+}
+
+export async function readJobLog(id: string): Promise<string> {
+  requireDesktop();
+  return invoke<string>('read_job_log', { id });
+}
+
 export async function stopJob(id: string): Promise<JobSnapshot> {
   requireDesktop();
   return invoke<JobSnapshot>('stop_job', { id });

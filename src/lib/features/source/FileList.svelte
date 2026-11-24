@@ -61,19 +61,37 @@
   let sortTrigger = $state<HTMLButtonElement>();
   let recentPopover = $state<HTMLDivElement>();
   let sortPopover = $state<HTMLDivElement>();
+  let focusedId = $state<string>();
+  let anchorId: string | undefined;
+  const tabStop = $derived(
+    files.find((file) => file.id === focusedId) ??
+      files.find((file) => selectedIds.includes(file.id)) ??
+      files[0],
+  );
+
+  function selectRange(target: number, fallback: number) {
+    const remembered = files.findIndex((file) => file.id === anchorId);
+    const anchor = remembered < 0 ? fallback : remembered;
+    anchorId = files[anchor].id;
+    onselect(
+      files.slice(Math.min(anchor, target), Math.max(anchor, target) + 1).map((file) => file.id),
+    );
+  }
 
   function select(event: MouseEvent, file: MediaFile) {
-    if (event.ctrlKey || event.metaKey)
+    focusedId = file.id;
+    if (event.shiftKey && selectedIds.length) {
+      const target = files.findIndex((entry) => entry.id === file.id);
+      const fallback = files.findIndex((entry) => selectedIds.includes(entry.id));
+      selectRange(target, fallback < 0 ? target : fallback);
+      return;
+    }
+    anchorId = file.id;
+    if (event.ctrlKey || event.metaKey) {
       onselect(
         selectedIds.includes(file.id)
           ? selectedIds.filter((id) => id !== file.id)
           : [...selectedIds, file.id],
-      );
-    else if (event.shiftKey && selectedIds.length) {
-      const start = files.findIndex((entry) => entry.id === selectedIds[0]);
-      const end = files.findIndex((entry) => entry.id === file.id);
-      onselect(
-        files.slice(Math.min(start, end), Math.max(start, end) + 1).map((entry) => entry.id),
       );
     } else onselect([file.id]);
   }
@@ -92,8 +110,7 @@
     if (!files.length) return;
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    const activeId = selectedIds.at(-1);
-    const current = activeId ? files.findIndex((file) => file.id === activeId) : -1;
+    const current = files.findIndex((file) => file.id === tabStop?.id);
     const next =
       event.key === 'Home'
         ? 0
@@ -101,15 +118,12 @@
           ? files.length - 1
           : event.key === 'ArrowDown'
             ? Math.min(files.length - 1, current + 1)
-            : Math.max(0, current <= 0 ? 0 : current - 1);
-    if (event.shiftKey && selectedIds.length) {
-      const anchor = files.findIndex((file) => file.id === selectedIds[0]);
-      const start = anchor < 0 ? next : anchor;
-      onselect(
-        files.slice(Math.min(start, next), Math.max(start, next) + 1).map((entry) => entry.id),
-      );
-    } else {
-      onselect([files[next].id]);
+            : Math.max(0, current - 1);
+    focusedId = files[next].id;
+    if (event.shiftKey) selectRange(next, current < 0 ? next : current);
+    else if (!event.ctrlKey && !event.metaKey) {
+      anchorId = focusedId;
+      onselect([focusedId]);
     }
     void tick().then(() => {
       rowsEl?.querySelectorAll<HTMLButtonElement>('[role="option"]')[next]?.focus();
@@ -173,11 +187,13 @@
       {#each files as file (file.id)}<button
           type="button"
           role="option"
+          tabindex={tabStop?.id === file.id ? 0 : -1}
           class:selected={selectedIds.includes(file.id)}
           aria-selected={selectedIds.includes(file.id)}
           title={statuses[file.id]?.note ||
             (file.source?.kind === 'imageSequence' ? file.source.directoryPath : file.path)}
           onclick={(event) => select(event, file)}
+          onfocus={() => (focusedId = file.id)}
           ondblclick={() => {
             onselect([file.id]);
             onload();

@@ -157,6 +157,7 @@
     Av1anGrainSettings,
     JobSnapshot,
     MediaFile,
+    MediaStream,
     ToolInfo,
     VideoEncoder,
     ContainerFormat,
@@ -178,7 +179,11 @@
     toolsLoading = false,
     jobs,
     connected,
+    visible = true,
     onfiles,
+    onbatchfolder,
+    onaddfiles,
+    addingFiles = false,
     onstart,
     onqueue,
     sourcePicker,
@@ -204,7 +209,11 @@
     toolsLoading?: boolean;
     jobs: JobSnapshot[];
     connected: boolean;
+    visible?: boolean;
     onfiles: () => void;
+    onbatchfolder?: () => void;
+    onaddfiles?: () => void;
+    addingFiles?: boolean;
     onstart: (request: EncodeRequest) => Promise<void>;
     onqueue: (request: EncodeRequest) => Promise<void>;
     sourcePicker?: Snippet;
@@ -233,20 +242,24 @@
         )
       : undefined,
   );
-  // Quick Convert encodes the checked video source; the loaded main file remains
-  // the source of the fork's subtitle-burn selector and metadata defaults.
-  const file = $derived.by(() => {
-    if (av1anBatchSource) return av1anBatchSource;
-    if (backend === 'av1an' || fileMode === 'batch') return mainFile;
-    const video = tracks.find(
-      (row) =>
-        row.included &&
-        files
-          .find((source) => source.id === row.sourceId)
-          ?.streams.some((stream) => stream.index === row.streamIndex && stream.kind === 'video'),
-    );
-    return (video ? files.find((source) => source.id === video.sourceId) : undefined) ?? mainFile;
-  });
+  const muxVideos = $derived(
+    fileMode === 'mux'
+      ? tracks.filter(
+          (row) =>
+            row.included &&
+            trackKind(
+              files
+                .find((source) => source.id === row.sourceId)
+                ?.streams.find((stream) => stream.index === row.streamIndex),
+            ) === 'video',
+        )
+      : [],
+  );
+  // The checked picture owns the encode. The first loaded file is still the
+  // default donor for metadata and the subtitle burn-in selector.
+  const file = $derived(
+    av1anBatchSource ?? files.find((source) => source.id === muxVideos[0]?.sourceId) ?? mainFile,
+  );
   let videoIndex = $state<number | undefined>();
   let videoMode = $state<'encode' | 'copy' | 'drop'>('encode');
   let selectedEncoder = $state<VideoEncoder>('svtAv1Hdr');
@@ -336,7 +349,13 @@
   let workerBaseline = initialAv1anPreferences.workerBaseline;
   let workers = $state<number | undefined>(initialAv1anPreferences.workers);
   let filmGrain = $state<number | undefined>(0);
-  let hdr10Fallback = $state(false);
+  let singleHdr10Fallback = $state(false);
+  let batchHdr10Fallback = $state(false);
+  const hdr10Fallback = $derived(fileMode === 'batch' ? batchHdr10Fallback : singleHdr10Fallback);
+  function setHdr10Fallback(enabled: boolean) {
+    if (fileMode === 'batch') batchHdr10Fallback = enabled;
+    else singleHdr10Fallback = enabled;
+  }
   let lineartPsyBias = $state<number | undefined>(0);
   let texturePsyBias = $state<number | undefined>(0);
   let hdrTune = $state<HdrTune>('visualQuality');
@@ -351,8 +370,13 @@
   let subtitles = $state<SubtitleTrackSettings[]>([]);
   let framing = $state(defaultFramingDraft());
   let trim = $state(defaultTrim());
-  let toneMap = $state(defaultToneMap());
+  let singleToneMap = $state(defaultToneMap());
+  let batchToneMap = $state<ToneMapDraft | undefined>();
+  const toneMap = $derived(
+    fileMode === 'batch' ? (batchToneMap ?? defaultToneMap()) : singleToneMap,
+  );
   let destination = $state('');
+  let destinationEdited = false;
   // The suggested output stem before picture adjustments, while the path is
   // unedited. Typing or browsing for a path clears it.
   let suggestedStem = $state<string | null>(null);
@@ -406,12 +430,23 @@
       if (imageReviewId === id && !imageAbort?.signal.aborted) imagePausePending = false;
     }
   }
+  let activeEncodeReview = $state<AbortController>();
+  let encodeReviewStopped = false;
   async function reviewAndRun(
     request: CommandEditRequest,
-    signal: AbortSignal,
+    parentSignal: AbortSignal,
     shouldEdit: () => boolean = () => true,
     onjob?: (job: JobSnapshot) => void,
   ): Promise<CommandEditResult | null> {
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const abort = () => controller.abort();
+    if (parentSignal.aborted) abort();
+    else parentSignal.addEventListener('abort', abort, { once: true });
+    if (request.kind === 'encode') {
+      activeEncodeReview = controller;
+      encodeReviewStopped = false;
+    }
     let id: string | undefined, trackedImageId: string | undefined;
     try {
       const review = await prepareCommandEdit(request, signal);
@@ -449,6 +484,8 @@
       }
       return result;
     } finally {
+      parentSignal.removeEventListener('abort', abort);
+      if (activeEncodeReview === controller) activeEncodeReview = undefined;
       if (trackedImageId && imageReviewId === trackedImageId) {
         imageReviewId = null;
         imagePaused = false;
@@ -646,6 +683,9 @@
     untrack(() => backend) === 'av1an' ? (initialAv1anPreferences.audio?.bitrateKbps ?? 128) : 128,
   );
   let audioConfig = $state('same');
+  const perTrackAudio = $derived(
+    backend === 'standalone' && fileMode === 'mux' && audioConfig === 'perTrack',
+  );
   let configuredAudioIdentity: string | null = null;
   const audioIdentity = () =>
     mainFile ? JSON.stringify([mainFile.path, mainFile.sizeBytes]) : null;
@@ -702,7 +742,7 @@
   function audioFor(source: MediaFile, streamIndex: number) {
     const stream = source.streams.find((s) => s.index === streamIndex);
     const row =
-      audioConfig === 'perTrack' && configuredAudioIdentity === audioIdentity()
+      perTrackAudio && configuredAudioIdentity === audioIdentity()
         ? perTrackRows.find((r) => r.sourcePath === source.path && r.streamIndex === streamIndex)
         : undefined;
     const count = row?.channels;
@@ -837,6 +877,10 @@
     imageProgressDescription = $state(''),
     singlePreparing = $state(false),
     batchEncodeRun = $state(false),
+    batchWaitingId = $state<string | null>(null),
+    batchWaitingCount = $state(0),
+    batchWaitingCanceled = $state(false),
+    batchWaitingCancel: (() => void) | undefined,
     batchCurrentJobId = $state<string | null>(null),
     batchPendingSource = $state<{
       inputPath: string;
@@ -1149,23 +1193,13 @@
     audioChannels;
     audioBitrate;
     file;
-    if (audioConfig === 'same') untrack(setAudio);
+    if (!perTrackAudio) untrack(setAudio);
   });
   $effect(() => {
     const selected = tracks
       .filter((t) => t.sourceId === file?.id && t.included)
       .map((t) => t.streamIndex);
-    if (tracks.length && file)
-      untrack(() => {
-        included = selected;
-        const row = tracks.find(
-          (t) =>
-            t.sourceId === file.id &&
-            t.included &&
-            file.streams.some((s) => s.index === t.streamIndex && s.kind === 'video'),
-        );
-        if (row) videoIndex = row.streamIndex;
-      });
+    if (tracks.length && file) untrack(() => (included = selected));
   });
   $effect(() => {
     const register = registerAction,
@@ -1174,6 +1208,7 @@
       av1anMode = chunked,
       inFlight = submitting,
       liveBatchJob = batchCurrentJob,
+      encodeReview = activeEncodeReview,
       imageId = imageReviewId,
       imageIsPaused = imagePaused,
       imagePauseBusy = imagePausePending;
@@ -1181,12 +1216,11 @@
     const enabled = imageMode
       ? !disabled &&
         !active &&
-        !suggestionPending &&
         connected &&
-        !!destination.trim() &&
+        outputPathReady &&
         !trimIssue &&
         (mode === 'batch'
-          ? files.length > 0
+          ? files.length > 0 && !hdrOutputIssue
           : noVideoForRun ||
             (videoIndex !== undefined &&
               framingValid &&
@@ -1218,11 +1252,15 @@
       reset: resetSourceSettings,
       canRun: enabled,
       blockedReason: enabled ? undefined : (runBlockedReason ?? undefined),
+      blockedByMissingTools:
+        !enabled && !!missingRunToolsMessage && runBlockedReason === missingRunToolsMessage,
       openBlockedSetting:
-        !enabled &&
-        runBlockedReason &&
-        [videoSettingsIssue, hdrOutputIssue].includes(runBlockedReason)
-          ? () => (settingsTab = 'video')
+        !enabled && runBlockedReason
+          ? [sourceTrackIssue, av1anVideoIssue].includes(runBlockedReason)
+            ? ontracklist
+            : [videoSettingsIssue, hdrOutputIssue].includes(runBlockedReason)
+              ? () => (settingsTab = 'video')
+              : undefined
           : undefined,
       batchNaming: naming,
       label: `${mode === 'batch' ? 'Run Batch' : 'Run'}: ${av1anMode ? 'AV1AN encode' : 'Encode'}`,
@@ -1231,6 +1269,14 @@
       progressDescription,
       progressJobId:
         inFlight && (batchEncodeRun || singlePreparing) ? (liveBatchJob?.id ?? null) : undefined,
+      waitingBatch:
+        inFlight && batchWaitingId && !batchWaitingCanceled && batchWaitingCount > 0
+          ? {
+              id: batchWaitingId,
+              count: batchWaitingCount,
+              cancel: () => batchWaitingCancel?.(),
+            }
+          : undefined,
       paused,
       pause,
       stop: () => {
@@ -1238,6 +1284,14 @@
         if (singlePreparing && !liveBatchJob) imageProgressDescription = 'Stopping preparation…';
         imageAbort?.abort();
       },
+      stopReview: encodeReview
+        ? () => {
+            if (activeEncodeReview === encodeReview) {
+              encodeReviewStopped = true;
+              encodeReview.abort();
+            }
+          }
+        : undefined,
     };
     if (register) untrack(() => register(view, action));
   });
@@ -1514,7 +1568,11 @@
       deinterlaceChoice = chunked ? 'automatic' : 'qtgmc';
       deinterlaceDouble = false;
     }
-    if (flags.toneMap) toneMap = defaultToneMap();
+    if (flags.toneMap) {
+      if (fileMode === 'batch') batchToneMap = defaultToneMap();
+      else singleToneMap = defaultToneMap();
+      setHdr10Fallback(false);
+    }
     if (flags.customFilters) av1anFilters = [];
   }
   const outputFrameRateLabel = $derived(
@@ -1686,7 +1744,38 @@
       !['progressive', 'unknown'].includes(selectedVideo.fieldOrder),
     ),
   );
-  const showToneMap = $derived(knownHdr(selectedVideo));
+  const batchInputs = $derived(
+    chunked ? files.filter((entry) => entry.source?.kind !== 'imageSequence') : files,
+  );
+  function firstVideoStream(entry: MediaFile) {
+    return entry.streams.find((stream) => stream.kind === 'video');
+  }
+  function batchPicture(entry: MediaFile) {
+    return isImage ? firstVideoStream(entry) : entry.streams.find(batchVideo);
+  }
+  const batchHdrVideos = $derived(
+    batchInputs.flatMap((entry) => {
+      const video = batchPicture(entry);
+      return video && knownHdr(video) ? [video] : [];
+    }),
+  );
+  const showToneMap = $derived(
+    fileMode === 'batch' ? batchHdrVideos.length > 0 : knownHdr(selectedVideo),
+  );
+  function defaultSourceToneMap(): ToneMapDraft {
+    return { ...defaultToneMap(), enabled: true, algorithm: chunked ? 'mobius' : 'spline' };
+  }
+  $effect(() => {
+    if (files.length === 0) {
+      batchToneMap = undefined;
+      batchHdr10Fallback = false;
+    } else if (fileMode === 'batch' && batchHdrVideos.length && batchToneMap === undefined) {
+      batchToneMap =
+        sourcePreferences?.resetOnNewFile?.toneMap === false
+          ? defaultToneMap()
+          : defaultSourceToneMap();
+    }
+  });
   const sourceMultipleVideos = $derived(!chunked && videoMode === 'copy');
   const sourceDetails = $derived.by(() => {
     const details: string[] = [];
@@ -1745,8 +1834,17 @@
   const supportsHdr10Fallback = $derived(
     supportsHdr10Output && (!chunked || isSvtEncoder(encoder)),
   );
+  const showHdr10Fallback = $derived(
+    !toneMap.enabled &&
+      supportsHdr10Fallback &&
+      (fileMode === 'batch' ? batchHdrVideos : [selectedVideo]).some(
+        (video) => preservableHdr10(video) && video?.dolbyVisionProfile !== 5,
+      ),
+  );
   const toneMapIssue = $derived(
-    toneMapError(toneMap, backend, selectedVideo, supportsHdr10Fallback && hdr10Fallback),
+    fileMode === 'batch'
+      ? null
+      : toneMapError(toneMap, backend, selectedVideo, supportsHdr10Fallback && hdr10Fallback),
   );
   const trimIssue = $derived(
     trimError(
@@ -1761,6 +1859,7 @@
       (trim.enabled &&
       !encodingVideo &&
       videoMode === 'drop' &&
+      fileMode !== 'batch' &&
       !videos.length &&
       trim.mode === 'frames'
         ? 'Choose time boundaries for an audio-only source.'
@@ -1807,26 +1906,54 @@
   const encodePixelFormat = $derived(
     highBitDepthDecision && chosenPixelFormat === 'yuv420p' ? 'yuv420p10le' : chosenPixelFormat,
   );
-  const hdrOutputIssue = $derived.by(() => {
-    if (toneMap.enabled) return null;
-    if (fileMode !== 'batch')
-      return (
-        hdrOutputError(selectedVideo, supportsHdr10Output, encodePixelFormat) ??
-        (chunked ? av1anDynamicHdrError(selectedVideo, isSvtEncoder(encoder), hdr10Fallback) : null)
+  function hdrPreservationIssue(
+    video: MediaStream | undefined,
+    encoder: VideoEncoder,
+    pixelFormat: Av1anPixelFormat | undefined,
+    fallback: boolean,
+  ) {
+    return (
+      hdrOutputError(video, encoderSupportsHdr10(encoder), pixelFormat) ??
+      (chunked ? av1anDynamicHdrError(video, isSvtEncoder(encoder), fallback) : null)
+    );
+  }
+  function batchColorIssue(
+    video: MediaStream | undefined,
+    draft: ToneMapDraft,
+    encoder: VideoEncoder,
+    pixelFormat: Av1anPixelFormat | undefined,
+    fallback: boolean,
+    image = false,
+  ) {
+    if (draft.enabled && knownHdr(video)) return toneMapError(draft, backend, video);
+    return image ? null : hdrPreservationIssue(video, encoder, pixelFormat, fallback);
+  }
+  const batchColorChecks = $derived.by(() => {
+    if (fileMode !== 'batch' || !encodingVideo) return [];
+    return batchInputs.flatMap((entry) => {
+      const video = batchPicture(entry);
+      if (!video && (chunked || isImage)) return [];
+      const issue = batchColorIssue(
+        video,
+        toneMap,
+        encoder,
+        encodePixelFormat,
+        hdr10Fallback,
+        isImage,
       );
-    let firstIssue: string | null = null;
-    for (const entry of files) {
-      if (chunked && entry.source?.kind === 'imageSequence') continue;
-      const video = entry.streams.find(batchVideo);
-      if (!video && chunked) continue;
-      const issue =
-        hdrOutputError(video, supportsHdr10Output, encodePixelFormat) ??
-        (chunked ? av1anDynamicHdrError(video, isSvtEncoder(encoder), hdr10Fallback) : null);
-      if (!issue) return null;
-      firstIssue ??= issue;
-    }
-    return firstIssue;
+      return [{ name: entry.name, issue }];
+    });
   });
+  const batchColorProblems = $derived(batchColorChecks.filter(({ issue }) => issue !== null));
+  const hdrOutputIssue = $derived(
+    fileMode === 'batch'
+      ? batchColorChecks.length > 0 && batchColorChecks.every(({ issue }) => issue)
+        ? batchColorChecks[0].issue
+        : null
+      : toneMap.enabled
+        ? null
+        : hdrPreservationIssue(selectedVideo, encoder, encodePixelFormat, hdr10Fallback),
+  );
   $effect(() => {
     if (!highBitDepthDecision) return;
     untrack(() => {
@@ -1856,6 +1983,15 @@
       : (!encodingVideo && videoMode === 'drop') ||
           (videos.some((stream) => stream.index === videoIndex) &&
             (!chunked || videoIndex === videos[0]?.index)),
+  );
+  const av1anVideoIssue = $derived(
+    !chunked || fileMode === 'batch' || !file
+      ? null
+      : !muxVideos.length
+        ? 'Select one video in Track List to encode with AV1AN.'
+        : !selectedVideoSupported
+          ? 'AV1AN currently encodes the first video track in each source. Select that track or use Quick Convert.'
+          : null,
   );
   const copiedStreams = $derived(file?.streams.filter((stream) => stream.kind !== 'video') ?? []);
   const externalIssue = $derived(
@@ -2057,15 +2193,7 @@
   const sourceTrackIssue = $derived.by(() => {
     if (fileMode !== 'mux' || !file) return null;
     const selected = tracks.filter((row) => row.included);
-    const videos = selected.filter(
-      (row) =>
-        trackKind(
-          files
-            .find((f) => f.id === row.sourceId)
-            ?.streams.find((stream) => stream.index === row.streamIndex),
-        ) === 'video',
-    );
-    if (videos.length > 1 && !sourceMultipleVideos && videoMode !== 'drop')
+    if (muxVideos.length > 1 && !sourceMultipleVideos && videoMode !== 'drop')
       return 'This encoder supports one selected video track per encode.';
     const unsupported = selected.find((row) => {
       const kind = trackKind(
@@ -2092,18 +2220,7 @@
       : null;
   });
   const noVideoForRun = $derived(
-    !chunked &&
-      fileMode === 'mux' &&
-      tracks.length > 0 &&
-      !tracks.some(
-        (row) =>
-          row.included &&
-          files
-            .find((source) => source.id === row.sourceId)
-            ?.streams.some(
-              (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
-            ),
-      ),
+    !chunked && fileMode === 'mux' && tracks.length > 0 && !muxVideos.length,
   );
   function sourceKnownStream(stream: import('$lib/ipc/generated').MediaStream) {
     const codec = stream.codec?.trim().toLowerCase();
@@ -2185,20 +2302,31 @@
   }
   // Track-selection and container problems are decided on other tabs, so the
   // shell repeats them beside Run instead of leaving a silently disabled button.
+  const missingRunToolsMessage = $derived(
+    !isImage && missingRunTools.length ? missingToolsMessage(missingRunTools) : null,
+  );
+  const outputPathIssue = $derived(
+    fileMode === 'batch'
+      ? null
+      : suggestionPending
+        ? 'Preparing the suggested output path…'
+        : !destination.trim()
+          ? 'Choose an output path to continue.'
+          : null,
+  );
+  const outputPathReady = $derived(!outputPathIssue);
   const runBlockedReason = $derived(
     (!desktop ? 'Open jesses in the desktop app to encode.' : null) ??
       (!usableSource ? 'Choose an encoding source to continue.' : null) ??
       (!connected ? 'Waiting for the job service to connect.' : null) ??
-      (suggestionPending ? 'Preparing the suggested output path…' : null) ??
-      (!destination.trim() ? 'Choose an output path to continue.' : null) ??
+      outputPathIssue ??
+      sourceTrackIssue ??
+      av1anVideoIssue ??
       (!isImage && !noVideoForRun && !batchWithoutVideo && encodingVideo
         ? (videoSettingsIssue ??
           tuningSettingsIssue ??
           customFiltersIssue ??
           pixelFormatIssue ??
-          (!selectedVideoSupported && fileMode !== 'batch'
-            ? 'AV1AN currently encodes the first video track. Choose that track or use Quick Convert.'
-            : null) ??
           hdrOutputIssue ??
           toneMapIssue ??
           temporalError(temporal, backend) ??
@@ -2209,21 +2337,20 @@
           grainTableError ??
           parsedHdr.error)
         : null) ??
-      (!isImage && missingRunTools.length ? missingToolsMessage(missingRunTools) : null) ??
-      sourceTrackIssue ??
+      (isImage && fileMode === 'batch' ? hdrOutputIssue : null) ??
+      missingRunToolsMessage ??
       containerIssue ??
       trimIssue ??
-      externalIssue ??
-      layoutIssue ??
-      timecodeIssue ??
-      (encodingVideo ? subtitleIssue : null) ??
+      (fileMode !== 'batch'
+        ? (externalIssue ?? layoutIssue ?? timecodeIssue ?? (encodingVideo ? subtitleIssue : null))
+        : null) ??
       (chunked && fileMode === 'batch' && files.length > 0 && !av1anBatchSource
         ? 'AV1AN requires at least one movie video stream in the batch.'
         : null),
   );
   const canQueue = $derived(
     !disabled &&
-      !suggestionPending &&
+      outputPathReady &&
       !(
         chunked &&
         (fileMode === 'batch'
@@ -2237,8 +2364,7 @@
           ) &&
           !trimIssue &&
           !sourceTrackIssue &&
-          validAudio(audio, included, file?.streams ?? []) &&
-          !!destination.trim()
+          validAudio(audio, included, file?.streams ?? [])
         : (!chunked && fileMode === 'batch'
             ? ['ffmpeg', 'ffprobe'].every((id) =>
                 tools.some((tool) => tool.id === id && tool.available),
@@ -2262,15 +2388,14 @@
           (!encodingVideo ||
             (!grainConflict && !parameterIssue && (fileMode === 'batch' || framingValid))) &&
           !trimIssue &&
-          !externalIssue &&
           !containerIssue &&
           !sourceTrackIssue &&
-          !layoutIssue &&
-          !timecodeIssue &&
+          (fileMode === 'batch' || !(externalIssue || layoutIssue || timecodeIssue)) &&
           (!encodingVideo ||
-            (!temporalError(temporal, backend) && !toneMapIssue && !subtitleIssue)) &&
-          validAudio(audio, included, file?.streams ?? []) &&
-          !!destination.trim()),
+            (!temporalError(temporal, backend) &&
+              !toneMapIssue &&
+              (fileMode === 'batch' || !subtitleIssue))) &&
+          validAudio(audio, included, file?.streams ?? [])),
   );
   const canStart = $derived(canQueue && !active);
   const sequenceIssue = $derived(
@@ -2293,6 +2418,64 @@
       };
     return { kind: 'container', format: outputContainer };
   }
+  const batchOutputDirectory = $derived(sourcePreferences?.defaultOutputDirectory ?? '');
+  let batchOutputExample = $state('');
+  let batchOutputExampleError = $state('');
+  function batchOutputInput(entry: MediaFile) {
+    // Batch naming tokens use the first video stream's header dimensions.
+    const video = firstVideoStream(entry);
+    return {
+      inputPath: entry.path,
+      ...(video?.width ? { width: video.width } : {}),
+      ...(video?.height ? { height: video.height } : {}),
+    };
+  }
+  $effect(() => {
+    if (!visible || !desktop || fileMode !== 'batch' || submitting) return;
+    batchOutputExample = '';
+    batchOutputExampleError = '';
+    if (!batchInputs.length) return;
+    const canUseExample = batchInputs.map(
+      (entry) => (!chunked && !isImage) || !!batchPicture(entry),
+    );
+    if (canUseExample.every((eligible) => !eligible)) {
+      batchOutputExampleError = 'Add a source with a video track to see an example.';
+      return;
+    }
+    const request = {
+      inputs: batchInputs.map(batchOutputInput),
+      target: outputTarget(),
+      naming: batchNamingValues(),
+      outputNameTemplate: batchNameTemplate,
+      namingDate: localNamingDate(),
+      defaultOutputDirectory: batchOutputDirectory,
+    };
+    const controller = new AbortController();
+    // Numeric quality fields can change several times during a single edit.
+    const timer = setTimeout(() => {
+      void resolveBatchOutputPaths(request, controller.signal).then(
+        ({ items }) => {
+          if (controller.signal.aborted) return;
+          const example = items.find(
+            (item, index) => canUseExample[index] && item.resolution,
+          )?.resolution;
+          if (example) batchOutputExample = example.outputPath;
+          else {
+            const firstEligible = canUseExample.indexOf(true);
+            batchOutputExampleError =
+              items[firstEligible]?.error?.message ?? 'No output path is available.';
+          }
+        },
+        (cause) => {
+          if (!controller.signal.aborted) batchOutputExampleError = errorMessage(cause);
+        },
+      );
+    }, 120);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  });
   function destinationStem(value: string, target: OutputTarget): string {
     const path = value.trim();
     // Sequence destinations are literal directory names. File destinations
@@ -2328,12 +2511,12 @@
         defaultOutputDirectory: sourcePreferences?.defaultOutputDirectory,
         target,
       });
-      if (revision === destinationRevision && mainFile?.id === source.id) {
+      if (revision === destinationRevision && file?.id === source.id) {
         suggestedStem = result.outputStem;
         destination = adjustedOutputStem(result.outputStem, outputPictureChange);
       }
     } catch (cause) {
-      if (revision === destinationRevision && mainFile?.id === source.id)
+      if (revision === destinationRevision && file?.id === source.id)
         onlog?.(`Could not suggest an output path: ${errorMessage(cause)}`);
     } finally {
       if (revision === destinationRevision) suggestionPending = false;
@@ -2343,9 +2526,9 @@
     suggestionTask = suggestDestination(source);
   }
   async function validateDestination() {
-    if (!file || !destination.trim()) return;
-    if (suggestionPending && mainFile) {
-      beginSuggestion(mainFile);
+    if (fileMode === 'batch' || !file || !destination.trim()) return;
+    if (suggestionPending) {
+      beginSuggestion(file);
       await suggestionTask;
       return;
     }
@@ -2367,21 +2550,13 @@
   }
 
   function checkedVideoIndex(source: MediaFile | undefined) {
-    if (chunked && fileMode === 'batch') return source?.streams.find(batchVideo)?.index;
-    return (
-      tracks.find(
-        (row) =>
-          row.sourceId === source?.id &&
-          row.included &&
-          source?.streams.some(
-            (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
-          ),
-      )?.streamIndex ??
-      (
-        source?.streams.find((stream) => stream.kind === 'video' && !stream.attachedPic) ??
-        source?.streams.find((stream) => stream.kind === 'video')
-      )?.index
-    );
+    if (fileMode === 'batch') return source?.streams.find(batchVideo)?.index;
+    const selected = muxVideos.find((row) => row.sourceId === source?.id)?.streamIndex;
+    return chunked
+      ? selected
+      : (selected ??
+          source?.streams.find(batchVideo)?.index ??
+          source?.streams.find((stream) => stream.kind === 'video')?.index);
   }
   function reset(
     source: MediaFile | undefined,
@@ -2404,7 +2579,7 @@
     preset = options.defaultPreset;
     workers = chunked && useInfrastructurePreferences ? readAv1anPreferences(true).workers : 4;
     filmGrain = 0;
-    hdr10Fallback = false;
+    setHdr10Fallback(false);
     lineartPsyBias = options.defaultLineartPsyBias;
     texturePsyBias = options.defaultTexturePsyBias;
     hdrTune = options.defaultHdrTune;
@@ -2430,12 +2605,15 @@
     subtitles = defaultSubtitles(source?.streams ?? []);
     framing = defaultFramingDraft();
     trim = defaultTrim();
-    toneMap = defaultToneMap();
+    if (fileMode === 'batch') batchToneMap = defaultToneMap();
+    else singleToneMap = defaultToneMap();
     temporal = {
       ...defaultTemporal(source?.streams.find((stream) => stream.index === videoIndex)),
       resizeFilter: 'bicubic',
     };
-    if (source && !source.id.startsWith('jesses-synthetic')) beginSuggestion(source);
+    destinationEdited = false;
+    if (fileMode !== 'batch' && source && !source.id.startsWith('jesses-synthetic'))
+      beginSuggestion(source);
     else {
       ++destinationRevision;
       suggestionPending = false;
@@ -2446,11 +2624,15 @@
   }
   let lastSourceId: string | null = null,
     lastMainId: string | null = null,
+    lastMode: FileListMode | undefined,
+    lastVideoIndex: number | undefined,
     lastEncoder: VideoEncoder | undefined;
   $effect(() => {
     const source = file,
       loaded = mainFile,
-      chosen = encoder;
+      chosen = encoder,
+      mode = fileMode,
+      index = checkedVideoIndex(source);
     untrack(() => {
       const identity = source ? JSON.stringify([chosen, source]) : null;
       if (chosen !== lastEncoder) {
@@ -2466,21 +2648,29 @@
         lastEncoder = chosen;
       }
       if (loaded?.id !== lastMainId) {
-        if (lastMainId !== null) resetSourceSettings();
         lastMainId = loaded?.id ?? null;
         metadataSource = loaded?.path ?? '';
         chapterSource = loaded?.path ?? '';
-        if (loaded && !loaded.id.startsWith('jesses-synthetic')) beginSuggestion(loaded);
-        else {
+      }
+      const sourceChanged = (source?.id ?? null) !== lastSourceId;
+      const videoChanged = sourceChanged || index !== lastVideoIndex;
+      const modeChanged = mode !== lastMode;
+      if (mode === 'mux' && videoChanged && lastSourceId !== null) resetSourceSettings();
+      if (sourceChanged || modeChanged) {
+        if (mode === 'mux' && source && !source.id.startsWith('jesses-synthetic')) {
+          if (!destinationEdited) beginSuggestion(source);
+        } else {
           ++destinationRevision;
           suggestionPending = false;
-          suggestedStem = null;
-          destination = '';
+          if (mode === 'mux') {
+            destinationEdited = false;
+            suggestedStem = null;
+            destination = '';
+          }
         }
       }
-      if (source?.id !== lastSourceId) {
-        lastSourceId = source?.id ?? null;
-        videoIndex = checkedVideoIndex(source);
+      videoIndex = index;
+      if (sourceChanged || modeChanged) {
         included = tracks.some((row) => row.sourceId === source?.id)
           ? tracks
               .filter((row) => row.sourceId === source?.id && row.included)
@@ -2495,24 +2685,23 @@
           bitrateKbps: audioBitrate,
         }));
         subtitles = defaultSubtitles(source?.streams ?? []);
+      }
+      if (videoChanged || modeChanged) {
+        const video = source?.streams.find((stream) => stream.index === index);
         temporal = {
           ...temporal,
-          fieldOrder:
-            source?.streams.find((stream) => stream.index === videoIndex)?.fieldOrder === 'bb'
-              ? 'bottomFirst'
-              : 'topFirst',
+          fieldOrder: video?.fieldOrder === 'bb' ? 'bottomFirst' : 'topFirst',
         };
         if (
-          source &&
-          knownHdr(source.streams.find((stream) => stream.index === videoIndex)) &&
+          mode === 'mux' &&
+          knownHdr(video) &&
           (sourcePreferences?.resetOnNewFile?.toneMap ?? true)
         )
-          toneMap = {
-            ...defaultToneMap(),
-            enabled: true,
-            algorithm: chunked ? 'mobius' : 'spline',
-          };
+          singleToneMap = defaultSourceToneMap();
       }
+      lastSourceId = source?.id ?? null;
+      lastVideoIndex = index;
+      lastMode = mode;
       ++draftGeneration;
       draftIdentity = identity;
       error = null;
@@ -2599,7 +2788,7 @@
     );
   }
   async function chooseOutput() {
-    if (disabled) return;
+    if (disabled || fileMode === 'batch') return;
     const generation = draftGeneration;
     const identity = draftIdentity;
     const revision = ++destinationRevision;
@@ -2616,6 +2805,7 @@
             match[1].toLowerCase(),
           );
         destination = match && (chunked || known) ? selected.slice(0, -match[0].length) : selected;
+        destinationEdited = true;
         suggestedStem = null;
       }
     } catch (cause) {
@@ -2638,18 +2828,7 @@
   function currentRequest(): EncodeRequest | undefined {
     const hasSelectedVideo =
       chunked ||
-      (fileMode === 'batch'
-        ? !batchWithoutVideo
-        : tracks.length === 0 ||
-          tracks.some(
-            (row) =>
-              row.included &&
-              files
-                .find((source) => source.id === row.sourceId)
-                ?.streams.some(
-                  (stream) => stream.index === row.streamIndex && stream.kind === 'video',
-                ),
-          ));
+      (fileMode === 'batch' ? !batchWithoutVideo : tracks.length === 0 || muxVideos.length > 0);
     const pictureEnabled = encodingVideo && hasSelectedVideo;
     const effectiveVideoMode = hasSelectedVideo ? videoMode : 'drop';
     if (
@@ -3033,7 +3212,6 @@
   async function runBatch(base: EncodeRequest, options: RunOptions, controller: AbortController) {
     const { source: _source, settings } = structuredClone($state.snapshot(base));
     const hdrPixelFormat = encodePixelFormat;
-    const batchSupportsHdr10 = encoderSupportsHdr10(settings.encoder);
     const burnOrdinal =
       mainFile?.streams
         .filter((stream) => stream.kind === 'subtitle')
@@ -3062,7 +3240,8 @@
         resizeFilter: temporal.resizeFilter,
         framing: copyFramingDraft(framing),
         outputContainer,
-        outputDirectory: sourcePreferences?.defaultOutputDirectory ?? '',
+        outputDirectory: batchOutputDirectory,
+        toneMapDraft: toneMap,
         naming: batchNamingValues(),
         namingDate: localNamingDate(),
         videoChoice,
@@ -3070,6 +3249,8 @@
       }),
     );
     const statusId = batchRunId('encode');
+    batchWaitingId = statusId;
+    batchWaitingCanceled = false;
     let statuses: Record<string, BatchRowStatus> = Object.fromEntries(
       batchState.files.map((entry) => [entry.id, { glyph: '○', text: 'Queued' }]),
     );
@@ -3078,6 +3259,22 @@
       if (imageAbort !== controller) return;
       statuses = { ...statuses, [id]: status };
       onbatchstatus?.(statusId, statuses);
+    };
+    const skippedByUser = {
+      glyph: '–',
+      text: 'Skipped',
+      note: 'The batch was stopped before this file ran.',
+    };
+    batchWaitingCancel = () => {
+      batchWaitingCanceled = true;
+      statuses = Object.fromEntries(
+        Object.entries(statuses).map(([id, status]) => [
+          id,
+          status.text === 'Queued' ? skippedByUser : status,
+        ]),
+      );
+      onbatchstatus?.(statusId, statuses);
+      if (!batchPendingSource && !batchCurrentJobId) controller.abort();
     };
     if (chunked) {
       for (const entry of batchState.files.filter(
@@ -3092,6 +3289,7 @@
       }
       batchState.files = batchState.files.filter((item) => item.source?.kind !== 'imageSequence');
     }
+    batchWaitingCount = batchState.files.length;
     const inputErrors: Record<string, string> = {};
     const inputs = await Promise.all(
       batchState.files.map(async (entry) => {
@@ -3142,6 +3340,7 @@
         );
         const noPicture = !chunked && !vid;
         const picture = !noPicture && batchState.encodingVideo;
+        const entryToneMap = picture && knownHdr(vid) ? settings.toneMap : undefined;
         const burn =
           picture && batchState.burnOrdinal >= 0
             ? entry.streams.filter((stream) => stream.kind === 'subtitle')[batchState.burnOrdinal]
@@ -3169,12 +3368,14 @@
         let detected: Awaited<ReturnType<typeof detectCrop>> | null = null,
           resolvedTemporal = picture ? settings.temporal : undefined;
         try {
-          if (picture && !settings.toneMap) {
-            const issue =
-              hdrOutputError(vid, batchSupportsHdr10, hdrPixelFormat) ??
-              (chunked
-                ? av1anDynamicHdrError(vid, isSvtEncoder(settings.encoder), settings.hdr10Fallback)
-                : null);
+          if (picture) {
+            const issue = batchColorIssue(
+              vid,
+              batchState.toneMapDraft,
+              settings.encoder,
+              hdrPixelFormat,
+              settings.hdr10Fallback,
+            );
             if (issue) throw new Error(issue);
           }
           if (
@@ -3205,7 +3406,10 @@
                 preset: batchState.qtgmcPreset,
                 resizeFilter: batchState.resizeFilter,
               },
-              base.source.outputPath,
+              targetPath(sourceOutputBase(entry), {
+                kind: 'container',
+                format: batchState.outputContainer,
+              }),
             );
         } catch (cause) {
           if (controller.signal.aborted) throw cause;
@@ -3254,7 +3458,7 @@
                 : settings.framing,
           ...(resolvedTemporal ? { temporal: resolvedTemporal } : {}),
           ...(settings.trim ? { trim: settings.trim } : {}),
-          ...(picture && settings.toneMap ? { toneMap: settings.toneMap } : {}),
+          ...(entryToneMap ? { toneMap: entryToneMap } : {}),
         };
       }),
     ).catch((cause) => {
@@ -3309,12 +3513,9 @@
     });
     for (const [index, entry] of batchState.files.entries()) {
       const item = result.items[index];
-      if (controller.signal.aborted) {
-        mark(entry.id, {
-          glyph: '–',
-          text: 'Skipped',
-          note: 'The batch was stopped before this file ran.',
-        });
+      batchWaitingCount = batchState.files.length - index - 1;
+      if (controller.signal.aborted || batchWaitingCanceled) {
+        mark(entry.id, skippedByUser);
         continue;
       }
       if (
@@ -3364,11 +3565,16 @@
         );
         if (!reviewed) {
           if (controller.signal.aborted) throw new DOMException('Canceled', 'AbortError');
-          mark(entry.id, {
-            glyph: '✕',
-            text: 'Failed',
-            note: 'The command was cleared in the edit window, so nothing was run.',
-          });
+          mark(
+            entry.id,
+            encodeReviewStopped
+              ? { glyph: '■', text: 'Stopped' }
+              : {
+                  glyph: '✕',
+                  text: 'Failed',
+                  note: 'The command was cleared in the edit window, so nothing was run.',
+                },
+          );
           continue;
         }
         if (reviewed.kind !== 'encode')
@@ -3376,12 +3582,13 @@
         const job = reviewed.job;
         const finished = await waitForJobTerminal(job.id, controller.signal);
         if (finished.state === 'succeeded') mark(entry.id, { glyph: '✔', text: 'Done' });
-        else if (finished.state === 'canceled' || finished.state === 'stopped') {
-          mark(entry.id, { glyph: '■', text: 'Canceled', note: finished.error?.message });
-          // Stop keeps this file's progress and also ends the batch, even when
-          // the stop finished before the batch's own wait was released.
-          if (finished.state === 'stopped') controller.abort();
-        } else
+        else if (finished.state === 'canceled' || finished.state === 'stopped')
+          mark(entry.id, {
+            glyph: '■',
+            text: finished.state === 'stopped' ? 'Stopped' : 'Canceled',
+            note: finished.error?.message,
+          });
+        else
           mark(entry.id, {
             glyph: '✕',
             text: 'Failed',
@@ -3390,6 +3597,7 @@
       } catch (cause) {
         if (controller.signal.aborted)
           mark(entry.id, { glyph: '■', text: 'Canceled', note: 'Stopped by the user.' });
+        else if (encodeReviewStopped) mark(entry.id, { glyph: '■', text: 'Stopped' });
         else {
           const message = errorMessage(cause);
           mark(entry.id, { glyph: '✕', text: 'Failed', note: message });
@@ -3403,9 +3611,10 @@
     const rows = Object.values(statuses),
       done = rows.filter((row) => row.text === 'Done').length,
       failed = rows.filter((row) => row.text === 'Failed').length,
+      stopped = rows.filter((row) => row.text === 'Stopped').length,
       skipped = rows.filter((row) => row.text === 'Canceled' || row.text === 'Skipped').length;
     imageProgress = 1;
-    imageProgressDescription = `Batch ${controller.signal.aborted ? 'stopped' : 'done'} - ${done}/${rows.length} finished${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} not run` : ''}.`;
+    imageProgressDescription = `Batch ${controller.signal.aborted || batchWaitingCanceled ? 'stopped' : 'done'} - ${done}/${rows.length} finished${failed ? `, ${failed} failed` : ''}${stopped ? `, ${stopped} stopped` : ''}${skipped ? `, ${skipped} not run` : ''}.`;
   }
   function sourceImageMetadata(
     sources: MediaFile[],
@@ -3654,8 +3863,7 @@
     if (
       !file ||
       (fileMode !== 'batch' && videoIndex === undefined) ||
-      !destination.trim() ||
-      suggestionPending ||
+      !outputPathReady ||
       submitting ||
       active
     )
@@ -3675,6 +3883,7 @@
         temporal: selectedTemporal(temporal),
         trim: selectedTrim(trim),
         toneMap: sourceToneMap(),
+        toneMapDraft: toneMap,
         filters: sourceFilterRows(av1anFilters),
       }),
     );
@@ -3731,7 +3940,7 @@
         qtgmcPreset: temporal.qtgmcPreset,
         resizeFilter: temporal.resizeFilter,
         videoIndex,
-        defaultOutputDirectory: sourcePreferences?.defaultOutputDirectory ?? '',
+        defaultOutputDirectory: batchOutputDirectory,
         naming: batchNamingValues(),
         namingDate: localNamingDate(),
       }),
@@ -3754,14 +3963,7 @@
         try {
           const prepared = await resolveBatchOutputPaths(
             {
-              inputs: targets.map((entry) => {
-                const video = entry.streams.find((track) => track.kind === 'video');
-                return {
-                  inputPath: entry.path,
-                  ...(video?.width ? { width: video.width } : {}),
-                  ...(video?.height ? { height: video.height } : {}),
-                };
-              }),
+              inputs: targets.map(batchOutputInput),
               target: { kind: 'image', format },
               naming: choice.naming,
               outputNameTemplate: choice.batchNameTemplate,
@@ -3803,12 +4005,19 @@
         imageProgressDescription = `File ${index + 1}/${targets.length} (${entry.name})`;
         mark(entry.id, { glyph: '▶', text: 'Running…' });
         try {
-          const stream = entry.streams.find(
-            (stream) =>
-              stream.kind === 'video' &&
-              (choice.fileMode === 'batch' || stream.index === choice.videoIndex),
-          );
+          const stream =
+            choice.fileMode === 'batch'
+              ? firstVideoStream(entry)
+              : entry.streams.find(
+                  (stream) => stream.kind === 'video' && stream.index === choice.videoIndex,
+                );
           if (!stream) throw new Error(`${entry.name}: no video track.`);
+          const imageToneMap =
+            choice.fileMode !== 'batch' || knownHdr(stream) ? settings.toneMap : undefined;
+          if (choice.fileMode === 'batch' && imageToneMap) {
+            const issue = toneMapError(settings.toneMapDraft, backend, stream);
+            if (issue) throw new Error(issue);
+          }
           if (choice.cropMode === 'manual' && !cropFits(choice.framing, stream))
             throw new Error(`${entry.name}: crop leaves less than two pixels.`);
           let framingValue =
@@ -3896,7 +4105,7 @@
               ...(burn ? { subtitleBurnIn: burn } : {}),
               ...(resolvedTemporal ? { temporal: resolvedTemporal } : {}),
               ...(settings.trim ? { trim: settings.trim } : {}),
-              ...(settings.toneMap ? { toneMap: settings.toneMap } : {}),
+              ...(imageToneMap ? { toneMap: imageToneMap } : {}),
               ...(settings.filters.length
                 ? { filters: settings.filters, sourceFilters: true }
                 : {}),
@@ -4031,6 +4240,7 @@
     const controller = new AbortController();
     imageAbort = controller;
     batchEncodeRun = runMode === 'batch';
+    encodeReviewStopped = false;
     singlePreparing = runMode !== 'batch';
     imageProgress = 0;
     imageProgressDescription = batchEncodeRun ? 'Preparing batch…' : 'Resolving output path…';
@@ -4105,7 +4315,7 @@
           (job) => (batchCurrentJobId = job.id),
         );
         if (!reviewed) {
-          if (!controller.signal.aborted)
+          if (!controller.signal.aborted && !encodeReviewStopped)
             onlog?.('The command was cleared in the edit window, so nothing was run.');
           return;
         }
@@ -4117,13 +4327,21 @@
         imageProgressDescription = controller.signal.aborted
           ? 'Batch stopped.'
           : 'Batch did not finish - the log has the details.';
-      if (!controller.signal.aborted && isCurrentDraft(generation, identity))
+      if (
+        !controller.signal.aborted &&
+        !encodeReviewStopped &&
+        isCurrentDraft(generation, identity)
+      )
         error = errorMessage(cause);
     } finally {
       // Keep the in-flight request locked across draft switches until its
       // authoritative reply settles, even when its draft is no longer visible.
       if (imageAbort === controller) imageAbort = undefined;
       batchCurrentJobId = null;
+      batchWaitingId = null;
+      batchWaitingCount = 0;
+      batchWaitingCanceled = false;
+      batchWaitingCancel = undefined;
       batchPendingSource = undefined;
       singlePreparing = false;
       submitting = false;
@@ -4152,7 +4370,11 @@
         </button>{/each}
     </div>
     <!-- Several files can be loaded; say which one Run encodes. -->
-    {#if fileMode === 'batch' && files.length}<span
+    {#if backend === 'standalone' && !usableSource && !files.length && onaddfiles}
+      <button type="button" onclick={onaddfiles} disabled={!desktop || addingFiles}>
+        Add Files…
+      </button>
+    {:else if fileMode === 'batch' && files.length}<span
         class="source-name"
         title={files.map((entry) => entry.name).join('\n')}
       >
@@ -4607,22 +4829,25 @@
                   /> One frame per field
                 </label>{/if}
             </div>{/if}
-          {#if knownHdr(selectedVideo)}<label for={`${idPrefix}-tone`}>Tone Mapping</label>
+          {#if showToneMap}<label for={`${idPrefix}-tone`}>Tone Mapping</label>
             <div class="inline">
               <select
                 id={`${idPrefix}-tone`}
                 disabled={!encodingVideo}
                 value={toneMap.enabled ? toneMap.algorithm : 'off'}
+                aria-describedby={fileMode === 'batch' ? `${idPrefix}-tone-batch-hint` : undefined}
                 onchange={(event) => {
                   const enabled = event.currentTarget.value !== 'off';
-                  if (enabled) hdr10Fallback = false;
-                  toneMap = {
+                  if (enabled) setHdr10Fallback(false);
+                  const update = {
                     ...toneMap,
                     enabled,
                     algorithm: (enabled
                       ? event.currentTarget.value
                       : 'hable') as ToneMapDraft['algorithm'],
                   };
+                  if (fileMode === 'batch') batchToneMap = update;
+                  else singleToneMap = update;
                 }}
               >
                 <option value="off">No tone mapping</option><option value="hable">
@@ -4630,11 +4855,37 @@
                 </option><option value="mobius">Mobius</option><option value="reinhard">
                   Reinhard
                 </option>{#if !chunked}<option value="spline">Spline (GPU)</option>{/if}
-              </select>{#if !toneMap.enabled && supportsHdr10Fallback && preservableHdr10(selectedVideo) && selectedVideo?.dolbyVisionProfile !== 5}<label>
-                  <input type="checkbox" bind:checked={hdr10Fallback} disabled={!encodingVideo} /> HDR10
-                  fallback (discard DV / HDR10+)
+              </select>{#if showHdr10Fallback}<label>
+                  <input
+                    type="checkbox"
+                    checked={hdr10Fallback}
+                    disabled={!encodingVideo}
+                    onchange={(event) => setHdr10Fallback(event.currentTarget.checked)}
+                  /> HDR10 fallback (discard DV / HDR10+)
                 </label>{/if}
-            </div>{/if}
+            </div>
+            {#if fileMode === 'batch'}
+              <p class="field-hint" id={`${idPrefix}-tone-batch-hint`}>
+                Tone mapping converts compatible HDR inputs to SDR.
+              </p>
+              {#if batchColorProblems.length && !hdrOutputIssue}
+                <p class="field-hint">
+                  {batchColorProblems.length === 1
+                    ? 'This file cannot run'
+                    : 'These files cannot run'}
+                  with the current HDR settings.
+                  {#each batchColorProblems.slice(0, 3) as { name, issue }}
+                    <span class="batch-hdr-problem"><strong>{name}</strong> {issue}</span>
+                  {/each}
+                  {#if batchColorProblems.length > 3}
+                    <span class="batch-hdr-problem">
+                      {batchColorProblems.length - 3} more files need different HDR settings.
+                    </span>
+                  {/if}
+                </p>
+              {/if}
+            {/if}
+          {/if}
         </div>
       </div>
     {:else if settingsTab === 'audio'}
@@ -4663,7 +4914,9 @@
             FLAC (Free Lossless Audio Coding)
           </option>
         </select>
-        {#if !chunked}<label for={`${idPrefix}-audio-config`}>Configuration</label>
+        {#if !chunked && fileMode === 'batch'}
+          <p class="field-hint">Batch uses the same audio settings for all tracks.</p>
+        {:else if !chunked}<label for={`${idPrefix}-audio-config`}>Configuration</label>
           <div class="inline">
             <select
               id={`${idPrefix}-audio-config`}
@@ -4707,15 +4960,12 @@
           max="8192"
           step="8"
           bind:value={audioBitrate}
-          disabled={stripAudio ||
-            audioCodec === 'copy' ||
-            audioCodec === 'flac' ||
-            (!chunked && audioConfig === 'perTrack')}
+          disabled={stripAudio || audioCodec === 'copy' || audioCodec === 'flac' || perTrackAudio}
         />
         <label for={`${idPrefix}-audio-channels`}>Channels</label><select
           id={`${idPrefix}-audio-channels`}
           bind:value={audioChannels}
-          disabled={stripAudio || audioCodec === 'copy' || (!chunked && audioConfig === 'perTrack')}
+          disabled={stripAudio || audioCodec === 'copy' || perTrackAudio}
         >
           <option value="preserve">0 (Keep original)</option>{#if !chunked}<option value="mono">
               1 (Mono)
@@ -4987,19 +5237,42 @@
     {/if}
   </div>
   <div class="output">
-    <label for={`${idPrefix}-output`}>Output Path</label><input
-      id={`${idPrefix}-output`}
-      bind:value={destination}
-      oninput={() => {
-        ++destinationRevision;
-        suggestionPending = false;
-        suggestedStem = null;
-      }}
-    />{#if !isImage}<span class="output-extension" title="Added from the chosen container">
-        .{outputContainer === 'matroska' ? 'mkv' : outputContainer}
-      </span>{/if}<button type="button" onclick={chooseOutput} aria-label="Browse output path">
-      …
-    </button>{#if chunked}<button type="button" onclick={() => void openRecoveries()}>
+    {#if fileMode === 'batch'}
+      <section class="batch-output" aria-label="Batch output">
+        <dl>
+          <dt>Default output folder</dt>
+          <dd>{batchOutputDirectory || 'Same folder as each source'}</dd>
+          <dt>Naming template</dt>
+          <dd>{batchNameTemplate.trim() || '{name}'}</dd>
+          <dt>Example output</dt>
+          <dd>
+            {batchOutputExample ||
+              batchOutputExampleError ||
+              (desktop && batchInputs.length ? 'Resolving…' : 'Add a source to see an example.')}
+          </dd>
+        </dl>
+        <div class="batch-output-actions">
+          <button type="button" onclick={onbatchfolder}>Change output folder</button>
+          <button type="button" onclick={onfiles}>Edit output names</button>
+        </div>
+      </section>
+    {:else}
+      <label for={`${idPrefix}-output`}>Output Path</label><input
+        id={`${idPrefix}-output`}
+        bind:value={destination}
+        oninput={() => {
+          ++destinationRevision;
+          suggestionPending = false;
+          destinationEdited = true;
+          suggestedStem = null;
+        }}
+      />{#if !isImage}<span class="output-extension" title="Added from the chosen container">
+          .{outputContainer === 'matroska' ? 'mkv' : outputContainer}
+        </span>{/if}<button type="button" onclick={chooseOutput} aria-label="Browse output path">
+        …
+      </button>
+    {/if}
+    {#if chunked}<button type="button" onclick={() => void openRecoveries()}>
         Resume…{recoveries.length ? ` (${recoveries.length})` : ''}
       </button><button
         type="button"
@@ -5657,6 +5930,37 @@
   }
   .output input {
     flex: 1;
+  }
+  .batch-output {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+    font-size: 0.85rem;
+  }
+  .batch-output dl {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 8px;
+    margin: 0;
+  }
+  .batch-output dt {
+    color: var(--muted-foreground);
+  }
+  .batch-output dd {
+    min-width: 0;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .batch-output-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .batch-hdr-problem {
+    display: block;
   }
   .output-extension {
     color: var(--muted-foreground);

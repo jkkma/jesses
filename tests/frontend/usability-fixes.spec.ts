@@ -92,7 +92,7 @@ test('the trim preview shows a portrait frame whole instead of clipping it', asy
   expect(box!.width).toBeLessThanOrEqual(frame!.width + 1);
 });
 
-test('Stop ends the active encode before releasing the batch', async ({ page }) => {
+test('Stop ends the active encode and reports the stopped file', async ({ page }) => {
   await installSourceEncodeFixture(page);
   await page.evaluate(() => ((globalThis as any).__holdTerminal = true));
   await loadMedia(page, {
@@ -104,8 +104,9 @@ test('Stop ends the active encode before releasing the batch', async ({ page }) 
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
   await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
   await expect(page.getByLabel('Current action')).toContainText('File 1/1');
+  await expect(page.getByLabel('Current action')).toContainText('Encoding 0%');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
-  await expect(page.getByLabel('Current action')).toContainText('Batch stopped');
+  await expect(page.getByLabel('Current action')).toContainText('1 stopped');
   const commands = await page.evaluate(() =>
     (globalThis as any).__sourceCalls.map((call: any) => call.command),
   );

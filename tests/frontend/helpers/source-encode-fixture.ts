@@ -126,8 +126,11 @@ export async function installSourceEncodeFixture(page: Page) {
           }));
         if (command === 'list_jobs') return [];
         if (command === 'get_preferences' || command === 'remember_recent_media')
-          return structuredClone(state.__preferences);
+          return command === 'get_preferences' && state.__preferenceLoadError
+            ? Promise.reject(new Error(state.__preferenceLoadError))
+            : structuredClone(state.__preferences);
         if (command === 'save_preferences') {
+          if (state.__preferenceSaveError) throw new Error(state.__preferenceSaveError);
           state.__preferences = {
             ...state.__preferences,
             general: payload.request.general,
@@ -358,7 +361,9 @@ export async function installSourceEncodeFixture(page: Page) {
           const held = state.__reviews[payload.id];
           if (held?.job) {
             state.__testJobs = state.__testJobs.map((entry: any) =>
-              entry.id === held.job.id ? { ...entry, state: 'canceled' } : entry,
+              entry.id === held.job.id && !['stopping', 'stopped'].includes(entry.state)
+                ? { ...entry, state: 'canceled' }
+                : entry,
             );
             emitJobs();
           }
@@ -402,6 +407,23 @@ export async function installSourceEncodeFixture(page: Page) {
           );
           emitJobs();
           return structuredClone(state.__testJobs);
+        }
+        if (command === 'cancel_queued_jobs') {
+          const canceled: string[] = [];
+          state.__testJobs = state.__testJobs.map((entry: any) => {
+            if (!payload.ids.includes(entry.id) || entry.state !== 'queued') return entry;
+            canceled.push(entry.id);
+            return { ...entry, state: 'canceled' };
+          });
+          emitJobs();
+          return structuredClone(
+            state.__testJobs.filter((entry: any) => canceled.includes(entry.id)),
+          );
+        }
+        if (command === 'read_job_log') {
+          const log = state.__jobLogs?.[payload.id];
+          if (log === undefined) throw new Error('Could not read the job log.');
+          return log;
         }
         if (command === 'set_job_paused') {
           state.__pausePreviousStates ??= {};

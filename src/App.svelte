@@ -27,7 +27,7 @@
   } from '$lib/source-workspace';
   import QuickConvert from '$lib/features/convert/QuickConvert.svelte';
   import Av1an from '$lib/features/av1an/Av1an.svelte';
-  import { terminalJob } from '$lib/components/shared/job-state';
+  import { canKeepProgressOnStop, canStopJob, terminalJob } from '$lib/components/shared/job-state';
   import {
     isEncoderProgressLine,
     liveJobProgress,
@@ -65,7 +65,8 @@
     openEncodeWindow,
     enqueueEncode,
     enqueueEncodeBatch,
-    cancelAllJobs,
+    cancelJob,
+    cancelQueuedJobs,
     stopJob,
     setJobPaused,
     recentPathIsFolder,
@@ -108,6 +109,18 @@
   const desktop = isDesktop();
   const sampleId = 'jesses-synthetic-preview';
   let view = $state<View>('files');
+  let toolsPanelElement = $state<HTMLElement>();
+  async function openToolsSettings() {
+    view = 'tools';
+    await tick();
+    toolsPanelElement?.scrollIntoView({ block: 'start' });
+    toolsPanelElement?.focus({ preventScroll: true });
+  }
+  async function openOutputFolderSettings() {
+    view = 'tools';
+    await tick();
+    document.getElementById('default-output-folder')?.focus();
+  }
   let uiStateReady = $state(false);
   let logHeight = $state(140);
   let logUserAdjusted = $state(false);
@@ -518,6 +531,16 @@
   let logOpen = $state(false);
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
+  let historyOpen = $state(false);
+  let historySection = $state<HTMLElement>();
+  const failedJobCount = $derived(jobs.filter((job) => job.state === 'failed').length);
+  async function showJobHistory() {
+    view = 'tools';
+    historyOpen = true;
+    await tick();
+    historySection?.scrollIntoView({ block: 'start' });
+    historySection?.querySelector('summary')?.focus({ preventScroll: true });
+  }
   const openedEncodeJobs = new Set<string>();
   const previousEncodeStates = new Map<string, JobSnapshot['state']>();
   async function showEncodeWindow() {
@@ -612,6 +635,31 @@
     const job = id === undefined ? currentJob : jobs.find((entry) => entry.id === id);
     return job && !terminalJob(job.state) ? job : undefined;
   });
+  const stoppableJob = $derived(
+    (!runningAction || runningAction.progressJobId !== undefined) &&
+      liveJob &&
+      canStopJob(liveJob.state)
+      ? liveJob
+      : undefined,
+  );
+  const stopPreparing = $derived(
+    displayAction?.active && displayAction.progressJobId == null ? displayAction.stop : undefined,
+  );
+  const waitingJobs = $derived(jobs.filter((job) => job.state === 'queued'));
+  const waitingCount = $derived(waitingJobs.length + (runningAction?.waitingBatch?.count ?? 0));
+  let queueConfirmation = $state<{ ids: string[]; batchId?: string }>();
+  let cancelingQueue = $state(false);
+  const confirmedWaitingBatch = $derived(
+    queueConfirmation?.batchId === runningAction?.waitingBatch?.id
+      ? runningAction?.waitingBatch
+      : undefined,
+  );
+  const confirmedWaitingJobs = $derived(
+    waitingJobs.filter((job) => queueConfirmation?.ids.includes(job.id)),
+  );
+  const confirmedWaitingCount = $derived(
+    confirmedWaitingJobs.length + (confirmedWaitingBatch?.count ?? 0),
+  );
   // Estimate a rate from progress seen in this window when the encoder lacks telemetry.
   const progressEstimator = new ProgressEstimator();
   let progressEstimate = $state<ProgressEstimate | null>(null);
@@ -845,35 +893,48 @@
     jobs = [...missing.reverse(), ...jobs];
     addLog(`${submitted.length} encodes added to the queue.`);
   }
-  async function stopQueue() {
-    const snapshots = await cancelAllJobs();
-    jobs = jobs.map((entry) =>
-      terminalJob(entry.state) ? entry : (snapshots.find((job) => job.id === entry.id) ?? entry),
-    );
+  function confirmCancelQueue() {
+    queueConfirmation = {
+      ids: waitingJobs.map((job) => job.id),
+      batchId: runningAction?.waitingBatch?.id,
+    };
   }
-  // Stop started encodes before releasing the batch wait or canceling its queue.
+  async function cancelWaitingQueue() {
+    const pending = confirmedWaitingJobs;
+    const batch = confirmedWaitingBatch;
+    queueConfirmation = undefined;
+    if (cancelingQueue) return;
+    cancelingQueue = true;
+    try {
+      batch?.cancel();
+      if (pending.length) {
+        const canceled = await cancelQueuedJobs(pending.map((job) => job.id));
+        jobs = jobs.map((entry) =>
+          pending.includes(entry) ? (canceled.find((job) => job.id === entry.id) ?? entry) : entry,
+        );
+        if (canceled.length)
+          addLog(`Canceled ${canceled.length} waiting job${canceled.length === 1 ? '' : 's'}.`);
+      }
+    } catch (error) {
+      addLog(`Could not cancel waiting jobs: ${errorMessage(error)}`, 'error');
+    } finally {
+      cancelingQueue = false;
+    }
+  }
   let stopping = $state(false);
   async function stopRun() {
     if (stopping) return;
     stopping = true;
     try {
-      // Started video encodes get a Stopped result. Copy and audio-only jobs
-      // are canceled along with queued work.
-      for (const job of jobs.filter(
-        (entry) =>
-          entry.encodeSettings &&
-          (entry.encodeSettings.videoMode ?? 'encode') === 'encode' &&
-          ['preparing', 'running', 'paused', 'finalizing'].includes(entry.state),
-      )) {
-        try {
-          const snapshot = await stopJob(job.id);
-          jobs = jobs.map((entry) => (entry.id === snapshot.id ? snapshot : entry));
-        } catch (error) {
-          addLog(`Could not stop the encode: ${errorMessage(error)}`, 'error');
-        }
-      }
-      if (displayAction?.active) displayAction.stop?.();
-      else await stopQueue();
+      const job = stoppableJob;
+      if (job) {
+        const stopReview = displayAction?.stopReview;
+        const snapshot = await (canKeepProgressOnStop(job) ? stopJob(job.id) : cancelJob(job.id));
+        jobs = jobs.map((entry) => (entry === job ? snapshot : entry));
+        stopReview?.();
+      } else stopPreparing?.();
+    } catch (error) {
+      addLog(`Could not stop the current job: ${errorMessage(error)}`, 'error');
     } finally {
       stopping = false;
     }
@@ -956,7 +1017,7 @@
     }
   }
 
-  function beginImport() {
+  function beginImport(showFileList = true) {
     fileQuery = '';
     const generation = ++importGeneration;
     importSession = { generation, folders: [], completed: [], ticket: null };
@@ -965,7 +1026,7 @@
     importing = true;
     importNotice = null;
     importErrors = [];
-    view = 'files';
+    if (showFileList) view = 'files';
     return generation;
   }
 
@@ -1120,9 +1181,9 @@
     }
   }
 
-  async function addFiles() {
+  async function addFiles(keepView = false) {
     if (!desktop || importing) return;
-    const generation = beginImport();
+    const generation = beginImport(!keepView);
     importingName = 'Choosing files';
     try {
       if (!(await reserveImport(generation))) return;
@@ -1629,7 +1690,7 @@
           onselect={selectFiles}
           onmode={changeFileMode}
           onname={(value) => (batchNameTemplate = value)}
-          onadd={addFiles}
+          onadd={() => addFiles()}
           onfolder={addFolder}
           onrecent={(path) => {
             recentSelection = path;
@@ -1660,16 +1721,20 @@
             workspaceActions.av1an?.reset?.();
           }}
         />
-        <SavedJobs {jobs} onqueue={queueEncode} />
-        <ToolsPanel
-          {tools}
-          {desktop}
-          loading={toolsLoading}
-          checked={toolsChecked}
-          error={toolsError}
-          onrefresh={refreshTools}
-          preferences={false}
-        />
+        <section bind:this={historySection} aria-label="Job history">
+          <SavedJobs {jobs} onqueue={queueEncode} bind:open={historyOpen} />
+        </section>
+        <section bind:this={toolsPanelElement} tabindex="-1" aria-label="Tool diagnostics">
+          <ToolsPanel
+            {tools}
+            {desktop}
+            loading={toolsLoading}
+            checked={toolsChecked}
+            error={toolsError}
+            onrefresh={refreshTools}
+            preferences={false}
+          />
+        </section>
       {/if}
       {#if (view === 'convert' || view === 'av1an') && jobsError}<p role="alert">
           {jobsError}
@@ -1677,6 +1742,8 @@
         </p>{/if}
       <div hidden={view !== 'convert'}>
         <QuickConvert
+          visible={view === 'convert'}
+          onbatchfolder={openOutputFolderSettings}
           {files}
           file={taskSource}
           {tools}
@@ -1699,12 +1766,16 @@
           isShiftHeld={() => shiftHeld}
           connected={jobsConnected}
           onfiles={() => (view = 'files')}
+          onaddfiles={() => addFiles(true)}
+          addingFiles={importing}
           onstart={submitEncode}
           onqueue={queueEncode}
         />
       </div>
       <div hidden={view !== 'av1an'}>
         <Av1an
+          visible={view === 'av1an'}
+          onbatchfolder={openOutputFolderSettings}
           {files}
           file={taskSource}
           {tools}
@@ -1722,6 +1793,7 @@
           onreviewjob={acceptReviewedJob}
           isShiftHeld={() => shiftHeld}
           onrecoverysource={activateRecoverySource}
+          ontracklist={() => (view = 'tracks')}
           onrecoveryjobs={acceptRecoveryJobs}
           connected={jobsConnected}
           onfiles={() => (view = 'files')}
@@ -1779,6 +1851,11 @@
     <div class="log-bar">
       <strong>LOG</strong>
       <div class="log-bar-right">
+        {#if jobs.length}
+          <button type="button" onclick={showJobHistory}>
+            Job history{failedJobCount ? ` (${failedJobCount} failed)` : ''}
+          </button>
+        {/if}
         {#if desktop && jobs.some((job) => job.encodeSettings?.backend === 'standalone')}
           <button type="button" onclick={showEncodeWindow}>Show encoding window</button>
         {/if}
@@ -1832,6 +1909,25 @@
       </button>
     </aside>
   {/if}
+  {#if runBlockedReason}
+    <div class="run-blocked-banner">
+      {#if action?.openBlockedSetting}
+        <button
+          type="button"
+          id="run-blocked-reason"
+          class="run-blocked"
+          onclick={action.openBlockedSetting}
+        >
+          {runBlockedReason}
+        </button>
+      {:else}
+        <span id="run-blocked-reason" class="run-blocked" role="alert">{runBlockedReason}</span>
+      {/if}
+      {#if action?.blockedByMissingTools}
+        <button type="button" onclick={openToolsSettings}>Open Tools</button>
+      {/if}
+    </div>
+  {/if}
   <footer class="status-bar">
     <div class="current-action">
       <div aria-label="Current action" title={currentActionTitle}>
@@ -1869,17 +1965,19 @@
         {displayAction.paused ? 'Resume' : 'Pause'}
       </button><button
         type="button"
-        title="Stop the current work and keep any saved encoder progress"
-        disabled={!displayAction.stop || stopping}
+        title={stoppableJob
+          ? 'Stop the current job and keep any saved encoder progress'
+          : 'Stop the current preparation or utility task'}
+        disabled={(!stoppableJob && !stopPreparing) || stopping}
         onclick={stopRun}
       >
         Stop
       </button>
-    {:else if currentJob && ['preparing', 'running', 'paused', 'finalizing'].includes(currentJob.state)}<button
+    {:else if stoppableJob}<button
         type="button"
-        onclick={() => pauseLiveJob(currentJob.id, currentJob.state !== 'paused')}
+        onclick={() => pauseLiveJob(stoppableJob!.id, stoppableJob!.state !== 'paused')}
       >
-        {currentJob.state === 'paused' ? 'Resume' : 'Pause'}
+        {stoppableJob.state === 'paused' ? 'Resume' : 'Pause'}
       </button><button
         type="button"
         title="Stop the current job and keep any saved encoder progress"
@@ -1888,22 +1986,11 @@
       >
         Stop
       </button>{/if}
-    {#if runBlockedReason && action?.openBlockedSetting}<button
-        type="button"
-        id="run-blocked-reason"
-        class="run-blocked"
-        title={runBlockedReason}
-        onclick={action.openBlockedSetting}
-      >
-        {runBlockedReason}
-      </button>{:else if runBlockedReason}<span
-        id="run-blocked-reason"
-        class="run-blocked"
-        role="alert"
-        title={runBlockedReason}
-      >
-        {runBlockedReason}
-      </span>{/if}
+    {#if waitingCount}
+      <button type="button" disabled={cancelingQueue} onclick={confirmCancelQueue}>
+        Cancel queue ({waitingCount})…
+      </button>
+    {/if}
     <button
       type="button"
       class="run-button"
@@ -1966,6 +2053,28 @@
       <button type="button" onclick={() => finishSequenceRate()}>OK</button>
     </div>
   {/if}
+</SourceDialog>
+<SourceDialog
+  title="Cancel waiting jobs?"
+  open={queueConfirmation !== undefined}
+  onclose={() => (queueConfirmation = undefined)}
+>
+  {#if confirmedWaitingCount}
+    <p>
+      Cancel {confirmedWaitingCount} waiting {confirmedWaitingCount === 1 ? 'job' : 'jobs'}? Any job
+      already running will continue.
+    </p>
+  {:else}
+    <p>The selected jobs have already started or left the queue.</p>
+  {/if}
+  <div class="import-actions">
+    <button type="button" data-dialog-initial-focus onclick={() => (queueConfirmation = undefined)}>
+      Keep queue
+    </button>
+    <button type="button" disabled={!confirmedWaitingCount} onclick={cancelWaitingQueue}>
+      Cancel waiting jobs
+    </button>
+  </div>
 </SourceDialog>
 <SourceDialog
   title="Close jesses?"
@@ -2333,26 +2442,29 @@
     background: var(--jesses-primary-hover);
     color: var(--primary-foreground);
   }
-  .status-bar .run-blocked {
-    max-width: 46ch;
+  .run-blocked-banner {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 10px;
+  }
+  .run-blocked {
+    flex: 1;
+    min-width: 0;
     color: var(--destructive);
     font-size: 0.85rem;
     font-weight: 600;
     line-height: 1.3;
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
+    overflow-wrap: anywhere;
   }
-  .status-bar button.run-blocked {
+  button.run-blocked {
     padding: 2px 4px;
     background: transparent;
     text-align: left;
     text-decoration: underline;
     text-underline-offset: 2px;
   }
-  .status-bar button.run-blocked:hover:not(:disabled) {
+  button.run-blocked:hover:not(:disabled) {
     background: var(--secondary);
     color: var(--destructive);
   }

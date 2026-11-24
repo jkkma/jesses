@@ -373,7 +373,7 @@ test('Stop cancels the running copy job and reflects the terminal snapshot', asy
   await expect
     .poll(() =>
       page.evaluate(() =>
-        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'cancel_all_jobs'),
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'cancel_job'),
       ),
     )
     .toBe(true);

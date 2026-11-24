@@ -1173,6 +1173,36 @@ impl JobManager {
             .collect()
     }
 
+    pub async fn read_job_log(&self, id: String) -> Result<String, AppError> {
+        let preferred = {
+            let state = self.state.lock().await;
+            let entry = state
+                .entries
+                .iter()
+                .find(|entry| entry.snapshot.id == id)
+                .ok_or_else(|| {
+                    AppError::new("JOB_NOT_FOUND", "The job is no longer in history.", None)
+                })?;
+            entry
+                .snapshot
+                .log_path
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name()?.to_str().map(str::to_owned))
+        };
+        let log_dir = self.log_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            log_retention::read_tail(&log_dir, &id, preferred.as_deref()).map_err(|e| {
+                AppError::new(
+                    "JOB_LOG_UNAVAILABLE",
+                    format!("Could not read the job log: {e}"),
+                    None,
+                )
+            })
+        })
+        .await
+        .map_err(|e| AppError::new("JOB_LOG_UNAVAILABLE", e.to_string(), None))?
+    }
+
     /// Live pause is separate from stop-and-keep-progress and durable resume.
     pub async fn set_job_paused(&self, id: String, paused: bool) -> Result<JobSnapshot, AppError> {
         let mut state = self.state.lock().await;
@@ -1255,6 +1285,32 @@ impl JobManager {
         self.persist(&mut state).await?;
         self.queue_changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    /// Cancel only the confirmed jobs that are still waiting for a worker.
+    pub async fn cancel_queued_jobs(&self, ids: Vec<String>) -> Result<Vec<JobSnapshot>, AppError> {
+        let ids: HashSet<_> = ids.into_iter().collect();
+        let mut state = self.state.lock().await;
+        if let Some(error) = &state.storage_error {
+            return Err(error.clone());
+        }
+        let mut canceled = Vec::new();
+        for entry in &mut state.entries {
+            if entry.snapshot.state == JobState::Queued && ids.contains(&entry.snapshot.id) {
+                entry.cancel.send_replace(true);
+                entry.snapshot.state = JobState::Canceling;
+                append_log(
+                    &mut entry.snapshot,
+                    "Canceled while waiting in the queue.".into(),
+                );
+                canceled.push(entry.snapshot.clone());
+            }
+        }
+        if !canceled.is_empty() {
+            self.persist(&mut state).await?;
+            self.queue_changed.notify_waiters();
+        }
+        Ok(canceled)
     }
 
     /// Stops the owned worker tree while retaining verified recovery artifacts.

@@ -60,6 +60,8 @@ fn main() {
             "enqueue_encode_batch",
             "cancel_all_jobs",
             "cancel_job",
+            "cancel_queued_jobs",
+            "read_job_log",
             "stop_job",
             "discard_job_progress",
             "resume_job",

@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { canResumeJob, hasSavedProgress, terminalJob } from '$lib/components/shared/job-state';
+  import {
+    canKeepProgressOnStop,
+    canResumeJob,
+    canStopJob,
+    hasSavedProgress,
+    terminalJob,
+  } from '$lib/components/shared/job-state';
+  import DiscardProgressDialog from '$lib/components/shared/DiscardProgressDialog.svelte';
   import { displayPaths, errorMessage, fileName, formatBytes } from '$lib/components/shared/format';
   import {
     isEncoderProgressLine,
@@ -32,6 +39,10 @@
   let disposed = false;
   let unsubscribe: (() => void) | undefined;
   let busy = $state(false);
+  let discardTargetId = $state<string>();
+  const discardTarget = $derived(
+    jobs.find((job) => job.id === discardTargetId && canResumeJob(job)),
+  );
   let actionError = $state<{ id: string; message: string } | null>(null);
   let logElement: HTMLPreElement | undefined = $state();
   let followLog = true;
@@ -229,7 +240,7 @@
         >
           Open output folder
         </button>
-        {#if ['preparing', 'running', 'paused', 'finalizing'].includes(current.state)}
+        {#if canStopJob(current.state)}
           <button
             type="button"
             aria-label={current.state === 'paused' ? 'Continue encoding' : 'Pause encoding'}
@@ -243,11 +254,7 @@
             title={hasSavedProgress(current)
               ? 'Keep the saved checkpoint. Resume restarts the interrupted phase.'
               : 'Stop this job. A new run starts from the source.'}
-            onclick={() =>
-              act(
-                current!,
-                (current!.encodeSettings?.videoMode ?? 'encode') === 'encode' ? 'stop' : 'cancel',
-              )}
+            onclick={() => act(current!, canKeepProgressOnStop(current!) ? 'stop' : 'cancel')}
             disabled={busy}
           >
             {hasSavedProgress(current) ? 'Stop and keep progress' : 'Stop'}
@@ -259,7 +266,7 @@
           <button
             type="button"
             class="discard"
-            onclick={() => act(current!, 'discard')}
+            onclick={() => (discardTargetId = current!.id)}
             disabled={busy}
           >
             Discard saved progress
@@ -278,6 +285,15 @@
     </p>
   </footer>
 </main>
+
+<DiscardProgressDialog
+  job={discardTarget}
+  onclose={() => (discardTargetId = undefined)}
+  onconfirm={(job) => {
+    discardTargetId = undefined;
+    void act(job, 'discard');
+  }}
+/>
 
 <style>
   :global(body:has(.encode-window)) {

@@ -58,6 +58,35 @@ impl Drop for Fixture {
 // Transaction-boundary tests bypass probing so they run without external tools.
 // The execution slot stays held until all admitted jobs have been canceled.
 #[tokio::test]
+async fn cancel_queued_jobs_leaves_started_and_unconfirmed_jobs_alone() {
+    let fixture = Fixture::new();
+    let manager = JobManager::new(fixture.0.join("logs"));
+    let slot = manager.execution.lock().await;
+    let admitted = manager
+        .admit_encode_batch((0..3).map(|i| fixture.request(i)).collect())
+        .await
+        .unwrap();
+    manager
+        .phase(
+            &admitted[0].id,
+            JobState::Preparing,
+            "Started before confirmation.",
+        )
+        .await;
+    let canceled = manager
+        .cancel_queued_jobs(vec![admitted[0].id.clone(), admitted[1].id.clone()])
+        .await
+        .unwrap();
+    assert_eq!(canceled.len(), 1);
+    assert_eq!(canceled[0].id, admitted[1].id);
+    let jobs = manager.list_jobs().await;
+    assert_eq!(jobs[0].state, JobState::Queued);
+    assert_eq!(jobs[2].state, JobState::Preparing);
+    manager.shutdown().await;
+    drop(slot);
+}
+
+#[tokio::test]
 async fn batch_refuses_collisions_without_queuing_or_altering_history() {
     let fixture = Fixture::new();
     let manager = JobManager::open(fixture.0.join("logs"), fixture.0.join("history")).await;

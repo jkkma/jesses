@@ -124,7 +124,10 @@ for (const hdrFirst of [true, false])
     await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
     await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
     const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
-    if (hdrFirst) await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+    await quick.getByLabel('Tone Mapping', { exact: true }).selectOption('off');
+    await expect(
+      quick.getByText('Choose a Tone Mapping curve to convert HLG to SDR.'),
+    ).toBeVisible();
     await quick.getByLabel('Color Format', { exact: true }).selectOption('yuv420p');
     await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
     await page.getByRole('button', { name: 'File List', exact: true }).click();

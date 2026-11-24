@@ -115,7 +115,7 @@ test('the batch footer tracks the current file through preparation, encoding and
   await expect(bar).toHaveAttribute('value', '0');
 });
 
-test('starting another encode batch clears the previous stopped status during preflight', async ({
+test('starting another encode batch clears the previous result during preflight', async ({
   page,
 }) => {
   await installSourceEncodeFixture(page);
@@ -132,7 +132,7 @@ test('starting another encode batch clears the previous stopped status during pr
   await run.click();
   await expect(status).toContainText('File 1/1 (input.mkv)');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
-  await expect(status).toContainText('Batch stopped');
+  await expect(status).toContainText('Batch done - 0/1 finished, 1 stopped.');
   await expect(run).toBeEnabled();
   await page.evaluate(() => {
     (globalThis as any).__holdBatchPreview = new Promise(() => {});
@@ -1492,6 +1492,9 @@ for (const kind of ['encode', 'image'] as const) {
         .getByRole('region', { name: 'Quick Convert', exact: true })
         .getByLabel('Codec', { exact: true })
         .selectOption('png');
+    await expect(
+      page.getByRole('region', { name: 'Batch output' }).locator('dd').last(),
+    ).not.toHaveText('Resolving…');
     await page.evaluate(() => {
       const h = globalThis as any;
       h.__holdAnalysis = new Promise((resolve) => (h.__releaseAnalysis = resolve));
@@ -1577,26 +1580,35 @@ for (const kind of ['encode', 'image'] as const) {
         .getByRole('region', { name: 'Quick Convert', exact: true })
         .getByLabel('Codec', { exact: true })
         .selectOption('png');
-    await page.evaluate((kind) => {
-      const h = globalThis as any;
-      if (kind === 'image')
-        h.__holdBatchResolution = new Promise((resolve) => (h.__releaseBatch = resolve));
-      else h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
-    }, kind);
+    await expect(
+      page.getByRole('region', { name: 'Batch output' }).locator('dd').last(),
+    ).not.toHaveText('Resolving…');
     const command = kind === 'image' ? 'resolve_batch_output_paths' : 'preview_encode_batch';
+    const baseline = await page.evaluate(
+      ({ kind, command }) => {
+        const h = globalThis as any;
+        if (kind === 'image')
+          h.__holdBatchResolution = new Promise((resolve) => (h.__releaseBatch = resolve));
+        else h.__holdBatchPreview = new Promise((resolve) => (h.__releaseBatch = resolve));
+        return h.__sourceCalls.filter((c: any) => c.command === command).length;
+      },
+      { kind, command },
+    );
     await page.getByRole('button', { name: 'Run Batch: Encode' }).click();
     await expect
       .poll(() =>
         page.evaluate(
-          (command) => (globalThis as any).__sourceCalls.some((c: any) => c.command === command),
+          (command) =>
+            (globalThis as any).__sourceCalls.filter((c: any) => c.command === command).length,
           command,
         ),
       )
-      .toBe(true);
+      .toBeGreaterThan(baseline);
     const id = await page.evaluate(
-      (command) =>
-        (globalThis as any).__sourceCalls.find((c: any) => c.command === command).payload.id,
-      command,
+      ({ command, baseline }) =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === command)[baseline]
+          .payload.id,
+      { command, baseline },
     );
     expect(id).toBeTruthy();
     if (kind === 'encode') {
