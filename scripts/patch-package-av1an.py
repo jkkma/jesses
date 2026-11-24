@@ -20,6 +20,7 @@ MARKERS = (
     "xpsnr-signed-stats-v1",
     "source-unfiltered-probes-v1",
     "preload-scenes-v1",
+    "fresh-scene-preload-v1",
     "ffmpeg91-metric-input-v1",
 )
 
@@ -51,11 +52,35 @@ def patch_source(source, archive_path, patch_path):
         raise ValueError("The pinned sampled-probe timestamp behavior is absent.")
     context = original[paths[0]]
     initialize = context[context.index("    fn initialize("):context.index("        if self.args.resume && done_json_exists {")]
-    # The fresh encode receives --resume to preserve the preloaded scene list.
-    # Upstream must then switch back to fresh mode before creating a new queue.
+    # Retain the v1 contract for older Jesses clients that used --resume.
     if ('if !self.args.resume && Path::new(&self.args.temp).is_dir() {' not in initialize
             or 'self.args.resume = false;' not in initialize[initialize.index("(false, false) => {"):]):
         raise ValueError("The pinned scene preload behavior is absent.")
+    before = initialize[initialize.index("        if !self.args.resume"):initialize.index("        create_dir!")]
+    # An explicit --scenes pointing at the temp scene list opts into preload.
+    # Admit only the two prepass files. A fresh encode must never adopt a queue.
+    after = '''        let temp = Path::new(&self.args.temp);
+        if !self.args.resume && temp.is_dir() {
+            let scenes = temp.join("scenes.json");
+            if self.args.scenes.as_deref() == Some(scenes.as_path()) && scenes.is_file() {
+                let split = temp.join("split");
+                // Input::new may already have written the current reader script.
+                let reader_files = 1 + usize::from(split.join("loadscript.vpy").is_file());
+                anyhow::ensure!(
+                    split.join("cache.lwi").is_file()
+                        && fs::read_dir(temp)?.count() == 2
+                        && fs::read_dir(&split)?.count() == reader_files,
+                    "Unexpected contents in the fresh scene preload directory"
+                );
+                info!("Starting a fresh encode with precomputed scenes");
+            } else {
+                fs::remove_dir_all(temp)
+                    .with_context(|| format!("Failed to remove temporary directory {}", temp.display()))?;
+            }
+        }
+
+'''
+    context = context.replace(before, after, 1)
     start = context.index("    fn create_select_chunk(")
     end = context.index("        let output_ext", start)
     region = context[start:end]

@@ -560,13 +560,11 @@ impl JobManager {
             source_filter.as_deref(),
         );
         if let Some(prepared) = &prepared_scenes {
-            // The packaged engine preserves the primed index in resume mode
-            // and starts a fresh queue when chunks.json and done.json are absent.
-            args.extend([
-                "--scenes".into(),
-                prepared.path.as_os_str().to_owned(),
-                "--resume".into(),
-            ]);
+            args.extend(["--scenes".into(), prepared.path.as_os_str().to_owned()]);
+            // Older engines clear the prepass files unless launched in resume mode.
+            if !version_text.contains(scenes::FRESH_PRELOAD) {
+                args.push("--resume".into());
+            }
         }
         let native_command = CommandSpec {
             executable: launch.executable.clone(),

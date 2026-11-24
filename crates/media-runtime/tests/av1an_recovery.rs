@@ -618,6 +618,10 @@ async fn run_crash_child(root: &Path) {
             .any(|line| line.contains("Parallel scene prepass: 2 slices")),
         "the crash must interrupt an encode using the prepass: {checkpoint:#?}"
     );
+    let log = Path::new(checkpoint.log_path.as_ref().unwrap()).with_extension("av1an.log");
+    let details = std::fs::read_to_string(log).unwrap();
+    assert!(details.contains("Starting a fresh encode with precomputed scenes"));
+    assert!(!details.contains("resume was set"));
     let workspace = PathBuf::from(&checkpoint.recovery.as_ref().unwrap().workspace);
     let attempts: Vec<_> = std::fs::read_dir(&workspace)
         .unwrap()

@@ -52,11 +52,13 @@ impl Prepared {
     }
 }
 
+pub(super) const FRESH_PRELOAD: &str = "[fresh-scene-preload-v1]";
+
 pub(super) fn supports_preload(version: &str) -> bool {
-    // The compatibility marker identifies builds that preserve --temp when
-    // --resume is present and then switch to fresh mode if the queue is absent.
-    // The previously packaged 0.5.2 revision has this behavior without the tag.
-    version.contains("[preload-scenes-v1]")
+    // The v1 preload contract and the pinned 0.5.2 build require --resume
+    // to preserve the reader index. Both start a new queue when none exists.
+    version.contains(FRESH_PRELOAD)
+        || version.contains("[preload-scenes-v1]")
         || version.lines().any(|line| {
             line.starts_with("av1an 0.5.2-unstable (rev 805dad69143fa0a81cfe2fb89c0b9e90a828ea72) ")
         })
@@ -964,6 +966,7 @@ mod tests {
 
     #[test]
     fn supports_preload_accepts_capability_tag() {
+        assert!(supports_preload("av1an [fresh-scene-preload-v1]"));
         assert!(supports_preload(
             "av1an 0.6.0 (rev 641ce62d70e34f438f3ee91ec50de77784a10705) (Release) [preload-scenes-v1]"
         ));

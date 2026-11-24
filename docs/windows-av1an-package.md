@@ -32,7 +32,9 @@ untagged Y4M reference. Independent decoded-file comparisons match every frame
 and aggregate metric after this correction. The version banner identifies the
 source revision and the retained compatibility markers. The
 `preload-scenes-v1` marker identifies an engine that can reuse precomputed
-scenes for a fresh encode. The `ffmpeg91-metric-input-v1` marker identifies
+scenes for a fresh encode. With `fresh-scene-preload-v1`, passing the prepared
+scene list starts a fresh queue and preserves the L-SMASH index without
+`--resume`. The `ffmpeg91-metric-input-v1` marker identifies
 the FFmpeg 9.1 compatibility fix for VMAF, weighted VMAF, and XPSNR input
 queues. FFmpeg 9.1 manages those demuxer queues internally.
 
