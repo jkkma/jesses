@@ -242,51 +242,66 @@ struct WindowsProcess {
     pid: u32,
     parent_pid: u32,
     name: String,
-    executable_path: Option<String>,
 }
 
 #[cfg(windows)]
 fn windows_process_inventory() -> Vec<WindowsProcess> {
-    use std::os::windows::process::CommandExt;
-    // The package gate deliberately leaves only System32 on PATH. Windows
-    // PowerShell is an OS tool in its own subdirectory, not a PATH media tool.
-    let powershell = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let result = Command::new(powershell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath) | ConvertTo-Json -Compress",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .expect("Windows process inventory must launch");
-    assert!(
-        result.status.success(),
-        "Windows process inventory failed: {}",
-        String::from_utf8_lossy(&result.stderr)
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    // SAFETY: TH32CS_SNAPPROCESS snapshots the system inventory and ignores PID.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(
+        raw,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
     );
-    let values: Value = serde_json::from_slice(&result.stdout).unwrap();
-    values
-        .as_array()
-        .expect("PowerShell must return a process array")
-        .iter()
-        .filter_map(|value| {
-            Some(WindowsProcess {
-                pid: u32::try_from(value["ProcessId"].as_u64()?).ok()?,
-                parent_pid: u32::try_from(value["ParentProcessId"].as_u64()?).ok()?,
-                name: value["Name"].as_str()?.to_owned(),
-                executable_path: value["ExecutablePath"].as_str().map(str::to_owned),
-            })
-        })
-        .collect()
+    // SAFETY: a successful snapshot call returns one owned closeable handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the snapshot is owned and the entry has the correct size.
+    assert_ne!(
+        unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) },
+        0
+    );
+    let mut processes = Vec::new();
+    loop {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push(WindowsProcess {
+            pid: entry.th32ProcessID,
+            parent_pid: entry.th32ParentProcessID,
+            name: String::from_utf16_lossy(&entry.szExeFile[..end]),
+        });
+        // SAFETY: the snapshot remains owned and the entry remains writable.
+        if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_NO_MORE_FILES as i32)
+            );
+            return processes;
+        }
+    }
 }
 
 #[cfg(windows)]
-fn descendants(root: u32, inventory: &[WindowsProcess]) -> Vec<WindowsProcess> {
-    let mut pids = std::collections::HashSet::from([root]);
+fn descendants(
+    roots: impl IntoIterator<Item = u32>,
+    inventory: &[WindowsProcess],
+) -> Vec<WindowsProcess> {
+    let mut pids: std::collections::HashSet<_> = roots.into_iter().collect();
     let mut result = Vec::new();
     loop {
         let mut changed = false;
@@ -307,34 +322,130 @@ fn descendants(root: u32, inventory: &[WindowsProcess]) -> Vec<WindowsProcess> {
 struct ObservedWindowsProcess {
     process: WindowsProcess,
     handle: std::os::windows::io::OwnedHandle,
+    executable_path: Option<String>,
+    created: u64,
+    in_any_job: bool,
+}
+
+#[cfg(windows)]
+impl ObservedWindowsProcess {
+    fn evidence(&self) -> String {
+        use std::os::windows::io::AsRawHandle;
+        let exited = (!process_is_running(&self.handle))
+            .then(|| windows_process_times(self.handle.as_raw_handle()).1);
+        format!(
+            "pid={} parent={} name={} path={:?} created={} exited={exited:?} in_any_job={}",
+            self.process.pid,
+            self.process.parent_pid,
+            self.process.name,
+            self.executable_path,
+            self.created,
+            self.in_any_job
+        )
+    }
 }
 
 #[cfg(windows)]
 fn open_live_process(process: WindowsProcess) -> Option<ObservedWindowsProcess> {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
-
-    // SAFETY: the PID came from Win32 immediately before this call. A non-null
-    // result is a new owned synchronization handle, immune to PID reuse.
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process.pid) };
-    (!handle.is_null()).then(|| ObservedWindowsProcess {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::ERROR_INVALID_PARAMETER,
+        System::{
+            JobObjects::IsProcessInJob,
+            Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                QueryFullProcessImageNameW,
+            },
+        },
+    };
+    // SAFETY: a non-null result is one owned process handle. Query identity and
+    // process liveness through this same handle instead of a second PID lookup.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            process.pid,
+        )
+    };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_INVALID_PARAMETER as i32),
+            "cannot inspect descendant {process:?}: {error}"
+        );
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    if !process_is_running(&handle) {
+        return None;
+    }
+    let (created, _) = windows_process_times(handle.as_raw_handle());
+    let mut path = vec![0_u16; 32_768];
+    let mut length = path.len() as u32;
+    // SAFETY: the handle remains live and both out-parameter buffers are writable.
+    let returned = unsafe {
+        QueryFullProcessImageNameW(handle.as_raw_handle(), 0, path.as_mut_ptr(), &mut length)
+    };
+    let executable_path =
+        (returned != 0).then(|| String::from_utf16_lossy(&path[..length as usize]));
+    let mut member = 0;
+    // SAFETY: null job requests membership of any job, with a valid out parameter.
+    assert_ne!(
+        unsafe { IsProcessInJob(handle.as_raw_handle(), std::ptr::null_mut(), &mut member) },
+        0
+    );
+    Some(ObservedWindowsProcess {
         process,
-        handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+        handle,
+        executable_path,
+        created,
+        in_any_job: member != 0,
     })
+}
+
+#[cfg(windows)]
+fn windows_process_times(handle: std::os::windows::io::RawHandle) -> (u64, u64) {
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: the caller retains the process handle and all four out pointers are writable.
+    assert_ne!(
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) },
+        0
+    );
+    let timestamp =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    (timestamp(created), timestamp(exited))
 }
 
 #[cfg(windows)]
 fn process_is_running(handle: &std::os::windows::io::OwnedHandle) -> bool {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
 
     // SAFETY: the handle remains owned and valid for the duration of the call.
-    unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => false,
+        WAIT_TIMEOUT => true,
+        result => panic!(
+            "process wait failed ({result}): {}",
+            std::io::Error::last_os_error()
+        ),
+    }
 }
 
 #[cfg(windows)]
 async fn observe_packaged_process_tree(
     host_pid: u32,
+    host_created: u64,
     resources: &Path,
     workspace: &Path,
 ) -> Vec<ObservedWindowsProcess> {
@@ -377,12 +488,11 @@ async fn observe_packaged_process_tree(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
-        let inventory = tokio::task::spawn_blocking(windows_process_inventory)
-            .await
-            .unwrap();
-        let observed: Vec<_> = descendants(host_pid, &inventory)
+        let inventory = windows_process_inventory();
+        let observed: Vec<_> = descendants([host_pid], &inventory)
             .into_iter()
             .filter_map(open_live_process)
+            .filter(|process| process.created >= host_created)
             .collect();
         let named = |name: &str| {
             observed.iter().find(|process| {
@@ -393,10 +503,9 @@ async fn observe_packaged_process_tree(
         if let (Some(av1an), Some(svt)) = (named("av1an.exe"), named("SvtAv1EncApp.exe")) {
             for (process, staged) in [(av1an, true), (svt, false)] {
                 let path = process
-                    .process
                     .executable_path
                     .as_deref()
-                    .expect("WMI must expose the package tool executable path");
+                    .expect("the held process handle must expose the package tool executable path");
                 let path = normalize(path);
                 assert!(
                     path.starts_with(&workspace) || path.starts_with(&resources),
@@ -429,24 +538,52 @@ async fn observe_packaged_process_tree(
 }
 
 #[cfg(windows)]
-async fn assert_process_tree_dead(host_pid: u32, observed: &[ObservedWindowsProcess]) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let inventory = tokio::task::spawn_blocking(windows_process_inventory)
-                .await
-                .unwrap();
-            if observed
+async fn assert_process_tree_dead(
+    host_pid: u32,
+    host_created: u64,
+    observed: &[ObservedWindowsProcess],
+) {
+    let started = tokio::time::Instant::now();
+    let mut additional = Vec::<ObservedWindowsProcess>::new();
+    loop {
+        // Retain the originally observed ancestry even when an intermediate
+        // process exited before the last snapshot. New live descendants are
+        // held by handle as well, and stale rows are checked for real liveness.
+        let roots = std::iter::once(host_pid).chain(
+            observed
                 .iter()
-                .all(|process| !process_is_running(&process.handle))
-                && descendants(host_pid, &inventory).is_empty()
-            {
-                return;
+                .chain(&additional)
+                .map(|process| process.process.pid),
+        );
+        let newly_seen = descendants(roots, &windows_process_inventory())
+            .into_iter()
+            .filter_map(open_live_process)
+            .filter(|process| process.created >= host_created);
+        additional.extend(newly_seen);
+        let live: Vec<_> = observed
+            .iter()
+            .chain(&additional)
+            .filter(|process| process_is_running(&process.handle))
+            .collect();
+        if live.is_empty() {
+            for process in observed.iter().chain(&additional) {
+                eprintln!(
+                    "owned descendant exited after crash: {}",
+                    process.evidence()
+                );
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            eprintln!("verified descendant cleanup in {:?}", started.elapsed());
+            return;
         }
-    })
-    .await
-    .expect("hard host termination must leave no live owned descendants");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "hard host termination left live owned descendants: {:#?}",
+            live.iter()
+                .map(|process| process.evidence())
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(windows)]
@@ -529,6 +666,7 @@ impl Drop for CrashHost {
 #[tokio::test]
 #[ignore = "requires the packaged Windows av1an, VapourSynth/L-SMASH and SVT-AV1 tools"]
 async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() {
+    use std::os::windows::io::AsRawHandle;
     if std::env::var_os(CRASH_CHILD_ENV).is_some() {
         let root = PathBuf::from(std::env::var_os(CRASH_ROOT_ENV).unwrap());
         run_crash_child(&root).await;
@@ -563,6 +701,7 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
             .unwrap(),
     );
     let host_pid = host.0.id();
+    let (host_created, _) = windows_process_times(host.0.as_raw_handle());
     let ready_path = fixture.0.join("crash-ready.json");
     tokio::time::timeout(Duration::from_secs(240), async {
         loop {
@@ -589,7 +728,8 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
         crashed_attempt.starts_with(&workspace),
         "the owned attempt must remain inside its recovery workspace"
     );
-    let observed = observe_packaged_process_tree(host_pid, &resources, &workspace).await;
+    let observed =
+        observe_packaged_process_tree(host_pid, host_created, &resources, &workspace).await;
     assert!(
         observed.iter().any(
             |process| process.process.name.eq_ignore_ascii_case("av1an.exe")
@@ -599,19 +739,7 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
     );
     let process_evidence: Vec<_> = observed
         .iter()
-        .map(|process| {
-            format!(
-                "owned descendant before crash: pid={} parent={} name={} path={}",
-                process.process.pid,
-                process.process.parent_pid,
-                process.process.name,
-                process
-                    .process
-                    .executable_path
-                    .as_deref()
-                    .unwrap_or("<unknown>")
-            )
-        })
+        .map(ObservedWindowsProcess::evidence)
         .collect();
 
     host.0.kill().expect("TerminateProcess must kill the host");
@@ -620,10 +748,14 @@ async fn windows_hard_crash_cleanup_reopens_rejects_changed_tool_and_recovers() 
         !status.success(),
         "the host must not perform orderly shutdown"
     );
-    assert_process_tree_dead(host_pid, &observed).await;
+    let (_, host_exited) = windows_process_times(host.0.as_raw_handle());
+    eprintln!(
+        "hard-terminated host pid={host_pid} created={host_created} exited={host_exited} status={status}"
+    );
     for evidence in process_evidence {
-        eprintln!("{evidence}");
+        eprintln!("owned descendant before crash: {evidence}");
     }
+    assert_process_tree_dead(host_pid, host_created, &observed).await;
     assert!(!destination.exists(), "a partial output was published");
     assert!(crashed_attempt.is_file());
     assert_eq!(std::fs::metadata(&crashed_attempt).unwrap().len(), 0);
