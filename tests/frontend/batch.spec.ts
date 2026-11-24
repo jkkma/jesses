@@ -360,6 +360,27 @@ test('source batch checks known tracks anew and maps data and attachments only t
     { ...source.streams[2], index: 4, kind: 'attachment', codec: 'ttf' },
     { ...source.streams[2], index: 5, codec: 'unknown' },
     { ...source.streams[2], index: 6, kind: 'data', codec: null, codecTag: 'gpmd' },
+    {
+      ...source.streams[2],
+      index: 7,
+      kind: 'attachment',
+      codec: null,
+      attachmentMimeType: 'application/vnd.ms-opentype',
+    },
+    {
+      ...source.streams[2],
+      index: 8,
+      kind: 'attachment',
+      codec: 'unknown',
+      attachmentFilename: 'Captions.ttf',
+    },
+    {
+      ...source.streams[2],
+      index: 9,
+      kind: 'attachment',
+      codec: null,
+      attachmentFilename: 'notes.pdf',
+    },
   ];
   const media = {
     ...source,
@@ -406,13 +427,13 @@ test('source batch checks known tracks anew and maps data and attachments only t
       .map((c: any) => c.payload.request.inputs[0].streamIndices),
   );
   expect(previews).toEqual([
-    [0, 1, 2, 4],
+    [0, 1, 2, 4, 7, 8],
     [0, 1, 2, 3, 6],
   ]);
   const log = page.getByRole('log', { name: 'Recent activity' });
   await expect(log).toContainText('2 data tracks left out: MKV cannot store data streams.');
   await expect(log).toContainText(
-    '1 attachment track left out: MOV cannot store attachment streams.',
+    '3 attachment tracks left out: MOV cannot store attachment streams.',
   );
 });
 

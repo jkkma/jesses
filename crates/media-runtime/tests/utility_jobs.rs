@@ -302,6 +302,105 @@ fn make_ffv1(path_value: &Path, matrix: &str, range: &str, seconds: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires FFmpeg and FFprobe"]
+async fn concat_keeps_explicit_default_and_nondefault_dispositions_in_stream_order() {
+    let fixture = Fixture::new();
+    let av = fixture.0.join("av.mkv");
+    let subtitle = fixture.0.join("caption.srt");
+    let first = fixture.0.join("first.mkv");
+    let second = fixture.0.join("second.mkv");
+    let output = fixture.0.join("concat.mkv");
+    make_ffv1(&av, "bt709", "tv", "1");
+    fs::write(&subtitle, "1\n00:00:00,100 --> 00:00:00,700\nCaption\n").unwrap();
+    run(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            &path(&av),
+            "-i",
+            &path(&subtitle),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1:s:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-disposition:0",
+            "default",
+            "-disposition:1",
+            "0",
+            "-disposition:2",
+            "default+forced+hearing_impaired",
+            "-disposition:3",
+            "default+original+comment",
+            "-default_mode",
+            "passthrough",
+            &path(&first),
+        ],
+    );
+    fs::copy(&first, &second).unwrap();
+    let dispositions = |media: &Path| {
+        let report = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type:stream_disposition",
+                "-of",
+                "json",
+                &path(media),
+            ])
+            .output()
+            .unwrap();
+        assert!(report.status.success());
+        let document: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+        document["streams"].as_array().unwrap().clone()
+    };
+    let expected = dispositions(&first);
+    let selected_flags = expected
+        .iter()
+        .map(|stream| {
+            let mut flags = stream["disposition"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, flag)| flag.as_u64() == Some(1))
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            flags.sort_unstable();
+            flags
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_flags,
+        [
+            vec!["default"],
+            vec![],
+            vec!["default", "forced", "hearing_impaired"],
+            vec!["comment", "default", "original"],
+        ]
+    );
+    let (_owner, cancel) = tokio::sync::watch::channel(false);
+    let result = media_runtime::run_utility(
+        UtilityRequest::Concat(ConcatRequest {
+            input_paths: vec![path(&first), path(&second)],
+            output_path: path(&output),
+        }),
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, UtilityResult::Artifact(_)));
+    assert_eq!(dispositions(&output), expected);
+}
+
+#[tokio::test]
 #[ignore = "requires FFmpeg, FFprobe, MKVToolNix, grav1synth, seconv, Tesseract, and eng.traineddata"]
 async fn real_utility_routes_publish_validated_outputs_without_touching_sources() {
     let fixture = Fixture::new();

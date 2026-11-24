@@ -32,7 +32,7 @@
     previewFrame,
   } from '$lib/ipc/client';
   import type { FramePreviewResult } from '$lib/ipc/generated';
-  import { batchRunId, isStyledSubtitle, trackKind } from '$lib/source-workspace';
+  import { batchRunId, isFontAttachment, isStyledSubtitle, trackKind } from '$lib/source-workspace';
   import type {
     FileListMode,
     TrackSelection,
@@ -2109,6 +2109,7 @@
     const codec = stream.codec?.trim().toLowerCase();
     return (
       (!!codec && codec !== 'unknown') ||
+      isFontAttachment(stream) ||
       (stream.kind === 'data' &&
         ['tmcd', 'gpmd'].includes(stream.codecTag?.trim().toLowerCase() ?? ''))
     );

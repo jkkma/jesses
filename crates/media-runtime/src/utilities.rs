@@ -2503,36 +2503,43 @@ async fn run_concat(
         )
     })?;
     let temporary = Temporary::create(&output, &nonce("concat"))?;
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-v".into(),
+        "warning".into(),
+        "-nostdin".into(),
+        "-protocol_whitelist".into(),
+        "file,pipe".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        os(&manifest),
+        "-map".into(),
+        "0".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+        "-c".into(),
+        "copy".into(),
+        "-avoid_negative_ts".into(),
+        "make_zero".into(),
+        "-y".into(),
+        "-f".into(),
+        "matroska".into(),
+    ];
+    // The concat demuxer loses dispositions. Restore them in the output
+    // order used by -map 0, including streams with no enabled flags.
+    for (position, stream) in probes[0].streams.iter().enumerate() {
+        args.extend(video_container::disposition_args(position, stream));
+    }
+    video_container::mux_metadata(&mut args, &probes[0], "matroska");
+    args.push(os(&temporary.path));
     let tool_output = checked(
         ffmpeg.clone(),
-        vec![
-            "-hide_banner".into(),
-            "-v".into(),
-            "warning".into(),
-            "-nostdin".into(),
-            "-protocol_whitelist".into(),
-            "file,pipe".into(),
-            "-f".into(),
-            "concat".into(),
-            "-safe".into(),
-            "0".into(),
-            "-i".into(),
-            os(&manifest),
-            "-map".into(),
-            "0".into(),
-            "-map_metadata".into(),
-            "0".into(),
-            "-map_chapters".into(),
-            "0".into(),
-            "-c".into(),
-            "copy".into(),
-            "-avoid_negative_ts".into(),
-            "make_zero".into(),
-            "-y".into(),
-            "-f".into(),
-            "matroska".into(),
-            os(&temporary.path),
-        ],
+        args,
         cancel,
         MEDIA_LIMIT,
         Some(&output),

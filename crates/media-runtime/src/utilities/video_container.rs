@@ -97,6 +97,24 @@ pub(super) fn mux_metadata(args: &mut Vec<OsString>, document: &ProbeDocument, f
     }
 }
 
+pub(super) fn disposition_args(position: usize, stream: &ProbeStream) -> [OsString; 2] {
+    let flags = stream
+        .disposition
+        .iter()
+        .filter(|(_, value)| **value != 0)
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    [
+        format!("-disposition:{position}").into(),
+        if flags.is_empty() {
+            "0".into()
+        } else {
+            flags.into()
+        },
+    ]
+}
+
 /// grav1synth's writer copies codec parameters/global tags but omits stream
 /// metadata, dispositions, chapters and attachments. Take the changed AV1 track
 /// from its validated derivative and every other packet/tag from the original.
@@ -145,21 +163,7 @@ pub(super) async fn restore_grain_metadata(
             format!("-map_metadata:s:{position}").into(),
             format!("0:s:{}", stream.index).into(),
         ]);
-        let disposition = stream
-            .disposition
-            .iter()
-            .filter(|(_, value)| **value != 0)
-            .map(|(key, _)| key.as_str())
-            .collect::<Vec<_>>()
-            .join("+");
-        args.extend([
-            format!("-disposition:{position}").into(),
-            if disposition.is_empty() {
-                "0".into()
-            } else {
-                disposition.into()
-            },
-        ]);
+        args.extend(disposition_args(position, stream));
         position += 1;
     }
     args.extend([
