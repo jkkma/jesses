@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import {
+    chooseUtilityFile,
     getEncoderParameters,
     getParameterPresets,
     isDesktop,
@@ -48,9 +49,11 @@
   type PendingPreset = { name: string; parameters: EncoderParameter[] | null };
   let catalog = $state<EncoderParameterCatalog | null>(null),
     category = $state(''),
+    argFilter = $state(''),
     error = $state(''),
     help = $state<string | null>(null),
     pendingPreset = $state<PendingPreset | null>(null),
+    confirmDeletePreset = $state<EncoderParameterPreset | null>(null),
     categoryListEl = $state<HTMLDivElement>();
   // Named presets the user saved, kept in preferences per encoder and route.
   let saved = $state<EncoderParameterPreset[]>([]),
@@ -98,12 +101,18 @@
       savingPreset = false;
     }
   }
-  async function deletePreset() {
+  function requestDeletePreset() {
     const preset = chosenSaved;
+    if (!preset) return;
+    confirmDeletePreset = preset;
+  }
+  async function deletePreset() {
+    const preset = confirmDeletePreset;
+    confirmDeletePreset = null;
     if (!preset) return;
     try {
       saved = (await removeParameterPreset({ name: preset.name, encoder, backend })) ?? [];
-      savedChoice = '';
+      if (savedChoice === preset.name) savedChoice = '';
     } catch (cause) {
       error = errorMessage(cause);
     }
@@ -134,6 +143,61 @@
   ]);
   const activeCategory = $derived(groups.includes(category) ? category : (groups[0] ?? ''));
   const activeCategoryIndex = $derived(Math.max(0, groups.indexOf(activeCategory)));
+  const filterQuery = $derived(argFilter.trim().toLowerCase());
+  const visibleCatalogParams = $derived(
+    (catalog?.parameters ?? []).filter((p) => {
+      if (virtuals.some((managed) => managed.name === p.name)) return false;
+      if (filterQuery) {
+        const summary = (sourceRows[p.name]?.summary ?? p.description).toLowerCase();
+        return (
+          p.name.toLowerCase().includes(filterQuery) ||
+          p.argument.toLowerCase().includes(filterQuery) ||
+          summary.includes(filterQuery)
+        );
+      }
+      return (p.group || 'Arguments') === activeCategory;
+    }),
+  );
+  const visibleVirtuals = $derived(
+    virtuals.filter((p) => {
+      if (filterQuery) {
+        const summary = (sourceRows[p.name]?.summary ?? '').toLowerCase();
+        return p.name.toLowerCase().includes(filterQuery) || summary.includes(filterQuery);
+      }
+      return p.group === activeCategory;
+    }),
+  );
+  function groupModifiedCount(group: string) {
+    const catCount = (catalog?.parameters ?? []).filter(
+      (p) =>
+        (p.group || 'Arguments') === group &&
+        !virtuals.some((m) => m.name === p.name) &&
+        value.some((item) => item.name === p.name && item.value.trim() !== ''),
+    ).length;
+    const virtCount = virtuals.filter(
+      (p) => p.group === group && (raw[p.name] ?? '').trim() !== '',
+    ).length;
+    return catCount + virtCount;
+  }
+  const browsableVirtuals = new Set(['fgs-table', 'dolby-vision-rpu', 'hdr10plus-json']);
+  async function browseVirtualResource(name: string) {
+    if (!browsableVirtuals.has(name)) return;
+    const spec =
+      name === 'fgs-table'
+        ? { title: 'Pick a film grain table', extensions: ['tbl'] }
+        : name === 'dolby-vision-rpu'
+          ? { title: 'Pick a Dolby Vision RPU file', extensions: ['bin', 'rpu'] }
+          : { title: 'Pick an HDR10+ JSON file', extensions: ['json'] };
+    try {
+      const path = await chooseUtilityFile(spec.title, spec.extensions);
+      if (path) {
+        onraw?.({ ...raw, [name]: path });
+        if (name === 'fgs-table') onresource?.(name, path);
+      }
+    } catch (cause) {
+      error = errorMessage(cause);
+    }
+  }
   const presets = $derived(contentPresets(encoder));
   const helpRow = $derived(help ? sourceRows[help] : undefined);
   const examples = $derived(
@@ -204,9 +268,16 @@
               : -1;
     if (next < 0) return;
     event.preventDefault();
+    argFilter = '';
     category = groups[next];
     void tick().then(() => {
-      categoryListEl?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+      const target = categoryListEl?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next];
+      target?.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+        container: 'nearest',
+      } as ScrollIntoViewOptions);
+      target?.focus();
     });
   }
   function handleRowContextMenu(event: MouseEvent, name: string) {
@@ -254,7 +325,11 @@
         onclick={() => applyPreset(preset.name)}
       >
         {preset.name}
-      </button>{/each}<button type="button" {disabled} onclick={() => applyPreset('')}>
+      </button>{/each}<button
+      type="button"
+      disabled={disabled || !currentFilled().length}
+      onclick={() => applyPreset('')}
+    >
       Clear
     </button>
   </div>{/if}
@@ -287,36 +362,60 @@
     </button><button
       type="button"
       disabled={disabled || !chosenSaved}
-      onclick={() => void deletePreset()}
+      onclick={requestDeletePreset}
     >
       Delete
-    </button>
+    </button>{#if !presets.length && currentFilled().length}<button
+        type="button"
+        {disabled}
+        onclick={() => applyParameters('', null)}
+      >
+        Clear
+      </button>{/if}
+  </div>{:else if !presets.length && currentFilled().length}<div class="preset-row">
+    <button type="button" {disabled} onclick={() => applyParameters('', null)}>Clear</button>
   </div>{/if}
+<search class="filter-bar">
+  <input
+    type="search"
+    aria-label="Filter arguments"
+    placeholder="Filter arguments…"
+    bind:value={argFilter}
+  />
+  {#if filterQuery}<button type="button" onclick={() => (argFilter = '')}>Show all</button>{/if}
+</search>
 <div
   role="tablist"
   aria-label="Encoder argument categories"
   class="categories"
   bind:this={categoryListEl}
 >
-  {#each groups as group, index}<button
+  {#each groups as group, index}{@const count = groupModifiedCount(group)}<button
       type="button"
       id={`${uid}-cat-${index}`}
       role="tab"
-      aria-selected={activeCategory === group}
+      aria-selected={!filterQuery && activeCategory === group}
       tabindex={activeCategory === group ? 0 : -1}
-      class:active={activeCategory === group}
+      class:active={!filterQuery && activeCategory === group}
       onkeydown={(event) => handleCategoryKeys(event, index)}
-      onclick={() => (category = group)}
+      onclick={() => {
+        argFilter = '';
+        category = group;
+      }}
     >
-      {group}
+      {group}{count ? ` (${count})` : ''}
     </button>{/each}
 </div>
+<!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable arguments table needs keyboard access.) -->
 <div
   class="grid"
-  role="tabpanel"
-  aria-labelledby={groups.length ? `${uid}-cat-${activeCategoryIndex}` : undefined}
+  role={filterQuery ? 'region' : 'tabpanel'}
+  tabindex="0"
+  aria-label={filterQuery ? `Filtered arguments matching ${argFilter.trim()}` : undefined}
+  aria-labelledby={!filterQuery && groups.length ? `${uid}-cat-${activeCategoryIndex}` : undefined}
 >
   <table>
+    <caption class="visually-hidden">Encoder arguments</caption>
     <thead>
       <tr>
         <th scope="col">Argument</th>
@@ -325,7 +424,7 @@
       </tr>
     </thead>
     <tbody>
-      {#each (catalog?.parameters ?? []).filter((p) => (p.group || 'Arguments') === activeCategory && !virtuals.some((managed) => managed.name === p.name)) as spec}<tr
+      {#each visibleCatalogParams as spec}<tr
           oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
         >
           <td>
@@ -349,7 +448,7 @@
             />
           </td><td>{sourceRows[spec.name]?.summary ?? spec.description.split('\n\n')[0]}</td>
         </tr>{/each}
-      {#each virtuals.filter((p) => p.group === activeCategory) as spec}<tr
+      {#each visibleVirtuals as spec}<tr
           oncontextmenu={(event) => handleRowContextMenu(event, spec.name)}
         >
           <td>
@@ -365,23 +464,41 @@
               </button>
             </div>
           </td><td>
-            <input
-              aria-label={`${spec.name} value`}
-              {disabled}
-              value={raw[spec.name] ?? ''}
-              oninput={(event) => onraw?.({ ...raw, [spec.name]: event.currentTarget.value })}
-              onblur={(event) => {
-                if (spec.name === 'fgs-table') onresource?.(spec.name, event.currentTarget.value);
-              }}
-            />
-          </td><td>{sourceRows[spec.name]?.summary ?? ''}</td>
+            <div class="virtual-value">
+              <input
+                aria-label={`${spec.name} value`}
+                {disabled}
+                value={raw[spec.name] ?? ''}
+                oninput={(event) => onraw?.({ ...raw, [spec.name]: event.currentTarget.value })}
+                onblur={(event) => {
+                  if (spec.name === 'fgs-table') onresource?.(spec.name, event.currentTarget.value);
+                }}
+              />{#if isDesktop() && browsableVirtuals.has(spec.name)}<button
+                  type="button"
+                  class="arg-browse"
+                  aria-label={`Browse ${spec.name}`}
+                  title={`Browse ${spec.name}`}
+                  {disabled}
+                  onclick={() => void browseVirtualResource(spec.name)}
+                >
+                  …
+                </button>{/if}
+            </div>
+          </td><td>
+            {sourceRows[spec.name]?.summary ??
+              (spec.name === 'fgs-table' ? 'Path to an AV1 film grain table (.tbl) file.' : '')}
+          </td>
         </tr>{/each}
+      {#if filterQuery && !visibleCatalogParams.length && !visibleVirtuals.length}
+        <tr><td colspan="3" class="small-muted">No arguments match "{argFilter.trim()}".</td></tr>
+      {/if}
     </tbody>
   </table>
 </div>
 {#if help}{@const spec = catalog?.parameters.find((p) => p.name === help)}<SourceDialog
     title="Argument Details"
     open={true}
+    closedby="any"
     onclose={() => (help = null)}
     width={720}
   >
@@ -423,9 +540,8 @@
       : 'Clearing empties them all. Continue?'}
   </p>
   <div class="help-actions">
-    <button type="button" data-dialog-initial-focus onclick={() => (pendingPreset = null)}>
-      No
-    </button><button
+    <!-- svelte-ignore a11y_autofocus -->
+    <button type="button" autofocus onclick={() => (pendingPreset = null)}> No </button><button
       type="button"
       onclick={() => {
         const choice = pendingPreset;
@@ -438,33 +554,52 @@
   </div>
 </SourceDialog>
 <SourceDialog title="Save preset" open={saveOpen} onclose={() => (saveOpen = false)} width={440}>
-  <label class="save-name">
-    Preset name<input
-      data-dialog-initial-focus
-      maxlength="64"
-      bind:value={saveName}
-      onkeydown={(event) => {
-        if (event.key === 'Enter' && !event.isComposing) void savePreset();
-      }}
-    />
-  </label>
-  <p>
-    Saves the {value.length} argument{value.length === 1 ? '' : 's'} set in this grid for this encoder
-    and route. HDR and grain file fields are not saved.
-  </p>
-  {#if savedHere.some((preset) => preset.name === saveName.trim())}<p>
-      This replaces the saved preset with the same name.
-    </p>{/if}
-  {#if saveError}<p role="alert">{saveError}</p>{/if}
-  <div class="help-actions">
-    <button type="button" onclick={() => (saveOpen = false)}>Cancel</button><button
-      type="button"
-      disabled={!saveName.trim() || savingPreset}
-      onclick={() => void savePreset()}
-    >
-      Save
-    </button>
-  </div>
+  <form
+    onsubmit={(event) => {
+      event.preventDefault();
+      if (saveName.trim() && !savingPreset) void savePreset();
+    }}
+  >
+    <label class="save-name">
+      <!-- svelte-ignore a11y_autofocus -->
+      Preset name<input autofocus maxlength="64" bind:value={saveName} />
+    </label>
+    <p>
+      Saves the {value.length} argument{value.length === 1 ? '' : 's'} set in this grid for this encoder
+      and route. HDR and grain file fields are not saved.
+    </p>
+    {#if savedHere.some((preset) => preset.name === saveName.trim())}<p>
+        This replaces the saved preset with the same name.
+      </p>{/if}
+    {#if saveError}<p role="alert">{saveError}</p>{/if}
+    <div class="help-actions">
+      <button type="button" onclick={() => (saveOpen = false)}>Cancel</button><button
+        type="submit"
+        disabled={!saveName.trim() || savingPreset}
+      >
+        Save
+      </button>
+    </div>
+  </form>
+</SourceDialog>
+<SourceDialog
+  title="Delete saved preset?"
+  open={confirmDeletePreset !== null}
+  onclose={() => (confirmDeletePreset = null)}
+  width={440}
+>
+  {#if confirmDeletePreset}
+    <p>Delete the saved preset "{confirmDeletePreset.name}"? This cannot be undone.</p>
+    <div class="help-actions">
+      <!-- svelte-ignore a11y_autofocus -->
+      <button type="button" autofocus onclick={() => (confirmDeletePreset = null)}>
+        Keep preset
+      </button>
+      <button type="button" class="danger" onclick={() => void deletePreset()}>
+        Delete preset
+      </button>
+    </div>
+  {/if}
 </SourceDialog>
 
 <style>
@@ -474,7 +609,7 @@
     align-items: center;
     flex-wrap: wrap;
     margin: 6px 0;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   .preset-row select {
     color: inherit;
@@ -486,6 +621,36 @@
   .save-name {
     display: grid;
     gap: 4px;
+  }
+  .filter-bar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin: 6px 0;
+  }
+  .filter-bar input {
+    width: min(260px, 100%);
+  }
+  .virtual-value {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .virtual-value input {
+    flex: 1;
+    min-width: 0;
+  }
+  .arg-browse {
+    flex: 0 0 auto;
+    padding: 4px 7px;
+  }
+  button.danger {
+    border-color: var(--destructive);
+    color: var(--destructive);
+  }
+  button.danger:hover:not(:disabled) {
+    background: var(--destructive);
+    color: var(--primary-foreground);
   }
   .categories {
     display: flex;
@@ -530,12 +695,17 @@
   }
   .grid {
     overflow: auto;
-    max-height: 50vh;
+    scrollbar-gutter: stable;
+    max-height: 50dvh;
   }
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
+  }
+  tbody tr {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 1.75rem;
   }
   th,
   td {
@@ -557,10 +727,10 @@
   }
   .arg-help {
     flex: 0 0 auto;
-    min-width: 22px;
-    min-height: 22px;
+    min-inline-size: 24px;
+    min-block-size: 24px;
     padding: 0 5px;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     line-height: 1;
     color: var(--muted-foreground);
     background: var(--secondary);
@@ -578,11 +748,11 @@
     border: 1px solid var(--border);
   }
   .help-content {
-    max-height: 70vh;
+    max-height: 70dvh;
     overflow: auto;
   }
   .help-content strong {
-    font-size: 1.38rem;
+    font-size: 1.1213rem;
   }
   .details {
     white-space: pre-wrap;

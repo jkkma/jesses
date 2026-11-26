@@ -5,12 +5,44 @@ export interface PopoverPlacement {
   constrainToMain?: boolean;
 }
 
+let toggletipFallbackInstalled = false;
+
+function ensureToggletipFallback() {
+  if (toggletipFallbackInstalled || typeof document === 'undefined') return;
+  toggletipFallbackInstalled = true;
+  const probe = document.createElement('div');
+  probe.setAttribute('popover', 'hint');
+  if (probe.popover !== 'hint') {
+    document.addEventListener(
+      'beforetoggle',
+      (event) => {
+        const target = event.target as HTMLElement | null;
+        if (!target || target.getAttribute('popover') !== 'hint') return;
+        const toggle = event as ToggleEvent;
+        if (
+          toggle.newState === 'open' &&
+          target.id &&
+          document.querySelector(`[popovertarget="${CSS.escape(target.id)}"]`)
+        ) {
+          target.popover = 'auto';
+        }
+      },
+      true,
+    );
+  }
+}
+
 /**
- * Positions a native top-layer popover beside its trigger button and clamps it
- * inside the viewport (or `<main>` when requested), without clipping.
+ * Keeps native top-layer popovers bounded within `<main>` when CSS Anchor Positioning
+ * handles placement, and falls back to explicit coordinates where unsupported.
  */
 export function placePopover(node: HTMLElement, options: PopoverPlacement) {
   let current = options;
+  ensureToggletipFallback();
+  const supportsAnchor =
+    typeof CSS !== 'undefined' &&
+    typeof CSS.supports === 'function' &&
+    CSS.supports('position-area', 'block-end');
 
   function position() {
     const trigger = current.trigger();
@@ -27,11 +59,17 @@ export function placePopover(node: HTMLElement, options: PopoverPlacement) {
     if (current.placement === 'above') {
       const available = Math.max(80, rect.top - topEdge - gap);
       node.style.maxHeight = `${Math.floor(available)}px`;
+    } else {
+      const availableBelow = Math.max(80, bottomEdge - rect.bottom - gap);
+      node.style.maxHeight = `${Math.floor(availableBelow)}px`;
+    }
+
+    if (supportsAnchor) return;
+
+    if (current.placement === 'above') {
       node.style.top = 'auto';
       node.style.bottom = `${Math.max(4, Math.round(window.innerHeight - rect.top + gap))}px`;
     } else {
-      const available = Math.max(80, bottomEdge - rect.bottom - gap);
-      node.style.maxHeight = `${Math.floor(available)}px`;
       node.style.bottom = 'auto';
       node.style.top = `${Math.max(4, Math.round(rect.bottom + gap))}px`;
     }

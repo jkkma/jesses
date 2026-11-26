@@ -21,8 +21,11 @@
     <p>{savedProgressSummary(job)}</p>
     <p>Discarding the checkpoint permanently removes this saved work.</p>
     <div class="actions">
-      <button type="button" data-dialog-initial-focus onclick={onclose}>Keep saved progress</button>
-      <button type="button" onclick={() => onconfirm(job!)}>Discard saved progress</button>
+      <!-- svelte-ignore a11y_autofocus -->
+      <button type="button" autofocus onclick={onclose}>Keep saved progress</button>
+      <button type="button" class="danger" onclick={() => onconfirm(job!)}>
+        Discard saved progress
+      </button>
     </div>
   {/if}
 </SourceDialog>
@@ -32,10 +35,30 @@
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
-    gap: 0.5rem;
-    margin-top: 1rem;
+    gap: 0.4063rem;
+    margin-top: 0.8125rem;
+  }
+  button {
+    padding: 0.325rem 0.7313rem;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
+  button.danger {
+    border-color: var(--destructive);
+    color: var(--destructive);
+    background: var(--background);
+  }
+  button.danger:hover:not(:disabled) {
+    background: var(--destructive);
+    color: var(--primary-foreground);
   }
   p + p {
-    margin-top: 0.5rem;
+    margin-top: 0.4063rem;
   }
 </style>

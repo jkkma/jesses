@@ -23,12 +23,13 @@
     jobs,
     onqueue,
     open = $bindable(false),
+    selected = $bindable(''),
   }: {
     jobs: JobSnapshot[];
     onqueue: (request: EncodeRequest) => Promise<void>;
     open?: boolean;
+    selected?: string;
   } = $props();
-  let selected = $state('');
   let svtBuild = $state<VideoEncoder | ''>('');
   let inspection = $state<SavedJobInspection | null>(null);
   let pending = $state(false);
@@ -40,6 +41,33 @@
     jobs.find((job) => job.id === discardTargetId && canResumeJob(job)),
   );
   let log = $state<{ name: string; result: Promise<{ text: string; notice?: string }> }>();
+  function isRemuxJob(job: JobSnapshot): boolean {
+    const settings = job.encodeSettings;
+    if (!settings) return true;
+    if ((settings.videoMode ?? 'encode') !== 'copy') return false;
+    if (
+      settings.audio.some(
+        (track) => track.codec !== 'copy' || !!track.gain || !!track.normalization,
+      )
+    )
+      return false;
+    if ((settings.subtitles ?? []).some((track) => track.mode !== 'copy' || !!track.burnIn))
+      return false;
+    if (
+      (settings.externalTracks ?? []).some(
+        (track) =>
+          !!track.audio ||
+          (track.subtitleMode !== undefined && track.subtitleMode !== 'copy') ||
+          !!track.subtitleBurnIn,
+      )
+    )
+      return false;
+    return true;
+  }
+  function jobModeLabel(job: JobSnapshot): string {
+    if (job.encodeSettings?.backend === 'av1an') return 'AV1AN';
+    return isRemuxJob(job) ? 'Remux' : 'Quick Convert';
+  }
   function viewLog(job: JobSnapshot) {
     const summary = job.logs.join('\n');
     log = {
@@ -141,7 +169,9 @@
       <label>
         Job from history<select bind:value={selected} disabled={pending}>
           <option value="">Choose a job</option>{#each jobs as job}<option value={job.id}>
-              {fileName(job.request.outputPath)} · {job.state}
+              {fileName(job.request.outputPath)} · {job.state} · {jobModeLabel(job)} · {fileName(
+                job.request.inputPath,
+              )}
             </option>{/each}
         </select>
       </label>
@@ -226,6 +256,7 @@
 <SourceDialog
   title={log ? `Job log for ${log.name}` : 'Job log'}
   open={!!log}
+  closedby="any"
   onclose={() => (log = undefined)}
   width={820}
 >
@@ -238,7 +269,9 @@
       {/if}
       {#if result.text}
         <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable job log needs keyboard access.) -->
-        <pre class="job-log" tabindex="0" aria-label="Job log contents">{result.text}</pre>
+        <pre class="job-log" role="region" tabindex="0" aria-label="Job log contents"><code
+            >{result.text}</code
+          ></pre>
       {:else if !result.notice}<p>No log entries were saved for this job.</p>{/if}
     {/await}
   {/if}
@@ -257,7 +290,7 @@
   .job-details {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr);
-    gap: 0.25rem 0.75rem;
+    gap: 0.2031rem 0.6094rem;
   }
   .job-details dt {
     font-weight: 600;
@@ -266,7 +299,7 @@
     overflow-wrap: anywhere;
   }
   .job-log {
-    max-height: 55vh;
+    max-height: 55dvh;
     overflow: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -280,7 +313,7 @@
   summary {
     cursor: pointer;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     padding: 8px 12px;
@@ -309,10 +342,10 @@
   }
   label {
     display: flex;
-    flex: 1 1 20rem;
+    flex: 1 1 16.25rem;
     min-width: 0;
     flex-direction: column;
-    gap: 0.35rem;
+    gap: 0.2844rem;
   }
   .actions {
     display: flex;
@@ -322,7 +355,7 @@
   select,
   button {
     font: inherit;
-    padding: 0.4rem 0.7rem;
+    padding: 0.325rem 0.5688rem;
     border: 1px solid var(--border);
     background: var(--background);
     color: var(--foreground);

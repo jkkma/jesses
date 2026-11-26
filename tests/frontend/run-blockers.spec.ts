@@ -328,3 +328,131 @@ test('a cover the container cannot store is reported as left out', async ({ page
     page.getByText('Cover image left out: MOV cannot store cover art.', { exact: false }),
   ).not.toHaveCount(0);
 });
+
+test('invalid audio bitrate explains the blocker and jumps to Audio settings', async ({ page }) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
+  const bitrate = quick.getByLabel('Bitrate (Kbps)', { exact: true });
+  await bitrate.fill('0');
+  await quick.getByRole('tab', { name: 'Video', exact: true }).click();
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(run).toBeDisabled();
+  const reason = page.locator('#run-blocked-reason');
+  await expect(reason).toContainText('Enter an audio bitrate between 8 and 8192 kbps in Audio.');
+  await reason.click();
+  await expect(bitrate).toBeVisible();
+  await bitrate.fill('160');
+  await expect(run).toBeEnabled();
+});
+
+test('audio bitrate scaling below 8 kbps blocks both audio-only and external mux tracks', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const audioOnly = {
+    ...source,
+    id: 'audio-only',
+    path: '/media/voice.mka',
+    name: 'voice.mka',
+    streams: [{ ...source.streams.find((s) => s.kind === 'audio')!, channels: 1 }],
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), audioOnly);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('opus');
+  await quick.getByLabel('Bitrate (Kbps)', { exact: true }).fill('8');
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(run).toBeDisabled();
+  await expect(page.locator('#run-blocked-reason')).toContainText(
+    'Enter an audio bitrate between 8 and 8192 kbps in Audio.',
+  );
+
+  // Switch to a video-only primary plus external mono audio in mux mode.
+  const videoOnly = {
+    ...source,
+    id: 'video-only',
+    path: '/media/silent.mkv',
+    name: 'silent.mkv',
+    streams: source.streams.filter((s) => s.kind === 'video'),
+  };
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /voice\.mka/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.evaluate(
+    ({ videoOnly, audioOnly }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [videoOnly.path, audioOnly.path];
+      host.__mediaByPath = { [videoOnly.path]: videoOnly, [audioOnly.path]: audioOnly };
+    },
+    { videoOnly, audioOnly },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /silent\.mkv/ }).click();
+  await page.getByRole('option', { name: /voice\.mka/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const encodeRun = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(encodeRun).toBeDisabled();
+  await expect(page.locator('#run-blocked-reason')).toContainText(
+    'Enter an audio bitrate between 8 and 8192 kbps in Audio.',
+  );
+  await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
+  await quick.getByLabel('Bitrate (Kbps)', { exact: true }).fill('16');
+  await expect(encodeRun).toBeEnabled();
+});
+
+test('switching a mono 8 kbps track to Copy or FLAC enables Run and normalizes emitted bitrateKbps', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  const monoSource = {
+    ...source,
+    id: 'mono-video',
+    path: '/media/mono.mkv',
+    name: 'mono.mkv',
+    streams: [
+      ...source.streams.filter((s) => s.kind === 'video'),
+      { ...source.streams.find((s) => s.kind === 'audio')!, channels: 1 },
+    ],
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), monoSource);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Container', { exact: true }).selectOption('matroska');
+  await quick.getByRole('tab', { name: 'Audio', exact: true }).click();
+  await quick.getByLabel('Codec', { exact: true }).selectOption('opus');
+  await quick.getByLabel('Bitrate (Kbps)', { exact: true }).fill('8');
+  const run = page.getByRole('button', { name: 'Run: Encode', exact: true });
+  await expect(run).toBeDisabled();
+
+  for (const codec of ['copy', 'flac'] as const) {
+    await quick.getByLabel('Codec', { exact: true }).selectOption(codec);
+    await expect(run).toBeEnabled();
+    await page.evaluate(() => ((globalThis as any).__sourceCalls.length = 0));
+    await run.click();
+    await expect
+      .poll(async () =>
+        page.evaluate(
+          () =>
+            (globalThis as any).__sourceCalls.find((c: any) => c.command === 'mock_start_encode')
+              ?.payload.request.settings.audio,
+        ),
+      )
+      .toMatchObject([{ streamIndex: 1, codec, bitrateKbps: 128 }]);
+    // Reset job list back to idle so the next codec submission can start cleanly.
+    await page.evaluate(() => {
+      const host = globalThis as any;
+      host.__testJobs = [];
+      host.__emitJobs();
+    });
+  }
+});

@@ -468,8 +468,8 @@ struct Jobs {
 }
 
 #[tauri::command]
-async fn open_encode_window(app: tauri::AppHandle) -> Result<(), AppError> {
-    encode_window::open(app).await
+async fn open_encode_window(app: tauri::AppHandle, focus: Option<bool>) -> Result<(), AppError> {
+    encode_window::open(app, focus.unwrap_or(true)).await
 }
 
 #[tauri::command]

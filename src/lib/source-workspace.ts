@@ -101,6 +101,7 @@ export type WorkspaceAction = {
   progressDescription?: string;
   /** The batch's current job, or null while the batch prepares its next job. */
   progressJobId?: string | null;
+  batchRunId?: string;
   waitingBatch?: { id: string; count: number; cancel: () => void };
   batchNaming?: { codec: string; quality: string; preset: string; extension: string };
   pause?: () => Promise<void>;
@@ -112,6 +113,7 @@ export type WorkspaceAction = {
   blockedByMissingTools?: boolean;
   /** Open the setting responsible for the visible blocker, when available. */
   openBlockedSetting?: () => void;
+  supportsCommandReview?: boolean;
   label: string;
 };
 

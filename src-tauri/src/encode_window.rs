@@ -75,15 +75,18 @@ pub(crate) fn fit_to_work_area(window: &tauri::WebviewWindow) {
     }
 }
 
-pub async fn open(app: tauri::AppHandle) -> Result<(), media_core::AppError> {
+pub async fn open(app: tauri::AppHandle, focus: bool) -> Result<(), media_core::AppError> {
     // Serialize concurrent start/reopen requests so they share one native window.
     static OPEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = OPEN.lock().await;
     let result = (|| -> tauri::Result<()> {
         if let Some(window) = app.get_webview_window(LABEL) {
-            window.show()?;
-            window.unminimize()?;
-            return window.set_focus();
+            if focus {
+                window.show()?;
+                window.unminimize()?;
+                return window.set_focus();
+            }
+            return Ok(());
         }
         let mut builder = tauri::WebviewWindowBuilder::new(
             &app,
@@ -94,6 +97,7 @@ pub async fn open(app: tauri::AppHandle) -> Result<(), media_core::AppError> {
         .inner_size(900.0, 760.0)
         .min_inner_size(360.0, 360.0)
         .center()
+        .focused(focus)
         .theme(Some(tauri::Theme::Light));
         if let Some(directory) = app.state::<crate::paths::AppPaths>().webview_data_dir() {
             builder = builder.data_directory(directory);

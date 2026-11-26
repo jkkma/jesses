@@ -28,3 +28,17 @@ the user has authorized it, and preserve the corresponding source trees and work
 - Keep source files and edits, user media and data, unique outputs, compact
   verification receipts, and files required by active work.
 - Perform size checks and session cleanup silently by default.
+
+## Browser support
+
+- Releases currently target **Windows x64** via Tauri v2 (Evergreen WebView2 /
+  modern Chromium). Linux (WebKitGTK) and macOS (WKWebView) targets are
+  deferred.
+- **Target floor**: `ES2024`, Evergreen WebView2 (`chrome129`+ in Vite build
+  targets, with `safari17.4`+ retained for local non-Windows development).
+- **Modern web features**: Baseline Widely Available and Baseline Newly
+  Available features may be used natively. Treat Chromium-first progressive
+  features (`closedby`, `position-area`, `interpolate-size`, `popover="hint"`,
+  `<meta name="text-scale">`, `content-visibility`) as enhancements paired with
+  lightweight `@supports` CSS gates or concise native fallbacks (`<= 20` lines,
+  zero external polyfill dependencies).

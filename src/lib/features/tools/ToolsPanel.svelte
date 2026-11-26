@@ -3,7 +3,8 @@
   import { Check, CircleAlert, ExternalLink, Info, LoaderCircle, RefreshCw } from '@lucide/svelte';
   import { appVersion } from '../../app-version';
   import type { ToolInfo } from '$lib/ipc/generated';
-  import { getStorageLocations } from '$lib/ipc/client';
+  import { getStorageLocations, openDirectory } from '$lib/ipc/client';
+  import { copyTextWithFeedback } from '$lib/components/shared/clipboard';
   import { errorMessage } from '$lib/components/shared/format';
 
   let {
@@ -25,7 +26,43 @@
 
   const available = $derived(tools.filter((tool) => tool.available).length);
   let locations = $state<[string, string][]>([]);
-  let storageError = $state<string | null>(null);
+  let storageLoadError = $state<string | null>(null);
+  let storageActionError = $state<{ label: string; message: string } | null>(null);
+  let storageOpen = $state(false);
+  let copiedStorage = $state<string | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function isStorageDirectory(label: string, value: string) {
+    return label !== 'Storage mode' && (/[\\/]/.test(value) || /^[a-z]:/i.test(value));
+  }
+
+  async function openStoragePath(label: string, path: string) {
+    storageActionError = null;
+    try {
+      await openDirectory(path);
+    } catch (err) {
+      storageActionError = { label, message: errorMessage(err) };
+      storageOpen = true;
+    }
+  }
+
+  async function copyStoragePath(label: string, path: string) {
+    storageActionError = null;
+    const copied = await copyTextWithFeedback(path, {
+      success: `Copied ${label} path`,
+      fail: `Could not copy ${label} path.`,
+    });
+    if (!copied) {
+      storageActionError = { label, message: `Could not copy ${label} path.` };
+      storageOpen = true;
+      return;
+    }
+    copiedStorage = label;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      copiedStorage = null;
+    }, 2000);
+  }
 
   onMount(() => {
     let active = true;
@@ -35,11 +72,15 @@
           if (active) locations = result;
         })
         .catch((err) => {
-          if (active) storageError = errorMessage(err);
+          if (active) {
+            storageLoadError = errorMessage(err);
+            storageOpen = true;
+          }
         });
     }
     return () => {
       active = false;
+      clearTimeout(copyTimer);
     };
   });
 </script>
@@ -90,8 +131,15 @@
         <p>Checking the required media tools and additional capabilities.</p>
       </div>
     {:else if tools.length}
-      <div class="tools-table-scroll">
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable table needs keyboard access.) -->
+      <div
+        class="tools-table-scroll"
+        tabindex="0"
+        role="region"
+        aria-label="Tools diagnostics table"
+      >
         <table class="tools-table">
+          <caption class="visually-hidden">Installed media tools and diagnostics</caption>
           <thead>
             <tr>
               <th scope="col">Tool</th>
@@ -172,14 +220,14 @@
       </p>
     </div>
 
-    <details class="storage-disclosure" open={storageError !== null}>
+    <details class="storage-disclosure" bind:open={storageOpen}>
       <summary>
         <span>APPLICATION STORAGE</span>
         <span class="small-muted">Paths &amp; portability</span>
       </summary>
       <div class="storage-body">
-        {#if storageError}
-          <p class="storage-error" role="alert">{storageError}</p>
+        {#if storageLoadError}
+          <p class="storage-error" role="alert">{storageLoadError}</p>
         {:else if !locations.length}
           <p class="small-muted">Reading application locations…</p>
         {:else}
@@ -187,7 +235,32 @@
             {#each locations as [label, value] (label)}
               <div>
                 <dt>{label}</dt>
-                <dd class="mono">{value}</dd>
+                <dd class="storage-value">
+                  <span class="mono">{value}</span>
+                  {#if isStorageDirectory(label, value)}
+                    <span class="storage-actions">
+                      <button
+                        type="button"
+                        aria-label={`Open ${label} folder`}
+                        onclick={() => void openStoragePath(label, value)}
+                      >
+                        Open
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Copy ${label} path`}
+                        onclick={() => void copyStoragePath(label, value)}
+                      >
+                        {copiedStorage === label ? 'Copied' : 'Copy'}
+                      </button>
+                    </span>
+                  {/if}
+                  {#if storageActionError?.label === label}
+                    <span class="storage-error storage-row-error" role="alert">
+                      {storageActionError.message}
+                    </span>
+                  {/if}
+                </dd>
               </div>
             {/each}
           </dl>
@@ -223,6 +296,7 @@
     gap: 10px;
     max-width: 920px;
     padding: 0 8px 14px;
+    container-type: inline-size;
   }
   .section-bar {
     display: flex;
@@ -236,7 +310,7 @@
   h2 {
     margin: 0;
     color: var(--foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.12em;
   }
   .sub-section {
@@ -257,11 +331,11 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 0.35rem 0.7rem;
+    padding: 0.2844rem 0.5688rem;
     border: 1px solid var(--border);
     background: var(--secondary);
     color: var(--secondary-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   button:hover:not(:disabled) {
     background: var(--accent);
@@ -270,7 +344,7 @@
   .tool-guidance,
   .scorer-summary {
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     line-height: 1.5;
     max-width: 78ch;
   }
@@ -296,11 +370,11 @@
   }
   .tools-empty h3 {
     color: var(--foreground);
-    font-size: 1rem;
+    font-size: 0.8125rem;
   }
   .tools-empty p {
     max-width: 66ch;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   .tools-table-scroll {
     overflow-x: auto;
@@ -316,7 +390,7 @@
   }
   .tools-table th {
     padding: 8px 12px;
-    font-size: 0.77rem;
+    font-size: 0.6256rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--foreground);
@@ -341,14 +415,14 @@
   .tool-id {
     display: block;
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     margin-top: 2px;
   }
   .tool-status {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     color: var(--destructive);
     white-space: nowrap;
   }
@@ -358,7 +432,7 @@
   .tool-diagnostics summary {
     cursor: pointer;
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .tool-diagnostics summary:hover {
     color: var(--foreground);
@@ -374,14 +448,14 @@
   }
   .tool-diagnostics dt {
     color: var(--muted-foreground);
-    font-size: 0.77rem;
+    font-size: 0.6256rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
   }
   .tool-diagnostics dd {
     margin: 0;
     overflow-wrap: anywhere;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     line-height: 1.45;
   }
   .footnote {
@@ -392,7 +466,7 @@
     border-top: 1px solid var(--rule);
     background: var(--card);
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     line-height: 1.45;
   }
   .footnote > :global(svg) {
@@ -409,7 +483,7 @@
     gap: 12px;
     padding: 8px 12px;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.08em;
     cursor: pointer;
   }
@@ -430,25 +504,45 @@
   }
   .storage-locations div {
     display: grid;
-    grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
+    grid-template-columns: minmax(6.5rem, 1fr) minmax(0, 3fr);
     gap: 12px;
   }
   .storage-locations dt {
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     font-weight: 600;
   }
   .storage-locations dd {
     margin: 0;
     overflow-wrap: anywhere;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
+  }
+  .storage-value {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 10px;
+  }
+  .storage-actions {
+    display: inline-flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .storage-actions button {
+    padding: 0.1625rem 0.4063rem;
+    font-size: 0.6906rem;
   }
   .storage-error {
     color: var(--destructive);
     font-weight: 600;
   }
+  .storage-row-error {
+    flex-basis: 100%;
+    font-size: 0.6906rem;
+  }
   .footnote-plain {
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .about-row {
     display: flex;
@@ -466,14 +560,14 @@
   }
   .about-title strong {
     font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
-    font-size: 1.08rem;
+    font-size: 0.8775rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
   }
   .version-tag {
     border: 1px solid var(--border);
     padding: 1px 6px;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     color: var(--muted-foreground);
     background: var(--background);
   }
@@ -482,12 +576,12 @@
     align-items: center;
     gap: 5px;
     font-weight: 600;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
-  @media (max-width: 800px) {
+  @container (inline-size <= 760px) {
     .storage-locations div {
       grid-template-columns: 1fr;
-      gap: 0.2rem;
+      gap: 0.1625rem;
     }
   }
 </style>

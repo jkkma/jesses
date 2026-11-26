@@ -231,6 +231,12 @@ test('named presets save, apply and delete per encoder and route', async ({ page
   await av.getByRole('tab', { name: 'Advanced' }).click();
   await saved.selectOption('Anime');
   await group.getByRole('button', { name: 'Delete', exact: true }).click();
+  const confirmDelete = page.getByRole('dialog', { name: 'Delete saved preset?' });
+  await expect(confirmDelete.getByRole('button', { name: 'Keep preset' })).toBeFocused();
+  await confirmDelete.getByRole('button', { name: 'Keep preset' }).click();
+  await expect(saved.getByRole('option', { name: 'Anime' })).toHaveCount(1);
+  await group.getByRole('button', { name: 'Delete', exact: true }).click();
+  await confirmDelete.getByRole('button', { name: 'Delete preset' }).click();
   await expect(saved.getByRole('option', { name: 'Anime' })).toHaveCount(0);
   expect(await page.evaluate(() => (globalThis as any).__parameterPresets)).toEqual([]);
 });

@@ -69,15 +69,26 @@
   const checked = $derived(tracks.filter((row) => row.included));
   const audio = $derived(checked.filter((row) => stream(row)?.kind === 'audio'));
   const subtitles = $derived(checked.filter((row) => stream(row)?.kind === 'subtitle'));
-  const selectedRow = $derived(tracks.find((row) => key(row) === selected));
+  const selectedIndex = $derived(tracks.findIndex((row) => key(row) === selected));
+  const selectedRow = $derived(selectedIndex >= 0 ? tracks[selectedIndex] : undefined);
   const selectedStream = $derived(selectedRow ? stream(selectedRow) : undefined);
+  const tabStopKey = $derived(selectedRow ? key(selectedRow) : tracks[0] ? key(tracks[0]) : '');
+  const multiFile = $derived(new Set(tracks.map((row) => row.sourceId)).size > 1);
 
   function handleTrackKeys(event: KeyboardEvent) {
     if (!tracks.length) return;
-    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     if ((event.target as HTMLElement | null)?.tagName === 'INPUT') return;
+    const current = tracks.findIndex((row) => key(row) === (selectedRow ? selected : tabStopKey));
+    if (
+      event.key === ' ' &&
+      (event.target as HTMLElement | null)?.classList.contains('track-option')
+    ) {
+      event.preventDefault();
+      if (!blocked && current >= 0) toggle(tracks[current]);
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    const current = tracks.findIndex((row) => key(row) === selected);
     const next =
       event.key === 'Home'
         ? 0
@@ -88,7 +99,7 @@
             : Math.max(0, current <= 0 ? 0 : current - 1);
     selected = key(tracks[next]);
     void tick().then(() => {
-      rowsEl?.querySelectorAll<HTMLButtonElement>('[role="option"]')[next]?.focus();
+      rowsEl?.querySelectorAll<HTMLButtonElement>('.track-option')[next]?.focus();
     });
   }
 
@@ -208,6 +219,18 @@
       )[lower] ?? (value.length <= 5 ? value.toUpperCase() : value)
     );
   }
+  function sourceLabel(source: MediaFile): string {
+    const siblings = files.filter((other) => other.id !== source.id && other.name === source.name);
+    if (!siblings.length) return source.name;
+    const parts = (path: string) => path.split(/[\\/]+/).filter(Boolean);
+    const mine = parts(source.path);
+    for (let depth = 2; depth <= mine.length; depth++) {
+      const candidate = mine.slice(-depth).join('/');
+      if (siblings.every((other) => parts(other.path).slice(-depth).join('/') !== candidate))
+        return candidate;
+    }
+    return source.path || source.name;
+  }
   const display = (row: TrackSelection) => {
     const item = stream(row);
     const zeroBased =
@@ -244,7 +267,8 @@
       if (row.title) parts.push(`'${row.title.slice(0, 50)}'`);
     } else if (item?.kind === 'attachment' && item.attachmentFilename)
       parts.push(item.attachmentFilename.slice(0, 50));
-    return `[#${number}]: ${kind} ${parts.join(' - ')}`;
+    const source = multiFile ? files.find((file) => file.id === row.sourceId) : undefined;
+    return `[#${number}]: ${kind} ${parts.join(' - ')}${source ? ` · ${sourceLabel(source)}` : ''}`;
   };
   // Numbered like the list above, so "#02" names the same track in both.
   function defaultDisplay(row: TrackSelection, subtitle: boolean) {
@@ -254,7 +278,8 @@
       row.language.toUpperCase().slice(0, 6),
       row.title.slice(0, subtitle ? 18 : 22),
     ].filter(Boolean);
-    return `${parts.join(' - ')}${subtitle ? ` (${codecName(stream(row)?.codec).slice(0, 10)})` : ''}`;
+    const source = multiFile ? files.find((file) => file.id === row.sourceId) : undefined;
+    return `${parts.join(' - ')}${subtitle ? ` (${codecName(stream(row)?.codec).slice(0, 10)})` : ''}${source ? ` · ${sourceLabel(source)}` : ''}`;
   }
   function toggle(row: TrackSelection) {
     updateChecked(
@@ -312,7 +337,7 @@
   function sortBy(option: string) {
     const [field, direction] = option.split(':');
     const kinds = [...new Set(tracks.map((row) => stream(row)?.kind ?? ''))];
-    const next = [...tracks].sort((a, b) => {
+    const next = tracks.toSorted((a, b) => {
       const group = kinds.indexOf(stream(a)?.kind ?? '') - kinds.indexOf(stream(b)?.kind ?? '');
       if (group) return group;
       const get = (row: TrackSelection) =>
@@ -355,7 +380,7 @@
   <div class="track-body">
     <div
       class="rows"
-      role="listbox"
+      role="grid"
       aria-label="Tracks"
       aria-disabled={blocked}
       tabindex="-1"
@@ -363,36 +388,52 @@
       onkeydown={handleTrackKeys}
     >
       {#each tracks as row (key(row))}
-        <div class="track-row" class:selected={selected === key(row)}>
-          <input
-            type="checkbox"
-            aria-label={`Include ${display(row)}`}
-            checked={row.included}
-            disabled={blocked}
-            onchange={() => toggle(row)}
-          />
-          <button
-            type="button"
-            role="option"
-            class="track-option"
-            aria-selected={selected === key(row)}
-            onclick={() => (selected = key(row))}
-          >
-            {display(row)}
-          </button>
+        <div
+          class="track-row"
+          role="row"
+          aria-selected={selected === key(row)}
+          class:selected={selected === key(row)}
+        >
+          <span role="gridcell" class="track-check">
+            <input
+              type="checkbox"
+              tabindex="-1"
+              aria-label={`Include ${display(row)}`}
+              checked={row.included}
+              disabled={blocked}
+              onchange={() => toggle(row)}
+            />
+          </span>
+          <span role="gridcell" class="track-name">
+            <button
+              type="button"
+              class="track-option"
+              tabindex={tabStopKey === key(row) ? 0 : -1}
+              onclick={() => (selected = key(row))}
+            >
+              {display(row)}
+            </button>
+          </span>
         </div>
       {:else}<p class="empty">Load tracks from the File List.</p>{/each}
     </div>
     <SourceThumbnail file={mainFile} />
   </div>
   <div class="actions">
-    <button type="button" popovertarget={selectMenuId} disabled={blocked} bind:this={selectTrigger}>
+    <button
+      type="button"
+      popovertarget={selectMenuId}
+      style={`anchor-name: --anchor-${selectMenuId}`}
+      disabled={blocked || !tracks.length}
+      bind:this={selectTrigger}
+    >
       Select…
     </button>
     <div
       id={selectMenuId}
       popover="auto"
       class="menu"
+      style={`position-anchor: --anchor-${selectMenuId}`}
       bind:this={selectPopover}
       use:placePopover={{
         trigger: () => selectTrigger,
@@ -412,13 +453,20 @@
           {label}
         </button>{/each}
     </div>
-    <button type="button" popovertarget={sortMenuId} disabled={blocked} bind:this={sortTrigger}>
+    <button
+      type="button"
+      popovertarget={sortMenuId}
+      style={`anchor-name: --anchor-${sortMenuId}`}
+      disabled={blocked || !tracks.length}
+      bind:this={sortTrigger}
+    >
       Sort…
     </button>
     <div
       id={sortMenuId}
       popover="auto"
       class="menu"
+      style={`position-anchor: --anchor-${sortMenuId}`}
       bind:this={sortPopover}
       use:placePopover={{
         trigger: () => sortTrigger,
@@ -447,14 +495,14 @@
       </button>{/if}
     {#if selectedRow}<button
         type="button"
-        disabled={blocked}
+        disabled={blocked || selectedIndex <= 0}
         aria-label="Move track up"
         onclick={() => move(-1)}
       >
         ▲
       </button><button
         type="button"
-        disabled={blocked}
+        disabled={blocked || selectedIndex < 0 || selectedIndex >= tracks.length - 1}
         aria-label="Move track down"
         onclick={() => move(1)}
       >
@@ -502,7 +550,7 @@
   .track-list {
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
+    gap: 0.4875rem;
     flex: 1;
     min-width: 0;
     min-height: 0;
@@ -513,7 +561,7 @@
   .format-info {
     margin: 0;
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -524,19 +572,20 @@
     grid-template-columns: minmax(0, 1fr) minmax(200px, 384px);
     grid-template-rows: minmax(0, 1fr);
     gap: 10px;
-    min-height: 7rem;
+    min-height: 5.6875rem;
   }
   .rows {
     min-height: 0;
     border: 1px solid var(--border);
     background: var(--background);
     overflow: auto;
+    scrollbar-gutter: stable;
   }
   .track-row {
     display: flex;
-    gap: 0.55rem;
+    gap: 0.4469rem;
     align-items: center;
-    padding-left: 0.65rem;
+    padding-left: 0.5281rem;
     border-left: 4px solid transparent;
     border-bottom: 1px solid var(--rule);
   }
@@ -548,11 +597,20 @@
     background: var(--accent);
     color: var(--foreground);
   }
+  .track-check {
+    display: inline-flex;
+    align-items: center;
+  }
+  .track-name {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+  }
   .track-option {
     flex: 1;
     min-width: 0;
     text-align: left;
-    padding: 0.45rem 0.65rem 0.45rem 0.1rem;
+    padding: 0.3656rem 0.5281rem 0.3656rem 0.0813rem;
     border: 0;
     background: transparent;
     color: inherit;
@@ -563,8 +621,14 @@
   }
   .empty,
   p {
-    padding: 0.6rem;
+    padding: 0.4875rem;
     color: var(--muted-foreground);
+  }
+  .empty {
+    display: grid;
+    place-items: center;
+    height: 100%;
+    text-align: center;
   }
   p[role='alert'] {
     color: var(--destructive);
@@ -572,10 +636,10 @@
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: 0.325rem;
   }
   .actions > button {
-    padding: 0.38rem 0.75rem;
+    padding: 0.3088rem 0.6094rem;
     border: 0;
     background: var(--secondary);
     color: var(--secondary-foreground);
@@ -586,16 +650,31 @@
     color: var(--accent-foreground);
   }
   .menu {
-    position: fixed;
     margin: 0;
     box-sizing: border-box;
     overflow-y: auto;
     width: 250px;
-    padding: 0.3rem;
+    padding: 0.2438rem;
     background: var(--popover);
     color: var(--popover-foreground);
     border: 1px solid var(--border);
     box-shadow: 3px 3px 0 #454b3c38;
+  }
+  @supports not (position-area: block-end) {
+    .menu {
+      position: fixed;
+    }
+  }
+  @supports (position-area: block-end) {
+    .menu {
+      inset: auto;
+      margin: 0 0 4px 0;
+      position-area: block-start span-inline-start;
+      position-try-fallbacks:
+        flip-block,
+        flip-inline,
+        flip-block flip-inline;
+    }
   }
   .menu:not(:popover-open) {
     display: none;
@@ -604,7 +683,7 @@
     display: grid;
   }
   .menu button {
-    padding: 0.38rem 0.75rem;
+    padding: 0.3088rem 0.6094rem;
     border: 0;
     text-align: left;
     background: transparent;
@@ -617,7 +696,7 @@
   }
   pre {
     margin: 0;
-    padding: 0.5rem;
+    padding: 0.4063rem;
     max-height: 110px;
     overflow: auto;
     border: 1px solid var(--rule);
@@ -626,16 +705,16 @@
   .defaults {
     display: flex;
     flex-wrap: wrap;
-    gap: 1.5rem 2rem;
+    gap: 1.2188rem 1.625rem;
   }
   .default-field {
     display: flex;
     align-items: center;
-    gap: 0.7rem;
+    gap: 0.5688rem;
   }
   select {
     min-width: 210px;
-    padding: 0.4rem;
+    padding: 0.325rem;
     background: var(--background);
     color: var(--foreground);
     border: 1px solid var(--border);

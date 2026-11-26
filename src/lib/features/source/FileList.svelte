@@ -16,6 +16,9 @@
     statuses,
     recentPaths,
     importing,
+    importingName = '',
+    importNotice = null,
+    importErrors = [],
     desktop,
     onselect,
     onmode,
@@ -27,6 +30,7 @@
     onremove,
     onmove,
     onsort,
+    ondismissImportFeedback,
   }: {
     files: MediaFile[];
     selectedIds: string[];
@@ -37,6 +41,9 @@
     statuses: Record<string, { glyph: string; text: string; note?: string }>;
     recentPaths: string[];
     importing: boolean;
+    importingName?: string;
+    importNotice?: string | null;
+    importErrors?: { name: string; message: string }[];
     desktop: boolean;
     onselect: (ids: string[]) => void;
     onmode: (mode: FileListMode) => void;
@@ -48,7 +55,12 @@
     onremove: () => void;
     onmove: (offset: number) => void;
     onsort: (sort: string) => void;
+    ondismissImportFeedback?: () => void;
   } = $props();
+
+  const singleSelectedIndex = $derived(
+    selectedIds.length === 1 ? files.findIndex((file) => file.id === selectedIds[0]) : -1,
+  );
 
   const uid = $props.id();
   const helpId = `${uid}-batch-help`;
@@ -57,6 +69,7 @@
 
   let rowsEl = $state<HTMLDivElement>();
   let helpTrigger = $state<HTMLButtonElement>();
+  let helpOpen = $state(false);
   let recentTrigger = $state<HTMLButtonElement>();
   let sortTrigger = $state<HTMLButtonElement>();
   let recentPopover = $state<HTMLDivElement>();
@@ -156,15 +169,22 @@
         type="button"
         class="help-trigger"
         aria-label="Batch naming help"
+        aria-expanded={helpOpen}
         popovertarget={helpId}
+        popovertargetaction="show"
+        {...{ interestfor: helpId } as Record<string, string>}
+        style={`anchor-name: --anchor-${helpId}`}
         bind:this={helpTrigger}
       >
         ?
       </button>
       <div
         id={helpId}
-        popover="auto"
+        popover="hint"
+        role="tooltip"
         class="popover-surface help-popover"
+        style={`position-anchor: --anchor-${helpId}`}
+        ontoggle={(event) => (helpOpen = (event as ToggleEvent).newState === 'open')}
         use:placePopover={{ trigger: () => helpTrigger, placement: 'below', align: 'start' }}
       >
         <p>
@@ -195,6 +215,7 @@
           onclick={(event) => select(event, file)}
           onfocus={() => (focusedId = file.id)}
           ondblclick={() => {
+            if (mode === 'batch' || importing) return;
             onselect([file.id]);
             onload();
           }}
@@ -215,6 +236,26 @@
     </div>
     <SourceThumbnail file={primary} />
   </div>
+  {#if importing || importNotice || importErrors.length}
+    <div class="import-feedback">
+      {#if importing}
+        <p role="status">{importingName || 'Importing media…'}</p>
+      {/if}
+      {#if importNotice}
+        <p role="status">{importNotice}</p>
+      {/if}
+      {#if importErrors.length}
+        <p role="alert">
+          Could not import {importErrors.length === 1
+            ? `${importErrors[0].name}: ${importErrors[0].message}`
+            : `${importErrors.length} items (first: ${importErrors[0].name}: ${importErrors[0].message}). See log for details.`}
+        </p>
+      {/if}
+      {#if !importing && (importNotice || importErrors.length) && ondismissImportFeedback}
+        <button type="button" onclick={ondismissImportFeedback}>Dismiss</button>
+      {/if}
+    </div>
+  {/if}
   <div class="file-actions">
     <span class="file-count">
       {`${files.length} ${files.length === 1 ? 'file' : 'files'} loaded.${
@@ -226,11 +267,12 @@
     <button type="button" onclick={onadd} disabled={!desktop || importing}>
       Add Files…
     </button><button type="button" onclick={onfolder} disabled={!desktop || importing}>
-      Add Folder…
+      Add Image Sequence…
     </button><button
       type="button"
       popovertarget={recentId}
-      disabled={!recentPaths.length}
+      style={`anchor-name: --anchor-${recentId}`}
+      disabled={!recentPaths.length || !desktop || importing}
       bind:this={recentTrigger}
     >
       Recent…
@@ -239,6 +281,7 @@
       id={recentId}
       popover="auto"
       class="popover-surface menu recent"
+      style={`position-anchor: --anchor-${recentId}`}
       bind:this={recentPopover}
       use:placePopover={{
         trigger: () => recentTrigger,
@@ -269,11 +312,20 @@
       disabled={!selectedIds.length || importing || mode === 'batch'}
     >
       Load Tracks
-    </button><button type="button" popovertarget={sortId} bind:this={sortTrigger}>Sort…</button>
+    </button><button
+      type="button"
+      popovertarget={sortId}
+      style={`anchor-name: --anchor-${sortId}`}
+      disabled={files.length < 2}
+      bind:this={sortTrigger}
+    >
+      Sort…
+    </button>
     <div
       id={sortId}
       popover="auto"
       class="popover-surface menu"
+      style={`position-anchor: --anchor-${sortId}`}
       bind:this={sortPopover}
       use:placePopover={{
         trigger: () => sortTrigger,
@@ -296,14 +348,14 @@
       type="button"
       aria-label="Move file up"
       onclick={() => onmove(-1)}
-      disabled={selectedIds.length !== 1}
+      disabled={singleSelectedIndex <= 0}
     >
       ▲
     </button><button
       type="button"
       aria-label="Move file down"
       onclick={() => onmove(1)}
-      disabled={selectedIds.length !== 1}
+      disabled={singleSelectedIndex < 0 || singleSelectedIndex >= files.length - 1}
     >
       ▼
     </button><button type="button" onclick={onremove} disabled={!selectedIds.length || importing}>
@@ -343,27 +395,53 @@
     height: 100%;
     display: grid;
     grid-template-rows: auto minmax(100px, 1fr) auto;
-    gap: 0.6rem;
+    gap: 0.4875rem;
+    container-type: inline-size;
   }
   .mode-line,
   label {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 0.4875rem;
   }
   .mode-line {
     flex-wrap: wrap;
+  }
+  .mode-line > label {
+    min-width: 0;
+    max-width: 100%;
+    flex: 0 1 auto;
   }
   select,
   input {
     background: var(--background);
     color: var(--foreground);
     border: 1px solid var(--border);
-    padding: 0.45rem;
+    padding: 0.3656rem;
   }
   select {
-    min-width: min(420px, 100%);
+    width: min(420px, 100%);
+    min-width: 0;
     max-width: 100%;
+  }
+  .import-feedback {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    background: var(--background);
+    font-size: 0.6906rem;
+  }
+  .import-feedback p {
+    flex: 1 1 200px;
+    min-width: 0;
+    color: var(--muted-foreground);
+  }
+  .import-feedback p[role='alert'] {
+    color: var(--destructive);
+    font-weight: 600;
   }
   .files-body {
     min-height: 100px;
@@ -375,19 +453,20 @@
   .rows {
     position: relative;
     overflow: auto;
+    scrollbar-gutter: stable;
     border: 1px solid var(--border);
     background: var(--background);
   }
   .rows > button {
     display: flex;
     align-items: baseline;
-    gap: 0.5rem;
+    gap: 0.4063rem;
     text-align: left;
     width: 100%;
     border: 0;
     border-left: 4px solid transparent;
     border-bottom: 1px solid var(--rule);
-    padding: 0.5rem 0.7rem;
+    padding: 0.4063rem 0.5688rem;
     color: var(--foreground);
     background: transparent;
   }
@@ -412,16 +491,16 @@
     flex-wrap: wrap;
     align-items: center;
     justify-content: flex-end;
-    gap: 0.35rem;
+    gap: 0.2844rem;
   }
   .file-count {
     flex: 1 1 100px;
     min-width: 100px;
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   button {
-    padding: 0.4rem 0.68rem;
+    padding: 0.325rem 0.5525rem;
     border: 0;
     background: var(--secondary);
     color: var(--secondary-foreground);
@@ -437,25 +516,49 @@
   }
   .help-trigger {
     min-width: 28px;
-    padding: 0.4rem 0.55rem;
+    padding: 0.325rem 0.4469rem;
     font-weight: 600;
   }
   .popover-surface {
-    position: fixed;
     margin: 0;
-    padding: 0.3rem;
+    padding: 0.2438rem;
     overflow-y: auto;
     border: 1px solid var(--border);
     background: var(--popover);
     color: var(--popover-foreground);
     box-shadow: 3px 3px 0 #454b3c38;
   }
+  @supports not (position-area: block-end) {
+    .popover-surface {
+      position: fixed;
+    }
+  }
+  @supports (position-area: block-end) {
+    .help-popover {
+      inset: auto;
+      margin: 4px 0 0 0;
+      position-area: block-end span-inline-end;
+      position-try-fallbacks:
+        flip-block,
+        flip-inline,
+        flip-block flip-inline;
+    }
+    .menu {
+      inset: auto;
+      margin: 0 0 4px 0;
+      position-area: block-start span-inline-start;
+      position-try-fallbacks:
+        flip-block,
+        flip-inline,
+        flip-block flip-inline;
+    }
+  }
   .popover-surface:not(:popover-open) {
     display: none;
   }
   .help-popover {
-    width: min(280px, calc(100vw - 24px));
-    padding: 0.5rem 0.7rem;
+    width: min(280px, calc(100dvw - 24px));
+    padding: 0.4063rem 0.5688rem;
     line-height: 1.5;
   }
   .menu {
@@ -477,7 +580,7 @@
     color: var(--accent-foreground);
   }
   .menu.recent {
-    width: min(420px, 70vw);
+    width: min(420px, 70dvw);
   }
   .menu.recent button {
     display: grid;
@@ -490,19 +593,19 @@
   }
   .recent-folder {
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .recent-empty {
-    padding: 0.4rem 0.7rem;
+    padding: 0.325rem 0.5688rem;
     color: var(--muted-foreground);
   }
-  @media (max-width: 820px) {
+  @container (inline-size <= 790px) {
     .file-actions {
-      gap: 0.25rem;
+      gap: 0.2031rem;
     }
     .file-actions > button {
-      padding: 0.36rem 0.5rem;
-      font-size: 0.92rem;
+      padding: 0.2925rem 0.4063rem;
+      font-size: 0.7475rem;
     }
   }
 </style>

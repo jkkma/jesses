@@ -54,7 +54,7 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 6px;
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
     max-width: 100%;
   }
@@ -65,11 +65,11 @@
     padding: 0 8px;
     border: 1px solid var(--border);
     background: var(--background);
-    font-size: 11px;
+    font-size: 0.6875rem;
   }
   p {
     margin: 0;
-    font-size: 11px;
+    font-size: 0.6875rem;
     color: var(--muted-foreground);
     overflow-wrap: anywhere;
   }

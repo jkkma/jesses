@@ -227,8 +227,8 @@ test('AV1AN batch explains why cover art alone cannot be encoded', async ({ page
 test('canceling the source image-sequence folder picker leaves import ready', async ({ page }) => {
   await installSourceEncodeFixture(page);
   await page.evaluate(() => ((globalThis as any).__pickerPaths = []));
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
-  await expect(page.getByRole('button', { name: 'Add Folder…' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
+  await expect(page.getByRole('button', { name: 'Add Image Sequence…' })).toBeEnabled();
   expect(
     await page.evaluate(() =>
       (globalThis as any).__sourceCalls.some(

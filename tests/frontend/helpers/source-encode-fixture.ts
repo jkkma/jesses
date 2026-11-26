@@ -90,6 +90,7 @@ export async function installSourceEncodeFixture(page: Page) {
       invoke: async (command: string, payload: any = {}) => {
         calls.push({ command, payload });
         if (command === 'open_encode_window') {
+          if (state.__holdEncodeWindow) await state.__holdEncodeWindow;
           if (state.__encodeWindowFailure) throw new Error(state.__encodeWindowFailure);
           return;
         }
@@ -634,13 +635,26 @@ export async function installSourceEncodeFixture(page: Page) {
           };
         }
         if (command === 'preview_encode_plan') {
+          const outPath = payload.request?.source?.outputPath;
+          const inPath = payload.request?.source?.inputPath;
           return {
             request: payload.request,
             sourceFingerprint: 'test',
             outputFrameCount: '288',
             outputFrameRate: '24/1',
             outputFrameCountEstimated: state.__commandPlanEstimated ?? true,
-            stages: [],
+            stages:
+              inPath && outPath
+                ? [
+                    {
+                      label: 'Encode',
+                      executable: 'ffmpeg',
+                      arguments: ['-i', inPath, outPath],
+                      workingDirectory: null,
+                      notes: [],
+                    },
+                  ]
+                : [],
             notes: [],
           };
         }

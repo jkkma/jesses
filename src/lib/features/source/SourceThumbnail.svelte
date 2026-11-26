@@ -85,10 +85,10 @@
     width: min(100%, 384px);
     max-height: 100%;
     min-height: 0;
-    overflow: hidden;
+    overflow: clip;
     display: grid;
     grid-template-rows: minmax(0, max-content) auto;
-    gap: 0.3rem;
+    gap: 0.2438rem;
     align-self: start;
     align-content: start;
   }
@@ -98,7 +98,7 @@
     max-height: 100%;
     aspect-ratio: 16 / 9;
     padding: 0;
-    overflow: hidden;
+    overflow: clip;
     border: 1px solid var(--rule);
     border-radius: var(--radius);
     background: var(--background);

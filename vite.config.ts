@@ -12,5 +12,5 @@ export default defineConfig({
     strictPort: true,
     watch: { ignored: ['**/src-tauri/**', '**/crates/**', '**/target/**'] },
   },
-  build: { target: ['es2022', 'chrome111', 'safari16.4'] },
+  build: { target: ['es2024', 'chrome129', 'safari17.4'] },
 });

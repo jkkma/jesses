@@ -19,10 +19,12 @@
     type ProgressEstimate,
   } from '$lib/components/shared/progress-estimate';
   import { encodeSummary } from '$lib/components/shared/encoder-options';
-  import { highlightLogLine } from './log-highlight';
+  import { copyTextWithFeedback } from '$lib/components/shared/clipboard';
+  import { highlightLogLine, type HighlightedLogLine } from './log-highlight';
   import {
     subscribeJobs,
     cancelJob,
+    cancelQueuedJobs,
     discardJobProgress,
     stopJob,
     resumeJob,
@@ -44,6 +46,8 @@
     jobs.find((job) => job.id === discardTargetId && canResumeJob(job)),
   );
   let actionError = $state<{ id: string; message: string } | null>(null);
+  let logCopied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
   let logElement: HTMLPreElement | undefined = $state();
   let followLog = true;
   let logJobId: string | undefined;
@@ -91,7 +95,19 @@
         )
       : 'Waiting for a Quick Convert job…',
   );
-  const highlightedLog = $derived(logText.split('\n').map(highlightLogLine));
+  let highlightedCache = new Map<string, HighlightedLogLine>();
+  function highlightLogLines(text: string) {
+    const nextCache = new Map<string, HighlightedLogLine>();
+    const lines = text.split('\n').map((line) => {
+      let parsed = highlightedCache.get(line) ?? nextCache.get(line);
+      if (!parsed) parsed = highlightLogLine(line);
+      nextCache.set(line, parsed);
+      return parsed;
+    });
+    highlightedCache = nextCache;
+    return lines;
+  }
+  const highlightedLog = $derived(highlightLogLines(logText));
   $effect(() => {
     const id = current?.id;
     const text = logText;
@@ -126,9 +142,26 @@
     }
   }
 
+  async function copyLog() {
+    if (!logText) return;
+    const copied = await copyTextWithFeedback(logText, {
+      success: 'Job log copied.',
+      fail: 'Could not copy job log.',
+    });
+    if (!copied) {
+      if (current) actionError = { id: current.id, message: 'Could not copy job log.' };
+      return;
+    }
+    logCopied = true;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      logCopied = false;
+    }, 2000);
+  }
+
   async function act(
     job: JobSnapshot,
-    action: 'pause' | 'cancel' | 'stop' | 'resume' | 'discard' | 'folder',
+    action: 'pause' | 'cancel' | 'cancelQueued' | 'stop' | 'resume' | 'discard' | 'folder',
   ) {
     if (busy) return;
     busy = true;
@@ -138,6 +171,14 @@
         const directory = parentDirectory(job.request.outputPath);
         if (!directory) throw new Error('The output has no parent folder.');
         await openDirectory(directory);
+      } else if (action === 'cancelQueued') {
+        const canceled = await cancelQueuedJobs([job.id]);
+        const updated = canceled.find((entry) => entry.id === job.id);
+        if (!updated) {
+          actionError = { id: job.id, message: 'Job is no longer queued.' };
+          return;
+        }
+        jobs = jobs.map((entry) => (entry === job ? updated : entry));
       } else {
         const result = await (action === 'pause'
           ? setJobPaused(job.id, job.state !== 'paused')
@@ -162,6 +203,7 @@
     void connect();
     return () => {
       disposed = true;
+      clearTimeout(copyTimer);
       unsubscribe?.();
     };
   });
@@ -201,7 +243,7 @@
       >{index < highlightedLog.length - 1 ? '\n' : ''}{/each}</pre>
   <section class="progress-area" aria-label="Encoding status">
     {#if connectionError}
-      <p role="alert">Could not connect to job progress: {connectionError}</p>
+      <p class="error" role="alert">Could not connect to job progress: {connectionError}</p>
       <button type="button" onclick={connect} disabled={connecting}>Reconnect</button>
     {:else if !connected}<p role="status">Connecting to the encode…</p>
     {:else if !current}<p role="status">No Quick Convert jobs yet.</p>{/if}
@@ -211,7 +253,9 @@
         {#if current.state === 'succeeded'}
           <span>Output verified and saved.</span>
           {#if current.outputSizeBytes}<span>{formatBytes(current.outputSizeBytes)}</span>{/if}
-        {:else if !finished}<span aria-label="Encoder statistics">{progress.text}</span>
+        {:else if !finished}<output aria-label="Encoder statistics" aria-live="off">
+            {progress.text}
+          </output>
         {:else if current.state === 'stopped' && !hasSavedProgress(current)}
           <span>Start a new job to encode this source.</span>
         {/if}
@@ -231,6 +275,9 @@
   </section>
   <footer>
     <div class="controls">
+      <button type="button" onclick={() => void copyLog()} disabled={!logText}>
+        {logCopied ? 'Copied' : 'Copy log'}
+      </button>
       {#if current}
         <button
           type="button"
@@ -273,7 +320,7 @@
           </button>
         {:else if current.state === 'queued'}<button
             type="button"
-            onclick={() => act(current!, 'cancel')}
+            onclick={() => act(current!, 'cancelQueued')}
             disabled={busy}
           >
             Cancel job
@@ -306,8 +353,9 @@
     height: 100dvh;
     min-height: 360px;
     padding: 10px;
+    container-type: inline-size;
     font:
-      12px/1.45 'Segoe UI',
+      0.7475rem/1.45 'Segoe UI',
       sans-serif;
   }
   header {
@@ -319,7 +367,7 @@
   h1 {
     flex-shrink: 0;
     margin: 0;
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 600;
   }
   .filename {
@@ -340,13 +388,14 @@
     margin: 0;
     padding: 12px;
     overflow: auto;
+    scrollbar-gutter: stable;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     border: 1px solid var(--border);
     background: var(--card);
     color: var(--foreground);
     font:
-      12px/1.5 Consolas,
+      0.7475rem/1.5 Consolas,
       'Cascadia Mono',
       monospace;
     tab-size: 4;
@@ -405,36 +454,57 @@
     font-weight: 600;
   }
   .status-line span,
+  .status-line output,
   .error {
     overflow-wrap: anywhere;
     min-width: 0;
   }
   progress {
     appearance: none;
+    container-type: inline-size;
     width: 100%;
     height: 16px;
     border: 1px solid var(--border);
     border-radius: 0;
+    overflow: clip;
     background: var(--muted);
     accent-color: var(--primary);
+    --progress-bar-indeterminate-size: 35%;
+    --progress-bar-indeterminate-animation-duration: 1.5s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    progress {
+      --progress-bar-indeterminate-animation-duration: 10s;
+    }
+  }
+  progress:indeterminate {
+    --progress-bar-animation: working var(--progress-bar-indeterminate-animation-duration) infinite
+      linear;
   }
   progress::-webkit-progress-bar {
-    background: var(--muted);
+    background: transparent;
   }
   progress::-webkit-progress-value {
     background: var(--primary);
+    transition: inline-size 0.25s;
+    animation: var(--progress-bar-animation, revert-rule);
   }
-  progress:indeterminate {
-    background: linear-gradient(90deg, var(--muted) 25%, var(--accent) 50%, var(--muted) 75%);
-    background-size: 200% 100%;
-    animation: working 1.6s linear infinite;
+  progress::-moz-progress-bar {
+    background: var(--primary);
+    transition: inline-size 0.25s;
+    animation: var(--progress-bar-animation, revert-rule);
   }
   @keyframes working {
+    from,
+    to {
+      inline-size: var(--progress-bar-indeterminate-size);
+      margin-right: auto;
+    }
     from {
-      background-position: 100% 0;
+      translate: -100%;
     }
     to {
-      background-position: -100% 0;
+      translate: 100cqi;
     }
   }
   footer {
@@ -475,12 +545,18 @@
     margin-right: auto;
   }
   .discard {
+    border-color: var(--destructive);
     color: var(--destructive);
+  }
+  .discard:hover:not(:disabled) {
+    border-color: var(--destructive);
+    background: var(--destructive);
+    color: var(--primary-foreground);
   }
   .close-note {
     margin: 6px 0 0;
     color: var(--muted-foreground);
-    font-size: 11px;
+    font-size: 0.6906rem;
   }
   .error {
     color: var(--destructive);
@@ -490,6 +566,8 @@
       padding: 8px;
       gap: 6px;
     }
+  }
+  @container (inline-size <= 520px) {
     header {
       flex-wrap: wrap;
       gap: 3px 10px;
@@ -507,11 +585,6 @@
     }
     .tool-output {
       padding: 8px;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    progress:indeterminate {
-      animation: none;
     }
   }
 </style>

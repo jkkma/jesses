@@ -58,8 +58,8 @@ test('copy conversion keeps colliding stream indices source-scoped and preserves
   const tracks = page.getByRole('region', { name: 'Track List' });
   await tracks.getByRole('checkbox', { name: /Include .*External commentary/ }).check();
   await tracks
-    .getByRole('listbox', { name: 'Tracks' })
-    .getByRole('option', { name: /External commentary/ })
+    .getByRole('grid', { name: 'Tracks' })
+    .locator('.track-option', { hasText: /External commentary/ })
     .click();
   await tracks.getByRole('button', { name: 'Move track up' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();

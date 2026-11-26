@@ -572,7 +572,7 @@ export async function chooseOutputFolder(): Promise<string | null> {
   const path = await openRemembered({
     directory: true,
     multiple: false,
-    title: 'Choose batch output folder',
+    title: 'Choose default output folder',
   });
   if (Array.isArray(path)) return null;
   rememberDirectory(path, true);
@@ -617,9 +617,9 @@ export async function startEncode(request: EncodeRequest): Promise<JobSnapshot> 
   return invoke<JobSnapshot>('start_encode', { request });
 }
 
-export async function openEncodeWindow(): Promise<void> {
+export async function openEncodeWindow(focus = true): Promise<void> {
   requireDesktop();
-  return invoke<void>('open_encode_window');
+  return invoke<void>('open_encode_window', { focus });
 }
 
 export async function enqueueEncode(request: EncodeRequest): Promise<JobSnapshot> {
@@ -712,12 +712,11 @@ export async function waitForJobTerminal(id: string, signal?: AbortSignal): Prom
   requireDesktop();
   let dispose = () => {};
   let settled = false;
-  let resolveResult!: (job: JobSnapshot) => void;
-  let rejectResult!: (cause: unknown) => void;
-  const result = new Promise<JobSnapshot>((resolve, reject) => {
-    resolveResult = resolve;
-    rejectResult = reject;
-  });
+  const {
+    promise: result,
+    resolve: resolveResult,
+    reject: rejectResult,
+  } = Promise.withResolvers<JobSnapshot>();
   // Abort can arrive while the native channel is being attached.
   void result.catch(() => {});
   const abort = () => {

@@ -31,6 +31,7 @@
   let folder = $state(''),
     busy = $state(false),
     error = $state(''),
+    resetNotice = $state(''),
     resetOpen = $state(false),
     draft = $state<ResetOnNewFilePreferences>({ ...defaultReset });
   let dirty = false;
@@ -169,8 +170,9 @@
           )}
       />
     </label>
-    <label>
-      Save encodes to <span class="folder">
+    <div class="form-row">
+      <label for="default-output-folder">Save encodes to</label>
+      <span class="folder">
         <input
           id="default-output-folder"
           value={folder}
@@ -182,7 +184,10 @@
           }}
           onblur={saveFolder}
           onkeydown={(event) => {
-            if (event.key === 'Enter' && !event.isComposing) void saveFolder();
+            if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) {
+              event.preventDefault();
+              void saveFolder();
+            }
           }}
         /><button
           type="button"
@@ -199,12 +204,12 @@
             dirty = true;
             void saveFolder();
           }}
-          disabled={!ready}
+          disabled={!ready || !folder}
         >
           Clear
         </button>
       </span>
-    </label>
+    </div>
   </div>
   <label class="check">
     <input
@@ -245,11 +250,15 @@
         .join(', ') || 'None'}
     </span><button type="button" onclick={openReset} disabled={!ready}> Configure… </button><button
       type="button"
-      onclick={onreset}
+      onclick={() => {
+        onreset();
+        resetNotice = 'Reset selected settings in Quick Convert and AV1AN.';
+      }}
     >
       Reset Now
     </button>
   </div>
+  {#if resetNotice}<p role="status">{resetNotice}</p>{/if}
   {#if error}<p role="alert">{error}</p>{/if}
 </section>
 <SourceDialog
@@ -263,7 +272,8 @@
       {label}
     </label>{/each}
   {#if error}<p role="alert">{error}</p>{/if}
-  <div class="reset">
+  <div class="dialog-actions">
+    <button type="button" onclick={() => (resetOpen = false)}>Cancel</button>
     <button
       type="button"
       disabled={busy}
@@ -280,36 +290,43 @@
   .settings {
     display: grid;
     align-content: start;
-    gap: 0.6rem;
+    gap: 0.4875rem;
     max-width: 920px;
     padding: 8px;
   }
   h2 {
-    margin: 0.5rem 0 0;
+    margin: 0.4063rem 0 0;
     color: var(--foreground);
     border-bottom: 1px solid var(--rule);
     padding-bottom: 3px;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.12em;
   }
   .form {
     display: grid;
-    gap: 0.45rem;
+    gap: 0.3656rem;
   }
-  .form > label {
+  .form > label,
+  .form > .form-row {
     display: grid;
     grid-template-columns: 200px minmax(200px, 1fr);
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.4063rem;
   }
   .form > label select {
     width: min(100%, 225px);
     justify-self: start;
   }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.325rem;
+    margin-top: 0.7313rem;
+  }
   select,
   input {
     min-width: 0;
-    padding: 0.4rem;
+    padding: 0.325rem;
     border: 1px solid var(--border);
     background: var(--background);
     color: var(--foreground);
@@ -322,7 +339,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.4rem;
+    gap: 0.325rem;
   }
   .folder input {
     width: 430px;
@@ -332,7 +349,7 @@
     min-width: 190px;
   }
   button {
-    padding: 0.4rem 0.7rem;
+    padding: 0.325rem 0.5688rem;
     border: 1px solid var(--border);
     background: var(--secondary);
     color: var(--secondary-foreground);
@@ -348,7 +365,7 @@
   }
   .check {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.4063rem;
     align-items: center;
   }
   p {

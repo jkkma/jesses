@@ -1,14 +1,27 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import type { EncodeCommandPlan, EncodeRequest } from '$lib/ipc/generated';
   import { previewEncodePlan } from '$lib/ipc/client';
+  import { copyTextWithFeedback } from './clipboard';
   let { request, disabled = false }: { request: EncodeRequest | undefined; disabled?: boolean } =
     $props();
   let plan = $state<EncodeCommandPlan | null>(null);
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let copiedStage = $state<number | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
   let controller: AbortController | undefined;
   let generation = 0;
+  async function copyStageArgs(index: number, args: string[]) {
+    const text = JSON.stringify(args, null, 2);
+    if (await copyTextWithFeedback(text)) {
+      copiedStage = index;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        copiedStage = null;
+      }, 2000);
+    }
+  }
   $effect(() => {
     JSON.stringify(request);
     untrack(() => {
@@ -51,6 +64,9 @@
     busy = false;
     plan = null;
   }
+  onDestroy(() => {
+    clearTimeout(copyTimer);
+  });
 </script>
 
 <section class="command-preview" aria-label="Command plan preview">
@@ -81,10 +97,15 @@
         {#if stage.workingDirectory}<p>
             <strong>Working directory:</strong> <code>{stage.workingDirectory}</code>
           </p>{/if}
-        <p class="small-muted">
-          Each JSON string below is one native argument, including its literal spaces and
-          punctuation.
-        </p>
+        <div class="stage-meta">
+          <p class="small-muted">
+            Each JSON string below is one native argument, including its literal spaces and
+            punctuation.
+          </p>
+          <button type="button" onclick={() => void copyStageArgs(i, stage.arguments)}>
+            {copiedStage === i ? 'Copied' : 'Copy arguments'}
+          </button>
+        </div>
         <textarea
           readonly
           rows="10"
@@ -111,7 +132,7 @@
     background: var(--background);
     color: var(--foreground);
     cursor: pointer;
-    font-size: 12px;
+    font-size: 0.7475rem;
   }
   button:disabled {
     opacity: 0.5;
@@ -119,17 +140,29 @@
   }
   summary {
     cursor: pointer;
-    font-size: 12px;
+    font-size: 0.7475rem;
     font-weight: 600;
   }
   p {
-    font-size: 12px;
+    font-size: 0.7475rem;
     overflow-wrap: anywhere;
+  }
+  .stage-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 4px 0;
+  }
+  .stage-meta button {
+    padding: 4px 8px;
+    font-size: 0.6906rem;
   }
   textarea {
     width: 100%;
     resize: vertical;
-    font-size: 11px;
+    font-size: 0.6906rem;
     max-height: 320px;
     overflow: auto;
     white-space: pre-wrap;
@@ -141,12 +174,12 @@
     min-width: 0;
   }
   .preview-help summary {
-    font-size: 10px;
+    font-size: 0.6906rem;
     font-weight: 400;
     color: var(--muted-foreground);
   }
   .preview-help p {
     margin-top: 6px;
-    font-size: 10px;
+    font-size: 0.6906rem;
   }
 </style>

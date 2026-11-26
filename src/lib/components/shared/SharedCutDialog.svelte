@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import SourceDialog from './SourceDialog.svelte';
   import { previewFrame, snapKeyframe } from '$lib/ipc/client';
+  import { errorMessage } from './format';
   import type { FramePreviewResult, MediaFile } from '$lib/ipc/generated';
   import { defaultTrim, type TrimDraft } from './trim-options';
   let {
@@ -32,6 +33,7 @@
     preview = $state<FramePreviewResult | null>(null),
     error = $state(''),
     loading = $state(false),
+    snapping = $state(false),
     previewTimer: ReturnType<typeof setTimeout> | undefined,
     previewAbort: AbortController | undefined,
     snapAbort: AbortController | undefined;
@@ -80,6 +82,7 @@
   }
   function invalidateSnap() {
     ++snapRevision;
+    snapping = false;
     snapAbort?.abort();
     snapAbort = undefined;
   }
@@ -171,6 +174,7 @@
     const revision = snapRevision,
       controller = new AbortController();
     snapAbort = controller;
+    snapping = true;
     try {
       const result = await snapKeyframe(
         { inputPath: file.path, videoStreamIndex, positionSeconds: ms / 1000 },
@@ -186,7 +190,10 @@
         throw new DOMException('Keyframe lookup canceled.', 'AbortError');
       throw cause;
     } finally {
-      if (snapAbort === controller) snapAbort = undefined;
+      if (snapAbort === controller) {
+        snapAbort = undefined;
+        snapping = false;
+      }
     }
   }
   async function markStart() {
@@ -197,7 +204,7 @@
       startText = textValue(ms);
       error = '';
     } catch (cause) {
-      if (!aborted(cause)) error = cause instanceof Error ? cause.message : String(cause);
+      if (!aborted(cause)) error = errorMessage(cause);
     }
   }
   async function confirm() {
@@ -233,7 +240,7 @@
             };
       onconfirm(next);
     } catch (cause) {
-      if (!aborted(cause)) error = cause instanceof Error ? cause.message : String(cause);
+      if (!aborted(cause)) error = errorMessage(cause);
     }
   }
   function changeMode(mode: string) {
@@ -259,9 +266,14 @@
   width={720}
 >
   <div class="preview">
-    {#if preview}<img src={preview.imageDataUrl} alt="Video preview" />{:else}<span>
+    {#if preview}
+      <img src={preview.imageDataUrl} alt="Video preview" />
+      {#if loading}<span class="preview-loading" role="status">Updating preview…</span>{/if}
+    {:else}
+      <span>
         {loading ? 'Reading preview…' : file ? 'No preview available' : 'No file loaded'}
-      </span>{/if}
+      </span>
+    {/if}
   </div>
   <input
     aria-label="Position"
@@ -295,11 +307,13 @@
         type="button"
         aria-label="Jump to start point"
         title="Jump to the start point"
+        disabled={duration <= 0}
         onclick={() => seek((fromText(startText) ?? 0) / 1000)}
       >
         ⏮
       </button>{#each [{ l: '-10s', n: -10 }, { l: '-1s', n: -1 }, { l: '-1f', n: -frameDuration / 1000 }, { l: '+1f', n: frameDuration / 1000 }, { l: '+1s', n: 1 }, { l: '+10s', n: 10 }] as item}<button
           type="button"
+          disabled={duration <= 0}
           onclick={() => seek(position + item.n)}
         >
           {item.l}
@@ -307,6 +321,7 @@
         type="button"
         aria-label="Jump to end point"
         title="Jump to the end point"
+        disabled={duration <= 0}
         onclick={() => seek((fromText(endText) ?? 0) / 1000)}
       >
         ⏭
@@ -342,17 +357,20 @@
             void snap(ms)
               .then((result) => (startText = textValue(result)))
               .catch((cause) => {
-                if (!aborted(cause)) error = String(cause);
+                if (!aborted(cause)) error = errorMessage(cause);
               });
         }
       }}
-    /><button type="button" onclick={() => void markStart()}>Set start to playhead</button>
+    /><button type="button" disabled={duration <= 0 || snapping} onclick={() => void markStart()}>
+      Set start to playhead
+    </button>
     <label for="cut-end">End</label><input
       id="cut-end"
       bind:value={endText}
       oninput={invalidateSnap}
     /><button
       type="button"
+      disabled={duration <= 0}
       onclick={() => {
         invalidateSnap();
         endText = textValue(position * 1000);
@@ -372,13 +390,14 @@
         : format(Math.max(0, (fromText(endText) ?? 0) - (fromText(startText) ?? 0)))}
     />{#if !copied}<button
         type="button"
+        disabled={duration <= 0 || snapping}
         onclick={() => {
           const ms = fromText(startText);
           if (ms !== null)
             void snap(ms)
               .then((result) => (startText = textValue(result)))
               .catch((cause) => {
-                if (!aborted(cause)) error = String(cause);
+                if (!aborted(cause)) error = errorMessage(cause);
               });
         }}
       >
@@ -389,7 +408,15 @@
       {error}
     </p>{/if}
   <div class="actions">
-    <button type="button" onclick={reset}>Reset</button><button
+    <button
+      type="button"
+      onclick={() => {
+        invalidateSnap();
+        onclose();
+      }}
+    >
+      Cancel
+    </button><button type="button" disabled={duration <= 0} onclick={reset}>Reset</button><button
       type="button"
       onclick={() => void confirm()}
     >
@@ -403,12 +430,23 @@
      16:9 or portrait frame is letterboxed whole instead of laid out at its
      natural height and clipped. */
   .preview {
+    position: relative;
     height: 300px;
     display: grid;
     grid-template: 100% / 100%;
     place-items: center;
     background: var(--muted);
-    overflow: hidden;
+    overflow: clip;
+  }
+  .preview-loading {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    background: var(--popover);
+    color: var(--foreground);
+    font-size: 0.6906rem;
   }
   .preview img {
     width: 100%;
@@ -477,8 +515,12 @@
   button:hover:not(:disabled) {
     background: var(--accent);
   }
+  input[readonly] {
+    background: var(--muted);
+    color: var(--muted-foreground);
+  }
   p {
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   p[role='alert'] {
     color: var(--destructive);

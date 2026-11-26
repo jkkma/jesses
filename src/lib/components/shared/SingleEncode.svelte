@@ -155,6 +155,7 @@
     EncodeTrackOverride,
     EncodeTrackRef,
     Av1anGrainSettings,
+    Av1anRecoveryEntry,
     JobSnapshot,
     MediaFile,
     MediaStream,
@@ -199,6 +200,7 @@
     onbatchstatus,
     onreviewjob,
     ontracklist,
+    ondraftchange,
     isShiftHeld: readShiftState,
   }: {
     backend: EncodeBackend;
@@ -224,7 +226,9 @@
     onbatchqueue?: (requests: EncodeRequest[]) => Promise<void>;
     sourcePreferences?: import('$lib/ipc/generated').GeneralPreferences;
     onlog?: (message: string) => void;
-    onrecoverysource?: (path: string) => Promise<void>;
+    onrecoverysource?: (
+      path: string,
+    ) => Promise<{ source: MediaFile; publish: () => Promise<void>; cancel: () => void } | void>;
     onrecoveryjobs?: (before: JobSnapshot[], after: JobSnapshot[]) => void;
     onbatchstatus?: (
       runId: string,
@@ -233,6 +237,7 @@
     ) => void;
     onreviewjob?: (job: JobSnapshot, started?: boolean) => void;
     ontracklist?: () => void;
+    ondraftchange?: () => void;
     isShiftHeld?: () => boolean;
   } = $props();
   const av1anBatchSource = $derived(
@@ -389,24 +394,36 @@
   let imageReviewId = $state<string | null>(null),
     imagePaused = $state(false),
     imagePausePending = $state(false);
+  type CommandDialogOutcome =
+    { kind: 'run'; args: string } | { kind: 'cleared' } | { kind: 'canceled' };
   let commandDialogOpen = $state(false),
     commandDialogText = $state(''),
-    commandDialogProgram = $state<'ffmpeg' | 'av1an'>('ffmpeg');
-  let finishCommandDialog: ((value: string | null) => void) | undefined;
-  function editCommand(program: 'ffmpeg' | 'av1an', command: string): Promise<string | null> {
+    commandDialogProgram = $state<'ffmpeg' | 'av1an'>('ffmpeg'),
+    commandDialogPlanRequest = $state<EncodeRequest | undefined>(undefined);
+  let finishCommandDialog: ((value: CommandDialogOutcome) => void) | undefined;
+  function editCommand(
+    program: 'ffmpeg' | 'av1an',
+    command: string,
+    planRequest?: EncodeRequest,
+  ): Promise<CommandDialogOutcome> {
     commandDialogProgram = program;
     commandDialogText = command;
+    commandDialogPlanRequest = planRequest;
     commandDialogOpen = true;
-    return new Promise((resolve) => {
-      finishCommandDialog = resolve;
-    });
+    const { promise, resolve } = Promise.withResolvers<CommandDialogOutcome>();
+    finishCommandDialog = resolve;
+    return promise;
   }
   function closeCommandDialog(confirm = false) {
     const value = confirm ? commandDialogText.trim() : '';
     commandDialogOpen = false;
+    commandDialogPlanRequest = undefined;
     const finish = finishCommandDialog;
     finishCommandDialog = undefined;
-    finish?.(value || null);
+    if (!finish) return;
+    if (!confirm) finish({ kind: 'canceled' });
+    else if (!value) finish({ kind: 'cleared' });
+    else finish({ kind: 'run', args: value });
   }
   onDestroy(() => {
     imageAbort?.abort();
@@ -432,17 +449,19 @@
   }
   let activeEncodeReview = $state<AbortController>();
   let encodeReviewStopped = false;
+  let encodeReviewOutcome: 'canceled' | 'cleared' | '' = '';
   async function reviewAndRun(
     request: CommandEditRequest,
     parentSignal: AbortSignal,
     shouldEdit: () => boolean = () => true,
     onjob?: (job: JobSnapshot) => void,
+    planRequest: EncodeRequest | undefined = request.kind === 'encode'
+      ? request.request
+      : undefined,
   ): Promise<CommandEditResult | null> {
     const controller = new AbortController();
-    const signal = controller.signal;
-    const abort = () => controller.abort();
-    if (parentSignal.aborted) abort();
-    else parentSignal.addEventListener('abort', abort, { once: true });
+    const signal = AbortSignal.any([parentSignal, controller.signal]);
+    encodeReviewOutcome = '';
     if (request.kind === 'encode') {
       activeEncodeReview = controller;
       encodeReviewStopped = false;
@@ -467,10 +486,20 @@
         const cancelDialog = () => closeCommandDialog();
         signal.addEventListener('abort', cancelDialog, { once: true });
         try {
-          args = await editCommand(
+          const outcome = await editCommand(
             review.executableLabel.toLowerCase().includes('av1an') ? 'av1an' : 'ffmpeg',
             review.arguments,
+            planRequest,
           );
+          if (outcome.kind === 'canceled') {
+            encodeReviewOutcome = 'canceled';
+            return null;
+          }
+          if (outcome.kind === 'cleared') {
+            encodeReviewOutcome = 'cleared';
+            return null;
+          }
+          args = outcome.args;
         } finally {
           signal.removeEventListener('abort', cancelDialog);
         }
@@ -484,7 +513,6 @@
       }
       return result;
     } finally {
-      parentSignal.removeEventListener('abort', abort);
       if (activeEncodeReview === controller) activeEncodeReview = undefined;
       if (trackedImageId && imageReviewId === trackedImageId) {
         imageReviewId = null;
@@ -563,13 +591,16 @@
   // The crop dialog shows one frame as stored (coded orientation, which is
   // what the crop edges refer to) with the kept area outlined.
   let cropPreview = $state<FramePreviewResult | null>(null);
+  let cropPreviewLoading = $state(false);
   let cropPreviewAbort: AbortController | undefined;
   function loadCropPreview() {
     cropPreviewAbort?.abort();
     cropPreview = null;
+    cropPreviewLoading = false;
     if (!desktop || !file || fileMode === 'batch' || videoIndex === undefined) return;
     const controller = new AbortController();
     cropPreviewAbort = controller;
+    cropPreviewLoading = true;
     void previewFrame(
       {
         inputPath: file.path,
@@ -583,6 +614,9 @@
       })
       .catch(() => {
         /* The numbers still work without a picture. */
+      })
+      .finally(() => {
+        if (cropPreviewAbort === controller) cropPreviewLoading = false;
       });
   }
   const storedRotation = $derived.by(() => {
@@ -759,8 +793,12 @@
               },
             };
     const bitrate =
-      row?.bitrate ??
-      Math.round(audioBitrate * audioMultiplier(channelCount(channels, stream?.channels ?? null)));
+      audioCodec === 'copy' || audioCodec === 'flac'
+        ? 128
+        : (row?.bitrate ??
+          Math.round(
+            audioBitrate * audioMultiplier(channelCount(channels, stream?.channels ?? null)),
+          ));
     return {
       streamIndex,
       codec: audioCodec,
@@ -971,6 +1009,13 @@
     ),
     stripSubs = $state(false);
   let selectedFilterIndex = $state<number | null>(null);
+  $effect(() => {
+    if (
+      selectedFilterIndex !== null &&
+      (selectedFilterIndex < 0 || selectedFilterIndex >= av1anFilters.length)
+    )
+      selectedFilterIndex = null;
+  });
   function selectedOptionTooltip(event: Event) {
     const element = event.target;
     if (element instanceof HTMLSelectElement)
@@ -1002,9 +1047,15 @@
     event.preventDefault();
     settingsTab = tabs[next].id;
     const tablist = (event.currentTarget as HTMLElement).parentElement;
-    void tick().then(() =>
-      tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus(),
-    );
+    void tick().then(() => {
+      const target = tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next];
+      target?.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+        container: 'nearest',
+      } as ScrollIntoViewOptions);
+      target?.focus();
+    });
   }
   function displaySize() {
     const [n, d] = (selectedVideo?.sampleAspectRatio ?? '1:1').split(/[:/]/).map(Number);
@@ -1260,8 +1311,11 @@
             ? ontracklist
             : [videoSettingsIssue, hdrOutputIssue].includes(runBlockedReason)
               ? () => (settingsTab = 'video')
-              : undefined
+              : audioSettingsIssue && runBlockedReason === audioSettingsIssue
+                ? () => (settingsTab = 'audio')
+                : undefined
           : undefined,
+      supportsCommandReview: true,
       batchNaming: naming,
       label: `${mode === 'batch' ? 'Run Batch' : 'Run'}: ${av1anMode ? 'AV1AN encode' : 'Encode'}`,
       active: inFlight,
@@ -1269,6 +1323,7 @@
       progressDescription,
       progressJobId:
         inFlight && (batchEncodeRun || singlePreparing) ? (liveBatchJob?.id ?? null) : undefined,
+      batchRunId: batchEncodeRun && batchWaitingId ? batchWaitingId : undefined,
       waitingBatch:
         inFlight && batchWaitingId && !batchWaitingCanceled && batchWaitingCount > 0
           ? {
@@ -1352,8 +1407,15 @@
   let recoveries = $state<import('$lib/ipc/generated').Av1anRecoveryEntry[]>([]),
     recoverySelected = $state<string | null>(null),
     recoveryDialog = $state<'list' | 'clear' | null>(null),
+    recoveryConfirm = $state<{
+      action: 'deleteEncode' | 'deleteChunks';
+      entry: import('$lib/ipc/generated').Av1anRecoveryEntry;
+    } | null>(null),
     recoveryBusy = $state(false),
     recoveryError = $state('');
+  const selectedRecovery = $derived(
+    recoveries.find((entry) => entry.job.id === recoverySelected) ?? null,
+  );
   let recoveryReadGeneration = 0,
     recoveryDisposed = false,
     clearReviewed = $state<string[]>([]),
@@ -1412,7 +1474,9 @@
     recoveryDisposed = true;
     ++recoveryReadGeneration;
   });
+  let recoveryOpener: HTMLElement | null = null;
   async function openRecoveries() {
+    recoveryOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     recoveryError = '';
     await refreshRecoveries();
     recoveryDialog = 'list';
@@ -1457,37 +1521,143 @@
       },
     };
   }
+  function validateIsolatedResume(candidate: MediaFile, saved: Av1anRecoveryEntry): string | null {
+    if (!connected) return 'Waiting for the job service to connect.';
+    if (candidate.source?.kind === 'imageSequence')
+      return 'AV1AN does not support image sequence folders.';
+    if (!firstVideoStream(candidate)) return 'The saved input file has no video track.';
+    const savedVideoIndex =
+      saved.job.encodeSettings?.videoStreamIndex ??
+      candidate.streams.find(
+        (stream) =>
+          saved.job.request.streamIndices.includes(stream.index) && stream.kind === 'video',
+      )?.index ??
+      firstVideoStream(candidate)?.index;
+    const video =
+      savedVideoIndex !== undefined
+        ? candidate.streams.find(
+            (stream) => stream.index === savedVideoIndex && stream.kind === 'video',
+          )
+        : undefined;
+    if (!video) return 'The saved video track was not found in the input file.';
+    const requiredTools = requiredEncoderTools(backend, encoder, av1an.concatMethod, true);
+    if (encoder === 'aomAv1' && preservableHdr10(video) && !toneMap.enabled)
+      requiredTools.push('mkvmerge');
+    const missing = [...new Set(requiredTools)].filter(
+      (id) => !tools.some((tool) => tool.id === id && tool.available),
+    );
+    if (missing.length) return missingToolsMessage(missing);
+    if (!validSettings) return 'The current settings are not valid for the saved input file.';
+    if (containerIssue) return containerIssue;
+    if (trimIssue) return trimIssue;
+    if (customFiltersIssue) return customFiltersIssue;
+    if (gridGrainIssue) return gridGrainIssue;
+    if (grainTableError) return grainTableError;
+    if (parsedHdr.error) return parsedHdr.error;
+    if (grainConflict) return grainConflict;
+    if (parameterIssue) return parameterIssue;
+    if (dynamicHdrIssue) return dynamicHdrIssue;
+    const tError = temporalError(temporal, backend);
+    if (tError) return tError;
+    if (
+      !validFramingDraft(alignedFraming(framing, video, cropMode === 'manual'), video) ||
+      (cropMode === 'manual' && !cropFits(framing, video))
+    )
+      return 'The current framing settings are not valid for the saved input file.';
+    const hdrIssue = toneMap.enabled
+      ? null
+      : hdrPreservationIssue(video, encoder, encodePixelFormat, hdr10Fallback);
+    if (hdrIssue) return hdrIssue;
+    const tmIssue = toneMapError(toneMap, backend, video, supportsHdr10Fallback && hdr10Fallback);
+    if (tmIssue) return tmIssue;
+    const aError = av1anError(
+      av1an,
+      knownHdr(video) && !toneMap.enabled,
+      encoder,
+      outputContainer === 'matroska',
+      true,
+    );
+    if (aError) return aError;
+    if (
+      hdrMetadata &&
+      (!supportsHdrMetadata(encoder) ||
+        !validHdrMetadata(hdrMetadata) ||
+        !knownHdr(video) ||
+        toneMap.enabled ||
+        (!supportsDynamicHdr(encoder) &&
+          (!!hdrMetadata.dolbyVisionRpuPath || !!hdrMetadata.hdr10PlusJsonPath)))
+    )
+      return 'The current HDR metadata settings are not valid for the saved input file.';
+    const savedStreamSet = new Set(saved.job.request.streamIndices);
+    const nonVideoIndices = candidate.streams
+      .filter((stream) => stream.index !== video.index && savedStreamSet.has(stream.index))
+      .map((stream) => stream.index);
+    const audioErr = audioSettingsErrorFor([candidate], nonVideoIndices, false);
+    if (audioErr) return audioErr;
+    return null;
+  }
   async function recoveryAction(
     action: 'deleteEncode' | 'deleteChunks' | 'resumeSaved' | 'resumeNew' | 'clearAll',
     shiftAtClick = false,
+    targetId?: string,
   ) {
     if (recoveryBusy) return;
-    const id = recoverySelected;
+    const id = targetId ?? recoverySelected;
     if (action !== 'clearAll' && !id) return;
+    if (
+      (action === 'deleteEncode' || action === 'deleteChunks') &&
+      !recoveries.some((entry) => entry.job.id === id)
+    ) {
+      recoveryError = 'The selected unfinished encode is no longer available.';
+      return;
+    }
     recoveryBusy = true;
     recoveryError = '';
+    const reviewOpener = recoveryOpener?.isConnected
+      ? recoveryOpener
+      : document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     let controller: AbortController | undefined;
+    let preparedRecovery:
+      { source: MediaFile; publish: () => Promise<void>; cancel: () => void } | undefined;
+    let reviewCanceled = false;
     try {
       let request: import('$lib/ipc/generated').Av1anRecoveryAction;
+      let planRequest: EncodeRequest | undefined;
       if (action === 'clearAll') request = { action, ids: [...clearReviewed] };
       else if (action === 'resumeNew') {
         const saved = recoveries.find((entry) => entry.job.id === id);
         if (!saved) throw new Error('The selected unfinished encode is no longer available.');
         const path = saved.job.request.inputPath;
-        if (file?.path !== path) {
+        if (file?.path === path) {
+          while (suggestionPending && suggestionTask) await suggestionTask;
+          const issue = validateIsolatedResume(file, saved);
+          if (issue) throw new Error(issue);
+          const current = currentRequest(file, saved);
+          if (!current)
+            throw new Error('The current settings could not be built for the saved input file.');
+          request = {
+            action,
+            id: id!,
+            settings: structuredClone($state.snapshot(current.settings)),
+          };
+        } else {
           if (!onrecoverysource)
             throw new Error('Load the saved input file before resuming with new settings.');
-          await onrecoverysource(path);
-          await tick();
+          preparedRecovery = (await onrecoverysource(path)) ?? undefined;
+          if (!preparedRecovery) throw new Error('The saved input file could not be loaded.');
+          const issue = validateIsolatedResume(preparedRecovery.source, saved);
+          if (issue) throw new Error(issue);
+          const current = currentRequest(preparedRecovery.source, saved);
+          if (!current)
+            throw new Error('The current settings could not be built for the saved input file.');
+          request = {
+            action,
+            id: id!,
+            settings: structuredClone($state.snapshot(current.settings)),
+          };
         }
-        if (file?.path !== path) throw new Error('The saved input file could not be loaded.');
-        while (suggestionPending && suggestionTask) await suggestionTask;
-        if (!canQueue)
-          throw new Error('The current settings are not valid for the saved input file.');
-        const current = currentRequest();
-        if (!current)
-          throw new Error('The current settings could not be built for the saved input file.');
-        request = { action, id: id!, settings: structuredClone($state.snapshot(current.settings)) };
       } else request = { action, id: id! };
       if (request.action === 'resumeSaved' || request.action === 'resumeNew') {
         recoveryDialog = null;
@@ -1502,15 +1672,24 @@
           command,
           controller.signal,
           () => shiftAtClick || (readShiftState?.() ?? false),
+          undefined,
+          planRequest,
         );
         if (!reviewed) {
+          reviewCanceled = true;
+          preparedRecovery?.cancel();
           if (!controller.signal.aborted)
-            onlog?.('The command was cleared in the edit window, so nothing was run.');
+            onlog?.(
+              encodeReviewOutcome === 'canceled'
+                ? 'Canceled in the command editor.'
+                : 'The command was cleared in the edit window, so nothing was run.',
+            );
           await refreshRecoveries();
           return;
         }
         if (reviewed.kind !== 'encode')
           throw new Error('The command returned an unexpected image result.');
+        await preparedRecovery?.publish();
         await refreshRecoveries();
         return;
       }
@@ -1525,6 +1704,7 @@
       }
       await refreshRecoveries();
     } catch (cause) {
+      preparedRecovery?.cancel();
       if (!controller?.signal.aborted) {
         recoveryError = errorMessage(cause);
         if (action === 'resumeSaved' || action === 'resumeNew') recoveryDialog = 'list';
@@ -1536,6 +1716,17 @@
         submitting = false;
       }
       recoveryBusy = false;
+      if (reviewCanceled && reviewOpener?.isConnected)
+        void tick()
+          .then(() => tick())
+          .then(() => {
+            if (
+              reviewOpener.isConnected &&
+              !reviewOpener.closest('[hidden]') &&
+              !(reviewOpener as HTMLButtonElement).disabled
+            )
+              reviewOpener.focus();
+          });
     }
   }
   function resetSourceSettings() {
@@ -1573,7 +1764,10 @@
       else singleToneMap = defaultToneMap();
       setHdr10Fallback(false);
     }
-    if (flags.customFilters) av1anFilters = [];
+    if (flags.customFilters) {
+      av1anFilters = [];
+      selectedFilterIndex = null;
+    }
   }
   const outputFrameRateLabel = $derived(
     temporal.changeRate
@@ -1621,7 +1815,7 @@
   // instances mounted; changing a source restores that workflow's prior edits.
   const drafts = new Map<string, Draft>();
   let draftIdentity: string | null = null;
-  let draftGeneration = 0;
+  let draftGeneration = $state(0);
   const desktop = isDesktop();
   const chunked = $derived(backend === 'av1an');
   const encodingVideo = $derived(chunked || videoMode === 'encode');
@@ -2315,6 +2509,98 @@
           : null,
   );
   const outputPathReady = $derived(!outputPathIssue);
+  function audioSettingsErrorFor(
+    sources: MediaFile[],
+    activeIncluded: number[] | null,
+    checkDraft: boolean,
+    selectedRows?: TrackSelection[],
+  ): string | null {
+    if (stripAudio) return null;
+    const validateTrack = (track: AudioTrackDraft) => {
+      if (track.codec === 'copy') {
+        if (track.gain) return 'Copy audio cannot apply volume gain.';
+        return null;
+      }
+      if (
+        track.gain &&
+        (!Number.isInteger(track.gain.tenthsDb) ||
+          track.gain.tenthsDb < -600 ||
+          track.gain.tenthsDb > 240)
+      )
+        return 'Use audio gain between -60 and +24 dB in Audio.';
+      if (
+        typeof track.channels === 'object' &&
+        (!Number.isInteger(track.channels.explicit.count) ||
+          track.channels.explicit.count < 1 ||
+          track.channels.explicit.count > 24)
+      )
+        return 'Use between 1 and 24 audio channels in Audio.';
+      if (track.normalization && track.gain)
+        return 'Audio loudness normalization cannot be combined with fixed gain.';
+      if (
+        track.codec !== 'flac' &&
+        (typeof track.bitrateKbps !== 'number' ||
+          !Number.isInteger(track.bitrateKbps) ||
+          track.bitrateKbps < 8 ||
+          track.bitrateKbps > 8192)
+      )
+        return 'Enter an audio bitrate between 8 and 8192 kbps in Audio.';
+      return null;
+    };
+    if (checkDraft) {
+      const draftIncluded = selectedRows?.length
+        ? selectedRows
+            .filter((row) => row.included && row.sourceId === file?.id)
+            .map((row) => row.streamIndex)
+        : (activeIncluded ?? []);
+      for (const track of audio) {
+        if (!draftIncluded.includes(track.streamIndex)) continue;
+        const issue = validateTrack(track);
+        if (issue) return issue;
+      }
+    }
+    if (selectedRows?.length) {
+      for (const row of selectedRows) {
+        if (!row.included) continue;
+        const source = sources.find((entry) => entry.id === row.sourceId);
+        const stream = source?.streams.find((item) => item.index === row.streamIndex);
+        if (!source || stream?.kind !== 'audio') continue;
+        const issue = validateTrack(audioFor(source, stream.index));
+        if (issue) return issue;
+      }
+      return null;
+    }
+    for (const source of sources) {
+      for (const stream of source.streams) {
+        if (stream.kind !== 'audio') continue;
+        if (activeIncluded !== null && !activeIncluded.includes(stream.index)) continue;
+        const issue = validateTrack(audioFor(source, stream.index));
+        if (issue) return issue;
+      }
+    }
+    return null;
+  }
+  const audioSettingsIssue = $derived.by(() =>
+    audioSettingsErrorFor(
+      fileMode === 'batch' || tracks.length ? files : file ? [file] : [],
+      fileMode === 'batch' ? null : included,
+      fileMode !== 'batch',
+      fileMode === 'mux' && tracks.length ? tracks : undefined,
+    ),
+  );
+  const qualityHint = $derived.by(() => {
+    if (isImage)
+      return videoChoice === 'gif'
+        ? 'colors (3–256)'
+        : videoChoice === 'png'
+          ? 'lossless'
+          : 'q 1–31 (low = best)';
+    if (chunked && av1an.targetEnabled)
+      return av1an.target.metric === 'butteraugli' ? 'lower = closer' : 'higher = better';
+    if (rate.mode === 'bitrate') return 'kbps';
+    if (rate.mode === 'targetSize') return 'MB';
+    return 'CRF (low = best)';
+  });
   const runBlockedReason = $derived(
     (!desktop ? 'Open jesses in the desktop app to encode.' : null) ??
       (!usableSource ? 'Choose an encoding source to continue.' : null) ??
@@ -2341,6 +2627,7 @@
       missingRunToolsMessage ??
       containerIssue ??
       trimIssue ??
+      audioSettingsIssue ??
       (fileMode !== 'batch'
         ? (externalIssue ?? layoutIssue ?? timecodeIssue ?? (encodingVideo ? subtitleIssue : null))
         : null) ??
@@ -2358,6 +2645,7 @@
           : file?.source?.kind === 'imageSequence')
       ) &&
       connected &&
+      !audioSettingsIssue &&
       (noVideoForRun || batchWithoutVideo
         ? ['ffmpeg', 'ffprobe'].every((id) =>
             tools.some((tool) => tool.id === id && tool.available),
@@ -2395,6 +2683,7 @@
             (!temporalError(temporal, backend) &&
               !toneMapIssue &&
               (fileMode === 'batch' || !subtitleIssue))) &&
+          !audioSettingsIssue &&
           validAudio(audio, included, file?.streams ?? [])),
   );
   const canStart = $derived(canQueue && !active);
@@ -2707,6 +2996,81 @@
       error = null;
     });
   });
+  const editorDraftSignature = $derived(
+    JSON.stringify([
+      trim,
+      cropMode,
+      framing,
+      resizeChoice,
+      fps,
+      temporal,
+      deinterlaceChoice,
+      deinterlaceDouble,
+      singleToneMap,
+      batchToneMap,
+      hdr10Fallback,
+      av1anFilters,
+      destinationEdited ? destination : '',
+      metadataSource,
+      chapterSource,
+      applyMetadata,
+      metadataEdits,
+      outputMetadataEdits,
+      audioCodec,
+      audioBitrate,
+      audioChannels,
+      stripAudio,
+      loudness,
+      perTrackAudio,
+      perTrackRows,
+      audio,
+      subtitleMode,
+      stripSubs,
+      copySubs,
+      copyData,
+      copyAttachments,
+      burnIndex,
+      subtitles,
+      outputContainer,
+      selectedEncoder,
+      videoMode,
+      crf,
+      preset,
+      rate,
+      parameters,
+      hdrMetadata,
+      av1an,
+      av1anGrain,
+      grainMode,
+      grainPath,
+      grainPreset,
+      gridGrain,
+    ]),
+  );
+  let lastObservedDraftGeneration = -1;
+  let lastObservedSourceId: string | null = null;
+  let lastObservedMode: FileListMode | undefined;
+  let lastObservedDraftSignature: string | null = null;
+  $effect(() => {
+    const sig = editorDraftSignature;
+    const sourceId = file?.id ?? null;
+    const mode = fileMode;
+    const gen = draftGeneration;
+    untrack(() => {
+      if (
+        lastObservedDraftSignature !== null &&
+        gen === lastObservedDraftGeneration &&
+        sourceId === lastObservedSourceId &&
+        mode === lastObservedMode &&
+        sig !== lastObservedDraftSignature
+      )
+        ondraftchange?.();
+      lastObservedDraftGeneration = gen;
+      lastObservedSourceId = sourceId;
+      lastObservedMode = mode;
+      lastObservedDraftSignature = sig;
+    });
+  });
   $effect(() => {
     if (chunked)
       reportPreferenceSave(
@@ -2825,33 +3189,85 @@
     const trim = new RegExp(`^${sourceSpace}+|${sourceSpace}+$`, 'g');
     return rows.filter((row) => row.replace(trim, '').length > 2);
   }
-  function currentRequest(): EncodeRequest | undefined {
+  function currentRequest(
+    isolatedSource?: MediaFile,
+    saved?: Av1anRecoveryEntry,
+  ): EncodeRequest | undefined {
+    const isolated = isolatedSource !== undefined;
+    const savedSettings = isolated ? (saved?.job.encodeSettings ?? null) : null;
+    const targetFile = isolatedSource ?? file;
+    if (!targetFile) return undefined;
+    const targetMain = isolated ? isolatedSource : mainFile;
+    const targetMode: FileListMode = isolated ? 'mux' : fileMode;
+    const targetVideoIndex = isolated
+      ? (saved?.job.encodeSettings?.videoStreamIndex ??
+        targetFile.streams.find(
+          (stream) =>
+            saved?.job.request.streamIndices.includes(stream.index) && stream.kind === 'video',
+        )?.index ??
+        firstVideoStream(isolatedSource)?.index)
+      : videoIndex;
+    const targetVideoStream =
+      targetVideoIndex !== undefined
+        ? targetFile.streams.find((stream) => stream.index === targetVideoIndex)
+        : undefined;
+    const targetMultipleVideos =
+      targetFile.streams.filter((stream) => stream.kind === 'video').length > 1;
+    const targetCopiedStreams = isolated
+      ? targetFile.streams.filter((stream) => stream.index !== targetVideoIndex)
+      : copiedStreams;
+    const targetIncluded = isolated
+      ? saved
+        ? targetFile.streams
+            .filter(
+              (stream) =>
+                stream.index !== targetVideoIndex &&
+                saved.job.request.streamIndices.includes(stream.index),
+            )
+            .map((stream) => stream.index)
+        : targetFile.streams
+            .filter((stream) => stream.kind !== 'video' && stream.kind !== 'data')
+            .map((stream) => stream.index)
+      : included;
+    const targetTracks = isolated ? [] : tracks;
+    const targetFraming = isolated
+      ? alignedFraming(framing, targetVideoStream, cropMode === 'manual')
+      : activeFraming;
     const hasSelectedVideo =
       chunked ||
-      (fileMode === 'batch' ? !batchWithoutVideo : tracks.length === 0 || muxVideos.length > 0);
+      (targetMode === 'batch'
+        ? !batchWithoutVideo
+        : isolated
+          ? targetVideoIndex !== undefined
+          : targetTracks.length === 0 || muxVideos.length > 0);
     const pictureEnabled = encodingVideo && hasSelectedVideo;
     const effectiveVideoMode = hasSelectedVideo ? videoMode : 'drop';
     if (
-      !file ||
-      (fileMode !== 'batch' &&
-        videoIndex === undefined &&
-        (pictureEnabled || effectiveVideoMode === 'copy'))
+      targetMode !== 'batch' &&
+      targetVideoIndex === undefined &&
+      (pictureEnabled || effectiveVideoMode === 'copy')
     )
       return undefined;
-    const copies = copiedStreams
+    const copies = targetCopiedStreams
       .filter(
         (stream) =>
-          (included.includes(stream.index) ||
-            (pictureEnabled &&
+          (targetIncluded.includes(stream.index) ||
+            (!isolated &&
+              pictureEnabled &&
               !chunked &&
               stream.kind === 'subtitle' &&
-              file.id === mainFile?.id &&
+              targetFile.id === targetMain?.id &&
               String(stream.index) === activeBurn)) &&
           !(stream.kind === 'audio' && stripAudio) &&
           !(
             stream.kind === 'subtitle' &&
             (stripSubs || (chunked && !copySubs)) &&
-            !(pictureEnabled && file.id === mainFile?.id && String(stream.index) === activeBurn)
+            !(
+              !isolated &&
+              pictureEnabled &&
+              targetFile.id === targetMain?.id &&
+              String(stream.index) === activeBurn
+            )
           ) &&
           !(stream.kind === 'data' && (outputContainer !== 'mov' || (chunked && !copyData))) &&
           !(
@@ -2860,53 +3276,71 @@
           ) &&
           !(
             imageSubtitleLeftOut(stream, outputContainer) &&
-            !(pictureEnabled && file.id === mainFile?.id && String(stream.index) === activeBurn)
+            !(
+              !isolated &&
+              pictureEnabled &&
+              targetFile.id === targetMain?.id &&
+              String(stream.index) === activeBurn
+            )
           ),
       )
       .sort((a, b) => Number(a.kind === 'attachment') - Number(b.kind === 'attachment'));
     const selectedIndices = [
-      ...((effectiveVideoMode === 'drop' && !chunked) || videoIndex === undefined
+      ...((effectiveVideoMode === 'drop' && !chunked) || targetVideoIndex === undefined
         ? []
-        : sourceMultipleVideos && tracks.length
-          ? tracks
+        : targetMultipleVideos && targetTracks.length
+          ? targetTracks
               .filter(
                 (row) =>
-                  row.sourceId === file.id &&
+                  row.sourceId === targetFile.id &&
                   row.included &&
-                  file.streams.some(
+                  targetFile.streams.some(
                     (stream) => stream.index === row.streamIndex && trackKind(stream) === 'video',
                   ),
               )
               .map((row) => row.streamIndex)
-          : [videoIndex]),
+          : [targetVideoIndex]),
       ...copies.map((stream) => stream.index),
     ];
     // A kept cover travels beside the selected streams. Encodes into MKV or MP4
     // keep it; a cover unchecked in the Track List is left out.
-    const sourceCover = file.streams.find((stream) => trackKind(stream) === 'cover');
+    const sourceCover = targetFile.streams.find((stream) => trackKind(stream) === 'cover');
     const coverRow =
       sourceCover &&
-      tracks.find((row) => row.sourceId === file.id && row.streamIndex === sourceCover.index);
-    const coverStreamIndex =
-      sourceCover &&
-      pictureEnabled &&
-      (coverRow ? coverRow.included : true) &&
-      coverContainers.includes(outputContainer)
+      targetTracks.find(
+        (row) => row.sourceId === targetFile.id && row.streamIndex === sourceCover.index,
+      );
+    const savedCoverIndex = savedSettings ? savedSettings.coverStreamIndex : undefined;
+    const coverStreamIndex = savedSettings
+      ? savedCoverIndex !== undefined &&
+        pictureEnabled &&
+        coverContainers.includes(outputContainer) &&
+        targetFile.streams.some(
+          (stream) => stream.index === savedCoverIndex && trackKind(stream) === 'cover',
+        )
+        ? savedCoverIndex
+        : undefined
+      : sourceCover &&
+          pictureEnabled &&
+          (coverRow ? coverRow.included : true) &&
+          coverContainers.includes(outputContainer)
         ? sourceCover.index
         : undefined;
     const selectedPrimary = new Set(selectedIndices);
-    const selectedOverrides = trackOverrides
-      .filter((entry) => selectedPrimary.has(entry.streamIndex))
-      .map((entry) => ({ ...entry }));
-    const selectedRows = tracks.filter((row) => {
+    const selectedOverrides = isolated
+      ? []
+      : trackOverrides
+          .filter((entry) => selectedPrimary.has(entry.streamIndex))
+          .map((entry) => ({ ...entry }));
+    const selectedRows = targetTracks.filter((row) => {
       if (
         (!row.included &&
           !(
             pictureEnabled &&
-            row.sourceId === mainFile?.id &&
+            row.sourceId === targetMain?.id &&
             String(row.streamIndex) === activeBurn
           )) ||
-        (fileMode !== 'mux' && row.sourceId !== file.id)
+        (targetMode !== 'mux' && row.sourceId !== targetFile.id)
       )
         return false;
       const rowStream = files
@@ -2918,7 +3352,7 @@
           imageSubtitleLeftOut(rowStream, outputContainer) &&
           !(
             pictureEnabled &&
-            row.sourceId === mainFile?.id &&
+            row.sourceId === targetMain?.id &&
             String(row.streamIndex) === activeBurn
           )
         ) &&
@@ -2929,7 +3363,7 @@
           (stripSubs || (chunked && !copySubs)) &&
           !(
             pictureEnabled &&
-            row.sourceId === mainFile?.id &&
+            row.sourceId === targetMain?.id &&
             String(row.streamIndex) === activeBurn
           )
         ) &&
@@ -2942,29 +3376,53 @@
       );
     });
     const externalRows = selectedRows
-      .filter((row) => row.sourceId !== file.id)
+      .filter((row) => row.sourceId !== targetFile.id)
       .map((row) => ({ row, source: files.find((entry) => entry.id === row.sourceId) }))
       .filter((entry): entry is { row: TrackSelection; source: MediaFile } => !!entry.source);
-    const selectedOrder = selectedRows.length
-      ? selectedRows.map((row) => ({
-          streamIndex: row.streamIndex,
-          ...(row.sourceId !== file.id
-            ? { inputPath: files.find((source) => source.id === row.sourceId)?.path }
-            : {}),
-        }))
-      : selectedTrackOrder(trackOrder, layoutDefaults);
+    const selectedOrder = savedSettings
+      ? savedSettings.trackOrder?.length
+        ? structuredClone($state.snapshot(savedSettings.trackOrder))
+        : undefined
+      : selectedRows.length
+        ? selectedRows.map((row) => ({
+            streamIndex: row.streamIndex,
+            ...(row.sourceId !== targetFile.id
+              ? { inputPath: files.find((source) => source.id === row.sourceId)?.path }
+              : {}),
+          }))
+        : isolated
+          ? selectedTrackOrder(
+              [],
+              defaultTrackOrder(
+                targetFile,
+                effectiveVideoMode === 'drop' && !chunked ? undefined : targetVideoIndex,
+                targetIncluded,
+                [],
+                [targetFile],
+              ),
+            )
+          : selectedTrackOrder(trackOrder, layoutDefaults);
     const rowOverrides = selectedRows
-      .filter((row) => row.sourceId === file.id && selectedPrimary.has(row.streamIndex))
+      .filter((row) => row.sourceId === targetFile.id && selectedPrimary.has(row.streamIndex))
       .map((row) => ({
         streamIndex: row.streamIndex,
         ...(applyMetadata ? metadataValue(row) : {}),
         ...(row.defaultFlag !== null ? { default: row.defaultFlag } : {}),
         ...(row.forcedFlag !== null ? { forced: row.forcedFlag } : {}),
       }));
+    const activeRequestTemporal = isolated ? selectedTemporal(temporal) : requestTemporal;
+    const activeBurnIndex = isolated ? '' : activeBurn;
+    const isolatedSubtitles = targetFile.streams
+      .filter((stream) => stream.kind === 'subtitle')
+      .map((stream) => ({
+        streamIndex: stream.index,
+        mode: storableSubtitleMode(subtitleMode, stream, outputContainer, backend),
+      }));
+    const isolatedSourceSubtitles = selectedSubtitles(isolatedSubtitles, targetIncluded);
     return {
       source: {
-        inputPath: file.path,
-        outputPath: targetPath(destination.trim(), outputTarget()),
+        inputPath: targetFile.path,
+        outputPath: isolated ? '' : targetPath(destination.trim(), outputTarget()),
         streamIndices: selectedIndices,
       },
       settings: {
@@ -2976,7 +3434,11 @@
               },
             }
           : {}),
-        ...(pictureEnabled && hdrMetadata ? { hdrMetadata } : {}),
+        ...(pictureEnabled && hdrMetadata
+          ? { hdrMetadata }
+          : savedSettings?.hdrMetadata
+            ? { hdrMetadata: structuredClone($state.snapshot(savedSettings.hdrMetadata)) }
+            : {}),
         ...(pictureEnabled && rate.mode === 'constantQp'
           ? { constantQuantizer: rate.constantQp! }
           : {}),
@@ -2987,8 +3449,8 @@
                 .map((value) => ({ ...value })),
             }
           : {}),
-        ...(pictureEnabled && requestTemporal ? { temporal: requestTemporal } : {}),
-        videoStreamIndex: videoIndex ?? 0,
+        ...(pictureEnabled && activeRequestTemporal ? { temporal: activeRequestTemporal } : {}),
+        videoStreamIndex: targetVideoIndex ?? 0,
         ...(coverStreamIndex !== undefined ? { coverStreamIndex } : {}),
         ...(!pictureEnabled ? { videoMode: effectiveVideoMode } : {}),
         ...(chunked
@@ -3048,24 +3510,20 @@
         lineartPsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? lineartPsyBias! : 0,
         texturePsyBias: pictureEnabled && encoder === 'svtAv1FiveFish' ? texturePsyBias! : 0,
         hdrTune: pictureEnabled && encoder === 'svtAv1Hdr' ? hdrTune : 'visualQuality',
-        audio: file.streams
-          .filter(
-            (stream) => stream.kind === 'audio' && included.includes(stream.index) && !stripAudio,
-          )
-          .map((stream) => audioFor(file, stream.index)),
-        ...(!chunked &&
-        selectedSubtitles(
-          pictureEnabled
-            ? subtitles
-            : subtitles.map((track) => ({
-                ...track,
-                burnIn: false,
-                mode: track.mode === 'burnIn' ? 'copy' : track.mode,
-              })),
-          selectedIndices,
-        ).length
-          ? {
-              subtitles: selectedSubtitles(
+        audio: selectedAudio(
+          targetFile.streams
+            .filter(
+              (stream) =>
+                stream.kind === 'audio' && targetIncluded.includes(stream.index) && !stripAudio,
+            )
+            .map((stream) => audioFor(targetFile, stream.index)),
+          targetIncluded,
+        ),
+        ...(!chunked && isolated && isolatedSourceSubtitles.length
+          ? { subtitles: isolatedSourceSubtitles }
+          : !chunked &&
+              !isolated &&
+              selectedSubtitles(
                 pictureEnabled
                   ? subtitles
                   : subtitles.map((track) => ({
@@ -3073,84 +3531,137 @@
                       burnIn: false,
                       mode: track.mode === 'burnIn' ? 'copy' : track.mode,
                     })),
-                selectedIndices,
-              ),
-            }
-          : {}),
-        ...(externalRows.length
-          ? {
-              externalTracks: externalRows.map(({ row, source }) => ({
-                inputPath: source.path,
-                streamIndex: row.streamIndex,
-                ...(source.streams.find((stream) => stream.index === row.streamIndex)?.kind ===
-                  'audio' && audioCodec !== 'copy'
-                  ? {
-                      audio: (({ streamIndex: _, ...settings }) => settings)(
-                        audioFor(source, row.streamIndex),
-                      ),
-                    }
-                  : {}),
-                ...(source.streams.find((stream) => stream.index === row.streamIndex)?.kind ===
-                'subtitle'
-                  ? pictureEnabled &&
-                    source.id === mainFile?.id &&
-                    String(row.streamIndex) === activeBurn
-                    ? !row.included || stripSubs
-                      ? { subtitleMode: 'burnIn' as const }
-                      : {
-                          ...(subtitleMode !== 'copy' ? { subtitleMode } : {}),
-                          subtitleBurnIn: true,
-                        }
-                    : ((mode) => (mode !== 'copy' ? { subtitleMode: mode } : {}))(
-                        storableSubtitleMode(
-                          subtitleMode,
-                          source.streams.find((stream) => stream.index === row.streamIndex),
-                          outputContainer,
-                          backend,
-                        ),
-                      )
-                  : {}),
-                ...(applyMetadata ? metadataValue(row) : {}),
-                ...(row.defaultFlag !== null ? { default: row.defaultFlag } : {}),
-                ...(row.forcedFlag !== null ? { forced: row.forcedFlag } : {}),
-              })),
-            }
-          : externalTracks.length
-            ? { externalTracks: requestExternalTracks(externalTracks) }
+                targetIncluded,
+              ).length
+            ? {
+                subtitles: selectedSubtitles(
+                  pictureEnabled
+                    ? subtitles
+                    : subtitles.map((track) => ({
+                        ...track,
+                        burnIn: false,
+                        mode: track.mode === 'burnIn' ? 'copy' : track.mode,
+                      })),
+                  targetIncluded,
+                ),
+              }
             : {}),
-        ...(rowOverrides.length
-          ? { trackOverrides: rowOverrides }
-          : selectedOverrides.length
-            ? { trackOverrides: selectedOverrides }
-            : {}),
-        ...(selectedOrder?.length ? { trackOrder: selectedOrder } : {}),
-        ...(!chunked && !metadataSource ? { copyMetadata: false } : {}),
-        ...(!chunked && !chapterSource ? { copyChapters: false } : {}),
-        ...(!chunked && fileMode !== 'batch' && metadataSource
-          ? { metadataSourcePath: metadataSource }
-          : {}),
-        ...(!chunked && fileMode !== 'batch' && chapterSource
-          ? { chaptersSourcePath: chapterSource }
-          : {}),
-        ...(!chunked && fileMode !== 'batch' && applyMetadata && mainFile
+        ...(savedSettings
           ? {
-              outputMetadata: {
-                title: outputMetadataValue(mainFile).title.trim(),
-                language: outputMetadataValue(mainFile).language.trim(),
-              },
+              ...(savedSettings.externalTracks?.length
+                ? { externalTracks: structuredClone($state.snapshot(savedSettings.externalTracks)) }
+                : {}),
+              ...(savedSettings.trackOverrides?.length
+                ? { trackOverrides: structuredClone($state.snapshot(savedSettings.trackOverrides)) }
+                : {}),
+              ...(savedSettings.trackOrder?.length
+                ? { trackOrder: structuredClone($state.snapshot(savedSettings.trackOrder)) }
+                : {}),
+              ...(savedSettings.copyMetadata !== undefined
+                ? { copyMetadata: savedSettings.copyMetadata }
+                : {}),
+              ...(savedSettings.copyChapters !== undefined
+                ? { copyChapters: savedSettings.copyChapters }
+                : {}),
+              ...(savedSettings.metadataSourcePath
+                ? { metadataSourcePath: savedSettings.metadataSourcePath }
+                : {}),
+              ...(savedSettings.chaptersSourcePath
+                ? { chaptersSourcePath: savedSettings.chaptersSourcePath }
+                : {}),
+              ...(savedSettings.outputMetadata
+                ? { outputMetadata: structuredClone($state.snapshot(savedSettings.outputMetadata)) }
+                : {}),
+              ...(savedSettings.movTimecodeTrack
+                ? {
+                    movTimecodeTrack: structuredClone(
+                      $state.snapshot(savedSettings.movTimecodeTrack),
+                    ),
+                  }
+                : {}),
             }
-          : {}),
-        ...(chunked && metadataDonor && metadataDonor.inputPath !== file.path
-          ? { metadataSourcePath: metadataDonor.inputPath }
-          : {}),
-        ...(chunked && chaptersDonor && chaptersDonor.inputPath !== file.path
-          ? { chaptersSourcePath: chaptersDonor.inputPath }
-          : {}),
-        ...(pictureEnabled && movTimecode
-          ? { movTimecodeTrack: selectedMovTimecode(movTimecode, file) }
-          : {}),
+          : {
+              ...(!isolated && externalRows.length
+                ? {
+                    externalTracks: externalRows.map(({ row, source }) => ({
+                      inputPath: source.path,
+                      streamIndex: row.streamIndex,
+                      ...(source.streams.find((stream) => stream.index === row.streamIndex)
+                        ?.kind === 'audio' && audioCodec !== 'copy'
+                        ? {
+                            audio: (({ streamIndex: _, ...settings }) => settings)(
+                              audioFor(source, row.streamIndex),
+                            ),
+                          }
+                        : {}),
+                      ...(source.streams.find((stream) => stream.index === row.streamIndex)
+                        ?.kind === 'subtitle'
+                        ? pictureEnabled &&
+                          source.id === targetMain?.id &&
+                          String(row.streamIndex) === activeBurnIndex
+                          ? !row.included || stripSubs
+                            ? { subtitleMode: 'burnIn' as const }
+                            : {
+                                ...(subtitleMode !== 'copy' ? { subtitleMode } : {}),
+                                subtitleBurnIn: true,
+                              }
+                          : ((mode) => (mode !== 'copy' ? { subtitleMode: mode } : {}))(
+                              storableSubtitleMode(
+                                subtitleMode,
+                                source.streams.find((stream) => stream.index === row.streamIndex),
+                                outputContainer,
+                                backend,
+                              ),
+                            )
+                        : {}),
+                      ...(applyMetadata ? metadataValue(row) : {}),
+                      ...(row.defaultFlag !== null ? { default: row.defaultFlag } : {}),
+                      ...(row.forcedFlag !== null ? { forced: row.forcedFlag } : {}),
+                    })),
+                  }
+                : !isolated && externalTracks.length
+                  ? { externalTracks: requestExternalTracks(externalTracks) }
+                  : {}),
+              ...(rowOverrides.length
+                ? { trackOverrides: rowOverrides }
+                : selectedOverrides.length
+                  ? { trackOverrides: selectedOverrides }
+                  : {}),
+              ...(selectedOrder?.length ? { trackOrder: selectedOrder } : {}),
+              ...(!chunked && !metadataSource ? { copyMetadata: false } : {}),
+              ...(!chunked && !chapterSource ? { copyChapters: false } : {}),
+              ...(!chunked && !isolated && targetMode !== 'batch' && metadataSource
+                ? { metadataSourcePath: metadataSource }
+                : {}),
+              ...(!chunked && !isolated && targetMode !== 'batch' && chapterSource
+                ? { chaptersSourcePath: chapterSource }
+                : {}),
+              ...(!chunked && targetMode !== 'batch' && applyMetadata && targetMain
+                ? {
+                    outputMetadata: {
+                      title: outputMetadataValue(targetMain).title.trim(),
+                      language: outputMetadataValue(targetMain).language.trim(),
+                    },
+                  }
+                : {}),
+              ...(chunked &&
+              !isolated &&
+              metadataDonor &&
+              metadataDonor.inputPath !== targetFile.path
+                ? { metadataSourcePath: metadataDonor.inputPath }
+                : {}),
+              ...(chunked &&
+              !isolated &&
+              chaptersDonor &&
+              chaptersDonor.inputPath !== targetFile.path
+                ? { chaptersSourcePath: chaptersDonor.inputPath }
+                : {}),
+              ...(!isolated && pictureEnabled && movTimecode
+                ? { movTimecodeTrack: selectedMovTimecode(movTimecode, targetFile) }
+                : {}),
+            }),
         framing: pictureEnabled
-          ? selectedFraming(activeFraming)
+          ? selectedFraming(targetFraming)
           : selectedFraming(defaultFramingDraft()),
         ...(trim.enabled ? { trim: selectedTrim(trim), sourceTrim: true } : {}),
         ...(pictureEnabled && toneMap.enabled ? { toneMap: sourceToneMap() } : {}),
@@ -3569,11 +4080,17 @@
             entry.id,
             encodeReviewStopped
               ? { glyph: '■', text: 'Stopped' }
-              : {
-                  glyph: '✕',
-                  text: 'Failed',
-                  note: 'The command was cleared in the edit window, so nothing was run.',
-                },
+              : encodeReviewOutcome === 'canceled'
+                ? {
+                    glyph: '■',
+                    text: 'Canceled',
+                    note: 'Canceled in the command editor.',
+                  }
+                : {
+                    glyph: '✕',
+                    text: 'Failed',
+                    note: 'The command was cleared in the edit window, so nothing was run.',
+                  },
           );
           continue;
         }
@@ -3807,6 +4324,8 @@
         keepFrameCount,
       }),
     );
+    const reviewOpener =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const controller = new AbortController();
     imageAbort = controller;
     batchEncodeRun = false;
@@ -3814,6 +4333,7 @@
     error = null;
     imageProgress = 0;
     imageProgressDescription = 'Preparing image output';
+    let reviewCanceled = false;
     try {
       const resolved = await resolveOutputPath({
         inputPath: current.path,
@@ -3837,8 +4357,13 @@
       );
       if (!reviewed) {
         imageProgressDescription = 'Canceled.';
+        reviewCanceled = !controller.signal.aborted;
         if (!controller.signal.aborted)
-          onlog?.('The command was cleared in the edit window, so nothing was run.');
+          onlog?.(
+            encodeReviewOutcome === 'canceled'
+              ? 'Canceled in the command editor.'
+              : 'The command was cleared in the edit window, so nothing was run.',
+          );
         return;
       }
       if (reviewed.kind !== 'image')
@@ -3857,6 +4382,17 @@
     } finally {
       if (imageAbort === controller) imageAbort = undefined;
       submitting = false;
+      if (reviewCanceled && reviewOpener?.isConnected)
+        void tick()
+          .then(() => tick())
+          .then(() => {
+            if (
+              reviewOpener.isConnected &&
+              !reviewOpener.closest('[hidden]') &&
+              !(reviewOpener as HTMLButtonElement).disabled
+            )
+              reviewOpener.focus();
+          });
     }
   }
   async function startImage(options: RunOptions = {}) {
@@ -3868,6 +4404,8 @@
       active
     )
       return;
+    const reviewOpener =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const targets = structuredClone($state.snapshot(fileMode === 'batch' ? files : [file])),
       controller = new AbortController(),
       statusId = batchRunId('image');
@@ -4119,13 +4657,22 @@
           if (!reviewed) {
             if (controller.signal.aborted) throw new DOMException('Canceled', 'AbortError');
             imageCanceled = true;
-            imageFailed = true;
-            mark(entry.id, {
-              glyph: '✕',
-              text: 'Failed',
-              note: 'The command was cleared in the edit window, so nothing was run.',
-            });
-            onlog?.('The command was cleared in the edit window, so nothing was run.');
+            if (encodeReviewOutcome === 'canceled') {
+              mark(entry.id, {
+                glyph: '■',
+                text: 'Canceled',
+                note: 'Canceled in the command editor.',
+              });
+              onlog?.('Canceled in the command editor.');
+            } else {
+              imageFailed = true;
+              mark(entry.id, {
+                glyph: '✕',
+                text: 'Failed',
+                note: 'The command was cleared in the edit window, so nothing was run.',
+              });
+              onlog?.('The command was cleared in the edit window, so nothing was run.');
+            }
             continue;
           }
           if (reviewed.kind !== 'image')
@@ -4164,6 +4711,13 @@
                 ? 'Did not finish - the log has the details.'
                 : 'Done.';
         submitting = false;
+        if (choice.fileMode !== 'batch' && imageCanceled && reviewOpener?.isConnected)
+          void tick()
+            .then(() => tick())
+            .then(() => {
+              if (reviewOpener.isConnected && !(reviewOpener as HTMLButtonElement).disabled)
+                reviewOpener.focus();
+            });
       }
     }
   }
@@ -4237,6 +4791,8 @@
       preset: temporal.qtgmcPreset,
       resizeFilter: temporal.resizeFilter,
     };
+    const reviewOpener =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const controller = new AbortController();
     imageAbort = controller;
     batchEncodeRun = runMode === 'batch';
@@ -4246,6 +4802,7 @@
     imageProgressDescription = batchEncodeRun ? 'Preparing batch…' : 'Resolving output path…';
     submitting = true;
     error = null;
+    let reviewCanceled = false;
     const generation = draftGeneration;
     const identity = draftIdentity;
     try {
@@ -4315,8 +4872,13 @@
           (job) => (batchCurrentJobId = job.id),
         );
         if (!reviewed) {
+          reviewCanceled = !controller.signal.aborted && !encodeReviewStopped;
           if (!controller.signal.aborted && !encodeReviewStopped)
-            onlog?.('The command was cleared in the edit window, so nothing was run.');
+            onlog?.(
+              encodeReviewOutcome === 'canceled'
+                ? 'Canceled in the command editor.'
+                : 'The command was cleared in the edit window, so nothing was run.',
+            );
           return;
         }
         if (reviewed.kind !== 'encode')
@@ -4345,6 +4907,17 @@
       batchPendingSource = undefined;
       singlePreparing = false;
       submitting = false;
+      if (reviewCanceled && reviewOpener?.isConnected)
+        void tick()
+          .then(() => tick())
+          .then(() => {
+            if (
+              reviewOpener.isConnected &&
+              !reviewOpener.closest('[hidden]') &&
+              !(reviewOpener as HTMLButtonElement).disabled
+            )
+              reviewOpener.focus();
+          });
     }
   }
 </script>
@@ -4364,13 +4937,20 @@
           tabindex={settingsTab === tab.id ? 0 : -1}
           class:active={settingsTab === tab.id}
           onkeydown={(event) => tabKeys(event, index)}
-          onclick={() => (settingsTab = tab.id)}
+          onclick={(event) => {
+            settingsTab = tab.id;
+            event.currentTarget.scrollIntoView({
+              block: 'nearest',
+              inline: 'nearest',
+              container: 'nearest',
+            } as ScrollIntoViewOptions);
+          }}
         >
           {tab.label}
         </button>{/each}
     </div>
     <!-- Several files can be loaded; say which one Run encodes. -->
-    {#if backend === 'standalone' && !usableSource && !files.length && onaddfiles}
+    {#if !usableSource && !files.length && onaddfiles}
       <button type="button" onclick={onaddfiles} disabled={!desktop || addingFiles}>
         Add Files…
       </button>
@@ -4507,62 +5087,65 @@
               </option><option value="targetSize">Target Filesize (MB)</option>
             </select>{/if}
           <label for={`${idPrefix}-quality`}>Quality</label>
-          {#if isImage}<input
-              id={`${idPrefix}-quality`}
-              type="number"
-              min={videoChoice === 'gif' ? 3 : 1}
-              max={videoChoice === 'gif' ? 256 : 31}
-              bind:value={imageQuality}
-              disabled={videoChoice === 'png'}
-            />{:else if chunked && av1an.targetEnabled}<input
-              id={`${idPrefix}-quality`}
-              type="number"
-              min={metricFields[av1an.target.metric]?.min}
-              max={metricFields[av1an.target.metric]?.max}
-              step={metricFields[av1an.target.metric]?.step}
-              value={av1an.target.minimumScoreTenths / 10}
-              oninput={(event) => {
-                const value = event.currentTarget.valueAsNumber;
-                if (!Number.isFinite(value)) return;
-                const tenths = Math.round(value * 10);
-                av1an = {
-                  ...av1an,
-                  target: {
-                    ...av1an.target,
-                    minimumScoreTenths: tenths,
-                    maximumScoreTenths: tenths,
-                  },
-                };
-              }}
-            />
-          {:else if rate.mode === 'bitrate'}<input
-              id={`${idPrefix}-quality`}
-              type="number"
-              min="10"
-              max="100000"
-              step="1"
-              bind:value={rate.bitrate}
-              disabled={!encodingVideo}
-            />{:else if rate.mode === 'targetSize'}<input
-              id={`${idPrefix}-quality`}
-              type="number"
-              min="0"
-              max="8192"
-              step="0.1"
-              bind:value={rate.targetSize}
-              disabled={!encodingVideo}
-            />{:else}<input
-              id={`${idPrefix}-quality`}
-              type="number"
-              min={options.crfMin}
-              max={options.crfMax}
-              step={1}
-              bind:value={crf}
-              disabled={!encodingVideo}
-              aria-describedby={isSvtEncoder(encoder) && crf === 0 && encodingVideo
-                ? `${idPrefix}-svt-zero-hint`
-                : undefined}
-            />{/if}
+          <div class="inline quality-inline">
+            {#if isImage}<input
+                id={`${idPrefix}-quality`}
+                type="number"
+                min={videoChoice === 'gif' ? 3 : 1}
+                max={videoChoice === 'gif' ? 256 : 31}
+                bind:value={imageQuality}
+                disabled={videoChoice === 'png'}
+              />{:else if chunked && av1an.targetEnabled}<input
+                id={`${idPrefix}-quality`}
+                type="number"
+                min={metricFields[av1an.target.metric]?.min}
+                max={metricFields[av1an.target.metric]?.max}
+                step={metricFields[av1an.target.metric]?.step}
+                value={av1an.target.minimumScoreTenths / 10}
+                oninput={(event) => {
+                  const value = event.currentTarget.valueAsNumber;
+                  if (!Number.isFinite(value)) return;
+                  const tenths = Math.round(value * 10);
+                  av1an = {
+                    ...av1an,
+                    target: {
+                      ...av1an.target,
+                      minimumScoreTenths: tenths,
+                      maximumScoreTenths: tenths,
+                    },
+                  };
+                }}
+              />
+            {:else if rate.mode === 'bitrate'}<input
+                id={`${idPrefix}-quality`}
+                type="number"
+                min="10"
+                max="100000"
+                step="1"
+                bind:value={rate.bitrate}
+                disabled={!encodingVideo}
+              />{:else if rate.mode === 'targetSize'}<input
+                id={`${idPrefix}-quality`}
+                type="number"
+                min="0"
+                max="8192"
+                step="0.1"
+                bind:value={rate.targetSize}
+                disabled={!encodingVideo}
+              />{:else}<input
+                id={`${idPrefix}-quality`}
+                type="number"
+                min={options.crfMin}
+                max={options.crfMax}
+                step={1}
+                bind:value={crf}
+                disabled={!encodingVideo}
+                aria-describedby={isSvtEncoder(encoder) && crf === 0 && encodingVideo
+                  ? `${idPrefix}-svt-zero-hint`
+                  : undefined}
+              />{/if}
+            <span class="quality-hint" id={`${idPrefix}-quality-hint`}>{qualityHint}</span>
+          </div>
           {#if encodingVideo && !isImage && isSvtEncoder(encoder) && crf === 0 && rate.mode === 'quality' && (!chunked || !av1an.targetEnabled)}
             <p class="field-hint" id={`${idPrefix}-svt-zero-hint`}>
               The documented SVT CRF range starts at 1; 0 is not lossless.
@@ -4652,6 +5235,7 @@
                 </option>{/each}
             </select>{#if tenBitNote}<p
                 class="geometry-readout subtitle-note"
+                role="note"
                 aria-label="Bit depth"
               >
                 {tenBitNote}
@@ -4675,7 +5259,9 @@
               Configure…
             </button>{#if trim.enabled}<button type="button" onclick={() => (trim = defaultTrim())}>
                 Clear
-              </button><span class="trim-range" aria-label="Trim range">{trimRange}</span>{/if}
+              </button><output class="trim-range" aria-label="Trim range" aria-live="off">
+                {trimRange}
+              </output>{/if}
           </div>
           <label for={`${idPrefix}-crop`}>Crop</label>
           <div class="inline">
@@ -4708,9 +5294,14 @@
                 Configure…
               </button>{/if}
           </div>
-          <p class="geometry-readout" aria-label="Output dimensions" title={geometry.resize}>
+          <output
+            class="geometry-readout"
+            aria-label="Output dimensions"
+            aria-live="off"
+            title={geometry.resize}
+          >
             {geometry.resize}
-          </p>
+          </output>
           <label for={`${idPrefix}-borders`}>Borders</label><select
             id={`${idPrefix}-borders`}
             value={framing.borderRatio}
@@ -4725,9 +5316,14 @@
               21:9 (Ultrawide)
             </option>
           </select>
-          <p class="geometry-readout" aria-label="Padding outcome" title={geometry.border}>
+          <output
+            class="geometry-readout"
+            aria-label="Padding outcome"
+            aria-live="off"
+            title={geometry.border}
+          >
             {geometry.border}
-          </p>
+          </output>
         </div>
         <div class="form">
           <label for={`${idPrefix}-grain`}>Grain Synthesis</label>
@@ -4956,12 +5552,19 @@
         <label for={`${idPrefix}-audio-bitrate`}>Bitrate (Kbps)</label><input
           id={`${idPrefix}-audio-bitrate`}
           type="number"
-          min="0"
+          min="8"
           max="8192"
           step="8"
+          aria-invalid={audioSettingsIssue ? 'true' : 'false'}
+          aria-describedby={audioSettingsIssue ? `${idPrefix}-audio-bitrate-error` : undefined}
           bind:value={audioBitrate}
           disabled={stripAudio || audioCodec === 'copy' || audioCodec === 'flac' || perTrackAudio}
         />
+        {#if audioSettingsIssue}
+          <p id={`${idPrefix}-audio-bitrate-error`} class="field-hint audio-error" role="alert">
+            {audioSettingsIssue}
+          </p>
+        {/if}
         <label for={`${idPrefix}-audio-channels`}>Channels</label><select
           id={`${idPrefix}-audio-channels`}
           bind:value={audioChannels}
@@ -4985,6 +5588,7 @@
               {flattenedStyledNote}
             </p>{/if}{#if leftOutImageSubtitlesNote}<p
               class="geometry-readout subtitle-note"
+              role="note"
               aria-label="Image subtitles"
             >
               {leftOutImageSubtitlesNote}
@@ -5037,6 +5641,7 @@
             {flattenedStyledNote}
           </p>{/if}{#if leftOutImageSubtitlesNote}<p
             class="geometry-readout subtitle-note"
+            role="note"
             aria-label="Image subtitles"
           >
             {leftOutImageSubtitlesNote}
@@ -5066,7 +5671,14 @@
         <input type="checkbox" bind:checked={applyMetadata} /> Apply the titles and languages below
       </label>
       <table class="metadata-table">
-        <thead><tr><th>Track</th><th>Title</th><th>Lang</th></tr></thead><tbody>
+        <caption class="visually-hidden">Track titles and languages</caption>
+        <thead>
+          <tr>
+            <th scope="col">Track</th>
+            <th scope="col">Title</th>
+            <th scope="col">Lang</th>
+          </tr>
+        </thead><tbody>
           {#if mainFile && fileMode !== 'batch'}<tr>
               <td>Output File</td><td>
                 <input
@@ -5106,6 +5718,20 @@
                 />
               </td>
             </tr>{/each}
+          {#if fileMode === 'batch'}
+            <tr>
+              <td colspan="3" class="small-muted">
+                Batch mode preserves each file's own tracks; individual track metadata is edited in
+                Muxing Mode.
+              </td>
+            </tr>
+          {:else if !mainFile && !tracks.some((t) => t.included)}
+            <tr>
+              <td colspan="3" class="small-muted">
+                Load tracks in Track List to edit output and per-track titles and languages.
+              </td>
+            </tr>
+          {/if}
         </tbody>
       </table>
     {:else if settingsTab === 'av1an'}
@@ -5207,8 +5833,56 @@
           Add
         </button><button
           type="button"
+          disabled={selectedFilterIndex === null ||
+            selectedFilterIndex <= 0 ||
+            selectedFilterIndex >= av1anFilters.length}
+          aria-label="Move filter up"
           onclick={() => {
-            const index = selectedFilterIndex ?? av1anFilters.length - 1;
+            if (
+              selectedFilterIndex === null ||
+              selectedFilterIndex <= 0 ||
+              selectedFilterIndex >= av1anFilters.length
+            )
+              return;
+            const i = selectedFilterIndex;
+            const next = [...av1anFilters];
+            [next[i - 1], next[i]] = [next[i], next[i - 1]];
+            av1anFilters = next;
+            selectedFilterIndex = i - 1;
+          }}
+        >
+          ▲
+        </button><button
+          type="button"
+          disabled={selectedFilterIndex === null ||
+            selectedFilterIndex < 0 ||
+            selectedFilterIndex >= av1anFilters.length - 1}
+          aria-label="Move filter down"
+          onclick={() => {
+            if (
+              selectedFilterIndex === null ||
+              selectedFilterIndex < 0 ||
+              selectedFilterIndex >= av1anFilters.length - 1
+            )
+              return;
+            const i = selectedFilterIndex;
+            const next = [...av1anFilters];
+            [next[i], next[i + 1]] = [next[i + 1], next[i]];
+            av1anFilters = next;
+            selectedFilterIndex = i + 1;
+          }}
+        >
+          ▼
+        </button><button
+          type="button"
+          disabled={!av1anFilters.length}
+          onclick={() => {
+            const index =
+              selectedFilterIndex !== null &&
+              selectedFilterIndex >= 0 &&
+              selectedFilterIndex < av1anFilters.length
+                ? selectedFilterIndex
+                : av1anFilters.length - 1;
             if (index >= 0) av1anFilters = av1anFilters.filter((_, i) => i !== index);
             selectedFilterIndex = null;
           }}
@@ -5217,11 +5891,13 @@
         </button>
       </div>
       <table>
+        <caption class="visually-hidden">Video filters</caption>
         <thead><tr><th scope="col">Filter</th></tr></thead><tbody>
           {#each av1anFilters as filter, index}<tr>
               <td>
                 <input
                   aria-label={`Filter ${index + 1}`}
+                  placeholder="e.g. eq=contrast=1.05 or scale=1280:-2"
                   value={filter}
                   onfocus={() => (selectedFilterIndex = index)}
                   oninput={(event) => {
@@ -5231,7 +5907,14 @@
                   }}
                 />
               </td>
-            </tr>{/each}
+            </tr>{:else}
+            <tr>
+              <td class="small-muted">
+                No custom video filters added. Click Add to enter raw FFmpeg filter expressions in
+                order.
+              </td>
+            </tr>
+          {/each}
         </tbody>
       </table>
     {/if}
@@ -5294,9 +5977,9 @@
       {containerIssue}
     </p>{/if}{#if encodingVideo && subtitleIssue}<p role="alert">
       {subtitleIssue}
-    </p>{/if}{#if parsedHdr.error}<p role="alert">{parsedHdr.error}</p>{/if}{#if gridGrainIssue}<p
-      role="alert"
-    >
+    </p>{/if}{#if parsedHdr.error}<p role="alert">
+      {parsedHdr.error}
+    </p>{/if}{#if gridGrainIssue}<p role="alert">
       {gridGrainIssue}
     </p>{/if}{#if gridGrain && grainMode !== 'disabled'}<p>
       The Advanced grain table takes precedence over grain analysis.
@@ -5306,12 +5989,13 @@
   open={commandDialogOpen}
   program={commandDialogProgram}
   bind:value={commandDialogText}
+  planRequest={commandDialogPlanRequest}
   onconfirm={() => closeCommandDialog(true)}
   oncancel={() => closeCommandDialog()}
 />
 <SourceDialog
   title="Resume AV1AN Encode"
-  open={recoveryDialog === 'list'}
+  open={visible && recoveryDialog === 'list'}
   onclose={() => (recoveryDialog = null)}
   width={820}
 >
@@ -5320,12 +6004,13 @@
       ? 'Unfinished av1an encodes found in the temp folder. Pick one to resume or delete.'
       : 'No unfinished av1an encodes were found in the temp folder.'}
   </p>
+  <!-- svelte-ignore a11y_autofocus -->
   <div
     class="recovery-list"
     role="listbox"
     aria-label="Unfinished AV1AN encodes"
     tabindex="0"
-    data-dialog-initial-focus
+    autofocus
     use:recoveryKeys
   >
     {#each recoveries as entry (entry.job.id)}<button
@@ -5339,38 +6024,108 @@
         {recoveryLabel(entry)}
       </button>{/each}
   </div>
+  {#if selectedRecovery}
+    <p class="recovery-guide">
+      <strong>Resume (Saved Settings)</strong> continues from saved parameters.
+      <strong>Resume (New Settings)</strong> keeps completed chunks and saved per-chunk CRF/preset, applying
+      current filters to unfinished chunks and current concatenation settings when joining. Hold Shift
+      while clicking a Resume button to edit arguments before running.
+    </p>
+  {/if}
   {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
-  <div class="dialog-actions">
-    <button
-      type="button"
-      disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('deleteEncode')}
-    >
-      Delete Encode
-    </button><button
-      type="button"
-      disabled={recoveryBusy || !recoverySelected}
-      onclick={() => void recoveryAction('deleteChunks')}
-    >
-      Delete Chunks
-    </button><button
-      type="button"
-      disabled={recoveryBusy || !recoverySelected}
-      onclick={(event) => void recoveryAction('resumeNew', event.shiftKey)}
-    >
-      Resume (New Settings)
-    </button><button
-      type="button"
-      disabled={recoveryBusy || !recoverySelected}
-      onclick={(event) => void recoveryAction('resumeSaved', event.shiftKey)}
-    >
-      Resume (Saved Settings)
-    </button>
+  <div class="dialog-actions recovery-actions">
+    <div class="recovery-danger-group">
+      <button
+        type="button"
+        class="danger-btn"
+        disabled={recoveryBusy || !selectedRecovery}
+        onclick={() =>
+          selectedRecovery &&
+          (recoveryConfirm = { action: 'deleteEncode', entry: selectedRecovery })}
+      >
+        Delete Encode
+      </button><button
+        type="button"
+        class="danger-btn"
+        disabled={recoveryBusy || !selectedRecovery}
+        onclick={() =>
+          selectedRecovery &&
+          (recoveryConfirm = { action: 'deleteChunks', entry: selectedRecovery })}
+      >
+        Delete Chunks
+      </button>
+    </div>
+    <div class="recovery-resume-group">
+      <button
+        type="button"
+        disabled={recoveryBusy || !selectedRecovery}
+        onclick={(event) => void recoveryAction('resumeNew', event.shiftKey)}
+      >
+        Resume (New Settings)
+      </button><button
+        type="button"
+        class="primary-btn"
+        disabled={recoveryBusy || !selectedRecovery}
+        onclick={(event) => void recoveryAction('resumeSaved', event.shiftKey)}
+      >
+        Resume (Saved Settings)
+      </button>
+    </div>
   </div>
 </SourceDialog>
 <SourceDialog
+  title={recoveryConfirm?.action === 'deleteEncode'
+    ? 'Delete unfinished AV1AN encode?'
+    : 'Delete encoded AV1AN chunks?'}
+  open={visible && recoveryConfirm !== null}
+  onclose={() => (recoveryConfirm = null)}
+  width={480}
+>
+  {#if recoveryConfirm}
+    <p>
+      <strong>{recoveryConfirm.entry.job.request.inputPath.split(/[\\/]/).at(-1)}</strong> ·
+      {recoveryConfirm.entry.chunkCount} chunks ·
+      {recoveryFormatBytes(recoveryConfirm.entry.encodedBytes)}
+    </p>
+    <p class="recovery-confirm-note">
+      {#if recoveryConfirm.action === 'deleteEncode'}
+        This permanently deletes the entire AV1AN recovery workspace, including all encoded chunks,
+        prepared source bytes, and scene/index receipts. Your original source file is untouched.
+      {:else}
+        This permanently deletes completed chunks and encode progress so chunks must be re-encoded.
+        Verified source preparation and scene/index receipts remain kept; your original source file
+        is untouched.
+      {/if}
+    </p>
+    <div class="dialog-actions">
+      <!-- svelte-ignore a11y_autofocus -->
+      <button
+        type="button"
+        autofocus
+        disabled={recoveryBusy}
+        onclick={() => (recoveryConfirm = null)}
+      >
+        Keep saved work
+      </button>
+      <button
+        type="button"
+        class="danger-btn"
+        disabled={recoveryBusy}
+        onclick={() => {
+          const pendingConfirm = recoveryConfirm;
+          recoveryConfirm = null;
+          if (pendingConfirm)
+            void recoveryAction(pendingConfirm.action, false, pendingConfirm.entry.job.id);
+        }}
+      >
+        {recoveryConfirm.action === 'deleteEncode' ? 'Delete Encode' : 'Delete Chunks'}
+      </button>
+    </div>
+  {/if}
+</SourceDialog>
+<SourceDialog
   title="Clear all av1an temp files?"
-  open={recoveryDialog === 'clear'}
+  open={visible && recoveryDialog === 'clear'}
   onclose={() => (recoveryDialog = null)}
 >
   <p>
@@ -5385,12 +6140,8 @@
   </p>
   {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
   <div class="dialog-actions">
-    <button
-      type="button"
-      data-dialog-initial-focus
-      disabled={recoveryBusy}
-      onclick={() => (recoveryDialog = null)}
-    >
+    <!-- svelte-ignore a11y_autofocus -->
+    <button type="button" autofocus disabled={recoveryBusy} onclick={() => (recoveryDialog = null)}>
       No
     </button><button
       type="button"
@@ -5410,6 +6161,8 @@
         style:top={`${(100 * (framing.crop.top ?? 0)) / selectedVideo.height}%`}
         style:bottom={`${(100 * (framing.crop.bottom ?? 0)) / selectedVideo.height}%`}
       ></span>
+    </div>{:else if cropPreviewLoading}<div class="crop-preview crop-preview-empty" role="status">
+      <span>Loading preview…</span>
     </div>{/if}
   {#if storedRotation}<p class="crop-note">
       This video is stored as {selectedVideo?.width}×{selectedVideo?.height} and shown rotated {storedRotation}°.
@@ -5442,7 +6195,7 @@
     {cropReadout}
   </p>
   <div class="dialog-actions">
-    <button
+    <button type="button" onclick={cancelEdit}>Cancel</button><button
       type="button"
       onclick={() => {
         framing = { ...framing, crop: { top: 0, right: 0, bottom: 0, left: 0 } };
@@ -5537,29 +6290,32 @@
       </option><option value="area">Area</option><option value="nearest">Nearest neighbor</option>
     </select>
   </div>
-  <label>
-    <input
-      type="checkbox"
-      bind:checked={framing.resizeAllowUpscale}
-      disabled={framing.resizeMode === 'percent' ||
-        (framing.resizeMode === 'exact' && framing.resizeFill !== 'pad')}
-    /> Allow upscaling past the source's own size
-  </label><br /><label>
-    <input
-      type="checkbox"
-      bind:checked={framing.resizeCorrectAspect}
-      disabled={(() => {
-        const [n, d] = (selectedVideo?.sampleAspectRatio ?? '1:1').split(/[:/]/).map(Number);
-        return !n || !d || n === d;
-      })()}
-    /> Correct non-square pixels
-  </label>
+  <div class="resize-checks">
+    <label>
+      <input
+        type="checkbox"
+        bind:checked={framing.resizeAllowUpscale}
+        disabled={framing.resizeMode === 'percent' ||
+          (framing.resizeMode === 'exact' && framing.resizeFill !== 'pad')}
+      /> Allow upscaling past the source's own size
+    </label>
+    <label>
+      <input
+        type="checkbox"
+        bind:checked={framing.resizeCorrectAspect}
+        disabled={(() => {
+          const [n, d] = (selectedVideo?.sampleAspectRatio ?? '1:1').split(/[:/]/).map(Number);
+          return !n || !d || n === d;
+        })()}
+      /> Correct non-square pixels
+    </label>
+  </div>
   <h3>RESULT</h3>
   <p>
     {resizeDialogDescription(activeFraming, geometryStream)}
   </p>
   <div class="dialog-actions">
-    <button
+    <button type="button" onclick={cancelEdit}>Cancel</button><button
       type="button"
       onclick={() => {
         framing = {
@@ -5596,6 +6352,7 @@
 <SourceDialog title="Configure Audio Tracks" open={dialog === 'audio'} onclose={cancelEdit}>
   <p>Configure channels and bitrate for each audio track.</p>
   <table>
+    <caption class="visually-hidden">Per-track audio channels and bitrate</caption>
     <thead>
       <tr>
         <th scope="col">Track</th>
@@ -5633,7 +6390,7 @@
     </tbody>
   </table>
   <div class="dialog-actions">
-    <button
+    <button type="button" onclick={cancelEdit}>Cancel</button><button
       type="button"
       onclick={() => {
         perTrackRows = perTrackRows.map((row) => ({
@@ -5653,7 +6410,7 @@
 <style>
   .recovery-list {
     min-height: 220px;
-    max-height: 45vh;
+    max-height: 45dvh;
     overflow: auto;
     border: 1px solid var(--border);
     display: flex;
@@ -5662,6 +6419,7 @@
   .recovery-list button {
     text-align: left;
     border: 0;
+    border-inline-start: 3px solid transparent;
     background: transparent;
     padding: 6px;
     color: inherit;
@@ -5671,7 +6429,7 @@
   }
   .recovery-list button.selected {
     background: var(--accent);
-    box-shadow: inset 3px 0 var(--primary);
+    border-inline-start-color: var(--primary);
   }
   .source-encode {
     display: flex;
@@ -5679,6 +6437,7 @@
     min-height: 0;
     height: 100%;
     gap: 8px;
+    container-type: inline-size;
   }
   .tabs-bar {
     display: flex;
@@ -5709,7 +6468,8 @@
     background: var(--secondary);
     color: var(--foreground);
   }
-  .tabs button[aria-selected='true'] {
+  .tabs button[aria-selected='true'],
+  .tabs button[aria-selected='true']:hover {
     color: var(--primary-foreground);
     background: var(--primary);
     border-color: var(--primary);
@@ -5720,12 +6480,57 @@
     inset: auto 0 0;
     border-bottom: 2px solid var(--primary-foreground);
   }
+  .crop-preview-empty {
+    width: 100%;
+    height: 150px;
+    display: grid;
+    place-items: center;
+    background: var(--muted);
+    color: var(--muted-foreground);
+    line-height: 1.4;
+  }
+  .recovery-guide,
+  .recovery-confirm-note {
+    margin-top: 8px;
+    color: var(--muted-foreground);
+    font-size: 0.6906rem;
+    line-height: 1.45;
+  }
+  .recovery-actions {
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .recovery-danger-group,
+  .recovery-resume-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  button.danger-btn {
+    border-color: var(--destructive);
+    color: var(--destructive);
+  }
+  button.danger-btn:hover:not(:disabled) {
+    background: var(--destructive);
+    color: var(--primary-foreground);
+  }
+  button.primary-btn {
+    border-color: var(--primary);
+    background: var(--primary);
+    color: var(--primary-foreground);
+    font-weight: 600;
+  }
+  button.primary-btn:hover:not(:disabled) {
+    background: var(--jesses-primary-hover);
+    color: var(--primary-foreground);
+  }
   .crop-preview {
     position: relative;
     width: fit-content;
     max-width: 100%;
     margin: 0 auto 10px;
-    overflow: hidden;
+    overflow: clip;
     line-height: 0;
     background: #111;
   }
@@ -5740,16 +6545,22 @@
     box-shadow: 0 0 0 9999px #0009;
     pointer-events: none;
   }
+  @media (forced-colors: active) {
+    .crop-keep {
+      border-color: Highlight;
+      outline: 1px solid CanvasText;
+    }
+  }
   .trim-range {
     align-self: center;
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     white-space: nowrap;
   }
   .crop-note {
     margin: 0 0 10px;
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     line-height: 1.4;
   }
   .source-name {
@@ -5759,7 +6570,7 @@
     overflow: hidden;
     padding-left: 12px;
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -5788,7 +6599,7 @@
     grid-template-columns: minmax(88px, 105px) minmax(0, 1fr);
     align-items: center;
     gap: 5px 8px;
-    font-size: 1rem;
+    font-size: 0.8125rem;
     min-width: 0;
   }
   .field-hint {
@@ -5820,20 +6631,32 @@
   .video-columns .form > select[id$='-preset'] {
     width: min(100%, 9ch);
   }
-  .video-columns .form > input[id$='-quality'] {
-    width: min(100%, 8ch);
+  .video-columns .form > input[id$='-quality'],
+  .video-columns .inline > input[id$='-quality'] {
+    width: min(100%, 10ch);
+  }
+  .video-columns .inline.quality-inline {
+    flex-wrap: nowrap;
+  }
+  .quality-hint {
+    color: var(--muted-foreground);
+    font-size: 0.6906rem;
+    white-space: nowrap;
   }
   .video-columns .form > input[id$='-fps'] {
     width: min(100%, 15ch);
   }
   .video-columns .inline > select {
-    width: min(100%, 22ch);
+    width: min(100%, 26ch);
+  }
+  .video-columns .inline > select[id$='-resize'] {
+    width: min(100%, 28ch);
   }
   .video-columns .inline > select[id$='-deinterlace'] {
     width: 190px;
     flex: 0 0 190px;
   }
-  @media (max-width: 1050px) {
+  @container (inline-size <= 1015px) {
     .video-columns {
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 6px 16px;
@@ -5850,6 +6673,13 @@
     .video-columns .form {
       row-gap: 2px;
     }
+    .video-columns .inline > select,
+    .video-columns .inline > select[id$='-resize'] {
+      width: min(100%, 22ch);
+    }
+    .video-columns .inline input[type='number'] {
+      width: 65px;
+    }
     /* Leave room for Windows native control metrics in the two-column form. */
     .video-columns select,
     .video-columns input:not([type='checkbox']),
@@ -5858,15 +6688,21 @@
     }
   }
   .geometry-readout {
+    display: block;
     grid-column: 1 / -1;
     min-width: 0;
     margin: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     line-height: 1.15;
     color: var(--muted-foreground);
+  }
+  .resize-checks {
+    display: grid;
+    gap: 4px;
+    margin: 8px 0;
   }
   .subtitle-note {
     margin-top: 4px;
@@ -5906,10 +6742,10 @@
     font: inherit;
   }
   .form input[type='number'] {
-    width: 8ch;
+    width: 11ch;
   }
   .inline input[type='number'] {
-    width: 65px;
+    width: 82px;
   }
   button {
     cursor: pointer;
@@ -5919,14 +6755,14 @@
     padding: 5px 10px;
     font: inherit;
   }
-  button:hover:not(:disabled) {
+  button:hover:not(:disabled):not([aria-selected='true']) {
     background: var(--secondary);
   }
   .output {
     display: flex;
     gap: 6px;
     align-items: center;
-    font-size: 1rem;
+    font-size: 0.8125rem;
   }
   .output input {
     flex: 1;
@@ -5938,7 +6774,7 @@
     gap: 8px;
     flex: 1;
     min-width: 0;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .batch-output dl {
     display: grid;
@@ -5964,7 +6800,7 @@
   }
   .output-extension {
     color: var(--muted-foreground);
-    font-size: 1rem;
+    font-size: 0.8125rem;
   }
   .metadata-head,
   .filter-head {
@@ -5978,11 +6814,11 @@
     flex: 1;
   }
   h3 {
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     margin: 14px 0 8px;
   }
   p {
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   /* A reason that blocks Run must read as an error, not as a hint. */
   p[role='alert'] {
@@ -5993,7 +6829,7 @@
     width: 100%;
     border-collapse: collapse;
     margin-top: 8px;
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   th,
   td {

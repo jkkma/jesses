@@ -63,8 +63,8 @@ test('selected tracks with colliding indices retain independent metadata, order 
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
   await tracks
-    .getByRole('listbox', { name: 'Tracks' })
-    .getByRole('option', { name: /Voice/ })
+    .getByRole('grid', { name: 'Tracks' })
+    .locator('.track-option', { hasText: /Voice/ })
     .click();
   await tracks.getByRole('button', { name: 'Move track up' }).click();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();

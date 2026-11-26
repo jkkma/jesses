@@ -15,6 +15,7 @@
     resolveDeinterlace,
     setMediaAnalysisPaused,
   } from '$lib/ipc/client';
+  import { copyTextWithFeedback } from '$lib/components/shared/clipboard';
   import {
     errorMessage,
     fileName,
@@ -54,6 +55,7 @@
     registerAction,
     onbatchstatus,
     onlog,
+    onswitchtomux,
   }: {
     files: MediaFile[];
     file?: MediaFile;
@@ -66,6 +68,7 @@
       begin?: boolean,
     ) => void;
     onlog: (message: string, error?: boolean) => void;
+    onswitchtomux?: () => void;
   } = $props();
   type Task =
     | 'bitrates'
@@ -160,11 +163,14 @@
   let task = $state<Task | null>(null),
     dialog = $state<Dialog>(null),
     activeTask = $state<Task | null>(null),
+    runningLabel = $state(''),
     paused = $state(false),
     pausing = $state(false),
     analysisId = $state<string | null>(null),
     progress = $state<UtilityProgress | null>(null);
   let completedStatus = $state('');
+  let ladderCopied = $state(false);
+  let ladderCopyTimer: ReturnType<typeof setTimeout> | undefined;
   const pending = $derived(activeTask !== null);
   let unsupportedBatchTask = $state<Task | null>(null);
   const batchReasons: Partial<Record<Task, string>> = {
@@ -262,17 +268,29 @@
         )
       : [],
   );
+  const CHART_VB_WIDTH = 640,
+    CHART_PLOT_LEFT = 56,
+    CHART_PLOT_RIGHT = 624,
+    CHART_PLOT_WIDTH = CHART_PLOT_RIGHT - CHART_PLOT_LEFT;
+  function chartX(index: number, count: number) {
+    return CHART_PLOT_LEFT + (index * CHART_PLOT_WIDTH) / Math.max(1, count - 1);
+  }
   function chartIndex(event: PointerEvent) {
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    return Math.max(
-      0,
-      Math.min(
-        (chartResult?.points.length ?? 1) - 1,
-        Math.round(
-          ((event.clientX - rect.left) / rect.width) * ((chartResult?.points.length ?? 1) - 1),
-        ),
-      ),
-    );
+    const svg = (event.currentTarget as HTMLElement).querySelector('svg') as SVGSVGElement | null;
+    const ctm = svg?.getScreenCTM();
+    let svgX: number;
+    if (svg && ctm) {
+      const point = svg.createSVGPoint();
+      point.x = event.clientX;
+      point.y = event.clientY;
+      svgX = point.matrixTransform(ctm.inverse()).x;
+    } else {
+      const rect = (svg ?? (event.currentTarget as HTMLElement)).getBoundingClientRect();
+      svgX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * CHART_VB_WIDTH;
+    }
+    const last = Math.max(0, (chartResult?.points.length ?? 1) - 1);
+    const ratio = (svgX - CHART_PLOT_LEFT) / CHART_PLOT_WIDTH;
+    return Math.max(0, Math.min(last, Math.round(ratio * last)));
   }
   let dialogMetricsEncoded = $state(''),
     dialogMetricsReference = $state('');
@@ -412,15 +430,99 @@
     ocr: 'Subtitle OCR',
   };
   const mainVideo = $derived(file?.streams.find((item) => item.kind === 'video'));
-  const eligible = $derived(!!task && isDesktop() && !pending);
+  const configuredColorSource = $derived(files.find((item) => item.path === colorSource));
+  const colorTargetFile = $derived(
+    fileMode === 'batch' ? undefined : files.find((item) => item.path === colorTarget),
+  );
+  const colorDonorMissing = $derived(
+    fileMode !== 'batch' && !!colorTargetFile && !configuredColorSource,
+  );
+  const activeColorSource = $derived(
+    configuredColorSource ?? (colorTargetFile ? undefined : (file ?? files[0])),
+  );
+  const utilityBlocked = $derived.by<{ reason: string; action?: () => void } | null>(() => {
+    if (!isDesktop()) return { reason: 'Open jesses in the desktop app to run utilities.' };
+    if (!task) return { reason: 'Pick a utility above to continue.' };
+    if (fileMode === 'batch' && batchReasons[task]) {
+      return {
+        reason: `${labels[task]} cannot be run per file. Switch to Muxing Mode to use it.`,
+        action: onswitchtomux,
+      };
+    }
+    if (!files.length) return { reason: 'Load a file in File List to run this utility.' };
+    if (task === 'metrics') {
+      if (files.length < 2)
+        return { reason: 'Load at least two files in File List to compare quality.' };
+      if (!metricsVmaf && !metricsSsim && !metricsPsnr)
+        return {
+          reason: 'Select at least one metric in Quality Metrics.',
+          action: () => choose('metrics', true),
+        };
+      if (
+        !files.some((item) => item.path === metricsEncoded) ||
+        !files.some((item) => item.path === metricsReference)
+      )
+        return {
+          reason: 'Choose the source and encoded files in Quality Metrics.',
+          action: () => choose('metrics', true),
+        };
+      return null;
+    }
+    if (task === 'concat') {
+      if (files.length < 2)
+        return { reason: 'Load at least two files in File List to concatenate.' };
+      if (files.length > 512)
+        return { reason: 'Concatenation supports at most 512 files at once.' };
+      return null;
+    }
+    if (task === 'color') {
+      if (fileMode === 'batch') {
+        if (!files.some((item) => item.streams.some((s) => s.kind === 'video')))
+          return { reason: 'Load a file with a video stream to read color metadata.' };
+        return null;
+      }
+      if (colorDonorMissing)
+        return {
+          reason: `The configured source video for ${colorTargetFile!.name} was removed. Choose a source video in Transfer Color Metadata.`,
+          action: () => choose('color', true),
+        };
+      if (!activeColorSource?.streams.some((s) => s.kind === 'video'))
+        return { reason: 'Choose a source file with a video stream for color metadata.' };
+      if (colorTargetFile && !colorTargetFile.streams.some((s) => s.kind === 'video'))
+        return {
+          reason: 'Choose a target file with a video stream for color metadata.',
+          action: () => choose('color', true),
+        };
+      if (colorTargetFile && activeColorSource && colorTargetFile.path === activeColorSource.path)
+        return {
+          reason: 'Choose a different target video than the source.',
+          action: () => choose('color', true),
+        };
+      return null;
+    }
+    if (fileMode !== 'batch' && !file)
+      return { reason: 'Load tracks for a file in File List to select the active source.' };
+    return null;
+  });
+  const eligible = $derived(!utilityBlocked && !pending);
+  const currentActionLabel = $derived(
+    task === 'color'
+      ? fileMode === 'batch'
+        ? 'Run Batch: Read color metadata'
+        : colorTargetFile
+          ? `Run: Rewrite metadata in ${colorTargetFile.name}`
+          : 'Run: Read color metadata'
+      : task
+        ? `${fileMode === 'batch' ? 'Run Batch' : 'Run'}: ${labels[task]}`
+        : 'Run',
+  );
   $effect(() => {
-    const displayedTask = activeTask ?? task;
     const next = {
       run,
       canRun: eligible,
-      label: displayedTask
-        ? `${fileMode === 'batch' ? 'Run Batch' : 'Run'}: ${labels[displayedTask]}`
-        : 'Run',
+      blockedReason: pending ? undefined : utilityBlocked?.reason,
+      openBlockedSetting: pending ? undefined : utilityBlocked?.action,
+      label: pending && runningLabel ? runningLabel : currentActionLabel,
       active: pending,
       paused,
       progress: progress
@@ -444,6 +546,7 @@
   });
   onDestroy(() => {
     abort?.abort();
+    clearTimeout(ladderCopyTimer);
     registerAction('utilities', null);
   });
   function choose(id: Task, configure = false) {
@@ -457,7 +560,7 @@
         onlog('Load at least two files to compare quality.', true);
         return;
       }
-      const sorted = [...files].sort((a, b) => Number(a.sizeBytes) - Number(b.sizeBytes));
+      const sorted = files.toSorted((a, b) => Number(a.sizeBytes) - Number(b.sizeBytes));
       const haveBoth =
         files.some((item) => item.path === metricsEncoded) &&
         files.some((item) => item.path === metricsReference);
@@ -475,11 +578,21 @@
         onlog('Load at least one source file.', true);
         return;
       }
-      if (!files.some((item) => item.path === colorSource))
-        colorSource = [...files].sort((a, b) => Number(b.sizeBytes) - Number(a.sizeBytes))[0].path;
-      if (!files.some((item) => item.path === colorTarget)) colorTarget = '';
-      dialogColorSource = fileMode === 'batch' ? (file?.path ?? colorSource) : colorSource;
-      dialogColorTarget = fileMode === 'batch' ? '' : colorTarget;
+      const resolvedTarget = files.some((item) => item.path === colorTarget) ? colorTarget : '';
+      const fallbackSource =
+        (files
+          .toSorted((a, b) => Number(b.sizeBytes) - Number(a.sizeBytes))
+          .find((item) => item.path !== resolvedTarget)?.path ??
+          files[0]?.path) ||
+        '';
+      const resolvedSource = files.some((item) => item.path === colorSource)
+        ? colorSource
+        : file && file.path !== resolvedTarget
+          ? file.path
+          : fallbackSource;
+      dialogColorSource = fileMode === 'batch' ? (file?.path ?? resolvedSource) : resolvedSource;
+      dialogColorTarget =
+        fileMode === 'batch' || resolvedTarget === dialogColorSource ? '' : resolvedTarget;
       dialogCopyColor = copyColor;
       dialogCopyHdr = copyHdr;
       dialog = 'color';
@@ -538,11 +651,19 @@
         ].join('\t'),
       ),
     ];
-    try {
-      await navigator.clipboard.writeText(lines.join('\n'));
-    } catch (e) {
-      onlog(`Could not copy sample results: ${errorMessage(e)}`, true);
+    const copied = await copyTextWithFeedback(lines.join('\n'), {
+      success: 'Copied sample encode results.',
+      fail: 'Could not copy sample results.',
+    });
+    if (!copied) {
+      onlog('Could not copy sample results: Clipboard access was denied.', true);
+      return;
     }
+    ladderCopied = true;
+    clearTimeout(ladderCopyTimer);
+    ladderCopyTimer = setTimeout(() => {
+      ladderCopied = false;
+    }, 2000);
   }
   function fileVideo(entry: MediaFile | undefined) {
     return entry?.streams.find((stream) => stream.kind === 'video')?.index ?? 0;
@@ -687,6 +808,13 @@
     return parsed.length ? parsed : ladderDefaults()[2].split(',').map(Number);
   }
   function configureText(id: Task) {
+    if (id === 'color') {
+      if (!files.length) return 'Configure…';
+      if (colorDonorMissing && colorTargetFile) return `Choose source → ${colorTargetFile.name}`;
+      if (fileMode === 'batch' || !colorTargetFile)
+        return `Read · ${activeColorSource?.name ?? files[0].name}`;
+      return `Rewrite · ${activeColorSource?.name ?? files[0].name} → ${colorTargetFile.name}`;
+    }
     if (id === 'grain')
       return grainOp === 'measureSource'
         ? `Measure · denoise ${denoise}${keepDenoised ? ' · keep video' : ''}`
@@ -850,10 +978,12 @@
   async function run() {
     if (!task || pending) return;
     const runTask = task;
-    if (!file) {
+    const needsActiveFile = !['metrics', 'concat', 'color'].includes(runTask);
+    if (!files.length || (needsActiveFile && !file)) {
       onlog('No input file loaded. Please load one first (File List).', true);
       return;
     }
+    const activeSource = file ?? files[0];
     const batch = fileMode === 'batch';
     if (batch && ['metrics', 'ladder', 'concat', 'chart'].includes(runTask)) {
       unsupportedBatchTask = runTask;
@@ -872,6 +1002,7 @@
     let batchInputBytes = 0n,
       batchOutputBytes = 0n;
     activeTask = runTask;
+    runningLabel = currentActionLabel;
     completedStatus = '';
     paused = false;
     progress = null;
@@ -905,8 +1036,8 @@
           runTask === 'chart'
             ? [
                 {
-                  sourceId: file.id,
-                  streamIndex: fileVideo(file),
+                  sourceId: activeSource.id,
+                  streamIndex: fileVideo(activeSource),
                   included: true,
                   title: '',
                   language: '',
@@ -1013,8 +1144,13 @@
           const result = await analyzeQuality(request, active.signal, (id) => (analysisId = id));
           onlog(`${metric.toUpperCase()}: ${result.score?.toFixed(4) ?? '∞'}`);
         }
-      } else if (runTask === 'color' && (batch || !colorTarget)) {
-        const sources = batch ? files : [files.find((item) => item.path === colorSource) ?? file];
+      } else if (runTask === 'color' && (batch || !colorTargetFile)) {
+        const sources = batch
+          ? files.filter((item) => item.streams.some((s) => s.kind === 'video'))
+          : activeColorSource
+            ? [activeColorSource]
+            : [];
+        if (!sources.length) throw new Error('Load a file with a video stream first.');
         for (const source of sources) {
           mark(source.id, 'running');
           onlog(
@@ -1046,9 +1182,10 @@
         }
         let requests: UtilityRequest[];
         if (runTask === 'color') {
-          const donor = files.find((item) => item.path === colorSource);
-          const target = files.find((item) => item.path === colorTarget);
-          if (!donor || !target) throw new Error('Choose the source and target video.');
+          const donor = configuredColorSource;
+          const target = colorTargetFile;
+          if (!donor || !target || donor.path === target.path)
+            throw new Error('Choose the source and target video.');
           const request = {
             inputPath: target.path,
             inputVideoStreamIndex: fileVideo(target),
@@ -1079,7 +1216,7 @@
           onlog(report.summary);
           requests = [{ kind: 'colorMetadataTransfer', request }];
         } else {
-          let sources = batch && runTask !== 'concat' ? files : [file];
+          let sources = batch && runTask !== 'concat' ? files : [activeSource];
           if (['cut', 'concat', 'grain', 'cadence', 'deinterlace', 'ladder'].includes(runTask)) {
             const unsupported = (runTask === 'concat' ? files : sources).filter(
               (entry) => entry.source?.kind === 'imageSequence',
@@ -1281,6 +1418,7 @@
             : `Done${outputSummary ? ` - ${outputSummary}` : ''} - finished in ${elapsed}.`;
       }
       activeTask = null;
+      runningLabel = '';
       analysisId = null;
       paused = false;
       abort = undefined;
@@ -1311,6 +1449,9 @@
           >
             <strong>{card.label}</strong>
           </button>
+          {#if fileMode === 'batch' && batchReasons[card.id]}
+            <span class="card-badge">Muxing Mode only</span>
+          {/if}
           {#if card.configure}
             {@const label = configureText(card.id)}
             <button
@@ -1378,7 +1519,7 @@
       bind:value={dialogSubsample}
     >
       {#each Array.from({ length: 32 }, (_, i) => i + 1) as n}<option value={n}>
-          {n} (Every {n === 1 ? 'frame' : `${n}th frame`})
+          {n === 1 ? '1 (Every frame)' : `${n} (Every ${n} frames)`}
         </option>{/each}
     </select><label for="metric-model">VMAF Model</label><select
       id="metric-model"
@@ -1390,6 +1531,7 @@
     </select>
   </div>
   <div class="actions">
+    <button type="button" onclick={() => (dialog = null)}>Cancel</button>
     <button
       type="button"
       onclick={() => {
@@ -1417,6 +1559,9 @@
     <label for="color-source">Source Video</label><select
       id="color-source"
       bind:value={dialogColorSource}
+      onchange={() => {
+        if (dialogColorTarget === dialogColorSource) dialogColorTarget = '';
+      }}
     >
       {#each fileMode === 'batch' && file ? [file] : files as item}<option value={item.path}>
           {item.name}
@@ -1428,31 +1573,43 @@
     >
       <option value="">(none - only read the source's metadata)</option>{#each files as item}<option
           value={item.path}
+          disabled={item.path === dialogColorSource}
         >
-          {item.name}
+          {item.name}{item.path === dialogColorSource ? ' (same as source)' : ''}
         </option>{/each}
     </select>
   </div>
-  {#if fileMode !== 'batch'}<p>
-      With no target picked, this utility only prints the source's metadata. Picking one rewrites
-      that file in place.
+  {#if fileMode !== 'batch'}<p class:overwrite-warning={!!dialogColorTarget}>
+      {#if dialogColorTarget}
+        Picking a target rewrites that file in place — running will overwrite {fileName(
+          dialogColorTarget,
+        )} with the selected metadata from {fileName(dialogColorSource)}.
+      {:else}
+        With no target picked, this utility only prints the source's metadata. Picking one rewrites
+        that file in place.
+      {/if}
     </p>{/if}
   <h3>DATA TO TRANSFER</h3>
-  <label>
-    <input type="checkbox" bind:checked={dialogCopyColor} /> Color space (transfer, primaries, matrix,
-    range)
-  </label><br /><label>
-    <input type="checkbox" bind:checked={dialogCopyHdr} /> HDR metadata (mastering display, MaxCLL/MaxFALL)
-  </label>{#if fileMode === 'batch'}<p>
+  <div class="check-stack">
+    <label>
+      <input type="checkbox" bind:checked={dialogCopyColor} /> Color space (transfer, primaries, matrix,
+      range)
+    </label>
+    <label>
+      <input type="checkbox" bind:checked={dialogCopyHdr} /> HDR metadata (mastering display, MaxCLL/MaxFALL)
+    </label>
+  </div>
+  {#if fileMode === 'batch'}<p>
       In Batch Processing Mode this utility can only read metadata. Switch to Muxing Mode to
       transfer it.
     </p>{/if}
   <div class="actions">
+    <button type="button" onclick={() => (dialog = null)}>Cancel</button>
     <button
       type="button"
       onclick={() => {
         colorSource = dialogColorSource;
-        colorTarget = dialogColorTarget;
+        colorTarget = dialogColorTarget === dialogColorSource ? '' : dialogColorTarget;
         copyColor = dialogCopyColor;
         copyHdr = dialogCopyHdr;
         dialog = null;
@@ -1498,7 +1655,7 @@
         </option><option value="faster">Faster</option><option value="veryFast">Very Fast</option>
       </select>{/if}
   </div>
-  <label>
+  <label class="dialog-check">
     <input type="checkbox" bind:checked={doubleRate} disabled={deinterlace === 'disabled'} /> One frame
     per field
   </label>
@@ -1506,6 +1663,7 @@
   <p>
     Written beside the source as a near-lossless x264 MKV, with audio and subtitles copied across.
   </p>
+  <p class="live-note">Changes apply immediately; OK saves them as defaults.</p>
   <div class="actions">
     <button
       type="button"
@@ -1602,6 +1760,7 @@
   </p>
   {#if grainWarning()}<h3>WARNING</h3>
     <p>{grainWarning()}</p>{/if}
+  <p class="live-note">Changes apply immediately; OK saves them as defaults.</p>
   <div class="actions">
     <button
       type="button"
@@ -1707,11 +1866,12 @@
       </select>
     </div>
   </div>
-  <label>
+  <label class="dialog-check">
     <input type="checkbox" bind:checked={keepSamples} /> Keep the sample encodes beside the source
   </label>
   <h3>RESULT</h3>
   <p>{ladderDescription()}</p>
+  <p class="live-note">Changes apply immediately; OK saves them as defaults.</p>
   <div class="actions">
     <button type="button" onclick={resetLadder}>Reset</button><button
       type="button"
@@ -1739,36 +1899,42 @@
 <SourceDialog
   title="Sample Encodes"
   open={dialog === 'ladderResult'}
+  closedby="any"
   onclose={() => (dialog = null)}
+  width={760}
 >
   {#if ladderResult?.kind === 'crfLadder'}<h3>CRF LADDER</h3>
-    <table>
-      <thead>
-        <tr>
-          <th scope="col">CRF</th>
-          <th scope="col">Video bitrate</th>
-          <th scope="col">Per minute</th>
-          <th scope="col">Whole file</th>
-          <th scope="col">Of source</th>
-          {#if ladderResult.result.metric !== 'none'}<th scope="col">Score</th>{/if}
-          <th scope="col">Encode time</th>
-        </tr>
-      </thead><tbody>
-        {#each ladderResult.result.rungs as row}<tr>
-            <td>{row.crf}</td><td>{row.bitrateKbps.toFixed(1)} kb/s</td><td>
-              {formatBytes(row.bytesPerMinute)}
-            </td><td>{formatBytes(row.projectedSizeBytes)}</td><td>
-              {Number(ladderResult.result.sourceSizeBytes) > 0
-                ? `${((Number(row.projectedSizeBytes) / Number(ladderResult.result.sourceSizeBytes)) * 100).toFixed(1)}%`
-                : '—'}
-            </td>{#if ladderResult.result.metric !== 'none'}<td>
-                {row.score?.toFixed(3) ?? '—'}
-              </td>{/if}<td>{row.encodeSeconds.toFixed(1)}s</td>
-          </tr>{/each}
-      </tbody>
-    </table>{/if}
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable table needs keyboard access.) -->
+    <div class="table-scroll" tabindex="0" role="region" aria-label="CRF ladder results">
+      <table>
+        <caption class="visually-hidden">Sample encode CRF ladder results</caption>
+        <thead>
+          <tr>
+            <th scope="col">CRF</th>
+            <th scope="col">Video bitrate</th>
+            <th scope="col">Per minute</th>
+            <th scope="col">Whole file</th>
+            <th scope="col">Of source</th>
+            {#if ladderResult.result.metric !== 'none'}<th scope="col">Score</th>{/if}
+            <th scope="col">Encode time</th>
+          </tr>
+        </thead><tbody>
+          {#each ladderResult.result.rungs as row}<tr>
+              <td>{row.crf}</td><td>{row.bitrateKbps.toFixed(1)} kb/s</td><td>
+                {formatBytes(row.bytesPerMinute)}
+              </td><td>{formatBytes(row.projectedSizeBytes)}</td><td>
+                {Number(ladderResult.result.sourceSizeBytes) > 0
+                  ? `${((Number(row.projectedSizeBytes) / Number(ladderResult.result.sourceSizeBytes)) * 100).toFixed(1)}%`
+                  : '—'}
+              </td>{#if ladderResult.result.metric !== 'none'}<td>
+                  {row.score?.toFixed(3) ?? '—'}
+                </td>{/if}<td>{row.encodeSeconds.toFixed(1)}s</td>
+            </tr>{/each}
+        </tbody>
+      </table>
+    </div>{/if}
   <div class="actions">
-    <button type="button" onclick={copyLadder}>Copy</button><button
+    <button type="button" onclick={copyLadder}>{ladderCopied ? 'Copied' : 'Copy'}</button><button
       type="button"
       onclick={() => (dialog = null)}
     >
@@ -1776,21 +1942,37 @@
     </button>
   </div>
 </SourceDialog>
-<SourceDialog title="Bitrate Chart" open={dialog === 'chartResult'} onclose={() => (dialog = null)}>
-  {#if chartResult}<p>
-      {#if selectedChartPoints.length}{@const first = selectedChartPoints[0]}{@const last =
-          selectedChartPoints.at(-1)!}Selected {formatDuration(first.startSeconds)} to {formatDuration(
-          last.startSeconds,
-        )} ({selectedChartPoints.length} samples) · Min {(
-          Math.min(...selectedChartPoints.map((p) => p.megabitsPerSecond)) * 1000
-        ).toFixed(0)}k · Max {(
-          Math.max(...selectedChartPoints.map((p) => p.megabitsPerSecond)) * 1000
-        ).toFixed(0)}k · Average {(
-          (selectedChartPoints.reduce((sum, p) => sum + p.megabitsPerSecond, 0) /
-            selectedChartPoints.length) *
-          1000
-        ).toFixed(0)}k{:else}Drag to select a range. Double click to reset.{/if}
-    </p>
+<SourceDialog
+  title="Bitrate Chart"
+  open={dialog === 'chartResult'}
+  closedby="any"
+  onclose={() => (dialog = null)}
+  width={760}
+>
+  {#if chartResult}
+    {@const peak = Math.max(1, chartResult.peakWindowMegabitsPerSecond)}
+    {@const minTime = chartResult.points[0]?.startSeconds ?? 0}
+    {@const maxTime = chartResult.points.at(-1)?.startSeconds ?? minTime}
+    {@const midTime = minTime + (maxTime - minTime) / 2}
+    {@const rangeSummary = selectedChartPoints.length
+      ? (() => {
+          const first = selectedChartPoints[0];
+          const last = selectedChartPoints.at(-1)!;
+          const minK = (
+            Math.min(...selectedChartPoints.map((p) => p.megabitsPerSecond)) * 1000
+          ).toFixed(0);
+          const maxK = (
+            Math.max(...selectedChartPoints.map((p) => p.megabitsPerSecond)) * 1000
+          ).toFixed(0);
+          const avgK = (
+            (selectedChartPoints.reduce((sum, p) => sum + p.megabitsPerSecond, 0) /
+              selectedChartPoints.length) *
+            1000
+          ).toFixed(0);
+          return `Selected ${formatDuration(first.startSeconds)} to ${formatDuration(last.startSeconds)} (${selectedChartPoints.length} samples) · Min ${minK}k · Max ${maxK}k · Average ${avgK}k`;
+        })()
+      : ''}
+    <p>{rangeSummary || 'Drag to select a range. Double click to reset.'}</p>
     <div
       role="slider"
       tabindex="0"
@@ -1798,6 +1980,7 @@
       aria-valuemin="0"
       aria-valuemax={Math.max(0, chartResult.points.length - 1)}
       aria-valuenow={chartEnd ?? 0}
+      aria-valuetext={rangeSummary || 'No range selected'}
       onpointerdown={(event) => {
         chartStart = chartIndex(event);
         chartEnd = chartStart;
@@ -1808,6 +1991,7 @@
         if (chartDragging) chartEnd = chartIndex(event);
       }}
       onpointerup={() => (chartDragging = false)}
+      onpointercancel={() => (chartDragging = false)}
       ondblclick={() => {
         chartStart = null;
         chartEnd = null;
@@ -1832,24 +2016,47 @@
         }
       }}
     >
-      <svg viewBox="0 0 600 240" aria-hidden="true">
+      <svg viewBox="0 0 640 260" aria-hidden="true">
+        <line x1="56" y1="16" x2="624" y2="16" stroke="var(--rule)" stroke-dasharray="2 3" />
+        <line x1="56" y1="118" x2="624" y2="118" stroke="var(--rule)" stroke-dasharray="2 3" />
+        <line x1="56" y1="220" x2="624" y2="220" stroke="var(--border)" />
+        <line x1="56" y1="16" x2="56" y2="220" stroke="var(--border)" />
+        <text x="50" y="20" text-anchor="end" class="chart-axis">{peak.toFixed(1)}M</text>
+        <text x="50" y="122" text-anchor="end" class="chart-axis">{(peak / 2).toFixed(1)}M</text>
+        <text x="50" y="224" text-anchor="end" class="chart-axis">0M</text>
+        <text x={CHART_PLOT_LEFT} y="242" text-anchor="start" class="chart-axis">
+          {formatDuration(minTime)}
+        </text>
+        <text
+          x={CHART_PLOT_LEFT + CHART_PLOT_WIDTH / 2}
+          y="242"
+          text-anchor="middle"
+          class="chart-axis"
+        >
+          {formatDuration(midTime)}
+        </text>
+        <text x={CHART_PLOT_RIGHT} y="242" text-anchor="end" class="chart-axis">
+          {formatDuration(maxTime)}
+        </text>
         {#if chartStart !== null && chartEnd !== null}<rect
-            x={(Math.min(chartStart, chartEnd) * 600) / Math.max(1, chartResult.points.length - 1)}
-            y="0"
+            x={chartX(Math.min(chartStart, chartEnd), chartResult.points.length)}
+            y="16"
             width={Math.max(
               2,
-              (Math.abs(chartEnd - chartStart) * 600) / Math.max(1, chartResult.points.length - 1),
+              chartX(Math.max(chartStart, chartEnd), chartResult.points.length) -
+                chartX(Math.min(chartStart, chartEnd), chartResult.points.length),
             )}
-            height="240"
+            height="204"
             fill="currentColor"
-            opacity="0.12"
+            opacity="0.14"
           />{/if}<polyline
           fill="none"
           stroke="currentColor"
+          stroke-width="1.5"
           points={chartResult.points
             .map(
               (p, i) =>
-                `${(i * 600) / Math.max(1, chartResult!.points.length - 1)},${230 - (p.megabitsPerSecond * 210) / Math.max(1, chartResult!.peakWindowMegabitsPerSecond)}`,
+                `${chartX(i, chartResult!.points.length)},${220 - (p.megabitsPerSecond * 204) / peak}`,
             )
             .join(' ')}
         />
@@ -1867,6 +2074,7 @@
     min-height: 0;
     overflow-y: auto;
     padding: 2px 0;
+    container-type: inline-size;
   }
   .utilities-intro {
     display: flex;
@@ -1879,14 +2087,14 @@
   }
   .utilities-intro > p {
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .batch-indicator {
     padding: 2px 8px;
     border: 1px solid var(--border);
     background: var(--secondary);
     color: var(--foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     font-weight: 600;
   }
   .cards {
@@ -1895,7 +2103,7 @@
     gap: 8px;
     max-width: 1280px;
   }
-  @media (max-width: 1000px) {
+  @container (inline-size <= 960px) {
     .cards {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -1929,13 +2137,29 @@
   .card.chosen {
     background: var(--accent);
     border-color: var(--primary);
-    box-shadow: inset 3px 0 var(--primary);
+    border-inline-start: 4px solid var(--primary);
+  }
+  @media (forced-colors: active) {
+    .card.chosen {
+      border-color: Highlight;
+    }
   }
   .card-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    min-height: 28px;
     gap: 6px;
+  }
+  .card-badge {
+    position: relative;
+    z-index: 1;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--muted-foreground);
+    font-size: 0.6256rem;
+    white-space: nowrap;
   }
   .card-select {
     flex: 1;
@@ -1971,7 +2195,7 @@
     display: block;
     margin-top: 6px;
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
   }
   .form {
     display: grid;
@@ -1990,7 +2214,30 @@
     color: inherit;
   }
   input[type='number'] {
-    width: 8ch;
+    width: 11ch;
+  }
+  .check-stack {
+    display: grid;
+    gap: 6px;
+  }
+  .dialog-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .overwrite-warning {
+    color: var(--destructive);
+    font-weight: 600;
+  }
+  .live-note {
+    margin-top: 8px;
+    color: var(--muted-foreground);
+    font-size: 0.6906rem;
+  }
+  .chart-axis {
+    fill: var(--muted-foreground);
+    font-size: 0.6875rem;
   }
   button {
     padding: 5px 10px;
@@ -2019,8 +2266,11 @@
   }
   h3 {
     margin: 14px 0 5px;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.08em;
+  }
+  .table-scroll {
+    overflow-x: auto;
   }
   table {
     width: 100%;

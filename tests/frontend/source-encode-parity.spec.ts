@@ -1476,6 +1476,16 @@ test('AV1AN recovery actions use the selected item and freeze confirmed clear ID
   await expect(dialog.getByRole('option').first()).toHaveAttribute('aria-selected', 'true');
   await dialog.getByRole('option').nth(1).click();
   await dialog.getByRole('button', { name: 'Delete Chunks' }).click();
+  const confirmChunks = page.getByRole('dialog', { name: 'Delete encoded AV1AN chunks?' });
+  await expect(confirmChunks.getByRole('button', { name: 'Keep saved work' })).toBeFocused();
+  await confirmChunks.getByRole('button', { name: 'Keep saved work' }).click();
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__sourceCalls.some((c: any) => c.command === 'av1an_recovery_action'),
+    ),
+  ).toBe(false);
+  await dialog.getByRole('button', { name: 'Delete Chunks' }).click();
+  await confirmChunks.getByRole('button', { name: 'Delete Chunks', exact: true }).click();
   await expect
     .poll(async () =>
       page.evaluate(() =>
@@ -1488,6 +1498,53 @@ test('AV1AN recovery actions use the selected item and freeze confirmed clear ID
       ),
     )
     .toBe(true);
+  // If the targeted recovery disappears while confirmation is open, Confirm must
+  // not delete a different item that becomes selected underneath.
+  await page.evaluate(
+    (entries) => {
+      const host = globalThis as any;
+      host.__recoveries = entries;
+      host.__sourceCalls.length = 0;
+    },
+    [recovery('one', '/media/a.mkv'), recovery('two', '/media/b.mkv', '2048')],
+  );
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  for (const [buttonName, dialogTitle] of [
+    ['Delete Chunks', 'Delete encoded AV1AN chunks?'],
+    ['Delete Encode', 'Delete unfinished AV1AN encode?'],
+  ] as const) {
+    await expect(dialog.getByRole('option')).toHaveCount(2);
+    await dialog.getByRole('option').first().click();
+    await dialog.getByRole('button', { name: buttonName }).click();
+    const confirmTarget = page.getByRole('dialog', { name: dialogTitle });
+    await expect(confirmTarget.getByRole('button', { name: 'Keep saved work' })).toBeFocused();
+    await page.evaluate(
+      (entry) => {
+        const host = globalThis as any;
+        host.__recoveries = [entry];
+        host.__emitJobs();
+      },
+      recovery('two', '/media/b.mkv', '2048'),
+    );
+    await expect(dialog.getByRole('option')).toHaveCount(1);
+    await confirmTarget.getByRole('button', { name: buttonName, exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('no longer available');
+    expect(
+      await page.evaluate(() =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'av1an_recovery_action'),
+      ),
+    ).toHaveLength(0);
+    await expect(dialog.getByRole('option')).toHaveCount(1);
+    await page.evaluate(
+      (entries) => {
+        const host = globalThis as any;
+        host.__recoveries = entries;
+        host.__emitJobs();
+      },
+      [recovery('one', '/media/a.mkv'), recovery('two', '/media/b.mkv', '2048')],
+    );
+  }
   await dialog.getByRole('button', { name: 'Close' }).click();
   await av.getByRole('button', { name: 'Clear Temp…' }).click();
   const confirm = page.getByRole('dialog', { name: 'Clear all av1an temp files?' });
@@ -1556,6 +1613,124 @@ test('resume with new settings activates the saved source and snapshots current 
   await expect(page.getByRole('option', { name: /other.mkv/ })).toBeVisible();
 });
 
+test('canceling command review during Resume (New Settings) preserves draft edits and concurrency', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const other = { ...source, id: 'source-2', path: '/media/other.mkv', name: 'other.mkv' };
+  await page.evaluate(
+    ({ entry, other }) => {
+      const host = globalThis as any;
+      host.__recoveries = [entry];
+      host.__mediaByPath[other.path] = other;
+    },
+    { entry: recovery('one', other.path), other },
+  );
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Quality', { exact: true }).fill('27');
+  await av.getByRole('button', { name: 'Configure…', exact: true }).first().click();
+  const trimDialog = page.getByRole('dialog', { name: 'Configure Trim' });
+  await trimDialog.getByLabel('End', { exact: true }).fill('00:00:05.000');
+  await trimDialog.getByRole('button', { name: 'OK', exact: true }).click();
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click({ modifiers: ['Shift'] });
+  const editor = page.getByRole('dialog', { name: 'Edit av1an Arguments' });
+  await expect(editor).toBeVisible();
+  await expect(editor.getByText('Per-stage native arguments')).toHaveCount(0);
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(av.getByLabel('Trim range')).toContainText('00:00:00–00:00:05');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toBeVisible();
+  await expect(page.getByRole('option', { name: /other.mkv/ })).toHaveCount(0);
+
+  // Hold prepare_command_edit pending, change workspace Mode, and reject preparation:
+  // failure must not clobber the newer workspace mode.
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdPrepareReply = new Promise((_, reject) => {
+      host.__rejectPrepare = reject;
+    });
+  });
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some(
+          (c: any) =>
+            c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.evaluate(() => (globalThis as any).__rejectPrepare(new Error('Prep failed')));
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'AV1AN recovery failed: Prep failed',
+  );
+  await expect(page.getByRole('combobox', { name: 'Mode', exact: true })).toHaveValue('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  await expect(
+    page.getByRole('dialog', { name: 'Resume AV1AN Encode' }).getByRole('alert'),
+  ).toContainText('Prep failed');
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Close' })
+    .click();
+});
+
+test('Review command returns focus on Cancel and batch command cancel marks row Canceled', async ({
+  page,
+}) => {
+  const second = { ...source, id: 'source-2', path: '/media/second.mkv', name: 'second.mkv' };
+  await page.evaluate(
+    ({ first, second }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [first.path, second.path];
+      host.__mediaByPath = { [first.path]: first, [second.path]: second };
+    },
+    { first: source, second },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /input.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const reviewBtn = page.getByRole('button', { name: 'Review command…', exact: true });
+  await reviewBtn.focus();
+  await reviewBtn.click();
+  const editor = page.getByRole('dialog', { name: 'Edit ffmpeg Arguments' });
+  await editor.getByRole('button', { name: 'Copy command', exact: true }).click();
+  await expect(editor.getByRole('button', { name: 'Copied', exact: true })).toBeVisible();
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(reviewBtn).toBeFocused();
+  await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
+    'Canceled in the command editor.',
+  );
+
+  // Batch command review cancel marks the canceled row as Canceled, not Failed.
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await reviewBtn.click();
+  await expect(editor).toBeVisible();
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(editor).toBeVisible();
+  await editor.getByRole('button', { name: 'Run', exact: true }).click();
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Canceled');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Done');
+});
+
 test('image batch reports failures per file and continues', async ({ page }) => {
   const second = { ...source, id: 'source-2', path: '/media/second.mkv', name: 'second.mkv' };
   await page.evaluate(
@@ -1604,6 +1779,8 @@ test('recovery failures remain visible and saved resume uses native action', asy
   await av.getByRole('button', { name: 'Resume…' }).click();
   const dialog = page.getByRole('dialog', { name: 'Resume AV1AN Encode' });
   await dialog.getByRole('button', { name: 'Delete Encode' }).click();
+  const confirmEncode = page.getByRole('dialog', { name: 'Delete unfinished AV1AN encode?' });
+  await confirmEncode.getByRole('button', { name: 'Delete Encode', exact: true }).click();
   await expect(dialog.getByRole('alert')).toContainText('Workspace is in use');
   await expect(dialog.getByRole('option')).toHaveCount(1);
   await page.evaluate(() => ((globalThis as any).__recoveryFailure = null));
@@ -2146,6 +2323,12 @@ test('closing trim while confirmation is probing never applies the stale result'
     .poll(async () => page.evaluate(() => (globalThis as any).__pendingSnaps?.length ?? 0))
     .toBeGreaterThan(0);
   await d.getByRole('button', { name: 'Close' }).click();
+  // Reopening immediately before the stale snap resolves must leave snap controls enabled.
+  await q.getByRole('button', { name: 'Configure…' }).first().click();
+  await expect(d.getByRole('button', { name: 'Set start' })).toBeEnabled();
+  await expect(d.getByRole('button', { name: 'Set end' })).toBeEnabled();
+  await expect(d.getByRole('button', { name: 'OK' })).toBeEnabled();
+  await d.getByRole('button', { name: 'Close' }).click();
   await page.evaluate(() => {
     const host = globalThis as any;
     for (const pending of host.__pendingSnaps)
@@ -2185,6 +2368,16 @@ test('Shift at preparation opens the source command editor and sends the edited 
   await expect(d.getByLabel('Command line')).toHaveValue(
     '-i "input file" | encoder --value 4 && mux',
   );
+  await d.getByText('Per-stage native arguments').click();
+  await expect(
+    d.getByText(
+      'Shows the native per-stage arguments for the prepared settings before edits above.',
+    ),
+  ).toBeVisible();
+  await expect(d.getByRole('button', { name: 'Preview command plan' })).toBeVisible();
+  await d.getByRole('button', { name: 'Preview command plan' }).click();
+  await d.getByText('1. Encode').click();
+  await expect(d.getByRole('button', { name: 'Copy arguments' })).toBeVisible();
   await d.getByLabel('Command line').fill('-i "input file" | encoder --value 8 && mux');
   await page.keyboard.up('Shift');
   await d.getByRole('button', { name: 'Run', exact: true }).click();
@@ -2378,7 +2571,7 @@ test('batch samples live Shift per file and continues after a canceled review', 
   ).toBe(1);
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await expect(page.getByRole('option', { name: /input.mkv/ })).toContainText('Done');
-  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Failed');
+  await expect(page.getByRole('option', { name: /second.mkv/ })).toContainText('Canceled');
 });
 
 test('stopping a running batch file keeps its progress and proceeds to the next file', async ({
@@ -2648,4 +2841,454 @@ test('closing trim before analysis registration returns cancels the ticket witho
       (globalThis as any).__sourceCalls.some((c: any) => c.command === 'preview_frame'),
     ),
   ).toBe(false);
+});
+
+test('delayed successful AV1AN recovery opens visible command editor without clobbering a newer workspace', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const other = { ...source, id: 'source-2', path: '/media/other.mkv', name: 'other.mkv' };
+  const third = { ...source, id: 'source-3', path: '/media/third.mkv', name: 'third.mkv' };
+  await page.evaluate(
+    ({ entry, other, third }) => {
+      const host = globalThis as any;
+      host.__recoveries = [entry];
+      host.__mediaByPath[other.path] = other;
+      host.__mediaByPath[third.path] = third;
+      host.__holdPrepareReply = new Promise((resolve) => {
+        host.__resolvePrepare = resolve;
+      });
+    },
+    { entry: recovery('one', other.path), other, third },
+  );
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click({ modifiers: ['Shift'] });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some(
+          (c: any) =>
+            c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.evaluate((path) => ((globalThis as any).__pickerPaths = [path]), third.path);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Import 1 File' })
+    .getByRole('button', { name: 'Replace file list' })
+    .click();
+  await expect(page.getByRole('option', { name: /third\.mkv/ })).toBeVisible();
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdPrepareReply = null;
+    host.__resolvePrepare();
+  });
+  const editor = page.getByRole('dialog', { name: 'Edit av1an Arguments' });
+  await expect(editor).toBeVisible();
+  const box = await editor.boundingBox();
+  expect(box?.width ?? 0).toBeGreaterThan(200);
+  expect(box?.height ?? 0).toBeGreaterThan(100);
+  await editor.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'confirm_command_edit'),
+      ),
+    )
+    .toBe(true);
+  await expect(page.getByRole('option', { name: /third\.mkv/ })).toBeVisible();
+  await expect(page.getByRole('option', { name: /other\.mkv/ })).toHaveCount(0);
+});
+
+test('isolated AV1AN recovery preserves saved streams only and keeps disabled crop cleared', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const audio = source.streams.find((s) => s.kind === 'audio')!;
+  const other = {
+    ...source,
+    id: 'source-multi-audio',
+    path: '/media/multi-audio.mkv',
+    name: 'multi-audio.mkv',
+    streams: [
+      ...source.streams.filter((s) => s.kind === 'video'),
+      { ...audio, index: 1, title: 'Keep' },
+      { ...audio, index: 2, title: 'Drop' },
+    ],
+  };
+  const savedEntry = recovery('subset', other.path);
+  savedEntry.job.request.streamIndices = [0, 1];
+  savedEntry.job.encodeSettings = { videoStreamIndex: 0 } as any;
+  await page.evaluate(
+    ({ entry, other }) => {
+      const host = globalThis as any;
+      host.__recoveries = [entry];
+      host.__mediaByPath[other.path] = other;
+    },
+    { entry: savedEntry, other },
+  );
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Crop').selectOption('manual');
+  await av.getByRole('button', { name: 'Configure…', exact: true }).nth(1).click();
+  const crop = page.getByRole('dialog', { name: 'Configure Crop' });
+  await crop.getByLabel('Left').fill('8');
+  await crop.getByRole('button', { name: 'OK' }).click();
+  await av.getByLabel('Crop').selectOption('disabled');
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click();
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (c: any) =>
+              c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+          )?.payload.request.settings,
+      ),
+    )
+    .toMatchObject({
+      videoStreamIndex: 0,
+      framing: { crop: { left: 0, right: 0, top: 0, bottom: 0 } },
+    });
+  const req = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find(
+        (c: any) => c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+      )?.payload.request,
+  );
+  expect(req.settings.audio.map((track: any) => track.streamIndex)).toEqual([1]);
+});
+
+test('delayed successful AV1AN recovery preserves Track List edits made during preparation', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const other = { ...source, id: 'source-2', path: '/media/other.mkv', name: 'other.mkv' };
+  await page.evaluate(
+    ({ entry, other }) => {
+      const host = globalThis as any;
+      host.__recoveries = [entry];
+      host.__mediaByPath[other.path] = other;
+      host.__holdPrepareReply = new Promise((resolve) => {
+        host.__resolvePrepare = resolve;
+      });
+    },
+    { entry: recovery('one', other.path), other },
+  );
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click({ modifiers: ['Shift'] });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some(
+          (c: any) =>
+            c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+        ),
+      ),
+    )
+    .toBe(true);
+
+  await page.getByRole('button', { name: 'Track List', exact: true }).click();
+  await page.getByRole('checkbox', { name: /Include .*Audio/ }).uncheck();
+  await page.getByLabel('Default Subtitles').selectOption('');
+
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdPrepareReply = null;
+    host.__resolvePrepare();
+  });
+  const editor = page.getByRole('dialog', { name: 'Edit av1an Arguments' });
+  await expect(editor).toBeVisible();
+  await editor.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'confirm_command_edit'),
+      ),
+    )
+    .toBe(true);
+
+  await expect(page.getByRole('checkbox', { name: /Include .*Audio/ })).not.toBeChecked();
+  await expect(page.getByLabel('Default Subtitles')).toHaveValue('');
+});
+
+test('same-source and batch-mode AV1AN Resume (New Settings) enforce saved stream subset cleanly', async ({
+  page,
+}) => {
+  const audio = source.streams.find((s) => s.kind === 'audio')!;
+  const multiAudio = {
+    ...source,
+    id: 'same-multi',
+    path: '/media/same-multi.mkv',
+    name: 'same-multi.mkv',
+    streams: [
+      ...source.streams.filter((s) => s.kind === 'video'),
+      { ...audio, index: 1, channels: 2, title: 'Stereo Kept' },
+      { ...audio, index: 2, channels: 1, title: 'Mono Excluded' },
+    ],
+  };
+  await page.evaluate((media) => (globalThis as any).__setSourceMedia(media), multiAudio);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  // Explicitly check stream 2 (Mono Excluded) in live Track List while saved job only had [0, 1].
+  await page.getByRole('checkbox', { name: /Include .*Mono Excluded/ }).check();
+  await expect(page.getByRole('checkbox', { name: /Include .*Mono Excluded/ })).toBeChecked();
+  const sameSaved = recovery('same-subset', multiAudio.path);
+  sameSaved.job.request.streamIndices = [0, 1];
+  sameSaved.job.encodeSettings = { videoStreamIndex: 0 } as any;
+  await page.evaluate((entry) => ((globalThis as any).__recoveries = [entry]), sameSaved);
+
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click();
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (c: any) =>
+              c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+          )?.payload.request.settings,
+      ),
+    )
+    .toBeTruthy();
+  const sameReq = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find(
+        (c: any) => c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+      )?.payload.request,
+  );
+  expect(sameReq.settings.audio.map((track: any) => track.streamIndex)).toEqual([1]);
+
+  // Now switch workspace to Batch mode + 8 kbps audio and resume cross-source saved subset [0, 1]:
+  // excluded mono stream 2 (which scales to 4 kbps) must NOT block cross-source recovery.
+  const cross = {
+    ...multiAudio,
+    id: 'cross-multi',
+    path: '/media/cross-multi.mkv',
+    name: 'cross-multi.mkv',
+  };
+  const crossSaved = recovery('cross-subset', cross.path);
+  crossSaved.job.request.streamIndices = [0, 1];
+  crossSaved.job.encodeSettings = { videoStreamIndex: 0 } as any;
+  await page.evaluate(
+    ({ entry, cross }) => {
+      const host = globalThis as any;
+      host.__sourceCalls.length = 0;
+      host.__testJobs = [];
+      host.__emitJobs();
+      host.__recoveries = [entry];
+      host.__mediaByPath[cross.path] = cross;
+    },
+    { entry: crossSaved, cross },
+  );
+  await av.getByRole('tab', { name: 'Audio & Tracks', exact: true }).click();
+  await av.getByLabel('Codec', { exact: true }).selectOption('opus');
+  await av.getByLabel('Bitrate (Kbps)', { exact: true }).fill('8');
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click();
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (c: any) =>
+              c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+          )?.payload.request.settings,
+      ),
+    )
+    .toBeTruthy();
+  const crossReq = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find(
+        (c: any) => c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+      )?.payload.request,
+  );
+  expect(
+    crossReq.settings.audio.map((track: any) => [track.streamIndex, track.bitrateKbps]),
+  ).toEqual([[1, 8]]);
+});
+
+test('AV1AN Resume (New Settings) preserves saved external tracks, donors, unchecked cover, and explicit track order', async ({
+  page,
+}) => {
+  const video = source.streams.find((s) => s.kind === 'video')!;
+  const audio = source.streams.find((s) => s.kind === 'audio')!;
+  const extAudio = {
+    ...source,
+    id: 'ext-audio',
+    path: '/media/ext-audio.mka',
+    name: 'ext-audio.mka',
+    streams: [{ ...audio, index: 0, title: 'External' }],
+  };
+  const primaryMkv = {
+    ...source,
+    id: 'mkv-cover',
+    path: '/media/covered.mkv',
+    name: 'covered.mkv',
+    streams: [
+      video,
+      { ...audio, index: 1, title: 'Main Audio' },
+      { ...audio, index: 2, title: 'Secondary Audio' },
+      { ...video, index: 5, codec: 'mjpeg', title: 'Cover', attachedPic: true },
+    ],
+  };
+  const savedEntry = recovery('ext-cover-order', primaryMkv.path);
+  savedEntry.job.request.streamIndices = [0, 1, 2];
+  savedEntry.job.encodeSettings = {
+    backend: 'av1an',
+    encoder: 'svtAv1Hdr',
+    videoStreamIndex: 0,
+    coverStreamIndex: undefined,
+    externalTracks: [{ inputPath: extAudio.path, streamIndex: 0 }],
+    metadataSourcePath: extAudio.path,
+    chaptersSourcePath: extAudio.path,
+    trackOrder: [
+      { streamIndex: 0 },
+      { streamIndex: 2 },
+      { streamIndex: 1 },
+      { inputPath: extAudio.path, streamIndex: 0 },
+    ],
+  } as any;
+  await page.evaluate(
+    ({ primaryMkv, extAudio, savedEntry }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = [primaryMkv.path, extAudio.path];
+      host.__mediaByPath = { [primaryMkv.path]: primaryMkv, [extAudio.path]: extAudio };
+      host.__recoveries = [savedEntry];
+    },
+    { primaryMkv, extAudio, savedEntry },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /covered\.mkv/ }).click();
+  await page.getByRole('option', { name: /ext-audio\.mka/ }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByLabel('Container', { exact: true }).selectOption('matroska');
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click();
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.find(
+            (c: any) =>
+              c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+          )?.payload.request.settings,
+      ),
+    )
+    .toBeTruthy();
+  const settings = await page.evaluate(
+    () =>
+      (globalThis as any).__sourceCalls.find(
+        (c: any) => c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+      )?.payload.request.settings,
+  );
+  expect(settings.coverStreamIndex).toBeUndefined();
+  expect(settings.externalTracks).toEqual([{ inputPath: '/media/ext-audio.mka', streamIndex: 0 }]);
+  expect(settings.metadataSourcePath).toBe('/media/ext-audio.mka');
+  expect(settings.chaptersSourcePath).toBe('/media/ext-audio.mka');
+  expect(settings.trackOrder).toEqual([
+    { streamIndex: 0 },
+    { streamIndex: 2 },
+    { streamIndex: 1 },
+    { inputPath: '/media/ext-audio.mka', streamIndex: 0 },
+  ]);
+});
+
+test('delayed successful AV1AN recovery preserves Quick Convert trim edit made during preparation', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const other = { ...source, id: 'source-2', path: '/media/other.mkv', name: 'other.mkv' };
+  await page.evaluate(
+    ({ entry, other }) => {
+      const host = globalThis as any;
+      host.__recoveries = [entry];
+      host.__mediaByPath[other.path] = other;
+      host.__holdPrepareReply = new Promise((resolve) => {
+        host.__resolvePrepare = resolve;
+      });
+    },
+    { entry: recovery('one', other.path), other },
+  );
+  await page.getByRole('button', { name: 'AV1AN', exact: true }).click();
+  const av = page.getByRole('region', { name: 'AV1AN', exact: true });
+  await av.getByRole('button', { name: 'Resume…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Resume AV1AN Encode' })
+    .getByRole('button', { name: 'Resume (New Settings)' })
+    .click({ modifiers: ['Shift'] });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some(
+          (c: any) =>
+            c.command === 'prepare_command_edit' && c.payload.request.kind === 'resumeNew',
+        ),
+      ),
+    )
+    .toBe(true);
+
+  // Switch to Quick Convert while AV1AN recovery prepares and edit Trim on input.mkv.
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByRole('button', { name: 'Configure…', exact: true }).first().click();
+  const trimDialog = page.getByRole('dialog', { name: 'Configure Trim' });
+  await trimDialog.getByLabel('End', { exact: true }).fill('00:00:05.000');
+  await trimDialog.getByRole('button', { name: 'OK', exact: true }).click();
+
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__holdPrepareReply = null;
+    host.__resolvePrepare();
+  });
+  const editor = page.getByRole('dialog', { name: 'Edit av1an Arguments' });
+  await expect(editor).toBeVisible();
+  await editor.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__sourceCalls.some((c: any) => c.command === 'confirm_command_edit'),
+      ),
+    )
+    .toBe(true);
+
+  await expect(quick).toContainText('Source: input.mkv');
+  await expect(quick.getByLabel('Trim range')).toContainText('00:00:00–00:00:05');
 });

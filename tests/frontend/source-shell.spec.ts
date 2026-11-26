@@ -264,6 +264,7 @@ test.beforeEach(async ({ page }) => {
           return;
         }
         if (command === 'probe_media') {
+          if (host.__failProbePaths?.includes(payload.path)) throw new Error('Invalid media.');
           const a = payload.path === pathA;
           return {
             id: payload.path === 'C:\\media\\C.mkv' ? 'c' : a ? 'a' : 'b',
@@ -451,7 +452,7 @@ test('source shell loads selected tracks, preserves selections, and disables Run
   await page.getByRole('option', { name: /B.mkv/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
-  await expect(tracks.getByRole('listbox', { name: 'Tracks' }).getByRole('option')).toHaveCount(7);
+  await expect(tracks.getByRole('grid', { name: 'Tracks' }).getByRole('row')).toHaveCount(7);
   if (process.env.JESSES_CAPTURE_UI)
     await page.screenshot({ path: 'target/source-track-list.png' });
   const firstAudio = tracks.getByRole('checkbox', { name: /Include \[#02\]: Audio/ }).first();
@@ -472,7 +473,7 @@ test('selected attachment extracts the correct source-scoped stream and opens it
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
   await expect(tracks.getByRole('button', { name: 'Extract', exact: true })).toHaveCount(0);
-  await tracks.getByRole('option', { name: /Font \(TTF\)/ }).click();
+  await tracks.locator('.track-option', { hasText: /Font \(TTF\)/ }).click();
   await tracks.getByRole('button', { name: 'Extract', exact: true }).click();
   await expect
     .poll(() =>
@@ -629,6 +630,21 @@ test('bitrate chart selection displays range and double click resets it', async 
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('option', { name: /A.mkv/ }).click();
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.evaluate(() => {
+    (globalThis as any).__bitrateResult = {
+      streamIndex: 0,
+      windowSeconds: 1,
+      packetBytes: '3000',
+      averageMegabitsPerSecond: 2,
+      peakWindowMegabitsPerSecond: 3,
+      sourceFingerprint: 'source',
+      points: [
+        { startSeconds: 60, megabitsPerSecond: 1, packetBytes: '1000' },
+        { startSeconds: 120, megabitsPerSecond: 2, packetBytes: '1000' },
+        { startSeconds: 180, megabitsPerSecond: 3, packetBytes: '1000' },
+      ],
+    };
+  });
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   await page
     .getByRole('region', { name: 'Utilities' })
@@ -636,12 +652,19 @@ test('bitrate chart selection displays range and double click resets it', async 
     .click();
   await page.getByRole('button', { name: 'Run: Bitrate chart' }).click();
   const dialog = page.getByRole('dialog', { name: 'Bitrate Chart' });
+  await expect(dialog).toContainText('01:00');
+  await expect(dialog).toContainText('02:00');
+  await expect(dialog).toContainText('03:00');
   const chart = dialog.getByRole('slider', { name: /Bitrate chart/ });
-  const box = await chart.boundingBox();
-  expect(box).not.toBeNull();
-  await page.mouse.move(box!.x + 2, box!.y + 20);
+  const svgBox = await chart.locator('svg').boundingBox();
+  expect(svgBox).not.toBeNull();
+  const firstPlotX = svgBox!.x + (svgBox!.width * 56) / 640;
+  const lastPlotX = svgBox!.x + (svgBox!.width * 624) / 640;
+  await page.mouse.click(firstPlotX, svgBox!.y + 20);
+  await expect(dialog).toContainText('Selected 00:01:00 to 00:01:00 (1 samples)');
+  await page.mouse.move(firstPlotX, svgBox!.y + 20);
   await page.mouse.down();
-  await page.mouse.move(box!.x + box!.width - 2, box!.y + 20);
+  await page.mouse.move(lastPlotX, svgBox!.y + 20);
   await page.mouse.up();
   await expect(dialog).toContainText('3 samples');
   await expect(dialog).toContainText('Average 2000k');
@@ -653,6 +676,44 @@ test('bitrate chart selection displays range and double click resets it', async 
   await expect(dialog).toContainText('2 samples');
   await page.keyboard.press('Escape');
   await expect(dialog).toContainText('Drag to select a range');
+});
+
+test('bitrate chart hit-tests rendered endpoints accurately at 720 px dialog width', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.evaluate(() => {
+    (globalThis as any).__bitrateResult = {
+      streamIndex: 0,
+      windowSeconds: 1,
+      packetBytes: '50000',
+      averageMegabitsPerSecond: 2,
+      peakWindowMegabitsPerSecond: 5,
+      sourceFingerprint: 'source',
+      points: Array.from({ length: 50 }, (_, index) => ({
+        startSeconds: index * 10,
+        megabitsPerSecond: 1 + (index % 4),
+        packetBytes: '1000',
+      })),
+    };
+  });
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await page
+    .getByRole('region', { name: 'Utilities' })
+    .getByRole('button', { name: /Show Bitrate Chart/ })
+    .click();
+  await page.getByRole('button', { name: 'Run: Bitrate chart' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Bitrate Chart' });
+  await expect(dialog).toBeVisible();
+  const plotBounds = await dialog.locator('svg line').nth(2).boundingBox();
+  expect(plotBounds).not.toBeNull();
+  await page.mouse.click(plotBounds!.x + 1, plotBounds!.y - 20);
+  await expect(dialog).toContainText('Selected 00:00:00 to 00:00:00 (1 samples)');
+  await page.mouse.click(plotBounds!.x + plotBounds!.width - 1, plotBounds!.y - 20);
+  await expect(dialog).toContainText('Selected 00:08:10 to 00:08:10 (1 samples)');
 });
 
 test('utility settings restore on reload, retain live edits on close and reset to fork defaults', async ({
@@ -881,36 +942,36 @@ test('removing the loaded source promotes the first remaining file and loads its
   await page.getByRole('button', { name: 'Remove', exact: true }).click();
   await page.getByRole('button', { name: 'Track List', exact: true }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
-  await expect(tracks.getByRole('listbox', { name: 'Tracks' }).getByRole('option')).toHaveCount(4);
-  await expect(tracks.getByRole('option', { name: /Font \(TTF\).*Font/ })).toBeVisible();
+  await expect(tracks.getByRole('grid', { name: 'Tracks' }).getByRole('row')).toHaveCount(4);
+  await expect(tracks.locator('.track-option', { hasText: /Font \(TTF\).*Font/ })).toBeVisible();
 });
 
-test('mode transition clears the assembled tracks and restores a single file on return to mux', async ({
+test('mode transition preserves mux tracks on return to mux and blocks Batch double-click', async ({
   page,
 }) => {
   await page.getByRole('button', { name: 'Add Files…' }).click();
-  await page.getByRole('option', { name: /B.mkv/ }).click();
-  await page.getByRole('button', { name: 'Remove', exact: true }).click();
   await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('option', { name: /B.mkv/ }).click({ modifiers: ['Control'] });
   await page.getByRole('button', { name: 'Load Tracks' }).click();
+  const trackRows = page
+    .getByRole('region', { name: 'Track List' })
+    .getByRole('grid', { name: 'Tracks' })
+    .getByRole('row');
+  const initialCount = await trackRows.count();
+  expect(initialCount).toBe(7);
+
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('option', { name: /A.mkv/ }).dblclick();
+  await expect(page.getByRole('region', { name: 'File List' })).toBeVisible();
+
   await page.getByRole('button', { name: 'Track List', exact: true }).click();
-  await expect(
-    page
-      .getByRole('region', { name: 'Track List' })
-      .getByRole('listbox', { name: 'Tracks' })
-      .getByRole('option'),
-  ).toHaveCount(0);
+  await expect(trackRows).toHaveCount(0);
+
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('mux');
   await page.getByRole('button', { name: 'Track List', exact: true }).click();
-  await expect(
-    page
-      .getByRole('region', { name: 'Track List' })
-      .getByRole('listbox', { name: 'Tracks' })
-      .getByRole('option'),
-  ).toHaveCount(3);
+  await expect(trackRows).toHaveCount(initialCount);
 });
 
 test('Color Data with no target logs the complete native report without a utility output', async ({
@@ -929,7 +990,8 @@ test('Color Data with no target logs the complete native report without a utilit
     .getByRole('dialog', { name: 'Transfer Color Metadata' })
     .getByRole('button', { name: 'OK' })
     .click();
-  await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+  await expect(card).toContainText('Read · A.mkv');
+  await page.getByRole('button', { name: 'Run: Read color metadata' }).click();
   await expect(page.getByRole('log', { name: 'Recent activity' })).toContainText(
     'MaxCLL 1000, Dolby Vision profile 8',
   );
@@ -1028,16 +1090,27 @@ test('an in-place color transfer keeps its original target during donor inspecti
     .getByRole('button', { name: /Configure/ });
   const dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   await configure.click();
+  await expect(
+    dialog.getByLabel('Target Video').locator(`option[value="${donor.replaceAll('\\', '\\\\')}"]`),
+  ).toBeDisabled();
   await dialog.getByLabel('Target Video').selectOption(originalTarget);
   await dialog.getByRole('button', { name: 'OK' }).click();
-  await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+  await expect(
+    page
+      .getByRole('region', { name: 'Utilities' })
+      .locator('article')
+      .filter({ hasText: /Transfer Color Metadata/ }),
+  ).toContainText('Rewrite · A.mkv → B.mkv');
+  await page.getByRole('button', { name: 'Run: Rewrite metadata in B.mkv' }).click();
   await expect(page.getByRole('log')).toContainText('from A.mkv to B.mkv');
   await configure.click();
   await dialog.getByLabel('Target Video').selectOption(nextTarget);
   await dialog.getByLabel(/HDR metadata/).uncheck();
   await dialog.getByRole('button', { name: 'OK' }).click();
   await page.getByRole('button', { name: /Repair Frame Cadence/ }).click();
-  await expect(page.getByLabel('Current action')).toHaveText('Running: Color data transfer...');
+  await expect(page.getByLabel('Current action')).toHaveText(
+    'Running: Rewrite metadata in B.mkv...',
+  );
   await page.evaluate(() => (globalThis as any).__releaseColorRead());
   await expect
     .poll(() =>
@@ -1083,7 +1156,7 @@ test('Color Data sends each source flag combination to the selected target in pl
     await dialog.getByLabel(/Color space/).setChecked(color);
     await dialog.getByLabel(/HDR metadata/).setChecked(hdr);
     await dialog.getByRole('button', { name: 'OK' }).click();
-    await page.getByRole('button', { name: 'Run: Color data transfer' }).click();
+    await page.getByRole('button', { name: 'Run: Rewrite metadata in B.mkv' }).click();
     count++;
     await expect
       .poll(() =>
@@ -1134,7 +1207,7 @@ test('Color Data batch mode only reads each file even after a target was configu
   dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
   await expect(dialog.getByLabel('Target Video')).toBeDisabled();
   await dialog.getByRole('button', { name: 'Close' }).click();
-  await page.getByRole('button', { name: 'Run Batch: Color data transfer' }).click();
+  await page.getByRole('button', { name: 'Run Batch: Read color metadata' }).click();
   await expect
     .poll(() =>
       page.evaluate(
@@ -1154,6 +1227,50 @@ test('Color Data batch mode only reads each file even after a target was configu
   await page.getByRole('button', { name: 'File List', exact: true }).click();
   await expect(page.getByRole('option', { name: /A.mkv/ })).toContainText('Done');
   await expect(page.getByRole('option', { name: /B.mkv/ })).toContainText('Done');
+});
+
+test('Color Data blocks in-place rewrite when the donor is removed, even after opening and canceling Configure', async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    (globalThis as any).__mediaPaths = ['C:\\media\\A.mkv', 'C:\\media\\B.mkv', 'C:\\media\\C.mkv'];
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const card = page
+    .getByRole('region', { name: 'Utilities' })
+    .locator('article')
+    .filter({ hasText: /Transfer Color Metadata/ });
+  await card.getByRole('button', { name: /Configure/ }).click();
+  let dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  await dialog.getByLabel('Source Video').selectOption('C:\\media\\A.mkv');
+  await dialog.getByLabel('Target Video').selectOption('C:\\media\\B.mkv');
+  await dialog.getByRole('button', { name: 'OK' }).click();
+
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Remove', exact: true }).click();
+  await page.getByRole('option', { name: /C.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  await card.click();
+  await expect(card).toContainText('Choose source → B.mkv');
+  const run = page.getByRole('button', { name: 'Run: Rewrite metadata in B.mkv', exact: true });
+  await expect(run).toBeDisabled();
+  await expect(page.locator('#run-blocked-reason')).toContainText(
+    'The configured source video for B.mkv was removed.',
+  );
+
+  await card.getByRole('button', { name: /Configure/ }).click();
+  dialog = page.getByRole('dialog', { name: 'Transfer Color Metadata' });
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(run).toBeDisabled();
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__shellCalls.filter((c: any) => c.command === 'run_utility'),
+    ),
+  ).toHaveLength(0);
 });
 
 test('Sample Encodes shows the exact per-encoder source color menus and sends selected format', async ({
@@ -1225,6 +1342,9 @@ for (const width of [800, 1360]) {
     page,
   }) => {
     await page.setViewportSize({ width, height: width === 800 ? 768 : 850 });
+    await page.getByRole('button', { name: 'Add Files…' }).click();
+    await page.getByRole('option', { name: /A.mkv/ }).click();
+    await page.getByRole('button', { name: 'Load Tracks' }).click();
     await page.getByRole('button', { name: 'Utilities', exact: true }).click();
     const utilities = page.getByRole('region', { name: 'Utilities' });
     const cards = utilities.locator('.card');
@@ -1258,7 +1378,7 @@ for (const width of [800, 1360]) {
 test('image sequence folder prompts for rate, displays original folder, and releases its managed source on removal', async ({
   page,
 }) => {
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   const prompt = page.getByRole('dialog', { name: 'Enter Frame Rate' });
   await expect(prompt).toContainText("image sequence 'frames'");
   await expect(prompt.getByLabel('Frame rate')).toHaveValue('30');
@@ -1302,32 +1422,35 @@ test('image sequence folder prompts for rate, displays original folder, and rele
     .toEqual({ inputPath: 'C:\\private\\sequence.mkv', sequenceFingerprint: 'sha256-test' });
 });
 
-test('image sequence rate prompt validates invalid input and closing uses source default 30', async ({
+test('image sequence rate prompt validates invalid input and closing cancels import', async ({
   page,
 }) => {
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   const prompt = page.getByRole('dialog', { name: 'Enter Frame Rate' });
   await prompt.getByLabel('Frame rate').fill('0/0');
   await prompt.getByRole('button', { name: 'OK' }).click();
   await expect(prompt.getByRole('alert')).toContainText('positive frame rate');
   await prompt.getByRole('button', { name: 'Close' }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (globalThis as any).__shellCalls.find((c: any) => c.command === 'import_image_sequence')
-            ?.payload.request.frameRate,
-      ),
-    )
-    .toEqual({ numerator: 30, denominator: 1 });
+  await expect(prompt).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__shellCalls.filter((c: any) => c.command === 'import_image_sequence'),
+    ),
+  ).toHaveLength(0);
 });
 
-test('sequence decimals follow fork integer rounding and duplicate folders retain the original rate', async ({
+test('sequence decimals parse exact rational rates and duplicate folders retain the original rate', async ({
   page,
 }) => {
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   const rate = page.getByRole('dialog', { name: 'Enter Frame Rate' });
-  await rate.getByLabel('Frame rate').fill('23.976');
+  await rate.getByLabel('Frame rate').fill('constructor');
+  await expect(rate).toContainText('Enter a positive number or fraction');
+  await rate.getByRole('button', { name: 'OK' }).click();
+  await expect(rate.getByRole('alert')).toContainText('positive frame rate');
+  await rate.getByLabel('Frame rate').fill('23.9760');
+  await expect(rate.getByRole('alert')).toHaveCount(0);
+  await expect(rate).toContainText('Effective rate: 24000/1001');
   await rate.getByRole('button', { name: 'OK' }).click();
   await expect(page.getByRole('option', { name: /frames/ })).toBeVisible();
   await expect
@@ -1345,8 +1468,8 @@ test('sequence decimals follow fork integer rounding and duplicate folders retai
         (globalThis as any).__shellCalls.find((c: any) => c.command === 'import_image_sequence')
           .payload.request.frameRate,
     ),
-  ).toEqual({ numerator: 24, denominator: 1 });
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  ).toEqual({ numerator: 24000, denominator: 1001 });
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   await page
     .getByRole('dialog', { name: 'Import 1 File' })
     .getByRole('button', { name: 'Add to file list' })
@@ -1363,7 +1486,7 @@ test('sequence decimals follow fork integer rounding and duplicate folders retai
 });
 
 test('sequence removal reports retained cache when a job still owns it', async ({ page }) => {
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   await page
     .getByRole('dialog', { name: 'Enter Frame Rate' })
     .getByRole('button', { name: 'OK' })
@@ -1566,7 +1689,7 @@ for (const configured of [false, true]) {
         .toBe(true);
       await page.getByRole('button', { name: 'File List', exact: true }).click();
     }
-    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
     await page
       .getByRole('dialog', { name: 'Enter Frame Rate' })
       .getByRole('button', { name: 'OK' })
@@ -1590,7 +1713,7 @@ test('Quick Convert encodes the managed sequence while output remains beside its
   await page.evaluate(() => localStorage.setItem('test-batch-capabilities', 'yes'));
   await page.reload();
   await page.evaluate(() => ((globalThis as any).__folderPath = 'C:\\media\\frames.01'));
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   await page
     .getByRole('dialog', { name: 'Enter Frame Rate' })
     .getByRole('button', { name: 'OK' })
@@ -1665,7 +1788,7 @@ test('batch naming example uses the full dotted sequence folder name and an empt
   page,
 }) => {
   await page.evaluate(() => ((globalThis as any).__folderPath = 'C:\\media\\frames.01'));
-  await page.getByRole('button', { name: 'Add Folder…' }).click();
+  await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
   await page
     .getByRole('dialog', { name: 'Enter Frame Rate' })
     .getByRole('button', { name: 'OK' })
@@ -1680,7 +1803,7 @@ for (const reusedCache of [false, true]) {
   test(`duplicate canonical sequence import selects the loaded row and ${reusedCache ? 'keeps its reused cache' : 'releases only the unused cache'}`, async ({
     page,
   }) => {
-    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
     await page
       .getByRole('dialog', { name: 'Enter Frame Rate' })
       .getByRole('button', { name: 'OK' })
@@ -1694,7 +1817,7 @@ for (const reusedCache of [false, true]) {
       host.__sequenceId = 'unused-sequence';
       host.__sequencePath = reused ? 'C:\\private\\sequence.mkv' : 'C:\\private\\unused.mkv';
     }, reusedCache);
-    await page.getByRole('button', { name: 'Add Folder…' }).click();
+    await page.getByRole('button', { name: 'Add Image Sequence…' }).click();
     await page
       .getByRole('dialog', { name: 'Import 1 File' })
       .getByRole('button', { name: 'Add to file list' })
@@ -1714,7 +1837,7 @@ for (const reusedCache of [false, true]) {
       .toBe(2);
     await expect(row).toHaveCount(1);
     await expect(row).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByRole('button', { name: 'Add Folder…' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Add Image Sequence…' })).toBeEnabled();
     await expect
       .poll(() =>
         page.evaluate(() =>
@@ -1742,52 +1865,89 @@ for (const reusedCache of [false, true]) {
   });
 }
 
-test('unsupported utility batches show the source-specific warning', async ({ page }) => {
+test('unsupported utility batches block Run proactively and switch back to Muxing Mode on click', async ({
+  page,
+}) => {
   await page.getByRole('button', { name: 'Add Files…' }).click();
   await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
   await page.getByRole('button', { name: 'Utilities', exact: true }).click();
   const utilities = page.getByRole('region', { name: 'Utilities' });
   const cases = [
-    {
-      card: 'Get Metrics',
-      task: 'Metrics calculation',
-      reason:
-        'It compares two loaded files against each other, so a single file means nothing to it.',
-      config: 'Quality Metrics',
-    },
-    {
-      card: 'Sample Encodes',
-      task: 'CRF ladder',
-      reason:
-        'It ends in a results window, which a queue would raise once per file with nobody there',
-    },
-    {
-      card: 'Show Bitrate Chart',
-      task: 'Bitrate chart',
-      reason:
-        'It opens a chart window for the file it analysed, and a queue would raise one per file.',
-    },
-    {
-      card: 'Concatenate Into Single MKV',
-      task: 'Concatenation',
-      reason:
-        'It joins the whole file list into one output, which is the opposite of running per file.',
-    },
+    { card: 'Get Metrics', task: 'Metrics calculation', config: 'Quality Metrics' },
+    { card: 'Sample Encodes', task: 'CRF ladder' },
+    { card: 'Show Bitrate Chart', task: 'Bitrate chart' },
+    { card: 'Concatenate Into Single MKV', task: 'Concatenation' },
   ];
   for (const entry of cases) {
+    const article = utilities.locator('article').filter({ hasText: entry.card });
+    await expect(article).toContainText('Muxing Mode only');
     await utilities.getByRole('button', { name: entry.card, exact: true }).click();
     if (entry.config)
       await page
         .getByRole('dialog', { name: entry.config })
         .getByRole('button', { name: 'Close' })
         .click();
-    await page.getByRole('button', { name: `Run Batch: ${entry.task}` }).click();
-    const warning = page.getByRole('dialog', { name: 'jesses - Warning' });
-    await expect(warning).toContainText(`${entry.task} cannot be run per file.`);
-    await expect(warning).toContainText(entry.reason);
-    await expect(warning).toContainText('Switch the File List tab to Muxing Mode to use it.');
-    await warning.getByRole('button', { name: 'OK' }).click();
+    await expect(page.getByRole('button', { name: `Run Batch: ${entry.task}` })).toBeDisabled();
+    await expect(page.locator('#run-blocked-reason')).toContainText(
+      `${entry.task} cannot be run per file. Switch to Muxing Mode to use it.`,
+    );
   }
+  await page.locator('#run-blocked-reason').click();
+  await expect(page.getByRole('button', { name: 'Run: Concatenation' })).toBeEnabled();
+});
+
+test('Get Metrics and Concatenate run with loaded files without pre-loading tracks, and failed replacement keeps the workspace', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toBeVisible();
+  await page.getByRole('option', { name: /A.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Utilities', exact: true }).click();
+  const utilities = page.getByRole('region', { name: 'Utilities' });
+  await utilities.getByRole('button', { name: 'Get Metrics', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: 'Quality Metrics' })
+    .getByRole('button', { name: 'OK' })
+    .click();
+  await page.getByRole('button', { name: 'Run: Metrics calculation' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some((c: any) => c.command === 'analyze_quality'),
+      ),
+    )
+    .toBe(true);
+
+  await utilities.getByRole('button', { name: 'Concatenate Into Single MKV', exact: true }).click();
+  await page.getByRole('button', { name: 'Run: Concatenation' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (globalThis as any).__shellCalls.some(
+          (c: any) => c.command === 'run_utility' && c.payload.request.kind === 'concat',
+        ),
+      ),
+    )
+    .toBe(true);
+
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__mediaPaths = ['C:\\media\\broken.mkv'];
+    host.__failProbePaths = ['C:\\media\\broken.mkv'];
+  });
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page
+    .getByRole('dialog', { name: 'Import 1 File' })
+    .getByRole('button', { name: 'Replace file list' })
+    .click();
+  await expect(page.getByRole('alert')).toContainText('broken.mkv');
+  await expect(page.getByRole('button', { name: 'Add Files…' })).toBeEnabled();
+  await expect(page.getByRole('option', { name: /A.mkv/ })).toBeVisible();
+  await expect(page.getByRole('option', { name: /B.mkv/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Track List', exact: true }).click();
+  await expect(page.getByRole('grid', { name: 'Tracks' }).getByRole('row')).toHaveCount(3);
 });
 
 test('utility progress accepts only its active ticket, supports pause and discards late completion after Stop', async ({

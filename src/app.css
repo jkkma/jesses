@@ -8,8 +8,6 @@
     -apple-system,
     BlinkMacSystemFont,
     sans-serif;
-  /* 81.25% of a 16px default is 13px, while still following OS/browser text-scale preferences. */
-  font-size: 81.25%;
   line-height: 1.5;
   color-scheme: light;
   color: #373a31;
@@ -17,7 +15,9 @@
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  scrollbar-color: #6d6b59 #dad4bb;
+  --scrollbar-thumb: #6d6b59;
+  --scrollbar-track: #dad4bb;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   --background: #dad4bb;
   --foreground: #373a31;
   --card: #e8e2cd;
@@ -47,8 +47,15 @@
   --radius: 0px;
   --jesses-primary-hover: #292d25;
   --jesses-rust-text: #454b3c;
-  --rule: #7c7967;
+  --rule: #757260;
   --success: #3f5236;
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --scrollbar-thumb: #292d25;
+    --scrollbar-track: #f1eedb;
+  }
 }
 
 @theme inline {
@@ -77,109 +84,150 @@
   --radius-xl: var(--radius);
 }
 
-* {
-  box-sizing: border-box;
-}
+@layer base {
+  body {
+    margin: 0;
+    min-width: 760px;
+    /* 13px at standard 16px root while preserving OS <meta name="text-scale"> scaling. */
+    font-size: 0.8125rem;
+  }
 
-body {
-  margin: 0;
-  min-width: 760px;
-}
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
 
-button,
-input,
-select,
-textarea {
-  font: inherit;
-}
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+    transition:
+      background-color 100ms ease,
+      border-color 100ms ease,
+      color 100ms ease;
+  }
 
-button,
-a {
-  -webkit-tap-highlight-color: transparent;
-  transition:
-    background-color 100ms ease,
-    border-color 100ms ease,
-    color 100ms ease;
-}
+  button:not(:disabled),
+  select:not(:disabled),
+  summary {
+    cursor: pointer;
+  }
 
-button:not(:disabled),
-select:not(:disabled),
-summary {
-  cursor: pointer;
-}
+  /* A disabled control must look unavailable, not only refuse interaction. */
+  button:disabled,
+  select:disabled,
+  input:disabled,
+  textarea:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
 
-/* A disabled button must look unavailable, not only refuse the click. */
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
+  button,
+  input,
+  select,
+  textarea,
+  summary,
+  [data-slot='button'] {
+    border-radius: 0;
+  }
 
-button,
-input,
-select,
-textarea,
-summary,
-[data-slot='button'] {
-  border-radius: 0;
-}
+  input:not([type='range']):user-invalid,
+  select:user-invalid,
+  textarea:user-invalid {
+    border-color: var(--destructive);
+  }
 
-input[type='checkbox'],
-input[type='radio'],
-input[type='range'],
-progress {
-  accent-color: var(--primary);
-}
+  input[type='checkbox'],
+  input[type='radio'],
+  input[type='range'],
+  progress {
+    accent-color: var(--primary);
+  }
 
-:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
 
-a {
-  color: var(--jesses-rust-text);
-  text-decoration: none;
-}
+  a {
+    color: var(--jesses-rust-text);
+    text-decoration: none;
+  }
 
-a:hover {
-  color: var(--foreground);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
+  a:hover {
+    color: var(--foreground);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
 
-p,
-h1,
-h2,
-h3 {
-  margin: 0;
-}
+  p,
+  h1,
+  h2,
+  h3 {
+    margin: 0;
+  }
 
-h1,
-h2,
-h3 {
-  font-weight: 600;
-}
+  h1,
+  h2,
+  h3 {
+    font-weight: 600;
+  }
 
-svg {
-  flex-shrink: 0;
-}
+  h1,
+  h2,
+  h3,
+  th {
+    text-wrap: balance;
+  }
 
-::selection {
-  background: var(--foreground);
-  color: var(--background);
-}
+  p {
+    text-wrap: pretty;
+  }
 
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
+  svg {
+    flex-shrink: 0;
+  }
 
-::-webkit-scrollbar-track {
-  background: var(--background);
-}
+  ::selection {
+    background: var(--foreground);
+    color: var(--background);
+  }
 
-::-webkit-scrollbar-thumb {
-  background: #6d6b59;
-  border: 2px solid var(--background);
+  details::details-content {
+    interpolate-size: allow-keywords;
+    overflow: clip;
+    contain: layout;
+  }
+
+  details:not([open])::details-content {
+    block-size: 0;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    details::details-content {
+      transition: block-size, content-visibility, display;
+      transition-duration: 0.16s;
+      transition-timing-function: ease-in-out;
+      transition-behavior: allow-discrete;
+    }
+  }
+
+  @supports not (scrollbar-color: auto) {
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--scrollbar-thumb);
+      border: 2px solid var(--scrollbar-track);
+    }
+  }
 }
 
 .mono {
@@ -188,12 +236,12 @@ svg {
 }
 
 .small-muted {
-  font-size: 0.85rem;
+  font-size: 0.6906rem;
   color: var(--muted-foreground);
 }
 
 .eyebrow {
-  font-size: 0.77rem;
+  font-size: 0.6256rem;
   font-weight: 600;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -212,23 +260,14 @@ svg {
 }
 
 .spinning {
-  animation: spin 1.3s linear infinite;
+  @media (prefers-reduced-motion: no-preference) {
+    animation: spin 1.3s linear infinite;
+  }
 }
 
 @keyframes spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
   }
 }
 

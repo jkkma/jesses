@@ -9,6 +9,7 @@
     rememberMedia,
   } from '$lib/preferences.svelte';
   import WindowControls from '$lib/components/WindowControls.svelte';
+  import { copyTextWithFeedback } from '$lib/components/shared/clipboard';
   import SourceFileList from '$lib/features/source/FileList.svelte';
   import SourceTrackList from '$lib/features/source/TrackList.svelte';
   import SourceSettings from '$lib/features/source/SourceSettings.svelte';
@@ -144,9 +145,12 @@
     if (!files.length || !paths.length) return Promise.resolve({ paths, replace: false });
     if (finishImportChoices) return Promise.resolve(null);
     importChoices = paths.map((path) => ({ path, checked: true }));
-    return new Promise<{ paths: string[]; replace: boolean } | null>((resolve) => {
-      finishImportChoices = resolve;
-    });
+    const { promise, resolve } = Promise.withResolvers<{
+      paths: string[];
+      replace: boolean;
+    } | null>();
+    finishImportChoices = resolve;
+    return promise;
   }
   function finishImportDialog(replace?: boolean) {
     const resolve = finishImportChoices;
@@ -159,21 +163,43 @@
   let finishSequencePrompt:
     ((rate: { numerator: number; denominator: number } | null) => void) | undefined;
   let sequenceImportAbort: AbortController | undefined;
-  function askSequenceRate(path: string) {
-    sequencePrompt = { path, text: '30', error: '' };
-    return new Promise<{ numerator: number; denominator: number } | null>((resolve) => {
-      finishSequencePrompt = resolve;
-    });
+  function gcd(a: number, b: number): number {
+    let x = Math.abs(a),
+      y = Math.abs(b);
+    while (y) [x, y] = [y, x % y];
+    return x || 1;
   }
-  function finishSequenceRate(useDefault = false) {
-    if (!sequencePrompt) return;
-    const text = useDefault ? '30' : sequencePrompt.text.trim() || '30';
-    const match = /^(\d+)(?:\/(\d+))?$/.exec(text);
-    const decimal = /^\d+(?:\.\d+)?$/.test(text) ? Math.fround(Number(text)) : NaN;
-    const floor = Math.floor(decimal);
-    const rounded = decimal - floor === 0.5 && floor % 2 === 0 ? floor : Math.round(decimal);
-    const numerator = match ? Number(match[1]) : rounded;
-    const denominator = match ? Number(match[2] || 1) : 1;
+  const knownNtscRates = new Map<string, { numerator: number; denominator: number }>([
+    ['23.976', { numerator: 24000, denominator: 1001 }],
+    ['29.97', { numerator: 30000, denominator: 1001 }],
+    ['59.94', { numerator: 60000, denominator: 1001 }],
+    ['119.88', { numerator: 120000, denominator: 1001 }],
+  ]);
+  function parseSequenceRate(text: string): { numerator: number; denominator: number } | null {
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+    let numerator = 0,
+      denominator = 1;
+    const fracMatch = /^(\d+)\s*\/\s*(\d+)$/.exec(trimmed);
+    const decMatch = /^(\d+)(?:\.(\d+))?$/.exec(trimmed);
+    if (fracMatch) {
+      numerator = Number(fracMatch[1]);
+      denominator = Number(fracMatch[2]);
+    } else if (decMatch) {
+      const wholeNorm = decMatch[1].replace(/^0+(?=\d)/, '');
+      const fracNorm = (decMatch[2] ?? '').replace(/0+$/, '');
+      const normalized = fracNorm ? `${wholeNorm}.${fracNorm}` : wholeNorm;
+      const ntsc = knownNtscRates.get(normalized);
+      if (ntsc) return ntsc;
+      const scale = 10 ** fracNorm.length;
+      const rawNum = Number(`${wholeNorm}${fracNorm}`);
+      if (!Number.isSafeInteger(rawNum) || !Number.isSafeInteger(scale)) return null;
+      const factor = gcd(rawNum, scale);
+      numerator = rawNum / factor;
+      denominator = scale / factor;
+    } else {
+      return null;
+    }
     if (
       !Number.isSafeInteger(numerator) ||
       !Number.isSafeInteger(denominator) ||
@@ -183,14 +209,40 @@
       denominator > 2147483647 ||
       numerator / denominator < 0.001 ||
       numerator / denominator > 1000
-    ) {
-      sequencePrompt.error = 'Enter a positive frame rate, such as 30 or 24000/1001.';
+    )
+      return null;
+    return { numerator, denominator };
+  }
+  const parsedSequenceRate = $derived(
+    sequencePrompt ? parseSequenceRate(sequencePrompt.text) : null,
+  );
+  function askSequenceRate(path: string) {
+    sequencePrompt = { path, text: '30', error: '' };
+    const { promise, resolve } = Promise.withResolvers<{
+      numerator: number;
+      denominator: number;
+    } | null>();
+    finishSequencePrompt = resolve;
+    return promise;
+  }
+  function finishSequenceRate(cancel = false) {
+    if (!sequencePrompt) return;
+    if (cancel) {
+      const resolve = finishSequencePrompt;
+      finishSequencePrompt = undefined;
+      sequencePrompt = null;
+      resolve?.(null);
+      return;
+    }
+    const rate = parseSequenceRate(sequencePrompt.text);
+    if (!rate) {
+      sequencePrompt.error = 'Enter a positive frame rate, such as 30, 23.976, or 24000/1001.';
       return;
     }
     const resolve = finishSequencePrompt;
     finishSequencePrompt = undefined;
     sequencePrompt = null;
-    resolve?.({ numerator, denominator });
+    resolve?.(rate);
   }
   function displaySourcePath(file: MediaFile) {
     return file.source?.kind === 'imageSequence' ? file.source.directoryPath : file.path;
@@ -200,6 +252,12 @@
   let batchNameTemplate = $state('{name}');
   let trackSelection = $state<TrackSelection[]>([]);
   let noDefaultSubtitles = $state(false);
+  let savedMuxDraft = $state<{
+    mainSourceId: string | null;
+    trackSelection: TrackSelection[];
+    noDefaultSubtitles: boolean;
+  } | null>(null);
+  let workspaceMutationRevision = 0;
   let workspaceActions = $state<Partial<Record<TaskView, WorkspaceAction>>>({});
   let lastActionStatus = $state('');
   let lastTaskTab = $state<'convert' | 'av1an' | 'utilities'>('av1an');
@@ -304,6 +362,7 @@
     selectedId = ids.at(-1) ?? null;
   }
   function loadTracks(ids = selectedFileIds, switchTab = true) {
+    if (fileMode === 'batch') return;
     const chosen = files.filter((file) => ids.includes(file.id));
     if (!chosen.length) return;
     if (!mainSourceId) mainSourceId = chosen[0].id;
@@ -362,19 +421,41 @@
         next = next.map((row) => (row === first ? { ...row, defaultFlag: true } : row));
       }
     }
+    workspaceMutationRevision++;
     trackSelection = next;
     if (switchTab) view = 'tracks';
   }
   function changeFileMode(next: FileListMode) {
     const previous = fileMode;
     if (previous === 'mux' && next === 'batch') {
+      workspaceMutationRevision++;
+      savedMuxDraft = { mainSourceId, trackSelection, noDefaultSubtitles };
       mainSourceId = null;
       trackSelection = [];
       noDefaultSubtitles = false;
     }
     fileMode = next;
-    if (previous === 'batch' && next === 'mux' && files.length === 1 && !trackSelection.length)
-      loadTracks([files[0].id], false);
+    if (previous === 'batch' && next === 'mux') {
+      workspaceMutationRevision++;
+      if (savedMuxDraft) {
+        const loadedIds = new Set(files.map((file) => file.id));
+        const restoredTracks = savedMuxDraft.trackSelection.filter((row) =>
+          loadedIds.has(row.sourceId),
+        );
+        if (restoredTracks.length) {
+          mainSourceId =
+            savedMuxDraft.mainSourceId && loadedIds.has(savedMuxDraft.mainSourceId)
+              ? savedMuxDraft.mainSourceId
+              : (restoredTracks[0]?.sourceId ?? files[0]?.id ?? null);
+          trackSelection = restoredTracks;
+          noDefaultSubtitles = savedMuxDraft.noDefaultSubtitles;
+          savedMuxDraft = null;
+          return;
+        }
+        savedMuxDraft = null;
+      }
+      if (files.length === 1 && !trackSelection.length) loadTracks([files[0].id], false);
+    }
   }
   function moveSelectedFile(offset: number) {
     if (selectedFileIds.length !== 1) return;
@@ -387,7 +468,7 @@
   function sortFiles(sort: string) {
     const [field, direction] = sort.split(':');
     const sign = direction === 'desc' ? -1 : 1;
-    files = [...files].sort((a, b) => {
+    files = files.toSorted((a, b) => {
       if (field === 'mtime') {
         const left = a.modifiedAtMs,
           right = b.modifiedAtMs;
@@ -441,6 +522,8 @@
     );
   }
   function resizeLog(event: PointerEvent) {
+    if (event.button !== 0) return;
+    (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
     const startY = event.clientY;
     const height =
       document.querySelector('.log-entries')?.getBoundingClientRect().height ?? logHeight;
@@ -451,7 +534,7 @@
       /* Optional UI state. */
     }
     function move(next: PointerEvent) {
-      logHeight = Math.max(90, Math.min(400, height - (next.clientY - startY)));
+      logHeight = Math.max(64, Math.min(400, height - (next.clientY - startY)));
     }
     function finish() {
       window.removeEventListener('pointermove', move);
@@ -515,7 +598,19 @@
   // The log follows new entries while it is scrolled to the bottom, and stays
   // put once the reader scrolls up to read something.
   let logElement = $state<HTMLDivElement>();
+  let renderedLogHeight = $state(140);
   let followLog = true;
+  $effect(() => {
+    const element = logElement;
+    if (!element || typeof ResizeObserver === 'undefined') return;
+    renderedLogHeight = Math.round(element.getBoundingClientRect().height) || logHeight;
+    const observer = new ResizeObserver(() => {
+      const next = Math.round(element.getBoundingClientRect().height);
+      if (next > 0) renderedLogHeight = next;
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  });
   function trackLogScroll() {
     if (!logElement) return;
     followLog = logElement.scrollHeight - logElement.scrollTop - logElement.clientHeight < 24;
@@ -532,35 +627,77 @@
   let nextLogId = 0;
   let jobs = $state<JobSnapshot[]>([]);
   let historyOpen = $state(false);
+  let selectedHistoryJobId = $state('');
   let historySection = $state<HTMLElement>();
   const failedJobCount = $derived(jobs.filter((job) => job.state === 'failed').length);
   async function showJobHistory() {
     view = 'tools';
     historyOpen = true;
+    selectedHistoryJobId = jobs.find((job) => job.state === 'failed')?.id ?? jobs[0]?.id ?? '';
     await tick();
     historySection?.scrollIntoView({ block: 'start' });
     historySection?.querySelector('summary')?.focus({ preventScroll: true });
   }
   const openedEncodeJobs = new Set<string>();
   const previousEncodeStates = new Map<string, JobSnapshot['state']>();
-  async function showEncodeWindow() {
+  const activeBatchId = $derived(
+    Object.values(workspaceActions).find((candidate) => candidate?.active && candidate.batchRunId)
+      ?.batchRunId ?? null,
+  );
+  let queueMonitorOpened = false;
+  let queueRunGeneration = 0;
+  let openedMonitorBatchId: string | null = null;
+  let encodeWindowOpening = false;
+  $effect(() => {
+    if (!activeBatchId) openedMonitorBatchId = null;
+  });
+  async function showEncodeWindow(focus = true) {
     try {
-      await openEncodeWindow();
+      await openEncodeWindow(focus);
+      return true;
     } catch (error) {
       addLog(
         `Could not open the encoding window: ${errorMessage(error)}. The job is still available in jesses.`,
         'error',
       );
+      return false;
     }
   }
-  function showStartedEncode(job: JobSnapshot) {
-    if (job.encodeSettings?.backend !== 'standalone' || openedEncodeJobs.has(job.id)) return;
-    openedEncodeJobs.add(job.id);
-    void showEncodeWindow();
+  async function showStartedEncode(job: JobSnapshot) {
+    const batchId = activeBatchId;
+    if (
+      job.encodeSettings?.backend !== 'standalone' ||
+      openedEncodeJobs.has(job.id) ||
+      encodeWindowOpening ||
+      (batchId ? openedMonitorBatchId === batchId : queueMonitorOpened)
+    )
+      return;
+    const queueGeneration = queueRunGeneration;
+    encodeWindowOpening = true;
+    try {
+      if (await showEncodeWindow(true)) {
+        openedEncodeJobs.add(job.id);
+        const hasActiveStandalone = jobs.some(
+          (entry) => entry.encodeSettings?.backend === 'standalone' && !terminalJob(entry.state),
+        );
+        if (batchId) {
+          if (activeBatchId === batchId) openedMonitorBatchId = batchId;
+        } else if (queueGeneration === queueRunGeneration && hasActiveStandalone) {
+          queueMonitorOpened = true;
+        }
+      }
+    } finally {
+      encodeWindowOpening = false;
+    }
   }
   function observeEncodeWindows(snapshot: JobSnapshot[]) {
-    for (const job of snapshot) {
-      if (job.encodeSettings?.backend !== 'standalone') continue;
+    const standalone = snapshot.filter((job) => job.encodeSettings?.backend === 'standalone');
+    const activeStandalone = standalone.filter((job) => !terminalJob(job.state));
+    if (!activeStandalone.length) {
+      queueMonitorOpened = false;
+      queueRunGeneration++;
+    }
+    for (const job of standalone) {
       const previous = previousEncodeStates.get(job.id);
       if (previous && terminalJob(previous) && !terminalJob(job.state))
         openedEncodeJobs.delete(job.id);
@@ -571,7 +708,7 @@
         ['running', 'paused', 'finalizing'].includes(job.state) ||
         (previous === 'queued' && job.state === 'preparing')
       )
-        showStartedEncode(job);
+        void showStartedEncode(job);
     }
   }
   let batchJobIds = $state<Record<string, string>>({});
@@ -813,21 +950,69 @@
     if (importing) throw new Error('Wait for the current import to finish before resuming.');
     const beforeFiles = files,
       beforeMain = mainSourceId,
+      beforeMode = fileMode,
+      beforeTracks = trackSelection,
+      beforeNoDefaultSubs = noDefaultSubtitles,
+      beforeSavedMuxDraft = savedMuxDraft,
+      beforeRevision = workspaceMutationRevision,
       generation = ++importGeneration;
+    const workspaceMatches = () =>
+      !importing &&
+      generation === importGeneration &&
+      workspaceMutationRevision === beforeRevision &&
+      files === beforeFiles &&
+      mainSourceId === beforeMain &&
+      fileMode === beforeMode &&
+      trackSelection === beforeTracks &&
+      noDefaultSubtitles === beforeNoDefaultSubs &&
+      savedMuxDraft === beforeSavedMuxDraft;
     const source = await probeMedia(path);
-    if (generation !== importGeneration || files !== beforeFiles || mainSourceId !== beforeMain)
+    if (!workspaceMatches())
       throw new Error('The source list changed while the saved input was loading.');
     if (source.path !== path)
       throw new Error('The saved input path did not resolve to the same source.');
-    clearFiles();
-    files = [source];
-    selectedId = source.id;
-    selectedFileIds = [source.id];
-    loadTracks([source.id], false);
-    await tick();
-    await tick();
-    if ((fileMode === 'batch' ? files[0]?.path : mainSource?.path) !== path)
-      throw new Error('The saved input could not be made the current source.');
+    return {
+      source,
+      cancel: () => {
+        if (
+          source.source?.kind === 'imageSequence' &&
+          !files.some((entry) => pathKey(entry.path) === pathKey(source.path))
+        )
+          releaseSequence(source);
+      },
+      publish: async () => {
+        if (!workspaceMatches()) {
+          if (
+            source.source?.kind === 'imageSequence' &&
+            !files.some((entry) => pathKey(entry.path) === pathKey(source.path))
+          )
+            releaseSequence(source);
+          return;
+        }
+        const previousFiles = files;
+        files = [source];
+        batchJobIds = {};
+        utilityBatchStatuses = {};
+        batchStatusOwner = null;
+        batchStatusFiles.clear();
+        mainSourceId = null;
+        trackSelection = [];
+        noDefaultSubtitles = false;
+        savedMuxDraft = null;
+        fileQuery = '';
+        selectedId = source.id;
+        selectedFileIds = [source.id];
+        if (fileMode === 'mux') loadTracks([source.id], false);
+        await tick();
+        await tick();
+        for (const entry of previousFiles)
+          if (
+            entry.source?.kind === 'imageSequence' &&
+            pathKey(entry.path) !== pathKey(source.path)
+          )
+            releaseSequence(entry);
+      },
+    };
   }
   function acceptRecoveryJobs(before: JobSnapshot[], after: JobSnapshot[]) {
     for (const snapshot of after) {
@@ -1005,10 +1190,12 @@
     return path.replace(/\/+$/, '');
   }
 
-  function queueImportPaths(paths: string[], detectFolders = false) {
+  function queueImportPaths(paths: string[], detectFolders = false, replace = false) {
     const activeKey = activePath ? pathKey(activePath) : null;
     const queued = new Set(importQueue.map((entry) => pathKey(entry.path)));
-    const loaded = new Set(files.map((file) => pathKey(displaySourcePath(file))));
+    const loaded = replace
+      ? new Set<string>()
+      : new Set(files.map((file) => pathKey(displaySourcePath(file))));
     for (const path of paths) {
       const key = pathKey(path);
       if (key === activeKey || queued.has(key) || loaded.has(key)) continue;
@@ -1099,19 +1286,21 @@
     return recent;
   }
 
-  async function drainImport(generation: number) {
+  async function drainImport(generation: number, replace = false) {
+    const staged: MediaFile[] = [];
     try {
       while (generation === importGeneration && importQueue.length) {
         const entry = importQueue.shift()!;
         const path = entry.path;
+        const itemName = fileName(path);
         activePath = path;
-        importingName = fileName(path);
+        importingName = `Importing ${itemName}…`;
         try {
           const folder = entry.detectFolder && (await recentPathIsFolder(path));
           if (generation !== importGeneration) return;
           if (folder) {
             const frameRate = await askSequenceRate(path);
-            if (generation !== importGeneration || !frameRate) return;
+            if (generation !== importGeneration || !frameRate) continue;
             const controller = new AbortController();
             sequenceImportAbort = controller;
             const media = await importImageSequence(
@@ -1121,13 +1310,19 @@
             if (sequenceImportAbort === controller) sequenceImportAbort = undefined;
             if (generation !== importGeneration) return;
             recordImportRecent(generation, 'folders', displaySourcePath(media));
-            const existing = files.find(
+            const targetList = replace ? staged : files;
+            const existing = targetList.find(
               (item) => pathKey(displaySourcePath(item)) === pathKey(displaySourcePath(media)),
             );
             if (existing) {
-              selectedId = existing.id;
-              selectedFileIds = [existing.id];
+              if (!replace) {
+                selectedId = existing.id;
+                selectedFileIds = [existing.id];
+              }
               releaseSequence(media);
+            } else if (replace) {
+              staged.push(media);
+              addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
             } else {
               files = [...files, media];
               addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
@@ -1139,18 +1334,46 @@
           const media = await probeMedia(path, importSession?.ticket ?? undefined);
           if (generation !== importGeneration) return;
           recordImportRecent(generation, 'completed', media.path);
-          if (!files.some((file) => file.id === media.id)) {
-            files = [...files, media];
-            addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
+          if (replace) {
+            if (!staged.some((file) => file.id === media.id)) {
+              staged.push(media);
+              addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
+            }
+          } else {
+            if (!files.some((file) => file.id === media.id)) {
+              files = [...files, media];
+              addLog(`Imported ${media.name} · ${media.streams.length} streams.`);
+            }
+            selectedId = media.id;
+            selectedFileIds = [media.id];
           }
-          selectedId = media.id;
-          selectedFileIds = [media.id];
         } catch (error) {
           if (generation !== importGeneration) return;
           const message = errorMessage(error);
-          importErrors = [...importErrors, { name: importingName, message }];
-          addLog(`Could not import ${importingName}: ${message}`, 'error');
+          importErrors = [...importErrors, { name: itemName, message }];
+          addLog(`Could not import ${itemName}: ${message}`, 'error');
         }
+      }
+      if (replace && generation === importGeneration && staged.length) {
+        const previous = files;
+        fileQuery = '';
+        files = staged;
+        for (const oldFile of previous)
+          if (
+            oldFile.source?.kind === 'imageSequence' &&
+            !staged.some((item) => pathKey(item.path) === pathKey(oldFile.path))
+          )
+            releaseSequence(oldFile);
+        batchJobIds = {};
+        utilityBatchStatuses = {};
+        batchStatusOwner = null;
+        batchStatusFiles.clear();
+        mainSourceId = null;
+        trackSelection = [];
+        noDefaultSubtitles = false;
+        savedMuxDraft = null;
+        selectedId = staged.at(-1)?.id ?? null;
+        selectedFileIds = selectedId ? [selectedId] : [];
       }
     } finally {
       await finishImport(generation);
@@ -1168,9 +1391,8 @@
       if (!(await reserveImport(generation))) return;
       const selection = await chooseImportItems(paths);
       if (generation !== importGeneration || !selection?.paths.length) return;
-      if (selection.replace) clearFiles();
-      queueImportPaths(selection.paths, detectFolders);
-      await drainImport(generation);
+      queueImportPaths(selection.paths, detectFolders, selection.replace);
+      await drainImport(generation, selection.replace);
     } catch (error) {
       if (generation !== importGeneration) return;
       const message = errorMessage(error);
@@ -1184,16 +1406,15 @@
   async function addFiles(keepView = false) {
     if (!desktop || importing) return;
     const generation = beginImport(!keepView);
-    importingName = 'Choosing files';
+    importingName = 'Choosing files…';
     try {
       if (!(await reserveImport(generation))) return;
       const paths = await chooseMediaFiles();
       if (generation !== importGeneration) return;
       const selection = await chooseImportItems(paths);
       if (generation !== importGeneration || !selection?.paths.length) return;
-      if (selection.replace) clearFiles();
-      queueImportPaths(selection.paths);
-      await drainImport(generation);
+      queueImportPaths(selection.paths, false, selection.replace);
+      await drainImport(generation, selection.replace);
     } catch (error) {
       if (generation !== importGeneration) return;
       const message = errorMessage(error);
@@ -1207,16 +1428,15 @@
   async function addFolder() {
     if (!desktop || importing) return;
     const generation = beginImport();
-    importingName = 'Choosing folder';
+    importingName = 'Choosing folder…';
     try {
       if (!(await reserveImport(generation))) return;
       const paths = await chooseMediaFolder();
       if (generation !== importGeneration || !paths.length) return;
       const selection = await chooseImportItems(paths);
       if (generation !== importGeneration || !selection?.paths.length) return;
-      if (selection.replace) clearFiles();
-      queueImportPaths(selection.paths, true);
-      await drainImport(generation);
+      queueImportPaths(selection.paths, true, selection.replace);
+      await drainImport(generation, selection.replace);
     } catch (error) {
       if (generation !== importGeneration) return;
       const message = errorMessage(error);
@@ -1235,7 +1455,7 @@
   }
 
   async function scanImportFolder(path: string, recursive: boolean, generation: number) {
-    importingName = `Scanning ${fileName(path)}`;
+    importingName = `Scanning ${fileName(path)}…`;
     const scan = await scanMediaFolder({ path, recursive });
     if (generation !== importGeneration) return;
     importErrors = [
@@ -1256,7 +1476,7 @@
     if (!desktop || importing || !recentSelection) return;
     const path = recentSelection;
     const generation = beginImport();
-    importingName = fileName(path);
+    importingName = `Opening ${fileName(path)}…`;
     try {
       if (!(await reserveImport(generation))) return;
       const folder = await recentPathIsFolder(path);
@@ -1272,9 +1492,8 @@
       // joins them, as Add Files and drag and drop do.
       const selection = await chooseImportItems([path]);
       if (generation !== importGeneration || !selection?.paths.length) return;
-      if (selection.replace) clearFiles();
-      queueImportPaths(selection.paths, folder);
-      await drainImport(generation);
+      queueImportPaths(selection.paths, folder, selection.replace);
+      await drainImport(generation, selection.replace);
     } catch (error) {
       if (generation === importGeneration) {
         const message = errorMessage(error);
@@ -1304,7 +1523,18 @@
     const { [id]: _removedUtilityStatus, ...remainingUtilityStatuses } = utilityBatchStatuses;
     utilityBatchStatuses = remainingUtilityStatuses;
     selectedFileIds = selectedFileIds.filter((entry) => entry !== id);
+    workspaceMutationRevision++;
     trackSelection = trackSelection.filter((track) => track.sourceId !== id);
+    if (savedMuxDraft) {
+      const remainingTracks = savedMuxDraft.trackSelection.filter((track) => track.sourceId !== id);
+      const nextMain =
+        savedMuxDraft.mainSourceId === id
+          ? (remainingTracks[0]?.sourceId ?? null)
+          : savedMuxDraft.mainSourceId;
+      savedMuxDraft = remainingTracks.length
+        ? { ...savedMuxDraft, mainSourceId: nextMain, trackSelection: remainingTracks }
+        : null;
+    }
     if (mainSourceId === id) {
       mainSourceId = null;
       if (fileMode === 'mux' && files.length) {
@@ -1335,9 +1565,11 @@
     batchStatusFiles.clear();
     selectedId = null;
     selectedFileIds = [];
+    workspaceMutationRevision++;
     mainSourceId = null;
     trackSelection = [];
     noDefaultSubtitles = false;
+    savedMuxDraft = null;
     addLog('Source list cleared.');
   }
 
@@ -1442,7 +1674,7 @@
       else if (savedView === 'batch') view = 'convert';
       else if (savedView === 'remux') view = 'tracks';
       const savedHeight = Number(localStorage.getItem('jesses.log-panel-height'));
-      if (Number.isFinite(savedHeight) && savedHeight >= 90 && savedHeight <= 400)
+      if (Number.isFinite(savedHeight) && savedHeight >= 64 && savedHeight <= 400)
         logHeight = savedHeight;
       logUserAdjusted = localStorage.getItem('jesses.log-height-user-adjusted') === 'true';
     } catch {
@@ -1574,30 +1806,10 @@
         logs
           .map((entry) => `${entry.time} [${entry.level.toUpperCase()}] ${entry.message}`)
           .join('\n') + '\n';
-      let copied = false;
-      try {
-        if (navigator.clipboard) {
-          await navigator.clipboard.writeText(contents);
-          copied = true;
-        }
-      } catch {
-        /* Try the webview fallback below. */
-      }
-      if (!copied) {
-        const previousFocus = document.activeElement as HTMLElement | null;
-        const text = document.createElement('textarea');
-        text.value = contents;
-        text.style.position = 'fixed';
-        text.style.opacity = '0';
-        document.body.appendChild(text);
-        text.select();
-        try {
-          copied = document.execCommand('copy');
-        } finally {
-          text.remove();
-          previousFocus?.focus();
-        }
-      }
+      const copied = await copyTextWithFeedback(contents, {
+        success: 'Activity log copied.',
+        fail: 'Clipboard access was denied.',
+      });
       if (!copied) throw new Error('Clipboard access was denied.');
       addLog('Activity log copied.');
     } catch (error) {
@@ -1635,6 +1847,7 @@
   class="app-shell"
   class:compact-utilities={view === 'utilities' && !logUserAdjusted}
   class:log-user-adjusted={logUserAdjusted}
+  inert={closing}
 >
   <header class="app-header" data-tauri-drag-region={desktop ? '' : undefined}>
     <div class="brand" data-tauri-drag-region={desktop ? '' : undefined}>
@@ -1686,6 +1899,9 @@
           statuses={batchStatuses}
           recentPaths={preferences.value.recentPaths}
           {importing}
+          {importingName}
+          {importNotice}
+          {importErrors}
           {desktop}
           onselect={selectFiles}
           onmode={changeFileMode}
@@ -1700,6 +1916,10 @@
           onremove={removeSelectedFiles}
           onmove={moveSelectedFile}
           onsort={sortFiles}
+          ondismissImportFeedback={() => {
+            importErrors = [];
+            importNotice = null;
+          }}
         />
       {:else if view === 'tracks'}
         <SourceTrackList
@@ -1709,6 +1929,7 @@
           mode={fileMode}
           {noDefaultSubtitles}
           onchange={(next, disableDefaultSubtitles) => {
+            workspaceMutationRevision++;
             trackSelection = next;
             if (disableDefaultSubtitles !== undefined) noDefaultSubtitles = disableDefaultSubtitles;
           }}
@@ -1722,7 +1943,12 @@
           }}
         />
         <section bind:this={historySection} aria-label="Job history">
-          <SavedJobs {jobs} onqueue={queueEncode} bind:open={historyOpen} />
+          <SavedJobs
+            {jobs}
+            onqueue={queueEncode}
+            bind:open={historyOpen}
+            bind:selected={selectedHistoryJobId}
+          />
         </section>
         <section bind:this={toolsPanelElement} tabindex="-1" aria-label="Tool diagnostics">
           <ToolsPanel
@@ -1768,6 +1994,9 @@
           onfiles={() => (view = 'files')}
           onaddfiles={() => addFiles(true)}
           addingFiles={importing}
+          ondraftchange={() => {
+            workspaceMutationRevision++;
+          }}
           onstart={submitEncode}
           onqueue={queueEncode}
         />
@@ -1797,6 +2026,11 @@
           onrecoveryjobs={acceptRecoveryJobs}
           connected={jobsConnected}
           onfiles={() => (view = 'files')}
+          onaddfiles={() => addFiles(true)}
+          addingFiles={importing}
+          ondraftchange={() => {
+            workspaceMutationRevision++;
+          }}
           onstart={submitEncode}
           onqueue={queueEncode}
         />
@@ -1810,6 +2044,7 @@
           registerAction={registerWorkspaceAction}
           onbatchstatus={(statuses, runId, begin) => reportBatchStatuses(runId, statuses, begin)}
           onlog={(message, error) => addLog(message, error ? 'error' : 'info')}
+          onswitchtomux={() => changeFileMode('mux')}
         />
       </div>
     </main>
@@ -1820,30 +2055,34 @@
     role="separator"
     aria-label="Resize log"
     aria-orientation="horizontal"
-    aria-valuenow={logHeight}
-    aria-valuemin="90"
-    aria-valuemax="400"
+    aria-valuenow={renderedLogHeight}
+    aria-valuemin={Math.min(64, renderedLogHeight)}
+    aria-valuemax={Math.max(400, renderedLogHeight)}
     tabindex="0"
     onpointerdown={resizeLog}
     onkeydown={(event) => {
+      const base = logUserAdjusted ? logHeight : renderedLogHeight;
       if (event.key === 'ArrowUp') {
         event.preventDefault();
+        const next = Math.min(400, Math.max(64, base + 10));
         logUserAdjusted = true;
         try {
           localStorage.setItem('jesses.log-height-user-adjusted', 'true');
         } catch {
           /* Optional UI state. */
         }
-        logHeight = Math.min(400, logHeight + 10);
+        logHeight = next;
       } else if (event.key === 'ArrowDown') {
         event.preventDefault();
+        if (base <= 64) return;
+        const next = Math.max(64, base - 10);
         logUserAdjusted = true;
         try {
           localStorage.setItem('jesses.log-height-user-adjusted', 'true');
         } catch {
           /* Optional UI state. */
         }
-        logHeight = Math.max(90, logHeight - 10);
+        logHeight = next;
       }
     }}
   ></div>
@@ -1857,7 +2096,9 @@
           </button>
         {/if}
         {#if desktop && jobs.some((job) => job.encodeSettings?.backend === 'standalone')}
-          <button type="button" onclick={showEncodeWindow}>Show encoding window</button>
+          <button type="button" onclick={() => void showEncodeWindow(true)}>
+            Show encoding window
+          </button>
         {/if}
         <button type="button" onclick={copyActivityLog} disabled={!logs.length}>Copy</button><button
           type="button"
@@ -1930,10 +2171,10 @@
   {/if}
   <footer class="status-bar">
     <div class="current-action">
-      <div aria-label="Current action" title={currentActionTitle}>
+      <output aria-label="Current action" aria-live="off" title={currentActionTitle}>
         {#if batchFileText && liveProgress}<span>{batchFileText}</span>{/if}
         <span>{currentActionText}</span>
-      </div>
+      </output>
       {#if statusProgress.value === null}<progress
           aria-label="Task progress"
           aria-valuetext={currentActionTitle}
@@ -1991,10 +2232,21 @@
         Cancel queue ({waitingCount})…
       </button>
     {/if}
+    {#if action?.supportsCommandReview}
+      <button
+        type="button"
+        disabled={!action?.canRun || !!runningAction || !desktop}
+        title="Inspect or edit the tool arguments before running (same as Shift+Run)"
+        onclick={() => action?.run({ editCommand: true, isShiftHeld: () => true })}
+      >
+        Review command…
+      </button>
+    {/if}
     <button
       type="button"
       class="run-button"
       aria-describedby={runBlockedReason ? 'run-blocked-reason' : undefined}
+      title={!action ? 'Select AV1AN, Quick Convert, or Utilities to run a task.' : undefined}
       disabled={!action?.canRun || !!runningAction || !desktop}
       onclick={(event) =>
         action?.run({ editCommand: event.shiftKey, isShiftHeld: () => shiftHeld })}
@@ -2032,26 +2284,61 @@
   title="Enter Frame Rate"
   open={sequencePrompt !== null}
   onclose={() => finishSequenceRate(true)}
-  width={440}
+  width={460}
 >
   {#if sequencePrompt}
-    <p>
-      Please enter a frame rate to use for the image sequence '{fileName(sequencePrompt.path).slice(
-        0,
-        80,
-      )}'.
-    </p>
-    <input
-      aria-label="Frame rate"
-      bind:value={sequencePrompt.text}
-      onkeydown={(event) => {
-        if (event.key === 'Enter' && !event.isComposing) finishSequenceRate();
+    <form
+      onsubmit={(event) => {
+        event.preventDefault();
+        finishSequenceRate();
       }}
-    />
-    {#if sequencePrompt.error}<p role="alert">{sequencePrompt.error}</p>{/if}
-    <div class="import-actions">
-      <button type="button" onclick={() => finishSequenceRate()}>OK</button>
-    </div>
+    >
+      <p>
+        Please enter a frame rate to use for the image sequence '{fileName(
+          sequencePrompt.path,
+        ).slice(0, 80)}'.
+      </p>
+      <!-- svelte-ignore a11y_autofocus -->
+      <input
+        aria-label="Frame rate"
+        autofocus
+        bind:value={sequencePrompt.text}
+        oninput={() => {
+          if (sequencePrompt?.error) sequencePrompt.error = '';
+        }}
+      />
+      <div class="rate-presets" role="group" aria-label="Quick presets">
+        {#each ['23.976', '24', '25', '29.97', '30', '60'] as rate}
+          <button
+            type="button"
+            onclick={() => {
+              if (sequencePrompt) {
+                sequencePrompt.text = rate;
+                sequencePrompt.error = '';
+              }
+            }}
+          >
+            {rate}
+          </button>
+        {/each}
+      </div>
+      <p class="small-muted">
+        {#if parsedSequenceRate}
+          Effective rate: {parsedSequenceRate.numerator}/{parsedSequenceRate.denominator} (~{(
+            parsedSequenceRate.numerator / parsedSequenceRate.denominator
+          )
+            .toFixed(3)
+            .replace(/\.?0+$/, '')} fps)
+        {:else}
+          Enter a positive number or fraction, e.g. 23.976 or 24000/1001.
+        {/if}
+      </p>
+      {#if sequencePrompt.error}<p role="alert">{sequencePrompt.error}</p>{/if}
+      <div class="import-actions">
+        <button type="button" onclick={() => finishSequenceRate(true)}>Cancel</button>
+        <button type="submit">OK</button>
+      </div>
+    </form>
   {/if}
 </SourceDialog>
 <SourceDialog
@@ -2068,7 +2355,8 @@
     <p>The selected jobs have already started or left the queue.</p>
   {/if}
   <div class="import-actions">
-    <button type="button" data-dialog-initial-focus onclick={() => (queueConfirmation = undefined)}>
+    <!-- svelte-ignore a11y_autofocus -->
+    <button type="button" autofocus onclick={() => (queueConfirmation = undefined)}>
       Keep queue
     </button>
     <button type="button" disabled={!confirmedWaitingCount} onclick={cancelWaitingQueue}>
@@ -2087,7 +2375,8 @@
     {activeJobCount === 1 ? 'it' : 'them'}. Encodes can resume later if they have saved progress.
   </p>
   <div class="import-actions">
-    <button type="button" data-dialog-initial-focus onclick={() => (closePrompt = false)}>
+    <!-- svelte-ignore a11y_autofocus -->
+    <button type="button" autofocus onclick={() => (closePrompt = false)}>
       Keep running
     </button><button type="button" onclick={() => void finishClose()}>Close anyway</button>
   </div>
@@ -2128,6 +2417,23 @@
     outline: 2px solid var(--primary);
     outline-offset: 2px;
   }
+  .rate-presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 8px 0;
+  }
+  .rate-presets button {
+    padding: 0.25rem 0.55rem;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    font-size: 0.85rem;
+  }
+  .rate-presets button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
   .closing-overlay {
     position: fixed;
     inset: 0;
@@ -2154,8 +2460,7 @@
     color: var(--foreground);
   }
   .app-header {
-    height: 32px;
-    min-height: 32px;
+    min-block-size: 32px;
     margin: 0 -10px -4px;
     padding: 0 0 0 10px;
     display: flex;
@@ -2184,7 +2489,7 @@
   .brand-wordmark {
     color: var(--foreground);
     font-family: 'Century Gothic', 'Avenir Next', 'DejaVu Sans', sans-serif;
-    font-size: 1.23rem;
+    font-size: 0.9994rem;
     line-height: 1;
     font-weight: 650;
     letter-spacing: 0.11em;
@@ -2192,7 +2497,7 @@
   }
   .version {
     color: var(--muted-foreground);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.06em;
   }
   .work-area {
@@ -2225,7 +2530,7 @@
     border: 0;
     background: transparent;
     color: var(--muted-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
     letter-spacing: 0.045em;
     white-space: nowrap;
   }
@@ -2295,7 +2600,7 @@
     border: 0;
   }
   .log-bar strong {
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     letter-spacing: 0.13em;
     color: var(--muted-foreground);
   }
@@ -2307,11 +2612,11 @@
   .log-bar button,
   .status-bar button,
   .finish-action button {
-    padding: 0.38rem 0.7rem;
+    padding: 0.3088rem 0.5688rem;
     border: 0;
     background: var(--secondary);
     color: var(--secondary-foreground);
-    font-size: 0.92rem;
+    font-size: 0.7475rem;
   }
   .log-bar button:hover:not(:disabled),
   .status-bar button:hover:not(:disabled),
@@ -2328,12 +2633,13 @@
     min-height: 64px;
     max-height: min(400px, 45dvh);
     overflow: auto;
+    scrollbar-gutter: stable;
     padding: 6px;
     border: 1px solid var(--border);
     background: #d6d0b8;
     color: var(--foreground);
     font:
-      0.85rem/1.35 Consolas,
+      0.6906rem/1.35 Consolas,
       monospace;
   }
   @media (max-height: 660px) {
@@ -2342,7 +2648,7 @@
     }
   }
   @media (max-width: 1000px) and (max-height: 800px) {
-    .compact-utilities .log-entries {
+    .app-shell.compact-utilities:not(.log-user-adjusted) .log-entries {
       min-height: 36px;
       height: 36px !important;
     }
@@ -2364,7 +2670,7 @@
     gap: 10px;
     padding: 6px 8px;
     border: 1px solid var(--primary);
-    font-size: 1rem;
+    font-size: 0.8125rem;
   }
   .status-bar {
     flex-shrink: 0;
@@ -2376,7 +2682,7 @@
     background: transparent;
     border: 0;
     color: var(--foreground);
-    font-size: 1rem;
+    font-size: 0.8125rem;
   }
   .current-action {
     flex: 1;
@@ -2385,50 +2691,69 @@
     flex-direction: column;
     gap: 3px;
   }
+  .current-action output {
+    display: block;
+  }
   .current-action span {
     display: block;
     min-height: 12px;
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     line-height: 1.15;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .status-bar progress {
+    appearance: none;
+    container-type: inline-size;
     width: 100%;
     height: 8px;
+    border: 0 solid;
+    overflow: clip;
+    background: var(--rule);
     accent-color: var(--primary);
+    --progress-bar-indeterminate-size: 40%;
+    --progress-bar-indeterminate-animation-duration: 1.4s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-bar progress {
+      --progress-bar-indeterminate-animation-duration: 10s;
+    }
   }
   /* A step without a measurable fraction (preparation, final checks) must
      still look busy; the native indeterminate bar can render as a bare track. */
   .status-bar progress:indeterminate {
-    appearance: none;
-    border: 0;
-    background:
-      linear-gradient(90deg, transparent, var(--primary), transparent) -40% 0 / 40% 100% no-repeat,
-      var(--rule);
-    animation: status-progress-sweep 1.4s ease-in-out infinite;
+    --progress-bar-animation: status-progress-sweep
+      var(--progress-bar-indeterminate-animation-duration) ease-in-out infinite;
   }
-  .status-bar progress:indeterminate::-webkit-progress-bar {
+  .status-bar progress::-webkit-progress-bar {
     background: transparent;
   }
-  @keyframes status-progress-sweep {
-    to {
-      background-position:
-        140% 0,
-        0 0;
-    }
+  .status-bar progress::-webkit-progress-value {
+    background: var(--primary);
+    animation: var(--progress-bar-animation, revert-rule);
   }
-  @media (prefers-reduced-motion: reduce) {
-    .status-bar progress:indeterminate {
-      animation: none;
-      background: repeating-linear-gradient(135deg, var(--primary) 0 6px, var(--rule) 6px 12px);
+  .status-bar progress::-moz-progress-bar {
+    background: var(--primary);
+    animation: var(--progress-bar-animation, revert-rule);
+  }
+  @keyframes status-progress-sweep {
+    from,
+    to {
+      inline-size: var(--progress-bar-indeterminate-size);
+      margin-right: auto;
+    }
+    from {
+      translate: -100%;
+    }
+    to {
+      translate: 100cqi;
     }
   }
   .status-bar label {
     white-space: nowrap;
     display: flex;
-    gap: 0.4rem;
+    gap: 0.325rem;
     align-items: center;
   }
   .status-bar .run-button {
@@ -2452,7 +2777,7 @@
     flex: 1;
     min-width: 0;
     color: var(--destructive);
-    font-size: 0.85rem;
+    font-size: 0.6906rem;
     font-weight: 600;
     line-height: 1.3;
     overflow-wrap: anywhere;

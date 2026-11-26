@@ -168,7 +168,7 @@ for (const viewport of [
     await expect(heading).toBeInViewport({ ratio: 1 });
     const jobPicker = history.getByRole('combobox', { name: 'Job from history' });
     await expect(jobPicker).toBeInViewport({ ratio: 1 });
-    await jobPicker.selectOption('older');
+    await expect(jobPicker).toHaveValue('older');
     await expect(history.getByText(errorMessage, { exact: true })).toBeInViewport({ ratio: 1 });
     const viewLog = history.getByRole('button', { name: 'View job log' });
     await expect(viewLog).toBeInViewport({ ratio: 1 });

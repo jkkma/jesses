@@ -466,3 +466,246 @@ for (const viewport of [
     await page.screenshot({ path: testInfo.outputPath('responsive-monitor.png'), fullPage: true });
   });
 }
+
+test('monitor queued Cancel uses cancel_queued_jobs and warns when the job already started', async ({
+  page,
+}) => {
+  await page.addInitScript(
+    (entry) => sessionStorage.setItem('test-initial-jobs', JSON.stringify([entry])),
+    { ...job, state: 'queued' },
+  );
+  await installSourceEncodeFixture(page);
+  await page.goto('/?window=quick-convert');
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs[0].state = 'running';
+  });
+  await page.getByRole('button', { name: 'Cancel job', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => (globalThis as any).__sourceCalls.map((call: any) => call.command)),
+    )
+    .toContain('cancel_queued_jobs');
+  expect(
+    await page.evaluate(() =>
+      (globalThis as any).__sourceCalls.some((call: any) => call.command === 'cancel_job'),
+    ),
+  ).toBe(false);
+  await expect(page.getByRole('alert')).toContainText('Job is no longer queued.');
+});
+
+test('batch monitor does not re-open between subsequent batch items', async ({ page }) => {
+  const secondSource = {
+    id: 'source-2',
+    path: '/media/second.mkv',
+    name: 'second.mkv',
+    sizeBytes: '1000',
+    durationSeconds: 12,
+    format: 'matroska',
+    streams: [
+      {
+        index: 0,
+        kind: 'video',
+        codec: 'h264',
+        width: 1920,
+        height: 1080,
+        frameRate: '24/1',
+        fieldOrder: 'tt',
+        sampleRate: null,
+        channels: null,
+        language: null,
+        title: null,
+      },
+    ],
+  };
+  await installSourceEncodeFixture(page);
+  await page.evaluate(
+    ({ secondSource }) => {
+      const host = globalThis as any;
+      host.__pickerPaths = ['/media/input.mkv', secondSource.path];
+      host.__mediaByPath[secondSource.path] = secondSource;
+      host.__holdTerminal = true;
+    },
+    { secondSource },
+  );
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('batch');
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Batch: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(1);
+  // Deliver file 1's terminal state alone before file 2 begins preparing.
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs[0].state = 'succeeded';
+    host.__emitJobs();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'mock_start_encode')
+            .length,
+      ),
+    )
+    .toBe(2);
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+          .length,
+    ),
+  ).toBe(1);
+
+  // Completing the batch clears batch suppression so a later standalone encode opens the monitor.
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    for (const entry of host.__testJobs) entry.state = 'succeeded';
+    host.__emitJobs();
+  });
+  await page.getByRole('button', { name: 'File List', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Mode', exact: true }).selectOption('mux');
+  await page.getByRole('option', { name: /input\.mkv/ }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(2);
+});
+
+test('monitor retries opening after a native open failure when another job runs', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate((entry) => {
+    const host = globalThis as any;
+    host.__encodeWindowFailure = 'Monitor busy';
+    host.__testJobs = [
+      { ...entry, id: 'job-2', state: 'queued' },
+      { ...entry, id: 'job-1', state: 'running' },
+    ];
+    host.__emitJobs();
+  }, job);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(1);
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__encodeWindowFailure = null;
+    host.__testJobs[0].state = 'running';
+    host.__emitJobs();
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(2);
+});
+
+test('late first monitor-open resolution after job completion does not suppress the next encode', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.evaluate((entry) => {
+    const host = globalThis as any;
+    host.__holdEncodeWindow = new Promise((resolve) => {
+      host.__resolveEncodeWindow = resolve;
+    });
+    host.__testJobs = [{ ...entry, id: 'job-short', state: 'running' }];
+    host.__emitJobs();
+  }, job);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(1);
+  // Job finishes before the first open_encode_window call resolves, then the first call resolves late.
+  await page.evaluate(() => {
+    const host = globalThis as any;
+    host.__testJobs[0].state = 'succeeded';
+    host.__emitJobs();
+    host.__holdEncodeWindow = null;
+    host.__resolveEncodeWindow();
+  });
+  await expect
+    .poll(() => page.evaluate(() => (globalThis as any).__testJobs[0].state))
+    .toBe('succeeded');
+  await page.evaluate((entry) => {
+    const host = globalThis as any;
+    host.__testJobs = [{ ...entry, id: 'job-next', state: 'running' }, ...host.__testJobs];
+    host.__emitJobs();
+  }, job);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(2);
+});
+
+test('fast command confirmation delivering terminal snapshot before reply does not suppress the next encode', async ({
+  page,
+}) => {
+  await installSourceEncodeFixture(page);
+  await page.getByRole('button', { name: 'Add Files…' }).click();
+  await page.getByRole('button', { name: 'Load Tracks' }).click();
+  await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
+  const quick = page.getByRole('region', { name: 'Quick Convert', exact: true });
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/fast-first');
+  // confirm_command_edit emits succeeded snapshot before returning, then Run finishes.
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(1);
+  await expect(page.getByLabel('Current action', { exact: true })).toContainText('Done');
+
+  // Running a second independent encode right away must still open the monitor again.
+  await quick.getByLabel('Output Path', { exact: true }).fill('/media/fast-second');
+  await page.getByRole('button', { name: 'Run: Encode', exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as any).__sourceCalls.filter((c: any) => c.command === 'open_encode_window')
+            .length,
+      ),
+    )
+    .toBe(2);
+});

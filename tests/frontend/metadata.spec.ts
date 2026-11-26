@@ -58,12 +58,16 @@ test('Track List describes source streams and metadata edits retain their indice
   await page.getByRole('button', { name: 'Load Tracks' }).click();
   const tracks = page.getByRole('region', { name: 'Track List' });
   await expect(
-    tracks.getByRole('option', { name: /Video \(H264\).*720x480.*Main feature/ }),
+    tracks.locator('.track-option', { hasText: /Video \(H264\).*720x480.*Main feature/ }),
   ).toBeVisible();
-  await expect(tracks.getByRole('option', { name: /Audio \(DTS\).*Commentary/ })).toBeVisible();
-  await expect(tracks.getByRole('option', { name: /Subtitles \(PGS\).*Japanese/ })).toBeVisible();
-  await expect(tracks.getByRole('option', { name: /vendor_subtitle/ })).toBeVisible();
-  await expect(tracks.getByRole('option', { name: /captions-font.ttf/ })).toBeVisible();
+  await expect(
+    tracks.locator('.track-option', { hasText: /Audio \(DTS\).*Commentary/ }),
+  ).toBeVisible();
+  await expect(
+    tracks.locator('.track-option', { hasText: /Subtitles \(PGS\).*Japanese/ }),
+  ).toBeVisible();
+  await expect(tracks.locator('.track-option', { hasText: /vendor_subtitle/ })).toBeVisible();
+  await expect(tracks.locator('.track-option', { hasText: /captions-font.ttf/ })).toBeVisible();
   await tracks.getByRole('checkbox', { name: /Include .*vendor_subtitle/ }).check();
   await tracks.getByRole('checkbox', { name: /Include .*captions-font.ttf/ }).check();
   await page.getByRole('button', { name: 'Quick Convert', exact: true }).click();
