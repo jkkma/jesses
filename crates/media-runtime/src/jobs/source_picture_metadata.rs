@@ -4,6 +4,7 @@
 //! stream-level plan; the complete source frame scan still checks every
 //! frame's color fields and static HDR metadata against that plan, so reading
 //! the whole video here would only repeat that work single-threaded.
+use super::encode_plan::hdr;
 use super::*;
 
 /// Most inputs produce pictures within this decode prefix.
@@ -43,12 +44,10 @@ pub(super) fn needs_enrichment(video: &super::metadata::Stream, tone_mapped: boo
                 video.color_transfer.as_deref(),
                 Some("smpte2084" | "arib-std-b67")
             )
-            && !video.side_data_list.iter().any(|value| {
-                value
-                    .get("side_data_type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| kind.contains("Mastering display"))
-            }))
+            && !video
+                .side_data_list
+                .iter()
+                .any(|value| hdr::kind(value) == "Mastering display metadata"))
 }
 
 fn enrich_args(input: &Path, index: u32, packets: u32) -> Vec<OsString> {
@@ -145,8 +144,7 @@ async fn probe_prefix(
         Duration::from_secs(10 * 60),
         move |reader| {
             let mut static_hdr =
-                super::encode_plan::hdr::StaticMetadata::parse(&video.side_data_list)
-                    .map_err(|e| e.message)?;
+                hdr::StaticMetadata::parse(&video.side_data_list).map_err(|e| e.message)?;
             let mut failure = None;
             let mut saw_picture = false;
             super::encode::frame_scan::parse::<Frame>(reader, |frame| {
@@ -176,20 +174,33 @@ async fn probe_prefix(
                         }
                     }
                     let actual =
-                        super::encode_plan::hdr::StaticMetadata::parse(&frame.side_data_list)
-                            .map_err(|e| e.message)?;
+                        hdr::StaticMetadata::parse(&frame.side_data_list).map_err(|e| e.message)?;
                     static_hdr
                         .absorb_first_frame(&actual)
                         .map_err(|e| e.message)?;
                     for value in frame.side_data_list {
-                        let kind = value
-                            .get("side_data_type")
-                            .and_then(serde_json::Value::as_str);
-                        if kind.is_some_and(|kind| {
-                            kind.contains("Mastering display") || kind.contains("Content light")
-                        }) && !video.side_data_list.iter().any(|v| {
-                            v.get("side_data_type").and_then(serde_json::Value::as_str) == kind
-                        }) {
+                        let kind = hdr::kind(&value);
+                        if !matches!(
+                            kind,
+                            "Mastering display metadata" | "Content light level metadata"
+                        ) {
+                            continue;
+                        }
+                        if let Some(previous) = video
+                            .side_data_list
+                            .iter_mut()
+                            .find(|v| hdr::kind(v) == kind)
+                        {
+                            // A header and a frame may declare complementary
+                            // mastering groups. Their shared values were checked above.
+                            if let (Some(header), serde_json::Value::Object(fields)) =
+                                (previous.as_object_mut(), value)
+                            {
+                                for (name, field) in fields {
+                                    header.entry(name).or_insert(field);
+                                }
+                            }
+                        } else {
                             video.side_data_list.push(value);
                         }
                     }

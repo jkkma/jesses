@@ -241,12 +241,7 @@ impl Cadence {
         let actual = self
             .plan
             .validate_frame_side_data(&frame.side_data_list, self.encoded)?;
-        if actual.mastering.is_some() {
-            self.observed_hdr.mastering = actual.mastering;
-        }
-        if actual.light.is_some() {
-            self.observed_hdr.light = actual.light;
-        }
+        self.observed_hdr.fill_missing(&actual);
         for (actual, expected) in [
             (&frame.color_space, &self.stream.color_space),
             (&frame.color_transfer, &self.stream.color_transfer),
@@ -277,7 +272,7 @@ impl Cadence {
             hdr.metadata
                 .validate_present(&self.observed_hdr, self.encoded)?;
             if self.encoded
-                && (self.observed_hdr.mastering.is_none()
+                && (self.observed_hdr.complete_mastering().is_none()
                     || (hdr.metadata.light.is_some() && self.observed_hdr.light.is_none()))
             {
                 return Err(unsupported(

@@ -2280,9 +2280,9 @@ impl Plan {
             if let Some(authored) = &self.authored_hdr {
                 output.metadata.apply_authored(authored);
             }
-            if required && output.metadata.mastering.is_none() {
+            if required && output.metadata.complete_mastering().is_none() {
                 return Err(unsupported(
-                    "HDR10 output requires mastering display metadata in the source or an authored mastering-display override.",
+                    "HDR10 output requires both mastering display coordinates and luminance. Supply a complete mastering-display override or select SDR tone mapping.",
                 ));
             }
             self.hdr10 = Some(output);
@@ -2371,7 +2371,7 @@ impl Plan {
     pub fn hdr_arguments(&self) -> Vec<std::ffi::OsString> {
         let mut args = Vec::new();
         if let Some(hdr) = self.validation_hdr(true) {
-            if let Some(mastering) = &hdr.metadata.mastering {
+            if let Some(mastering) = hdr.metadata.complete_mastering() {
                 args.extend(["--mastering-display".into(), mastering.argument().into()]);
             }
             if let Some((cll, fall)) = hdr.metadata.light {
@@ -2385,7 +2385,7 @@ impl Plan {
         let mut args = Vec::new();
         if let Some(hdr) = self.validation_hdr(true) {
             args.push("--hdr10".into());
-            if let Some(mastering) = &hdr.metadata.mastering {
+            if let Some(mastering) = hdr.metadata.complete_mastering() {
                 args.extend(["--master-display".into(), mastering.x265_argument().into()]);
             }
             if let Some((cll, fall)) = hdr.metadata.light {
@@ -2432,7 +2432,7 @@ impl Plan {
             "0:1".into(),
         ];
         if let Some(hdr) = self.validation_hdr(true) {
-            if let Some(mastering) = &hdr.metadata.mastering {
+            if let Some(mastering) = hdr.metadata.complete_mastering() {
                 args.extend(mastering.mkvmerge_arguments());
             }
             if let Some((cll, fall)) = hdr.metadata.light {
@@ -2646,12 +2646,7 @@ impl Plan {
                 hdr.metadata.validate_present(&actual, encoded)?;
                 // Metadata need not be repeated on every frame, but output must
                 // contain all planned static metadata somewhere in the stream.
-                if actual.mastering.is_some() {
-                    observed_hdr.mastering = actual.mastering;
-                }
-                if actual.light.is_some() {
-                    observed_hdr.light = actual.light;
-                }
+                observed_hdr.fill_missing(&actual);
             }
             for (actual, expected) in [
                 (&frame.color_space, &stream.color_space),
@@ -2669,7 +2664,7 @@ impl Plan {
         if let Some(hdr) = self.validation_hdr(encoded) {
             hdr.metadata.validate_present(&observed_hdr, encoded)?;
             if encoded
-                && (observed_hdr.mastering.is_none()
+                && (observed_hdr.complete_mastering().is_none()
                     || (hdr.metadata.light.is_some() && observed_hdr.light.is_none()))
             {
                 return Err(unsupported(
@@ -3261,6 +3256,92 @@ mod tests {
             serde_json::json!({"side_data_type":"Content light level metadata", "max_content":200, "max_average":142}),
         ];
         (source, decoded)
+    }
+
+    #[test]
+    fn spline_accepts_mastering_coordinates_without_luminance() {
+        let (source, mut decoded) = hdr_source_and_frames();
+        let mastering = decoded.frames[0].side_data_list[0].as_object_mut().unwrap();
+        mastering.remove("max_luminance");
+        mastering.remove("min_luminance");
+        let selected = source.selected(&[0]).unwrap();
+        let settings = EncodeSettings {
+            encoder: VideoEncoder::SvtAv1Hdr,
+            tone_map: Some(
+                serde_json::from_value(serde_json::json!({
+                    "algorithm":"spline", "backend":"auto", "peakMode":"measured",
+                    "sourcePeakNits":1000, "sourceWorkflow":true
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut plan = Plan::build(&source, &selected, &settings).unwrap();
+        plan.validate_source_frames(&decoded, &source.streams[0])
+            .unwrap();
+        assert!(plan.hdr_arguments().is_empty());
+        assert_eq!(
+            plan.source_hdr10
+                .as_ref()
+                .unwrap()
+                .metadata
+                .declared_peak_nits(),
+            Some(200.0)
+        );
+
+        let mut preserve = Plan::build(&source, &selected, &EncodeSettings::default()).unwrap();
+        let error = preserve
+            .validate_source_frames(&decoded, &source.streams[0])
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("both mastering display coordinates and luminance")
+        );
+
+        let mut changed = decoded.frames[0].side_data_list[0].clone();
+        changed["red_x"] = "33000/50000".into();
+        decoded.frames[1].side_data_list.push(changed);
+        assert!(
+            plan.validate_source_frames(&decoded, &source.streams[0])
+                .is_err()
+        );
+        decoded.frames[1].side_data_list.clear();
+        decoded.frames[0].side_data_list[0]["min_luminance"] = "1/10000".into();
+        let error = plan
+            .validate_source_frames(&decoded, &source.streams[0])
+            .unwrap_err();
+        assert!(error.message.contains("max_luminance"));
+    }
+
+    #[test]
+    fn hdr10_combines_header_luminance_with_first_frame_coordinates() {
+        let (mut source, mut decoded) = hdr_source_and_frames();
+        let frame = decoded.frames[0].side_data_list[0].as_object_mut().unwrap();
+        let luminance = serde_json::json!({
+            "side_data_type": "Mastering display metadata",
+            "max_luminance": frame.remove("max_luminance").unwrap(),
+            "min_luminance": frame.remove("min_luminance").unwrap()
+        });
+        source.streams[0].side_data_list.push(luminance);
+        let mut plan = Plan::build(
+            &source,
+            &source.selected(&[0]).unwrap(),
+            &EncodeSettings::default(),
+        )
+        .unwrap();
+        plan.validate_source_frames(&decoded, &source.streams[0])
+            .unwrap();
+        assert!(
+            plan.hdr_arguments()[1]
+                .to_string_lossy()
+                .ends_with("L(1000.0000000000,0.0001000000)")
+        );
+        plan.validate_frames(&decoded, &source.streams[0], true)
+            .unwrap();
+        let mut no_luminance = source.streams[0].clone();
+        no_luminance.side_data_list.clear();
+        assert!(plan.validate_frames(&decoded, &no_luminance, true).is_err());
     }
 
     #[test]

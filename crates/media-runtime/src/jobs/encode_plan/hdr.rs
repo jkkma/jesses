@@ -8,8 +8,9 @@ use super::unsupported;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::jobs) struct Mastering {
-    // R, G, B, white point x/y; max and min luminance in cd/m2.
-    values: [f64; 10],
+    // R, G, B and white point x/y, followed separately by max/min in cd/m².
+    coordinates: [f64; 8],
+    luminance: [f64; 2],
 }
 
 fn rational(value: &Value, key: &str) -> Result<f64, AppError> {
@@ -22,66 +23,43 @@ fn rational(value: &Value, key: &str) -> Result<f64, AppError> {
     parsed
         .filter(|v| v.is_finite() && *v >= 0.0)
         .ok_or_else(|| {
-            unsupported("HDR10 mastering metadata contains a missing or invalid rational value.")
+            unsupported(&format!(
+                "HDR10 mastering field '{key}' is missing or has an invalid rational value."
+            ))
         })
 }
 
-impl Mastering {
-    fn parse(value: &Value) -> Result<Self, AppError> {
-        let mut values = [0.0; 10];
-        for (index, name) in [
-            "red_x",
-            "red_y",
-            "green_x",
-            "green_y",
-            "blue_x",
-            "blue_y",
-            "white_point_x",
-            "white_point_y",
-            "max_luminance",
-            "min_luminance",
-        ]
-        .iter()
-        .enumerate()
-        {
-            values[index] = rational(value, name)?;
-        }
-        let triangle = (values[2] - values[0]) * (values[5] - values[1])
-            - (values[4] - values[0]) * (values[3] - values[1]);
-        if values[..8].iter().any(|v| *v >= 1.0)
-            || values[..8]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .any(|xy| xy[0] + xy[1] > 1.000001)
-            || triangle.abs() < 1e-8
-            || values[6] <= 0.0
-            || values[7] <= 0.0
-            || values[8] <= 0.0
-            || values[8] > 10_000.0
-            || values[9] >= values[8]
-        {
-            return Err(unsupported(
-                "HDR10 mastering coordinates or luminance are out of range.",
-            ));
-        }
-        Ok(Self { values })
+/// FFprobe reports mastering primaries and luminance independently. Within
+/// each declared group every field must be present and valid.
+fn rational_group<const N: usize>(
+    value: &Value,
+    keys: [&str; N],
+) -> Result<Option<[f64; N]>, AppError> {
+    if keys.iter().all(|key| value.get(key).is_none()) {
+        return Ok(None);
     }
+    let mut values = [0.0; N];
+    for (slot, key) in values.iter_mut().zip(keys) {
+        *slot = rational(value, key)?;
+    }
+    Ok(Some(values))
+}
 
+impl Mastering {
     pub fn argument(&self) -> String {
-        let v = self.values;
+        let v = self.coordinates;
+        let [max, min] = self.luminance;
         format!(
             "G({:.10},{:.10})B({:.10},{:.10})R({:.10},{:.10})WP({:.10},{:.10})L({:.10},{:.10})",
-            v[2], v[3], v[4], v[5], v[0], v[1], v[6], v[7], v[8], v[9]
+            v[2], v[3], v[4], v[5], v[0], v[1], v[6], v[7], max, min
         )
     }
 
     /// x265's HEVC SEI parser takes integer chromaticities in 0.00002 units
     /// and integer luminances in 0.0001 cd/m² units.
     pub fn x265_argument(&self) -> String {
-        let v = self.values;
-        let xy = |index: usize| (v[index] * 50_000.0).round() as u32;
-        let luminance = |index: usize| (v[index] * 10_000.0).round() as u32;
+        let xy = |index: usize| (self.coordinates[index] * 50_000.0).round() as u32;
+        let [max, min] = self.luminance.map(|nits| (nits * 10_000.0).round() as u32);
         format!(
             "G({},{})B({},{})R({},{})WP({},{})L({},{})",
             xy(2),
@@ -92,42 +70,24 @@ impl Mastering {
             xy(1),
             xy(6),
             xy(7),
-            luminance(8),
-            luminance(9)
+            max,
+            min
         )
     }
 
     pub fn mkvmerge_arguments(&self) -> Vec<OsString> {
-        let v = self.values;
+        let v = self.coordinates;
+        let [max, min] = self.luminance;
         vec![
             "--chromaticity-coordinates".into(),
             format!("0:{},{},{},{},{},{}", v[0], v[1], v[2], v[3], v[4], v[5]).into(),
             "--white-color-coordinates".into(),
             format!("0:{},{}", v[6], v[7]).into(),
             "--max-luminance".into(),
-            format!("0:{}", v[8]).into(),
+            format!("0:{max}").into(),
             "--min-luminance".into(),
-            format!("0:{}", v[9]).into(),
+            format!("0:{min}").into(),
         ]
-    }
-
-    fn matches(&self, actual: &Self, encoded: bool) -> bool {
-        self.values
-            .iter()
-            .zip(actual.values)
-            .enumerate()
-            .all(|(i, (a, b))| {
-                let tolerance = if encoded {
-                    match i {
-                        0..=7 => 1.0 / 65536.0,
-                        8 => 1.0 / 256.0,
-                        _ => 1.0 / 16384.0,
-                    }
-                } else {
-                    0.0
-                };
-                (a - b).abs() <= tolerance + 1e-10
-            })
     }
 }
 
@@ -137,13 +97,16 @@ mod formatting_tests {
 
     #[test]
     fn x265_uses_hevc_fixed_point_mastering_units() {
-        let mastering = Mastering::parse(&serde_json::json!({
+        let mastering = StaticMetadata::parse(&[serde_json::json!({
+            "side_data_type":"Mastering display metadata",
             "red_x":"34000/50000", "red_y":"16000/50000",
             "green_x":"13250/50000", "green_y":"34500/50000",
             "blue_x":"7500/50000", "blue_y":"3000/50000",
             "white_point_x":"15635/50000", "white_point_y":"16450/50000",
             "max_luminance":"10000000/10000", "min_luminance":"1/10000"
-        }))
+        })])
+        .unwrap()
+        .complete_mastering()
         .unwrap();
         assert_eq!(
             mastering.x265_argument(),
@@ -154,11 +117,19 @@ mod formatting_tests {
 
 #[derive(Clone, Debug, Default)]
 pub(in crate::jobs) struct StaticMetadata {
-    pub mastering: Option<Mastering>,
+    coordinates: Option<[f64; 8]>,
+    luminance: Option<[f64; 2]>,
     pub light: Option<(u16, u16)>,
 }
 
 impl StaticMetadata {
+    pub(super) fn complete_mastering(&self) -> Option<Mastering> {
+        Some(Mastering {
+            coordinates: self.coordinates?,
+            luminance: self.luminance?,
+        })
+    }
+
     /// MaxCLL is the first declared ceiling; a 10,000-nit placeholder is not
     /// a measurement, so mastering luminance is used when available.
     pub fn declared_peak_nits(&self) -> Option<f64> {
@@ -166,9 +137,8 @@ impl StaticMetadata {
             .map(|light| f64::from(light.0))
             .filter(|value| *value > 0.0 && *value < 10_000.0)
             .or_else(|| {
-                self.mastering
-                    .as_ref()
-                    .map(|mastering| mastering.values[8])
+                self.luminance
+                    .map(|[max, _]| max)
                     .filter(|value| *value > 0.0 && *value < 10_000.0)
             })
     }
@@ -178,14 +148,52 @@ impl StaticMetadata {
         for value in values {
             match kind(value) {
                 "Mastering display metadata" => {
-                    if metadata
-                        .mastering
-                        .replace(Mastering::parse(value)?)
-                        .is_some()
-                    {
+                    if metadata.coordinates.is_some() || metadata.luminance.is_some() {
                         return Err(unsupported(
                             "Duplicate HDR10 mastering metadata is ambiguous.",
                         ));
+                    }
+                    metadata.coordinates = rational_group(
+                        value,
+                        [
+                            "red_x",
+                            "red_y",
+                            "green_x",
+                            "green_y",
+                            "blue_x",
+                            "blue_y",
+                            "white_point_x",
+                            "white_point_y",
+                        ],
+                    )?;
+                    metadata.luminance = rational_group(value, ["max_luminance", "min_luminance"])?;
+                    if metadata.coordinates.is_none() && metadata.luminance.is_none() {
+                        return Err(unsupported(
+                            "HDR10 mastering metadata contains neither coordinates nor luminance.",
+                        ));
+                    }
+                    if let Some(v) = metadata.coordinates {
+                        let triangle =
+                            (v[2] - v[0]) * (v[5] - v[1]) - (v[4] - v[0]) * (v[3] - v[1]);
+                        if v.iter().any(|v| *v >= 1.0)
+                            || v.as_chunks::<2>()
+                                .0
+                                .iter()
+                                .any(|xy| xy[0] + xy[1] > 1.000001)
+                            || triangle.abs() < 1e-8
+                            || v[6] <= 0.0
+                            || v[7] <= 0.0
+                        {
+                            return Err(unsupported(
+                                "HDR10 mastering coordinates are out of range.",
+                            ));
+                        }
+                    }
+                    if metadata
+                        .luminance
+                        .is_some_and(|[max, min]| max > 10_000.0 || min >= max)
+                    {
+                        return Err(unsupported("HDR10 mastering luminance is out of range."));
                     }
                 }
                 "Content light level metadata" => {
@@ -215,35 +223,42 @@ impl StaticMetadata {
         Ok(metadata)
     }
 
+    pub(super) fn fill_missing(&mut self, other: &Self) {
+        self.coordinates = self.coordinates.or(other.coordinates);
+        self.luminance = self.luminance.or(other.luminance);
+        self.light = self.light.or(other.light);
+    }
+
     pub fn absorb_first_frame(&mut self, frame: &Self) -> Result<(), AppError> {
-        if let (Some(a), Some(b)) = (&self.mastering, &frame.mastering)
-            && !a.matches(b, false)
-        {
-            return Err(unsupported(
-                "Stream and frame HDR10 mastering metadata disagree.",
-            ));
-        }
-        if self.light.is_some() && frame.light.is_some() && self.light != frame.light {
-            return Err(unsupported(
-                "Stream and frame HDR10 content light metadata disagree.",
-            ));
-        }
-        if self.mastering.is_none() {
-            self.mastering = frame.mastering.clone();
-        }
-        if self.light.is_none() {
-            self.light = frame.light;
-        }
+        let mut merged = self.clone();
+        merged.fill_missing(frame);
+        merged.validate_present(frame, false).map_err(|_| {
+            unsupported("Stream and frame HDR10 mastering or content light metadata disagree.")
+        })?;
+        *self = merged;
         Ok(())
     }
 
     pub fn validate_present(&self, actual: &Self, encoded: bool) -> Result<(), AppError> {
-        if actual.mastering.as_ref().is_some_and(|b| {
-            !self
-                .mastering
-                .as_ref()
-                .is_some_and(|a| a.matches(b, encoded))
-        }) || (actual.light.is_some() && actual.light != self.light)
+        // AV1 stores chromaticities, maximum and minimum luminance at different precisions.
+        let matches =
+            |a: f64, b: f64, step: f64| (a - b).abs() <= (if encoded { step } else { 0.0 }) + 1e-10;
+        let coordinates_match = actual.coordinates.is_none_or(|actual| {
+            self.coordinates.is_some_and(|planned| {
+                planned
+                    .into_iter()
+                    .zip(actual)
+                    .all(|(a, b)| matches(a, b, 1.0 / 65536.0))
+            })
+        });
+        let luminance_matches = actual.luminance.is_none_or(|[max, min]| {
+            self.luminance.is_some_and(|[a, b]| {
+                matches(a, max, 1.0 / 256.0) && matches(b, min, 1.0 / 16384.0)
+            })
+        });
+        if !coordinates_match
+            || !luminance_matches
+            || (actual.light.is_some() && actual.light != self.light)
         {
             return Err(unsupported(
                 "HDR10 mastering or content light metadata changed unexpectedly.",
@@ -286,7 +301,7 @@ mod rpu_tests {
     }
 }
 
-pub(super) fn kind(value: &Value) -> &str {
+pub(in crate::jobs) fn kind(value: &Value) -> &str {
     value
         .get("side_data_type")
         .and_then(Value::as_str)
@@ -518,8 +533,9 @@ pub(super) fn authored(
 }
 impl StaticMetadata {
     pub(super) fn apply_authored(&mut self, authored: &Self) {
-        if authored.mastering.is_some() {
-            self.mastering = authored.mastering.clone();
+        if let Some(mastering) = authored.complete_mastering() {
+            self.coordinates = Some(mastering.coordinates);
+            self.luminance = Some(mastering.luminance);
         }
         if let Some(light) = authored.light {
             self.light = if light == (0, 0) { None } else { Some(light) };
